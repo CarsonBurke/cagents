@@ -245,11 +245,14 @@ impl Peer {
                     }
                     // ControlClient finishes attachment even when the actual
                     // Input/Shutdown was refused. This is not a mutation retry.
-                    let detach = next(&mut peer);
-                    assert!(
-                        matches!(detach.request, ClientRequest::Detach { terminal_id } if terminal_id == id)
-                    );
-                    response(&mut peer, &detach, ServerResponse::Detached);
+                    // Only an accepted Close already retired the subscription.
+                    if scoped || !matches!(business, Business::Close) {
+                        let detach = next(&mut peer);
+                        assert!(
+                            matches!(detach.request, ClientRequest::Detach { terminal_id } if terminal_id == id)
+                        );
+                        response(&mut peer, &detach, ServerResponse::Detached);
+                    }
                 }
             }
             assert!(

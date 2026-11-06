@@ -427,7 +427,7 @@ impl Runtime {
         // conversation's own names rather than reprinting its command.
         let coordinated = cached.coordination.as_deref();
         let (verb, label) = match coordinated {
-            Some(coordinated) => coordinated.line(&|id| self.agent_name(id)),
+            Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
             None => (
                 turn::step_verb(&item.content).to_owned(),
                 turn::step_label(&item.content).to_owned(),

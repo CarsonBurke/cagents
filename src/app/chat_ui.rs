@@ -2337,6 +2337,10 @@ pub(super) struct Runtime {
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
     child_picker: Option<child_navigation::Picker>,
+    /// The child whose tab holds keyboard focus. The tab strip reports it, so
+    /// the next frame keeps that tab mounted wherever its state sorts it.
+    child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    child_ordinals: child_navigation::Ordinals,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -3318,6 +3322,8 @@ impl Runtime {
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
             child_picker: None,
+            child_tab_focus: Default::default(),
+            child_ordinals: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -3409,6 +3415,7 @@ impl Runtime {
         self.unplaced_failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
+        self.child_tab_focus.borrow_mut().take();
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -4518,6 +4525,9 @@ impl Runtime {
         mut snapshot: Arc<Snapshot>,
         source_clock: Option<chat::client::SourceClock>,
     ) {
+        // Hidden publications number new children too, so a child keeps the
+        // number it first appeared with for as long as it stays listed.
+        self.child_ordinals.observe(&snapshot.subagents);
         if !self.visible.load(Ordering::Relaxed) {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
@@ -12215,7 +12225,7 @@ impl Cagents {
                     && let Some(picker) = runtime.child_picker.as_mut()
                 {
                     let last = picker
-                        .rows(&runtime.snapshot.subagents)
+                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
                         .len()
                         .saturating_sub(1)
                         / 24;

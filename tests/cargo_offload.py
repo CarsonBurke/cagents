@@ -15,6 +15,7 @@ import json
 import os
 import resource
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import socket
@@ -24,6 +25,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -551,6 +553,12 @@ class StandInHost(unittest.TestCase):
         self.root = Path(temporary.name)
         tools = self.root / "tools"
         tools.mkdir()
+        # HOME changes below, so caller Python shims (such as mise's) may
+        # no longer resolve their interpreter. Keep the test's own Python
+        # first without changing which Cargo or rustup each side finds.
+        python_tools = self.root / "python"
+        python_tools.mkdir()
+        (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
                      "cargo-offload"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
@@ -571,17 +579,20 @@ class StandInHost(unittest.TestCase):
         """))
         (self.crate / "src/main.rs").write_text('fn main() { println!("probe"); }\n')
         (self.crate / ".gitignore").write_text("/target\n")
+        # A host's default toolchain may predate CARGO_BUILD_BUILD_DIR.
+        shutil.copy2(ROOT / "rust-toolchain.toml", self.crate)
         subprocess.run(["git", "init", "-q"], cwd=self.crate, check=True)
         home = Path.home()
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith(("CAGENTS_BUILD_", "CARGO_BUILD_"))
         } | {
-            "PATH": f"{tools}:{os.environ['PATH']}",
+            "PATH": os.pathsep.join([str(python_tools), str(tools), os.environ["PATH"]]),
             # A build host's `cargo` is rustup's, as fw16's is, rather than
             # whatever wraps it first on this host's PATH: mise's shim, for
             # one, raises the open-file limit the build is meant to keep.
             "STAND_IN_HOST_PATH": os.pathsep.join([
+                str(python_tools),
                 os.path.join(os.environ.get("CARGO_HOME", str(home / ".cargo")), "bin"),
                 os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
@@ -881,6 +892,59 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run("exec", "sh", "-ec", f"'{cargo}' metadata --format-version 1 "
                                ">/dev/null && printf ok", env=self.remote_env(), timeout=60)
         self.assertEqual((result.returncode, result.stdout), (0, "ok"), result.stderr)
+
+    def shell_program(self):
+        # Exercise Offload.launch with a real Cargo-built program, which runs
+        # the commands after the remote lease and its children have ended.
+        (self.crate / "src/main.rs").write_text(textwrap.dedent("""
+            fn main() {
+                let status = std::process::Command::new("sh")
+                    .args(std::env::args().skip(1)).status().unwrap();
+                std::process::exit(status.code().unwrap_or(127));
+            }
+        """))
+
+    def test_a_program_run_inside_exec_reenters_the_gate_for_named_cargo(self):
+        self.shell_program()
+        result = self.gate_run(
+            "exec", "cargo", "run", "--quiet", "--", "-ec",
+            "cargo build --bin probe; cargo metadata --format-version 1 >/dev/null",
+            env=self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.root / "local-build").exists())
+
+    def logging_rustc_wrapper(self):
+        wrapper = self.root / "rustc-wrapper"
+        wrapper.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >>"$WRAPPER_LOG"\nexec "$@"\n')
+        wrapper.chmod(0o755)
+        return {"RUSTC_WRAPPER": str(wrapper), "PROBE_WRAPPER": str(wrapper),
+                "WRAPPER_LOG": str(self.root / "wrapper-log")}
+
+    def test_a_program_run_inside_exec_cannot_compile_through_absolute_cargo(self):
+        self.shell_program()
+        result = self.gate_run(
+            "exec", "cargo", "run", "--quiet", "--", "-ec",
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; "$CARGO" build --bin probe',
+            env=self.remote_env() | self.logging_rustc_wrapper())
+        self.assertNotEqual(result.returncode, 0, result.stderr)
+        self.assertIn("would compile on this host", result.stderr)
+        self.assertEqual([path for path in (self.root / "local-build").rglob("probe*")
+                          if path.is_file()], [])
+        # The guard still hands queries to the caller's saved wrapper.
+        queries = (self.root / "wrapper-log").read_text()
+        self.assertIn("-vV", queries)
+        self.assertNotIn("--crate-name probe ", queries)
+
+    def test_a_program_run_outside_exec_keeps_the_callers_environment(self):
+        self.shell_program()
+        result = self.gate_run(
+            "run", "--quiet", "--", "-ec",
+            'test "$RUSTC_WRAPPER" = "$PROBE_WRAPPER"; '
+            'test -z "${CAGENTS_BUILD_EXEC_SHIMS-}"; '
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null',
+            env=self.remote_env() | self.logging_rustc_wrapper())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("-vV", (self.root / "wrapper-log").read_text())
 
     def test_documentation_opens_here(self):
         (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
@@ -1214,6 +1278,51 @@ class StandInHost(unittest.TestCase):
                 break
             self.assertLess(time.monotonic(), deadline, "the remote build script outlived the gate")
             time.sleep(0.1)
+
+
+class StandInHostPython(unittest.TestCase):
+    """Interpreter selection needs no Cargo build or real SSH connection."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-python-shim-")
+        self.addCleanup(temporary.cleanup)
+        caller_tools = Path(temporary.name)
+        self.shim_calls = caller_tools / "invocations"
+        shim = caller_tools / "python3"
+        # Fail promptly instead of reproducing a shim's recursive exec loop.
+        shim.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "${0%/*}/invocations"\nexit 86\n')
+        shim.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{caller_tools}:{os.environ['PATH']}"}):
+            self.host = StandInHost()
+            self.addCleanup(self.host.doCleanups)
+            self.host.setUp()
+        self.environment = self.host.remote_env() | {"CAGENTS_FIXTURE_CALLER_ONLY": "present"}
+        self.probe = (
+            "import json, os, pathlib, sys; "
+            "print(json.dumps({'executable': str(pathlib.Path(sys.executable).resolve()), "
+            "'home': os.environ['HOME'], "
+            "'caller': os.environ.get('CAGENTS_FIXTURE_CALLER_ONLY')}))"
+        )
+
+    def assert_interpreter(self, result, *, caller):
+        self.assertFalse(self.shim_calls.exists(), "the caller's python3 shim ran")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "executable": str(Path(sys.executable).resolve()),
+            "home": str(self.host.host_home),
+            "caller": caller,
+        })
+
+    def test_copied_gate_ignores_callers_python_shim(self):
+        result = self.host.gate_run("exec", "python3", "-c", self.probe,
+                                    env=self.environment, timeout=10)
+        self.assert_interpreter(result, caller="present")
+
+    def test_clean_stand_in_host_ignores_callers_python_shim(self):
+        result = subprocess.run(["ssh", "stand-in", "python3", "-c", shlex.quote(self.probe)],
+                                cwd=self.host.crate, env=self.environment,
+                                capture_output=True, text=True, timeout=10)
+        self.assert_interpreter(result, caller=None)
 
 
 class RemoteRun(unittest.TestCase):

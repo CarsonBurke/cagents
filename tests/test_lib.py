@@ -78,7 +78,9 @@ if config.get("hold") == phase:
 if phase == "metadata":
     if config.get("metadata_exit"):
         raise SystemExit(config["metadata_exit"])
-    metadata = dict(target_directory=str(root / "owned-target"))
+    metadata = {}
+    if not config.get("metadata_omit_target_directory"):
+        metadata["target_directory"] = str(root / "owned-target")
     if not config.get("metadata_omit_build_directory"):
         metadata["build_directory"] = config.get("metadata_build_directory", str(root / "owned-build"))
     print(json.dumps(metadata, separators=(",", ":")))
@@ -331,10 +333,11 @@ class TestLib(unittest.TestCase):
         self.assertTrue(self.events("compiler")[0]["held"])
         self.assert_one_build_then_direct_harness()
 
-    def test_failed_empty_or_target_only_metadata_bypasses_disk_guard(self):
+    def test_failed_or_pathless_metadata_bypasses_disk_guard(self):
         environment = self.disk_policy()
-        for config in ({"metadata_exit": 37}, {"metadata_build_directory": ""},
-                       {"metadata_omit_build_directory": True}):
+        for config in ({"metadata_exit": 37},
+                       {"metadata_build_directory": "", "metadata_omit_target_directory": True},
+                       {"metadata_omit_build_directory": True, "metadata_omit_target_directory": True}):
             with self.subTest(config=config):
                 self.clear()
                 # The fake disk would refuse this build if the guard ran.
@@ -346,6 +349,23 @@ class TestLib(unittest.TestCase):
                 self.assertEqual([event["phase"] for event in self.events()[:2]], ["metadata", "compiler"])
                 self.assertTrue(self.events("compiler")[0]["held"])
                 self.assert_one_build_then_direct_harness()
+
+    def test_disk_guard_uses_the_build_directory_else_the_target(self):
+        environment = self.disk_policy()
+        for name in ("owned-build", "owned-target"):
+            (self.root / name).mkdir()
+        for config, guarded in (({}, "owned-build"),
+                                ({"metadata_build_directory": ""}, "owned-target"),
+                                ({"metadata_omit_build_directory": True}, "owned-target")):
+            with self.subTest(config=config):
+                self.clear()
+                # The fake disk refuses, so the path it was asked about is the guarded one.
+                self.configure(size_gib=100, free_gib=0, **config)
+                result = self.invoke("cli", "module::one", env=environment)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.events("disk")[0]["arguments"],
+                                 ["-Pk", "--", str(self.root / guarded)])
+                self.assertEqual(self.events("compiler"), [])
 
     def test_artifact_must_be_unique_matching_absolute_and_runnable(self):
         for variant in ("missing", "duplicate", "wrong-manifest", "wrong-name", "wrong-kind",

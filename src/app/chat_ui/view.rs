@@ -1273,13 +1273,13 @@ impl Runtime {
             text
         }
     }
+    /// The agent's own name: Codex's nickname, the name Claude was asked to
+    /// give an agent, else its type, or OMP's agent name. The description is
+    /// the task it was given, which says what it does rather than who it is,
+    /// so it never stands in for the name.
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
-        agent
-            .description
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .or_else(|| (!agent.kind.trim().is_empty()).then_some(agent.kind.trim()))
+        Some(agent.kind.trim())
+            .filter(|name| !name.is_empty())
             .unwrap_or("Subagent")
     }
 
@@ -1295,6 +1295,12 @@ impl Runtime {
     }
 
     pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
+        self.child_description(agent, &self.child_label(agent, 80))
+    }
+
+    /// What a child's tab and rows say beyond its name: its state, where it
+    /// runs and the task it was given. `label` is its name as listed.
+    pub(super) fn child_description(&self, agent: &chat::Subagent, label: &str) -> String {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
@@ -1307,16 +1313,40 @@ impl Runtime {
             .filter(|model| !model.is_empty())
             .unwrap_or("Model not reported");
         let mut identity = format!(
-            "{provider} native subagent · {} · {} · {}",
-            Self::short_description(Self::native_child_name(agent), 80),
+            "{} · {} · {provider} native subagent · {}",
+            Self::short_description(label, 80),
+            Self::native_child_status(agent),
             Self::short_description(model, 80),
-            Self::native_child_status(agent)
         );
-        if !agent.detail.trim().is_empty() {
+        // A blocked or failed child's provider error keeps its raw diagnostic
+        // for copying; the tab says what it means. A finished child's detail
+        // is its own report, whose prose may merely mention such words.
+        let detail = agent.detail.trim();
+        if !detail.is_empty() {
             identity.push_str(" · ");
-            identity.push_str(&Self::short_description(agent.detail.trim(), 120));
+            let failure = (agent.waiting || agent.status == chat::ToolStatus::Failed)
+                .then(|| chat::failure::Failure::parse(self.session.launch.provider, detail))
+                .flatten();
+            match failure {
+                Some(failure) => identity.push_str(&failure.summary),
+                None => identity.push_str(&Self::short_description(detail, 120)),
+            }
+        }
+        if let Some(task) = Self::native_child_task(agent) {
+            identity.push_str(" · Task: ");
+            identity.push_str(&Self::short_description(task, 120));
         }
         identity
+    }
+
+    /// The first line of the task a child was given, which can be a whole
+    /// prompt. It describes a child's tab; it never names one.
+    pub(super) fn native_child_task(agent: &chat::Subagent) -> Option<&str> {
+        agent
+            .description
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
     }
 
     /// Completion requires provider evidence. An unstarted conversation is a
@@ -1943,9 +1973,9 @@ impl Runtime {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .unwrap_or("Model not reported");
-            let heading: Element<'_, Message> = widget::column::with_children(vec![
+            let mut heading = vec![
                 widget::row::with_children(vec![
-                    chat_title(Self::short_description(Self::native_child_name(agent), 80))
+                    chat_title(self.child_label(agent, 80))
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
@@ -1955,6 +1985,17 @@ impl Runtime {
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .into(),
+            ];
+            // The name titles the transcript; the task it was given sits
+            // beneath it, quieter, so the reader knows what it is for.
+            if let Some(task) = Self::native_child_task(agent) {
+                heading.push(
+                    design::caption(Self::short_description(task, 80))
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .into(),
+                );
+            }
+            heading.push(
                 crate::interaction::tooltip(
                     design::caption(format!(
                         "Native subagent · {provider} · {}",
@@ -1963,10 +2004,11 @@ impl Runtime {
                     self.native_child_identity(agent),
                 )
                 .into(),
-            ])
-            .spacing(step::GAP_XS)
-            .width(Length::Fill)
-            .into();
+            );
+            let heading: Element<'_, Message> = widget::column::with_children(heading)
+                .spacing(step::GAP_XS)
+                .width(Length::Fill)
+                .into();
             selected_identity = Some(
                 if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
                 {
@@ -7352,6 +7394,20 @@ mod tests {
         assert!(known.contains("child-model"));
         assert!(known.contains("Waiting for you"));
         assert!(known.contains("Waiting for your approval"));
+        // A provider's raw error payload is summarized, not quoted.
+        child.detail =
+            r#"{"message":"You've hit your limit · resets 1:30pm","type":"rate_limit_error"}"#
+                .into();
+        let limited = runtime.native_child_identity(&child);
+        assert!(limited.contains("Claude usage limit reached · resets 1:30pm"));
+        assert!(!limited.contains("rate_limit_error"));
+        // A finished child's own report is quoted, never read as a failure.
+        child.waiting = false;
+        child.status = chat::ToolStatus::Succeeded;
+        child.detail = "psql gave connection refused until postgres started".into();
+        let report = runtime.native_child_identity(&child);
+        assert!(report.contains("psql gave connection refused"));
+        assert!(!report.contains("connection was interrupted"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
     }
@@ -8512,8 +8568,8 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label.starts_with("Choose subagent:")
-                    && label.contains("Inspect repository")),
+                .any(|label| label.starts_with("Scout · Waiting · ")
+                    && label.contains("Task: Inspect repository")),
             "{labels:?}"
         );
         assert!(
@@ -10097,7 +10153,7 @@ mod tests {
                 .find(|node| {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
                         && node.node().label().is_some_and(|label| match step {
-                            0 => label.starts_with("Choose subagent:"),
+                            0 => label.starts_with("Search and filter subagents:"),
                             1 => {
                                 label.contains("Inspect repository")
                                     && label.ends_with(" · native-child")
