@@ -20,10 +20,13 @@ Environment:
                            24G (default {DEFAULT_MAX}); 0 runs without a limit
   CAGENTS_MEMORY_SWAP_MAX  Swap they may use besides (default {DEFAULT_SWAP_MAX})
 
-A command already under a limit keeps that one. Over the limit, the whole scope
-is stopped and this exits 137. Interrupting this stops the scope too.
+A command already under a memory limit, whether from this tool or a caller's own
+scope, keeps that one. Over the limit, the whole scope is stopped and this exits
+137. Interrupting this stops the scope too.
 """
 UNITS = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
+PAGE = os.sysconf("SC_PAGE_SIZE")
+FORWARDED = (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT)
 PR_SET_PDEATHSIG = 1
 UNIT_PREFIX = "cagents-capped-"
 # A fixture or a nested session replaces these, which hides the user manager
@@ -50,18 +53,40 @@ def size(setting, default):
     if not match:
         print(f"{PROGRAM}: {setting} must be a size such as 16G: {text}", file=sys.stderr)
         raise SystemExit(2)
-    return int(match[1]) * UNITS[match[2]]
+    # The kernel keeps whole pages, and the check below compares what it kept.
+    return (int(match[1]) * UNITS[match[2]] + PAGE - 1) // PAGE * PAGE
 
 
 def already_limited():
-    """Whether this process is in one of these scopes now. Being started by one
+    """Whether this process's cgroup or one above it has a memory limit now, so
+    that moving out would lift a stricter one. Being started under a limit
     wouldn't do: what starts in a scope of its own, such as a daemon and the
     sessions it runs, carries the environment but not the limit."""
     try:
         with open("/proc/self/cgroup") as file:
-            return f"/{UNIT_PREFIX}" in file.read()
-    except OSError:
+            group = next(line[3:].strip() for line in file if line.startswith("0::"))
+    except (OSError, StopIteration):
         return False
+    while group not in ("", "/"):
+        try:
+            with open(f"/sys/fs/cgroup{group}/memory.max") as file:
+                if file.read().strip() != "max":
+                    return True
+        except OSError:
+            pass
+        group = os.path.dirname(group)
+    return False
+
+
+def run_as_is(command):
+    # Python ignores these, and a command run directly wouldn't.
+    for number in (signal.SIGPIPE, signal.SIGXFSZ):
+        signal.signal(number, signal.SIG_DFL)
+    try:
+        os.execvp(command[0], command)
+    except OSError as error:
+        print(f"{PROGRAM}: {command[0]}: {error.strerror}", file=sys.stderr)
+        return 127
 
 
 def scope_command(unit, limit, swap):
@@ -90,11 +115,19 @@ def follow_parent(parent):
         os._exit(143)
 
 
-def went_over(unit):
+def went_over(unit, killed):
+    """Whether the unit was stopped for going over its limit. A failed unit is
+    left for no one to read. The manager can hear of a kill after the command's
+    parent does, so a killed command gets a moment."""
+    deadline = time.monotonic() + (2 if killed else 0)
     try:
-        result = subprocess.run(["systemctl", "--user", "show", unit, "--property=Result", "--value"],
-                                stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
-                                env=manager_environment())
+        while True:
+            result = subprocess.run(["systemctl", "--user", "show", unit, "--property=Result", "--value"],
+                                    stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=30,
+                                    env=manager_environment())
+            if result.stdout.strip() == "oom-kill" or time.monotonic() >= deadline:
+                break
+            time.sleep(0.1)
         subprocess.run(["systemctl", "--user", "reset-failed", unit], stdin=subprocess.DEVNULL,
                        capture_output=True, timeout=30, env=manager_environment())
     except (OSError, subprocess.SubprocessError):
@@ -102,19 +135,29 @@ def went_over(unit):
     return result.stdout.strip() == "oom-kill"
 
 
+def end_as(status):
+    """Ends as the command did, so a calling script stops on Ctrl-C too."""
+    if status >= 0:
+        return status
+    if -status in FORWARDED:
+        signal.signal(-status, signal.SIG_DFL)
+        os.kill(os.getpid(), -status)
+    return 128 - status
+
+
 def main():
     command = sys.argv[1:]
     if not command or command[0] in ("-h", "--help"):
         print(USAGE, end="", file=sys.stdout if command else sys.stderr)
         return 0 if command else 2
-    if os.environ.get("CAGENTS_MEMORY_MAX") == "0" or already_limited():
-        os.execvp(command[0], command)
     limit = size("CAGENTS_MEMORY_MAX", DEFAULT_MAX)
     swap = size("CAGENTS_MEMORY_SWAP_MAX", DEFAULT_SWAP_MAX)
+    if limit == 0 or already_limited():
+        return run_as_is(command)
     if not scope_limits_memory(limit, swap):
         print(f"{PROGRAM}: no systemd scope can limit memory here; running without a limit",
               file=sys.stderr)
-        os.execvp(command[0], command)
+        return run_as_is(command)
     unit = f"{UNIT_PREFIX}{os.getpid()}-{time.monotonic_ns()}.scope"
     parent = os.getpid()
     # The command runs as this child: systemd-run execs it after making the scope.
@@ -127,20 +170,26 @@ def main():
         interrupted.append(sent)
         child.send_signal(sent)
 
-    for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP, signal.SIGQUIT):
+    for number in FORWARDED:
         signal.signal(number, forward)
     status = child.wait()
     if interrupted:
         # Whatever ignored the signal, such as a compositor, goes with the scope.
-        subprocess.run(["systemctl", "--user", "stop", "--no-block", unit], stdin=subprocess.DEVNULL,
-                       capture_output=True, timeout=30, env=manager_environment())
-    if status != 0 and went_over(unit):
+        try:
+            subprocess.run(["systemctl", "--user", "stop", unit], stdin=subprocess.DEVNULL,
+                           capture_output=True, timeout=30, env=manager_environment())
+        except (OSError, subprocess.SubprocessError):
+            pass
+    if went_over(unit, status == -signal.SIGKILL):
         print(f"{PROGRAM}: stopped `{command[0]}`, which went over its limit of {limit // 2**20} MiB "
               f"of memory and {swap // 2**20} MiB of swap. If it isn't running away, raise "
               "CAGENTS_MEMORY_MAX.", file=sys.stderr)
         return 137
-    return 128 - status if status < 0 else status
+    return end_as(status)
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(end_as(-signal.SIGINT))

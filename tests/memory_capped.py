@@ -88,6 +88,10 @@ class InARealScope(unittest.TestCase):
             self.assertLess(time.monotonic(), deadline, what)
             time.sleep(0.02)
 
+    def assert_not_left_failed(self, unit):
+        state = subprocess.run(["systemctl", "--user", "is-failed", unit], capture_output=True, text=True)
+        self.assertNotEqual(state.stdout.strip(), "failed", "the failed unit was left behind")
+
     def test_a_runaway_is_stopped_and_named_with_its_children(self):
         survivor = self.root / "survivor"
         unit = self.root / "unit"
@@ -107,9 +111,7 @@ class InARealScope(unittest.TestCase):
         self.assertLess(time.monotonic() - started, 60)
         pid = int(survivor.read_text())
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "a child outlived the scope")
-        state = subprocess.run(["systemctl", "--user", "is-failed", unit.read_text()],
-                               capture_output=True, text=True)
-        self.assertNotEqual(state.stdout.strip(), "failed", "the failed unit was left behind")
+        self.assert_not_left_failed(unit.read_text())
 
     def test_memory_under_the_limit_is_undisturbed(self):
         script = "data = bytearray(b'x') * (64 * 2**20); print(len(data))"
@@ -130,17 +132,64 @@ class InARealScope(unittest.TestCase):
 
     def test_interrupting_it_stops_what_ignores_the_signal(self):
         marker = self.root / "pid"
+        unit = self.root / "unit"
         wrapper = subprocess.Popen(
-            [str(TOOL), "sh", "-c", f'sh -c \'trap "" TERM INT HUP; echo $$ >"{marker}"; '
+            [str(TOOL), "sh", "-c", f'{LEAF} >"{unit}"; sh -c \'trap "" TERM INT HUP; echo $$ >"{marker}"; '
              'while :; do sleep 1; done\' & wait'],
-            env=self.env, stderr=subprocess.DEVNULL)
-        self.addCleanup(wrapper.wait)
+            env=self.env, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(wrapper.communicate)
         self.wait_for(lambda: marker.exists() and marker.read_text().strip(), "never started")
         pid = int(marker.read_text())
         self.addCleanup(lambda: subprocess.run(["kill", "-KILL", str(pid)], capture_output=True))
         wrapper.terminate()
-        wrapper.wait(20)
+        _, errors = wrapper.communicate(timeout=20)
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "it outlived the scope")
+        self.assertNotIn("over its limit", errors)
+        self.assert_not_left_failed(unit.read_text().strip())
+
+    def test_an_interrupted_command_ends_a_calling_script_too(self):
+        marker = self.root / "pid"
+        script = subprocess.Popen(
+            ["bash", "-c", f'"{TOOL}" sh -c \'echo $$ >"{marker}"; exec sleep 300\'; echo continued'],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
+        self.addCleanup(script.communicate)
+        self.wait_for(lambda: marker.exists() and marker.read_text().strip(), "never started")
+        # As a terminal delivers Ctrl-C: to the whole foreground group.
+        os.killpg(script.pid, signal.SIGINT)
+        output, errors = script.communicate(timeout=30)
+        self.assertEqual((script.returncode, output), (-signal.SIGINT, ""), errors)
+
+    def test_a_stricter_limit_of_the_callers_stays_in_force(self):
+        result = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect", "--property=MemoryMax=134217728",
+             "--property=MemorySwapMax=0", str(TOOL), "sh", "-c",
+             f'{LEAF}; cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'],
+            env=self.env, capture_output=True, text=True, timeout=60)
+        leaf, limit = result.stdout.split()
+        self.assertNotRegex(leaf, r"^cagents-capped-", result.stderr)
+        self.assertEqual(limit, "134217728")
+
+    def test_any_size_is_honoured_and_zero_turns_it_off(self):
+        page = os.sysconf("SC_PAGE_SIZE")
+        self.env["CAGENTS_MEMORY_MAX"] = str(64 * 2**20 + 1)
+        report = f'{LEAF}; cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'
+        result = self.run_tool("sh", "-c", report)
+        self.assertNotIn("without a limit", result.stderr)
+        leaf, limit = result.stdout.split()
+        self.assertRegex(leaf, r"^cagents-capped-")
+        self.assertEqual(int(limit), 64 * 2**20 + page)
+        for off in ("0", "0G"):
+            self.env["CAGENTS_MEMORY_MAX"] = off
+            result = self.run_tool("sh", "-c", LEAF)
+            self.assertNotRegex(result.stdout, r"^cagents-capped-", off)
+            self.assertEqual(result.stderr, "", off)
+
+    def test_a_pipe_reader_going_away_ends_a_command_run_without_a_scope(self):
+        self.env["CAGENTS_MEMORY_MAX"] = "0"
+        result = subprocess.run(
+            ["bash", "-c", f'"{TOOL}" sh -c "while echo x; do :; done" | head -n 1; echo "${{PIPESTATUS[0]}}"'],
+            env=self.env, capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.stdout.split(), ["x", "141"], result.stderr)
 
     def test_a_command_in_a_limited_scope_stays_in_it_and_one_outside_gets_its_own(self):
         inner = f'"{TOOL}" sh -c "{LEAF}"'
@@ -150,7 +199,8 @@ class InARealScope(unittest.TestCase):
         self.assertEqual(nested, outer)
         # A daemon's own scope, started from a limited one, isn't limited.
         escaped = subprocess.run(
-            ["systemd-run", "--user", "--scope", "--quiet", "--collect", str(TOOL), "sh", "-c", LEAF],
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect",
+             f"--unit=cagentsd-memory-capped-{os.getpid()}.scope", str(TOOL), "sh", "-c", LEAF],
             env=self.env, capture_output=True, text=True, timeout=60)
         self.assertRegex(escaped.stdout.strip(), r"^cagents-capped-.*\.scope$", escaped.stderr)
 

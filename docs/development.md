@@ -730,15 +730,16 @@ runaway just moves into swap. For scale, the whole UI lib test binary peaks at
 about 3 GiB, and the host one at about 1 GiB.
 
 `scripts/cargo-gate test` and `bench` run under it, inside a held slot too, as do
-the app in `scripts/run-development`, `--instance` included, and a
-`scripts/native-evidence` session. It doesn't cover doctests, `cargo-gate run`,
-`--hot`, tests run on a build host through `cargo-offload`, or a harness that runs
-Cargo or a test binary itself.
+`scripts/test-lib`, the app in `scripts/run-development`, `--instance` included,
+and a `scripts/native-evidence` session. A command that already has a memory limit
+keeps it. It doesn't cover outer `cargo-gate test --doc`, `cargo-gate run`, `--hot`,
+tests run on a build host through `cargo-offload`, Cargo run by a script under
+`cargo-gate exec`, or a harness that runs Cargo or a test binary itself.
 
 **Writing a mutation harness:** a mutant can turn a bounded loop into an endless
-one that allocates, so run each mutant through `scripts/cargo-gate test` or put
-`scripts/memory-capped` in front of the command, and give it a lower limit than
-the default if you know what the tests need. Don't use `ulimit -v`: it limits
+one that allocates, so run each mutant through `scripts/cargo-gate test` or
+`scripts/test-lib`, or put `scripts/memory-capped` in front of the command, and
+give it a lower limit than the default if you know what the tests need. Don't use `ulimit -v`: it limits
 address space rather than memory, and these binaries reserve far more than they
 touch. A `signal: 9` from a mutant is a result to read, and doesn't show that a
 test caught it. A test that allocates on purpose needs a ceiling of its own: a

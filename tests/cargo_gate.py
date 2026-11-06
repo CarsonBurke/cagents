@@ -1489,9 +1489,15 @@ class TestsUnderAMemoryLimit(TwoSlots):
                 self.assertNotIn("limited", "\n".join(self.gate_run(*arguments)))
 
     def test_tests_inside_a_held_slot_run_under_it(self):
-        lines = self.gate_run("exec", str(self.gate), "test", "--lib")
-        self.assertIn("limited cargo test --lib", lines)
-        self.assertIn("cargo test --lib", lines)
+        for subcommand in ("test", "bench"):
+            with self.subTest(subcommand):
+                self.ran.unlink(missing_ok=True)
+                lines = self.gate_run("exec", str(self.gate), subcommand, "--lib")
+                self.assertIn(f"limited cargo {subcommand} --lib", lines)
+                self.assertIn(f"cargo {subcommand} --lib", lines)
+
+    def test_an_updated_gate_brings_the_limit_with_it(self):
+        self.assertIn('"scripts/memory-capped"', (ROOT / "scripts/cargo-gate-sync.py").read_text())
 
 
 class MemoryAdmission(TwoSlots):

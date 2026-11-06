@@ -231,6 +231,10 @@ def main():
             signal.signal(getattr(signal, name), signal.SIG_DFL)
     if cancellation:
         raise SystemExit(128 + cancellation)
+    # A filtered mutation loop runs here too, and a mutant can allocate forever.
+    limit = ROOT / "scripts/memory-capped"
+    if os.access(limit, os.X_OK):
+        os.execv(limit, [str(limit), executable, *command[1:]])
     os.execv(executable, command)
 
 
