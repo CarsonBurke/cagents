@@ -3275,13 +3275,17 @@ impl Runtime {
             leading.extend(notice);
             engine.push(spend);
             // The leading group wraps when the place is long; the trailing
-            // one stays on a line of its own edge.
+            // one holds the footer's far edge. The flex row stays shrink-wide
+            // inside a filling container: a filling flex row hands its width
+            // to every item as a minimum, setting each on a line of its own.
             widget::row::with_children(vec![
-                widget::flex_row(leading)
-                    .spacing(step::GAP_S as u16)
-                    .align_items(Alignment::Center)
-                    .width(Length::Fill)
-                    .into(),
+                widget::container(
+                    widget::flex_row(leading)
+                        .spacing(step::GAP_S as u16)
+                        .align_items(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .into(),
                 widget::row::with_children(engine)
                     .spacing(step::GAP_S)
                     .align_y(Alignment::Center)
