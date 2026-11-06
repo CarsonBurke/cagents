@@ -1518,7 +1518,9 @@ def trace(value):
 trace({'event':'bootstrap','HOME':os.environ.get('HOME'),'CLAUDE_CONFIG_DIR':os.environ.get('CLAUDE_CONFIG_DIR'),'cwd':os.getcwd(),'scriptroot':str(scriptroot)})
 root=pathlib.Path(os.environ['HOME']).parent
 trace({'event':'marker-root','markerroot':str(root)})
-session=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+resumed=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--resume=')), None)
+session=resumed or next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+with (root/'launches').open('a') as log: log.write((resumed or 'new')+'\n')
 def send(value): print(json.dumps(value),flush=True)
 for line in sys.stdin:
     frame=json.loads(line)
@@ -1534,6 +1536,13 @@ for line in sys.stdin:
             (root/'survivor-pid').write_text(str(survivor.pid))
         received=frame['uuid']
         send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':frame['message']})
+        if (root/'stop-on-prompt').exists():
+            # The provider dies mid-turn, as under an out-of-memory kill. The
+            # marker is consumed first, so a resumed provider answers normally.
+            (root/'stop-on-prompt').unlink()
+            send({'type':'assistant','uuid':'stopping','message':{'id':'stopping','role':'assistant','content':[{'type':'text','text':'STOPPING|'}]}})
+            import signal
+            os.kill(os.getpid(), signal.SIGKILL)
         send({'type':'command_lifecycle','command_uuid':received,'state':'started','session_id':session,'uuid':'lifecycle-'+received})
         for index in range(40):
             send({'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}})
@@ -4764,4 +4773,295 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
     assert_ne!(reopened.id, running);
     assert_eq!(reopened.launch.session_id, closed_early.launch.session_id);
     assert!(successor.lock().unwrap().chats.is_empty());
+}
+
+/// A card whose provider died under a running daemon, as under an
+/// out-of-memory kill, resumes the exact conversation in a successor started
+/// by that same daemon: once, however often it is asked, with nothing the
+/// ended actor held sent again.
+#[cfg(target_os = "linux")]
+#[test]
+fn exited_claude_card_resumes_its_conversation_once_in_the_same_daemon() {
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_EXITED_CLAUDE_RESUME_TEST";
+    if std::env::var_os(MODE).is_none() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for path in [
+            "home/.claude",
+            "run",
+            "data",
+            "config",
+            "cache",
+            "bin",
+            "project",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        let test = thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env_clear()
+            .env(
+                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                retained_helper_executable(),
+            )
+            .env(MODE, "1")
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CAGENTS_HOLDER_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "exited resume failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    install_provider(&root.join("bin/claude"));
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("exited-resume-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("only"),
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut state = HostState::new(proof.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&root.join("registry.sqlite3")).unwrap());
+    let host = Arc::new(HostLock::new(state));
+    let _notifications = {
+        let broker = super::super::notifications::Broker::start(
+            &host,
+            crate::notifications::Application::Cagents,
+        )
+        .unwrap();
+        host.lock().unwrap().notifications = Some(broker.handle());
+        broker
+    };
+    struct Cleanup(crate::daemon::holder_registry::Record);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in [&self.0.root, &self.0.holder] {
+                if process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    let lines = |name: &str| {
+        fs::read_to_string(root.join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let prompt = |handle: &Handle, text: &str| {
+        handle
+            .command(chat::Command::Prompt {
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+    };
+    let launch = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = launch.id;
+    start_execution(
+        &host,
+        0,
+        launch,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().unwrap();
+    let _cleanup = Cleanup(identity.record.clone());
+    wait_until(
+        || handle.attachment_snapshot().ready,
+        "actor never initialized",
+    );
+    prompt(&handle, "A turn that names the conversation");
+    wait_until(
+        || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
+        "fixture provider never confirmed its conversation",
+    );
+    let conversation = handle.confirmed_session_id();
+    // The card holds the descriptor the daemon publishes for its chat.
+    let ServerResponse::ChatListed { sessions } =
+        process(&host, 1, ClientRequest::ChatList).unwrap()
+    else {
+        panic!("the daemon did not list its chats");
+    };
+    let card = sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .unwrap();
+    assert_eq!(card.launch.session_id, conversation);
+    assert_eq!(card.proof.as_ref(), Some(&proof));
+    process(
+        &host,
+        1,
+        ClientRequest::ChatAttach {
+            session: card.clone(),
+        },
+    )
+    .unwrap();
+
+    // The provider dies mid-turn; its helper and the daemon keep running.
+    fs::remove_file(root.join("provider-done")).unwrap();
+    fs::write(root.join("stop-on-prompt"), "").unwrap();
+    prompt(&handle, "A turn the provider dies during");
+    wait_until(
+        || handle.is_completed() && handle.attachment_snapshot().exited,
+        "the provider's death never reached the card",
+    );
+    assert!(!root.join("stop-on-prompt").exists());
+    assert!(
+        identity.record.holder.is_current(),
+        "the helper outlives its provider"
+    );
+    // Attaching again, all Reconnect used to do, only brings it back stopped.
+    let ServerResponse::ChatAttached { snapshot, .. } = process(
+        &host,
+        1,
+        ClientRequest::ChatAttach {
+            session: card.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("the stopped chat did not attach");
+    };
+    assert!(snapshot.exited);
+    assert_eq!(lines("launches"), ["new"]);
+
+    // Resume retires the stopped actor and prepares one successor on the
+    // same conversation, without starting anything itself.
+    let ServerResponse::ChatResumePrepared { session: successor } = process_inner(
+        &host,
+        2,
+        ClientRequest::ChatPrepareResume {
+            source: card.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("a stopped card must prepare its resume");
+    };
+    assert!(chat::is_retained_resume_successor(&card, &successor));
+    assert_eq!(successor.launch.session_id, conversation);
+    assert!(
+        !host.lock().unwrap().chats.contains_key(&id),
+        "the stopped actor is retired before its successor starts"
+    );
+    wait_until(
+        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
+        "the stopped actor never exited",
+    );
+    // A second press before the first start lands may prepare again, but
+    // can never start a second provider beside the first.
+    let again = process_inner(
+        &host,
+        3,
+        ClientRequest::ChatPrepareResume {
+            source: card.clone(),
+        },
+    );
+    let ServerResponse::ChatAttached {
+        session: started,
+        snapshot,
+    } = process(
+        &host,
+        2,
+        ClientRequest::ChatStart {
+            session: successor.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("the prepared successor did not start");
+    };
+    assert!(chat::is_retained_resume_commit(&card, &started));
+    let resumed = host.lock().unwrap().chats[&started.id].handle.clone();
+    let _resumed_cleanup = Cleanup(resumed.actor_identity().unwrap().record);
+    if let Ok(ServerResponse::ChatResumePrepared { session: second }) = again {
+        assert!(
+            process(
+                &host,
+                3,
+                ClientRequest::ChatStart {
+                    session: second,
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                },
+            )
+            .is_err(),
+            "a second successor must not start beside the first"
+        );
+    }
+    assert!(
+        process_inner(
+            &host,
+            4,
+            ClientRequest::ChatPrepareResume {
+                source: card.clone(),
+            },
+        )
+        .is_err(),
+        "a running successor is never prepared again"
+    );
+    assert_eq!(host.lock().unwrap().chats.len(), 1);
+    wait_until(
+        || resumed.attachment_snapshot().ready,
+        "the successor never initialized",
+    );
+    assert!(snapshot.session_id.is_none() || snapshot.session_id == conversation);
+    assert_eq!(
+        lines("launches"),
+        ["new".to_owned(), conversation.clone().unwrap()],
+        "exactly one provider resumed the exact conversation"
+    );
+    assert_eq!(
+        lines("prompts").len(),
+        2,
+        "nothing the stopped actor held is sent again"
+    );
+    // The conversation continues in the successor.
+    prompt(&resumed, "A follow-up after resuming");
+    wait_until(
+        || root.join("provider-done").exists() && resumed.confirmed_session_id() == conversation,
+        "the resumed conversation never answered",
+    );
+    assert_eq!(lines("prompts").len(), 3);
+    process(
+        &host,
+        2,
+        ClientRequest::ChatClose {
+            chat_id: started.id,
+        },
+    )
+    .unwrap();
 }

@@ -817,6 +817,40 @@ pub(in crate::host) fn finish_interrupted_exit_of(
     }
 }
 
+/// Ends the exact hosted actor of `source` whose provider exited while this
+/// daemon kept running, as a stop rather than a close: its agent keeps its
+/// pane and channel and its final attention stays, as after a daemon stop.
+/// The verified retirement this leaves is what lets a resume prepare a
+/// successor on the same conversation; nothing the actor held is resubmitted.
+///
+/// Returns false, changing nothing, unless `source` names this daemon's
+/// attachment, its actor is retained, its provider has exited and it holds no
+/// work. A provider that is still running is never ended here.
+pub(in crate::host) fn finish_exited_attachment(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<bool, String> {
+    let target = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(record) = state.chats.get(&source.id) else {
+            return Ok(false);
+        };
+        if source.launch.provider != Provider::Claude
+            || source.proof.as_ref() != Some(state.proof())
+            || record.handle.actor_identity().is_none()
+            || !record.handle.is_completed()
+            || record.handle.owns_work()
+            || record.handle.is_close_only()
+            || record.returning_terminal
+        {
+            return Ok(false);
+        }
+        super::CloseTarget::from_record(record)
+    };
+    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)?;
+    Ok(true)
+}
+
 /// Whether `issued`'s paired CLI view has no worker here and its original
 /// holder left an exact close receipt, so cleanup may proceed without it.
 fn paired_view_proved_closed(
