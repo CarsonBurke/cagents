@@ -254,6 +254,12 @@ fn retained_upgrade_tail(fail_final_save: bool) {
             crate::agent_execution::HostedSession::Chat(source),
         )
         .unwrap();
+    // A run's prompt is refused until the provider is ready, so wait as
+    // agent execution does; on a loaded host Claude's initialize reply can
+    // still be outstanding here.
+    super::super::agent_execution::await_provider_ready(&handle)
+        .map_err(|(_, error)| error)
+        .unwrap();
     handle
         .command_for_run(
             accepted.run.id,
@@ -724,6 +730,12 @@ fn retained_turn_final_action(action: &str) {
             None,
             crate::agent_execution::HostedSession::Chat(hosted_source.clone()),
         )
+        .unwrap();
+    // A run's prompt is refused until the provider is ready, so wait as
+    // agent execution does; on a loaded host Claude's initialize reply can
+    // still be outstanding here.
+    super::super::agent_execution::await_provider_ready(&handle)
+        .map_err(|(_, error)| error)
         .unwrap();
     handle
         .command_for_run(
@@ -2382,6 +2394,10 @@ fn sigkill_host_fixture(semantic_held: bool) {
                 None,
                 crate::agent_execution::HostedSession::Chat(source),
             )
+            .unwrap();
+        // As agent execution does, wait for Claude's initialize reply first.
+        super::super::agent_execution::await_provider_ready(&handle)
+            .map_err(|(_, error)| error)
             .unwrap();
         handle
             .command_for_run(
