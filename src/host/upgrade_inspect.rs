@@ -503,21 +503,22 @@ impl ExecutionEvidence {
         let Ok(native_holders) = &self.native_holders else {
             return SavedExecution::Unproved;
         };
-        let holder = match holder_registry::recovery_candidate(
-            &holder_registry::socket(native_holders, source.id),
-            Kind::Native,
-        ) {
+        let control = holder_registry::socket(native_holders, source.id);
+        // Discovery refuses a record of another boot.
+        let holder = match holder_registry::recovery_candidate(&control, Kind::Native) {
             Ok(holder) => holder,
             Err(_) => return SavedExecution::Unproved,
         };
-        if let Some(holder) = holder.filter(|holder| holder.boot == self.boot) {
+        if let Some(holder) = holder {
             match crate::chat::runtime::retained_actor_abandoned(&holder.holder, &holder.root) {
                 Ok(true) => {}
                 Ok(false) => return SavedExecution::Running,
                 Err(_) => return SavedExecution::Unproved,
             }
         }
-        match codex_listener_survives(&self.processes, source.id, &listener.socket) {
+        // A holder binds its control socket before it starts the server and
+        // publishes its record, so a starting holder is seen by that socket.
+        match codex_listener_survives(&self.processes, source.id, &[&listener.socket, &control]) {
             Ok(true) => SavedExecution::Running,
             Ok(false) => SavedExecution::Ended,
             Err(_) => SavedExecution::Unproved,
@@ -526,16 +527,18 @@ impl ExecutionEvidence {
 }
 
 /// Whether any process of this user names a Codex pane's listener directory
-/// in its arguments, or a socket is still bound at its listener path. A
+/// in its arguments, or a socket is still bound at one of `sockets`. A
 /// process between `execve` and publishing its new arguments briefly shows
-/// none; it is read again for a bounded moment, and one that still shows no
-/// arguments, other than a zombie, is not evidence of absence.
+/// none; it is read again for a bounded moment. One that still shows none is
+/// evidence of absence only when it is a zombie, or an exiting single-thread
+/// process (a PID-namespace init waiting in `do_exit`, or one blocked closing
+/// files after releasing its memory), which can no longer write anything.
 fn codex_listener_survives(
     processes: &Path,
     pane: crate::model::TerminalId,
-    socket: &Path,
+    sockets: &[&Path],
 ) -> Result<bool, String> {
-    codex_listener_survives_with(processes, pane, socket, EXEC_SETTLE)
+    codex_listener_survives_with(processes, pane, sockets, EXEC_SETTLE)
 }
 
 /// How long one process may take to publish its arguments after `execve`.
@@ -544,7 +547,7 @@ const EXEC_SETTLE: Duration = Duration::from_millis(100);
 fn codex_listener_survives_with(
     processes: &Path,
     pane: crate::model::TerminalId,
-    socket: &Path,
+    sockets: &[&Path],
     settle: Duration,
 ) -> Result<bool, String> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
@@ -571,11 +574,19 @@ fn codex_listener_survives_with(
                 Err(error) if unavailable(&error) => return Ok(None),
                 Err(error) => return Err(format!("Cannot inspect a process: {error}")),
             };
-            let state = stat
-                .iter()
-                .rposition(|byte| *byte == b')')
-                .and_then(|close| stat.get(close + 2));
-            if matches!(state, Some(b'Z' | b'X')) {
+            // Fields after the command name begin at state (3): flags is
+            // field 9 and the thread count field 20.
+            let stat = String::from_utf8_lossy(&stat);
+            let fields = stat
+                .rsplit_once(')')
+                .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let exiting = fields.get(17) == Some(&"1")
+                && fields
+                    .get(6)
+                    .and_then(|flags| flags.parse::<u64>().ok())
+                    .is_some_and(|flags| flags & 0x4 != 0);
+            if matches!(fields.first(), Some(&"Z" | &"X")) || exiting {
                 return Ok(None);
             }
             if Instant::now() >= deadline {
@@ -608,13 +619,17 @@ fn codex_listener_survives_with(
             return Ok(true);
         }
     }
-    let sockets = std::fs::read(processes.join("net/unix"))
+    let bound = std::fs::read(processes.join("net/unix"))
         .map_err(|error| format!("Cannot inspect bound sockets: {error}"))?;
-    let socket = socket.as_os_str().as_bytes();
-    Ok(sockets
-        .split(|byte| *byte == b'\n')
-        .skip(1)
-        .any(|line| line.split(|byte| *byte == b' ').next_back() == Some(socket)))
+    // The path is the last field, after the fixed-width columns.
+    Ok(bound.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        sockets.iter().any(|socket| {
+            let socket = socket.as_os_str().as_bytes();
+            line.len() > socket.len()
+                && line.ends_with(socket)
+                && line[line.len() - socket.len() - 1] == b' '
+        })
+    }))
 }
 
 /// The census owners whose retirement the store records, read like the census.
@@ -1233,7 +1248,10 @@ mod tests {
     /// inspects must not turn an ended Codex pane into an unproved one.
     #[test]
     fn processes_starting_during_inspection_do_not_unprove_an_ended_codex_pane() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let [card, _] = codex_cards(root.path());
@@ -1366,6 +1384,43 @@ mod tests {
         assert_eq!(table.classify(&card), SavedExecution::Ended);
         std::fs::write(process.join("stat"), b"4242 (codex) R 1 4242 4242").unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        // An exiting single-thread process (PF_EXITING) can write nothing,
+        // like a PID-namespace init waiting in do_exit; one with live threads
+        // still can.
+        let stat = |flags: u64, threads: u32| {
+            format!("4242 (a) b) D 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 1")
+        };
+        std::fs::write(process.join("stat"), stat(0x4, 1)).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        std::fs::write(process.join("stat"), stat(0x4, 2)).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        std::fs::write(process.join("stat"), stat(0, 1)).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        std::fs::remove_dir_all(&process).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        // A socket bound at the listener, or at a starting holder's control
+        // endpoint, is live work; a different path that ends alike is not.
+        let listener = card.owned_codex_listener.clone().unwrap().socket;
+        let control = crate::daemon::holder_registry::socket(holders.path(), card.id);
+        for (path, expected) in [
+            (listener.clone(), SavedExecution::Running),
+            (control, SavedExecution::Running),
+            (
+                format!("/elsewhere{}", listener.display()).into(),
+                SavedExecution::Ended,
+            ),
+        ] {
+            std::fs::write(
+                processes.path().join("net/unix"),
+                format!(
+                    "Num       RefCount Protocol Flags    Type St Inode Path\n\
+                     0000000000000000: 00000002 00000000 00010000 0001 01 4242 {}\n",
+                    std::path::Path::new(&path).display()
+                ),
+            )
+            .unwrap();
+            assert_eq!(table.classify(&card), expected, "{}", path.display());
+        }
         // Discovery evidence that cannot be authenticated is never absence.
         std::fs::write(
             crate::daemon::holder_registry::socket(holders.path(), card.id).with_extension("json"),
