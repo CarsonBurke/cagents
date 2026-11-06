@@ -850,9 +850,9 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
-    /// A lock this test's child inherited stays held by any sibling test's fork
-    /// made while the descriptor was inheritable, until that fork's exec. That is
-    /// inferred: the test passed alone before this wait.
+    /// A plain `File` holding a lock releases it only when every copy closes, and
+    /// a sibling test's fork holds a copy until its exec. That is inferred: the test
+    /// passed alone before this wait.
     fn acquire_once_released(runtime: &Path, directory: &Path, exclusive: bool) -> Protection {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
         loop {
@@ -864,7 +864,7 @@ mod tests {
                 {
                     std::thread::sleep(std::time::Duration::from_millis(10))
                 }
-                Err(error) => panic!("{} stayed protected: {error}", directory.display()),
+                Err(error) => panic!("could not protect {}: {error}", directory.display()),
             }
         }
     }
