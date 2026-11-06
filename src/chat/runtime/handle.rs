@@ -37,6 +37,11 @@ impl Handle {
             responder.settle_input_fixture(outcome)
         })
     }
+    /// A retained attachment whose proxy already recorded a terminal failure.
+    #[cfg(test)]
+    pub(crate) fn fixture_failed_remote() -> Self {
+        Self(Owner::Remote(RemoteActor::completed_failure_fixture()))
+    }
     /// Same retained actor identity, distinct proxy attachment allocations.
     /// Neither fixture has a live helper or permits real provider operations.
     #[cfg(test)]
@@ -160,6 +165,12 @@ impl Handle {
         proof: &crate::model::HostSessionProof,
     ) -> Result<super::RetirementInspection, String> {
         RemoteActor::inspect_retained_retirement(record, proof)
+    }
+    pub(crate) fn inspect_abandoned_actor(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<bool, String> {
+        RemoteActor::inspect_abandoned(record, proof)
     }
     pub(crate) fn retired_actor_receipt(
         record: &crate::daemon::holder_registry::Record,
@@ -536,6 +547,12 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.session_id(),
             Owner::Remote(remote) => remote.state().session_id.clone(),
+        }
+    }
+    pub(crate) fn is_ready(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.is_ready(),
+            Owner::Remote(remote) => remote.state().ready,
         }
     }
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {

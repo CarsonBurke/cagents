@@ -145,6 +145,7 @@ fn pending_uninstalled_adoption_publishes_one_retained_authority_tuple() {
             source: source.clone(),
             requested: source.clone(),
             context: context.clone(),
+            failed_close: None,
         },
     );
     // Keep the actual pending owner/control socket alive while replacing the

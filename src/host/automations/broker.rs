@@ -947,14 +947,13 @@ impl AttentionTransfer {
         self.retry_at = None;
         match self.pump_ready(registry, notifications) {
             Ok(AttentionProgress::Retry) => Ok(Some(self.defer_retry())),
-            Ok(progress) => {
+            Ok(AttentionProgress::Idle) => {
                 self.retry_delay = Duration::ZERO;
-                Ok(match progress {
-                    AttentionProgress::Idle => None,
-                    AttentionProgress::Waiting => Some(Duration::from_millis(250)),
-                    AttentionProgress::Retry => unreachable!(),
-                })
+                Ok(None)
             }
+            // Queue admission and pending receipts do not prove recovery.
+            // Preserve prior failures until the durable handoff is idle.
+            Ok(AttentionProgress::Waiting) => Ok(Some(Duration::from_millis(250))),
             Err(error) => {
                 self.defer_retry();
                 Err(error)
@@ -1029,6 +1028,12 @@ impl AttentionTransfer {
             return Ok(AttentionProgress::Waiting);
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        // Nothing owed: a read settles an idle tick without waiting on another
+        // connection's write lock while this registry mutex is held. A row
+        // committed just after this read is the same as one after the transaction.
+        if self.in_flight.is_empty() && !registry.has_pending_automation_attention()? {
+            return Ok(AttentionProgress::Idle);
+        }
         // A short Immediate source transaction also excludes writers using a
         // separate execution connection. A stale loaded edge must not enqueue
         // after its committed replacement. Handle admission is only a bounded

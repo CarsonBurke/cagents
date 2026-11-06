@@ -47,6 +47,18 @@ const MAX_ACTIVATION_LINE_BYTES: usize = 4096;
 const PRIVATE_FILE_MODE: u32 = 0o600;
 const LEASE_CAPABLE_PROCESS_NAME: &str = "cagents-ui-v2";
 const LEGACY_PROCESS_NAME: &str = "cagents-ui";
+/// The modes `cagents-ui` spawns itself with, each its first argument. None of
+/// them takes the window lease or opens the session store.
+pub const CONFIRM_DAEMON_STOP_MODE: &str = "--confirm-daemon-stop";
+pub const STARTUP_ERROR_MODE: &str = "--startup-error";
+pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
+pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
+const HELPER_MODES: [&str; 4] = [
+    CONFIRM_DAEMON_STOP_MODE,
+    STARTUP_ERROR_MODE,
+    STARTUP_UPDATE_MODE,
+    RENDER_PAGE_MODE,
+];
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
 // `full` names the product that ships the embedded browser: it claims that
 // package's application id, window class, and peer directory. A UI built with
@@ -188,6 +200,81 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
     Ok(OwnedLock(lock))
 }
 
+/// Expected contention with the installation coordinator, distinct from a
+/// filesystem failure or a window that is already open.
+#[derive(Debug, Error)]
+#[error("an update is in progress")]
+pub struct UpdateInProgress;
+
+pub fn is_update_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(error) = current {
+        if error.is::<UpdateInProgress>()
+            || error.downcast_ref::<io::Error>().is_some_and(|error| {
+                error
+                    .get_ref()
+                    .is_some_and(|inner| inner.is::<UpdateInProgress>())
+            })
+        {
+            return true;
+        }
+        current = error.source();
+    }
+    false
+}
+
+fn update_lock_error(error: io::Error) -> io::Error {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        io::Error::new(error.kind(), UpdateInProgress)
+    } else {
+        error
+    }
+}
+
+/// Observe an existing private lock without creating, repairing, or retaining
+/// it. This is a point-in-time status observation, never launch admission.
+#[cfg(feature = "ui")]
+pub(crate) fn private_lock_is_held(path: &Path) -> io::Result<bool> {
+    let named = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    let safe = |metadata: &fs::Metadata| {
+        metadata.is_file()
+            && metadata.uid() == current_uid()
+            && metadata.mode() & 0o077 == 0
+            && metadata.nlink() == 1
+    };
+    if !safe(&named) {
+        return Err(io::Error::other("update ownership is unavailable"));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let opened = file.metadata()?;
+    let same = |a: &fs::Metadata, b: &fs::Metadata| a.dev() == b.dev() && a.ino() == b.ino();
+    if !safe(&opened) || !same(&named, &opened) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    let held = match owned_file_lock(file, libc::LOCK_SH | libc::LOCK_NB) {
+        Ok(_probe) => false,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => true,
+        Err(error) => return Err(error),
+    };
+    let current = fs::symlink_metadata(path)?;
+    if !safe(&current) || !same(&opened, &current) {
+        return Err(io::Error::other("update ownership changed"));
+    }
+    Ok(held)
+}
+
+#[cfg(feature = "ui")]
+pub(crate) fn update_fence_held() -> io::Result<bool> {
+    private_lock_is_held(&runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")))
+}
+
 /// A slot owns its full workspace snapshot; terminal identifiers still refer to
 /// the one shared daemon. The old global lock remains held shared, so older
 /// exclusive-lease binaries cannot open any of these stores concurrently.
@@ -224,9 +311,7 @@ impl WindowLease {
             &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
             libc::LOCK_SH | libc::LOCK_NB,
         )
-        .map_err(|error| {
-            io::Error::new(error.kind(), format!("an update is in progress: {error}"))
-        })?;
+        .map_err(update_lock_error)?;
         if !IS_DEVELOPMENT && peer_ui_predates_lease(Path::new(PEER_PACKAGE_DIRECTORY)) {
             return Err(io::Error::other(
                 "installed peer UI predates the shared-session lease; upgrade that package first",
@@ -415,20 +500,48 @@ pub fn window_database_path(slot: &str) -> io::Result<PathBuf> {
 }
 
 pub fn window_database_paths() -> io::Result<Vec<PathBuf>> {
-    let primary = window_database_path(PRIMARY_WINDOW)?;
+    window_database_paths_at(window_database_path(PRIMARY_WINDOW)?)
+}
+
+fn window_database_paths_at(primary: PathBuf) -> io::Result<Vec<PathBuf>> {
+    // Old inactive snapshots are retained for ordinary reopening/migration.
+    // Bound enumeration before allocating paths or opening SQLite stores.
+    const MAX_STORES: usize = 1024;
+    const MAX_ENTRIES: usize = 8192;
     let mut paths = vec![primary.clone()];
     let windows = primary.parent().unwrap().join("windows");
     match fs::read_dir(windows) {
         Ok(entries) => {
-            for entry in entries {
+            for (index, entry) in entries.enumerate() {
+                if index >= MAX_ENTRIES {
+                    return Err(io::Error::other(
+                        "Saved window enumeration exceeds its bounded entry limit",
+                    ));
+                }
                 let entry = entry?;
                 if entry.file_type()?.is_dir()
                     && let Some(slot) = entry.file_name().to_str()
                     && validate_window_slot(slot).is_ok()
                 {
                     let path = entry.path().join("sessions.sqlite3");
-                    if path.is_file() {
-                        paths.push(path);
+                    match fs::symlink_metadata(&path) {
+                        Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                            if paths.len() >= MAX_STORES {
+                                return Err(io::Error::other(
+                                    "Saved window inventory exceeds its bounded store limit",
+                                ));
+                            }
+                            // Include symlinks so the NOFOLLOW reader reports
+                            // a refusal instead of silently omitting a store.
+                            paths.push(path);
+                        }
+                        Ok(_) => {
+                            return Err(io::Error::other(
+                                "Saved window store is not a regular database file",
+                            ));
+                        }
+                        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                        Err(error) => return Err(error),
                     }
                 }
             }
@@ -470,7 +583,7 @@ pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
         &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
         libc::LOCK_SH | libc::LOCK_NB,
     )
-    .map_err(|error| io::Error::new(error.kind(), format!("an update is in progress: {error}")))
+    .map_err(update_lock_error)
 }
 
 static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
@@ -1852,7 +1965,13 @@ fn parse_activation_request(line: &str) -> io::Result<ActivationRequest> {
     }
 }
 
-fn mark_lease_capable_process() -> io::Result<()> {
+/// Names this process so a starting window does not mistake it for a UI that
+/// predates the session-store lease.
+///
+/// Every mode of the current UI executable takes it, not only a window that
+/// holds the lease: the legacy scan matches any process still named
+/// `cagents-ui` that is not running a helper mode.
+pub fn mark_lease_capable_process() -> io::Result<()> {
     fs::write("/proc/self/comm", LEASE_CAPABLE_PROCESS_NAME)
 }
 fn peer_ui_predates_lease(peer_directory: &Path) -> bool {
@@ -1886,7 +2005,7 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
         if name.trim_end() == LEGACY_PROCESS_NAME {
             let stat = match fs::read_to_string(entry.path().join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if process_exited(&error) => continue,
                 Err(error) => return Err(error),
             };
             let fields = stat
@@ -1910,10 +2029,34 @@ fn legacy_ui_process_running(proc_root: &Path) -> io::Result<bool> {
             if matches!(state, "Z" | "X") && fields.get(17) == Some(&"1") {
                 continue;
             }
-            return Ok(true);
+            // Every helper mode postdates the lease, so one still carrying the
+            // old name is a lease-aware build's helper. A launcher started
+            // before an update can open the progress window from a build that
+            // does not rename its helpers; refusing on it would block the
+            // update's own windows.
+            match runs_helper_mode(&entry.path()) {
+                Ok(true) => continue,
+                Err(error) if process_exited(&error) => continue,
+                Ok(false) | Err(_) => return Ok(true),
+            }
         }
     }
     Ok(false)
+}
+
+/// A process that ended after its name was read: opening one of its `/proc`
+/// entries then fails with ENOENT, and reading one already open with ESRCH.
+fn process_exited(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Unreadable arguments are not evidence of a helper, so they keep the refusal.
+fn runs_helper_mode(process: &Path) -> io::Result<bool> {
+    let arguments = fs::read(process.join("cmdline"))?;
+    Ok(arguments
+        .split(|byte| *byte == 0)
+        .nth(1)
+        .is_some_and(|mode| HELPER_MODES.iter().any(|helper| helper.as_bytes() == mode)))
 }
 
 fn current_uid() -> u32 {
@@ -1957,8 +2100,62 @@ pub const RUNTIME_SUBDIRECTORY: &str = if IS_DEVELOPMENT {
     "cagents"
 };
 
+/// Selects one of several side-by-side development instances, each with its
+/// own storage and daemon. `scripts/run-development --instance` sets it; a
+/// production build ignores it.
+pub const DEVELOPMENT_INSTANCE_ENV: &str = "CAGENTS_DEVELOPMENT_INSTANCE";
+const DEVELOPMENT_INSTANCE_MAX: usize = 24;
+
+fn development_instance_name(value: Option<&std::ffi::OsStr>) -> Result<Option<String>, String> {
+    let Some(value) = value.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Some(name)
+            if name.len() <= DEVELOPMENT_INSTANCE_MAX
+                && name.starts_with(|c: char| c.is_ascii_alphanumeric())
+                && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') =>
+        {
+            Ok(Some(name.to_owned()))
+        }
+        _ => Err(format!(
+            "{DEVELOPMENT_INSTANCE_ENV} must be 1-{DEVELOPMENT_INSTANCE_MAX} ASCII letters, \
+             digits or hyphens, starting with a letter or digit"
+        )),
+    }
+}
+
+/// The directory name under the data, config, state and runtime roots that
+/// holds this instance's files: `STORAGE_NAME` / `RUNTIME_SUBDIRECTORY`, with a
+/// development instance's name appended. An invalid name stops the process
+/// rather than falling back to the shared development state.
+fn namespace() -> &'static str {
+    static NAMESPACE: OnceLock<String> = OnceLock::new();
+    NAMESPACE.get_or_init(|| {
+        if !IS_DEVELOPMENT {
+            return STORAGE_NAME.to_owned();
+        }
+        match development_instance_name(env::var_os(DEVELOPMENT_INSTANCE_ENV).as_deref()) {
+            Ok(Some(name)) => format!("{STORAGE_NAME}-{name}"),
+            Ok(None) => STORAGE_NAME.to_owned(),
+            Err(message) => panic!("{message}"),
+        }
+    })
+}
+
+/// Names this instance's data, configuration and state directories.
+pub fn storage_name() -> &'static str {
+    namespace()
+}
+
+/// Names this instance's directory under `XDG_RUNTIME_DIR`, which holds the
+/// daemon socket and its lock.
+pub fn runtime_subdirectory() -> &'static str {
+    namespace()
+}
+
 pub fn project_dirs() -> Option<ProjectDirs> {
-    ProjectDirs::from("dev", "cagents", STORAGE_NAME)
+    ProjectDirs::from("dev", "cagents", storage_name())
 }
 
 /// This instance's settings file, which the UI owns and the CLI only reads.
@@ -1971,6 +2168,33 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn development_instance_names_are_short_path_safe_words() {
+        use std::ffi::OsStr;
+        assert_eq!(development_instance_name(None), Ok(None));
+        assert_eq!(development_instance_name(Some(OsStr::new(""))), Ok(None));
+        for name in ["pr2064", "a", "Steward-3", "x23456789012345678901234"] {
+            assert_eq!(
+                development_instance_name(Some(OsStr::new(name))),
+                Ok(Some(name.to_owned()))
+            );
+        }
+        for name in [
+            "-leading",
+            "has space",
+            "../escape",
+            "dot.name",
+            "under_score",
+            "x234567890123456789012345",
+            "é",
+        ] {
+            assert!(
+                development_instance_name(Some(OsStr::new(name))).is_err(),
+                "{name}"
+            );
+        }
+    }
 
     use super::*;
 
@@ -2300,6 +2524,33 @@ mod tests {
     }
 
     #[test]
+    fn saved_window_enumeration_retains_inactive_stores_and_refuses_excess() {
+        let root = tempdir().unwrap();
+        let primary = root.path().join("sessions.sqlite3");
+        let old = root.path().join("windows/september-copy/sessions.sqlite3");
+        fs::create_dir_all(old.parent().unwrap()).unwrap();
+        fs::write(&old, "original legacy store bytes").unwrap();
+        let mut expected = vec![primary.clone(), old.clone()];
+        expected.sort();
+        assert_eq!(window_database_paths_at(primary.clone()).unwrap(), expected);
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+        for index in 0..1023 {
+            let path = root
+                .path()
+                .join(format!("windows/old-{index}/sessions.sqlite3"));
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, []).unwrap();
+        }
+        assert!(
+            window_database_paths_at(primary)
+                .unwrap_err()
+                .to_string()
+                .contains("bounded store limit")
+        );
+        assert_eq!(fs::read(&old).unwrap(), b"original legacy store bytes");
+    }
+
+    #[test]
     fn window_leases_allow_multiple_slots_and_reuse_only_closed_slots() {
         let runtime = tempdir().unwrap();
         let (primary, name) = WindowLease::acquire_in(runtime.path(), false, None).unwrap();
@@ -2521,6 +2772,11 @@ mod tests {
         assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
 
         fs::write(legacy.join("comm"), "cagents-ui\n").unwrap();
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0primary\0",
+        )
+        .unwrap();
         let mut fields = ["0"; 18];
         fields[0] = "S";
         fields[1] = "1";
@@ -2538,6 +2794,34 @@ mod tests {
         fields[17] = "2";
         fs::write(legacy.join("stat"), stat(&fields)).unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        for mode in HELPER_MODES {
+            fs::write(
+                legacy.join("cmdline"),
+                format!("/old/cagents-ui\0{mode}\0payload\0"),
+            )
+            .unwrap();
+            assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
+        }
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0primary\0",
+        )
+        .unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        // A helper flag is only a mode in first position.
+        fs::write(
+            legacy.join("cmdline"),
+            "/old/cagents-ui\0--window\0--startup-update\0",
+        )
+        .unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        // Arguments that cannot be read are not evidence of a helper.
+        fs::remove_file(legacy.join("cmdline")).unwrap();
+        fs::create_dir(legacy.join("cmdline")).unwrap();
+        assert!(legacy_ui_process_running(proc_root.path()).unwrap());
+        fs::remove_dir(legacy.join("cmdline")).unwrap();
+        // A process that exited after its name was read is gone.
+        assert!(!legacy_ui_process_running(proc_root.path()).unwrap());
         fs::write(legacy.join("stat"), "malformed").unwrap();
         assert!(legacy_ui_process_running(proc_root.path()).is_err());
         fs::remove_file(legacy.join("stat")).unwrap();
@@ -2893,6 +3177,75 @@ mod tests {
                 "cagents-ui.lock",
                 "cagents-ui.activate",
             )
+        );
+    }
+}
+
+#[cfg(all(test, feature = "ui"))]
+mod startup_update_tests {
+    use super::*;
+    #[test]
+    fn held_update_fence_is_typed_and_readonly_probe_preserves_original_ownership() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = runtime
+            .path()
+            .join(format!("{APPLICATION_LOCK_FILE}.update"));
+        let held = owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let original = fs::metadata(&path).unwrap();
+        let Err(error) = WindowLease::acquire_in(runtime.path(), false, None) else {
+            panic!("original update fence must block startup")
+        };
+        assert!(is_update_in_progress(&error));
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(error.to_string(), "an update is in progress");
+        assert!(private_lock_is_held(&path).unwrap());
+        assert!(owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().ino(), original.ino());
+        assert_eq!(fs::metadata(&path).unwrap().mode(), original.mode());
+        drop(held);
+        assert!(!private_lock_is_held(&path).unwrap());
+        let missing = runtime.path().join("absent");
+        assert!(!private_lock_is_held(&missing).unwrap());
+        assert!(!missing.exists());
+        assert!(!is_update_in_progress(&io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "not an update"
+        )));
+        assert!(!is_update_in_progress(&update_lock_error(
+            io::Error::from_raw_os_error(libc::EACCES)
+        )));
+        assert!(!is_update_in_progress(&io::Error::from_raw_os_error(
+            libc::EAGAIN
+        )));
+    }
+    #[test]
+    fn existing_window_activation_still_uses_the_original_private_protocol_during_an_update() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let _held = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let (sender, receiver) = async_channel::unbounded();
+        let _listener = UiActivationListener::bind_in(runtime.path(), sender).unwrap();
+        assert!(activate_window_at_with_token(runtime.path(), PRIMARY_WINDOW, None).unwrap());
+        let activation = receiver.recv_blocking().unwrap();
+        assert!(
+            activation.update.is_none()
+                && activation.session.is_none()
+                && activation.token.is_none()
+        );
+        assert!(
+            private_lock_is_held(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update"))
+            )
+            .unwrap()
         );
     }
 }

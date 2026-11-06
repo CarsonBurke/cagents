@@ -1,4 +1,6 @@
 mod account_lifecycle;
+#[cfg(test)]
+mod account_restore_tests;
 pub(crate) use account_lifecycle::Reservation as AccountReservation;
 mod activity;
 mod agent_execution;
@@ -287,6 +289,8 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let _agent_activity = activity::Monitor::start(&host)?;
     let listener = listener_before_restore(&paths, || {
         let restored = (|| -> io::Result<()> {
+            chat::retained_actor::reconcile_previous_boot_history(&host)
+                .map_err(io::Error::other)?;
             let unattached = state::restore_upgrade(&host).map_err(io::Error::other)?;
             state::restore_orphaned_holders(&host).map_err(io::Error::other)?;
             if let Some(detail) = host
@@ -350,6 +354,15 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         .unwrap_or_else(|p| p.into_inner())
         .startup_recovery()
         .is_some();
+    if !recovery_only {
+        let restore_host = Arc::downgrade(&host);
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-account-restore".into())
+            .spawn(move || account_lifecycle::restore_unregistered_homes(restore_host))
+        {
+            tracing::warn!(%error, "lost accounts will not be restored automatically");
+        }
+    }
     let mut automation_broker = if recovery_only {
         None
     } else {
@@ -700,8 +713,10 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     // Closing the provider leaves its retained helper alive
                     // until final outcomes are durably committed and ACKed.
                     // Preserve that ownership on failure, before retiring the
-                    // delegated session record below.
-                    chat::retained_actor::finish_close(host, &chat, &session)
+                    // delegated session record below. A paired CLI view closes
+                    // first, with the proof its resume requires.
+                    chat::retained_actor::close_paired_view(host, session.id)
+                        .and_then(|()| chat::retained_actor::finish_close(host, &chat, &session))
                 } else {
                     Ok(())
                 }
@@ -709,11 +724,12 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         };
         match closed {
             Ok(()) if !upgrading => {
-                // Ordinary shutdown proved this exact provider stopped. Retire
-                // its delegated record before a new daemon can resume the UI
-                // descriptor with another proof; absence alone cannot do this.
-                if let Err(error) = agent_execution::retired(host, &session) {
-                    tracing::warn!(%error, "delegated provider retirement was not saved");
+                // Ordinary shutdown proved this exact provider stopped. End its
+                // delegated authority and runs before a new daemon can resume
+                // the UI descriptor with another proof; absence alone cannot do
+                // this. The agent, pane and channel stay so it resumes in place.
+                if let Err(error) = agent_execution::stopped(host, &session) {
+                    tracing::warn!(%error, "delegated provider stop was not saved");
                     if result.is_ok() {
                         result = Err(error);
                     }

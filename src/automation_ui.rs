@@ -181,6 +181,10 @@ enum Pending {
 }
 
 impl Pending {
+    fn command(self) -> bool {
+        matches!(self, Self::Save | Self::Mutate | Self::OpenRun)
+    }
+
     fn background_read(self) -> bool {
         matches!(
             self,
@@ -739,6 +743,8 @@ pub struct State {
     all_history: bool,
     run: Option<RunDetail>,
     error: Option<String>,
+    /// A command failure belongs to the user's action, not to later reads.
+    error_is_command: bool,
     notice: Option<String>,
     targets: Vec<TargetChoice>,
     accounts: Vec<AccountChoice>,
@@ -870,7 +876,7 @@ impl State {
         self.run = None;
         self.lifecycle = None;
         self.all_history = false;
-        self.error = None;
+        self.clear_error();
         self.notice = None;
         self.lifecycle_notice = Some(LifecycleNotice {
             id,
@@ -890,13 +896,67 @@ impl State {
         self.accounts = accounts;
         self.models = models;
     }
+
+    fn clear_error(&mut self) {
+        self.error = None;
+        self.error_is_command = false;
+    }
+
+    fn set_error(&mut self, error: String, command: bool) {
+        if command || !self.error_is_command {
+            self.error = Some(error);
+            self.error_is_command = command;
+        }
+    }
+
+    fn acknowledges_error(&self, action: &Action) -> bool {
+        match action {
+            Action::Browse
+            | Action::Refresh
+            | Action::New
+            | Action::Select(_)
+            | Action::AllHistory
+            | Action::Run(_) => true,
+            Action::Edit | Action::Enable | Action::Pause | Action::RunNow | Action::Remove => {
+                self.selected.is_some()
+            }
+            Action::CloseRun | Action::CancelRun | Action::OpenSession => self.run.is_some(),
+            Action::CancelEdit
+            | Action::Save
+            | Action::Field(..)
+            | Action::Account(..)
+            | Action::Model(..)
+            | Action::Effort(..)
+            | Action::Reuse(..)
+            | Action::Precheck(..) => self.draft.is_some(),
+            Action::Provider(index) => self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| *index < PROVIDERS.len() && *index != draft.provider),
+            Action::Target(index) => self
+                .draft
+                .as_ref()
+                .is_some_and(|draft| *index < draft.targets.len()),
+            Action::Schedule(index) => self.draft.is_some() && *index < SCHEDULES.len(),
+            Action::Weekday(index) => self.draft.is_some() && *index < WEEKDAYS.len(),
+            Action::Prompt(action) | Action::Shell(action) => {
+                self.draft.is_some() && action.is_edit()
+            }
+            _ => false,
+        }
+    }
+
     fn request(&mut self, pending: Pending, request: Request) -> Option<Effect> {
         self.sequence = self.sequence.wrapping_add(1);
         if !pending.background_read() {
             self.history_refresh = None;
         }
         self.pending = Some((self.sequence, pending));
-        self.error = None;
+        // A successful poll (including its automatic history continuation)
+        // cannot acknowledge a rejected command on the user's behalf.
+        if !self.error_is_command {
+            self.error = None;
+        }
         if matches!(pending, Pending::History { .. }) {
             self.history_status = HistoryStatus::Loading;
         }
@@ -928,7 +988,7 @@ impl State {
         {
             self.list_status =
                 ListStatus::Failed("The automation list reply was inconsistent".into());
-            self.error = Some("The automation list reply was inconsistent".into());
+            self.set_error("The automation list reply was inconsistent".into(), false);
             return;
         }
         let last = rows.last().map(|row| row.id);
@@ -1066,7 +1126,7 @@ impl State {
             Ok(before) => before,
             Err(error) => {
                 self.history_status = HistoryStatus::Failed(error.into());
-                self.error = Some(error.into());
+                self.set_error(error.into(), false);
                 return None;
             }
         };
@@ -1140,7 +1200,7 @@ impl State {
         if !valid {
             let error = "The older run history reply was inconsistent".to_owned();
             self.history_status = HistoryStatus::Failed(error.clone());
-            self.error = Some(error);
+            self.set_error(error, false);
             return;
         }
         self.history_status = HistoryStatus::Loaded;
@@ -1200,25 +1260,6 @@ impl State {
             }
             return None;
         }
-        if matches!(
-            &action,
-            Action::Field(..)
-                | Action::Provider(..)
-                | Action::Model(..)
-                | Action::Effort(..)
-                | Action::Account(..)
-                | Action::Target(..)
-                | Action::Schedule(..)
-                | Action::Weekday(..)
-                | Action::Reuse(..)
-                | Action::Precheck(..)
-                | Action::Prompt(..)
-                | Action::PromptCursor(..)
-                | Action::Shell(..)
-                | Action::ShellCursor(..)
-        ) {
-            self.error = None;
-        }
         if let Action::Received { sequence, result } = action {
             let Some((expected, pending)) = self.pending else {
                 return None;
@@ -1240,7 +1281,7 @@ impl State {
                     _ => {
                         let error = "The newest run history reply was inconsistent".to_owned();
                         self.history_status = HistoryStatus::Failed(error.clone());
-                        self.error = Some(error);
+                        self.set_error(error, false);
                         return None;
                     }
                 }
@@ -1253,7 +1294,7 @@ impl State {
                             "The older run history reply was inconsistent".into()
                         });
                         self.history_status = HistoryStatus::Failed(error.clone());
-                        self.error = Some(error);
+                        self.set_error(error, false);
                     }
                 }
                 return None;
@@ -1266,7 +1307,7 @@ impl State {
                             .err()
                             .unwrap_or_else(|| "The automation list reply was inconsistent".into());
                         self.list_status = ListStatus::Failed(error.clone());
-                        self.error = Some(error);
+                        self.set_error(error, false);
                     }
                 }
                 return None;
@@ -1285,7 +1326,7 @@ impl State {
                     ) {
                         self.list_status = ListStatus::Failed(error.clone());
                     }
-                    self.error = Some(error);
+                    self.set_error(error, pending.command());
                 }
                 Ok(Response::Listed(rows)) => {
                     self.list_status = ListStatus::Loaded;
@@ -1465,7 +1506,10 @@ impl State {
                     )
                 }
                 Ok(Response::Proposal(_) | Response::Proposals(_)) => {
-                    self.error = Some("Unexpected automation approval response".into());
+                    self.set_error(
+                        "Unexpected automation approval response".into(),
+                        pending.command(),
+                    );
                 }
             }
             return None;
@@ -1474,6 +1518,7 @@ impl State {
             if !self.can_open_run() {
                 return None;
             }
+            self.clear_error();
             if self
                 .run
                 .as_ref()
@@ -1558,6 +1603,7 @@ impl State {
                 self.confirmation = Some(confirmation);
                 return None;
             }
+            self.clear_error();
             if let Request::RunNow {
                 id,
                 execution_revision,
@@ -1578,6 +1624,11 @@ impl State {
             self.discard_generation = self.discard_generation.wrapping_add(1);
             self.discard_draft = Some((self.discard_generation, action));
             return None;
+        }
+        // Reading more context or moving an editor cursor is not an
+        // acknowledgment. Navigation, a new command, or a form edit is.
+        if self.acknowledges_error(&action) {
+            self.clear_error();
         }
         self.confirmation = None;
         match action {
@@ -1683,7 +1734,7 @@ impl State {
                             };
                             return self.request(Pending::Save, request);
                         }
-                        Err(error) => self.error = Some(error),
+                        Err(error) => self.set_error(error, true),
                     }
                 }
             }
@@ -7173,6 +7224,232 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn refused_removal_survives_periodic_refresh_until_the_user_changes_subject() {
+        use crate::automations::FiringState;
+
+        let owner = automation();
+        let mut other = automation();
+        other.definition.name = "Another automation".into();
+        let mut firing = history_firing(100, FiringState::Succeeded);
+        firing.automation = owner.id;
+        let mut state = State {
+            rows: vec![owner.summary(Some(firing.state)), other.summary(None)],
+            selected: Some(owner.clone()),
+            list_status: ListStatus::Loaded,
+            history: vec![firing.clone()],
+            history_status: HistoryStatus::Loaded,
+            ..Default::default()
+        };
+        state.update(Action::Remove);
+        let generation = state.confirmation.as_ref().unwrap().generation;
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Remove { id, revision },
+        }) = state.update(Action::Confirm(generation))
+        else {
+            panic!("confirm removal of the displayed revision");
+        };
+        assert_eq!((id, revision), (owner.id, owner.revision));
+        let refusal = "The exact provider ownership is unavailable for reconciliation";
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err(refusal.into())),
+        });
+        for reply in [
+            Ok(Response::History(history_page(vec![firing.clone()], false))),
+            Err("Temporary history read failure".into()),
+            Ok(Response::Detail(run_of(&owner))),
+            Ok(Response::History(history_page(vec![firing.clone()], false))),
+        ] {
+            let Some(Effect::Request {
+                sequence,
+                request: Request::Show { id },
+            }) = state.update(Action::Tick)
+            else {
+                panic!("periodic refresh reads the selected automation");
+            };
+            assert_eq!(id, owner.id);
+            assert_eq!(state.error.as_deref(), Some(refusal));
+            let Some(Effect::Request {
+                sequence,
+                request: Request::History { id, .. },
+            }) = state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(Response::Automation(owner.clone()))),
+            })
+            else {
+                panic!("the refresh continues to the selected history");
+            };
+            assert_eq!(id, Some(owner.id));
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(reply),
+            });
+            assert_eq!(state.error.as_deref(), Some(refusal));
+        }
+        assert_eq!(state.history_status, HistoryStatus::Loaded);
+        // Context reads and callbacks with no live target cannot acknowledge
+        // the failed operation.
+        for action in [
+            Action::Search("automation".into()),
+            Action::ToggleAdvanced,
+            Action::Field(Field::Name, "Retained editor callback".into()),
+            Action::CancelEdit,
+            Action::CloseRun,
+            Action::CancelRun,
+            Action::OpenSession,
+            Action::Confirm(generation),
+        ] {
+            assert!(state.update(action).is_none());
+            assert_eq!(state.error.as_deref(), Some(refusal));
+        }
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Audit { id, .. },
+        }) = state.update(Action::Lifecycle)
+        else {
+            panic!("investigating recorded changes reads the same subject");
+        };
+        assert_eq!(id, owner.id);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Audit(crate::automations::LifecyclePage {
+                events: vec![],
+                next: None,
+                earlier_events_unavailable: false,
+            }))),
+        });
+        assert_eq!(state.error.as_deref(), Some(refusal));
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Show { id },
+        }) = state.update(Action::Select(other.id))
+        else {
+            panic!("the user selects another automation");
+        };
+        assert_eq!(id, other.id);
+        assert!(state.error.is_none());
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Automation(other.clone()))),
+        }) else {
+            panic!("read the new subject's history");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::History(history_page(vec![], false)))),
+        });
+        assert_eq!(state.selected.as_ref().unwrap().id, other.id);
+        assert!(state.error.is_none());
+    }
+
+    #[test]
+    fn transient_list_history_and_run_read_errors_recover_through_polling() {
+        for surface in ["list", "history", "run"] {
+            let owner = automation();
+            let detail = run_of(&owner);
+            let mut state = State {
+                rows: vec![owner.summary(None)],
+                selected: (surface != "list").then_some(owner.clone()),
+                run: (surface == "run").then_some(detail.clone()),
+                ..Default::default()
+            };
+            let action = match surface {
+                "list" => Action::Browse,
+                "history" => Action::History,
+                _ => Action::Refresh,
+            };
+            let Some(Effect::Request { sequence, .. }) = state.update(action) else {
+                panic!("the user requests a {surface} read");
+            };
+            state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Err("Temporary read failure".into())),
+            });
+            assert_eq!(state.error.as_deref(), Some("Temporary read failure"));
+            let Some(Effect::Request { sequence, request }) = state.update(Action::Tick) else {
+                panic!("polling retries {surface}");
+            };
+            let response = match request {
+                Request::List { .. } if surface == "list" => {
+                    Response::Listed(vec![owner.summary(None)])
+                }
+                Request::Show { id } if surface == "history" && id == owner.id => {
+                    Response::Automation(owner)
+                }
+                Request::ShowFiring { id } if surface == "run" && id == detail.firing.id => {
+                    Response::Detail(detail)
+                }
+                _ => panic!("poll the same {surface} subject"),
+            };
+            let followup = state.update(Action::Received {
+                sequence,
+                result: std::sync::Arc::new(Ok(response)),
+            });
+            if surface == "history" {
+                let Some(Effect::Request {
+                    sequence,
+                    request: Request::History { .. },
+                }) = followup
+                else {
+                    panic!("finish the history retry");
+                };
+                state.update(Action::Received {
+                    sequence,
+                    result: std::sync::Arc::new(Ok(Response::History(history_page(vec![], false)))),
+                });
+            }
+            assert!(state.error.is_none(), "{surface} read recovered");
+        }
+    }
+
+    #[test]
+    fn refused_cancellation_survives_run_polling_until_an_explicit_retry() {
+        let owner = automation();
+        let mut detail = run_of(&owner);
+        detail.firing.state = crate::automations::FiringState::Running;
+        let mut state = State {
+            selected: Some(owner),
+            run: Some(detail.clone()),
+            ..Default::default()
+        };
+        let Some(Effect::Request {
+            sequence,
+            request: Request::Cancel { firing, .. },
+        }) = state.update(Action::CancelRun)
+        else {
+            panic!("the user cancels the displayed run");
+        };
+        assert_eq!(firing, detail.firing.id);
+        let refusal = "The provider could not confirm cancellation";
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err(refusal.into())),
+        });
+        let Some(Effect::Request {
+            sequence,
+            request: Request::ShowFiring { id },
+        }) = state.update(Action::Tick)
+        else {
+            panic!("periodic refresh reads the run");
+        };
+        assert_eq!(id, detail.firing.id);
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Ok(Response::Detail(detail))),
+        });
+        assert_eq!(state.error.as_deref(), Some(refusal));
+        assert!(matches!(
+            state.update(Action::CancelRun),
+            Some(Effect::Request {
+                request: Request::Cancel { .. },
+                ..
+            })
+        ));
+        assert!(state.error.is_none());
     }
 
     #[test]

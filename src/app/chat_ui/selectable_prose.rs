@@ -13,7 +13,7 @@ use unicode_segmentation::UnicodeSegmentation;
 type ParagraphBuffer = <cosmic::Renderer as TextRenderer>::Paragraph;
 
 static NEXT_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-static ACTIVE_SELECTION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+application_atomic!(fn active_selection() -> AtomicU64);
 
 pub(super) struct State {
     pub(super) identity: u64,
@@ -669,7 +669,7 @@ impl Selectable {
                 if selected || found {
                     part.highlight = Some(iced::advanced::text::Highlight {
                         background: if selected {
-                            design::accent_color(&cosmic::theme::active())
+                            design::selection_wash(&cosmic::theme::active())
                         } else {
                             design::accent_wash(&cosmic::theme::active())
                         }
@@ -1061,7 +1061,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 paragraph,
                 &[selection],
                 translation,
-                design::accent_color(theme),
+                design::selection_wash(theme),
             );
         }
         // Decorations remain visible over opaque selection/Find backgrounds.
@@ -1155,7 +1155,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
             Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) => {
                 state.focused = position.is_some() && cursor.is_over(*viewport);
                 if state.focused {
-                    ACTIVE_SELECTION.store(state.identity, Ordering::Relaxed);
+                    active_selection().store(state.identity, Ordering::Relaxed);
                     state.anchor = self.hit(state, position.unwrap());
                     state.end = state.anchor;
                     state.dragging = true;
@@ -1195,7 +1195,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selectable {
                 modifiers,
                 ..
             }) if state.focused
-                && ACTIVE_SELECTION.load(Ordering::Relaxed) == state.identity
+                && active_selection().load(Ordering::Relaxed) == state.identity
                 && modifiers.command() =>
             {
                 if key.eq_ignore_ascii_case("c") && state.anchor != state.end {
@@ -1442,7 +1442,7 @@ mod tests {
                 let color = if find {
                     design::accent_wash(&cosmic::theme::active())
                 } else {
-                    design::accent_color(&cosmic::theme::active())
+                    design::selection_wash(&cosmic::theme::active())
                 }
                 .into_rgba8();
                 for part in 0..count {
@@ -1523,7 +1523,7 @@ mod tests {
         let selected = if find {
             design::accent_wash(&cosmic::theme::active())
         } else {
-            design::accent_color(&cosmic::theme::active())
+            design::selection_wash(&cosmic::theme::active())
         }
         .into_rgba8();
         for (byte, x, y) in probes {

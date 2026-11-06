@@ -97,6 +97,10 @@ while [ "$#" -gt 0 ]; do
     esac
 done
 
+if [ "${CAGENTS_AGENT_AUTHORITY+x}" = x ]; then
+    fail 'installation and removal require your own terminal; hosted sessions cannot change the installation. Cagents terminals are hosted sessions. A person must run this command from a system terminal outside cagents.'
+fi
+
 if [ "$STAGE_ONLY" -eq 1 ]; then
     [ "$RESTART_DAEMON" -eq 0 ] && [ "$UNINSTALL" -eq 0 ] \
         && [ "$REQUIRE_EMPTY_DAEMON" -eq 0 ] && [ -z "$RELAUNCH_AGENTS" ] \
@@ -632,10 +636,10 @@ if ! awk -v top="$TOP_LEVEL" '
     $0 == top "/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg" { required[6] = 1 }
     $0 == top "/share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png" { required[9] = 1 }
     $0 == top "/share/metainfo/dev.cagents.Cagents.metainfo.xml" { required[7] = 1 }
-    $0 == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" { required[10] = 1 }
+    $0 == top "/share/autostart/dev.cagents.Cagents.Daemon.desktop" { required[11] = 1 }
     $0 == top "/share/doc/cagents/LICENSE" { required[8] = 1 }
     END {
-        for (i = 1; i <= 10; i++) if (!required[i]) exit 1
+        for (i = 1; i <= 11; i++) if (!required[i]) exit 1
     }
 ' "$ARCHIVE_LIST"; then
     fail 'archive has an unexpected or incomplete entry structure'
@@ -647,7 +651,12 @@ fi
 CANDIDATE_COORDINATOR=$DOWNLOAD_DIR/cagents-install-coordinator
 tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagents" > "$CANDIDATE_COORDINATOR" \
     || fail 'could not extract the verified update coordinator'
-chmod 0700 "$CANDIDATE_COORDINATOR"
+# Source-pane preflight runs the matched host beside the selected coordinator.
+# A fresh install (or an old CLI without the guard) uses this extracted pair.
+CANDIDATE_INSPECTOR=$DOWNLOAD_DIR/cagentsd
+tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagentsd" > "$CANDIDATE_INSPECTOR" \
+    || fail 'could not extract the verified source inspector'
+chmod 0700 "$CANDIDATE_COORDINATOR" "$CANDIDATE_INSPECTOR"
 supports_install_guard() {
     [ -x "$1" ] \
         && "$1" coordinate-install --help >/dev/null 2>&1 \
@@ -793,12 +802,23 @@ prepare_link_parent() {
 }
 
 desktop_exec_escape() {
-    printf '%s' "$1" | sed \
+    desktop_exec_quoted=$(printf '%s' "$1" | sed \
         -e 's/\\/\\\\/g' \
         -e 's/"/\\"/g' \
         -e 's/`/\\`/g' \
         -e 's/\$/\\$/g' \
-        -e 's/%/%%/g'
+        -e 's/%/%%/g')
+    # Desktop-entry string unescaping happens before Exec argument parsing.
+    desktop_string_escape "$desktop_exec_quoted"
+}
+
+desktop_string_escape() {
+    printf '%s\n' "$1" | sed \
+        -e ':join' -e '$!{N;b join;}' \
+        -e 's/\\/\\\\/g' \
+        -e 's/\t/\\t/g' \
+        -e 's/\r/\\r/g' \
+        -e 's/\n/\\n/g'
 }
 
 check_link_destination "$BIN_LINK" "$BIN_TARGET"
@@ -820,13 +840,20 @@ tar --no-same-owner --no-same-permissions -xzf "$ARCHIVE_PATH" -C "$INSTALL_STAG
     || fail 'archive extraction failed'
 AUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")
 DESKTOP_EXEC=$(desktop_exec_escape "$BIN_TARGET")
-DESKTOP_ICON=$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
+# GLib checks the executable exists before expanding %% in Exec. Keep paths
+# containing percent signs out of that lookup and only in positional arguments.
+DESKTOP_EXEC_PREFIX=
+case $BIN_TARGET in
+    *%*) DESKTOP_EXEC_PREFIX='/bin/sh -c "exec \\"\\$@\\"" cagents-desktop ' ;;
+esac
+DESKTOP_TRY_EXEC=$(desktop_string_escape "$BIN_TARGET")
+DESKTOP_ICON=$(desktop_string_escape "$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg")
 DESKTOP_FILE=$INSTALL_STAGE/$TOP_LEVEL/share/applications/dev.cagents.Cagents.desktop
 {
     while IFS= read -r line || [ -n "$line" ]; do
         case $line in
-            Exec=*) printf 'Exec="%s" ui\n' "$DESKTOP_EXEC" ;;
-            TryExec=*) printf 'TryExec=%s\n' "$BIN_TARGET" ;;
+            Exec=*) printf 'Exec=%s"%s" ui\n' "$DESKTOP_EXEC_PREFIX" "$DESKTOP_EXEC" ;;
+            TryExec=*) printf 'TryExec=%s\n' "$DESKTOP_TRY_EXEC" ;;
             Icon=*) printf 'Icon=%s\n' "$DESKTOP_ICON" ;;
             *) printf '%s\n' "$line" ;;
         esac
@@ -841,7 +868,7 @@ mv "$DESKTOP_FILE.rewritten" "$DESKTOP_FILE" \
         'Type=Application' \
         'Name=cagents daemon' \
         'Comment=Keep cagents sessions available in the system tray'
-    printf 'Exec="%s" daemon start\n' "$AUTOSTART_EXEC"
+    printf 'Exec=%s"%s" daemon start\n' "$DESKTOP_EXEC_PREFIX" "$AUTOSTART_EXEC"
     printf '%s\n' \
         'Terminal=false' \
         'NoDisplay=true' \

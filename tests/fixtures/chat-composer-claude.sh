@@ -26,6 +26,19 @@ done
 # daemon restart. Mirror that contract rather than emitting an ephemeral stream.
 umask 077
 config=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+task_scene=
+task_scene_file=$config/fixture-agent-task-receipt.json
+if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
+    if [ ! -f "$task_scene_file" ] || [ -L "$task_scene_file" ] ||
+        ! task_scene=$(jq -ers 'select(length == 1) | .[0]
+            | select(type == "object" and keys == ["situation", "status"])
+            | select(.situation == "text" or .situation == "task-only")
+            | select(.status == "completed" or .status == "failed")
+            | .situation + "-" + .status' "$task_scene_file" 2>/dev/null); then
+        printf '%s\n' 'Invalid fixture-agent-task-receipt.json' >&2
+        exit 2
+    fi
+fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
@@ -33,7 +46,10 @@ parent=null
 turn=0
 if [ -f "$history" ]; then
     parent=$(jq -sr 'last.uuid // null' "$history")
-    turn=$(jq -s '[.[] | select(.type == "assistant")] | length' "$history")
+    # Count the prompts handled, not assistant records: a failed turn
+    # writes none and a delivered one writes two.
+    turn=$(jq -s '[.[] | select(.type == "user" and (.origin.kind // "") != "task-notification"
+        and ((.message.content | type) == "string" or any(.message.content[]; .type != "tool_result")))] | length' "$history")
 fi
 persist_record() {
     record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \
@@ -48,6 +64,28 @@ emit_record() {
     persist_record "$1"
     printf '%s\n' "$1"
 }
+
+# A fixed live receipt precedes its launch acknowledgement, without a timer.
+# The main result ends the turn; only the receipt/ACK can settle its Agent.
+task_receipt_turn() {
+    agent_tool=fixture-agent-tool-$turn
+    agent_task=fixture-agent-task-$turn
+    agent_status=${task_scene##*-}
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" '{type:"assistant",uuid:("fixture-agent-launch-"+$turn),message:{id:("fixture-agent-launch-"+$turn),role:"assistant",content:[{type:"tool_use",id:$tool,name:"Agent",input:{description:"Check receipt settlement",run_in_background:true}}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" '{type:"system",subtype:"task_started",uuid:("fixture-agent-start-"+$turn),task_id:$task,tool_use_id:$tool,task_type:"local_agent",description:"Check receipt settlement"}')"
+    case $task_scene in
+        text-*)
+            emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" --arg status "$agent_status" '{type:"user",uuid:("fixture-agent-notice-"+$turn),origin:{kind:"task-notification"},message:{role:"user",content:("<task-notification>\n<task-id>"+$task+"</task-id>\n<tool-use-id>"+$tool+"</tool-use-id>\n<status>"+$status+"</status>\n<summary>Offline Agent task "+$status+"</summary>\n<result>Offline report.</result>\n</task-notification>")}}')"
+            ;;
+        task-only-*)
+            emit_record "$(jq -cn --arg turn "$turn" --arg task "$agent_task" --arg status "$agent_status" '{type:"system",subtype:"task_notification",uuid:("fixture-agent-notice-"+$turn),task_id:$task,status:$status,summary:("Offline Agent task "+$status)}')"
+            ;;
+    esac
+    emit_record "$(jq -cn --arg turn "$turn" --arg tool "$agent_tool" --arg task "$agent_task" '{type:"user",uuid:("fixture-agent-ack-"+$turn),tool_use_result:{status:"async_launched",agentId:$task},message:{role:"user",content:[{type:"tool_result",tool_use_id:$tool,content:"Launched"}]}}')"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-agent-answer-"+$turn),message:{id:("fixture-agent-answer-"+$turn),role:"assistant",content:[{type:"text",text:"The offline task receipt has arrived."}]}}')"
+    emit_record "$(jq -cn --arg session "$session" --arg turn "$turn" '{type:"result",uuid:("fixture-agent-result-"+$turn),subtype:"success",is_error:false,session_id:$session}')"
+}
+
 verbosity_turn() {
     input=$(jq -cn '{path:"src/app.rs",prompt:("Internal skill and protocol framing.\n" * 80)}')
     first=$(printf '%s' "$input" | jq -Rs '.[0:30]')
@@ -70,9 +108,92 @@ verbosity_turn() {
     emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("verbosity-shell-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:("shell-"+$turn),content:"Shell fixture complete"}]}}')"
 }
 
+# Optional subagent tabs: one named working agent, a waiting one, a failed
+# one and two finished agents that share a type, so a check can see each
+# state's mark, the working-first order and how a shared name is told apart.
+subagents_turn() {
+    agent() {
+        emit_record "$(jq -cn --arg turn "$turn" --arg id "$1" --argjson input "$2" '{type:"assistant",uuid:("fixture-"+$id+"-"+$turn),message:{id:("fixture-"+$id+"-"+$turn),role:"assistant",content:[{type:"tool_use",id:($id+"-"+$turn),name:"Agent",input:$input}]}}')"
+    }
+    # A background agent runs as a task, which Stop ends by its task ID.
+    started() {
+        emit_record "$(jq -cn --arg turn "$turn" --arg id "$1" --arg description "$2" '{type:"system",subtype:"task_started",uuid:("fixture-"+$id+"-start-"+$turn),task_id:("fixture-task-"+$id+"-"+$turn),tool_use_id:($id+"-"+$turn),task_type:"local_agent",description:$description}')"
+        background_agents="$background_agents $1-$turn"
+    }
+    settle() {
+        emit_record "$(jq -cn --arg turn "$turn" --arg id "$1" --arg result "$2" --argjson error "$3" '{type:"user",uuid:("fixture-"+$id+"-result-"+$turn),message:{role:"user",content:[{type:"tool_result",tool_use_id:($id+"-"+$turn),is_error:$error,content:$result}]}}')"
+    }
+    agent explore-logs '{"subagent_type":"Explore","description":"Read the failing submission logs"}'
+    settle explore-logs 'The submission timed out while scoring.' false
+    agent scout '{"name":"Scout","subagent_type":"Explore","description":"Map the submission pipeline","run_in_background":true}'
+    started scout 'Map the submission pipeline'
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-scout-answer-"+$turn),parent_tool_use_id:("scout-"+$turn),message:{id:("fixture-scout-answer-"+$turn),role:"assistant",content:[{type:"text",text:"Reading the submission script and its scoring step."}]}}')"
+    agent planner '{"name":"Planner","subagent_type":"Plan","description":"Plan a retry that fits the time limit","run_in_background":true}'
+    started planner 'Plan a retry that fits the time limit'
+    jq -cn --arg turn "$turn" '{type:"stream_event",parent_tool_use_id:("planner-"+$turn),event:{type:"error",error:{type:"rate_limit_error",message:"Waiting for the rate limit to reset"}}}'
+    agent builder '{"name":"Builder","subagent_type":"general-purpose","description":"Rebuild the submission archive"}'
+    settle builder 'The archive step failed: disk quota exceeded.' true
+    agent explore-history '{"subagent_type":"Explore","description":"Compare with the last successful version"}'
+    settle explore-history 'The last good run used a smaller model.' false
+}
+
+# Claude Code reports each background agent that a Stop ended.
+background_agents=
+stop_agent() {
+    emit_record "$(jq -cn --arg tool "$1" '{type:"system",subtype:"task_notification",uuid:("fixture-"+$tool+"-stopped"),task_id:("fixture-task-"+$tool),tool_use_id:$tool,status:"stopped",summary:"Agent stopped"}')"
+    remaining=
+    for known in $background_agents; do
+        [ "$known" = "$1" ] || remaining="$remaining $known"
+    done
+    background_agents=$remaining
+}
+
+# Optional scripted tool calls: each line of fixture-tools.jsonl is
+# {"name":..., "input":{...}, "result":"...", "is_error":bool}, emitted as a
+# tool call and its result on every turn, so a rendering check can choose the
+# exact calls and outputs it needs.
+tools_file=$config/fixture-tools.jsonl
+tools_turn() {
+    call=0
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        call=$((call + 1))
+        id="tool-$turn-$call"
+        emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:.name,input:.input}]}}')"
+        emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"user",uuid:("fixture-"+$id+"-result"),message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:(.is_error // false),content:(.result // "")}]}}')"
+    done < "$tools_file"
+}
+
+# Optional provider-produced image for image preview/viewer acceptance: each
+# turn returns this PNG as a base64 block. Native launches drop CAGENTS_*
+# variables, so the provider home's fixture-image.png is the default.
+fixture_image=${CAGENTS_FIXTURE_IMAGE:-$HOME/fixture-image.png}
+image_turn() {
+    emit_record "$(base64 -w0 "$fixture_image" | jq -Rsc --arg turn "$turn" '{type:"assistant",uuid:("fixture-image-"+$turn),message:{id:("fixture-image-"+$turn),role:"assistant",content:[{type:"text",text:"Here is the chart from the failed run."},{type:"image",source:{type:"base64",media_type:"image/png",data:.}}]}}')"
+}
+
+# Optional behaviors. The daemon removes CAGENTS_* variables from a
+# provider's environment, so each is also enabled by a file in the config
+# directory. The variables still work when this script is run directly.
+fixture_switch() {
+    [ "$1" = 1 ] || [ -e "$config/$2" ]
+}
+fast_fixture=0
+if fixture_switch "${CAGENTS_FIXTURE_FAST_MODE:-0}" fixture-fast-mode; then fast_fixture=1; fi
+verbosity=0
+if fixture_switch "${CAGENTS_FIXTURE_VERBOSITY:-0}" fixture-verbosity; then verbosity=1; fi
+subagents=0
+if fixture_switch "${CAGENTS_FIXTURE_SUBAGENTS:-0}" fixture-subagents; then subagents=1; fi
+# The switch file may hold the delay between deltas in seconds.
+stream_reply=0
+stream_delay=0.25
+if fixture_switch "${CAGENTS_FIXTURE_STREAM_REPLY:-0}" fixture-stream-reply; then
+    stream_reply=1
+    if [ -s "$config/fixture-stream-reply" ]; then stream_delay=$(head -n 1 "$config/fixture-stream-reply"); fi
+fi
+
 busy=false
 fast=off
-fast_fixture=${CAGENTS_FIXTURE_FAST_MODE:-0}
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
 while IFS= read -r frame; do
@@ -87,6 +208,11 @@ while IFS= read -r frame; do
                 if [ "$fast_fixture" = 1 ]; then
                     metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
                 fi
+                # Optional advertised commands and skills: a JSON object with
+                # `commands` ([{name, description}]) and `skills` ([name]).
+                if [ -f "$config/fixture-commands.json" ]; then
+                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
+                fi
             elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
                 requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
                 if [ "$requested" = true ]; then fast=on; else fast=off; fi
@@ -100,8 +226,15 @@ while IFS= read -r frame; do
                     jq -cn --arg uuid "$uuid" \
                         '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
                     ;;
+                stop_task)
+                    task=$(printf '%s' "$frame" | jq -r '.request.task_id')
+                    case $task in
+                        fixture-task-*) stop_agent "${task#fixture-task-}" ;;
+                    esac
+                    ;;
                 interrupt)
                     busy=false
+                    for tool in $background_agents; do stop_agent "$tool"; done
                     jq -cn --arg session "$session" --arg turn "$turn" \
                         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
                     ;;
@@ -120,9 +253,55 @@ while IFS= read -r frame; do
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
                 jq -cn --arg session "$session" --arg model "$model" \
                     '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
-                if [ "${CAGENTS_FIXTURE_VERBOSITY:-0}" = 1 ]; then verbosity_turn; fi
-                assistant=$(jq -cn --arg turn "$turn" \
-                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:"I’m checking the submission logs and comparing the failed run with the last successful version."}],usage:{input_tokens:4200,output_tokens:180}}}')
+                if [ -n "$task_scene" ]; then
+                    task_receipt_turn
+                    busy=false
+                    continue
+                fi
+                # Optional provider failure for a prompt with an image, settled
+                # before any reply as an expired login does.
+                if [ -s "$config/fixture-image-prompt-error" ] &&
+                    printf '%s' "$frame" | jq -e '.message.content | arrays | any(.type == "image")' >/dev/null; then
+                    jq -cn --arg session "$session" --arg turn "$turn" --rawfile error "$config/fixture-image-prompt-error" \
+                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,errors:[$error | sub("\\s+$"; "")],session_id:$session}'
+                    continue
+                fi
+                # Optional provider failure after a reply, a background command's
+                # completion notice and the work it prompted.
+                if [ -s "$config/fixture-delivery-error" ]; then
+                    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-delivery-reply-"+$turn),message:{id:("fixture-delivery-reply-"+$turn),role:"assistant",content:[{type:"text",text:"I started the test suite in the background."}]}}')"
+                    emit_record "$(jq -cn --arg turn "$turn" '{type:"user",uuid:("fixture-delivery-notice-"+$turn),origin:{kind:"task-notification"},message:{role:"user",content:("<task-notification>\n<task-id>fixture-"+$turn+"</task-id>\n<status>completed</status>\n<summary>Background command \"Run tests\" completed (exit code 0)</summary>\n</task-notification>")}}')"
+                    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-delivery-followup-"+$turn),message:{id:("fixture-delivery-followup-"+$turn),role:"assistant",content:[{type:"text",text:"The tests finished. Reviewing their output now."}]}}')"
+                    jq -cn --arg session "$session" --arg turn "$turn" --rawfile error "$config/fixture-delivery-error" \
+                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,errors:[$error | sub("\\s+$"; "")],session_id:$session}'
+                    continue
+                fi
+                if [ "$verbosity" = 1 ]; then verbosity_turn; fi
+                if [ "$subagents" = 1 ]; then subagents_turn; fi
+                if [ -f "$tools_file" ]; then tools_turn; fi
+                if [ -f "$fixture_image" ]; then image_turn; fi
+                # A Markdown file in the config directory can stand in for the
+                # answer, so rendering and long-transcript checks need no live
+                # provider.
+                # jq reads the file itself: an answer over 128 KiB exceeds the
+                # kernel's limit for a single command-line argument.
+                reply=$config/fixture-reply.md
+                [ -f "$reply" ] || reply=/dev/null
+                # Optionally stream the answer as Claude does, in text deltas
+                # before the final record, so a long answer grows across cuts.
+                if [ "$stream_reply" = 1 ] && [ -s "$reply" ]; then
+                    jq -cn --arg id "fixture-message-$turn" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
+                    jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
+                    jq -cn --rawfile text "$reply" '$text | range(0; length; 16384) as $at | .[$at:$at + 16384]' |
+                        while IFS= read -r delta; do
+                            jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:$delta}}}'
+                            sleep "$stream_delay"
+                        done
+                    jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+                fi
+                assistant=$(jq -cn --arg turn "$turn" --rawfile text "$reply" \
+                    --arg default "I’m checking the submission logs and comparing the failed run with the last successful version." \
+                    '{type:"assistant",uuid:("fixture-message-"+$turn),message:{id:("fixture-message-"+$turn),role:"assistant",content:[{type:"text",text:(if $text == "" then $default else $text end)}],usage:{input_tokens:4200,output_tokens:180}}}')
                 persist_record "$assistant"
                 printf '%s\n' "$assistant"
                 if [ "$turn" -eq 1 ]; then

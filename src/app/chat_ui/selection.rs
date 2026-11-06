@@ -23,7 +23,7 @@ pub(super) use document::{
 };
 
 static NEXT: AtomicU64 = AtomicU64::new(1);
-static ACTIVE: AtomicU64 = AtomicU64::new(0);
+application_atomic!(fn active() -> AtomicU64);
 
 pub(super) fn transcript<'a>(
     content: impl Into<Element<'a, Message>>,
@@ -189,7 +189,7 @@ impl operation::Focusable for State {
     }
     fn focus(&mut self) {
         self.focused = true;
-        ACTIVE.store(self.identity, Ordering::Relaxed);
+        active().store(self.identity, Ordering::Relaxed);
     }
     fn unfocus(&mut self) {
         self.focused = false;
@@ -1209,7 +1209,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 modifiers,
                 ..
             }) if state.focused
-                && ACTIVE.load(Ordering::Relaxed) == state.identity
+                && active().load(Ordering::Relaxed) == state.identity
                 && modifiers.command()
                 && !shell.is_event_captured()
                 && (key.eq_ignore_ascii_case("c") || key.eq_ignore_ascii_case("a")) =>
@@ -1285,7 +1285,7 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Selection<'_> {
                 state.dragging = state.focused;
                 if state.focused {
                     let block = read.endpoint(true).unwrap();
-                    ACTIVE.store(state.identity, Ordering::Relaxed);
+                    active().store(state.identity, Ordering::Relaxed);
                     let point = cursor.position().unwrap();
                     state.origin = Some(point);
                     state.moved = false;
@@ -2030,7 +2030,7 @@ mod tests {
             ] {
                 let code = prose::code_text(
                     source.clone(),
-                    Arc::from([]),
+                    None,
                     14.0.into(),
                     iced::Font::MONOSPACE,
                     target,
@@ -2393,7 +2393,7 @@ mod tests {
                 mouse::Cursor::Unavailable,
             );
             let after = renderer.screenshot(Size::new(400, 120), 1.0, iced::Color::WHITE);
-            let accent = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let accent = design::selection_wash(&cosmic::theme::active()).into_rgba8();
             let painted = |pixels: &[u8], bounds: Rectangle| {
                 let y = (bounds.y + 1.0) as usize;
                 (bounds.x.ceil() as usize..(bounds.x + bounds.width).floor() as usize).any(|x| {
@@ -2504,7 +2504,7 @@ mod tests {
                 &viewport,
             );
             let pixels = renderer.screenshot(Size::new(600, 1400), 1.0, iced::Color::WHITE);
-            let selected = design::accent_color(&cosmic::theme::active()).into_rgba8();
+            let selected = design::selection_wash(&cosmic::theme::active()).into_rgba8();
             for block in &read.blocks {
                 let y = (block.bounds.y + 1.0) as usize;
                 let painted = (block.bounds.x.ceil() as usize
@@ -2778,7 +2778,7 @@ mod tests {
                 .as_widget_mut()
                 .layout(&mut tree, &renderer, &limits);
         }
-        // Focus through actual pointer input. Setting ACTIVE alone does not
+        // Focus through actual pointer input. Setting active() alone does not
         // make a transcript focused, so it never exercises the copy command.
         let mut visible = Read::new(None);
         element
@@ -2834,7 +2834,7 @@ mod tests {
             "native pointer focus must precede Ctrl+A/C"
         );
         assert_eq!(
-            ACTIVE.load(Ordering::Relaxed),
+            active().load(Ordering::Relaxed),
             tree.state.downcast_ref::<State>().identity
         );
         for key in ["a", "c"] {

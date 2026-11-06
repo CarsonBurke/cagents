@@ -56,6 +56,19 @@ pub enum ModelUpdate {
         model: WorkspaceModel,
     },
     NavigationFailed(String),
+    /// The registry's answer to this window's request to retire an emptied
+    /// channel: the model after it decided, either way. A channel still in it
+    /// was kept.
+    RetirementAnswered {
+        channel: ChannelId,
+        model: WorkspaceModel,
+    },
+    /// A definitive refusal of the edit itself, rather than an unknown
+    /// transport outcome that the publisher will retry.
+    RetirementFailed {
+        channel: ChannelId,
+        error: String,
+    },
     /// Optional naming yielded after temporary admission pressure. The next
     /// real wake may retry this exact current candidate; this is not a timer.
     TitleDeferred(ModelEdit),
@@ -79,7 +92,7 @@ pub enum ModelUpdate {
     },
     Ranked {
         channel: ChannelId,
-        ordinal: u32,
+        model: WorkspaceModel,
     },
 }
 
@@ -109,6 +122,13 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
     // model to mirror, and the window starts one itself as soon as it publishes.
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    observe_with_client(sender, &mut client)
+}
+
+fn observe_with_client(
+    sender: &async_channel::Sender<ModelUpdate>,
+    client: &mut ControlClient,
+) -> Result<(), String> {
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
@@ -124,7 +144,8 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
             .map_err(|error| error.to_string())?;
         // View edits and proof-dependent title suggestions need complete
         // authoritative pane data: the cached view may precede their revision.
-        // Navigation also reads its settled registry ordering.
+        // Navigation also reads its settled registry ordering, and an agent
+        // invalidation carries no inventory of its own.
         if matches!(
             edit,
             ModelEdit::SeedView { .. }
@@ -133,6 +154,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 | ModelEdit::ReorderNavigation { .. }
                 | ModelEdit::ResetNavigation { .. }
                 | ModelEdit::RetireEmptyChannel { .. }
+                | ModelEdit::AgentsChanged
         ) {
             let model = client
                 .read_workspace_model()
@@ -142,13 +164,7 @@ fn observe(sender: &async_channel::Sender<ModelUpdate>) -> Result<(), String> {
                 .map_err(|error| error.to_string())?;
             continue;
         }
-        let ranked = matches!(
-            edit,
-            ModelEdit::CreateChannel { .. }
-                | ModelEdit::AgentsChanged
-                | ModelEdit::SeedView { .. }
-                | ModelEdit::ChangeView { .. }
-        );
+        let ranked = matches!(edit, ModelEdit::CreateChannel { .. });
         sender
             .send_blocking(ModelUpdate::Edited { sequence, edit })
             .map_err(|error| error.to_string())?;
@@ -243,6 +259,12 @@ fn publish(
                         let _ = updates.send_blocking(ModelUpdate::ViewRefused {
                             scope: scope.clone(),
                             operation: *operation,
+                            error: error.to_string(),
+                        });
+                    }
+                    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
+                        let _ = updates.send_blocking(ModelUpdate::RetirementFailed {
+                            channel: home.channel,
                             error: error.to_string(),
                         });
                     }
@@ -369,16 +391,16 @@ fn send(
         && let Some(channel) = model.channel(id)
     {
         let _ = updates.send_blocking(ModelUpdate::Ranked {
-            channel: id,
-            ordinal: channel.ordinal,
+            channel: channel.id,
+            model: model.clone(),
         });
     }
-    if reordered
-        || matches!(
-            &request,
-            ModelEdit::SuggestConversationTitle { .. } | ModelEdit::RetireEmptyChannel { .. }
-        )
-    {
+    if let ModelEdit::RetireEmptyChannel { home, .. } = &request {
+        let _ = updates.send_blocking(ModelUpdate::RetirementAnswered {
+            channel: home.channel,
+            model: model.clone(),
+        });
+    } else if reordered || matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
         let _ = updates.send_blocking(ModelUpdate::Read(model.clone()));
     }
     if let Some(repository) = reopened {
@@ -421,6 +443,24 @@ enum Adoption {
     /// Nothing this window can show yet; the row is retained in the model and
     /// reconsidered on the next reconciliation.
     Retained,
+}
+
+/// Absence candidates only; the caller retains deletion/republish policy.
+/// Shared IDs include rows skipped during adoption. Local order and duplicate
+/// entries remain authoritative for the later action loop.
+fn channels_absent_from_model(
+    local: &[ProjectChannel],
+    shared: &[ModelChannel],
+) -> Vec<(ChannelId, bool)> {
+    let shared_ids = shared
+        .iter()
+        .map(|channel| channel.id)
+        .collect::<HashSet<_>>();
+    local
+        .iter()
+        .filter(|channel| !shared_ids.contains(&channel.id))
+        .map(|channel| (channel.id, channel.shared))
+        .collect()
 }
 
 impl Cagents {
@@ -532,6 +572,28 @@ impl Cagents {
         &mut self,
         update: ModelUpdate,
     ) -> (Task<Message>, bool) {
+        if let ModelUpdate::RetirementAnswered { channel, model } = update {
+            // The registry never echoes this window's own retirement, so the
+            // answer's model is the evidence of it: a channel absent there
+            // retired, even when metadata folded since keeps an older channel
+            // list. It retires here while the retirement still reads as this
+            // window's own, which keeps its cards reopenable.
+            let retired =
+                model.channel(channel).is_none() && model.identity == self.workspace_model.identity;
+            let (mut task, applied) =
+                self.apply_workspace_model_update_effect(ModelUpdate::Read(model));
+            if retired {
+                self.workspace_model
+                    .channels
+                    .retain(|shared| shared.id != channel);
+                task = Task::batch([task, self.retire_peer_channel(channel)]);
+            }
+            self.channel_work.retiring.remove(&channel);
+            return (
+                Task::batch([task, self.finish_channel_reopen(channel)]),
+                applied || retired,
+            );
+        }
         if let ModelUpdate::Read(model) = &update
             && model.identity == self.workspace_model.identity
             && model.sequence < self.shared_views.snapshot_sequence
@@ -543,6 +605,14 @@ impl Cagents {
 
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
+            ModelUpdate::RetirementFailed { channel, error } => {
+                self.channel_work.retiring.remove(&channel);
+                self.fail_channel_reopen(
+                    channel,
+                    &format!("Could not reopen the channel: {error}. Try reopening again."),
+                );
+                Task::none()
+            }
             ModelUpdate::TitleDeferred(edit) => {
                 self.defer_channel_title_suggestion(&edit);
                 Task::none()
@@ -567,7 +637,7 @@ impl Cagents {
                 if self.shared_views.is_requested_transfer(operation) {
                     self.reject_pane_transfer(operation, error);
                 } else {
-                    self.shared_views.refused(operation);
+                    self.refuse_shared_view_edit(&scope, operation);
                     self.status = Some(TransientNotice::warning(format!(
                         "The pane change was not applied: {error}"
                     )));
@@ -608,6 +678,9 @@ impl Cagents {
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();
                 Task::batch([closed, self.reconcile_workspace_model()])
+            }
+            ModelUpdate::RetirementAnswered { .. } => {
+                unreachable!("a retirement answer is applied as the snapshot it carries")
             }
             ModelUpdate::Read(model) => {
                 if !self.install_workspace_model_snapshot(model) {
@@ -668,6 +741,17 @@ impl Cagents {
                 }
 
                 if sequence <= self.workspace_model.sequence {
+                    if let ModelEdit::DeleteChannel { id } = edit {
+                        // A snapshot can overtake this explicit instruction.
+                        // It must still revoke automatic revival, even when
+                        // absence already removed the local channel.
+                        self.forget_channel_revival(id);
+                        self.workspace_model
+                            .channels
+                            .retain(|channel| channel.id != id);
+                        let retired = self.retire_peer_channel(id);
+                        return Task::batch([retired, self.finish_channel_reopen(id)]);
+                    }
                     return Task::none();
                 }
                 // An explicit delete is an instruction rather than an absence,
@@ -696,6 +780,9 @@ impl Cagents {
                     self.close_shared_project(&repository)
                 });
                 let retired = deleted.map_or_else(Task::none, |id| {
+                    // An explicit deletion is final even if an automatic
+                    // retirement of this identity was already in flight.
+                    self.forget_channel_revival(id);
                     // The registry has authoritatively removed this identity,
                     // even if its creation acknowledgment never reached us.
                     // A failed session close must not make it publishable again.
@@ -706,41 +793,60 @@ impl Cagents {
                     {
                         channel.shared = true;
                     }
-                    self.retire_peer_channel(id)
+                    let retired = self.retire_peer_channel(id);
+                    Task::batch([retired, self.finish_channel_reopen(id)])
                 });
                 Task::batch([removed, retired, self.reconcile_workspace_model()])
             }
-            ModelUpdate::Ranked { channel, ordinal } => {
-                let Some(index) = self
-                    .durable
-                    .channels
-                    .iter()
-                    .position(|local| local.id == channel)
+            ModelUpdate::Ranked { channel, model } => {
+                // The publisher and observer use separate connections. Keep the
+                // complete response: a rank alone cannot fence an older observer
+                // read, and a late create echo must not erase this rank proof.
+                if model.identity == NO_REGISTRY
+                    || model.identity != self.workspace_model.identity
+                    || model.sequence < self.shared_views.snapshot_sequence
+                    || self.channel_ui.is_deleting(channel)
+                    || self.channel_ui.was_deleted(channel)
+                    || !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|local| local.id == channel)
+                {
+                    return Task::none();
+                }
+                let Some(receipt) = model
+                    .channel(channel)
+                    .filter(|entry| entry.ordinal != PENDING_ORDINAL)
+                    .cloned()
                 else {
                     return Task::none();
                 };
-                let local = &self.durable.channels[index];
-                if local.ordinal == ordinal && local.shared {
+                if model.sequence < self.workspace_model.sequence
+                    && self.workspace_model.channel(channel).is_none()
+                {
+                    // Newer folded metadata removed this identity. The older
+                    // publisher response cannot introduce it again.
                     return Task::none();
                 }
-                let local = &mut Arc::make_mut(&mut self.durable).channels[index];
-                local.ordinal = ordinal;
-                // The registry answered about this channel, so it holds it. From
-                // here its absence from a later model is a deletion rather than
-                // ignorance, which is the whole point of recording the fact.
-                local.shared = true;
-                if let Some(shared) = self
+                if !self.install_workspace_model_snapshot(model) {
+                    return Task::none();
+                }
+                if let Some(current) = self
                     .workspace_model
                     .channels
                     .iter_mut()
-                    .find(|shared| shared.id == channel)
+                    .find(|entry| entry.id == channel)
+                    && current.repository == receipt.repository
+                    && current.ordinal == PENDING_ORDINAL
                 {
-                    shared.ordinal = ordinal;
+                    // A newer unrelated echo can precede an older full reply.
+                    // Preserve that newer metadata while completing this exact
+                    // channel's still-pending rank from its canonical receipt.
+                    current.ordinal = receipt.ordinal;
                 }
-                self.sort_durable_channels();
-                self.refresh_sidebar_channels();
-                self.persist();
-                Task::none()
+                let closed = self.apply_closed_project_tombstones();
+                Task::batch([closed, self.reconcile_workspace_model()])
             }
         }
     }
@@ -863,13 +969,7 @@ impl Cagents {
             }
         }
         let mut republished = Vec::new();
-        let retired = self
-            .durable
-            .channels
-            .iter()
-            .filter(|local| !model.channels.iter().any(|shared| shared.id == local.id))
-            .map(|local| (local.id, local.shared))
-            .collect::<Vec<_>>();
+        let retired = channels_absent_from_model(&self.durable.channels, &model.channels);
         for (id, shared) in retired {
             if self.channel_ui.is_deleting(id) {
                 continue;
@@ -935,16 +1035,22 @@ impl Cagents {
         for (scope, card) in new_managed_panes {
             self.publish_new_managed_pane(scope, card);
         }
+        // Normalize only sidebar ranks before the existing projection writes
+        // its snapshot. The source/operation barriers and pending Inserts above
+        // stay in place; no pane or canonical view metadata is changed here.
+        if changed {
+            self.sort_durable_channels();
+        }
         // Fence canonical evidence and finish projecting authoritative pane
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
         tasks.push(self.reconcile_shared_views());
         if changed {
-            self.sort_durable_channels();
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
         }
         self.refresh_channel_title_suggestions();
+        self.restore_channel_names();
         Task::batch(tasks)
     }
 
@@ -1403,6 +1509,75 @@ impl Cagents {
     /// channels that share a rank - the unranked ones a registryless window
     /// creates - keep the order they were created in.
     pub(super) fn sort_durable_channels(&mut self) {
+        // A create echo proves existence before it supplies a rank. Pending
+        // local and folded remote creations must remain newer than a preceding
+        // acknowledgement even when the registry was far ahead of this window.
+        let has_pending = self
+            .durable
+            .channels
+            .iter()
+            .any(|channel| !channel.shared || channel.ordinal == PENDING_ORDINAL)
+            || self
+                .workspace_model
+                .channels
+                .iter()
+                .any(|channel| channel.ordinal == PENDING_ORDINAL);
+        if has_pending {
+            let ranks: std::collections::HashMap<_, _> = self
+                .workspace_model
+                .channels
+                .iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect();
+            let pending = |channel: &ProjectChannel| {
+                !channel.shared
+                    || channel.ordinal == PENDING_ORDINAL
+                    || ranks.get(&channel.id) == Some(&PENDING_ORDINAL)
+            };
+            let mut provisional: Vec<_> = self
+                .durable
+                .channels
+                .iter()
+                .enumerate()
+                .filter(|(_, channel)| pending(channel))
+                .map(|(index, channel)| (index, channel.ordinal))
+                .collect();
+            if !provisional.is_empty() {
+                provisional.sort_by_key(|(_, ordinal)| *ordinal);
+                let highest = self
+                    .workspace_model
+                    .channels
+                    .iter()
+                    .map(|channel| channel.ordinal)
+                    .chain(
+                        self.durable
+                            .channels
+                            .iter()
+                            .filter(|channel| !pending(channel))
+                            .map(|channel| channel.ordinal),
+                    )
+                    .filter(|ordinal| *ordinal != PENDING_ORDINAL)
+                    .max()
+                    .unwrap_or(0);
+                let mut next = Some(highest);
+                let updates: Vec<_> = provisional
+                    .into_iter()
+                    .filter_map(|(index, ordinal)| {
+                        next = next
+                            .and_then(|rank| rank.checked_add(1))
+                            .filter(|rank| *rank != PENDING_ORDINAL);
+                        let rank = next.unwrap_or(PENDING_ORDINAL);
+                        (rank != ordinal).then_some((index, rank))
+                    })
+                    .collect();
+                if !updates.is_empty() {
+                    let durable = Arc::make_mut(&mut self.durable);
+                    for (index, rank) in updates {
+                        durable.channels[index].ordinal = rank;
+                    }
+                }
+            }
+        }
         if self
             .durable
             .channels
@@ -1433,6 +1608,7 @@ impl Cagents {
                     .iter()
                     .map(|channel| channel.ordinal),
             )
+            .filter(|ordinal| *ordinal != PENDING_ORDINAL)
             .max()
             .unwrap_or(0)
             .saturating_add(1)
@@ -1454,11 +1630,19 @@ impl Cagents {
             repository: repository.clone(),
             name,
         });
+        // A new channel's title is empty; a revived one keeps the name it had.
+        let (title, title_source) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| (channel.title.clone(), channel.title_source))
+            .unwrap_or_default();
         self.publish_model_edit(ModelEdit::CreateChannel {
             id,
             repository,
-            title: String::new(),
-            title_source: Default::default(),
+            title,
+            title_source,
         });
     }
 
@@ -1549,6 +1733,341 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn absent_channel_candidates_preserve_local_order_duplicates_and_shared_flags() {
+        let project = ProjectId::new();
+        let repository = PathBuf::from("/repo/.git");
+        let mut locals = (0..2_046)
+            .map(|index| {
+                let mut channel = local(ChannelId::new(), project, "local", index);
+                channel.shared = index % 2 == 0;
+                let card = CardId::new();
+                channel.cards.push(card);
+                channel.focused = Some(card);
+                channel
+            })
+            .collect::<Vec<_>>();
+        let missing = locals[0].id;
+        let present = locals[1].id;
+        let skipped_adoption = locals[3].id;
+        let mut incoming = locals
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 3 != 0)
+            .rev()
+            .map(|(_, channel)| shared(channel.id, &repository, "shared", channel.ordinal))
+            .collect::<Vec<_>>();
+        // Even a model row the caller skips while adopting is still present for
+        // absence authority. The selector must consume the complete model list.
+        incoming.push(shared(skipped_adoption, &repository, "skipped adoption", 0));
+        incoming.push(incoming[0].clone());
+        incoming.push(shared(ChannelId::new(), &repository, "not local", 1));
+        let mut duplicate_missing = locals[0].clone();
+        duplicate_missing.shared = false;
+        duplicate_missing.title = "unshared duplicate".into();
+        locals.insert(9, duplicate_missing);
+        let mut duplicate_present = locals[2].clone();
+        // After the insertion, original row1 is still at index1.
+        duplicate_present.id = present;
+        duplicate_present.shared = true;
+        locals.push(duplicate_present);
+        assert_eq!(locals.len(), 2_048);
+        let before = locals.clone();
+
+        // Independent old nested membership is the semantic oracle, not an
+        // assertion about HashSet iteration or measured runtime.
+        let expected = locals
+            .iter()
+            .filter(|local| !incoming.iter().any(|shared| shared.id == local.id))
+            .map(|local| (local.id, local.shared))
+            .collect::<Vec<_>>();
+        let absent = channels_absent_from_model(&locals, &incoming);
+        assert_eq!(absent, expected);
+        assert_eq!(absent.len(), 682);
+        assert_eq!(
+            absent
+                .iter()
+                .copied()
+                .filter(|(id, _)| *id == missing)
+                .collect::<Vec<_>>(),
+            [(missing, true), (missing, false)],
+            "local duplicates retain order and their distinct retirement authority"
+        );
+        assert!(
+            !absent
+                .iter()
+                .any(|(id, _)| *id == present || *id == skipped_adoption)
+        );
+        assert_eq!(
+            locals, before,
+            "titles, conversations and focus are untouched"
+        );
+
+        assert_eq!(
+            channels_absent_from_model(&locals, &[]),
+            locals
+                .iter()
+                .map(|local| (local.id, local.shared))
+                .collect::<Vec<_>>()
+        );
+        let all_present = locals
+            .iter()
+            .rev()
+            .map(|channel| shared(channel.id, &repository, "shared", channel.ordinal))
+            .collect::<Vec<_>>();
+        assert!(channels_absent_from_model(&locals, &all_present).is_empty());
+    }
+
+    #[test]
+    fn agent_invalidation_reads_once_without_reconciling_a_stale_inventory_edge() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        // Exercise both a real inventory arrival and removal while preserving
+        // the exact five-update ordering contract in each scenario.
+        for removed in [false, true] {
+            let (_, mut agent, _, _) = managed_display_fixture();
+            agent.name = Some("Refreshed managed agent".into());
+            let initial = if removed {
+                vec![agent.clone()]
+            } else {
+                Vec::new()
+            };
+            let refreshed = if removed { Vec::new() } else { vec![agent] };
+            let server_initial = initial.clone();
+            let server_refreshed = refreshed.clone();
+            let channel = ChannelId::new();
+            let title = ModelEdit::RetitleChannel {
+                id: channel,
+                title: "Manual title".into(),
+            };
+            let create = ModelEdit::CreateChannel {
+                id: ChannelId::new(),
+                repository: "/repo/.git".into(),
+                title: "Other channel".into(),
+                title_source: Default::default(),
+            };
+            let expected_title = title.clone();
+            let expected_create = create.clone();
+            let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let server = std::thread::spawn(move || {
+                let proof = crate::model::HostSessionProof {
+                    host_session_id: "observer".into(),
+                    boot_id: "boot".into(),
+                    host_incarnation: "owner".into(),
+                };
+                let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(hello.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: vec![],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                let watch: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(watch.request, ClientRequest::WatchWorkspaceModel);
+                let mut model = WorkspaceModel {
+                    identity: uuid::Uuid::new_v4(),
+                    agents: server_initial,
+                    ..Default::default()
+                };
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(watch.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::WorkspaceModel {
+                                model: model.clone(),
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+                for (sequence, edit) in [(1, title), (2, ModelEdit::AgentsChanged), (3, create)] {
+                    write_frame(
+                        &mut peer,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: None,
+                            proof: proof.clone(),
+                            message: ServerMessage::WorkspaceModelEdited {
+                                sequence,
+                                edit: edit.clone(),
+                            },
+                        },
+                    )
+                    .unwrap();
+                    model.fold(sequence, &edit);
+                    if sequence == 2 {
+                        model.agents = server_refreshed.clone();
+                    }
+                    if sequence != 1 {
+                        let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                        assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                        write_frame(
+                            &mut peer,
+                            &ServerEnvelope {
+                                version: PROTOCOL_VERSION,
+                                request_id: Some(read.request_id),
+                                proof: proof.clone(),
+                                message: ServerMessage::Response {
+                                    response: ServerResponse::WorkspaceModel {
+                                        model: model.clone(),
+                                    },
+                                },
+                            },
+                        )
+                        .unwrap();
+                    }
+                }
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: None,
+                        proof,
+                        message: ServerMessage::HostShuttingDown,
+                    },
+                )
+                .unwrap();
+            });
+            let mut client = ControlClient::from_stream(stream).unwrap();
+            let (tx, rx) = async_channel::unbounded();
+            assert!(observe_with_client(&tx, &mut client).is_err());
+            server.join().unwrap();
+            let updates = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+            assert_eq!(
+                updates.len(),
+                5,
+                "one full Read for AgentsChanged, never a stale Edited first"
+            );
+            assert!(matches!(&updates[0], ModelUpdate::Connected(model) if model.sequence == 0));
+            assert!(
+                matches!(&updates[0], ModelUpdate::Connected(model) if model.agents == initial),
+                "the watch response keeps the original inventory"
+            );
+            assert!(
+                matches!(&updates[1], ModelUpdate::Edited { sequence: 1, edit } if edit == &expected_title)
+            );
+            assert!(matches!(&updates[2], ModelUpdate::Read(model) if model.sequence == 2));
+            assert!(
+                matches!(&updates[2], ModelUpdate::Read(model) if model.agents == refreshed),
+                "AgentsChanged must carry the exact fresh inventory, including removal"
+            );
+            assert!(
+                matches!(&updates[3], ModelUpdate::Edited { sequence: 3, edit } if edit == &expected_create)
+            );
+            assert!(matches!(&updates[4], ModelUpdate::Read(model) if model.sequence == 3));
+            assert!(
+                matches!(&updates[4], ModelUpdate::Read(model) if model.agents == refreshed),
+                "later full reads must not restore stale agent inventory"
+            );
+        }
+    }
+
+    #[test]
+    fn create_publisher_keeps_the_complete_canonical_rank_response() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let id = ChannelId::new();
+        let repository = PathBuf::from("/repo/.git");
+        let mut model = registry(vec![shared(id, &repository, "Canonical title", 17)]);
+        model.sequence = 42;
+        model.projects.push(ModelProject {
+            repository: repository.clone(),
+            name: "repo".into(),
+            kind: ProjectKind::Git,
+            ordinal: 3,
+        });
+        let app = super::super::tests::context_inspector_test_app(true);
+        model.views.push(crate::workspace_model::views::View {
+            scope: crate::workspace_model::views::Scope::Channel(id),
+            revision: 9,
+            panes: vec![
+                crate::workspace_model::views::Pane::from_card(&app.durable.cards[0], None)
+                    .unwrap(),
+            ],
+            retired: Vec::new(),
+        });
+        let expected = model.clone();
+        let edit = ModelEdit::CreateChannel {
+            id,
+            repository,
+            title: "Requested title".into(),
+            title_source: Default::default(),
+        };
+        let expected_edit = edit.clone();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "rank-response".into(),
+                boot_id: "rank-boot".into(),
+                host_incarnation: "rank-host".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: Vec::new(),
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: expected_edit
+                }
+            );
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof,
+                    message: ServerMessage::Response {
+                        response: ServerResponse::WorkspaceModel { model },
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (sender, updates) = async_channel::unbounded();
+        send(&mut client, edit, &sender).unwrap();
+        let ModelUpdate::Ranked { channel, model } = updates.try_recv().unwrap() else {
+            panic!("a successful create forwards its canonical receipt")
+        };
+        assert_eq!(channel, id);
+        assert_eq!(model, expected);
+        assert!(updates.try_recv().is_err());
+        drop(client);
+        server.join().unwrap();
+    }
 
     #[test]
     fn busy_title_publication_yields_after_three_original_attempts_to_the_next_edit() {
@@ -3173,6 +3692,36 @@ mod tests {
         }
     }
 
+    fn rank_receipt(app: &Cagents, id: ChannelId, ordinal: u32, sequence: u64) -> ModelUpdate {
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap();
+        let repository = &app
+            .sidebar_model
+            .project(local.project_id)
+            .unwrap()
+            .repository;
+        let mut model = app.workspace_model.clone();
+        model.sequence = sequence;
+        // A server snapshot contains assigned project/channel ranks, not the
+        // pending placeholders a client folds from observer edges.
+        for project in &mut model.projects {
+            if project.ordinal == PENDING_ORDINAL {
+                project.ordinal = 1;
+            }
+        }
+        model
+            .channels
+            .retain(|channel| channel.id != id && channel.ordinal != PENDING_ORDINAL);
+        model
+            .channels
+            .push(shared(id, repository, &local.title, ordinal));
+        ModelUpdate::Ranked { channel: id, model }
+    }
+
     #[test]
     fn a_reconnecting_window_applies_a_missed_project_close() {
         let (mut app, project, repository) = app_with_project();
@@ -4015,24 +4564,636 @@ mod tests {
         );
     }
 
+    /// Publisher replies and observer echoes use separate connections. A saved
+    /// channel can receive its real rank before its create echo reaches the
+    /// observer; a later channel's reply must not make that first one pending.
+    #[test]
+    fn startup_republication_keeps_ranked_channels_stable_when_create_echoes_arrive_late() {
+        fn ranks(app: &Cagents) -> Vec<(ChannelId, u32)> {
+            crate::sidebar::channels_in_display_order(&app.sidebar_model.projects[0].channels)
+                .into_iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect()
+        }
+        let (mut app, project, repository) = app_with_project();
+        let first = ChannelId::new();
+        let second = ChannelId::new();
+        let mut first_saved = local(first, project, "Saved first", 20);
+        first_saved.shared = true;
+        let mut second_saved = local(second, project, "Saved second", 21);
+        second_saved.shared = true;
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels = vec![first_saved, second_saved];
+        durable.active_channel = Some(second);
+        durable.workspace_model_identity = Some(uuid::Uuid::new_v4());
+        assert_eq!(app.workspace_model.identity, NO_REGISTRY);
+        let published = intercept_publishes(&mut app);
+        let replacement = registry(Vec::new());
+        drop(app.apply_workspace_model_update(ModelUpdate::Connected(replacement)));
+        let edits = drain(&published);
+        let creates = edits
+            .iter()
+            .filter_map(|edit| match edit {
+                ModelEdit::CreateChannel { id, .. } => Some((*id, edit.clone())),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            creates.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+            [first, second]
+        );
+        assert!(
+            app.workspace_model.channels.is_empty(),
+            "publication is not an observer acknowledgement"
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 1,
+            edit: ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "repo".into(),
+                kind: ProjectKind::Git,
+            },
+        }));
+        // The reply wins the race against the originating create's observer
+        // echo, precisely the interleaving possible during startup republishing.
+        let first_reply = rank_receipt(&app, first, 1, 2);
+        let ModelUpdate::Ranked {
+            model: first_snapshot,
+            ..
+        } = first_reply.clone()
+        else {
+            unreachable!()
+        };
+        drop(app.apply_workspace_model_update(first_reply));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 2,
+            edit: creates[0].1.clone(),
+        }));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        drop(app.apply_workspace_model_update(rank_receipt(&app, second, 2, 4)));
+        assert_eq!(
+            ranks(&app),
+            [(second, 2), (first, 1)],
+            "a late echo cannot turn the first authoritative rank back into a newer provisional rank"
+        );
+        // The observer took this A-only read before B's publisher committed,
+        // but delivered it after the B reply. It must not retire selected B.
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(first_snapshot)));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        assert_eq!(app.durable.active_channel, Some(second));
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == second)
+        );
+        assert_eq!(app.shared_views.snapshot_sequence, 4);
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 4,
+            edit: creates[1].1.clone(),
+        }));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        let mut settled = app.workspace_model.clone();
+        settled.sequence = 5;
+        settled.channels = vec![
+            shared(first, &repository, "Saved first", 1),
+            shared(second, &repository, "Saved second", 2),
+        ];
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(settled)));
+        assert_eq!(ranks(&app), [(second, 2), (first, 1)]);
+        assert!(app.durable.channels.iter().all(|channel| channel.shared));
+    }
+
+    #[test]
+    fn delayed_rank_receipts_preserve_newer_metadata_and_do_not_revive_deleted_channels() {
+        let (mut app, project, repository) = app_with_project();
+        let id = ChannelId::new();
+        app.workspace_model = registry(Vec::new());
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(local(id, project, "Original", 1));
+        let receipt = rank_receipt(&app, id, 7, 2);
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 2,
+            edit: ModelEdit::CreateChannel {
+                id,
+                repository: repository.clone(),
+                title: "Original".into(),
+                title_source: Default::default(),
+            },
+        }));
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 3,
+            edit: ModelEdit::RetitleChannel {
+                id,
+                title: "Newer user title".into(),
+            },
+        }));
+        assert_eq!(
+            app.workspace_model.channel(id).unwrap().ordinal,
+            PENDING_ORDINAL
+        );
+        drop(app.apply_workspace_model_update(receipt.clone()));
+        let canonical = app.workspace_model.channel(id).unwrap();
+        assert_eq!(canonical.ordinal, 7);
+        assert_eq!(canonical.title, "Newer user title");
+        assert_eq!(app.workspace_model.sequence, 3);
+        assert_eq!(app.shared_views.snapshot_sequence, 2);
+        let local = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .unwrap();
+        assert_eq!(local.ordinal, 7);
+        assert_eq!(local.title, "Newer user title");
+        assert!(local.shared);
+        // Ordinary remote pending channels still take a newer provisional rank.
+        let remote = ChannelId::new();
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 4,
+            edit: ModelEdit::CreateChannel {
+                id: remote,
+                repository,
+                title: "Still pending".into(),
+                title_source: Default::default(),
+            },
+        }));
+        let before_duplicate = app.durable.channels.clone();
+        drop(app.apply_workspace_model_update(receipt.clone()));
+        assert_eq!(app.durable.channels, before_duplicate);
+        assert_eq!(
+            app.workspace_model.channel(remote).unwrap().ordinal,
+            PENDING_ORDINAL
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == remote)
+                .unwrap()
+                .ordinal,
+            8
+        );
+        let mut newer = app.workspace_model.clone();
+        newer.sequence = 5;
+        newer
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == id)
+            .unwrap()
+            .ordinal = 9;
+        newer
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == remote)
+            .unwrap()
+            .ordinal = 10;
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(newer)));
+        drop(app.apply_workspace_model_update(receipt.clone()));
+        assert_eq!(app.workspace_model.channel(id).unwrap().ordinal, 9);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .unwrap()
+                .ordinal,
+            9
+        );
+        // A real newer delete goes through the application's retirement path.
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 6,
+            edit: ModelEdit::DeleteChannel { id },
+        }));
+        assert!(app.workspace_model.channel(id).is_none());
+        let durable = Arc::clone(&app.durable);
+        let model = app.workspace_model.clone();
+        drop(app.apply_workspace_model_update(receipt));
+        assert_eq!(app.durable, durable);
+        assert_eq!(app.workspace_model, model);
+        assert!(app.workspace_model.channel(id).is_none());
+    }
+
+    #[test]
+    fn rank_receipts_repair_duplicate_proof_and_reject_unknown_foreign_or_stale_sources() {
+        for invalid in [
+            "unknown",
+            "foreign",
+            "stale",
+            "pending",
+            "absent",
+            "newer-delete",
+        ] {
+            let (mut app, project, _) = app_with_project();
+            let id = ChannelId::new();
+            app.workspace_model = registry(Vec::new());
+            app.workspace_model.sequence = 10;
+            app.shared_views.snapshot_sequence = 5;
+            let mut local = local(id, project, "Retained", 7);
+            local.shared = true;
+            Arc::make_mut(&mut app.durable).channels.push(local);
+            let ModelUpdate::Ranked { mut model, .. } = rank_receipt(&app, id, 7, 10) else {
+                unreachable!()
+            };
+            match invalid {
+                "unknown" => model.identity = NO_REGISTRY,
+                "foreign" => model.identity = uuid::Uuid::new_v4(),
+                "stale" => model.sequence = 4,
+                "pending" => model.channels[0].ordinal = PENDING_ORDINAL,
+                "absent" => Arc::make_mut(&mut app.durable).channels.clear(),
+                "newer-delete" => model.sequence = 9,
+                _ => unreachable!(),
+            }
+            let durable = Arc::clone(&app.durable);
+            let current = app.workspace_model.clone();
+            let before_snapshot = app.shared_views.snapshot_sequence;
+            let published = intercept_publishes(&mut app);
+            drop(app.apply_workspace_model_update(ModelUpdate::Ranked { channel: id, model }));
+            assert_eq!(app.durable, durable, "{invalid}");
+            assert_eq!(app.workspace_model, current, "{invalid}");
+            assert_eq!(
+                app.shared_views.snapshot_sequence, before_snapshot,
+                "{invalid}"
+            );
+            assert!(drain(&published).is_empty(), "{invalid}");
+        }
+        // A duplicate real acknowledgement must repair a missing canonical
+        // cache even when local rank/shared already match. Only complete proof
+        // may advance this sequence and fence older observer snapshots.
+        let (mut app, project, _) = app_with_project();
+        let id = ChannelId::new();
+        app.workspace_model = registry(Vec::new());
+        app.workspace_model.sequence = 10;
+        let mut local = local(id, project, "Retained", 7);
+        local.shared = true;
+        Arc::make_mut(&mut app.durable).channels.push(local);
+        app.refresh_sidebar_channels();
+        assert!(app.workspace_model.channel(id).is_none());
+        drop(app.apply_workspace_model_update(rank_receipt(&app, id, 7, 10)));
+        assert_eq!(app.workspace_model.channel(id).unwrap().ordinal, 7);
+        assert_eq!(app.shared_views.snapshot_sequence, 10);
+        assert_eq!(app.durable.channels[0].ordinal, 7);
+        assert!(app.durable.channels[0].shared);
+    }
+
     /// The rank the registry assigns replaces the provisional one a local
     /// creation started with, so the window that created a channel and the
     /// window that adopted it agree on where it sorts. The same answer is the
     /// proof the registry holds it.
     #[test]
+    fn six_creations_stay_above_saved_mixed_rows_through_pending_echoes_rank_leap_and_reopen() {
+        use crate::sidebar::{SelectionRow, SidebarAction};
+        use crate::workspace_model::{NavigationItem, NavigationOrder};
+        fn channel_rows(app: &Cagents) -> Vec<ChannelId> {
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false)
+                .into_iter()
+                .filter_map(|row| match row {
+                    SelectionRow::Channel(id) => Some(id),
+                    _ => None,
+                })
+                .collect()
+        }
+        let (mut app, project, repository) = app_with_project();
+        let storage = tempfile::tempdir().unwrap();
+        let database = storage.path().join("channel-order.sqlite3");
+        let boot = crate::model::BootId::new("channel-order-reopen");
+        let (session, _) = crate::session::SessionRuntime::open(&database, boot.clone()).unwrap();
+        app.session = Some(session);
+        let main = crate::model::WorktreeId::new();
+        app.sidebar_model.projects[0].worktrees =
+            vec![crate::sidebar::SidebarWorktree::from_durable(
+                main,
+                "/repo".into(),
+                Some("main".into()),
+            )];
+        let saved: Vec<_> = (0..6)
+            .map(|index| {
+                let mut channel = local(
+                    ChannelId::new(),
+                    project,
+                    &format!("Saved {index}"),
+                    index + 20,
+                );
+                channel.shared = true;
+                channel
+            })
+            .collect();
+        Arc::make_mut(&mut app.durable).channels = saved.clone();
+        let manual: Vec<_> = std::iter::once(NavigationItem::Worktree("/repo".into()))
+            .chain(
+                saved
+                    .iter()
+                    .map(|channel| NavigationItem::Channel(channel.id)),
+            )
+            .collect();
+        app.workspace_model = registry(
+            saved
+                .iter()
+                .map(|channel| shared(channel.id, &repository, &channel.title, channel.ordinal))
+                .collect(),
+        );
+        app.workspace_model.navigation_orders.push(NavigationOrder {
+            repository: repository.clone(),
+            items: manual.clone(),
+        });
+        drop(app.reconcile_workspace_model());
+        // Put real user work in an existing channel before creating others.
+        // Opening it through the actual update creates its inert native draft;
+        // typing promotes the placeholder, without starting a provider.
+        drop(
+            app.update(Message::ChannelUi(super::super::channel_ui::Action::Open(
+                saved[2].id,
+            ))),
+        );
+        let draft_card = app.workspace.focused().expect("the old composer opens");
+        let target = match app.cards.get(&draft_card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.target,
+            _ => panic!("the channel's default pane must be a native draft"),
+        };
+        let draft = "Keep this edited draft  \nUnicode 🦀 and exact trailing spaces  ";
+        drop(
+            app.update(Message::ChatUi(super::super::chat_ui::Action::Composer(
+                target,
+                cosmic::widget::text_editor::Action::Edit(
+                    cosmic::widget::text_editor::Edit::Paste(Arc::new(draft.to_owned())),
+                ),
+            ))),
+        );
+        assert_eq!(app.persistent_workspace().chat_drafts[&draft_card], draft);
+        let saved = app.durable.channels.clone();
+        let published = intercept_publishes(&mut app);
+        let mut created = Vec::new();
+        for _ in 0..6 {
+            drop(app.update(Message::ChannelUi(
+                super::super::channel_ui::Action::Create(project),
+            )));
+            let id = app
+                .durable
+                .active_channel
+                .expect("creation selects its exact new channel");
+            created.push(id);
+            // Inspect the real update's returned projection before any manual
+            // refresh; the reveal task must address a row already mounted next frame.
+            assert_eq!(
+                &channel_rows(&app)[..created.len()],
+                created.iter().rev().copied().collect::<Vec<_>>()
+            );
+            assert!(!app.modal_is_open());
+            assert!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                    .unwrap()
+                    .focused
+                    .is_some(),
+                "the new composer opens immediately"
+            );
+        }
+        let edits = drain(&published);
+        assert_eq!(
+            edits
+                .iter()
+                .filter(|edit| matches!(edit, ModelEdit::CreateChannel { .. }))
+                .count(),
+            6
+        );
+        assert!(
+            !edits.iter().any(|edit| matches!(
+                edit,
+                ModelEdit::ReorderNavigation { .. } | ModelEdit::ResetNavigation { .. }
+            )),
+            "creation must not rewrite the user's saved relative order"
+        );
+        // Folded creates prove existence but still carry the pending sentinel.
+        // They must neither poison max+1 nor turn their source order into ties.
+        for (index, id) in created.iter().enumerate() {
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence: 100 + index as u64,
+                edit: ModelEdit::CreateChannel {
+                    id: *id,
+                    repository: repository.clone(),
+                    title: String::new(),
+                    title_source: Default::default(),
+                },
+            }));
+            assert_eq!(
+                &channel_rows(&app)[..6],
+                created.iter().rev().copied().collect::<Vec<_>>()
+            );
+            assert_ne!(app.next_provisional_ordinal(), PENDING_ORDINAL);
+        }
+        drop(app.apply_workspace_model_update(rank_receipt(&app, created[0], 600, 100)));
+        assert_eq!(
+            &channel_rows(&app)[..6],
+            created.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == created[1])
+                .unwrap()
+                .ordinal,
+            601
+        );
+        assert_eq!(
+            app.workspace_model.channel(created[1]).unwrap().ordinal,
+            PENDING_ORDINAL,
+            "a provisional UI rank never claims a registry assignment"
+        );
+        for (index, id) in created.iter().enumerate().skip(1) {
+            drop(app.apply_workspace_model_update(rank_receipt(
+                &app,
+                *id,
+                600 + index as u32,
+                100 + index as u64,
+            )));
+            assert_eq!(
+                &channel_rows(&app)[..6],
+                created.iter().rev().copied().collect::<Vec<_>>(),
+                "each acknowledgement preserves the still newer pending creations"
+            );
+        }
+        let mut settled = app.workspace_model.clone();
+        settled.sequence = 200;
+        for (index, id) in created.iter().enumerate() {
+            settled
+                .channels
+                .iter_mut()
+                .find(|channel| channel.id == *id)
+                .unwrap()
+                .ordinal = 600 + index as u32;
+        }
+        drop(app.apply_workspace_model_update(ModelUpdate::Read(settled.clone())));
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 101,
+            edit: ModelEdit::CreateChannel {
+                id: created[0],
+                repository: repository.clone(),
+                title: "stale echo".into(),
+                title_source: Default::default(),
+            },
+        }));
+        assert_eq!(
+            &channel_rows(&app)[..6],
+            created.iter().rev().copied().collect::<Vec<_>>()
+        );
+        assert_eq!(app.sidebar_model.projects[0].navigation_order, manual);
+        for original in &saved {
+            assert_eq!(
+                app.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == original.id),
+                Some(original),
+                "saved channel data survives all six creations"
+            );
+        }
+        let rows =
+            crate::sidebar::visible_selection_rows(&app.sidebar_model, &app.sidebar_state, false);
+        assert_eq!(rows[7], SelectionRow::Worktree(project, main));
+        assert_eq!(app.persistent_workspace().chat_drafts[&draft_card], draft);
+        assert!(app.shared_chat_has_local_work(draft_card));
+        let before_restart = app.durable.channels.clone();
+        // No explicit snapshot here: creation and model reconciliation must have
+        // saved their own result through the production persistence path.
+        let mut session = app.session.take().unwrap();
+        session.shutdown();
+        assert_eq!(session.last_error(), None);
+        let (mut restored_session, restored) =
+            crate::session::SessionRuntime::open(&database, boot).unwrap();
+        let restored = restored.expect("the automatic writes saved this workspace");
+        assert_eq!(restored.chat_drafts[&draft_card], draft);
+        // Empty default composers are intentionally omitted from storage, so
+        // compare identities/ranks and the edited channel's real membership.
+        assert_eq!(
+            restored
+                .channels
+                .iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect::<Vec<_>>(),
+            before_restart
+                .iter()
+                .map(|channel| (channel.id, channel.ordinal))
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            restored
+                .channels
+                .iter()
+                .find(|channel| channel.id == saved[2].id),
+            saved.iter().find(|channel| channel.id == saved[2].id)
+        );
+        let (mut reopened, _, _) = app_with_project();
+        reopened.sidebar_model = app.sidebar_model.clone();
+        for project in &mut reopened.sidebar_model.projects {
+            project.channels.clear();
+        }
+        reopened.chat_ui = super::super::chat_ui::State::with_drafts(restored.chat_drafts.clone());
+        reopened.durable = Arc::new(restored);
+        reopened.workspace_model = settled.clone();
+        reopened.refresh_sidebar_channels();
+        assert_eq!(channel_rows(&reopened), channel_rows(&app));
+        assert_eq!(reopened.durable.active_channel, created.last().copied());
+        drop(
+            reopened.update(Message::ChannelUi(super::super::channel_ui::Action::Open(
+                saved[2].id,
+            ))),
+        );
+        assert_eq!(reopened.workspace.focused(), Some(draft_card));
+        assert_eq!(
+            reopened.persistent_workspace().chat_drafts[&draft_card],
+            draft
+        );
+        restored_session.shutdown();
+        // Another window derives exactly the same order from authoritative IDs.
+        let (mut peer, _, _) = app_with_project();
+        peer.sidebar_model = app.sidebar_model.clone();
+        peer.workspace_model = settled;
+        drop(peer.reconcile_workspace_model());
+        assert_eq!(channel_rows(&peer), channel_rows(&app));
+        // Activity and ordinary reopening are not a creation or reorder intent.
+        let before = channel_rows(&app);
+        drop(app.handle_channel_ui(super::super::channel_ui::Action::Open(saved[2].id)));
+        app.refresh_sidebar_channels();
+        assert_eq!(channel_rows(&app), before);
+        assert!(
+            matches!(crate::sidebar::workspace_cycle(&app.sidebar_model, &app.sidebar_state)[0], SidebarAction::OpenChannel { channel_id } if channel_id == created[5])
+        );
+    }
+
+    #[test]
+    fn folded_remote_creations_and_pending_rank_ceiling_keep_newest_first_without_wrap() {
+        let (mut app, project, repository) = app_with_project();
+        app.workspace_model = registry(Vec::new());
+        let ids: Vec<_> = (0..6).map(|_| ChannelId::new()).collect();
+        for (index, id) in ids.iter().enumerate() {
+            drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+                sequence: index as u64 + 1,
+                edit: ModelEdit::CreateChannel {
+                    id: *id,
+                    repository: repository.clone(),
+                    title: format!("Remote {index}"),
+                    title_source: Default::default(),
+                },
+            }));
+            let rows =
+                crate::sidebar::channels_in_display_order(&app.sidebar_model.projects[0].channels);
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                ids[..=index].iter().rev().copied().collect::<Vec<_>>()
+            );
+        }
+        let old = ChannelId::new();
+        let mut high = local(old, project, "Last authoritative rank", PENDING_ORDINAL - 1);
+        high.shared = true;
+        Arc::make_mut(&mut app.durable).channels.insert(0, high);
+        app.workspace_model.channels.insert(
+            0,
+            shared(
+                old,
+                &repository,
+                "Last authoritative rank",
+                PENDING_ORDINAL - 1,
+            ),
+        );
+        app.sort_durable_channels();
+        app.refresh_sidebar_channels();
+        let rows =
+            crate::sidebar::channels_in_display_order(&app.sidebar_model.projects[0].channels);
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            ids.iter().rev().copied().chain([old]).collect::<Vec<_>>()
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .filter(|channel| channel.id != old)
+                .all(|channel| channel.ordinal == PENDING_ORDINAL)
+        );
+        assert_eq!(
+            app.next_provisional_ordinal(),
+            PENDING_ORDINAL,
+            "saturation stays explicitly pending rather than wrapping into an older authoritative rank"
+        );
+    }
+
+    #[test]
     fn the_registry_rank_replaces_the_provisional_one_and_records_the_sharing() {
         let (mut app, project, _repository) = app_with_project();
         let id = ChannelId::new();
+        app.workspace_model = registry(Vec::new());
         let provisional = app.next_provisional_ordinal();
         Arc::make_mut(&mut app.durable)
             .channels
             .push(local(id, project, "", provisional));
         assert_ne!(provisional, 11);
 
-        let _ = app.apply_workspace_model_update(ModelUpdate::Ranked {
-            channel: id,
-            ordinal: 11,
-        });
+        let _ = app.apply_workspace_model_update(rank_receipt(&app, id, 11, 1));
 
         let ranked = app
             .durable

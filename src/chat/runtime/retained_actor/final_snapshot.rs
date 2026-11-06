@@ -11,7 +11,6 @@ use crate::{
 use serde::{Deserialize, Serialize};
 use std::os::unix::fs::OpenOptionsExt;
 use std::{
-    fs::File,
     io::{Read, Write},
     path::PathBuf,
 };
@@ -86,6 +85,12 @@ pub(super) fn save(
     }
     save_at(&path(&identity.record)?, &bytes)
 }
+/// Publishes a complete receipt by rename, without fsync. Receipts live in the
+/// runtime directory beside the boot-bound holder records that validate them,
+/// so only readers in the same boot exist, and the page cache serves those
+/// across any daemon crash or upgrade. The helper publishes from its single
+/// request loop, where an fsync can take seconds on a disk-backed runtime
+/// directory and expire the `close` or `retire` request (#2180).
 fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
     let parent = path.parent().ok_or("Missing final snapshot directory")?;
     let temporary = parent.join(format!(".actor-final-{}", uuid::Uuid::new_v4()));
@@ -97,13 +102,8 @@ fn save_at(path: &std::path::Path, bytes: &[u8]) -> Result<(), String> {
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&temporary)
             .map_err(|error| error.to_string())?;
-        file.write_all(bytes)
-            .and_then(|()| file.sync_all())
-            .map_err(|error| error.to_string())?;
-        std::fs::rename(&temporary, &path).map_err(|error| error.to_string())?;
-        File::open(parent)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string())
+        file.write_all(bytes).map_err(|error| error.to_string())?;
+        std::fs::rename(&temporary, path).map_err(|error| error.to_string())
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temporary);
@@ -120,8 +120,15 @@ pub(super) fn read(
     Ok(receipt.snapshot)
 }
 fn read_receipt(record: &Record) -> Result<Receipt, String> {
-    let file = crate::secure_file::open_existing_private_file_readonly(&path(record)?)
-        .map_err(|error| error.to_string())?;
+    read_receipt_if_published(record)?
+        .ok_or_else(|| "The helper has not published its final retained snapshot".into())
+}
+fn read_receipt_if_published(record: &Record) -> Result<Option<Receipt>, String> {
+    let file = match crate::secure_file::open_existing_private_file_readonly(&path(record)?) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
     let mut bytes = Vec::new();
     file.take((MAX_FRAME + 1) as u64)
         .read_to_end(&mut bytes)
@@ -130,7 +137,7 @@ fn read_receipt(record: &Record) -> Result<Receipt, String> {
         return Err("Final retained snapshot is oversized".into());
     }
     let receipt: Receipt = serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
-    Ok(receipt)
+    Ok(Some(receipt))
 }
 fn validate_publication(
     receipt: &Receipt,
@@ -184,7 +191,12 @@ pub(super) fn close_proved(
     if !execution_exit::identity_absent(&identity.record.root)? {
         return Ok(false);
     }
-    read(identity, proof, source).map(|_| true)
+    // The helper publishes after its provider exits. Until then, closure is
+    // unproved rather than an error that would hide why the close failed.
+    let Some(receipt) = read_receipt_if_published(&identity.record)? else {
+        return Ok(false);
+    };
+    validate_publication(&receipt, identity, proof, source).map(|()| true)
 }
 const MAX_RETIREMENT: usize = 256 * 1024;
 #[derive(Serialize, Deserialize)]
@@ -420,9 +432,7 @@ pub(crate) fn remove(record: &Record) -> Result<(), String> {
         Err(error) => return Err(error.to_string()),
     }
     match std::fs::remove_file(&path) {
-        Ok(()) => File::open(path.parent().ok_or("Missing final snapshot directory")?)
-            .and_then(|file| file.sync_all())
-            .map_err(|error| error.to_string()),
+        Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.to_string()),
     }
@@ -509,6 +519,18 @@ mod tests {
         );
         receipt.snapshot.exited = false;
         assert!(validate_publication(&receipt, &identity, &proof, &source).is_err());
+    }
+    #[test]
+    fn an_unpublished_final_snapshot_leaves_close_unproved() {
+        let actor = RemoteActor::fixture();
+        let mut identity = actor.identity();
+        identity.record.root = reaped_process();
+        let proof = actor.proof();
+        let mut source = super::super::transport::fixture_source();
+        source.id = identity.record.terminal;
+        source.proof = Some(proof.clone());
+        assert_eq!(close_proved(&identity, &proof, &source), Ok(false));
+        assert!(read(&identity, &proof, &source).is_err());
     }
     #[test]
     fn retirement_cross_checks_final_tuple_without_reopening_a_removed_account_home() {
@@ -902,7 +924,7 @@ os.waitpid(pid,0)
     }
 
     #[test]
-    fn final_publication_is_private_durable_and_bound_to_the_exact_actor() {
+    fn final_publication_is_private_and_bound_to_the_exact_actor() {
         use std::os::unix::fs::PermissionsExt;
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let path = directory.path().join("final");

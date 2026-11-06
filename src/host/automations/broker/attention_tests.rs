@@ -81,6 +81,27 @@ fn retry_due(transfer: &mut AttentionTransfer) {
 }
 
 #[test]
+fn an_idle_tick_reads_past_another_connections_write_lock() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("registry.sqlite3");
+    let registry: agent_execution::SharedRegistry =
+        Arc::new(Mutex::new(Registry::at(&path).unwrap()));
+    let writer = rusqlite::Connection::open(&path).unwrap();
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+
+    let started = Instant::now();
+    let delay = AttentionTransfer::default().pump(&registry, None).unwrap();
+
+    assert_eq!(delay, None);
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "idle tick waited {:?} on the write lock",
+        started.elapsed()
+    );
+    writer.execute_batch("ROLLBACK").unwrap();
+}
+
+#[test]
 fn stopped_and_full_journals_keep_source_pending_and_retry_without_hot_enqueue() {
     for full in [false, true] {
         let (directory, registry, _) = fixture();
@@ -169,11 +190,20 @@ fn journal_write_failure_keeps_source_until_a_later_real_commit() {
     let path = directory.path().join("notices.sqlite3");
     let (notifications, mut journal) = JournalTestBridge::new(&path).unwrap();
     let mut transfer = AttentionTransfer::default();
+    let original = registry
+        .lock()
+        .unwrap()
+        .pending_automation_attention(100)
+        .unwrap()[0]
+        .receipt;
     transfer.pump(&registry, Some(&notifications)).unwrap();
     let connection = rusqlite::Connection::open(&path).unwrap();
     connection.execute_batch("DROP TABLE seen").unwrap();
     assert!(journal.commit_next(&Preferences::default(), false).is_err());
-    transfer.pump(&registry, Some(&notifications)).unwrap();
+    assert_eq!(
+        transfer.pump(&registry, Some(&notifications)).unwrap(),
+        Some(Duration::from_secs(1))
+    );
     assert!(transfer.in_flight.is_empty());
     assert_eq!(
         registry
@@ -184,11 +214,36 @@ fn journal_write_failure_keeps_source_until_a_later_real_commit() {
             .len(),
         1
     );
+    retry_due(&mut transfer);
+    assert_eq!(
+        transfer.pump(&registry, Some(&notifications)).unwrap(),
+        Some(Duration::from_millis(250))
+    );
+    assert_eq!(transfer.retry_delay, Duration::from_secs(1));
+    assert!(journal.commit_next(&Preferences::default(), false).is_err());
+    assert_eq!(
+        transfer.pump(&registry, Some(&notifications)).unwrap(),
+        Some(Duration::from_secs(2))
+    );
+    assert!(transfer.in_flight.is_empty());
+    let pending = registry
+        .lock()
+        .unwrap()
+        .pending_automation_attention(100)
+        .unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].receipt, original);
     connection.execute_batch("CREATE TABLE seen(session TEXT NOT NULL,evidence TEXT NOT NULL,ordinal INTEGER PRIMARY KEY AUTOINCREMENT,UNIQUE(session,evidence))").unwrap();
     retry_due(&mut transfer);
     transfer.pump(&registry, Some(&notifications)).unwrap();
     journal.commit_next(&Preferences::default(), false).unwrap();
-    transfer.pump(&registry, Some(&notifications)).unwrap();
+    assert_eq!(
+        transfer.pump(&registry, Some(&notifications)).unwrap(),
+        None
+    );
+    assert!(transfer.in_flight.is_empty());
+    assert!(transfer.retry_at.is_none());
+    assert!(transfer.retry_delay.is_zero());
     assert!(
         registry
             .lock()

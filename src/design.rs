@@ -127,6 +127,11 @@ pub use crate::layout_metrics::{
 };
 pub const NAVIGATION_RAIL_WIDTH: f32 = 52.0;
 
+/// The band along a free window edge in which the window shell, not the
+/// interface, receives presses and starts an interactive resize. It is in the
+/// compositor's logical pixels, before the interface scale.
+pub const WINDOW_RESIZE_BORDER: f32 = 8.0;
+
 /// Shared gutter geometry for native scrollables and custom-rendered content.
 ///
 /// The three constants are one contract, not three independent numbers. A

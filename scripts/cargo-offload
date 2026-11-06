@@ -1,0 +1,1855 @@
+#!/usr/bin/env python3
+"""Run a gated Cargo command on the build host instead of this one.
+
+scripts/cargo-gate runs this before anything else. Rust compiles only on the
+host in CAGENTS_BUILD_REMOTE, unless that is `local` or names this host. A
+command that compiles leases a build slot there, copies the
+checkout's sources into it, and runs Cargo there with its output streamed
+back and its exit status kept. What a caller here expects from it comes back:
+executables, documentation, timing reports, artifact directories, fixes to
+the sources, and Cargo's messages with their paths turned into this host's.
+`run` builds there and runs the program here.
+
+Each slot's checkout path never changes, so every worktree built in a slot
+reuses what the previous one compiled there, and the slot a worktree used
+last is preferred. While the host is unreachable, does not answer or is low
+on disk, the command waits for it, saying so once a minute, within the gate's
+admission budget; it never builds here instead. Cargo commands that do not
+compile run here directly. A command that compiles but cannot run there
+faithfully is refused with the reason.
+"""
+
+import base64
+import hashlib
+import ipaddress
+import json
+import os
+import queue
+import resource
+from pathlib import Path
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+# The gate builds here: CAGENTS_BUILD_REMOTE is `local` or names this host.
+FALL_BACK = 75
+# A command the build host cannot run faithfully, which building here would hide.
+REFUSED = 78
+# The build host could not lease a slot for a reason waiting does not fix.
+UNAVAILABLE = 69
+# The admission budget ran out, as for a slot here.
+EXPIRED = 124
+program = "cargo-gate"
+OPT_OUT = "set CAGENTS_BUILD_REMOTE=local to build here instead"
+
+# Subcommands, and their aliases, that compile.
+REMOTE = {
+    "build": "build", "b": "build", "check": "check", "c": "check", "clippy": "clippy",
+    "test": "test", "t": "test", "bench": "bench", "doc": "doc", "d": "doc",
+    "rustc": "rustc", "rustdoc": "rustdoc", "run": "run", "r": "run", "fix": "fix",
+}
+# Subcommands that read or change only this checkout, the lock file or
+# Cargo's caches, and compile nothing: they run here as they are.
+HERE = {
+    "metadata", "tree", "fmt", "locate-project", "pkgid", "fetch", "generate-lockfile",
+    "update", "vendor", "clean", "search", "version", "help", "verify-project",
+    "read-manifest", "config", "info", "add", "remove", "new", "init", "owner", "yank",
+    "login", "logout", "report", "-V", "--version", "-vV", "--list", "-h", "--help",
+}
+# Options that take a value in the next argument when not given with `=`.
+VALUED = {
+    "-p", "--package", "--bin", "--example", "--test", "--bench", "-F", "--features",
+    "-j", "--jobs", "--profile", "--target", "--target-dir", "--manifest-path",
+    "--message-format", "--color", "--config", "-Z", "--lockfile-path", "--artifact-dir",
+    "--out-dir", "--exclude", "--crate-type", "--explain", "--edition",
+}
+# Options whose value is a path, which the build host has at the same place
+# in its copy of the checkout. `--config` and `--target` take a path only
+# sometimes.
+PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir", "--out-dir"}
+# Settings naming a path that only this repository's scripts read, never a
+# build or its tests; they stay here.
+SCRIPT_SETTINGS = {"CAGENTS_ZIG"}
+RUN_MARKER = "cargo-offload-run "
+DIRECTORIES_MARKER = "cargo-offload-directories "
+
+
+class Refusal(Exception):
+    """The command compiles, but the build host cannot run it faithfully."""
+
+
+class Plan:
+    """A Cargo command line, read for what has to travel to the build host
+    and what has to come back."""
+
+    def __init__(self, arguments):
+        self.toolchain = None
+        if arguments and arguments[0].startswith("+"):
+            self.toolchain, arguments = arguments[0], arguments[1:]
+        self.name = arguments[0]
+        self.subcommand = REMOTE[self.name]
+        # (option, value, attached) for each option before `--`; a bare
+        # argument is (None, argument, False).
+        self.options = []
+        self.program = []
+        self.trailing = []
+        words = arguments[1:]
+        index = 0
+        while index < len(words):
+            word = words[index]
+            index += 1
+            if word == "--":
+                if self.subcommand == "run":
+                    self.program = words[index:]
+                else:
+                    self.trailing = words[index - 1:]
+                break
+            if word.startswith("--") and "=" in word:
+                option, value = word.split("=", 1)
+                self.options.append((option, value, True))
+            elif word in VALUED and index < len(words):
+                self.options.append((word, words[index], False))
+                index += 1
+            elif len(word) > 2 and word[0] == "-" and word[1] != "-" and word[:2] in VALUED:
+                self.options.append((word[:2], word[2:], True))
+            elif not word.startswith("-") and self.subcommand == "run":
+                # `cargo run` passes its first bare argument and everything
+                # after it to the program.
+                self.program = words[index - 1:]
+                break
+            else:
+                self.options.append((None, word, False) if not word.startswith("-")
+                                    else (word, None, False))
+
+    def values(self, option):
+        return [value for name, value, _ in self.options if name == option]
+
+    def flag(self, option):
+        return any(name == option for name, _, _ in self.options)
+
+    @property
+    def message_format(self):
+        formats = self.values("--message-format")
+        return ",".join(formats) if formats else None
+
+    @property
+    def caller_wants_json(self):
+        return any(part.strip().startswith("json") for part in (self.message_format or "").split(","))
+
+    @property
+    def no_run(self):
+        return self.flag("--no-run")
+
+    @property
+    def fixes(self):
+        return self.subcommand == "fix" or self.flag("--fix")
+
+    @property
+    def timings(self):
+        return self.flag("--timings")
+
+    @property
+    def executables(self):
+        """Whether the executables the command makes are its result here."""
+        return self.subcommand in ("build", "rustc", "run") or (
+            self.subcommand in ("test", "bench") and self.no_run)
+
+    @property
+    def captures(self):
+        """Whether Cargo's standard output is read here: for the executables
+        it reports, or to turn the build host's paths in its messages into
+        this host's."""
+        return (self.executables or self.caller_wants_json or self.flag("--open")
+                or self.flag("--unit-graph") or self.flag("--build-plan"))
+
+    def arguments(self, translate, extra):
+        """The command line for the build host: paths translated, the
+        message format this side reads, and `extra` options."""
+        words = [self.toolchain] if self.toolchain else []
+        words.append(self.name)
+        formats = []
+        for option, value, attached in self.options:
+            if option == "--message-format":
+                formats.append(value)
+                continue
+            if option == "--open":
+                continue  # This host opens the documentation, not the build host.
+            if value is not None and option is not None:
+                value = translate(option, value)
+            if option is None:
+                words.append(value)
+            elif value is None:
+                words.append(option)
+            elif attached:
+                words.append(f"{option}={value}" if option.startswith("--") else option + value)
+            else:
+                words += [option, value]
+        if self.captures and not self.caller_wants_json:
+            # Cargo's diagnostics stay as the caller asked; its messages carry
+            # the executables.
+            short = "short" in ",".join(formats)
+            formats = ["json-render-diagnostics"] + (["json-diagnostic-short"] if short else [])
+        if formats:
+            words.append("--message-format=" + ",".join(formats))
+        words += extra
+        if self.subcommand == "run":
+            return words
+        return words + self.trailing
+
+
+def parse(arguments):
+    """The Plan for a command that compiles, or None for one that runs here.
+    Raises Refusal for one that compiles and cannot run on the build host."""
+    words = arguments[1:] if arguments[:1] and arguments[0].startswith("+") else arguments
+    if not words or words[0] in HERE:
+        return None
+    if words[0].startswith("-"):
+        raise Refusal(f"`cargo {' '.join(arguments)}`: options before the subcommand are not "
+                      f"passed to the build host; put them after it, or {OPT_OUT}")
+    if words[0] not in REMOTE:
+        raise Refusal(f"`cargo {words[0]}` may compile, and only the build host compiles; "
+                      f"it has no offloaded form, so {OPT_OUT}")
+    plan = Plan(arguments)
+    if plan.subcommand == "doc" and plan.flag("--open") and plan.caller_wants_json:
+        raise Refusal(f"`cargo doc --open` with JSON messages is not supported; {OPT_OUT}")
+    return plan
+
+
+def artifacts(messages, roots):
+    """The executables Cargo reported, by which of the directories `roots`
+    holds them (the innermost), as paths relative to it: programs, examples
+    and test harnesses, not build scripts. Cargo reports test harnesses in its
+    build directory, which its configuration may keep apart from the target
+    directory."""
+    roots = sorted(dict.fromkeys(root.rstrip("/") for root in roots), key=len, reverse=True)
+    found = {root: [] for root in roots}
+    for message in messages:
+        if isinstance(message, str):
+            try:
+                message = json.loads(message)
+            except ValueError:
+                continue
+        if not isinstance(message, dict) or message.get("reason") != "compiler-artifact":
+            continue
+        executable = message.get("executable")
+        kinds = (message.get("target") or {}).get("kind") or []
+        if "custom-build" in kinds:
+            continue
+        if not isinstance(executable, str):
+            continue
+        root = next((root for root in roots if executable.startswith(root + "/")), None)
+        if root is None:
+            continue
+        relative = executable[len(root) + 1:]
+        if relative not in found[root] and ".." not in relative.split("/"):
+            found[root].append(relative)
+    return {root: made for root, made in found.items() if made}
+
+
+def rewrite(value, mappings):
+    """`value` with every string that names a path under one of the build
+    host's directories naming the same path under this host's."""
+    if isinstance(value, str):
+        # Package IDs name a path package by its URL.
+        for scheme in ("path+file://", "file://"):
+            if value.startswith(scheme + "/"):
+                path, mark, rest = value[len(scheme):].partition("#")
+                return scheme + rewrite(path, mappings) + mark + rest
+        for remote, local in mappings:
+            if value == remote or value.startswith(remote + "/"):
+                return local + value[len(remote):]
+        # Search paths a build script gives, such as `native=/path`.
+        kind, mark, path = value.partition("=")
+        if mark and path.startswith("/") and kind.isidentifier():
+            changed = rewrite(path, mappings)
+            if changed != path:
+                return kind + mark + changed
+        return value
+    if isinstance(value, list):
+        return [rewrite(item, mappings) for item in value]
+    if isinstance(value, dict):
+        return {key: rewrite(item, mappings) for key, item in value.items()}
+    return value
+
+
+def forwarded_environment(environment):
+    """The caller's settings that change what Cargo, rustc or the tests do,
+    without paths on this host or this host's build-slot settings."""
+    kept = {}
+    for name, value in environment.items():
+        if name.startswith(("RUST_", "CARGO_TERM_", "CARGO_PROFILE_")) or name in (
+            "RUSTFLAGS", "RUSTDOCFLAGS", "CARGO_INCREMENTAL", "CARGO_ENCODED_RUSTFLAGS",
+            "CARGO_ENCODED_RUSTDOCFLAGS", "NEXTEST_PROFILE",
+        ):
+            kept[name] = value
+        elif name.startswith("CAGENTS_") and not name.startswith("CAGENTS_BUILD_") \
+                and not value.startswith(("/", "~")) and not secret(name):
+            kept[name] = value
+    return kept
+
+
+def secret(name):
+    """Whether a setting looks like a credential, which stays on this host."""
+    return any(word in name.upper() for word in ("TOKEN", "KEY", "SECRET", "PASS", "AUTH", "CREDENTIAL", "COOKIE"))
+
+
+def path_settings(environment):
+    """Settings naming a file on this host that the build or its tests read,
+    such as the retained-actor helper the HOST tests execute."""
+    return [name for name, value in sorted(environment.items())
+            if name.startswith("CAGENTS_") and not name.startswith("CAGENTS_BUILD_")
+            and name not in SCRIPT_SETTINGS and value.startswith(("/", "~"))
+            and not secret(name)]
+
+
+def inside(path, root):
+    return os.path.commonpath([path, root]) == root
+
+
+def build_metadata(root, version, environment):
+    """The version stamp build.rs would give this checkout, which the build
+    host's copy, having no Git history, cannot work out itself."""
+    given = environment.get("CAGENTS_BUILD_METADATA", "").strip()
+    if given:
+        return given
+
+    def git(*arguments):
+        result = subprocess.run(
+            ["git", "-C", root, *arguments], capture_output=True, text=True,
+            env=dict(environment, GIT_OPTIONAL_LOCKS="0"),
+        )
+        return result.stdout.strip() if result.returncode == 0 else None
+
+    sha = git("rev-parse", "--short", "HEAD")
+    if not sha:
+        return None
+    dirty = bool(git("status", "--porcelain", "--untracked-files=no"))
+    tags = (git("tag", "--points-at", "HEAD") or "").splitlines()
+    if f"v{version}" in tags and not dirty:
+        return None
+    return f"local.{sha}.dirty" if dirty else f"local.{sha}"
+
+
+def uncommitted(top, workspace, environment):
+    """The workspace's files with changes that are not staged, and those with
+    staged changes, as `cargo fix` judges a checkout before changing it."""
+    result = subprocess.run(
+        ["git", "-C", top, "status", "--porcelain=v1", "-z", "--untracked-files=all", "--",
+         workspace],
+        capture_output=True, env=dict(environment, GIT_OPTIONAL_LOCKS="0"), check=True)
+    dirty, staged = [], []
+    entries = iter(result.stdout.split(b"\0"))
+    for entry in entries:
+        if not entry:
+            continue
+        state, name = entry[:2].decode(), os.fsdecode(entry[3:])
+        if state[0] in "RC":
+            next(entries, None)  # The rename's source.
+        if state == "??" or state[1] != " ":
+            dirty.append(name)
+        if state[0] not in " ?":
+            staged.append(name)
+    return dirty, staged
+
+
+def profile_config(path):
+    """This user's Cargo profile settings as TOML for the build host, which
+    builds the same profiles. Build settings such as jobs and build-dir
+    describe this host and stay here."""
+    try:
+        import tomllib
+        with open(path, "rb") as file:
+            profiles = tomllib.load(file).get("profile", {})
+    except (OSError, ValueError, ImportError):
+        return ""
+
+    def key(name):
+        return name if name.replace("-", "").replace("_", "").isalnum() else json.dumps(name)
+
+    def value(item):
+        if isinstance(item, bool):
+            return "true" if item else "false"
+        if isinstance(item, (int, float)):
+            return str(item)
+        if isinstance(item, str):
+            return json.dumps(item)
+        if isinstance(item, list):
+            return "[" + ", ".join(value(element) for element in item) + "]"
+        raise ValueError(item)
+
+    lines = []
+
+    def table(names, entries):
+        scalars = {name: item for name, item in entries.items() if not isinstance(item, dict)}
+        if scalars:
+            lines.append("[" + ".".join(key(name) for name in names) + "]")
+            for name, item in scalars.items():
+                lines.append(f"{key(name)} = {value(item)}")
+        for name, item in entries.items():
+            if isinstance(item, dict):
+                table(names + [name], item)
+
+    try:
+        table(["profile"], profiles)
+    except ValueError:
+        return ""
+    return "\n".join(lines) + "\n" if lines else ""
+
+
+def local_addresses():
+    """This host's network addresses."""
+    try:
+        listing = subprocess.run(["ip", "-j", "address", "show"], capture_output=True,
+                                 text=True, timeout=5).stdout
+        return {entry["local"] for interface in json.loads(listing)
+                for entry in interface.get("addr_info", []) if "local" in entry}
+    except (OSError, ValueError, subprocess.TimeoutExpired, KeyError, TypeError):
+        return set()
+
+
+def is_this_host(host):
+    """Whether `host`, as ssh reaches it, is this machine: the build host's own
+    builds run here."""
+    names = {socket.gethostname(), os.uname().nodename}
+    short = {name.split(".")[0] for name in names}
+    if host in names or host.split(".")[0] in short:
+        return True
+    try:
+        configuration = subprocess.run(["ssh", "-G", host], capture_output=True, text=True,
+                                       timeout=5, stdin=subprocess.DEVNULL).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    resolved = next((line.split(None, 1)[1] for line in configuration.splitlines()
+                     if line.startswith("hostname ")), host).strip()
+    if resolved in names or resolved.split(".")[0] in short:
+        return True
+    try:
+        addresses = {str(ipaddress.ip_address(resolved))}
+    except ValueError:
+        # A name: a resolver that does not know it can take seconds to say
+        # so, which every build would wait for.
+        found = []
+        lookup = threading.Thread(target=resolve, args=(resolved, found), daemon=True)
+        lookup.start()
+        lookup.join(1)
+        addresses = set(found)
+    return bool(addresses & (local_addresses() | {"127.0.0.1", "::1"}))
+
+
+def resolve(name, found):
+    try:
+        found.extend(info[4][0] for info in socket.getaddrinfo(name, None))
+    except (OSError, UnicodeError):
+        pass
+
+
+def real_cargo(environment):
+    """This host's Cargo: the first on PATH, from which the gate has taken an
+    `exec` command's `cargo` shim, unless CAGENTS_BUILD_CARGO names one."""
+    return environment.get("CAGENTS_BUILD_CARGO") or "cargo"
+
+
+# Runs on the build host as `python3 -c REMOTE_AGENT COMMAND ...`. Every
+# command ends with what it started when its standard input closes: the
+# connection to this host dropped or the gate here was cancelled.
+REMOTE_AGENT = r'''
+import fcntl, hashlib, json, os, resource, shutil, signal, stat, subprocess, sys, threading, time
+command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
+DIRECTORIES_MARKER = "cargo-offload-directories "
+
+def until_closed(then):
+    def watch():
+        try:
+            while sys.stdin.buffer.read(65536):
+                pass
+        except OSError:
+            pass
+        then()
+    threading.Thread(target=watch, daemon=True).start()
+
+def say(*words):
+    print(*words, flush=True)
+
+def temporary_directory(slot):
+    """A short private directory for the slot's temporary files, or one in
+    the slot when the short one is unsafe. Tests bind Unix sockets several
+    levels under it, within 108 bytes, so the HOST fixtures want a base of at
+    most 28 bytes (docs/development.md). As in that document's recipe, it is
+    in the user's runtime directory: agent sandboxes leave `.git`
+    placeholders in /tmp, /var/tmp and ~/.cache, under which recovery
+    placement refuses by design, and fixtures refuse roots inside the home
+    directory. A host test lane leaves about 12 MB there, which the next
+    command in the slot removes."""
+    # The variable is for tests standing in for the build host; ssh does not
+    # pass it on.
+    runtime = os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}"
+    private = os.environ.get("CAGENTS_OFFLOAD_TEMPORARY_ROOT") or os.path.join(runtime, "cof")
+    try:
+        os.mkdir(private, 0o700)
+    except FileExistsError:
+        pass
+    except OSError:
+        return os.path.join(slot, "tmp")
+    status = os.lstat(private)
+    if not stat.S_ISDIR(status.st_mode) or status.st_uid != os.getuid() or status.st_mode & 0o077:
+        return os.path.join(slot, "tmp")
+    index = os.path.basename(slot).removeprefix("slot-")
+    path = os.path.join(private, os.path.basename(os.path.dirname(slot)) + "-" + index)
+    if len(path) > 28:
+        # A long repository name: a short digest of the slot keeps the base
+        # within the fixtures' budget.
+        digest = hashlib.sha256(os.fsencode(slot)).hexdigest()[:6]
+        path = os.path.join(private, f"{digest}-{index}")
+    return path
+
+
+def clear(root):
+    """Removes a directory tree, including directories a test left without
+    owner permissions, changing permissions only inside the tree."""
+    def inside(path):
+        return os.path.commonpath([root, path]) == root
+    def retry(function, failed, _error):
+        unlocked = False
+        for directory in (os.path.dirname(failed), failed):
+            if inside(directory) and os.path.isdir(directory) and not os.path.islink(directory):
+                try:
+                    os.chmod(directory, 0o700)
+                    unlocked = True
+                except OSError:
+                    pass
+        if not unlocked:
+            return
+        try:
+            if os.path.isdir(failed) and not os.path.islink(failed):
+                if failed != root:
+                    remove(failed)
+            else:
+                function(failed)
+        except OSError:
+            pass
+    def remove(path):
+        if sys.version_info >= (3, 12):
+            shutil.rmtree(path, onexc=retry)
+        else:
+            shutil.rmtree(path, onerror=retry)
+    if os.path.lexists(root):
+        remove(root)
+    # A test may have locked the root itself, which rmtree cannot open; one
+    # more pass after unlocking it.
+    if os.path.isdir(root) and not os.path.islink(root):
+        try:
+            os.chmod(root, 0o700)
+        except OSError:
+            return
+        remove(root)
+
+
+GIB = 2**30
+# A build whose cost is unknown, and a slot leased without one, is priced as
+# the largest: a UI link, as scripts/cargo-gate measures it.
+LARGEST = 9 * GIB
+# Memory pressure (`some avg10` in /proc/pressure/memory, a percentage) at
+# which a build waits rather than start beside others: tasks are already
+# stalling on reclaim.
+MEMORY_PRESSURE_LIMIT = 10
+# The least any build is priced at: even a check of one crate runs rustc and
+# Cargo beside the build's other processes.
+LEAST = 2 * GIB
+# CPU pressure (`some avg10` in /proc/pressure/cpu) at which a build waits
+# rather than start beside others: runnable tasks already wait this share of
+# the time, so another build would only slow the running ones.
+CPU_PRESSURE_LIMIT = 40
+# What a further slot's build output is expected to take on disk, beyond the
+# floor the host keeps free, before one is made. The variable is for tests
+# standing in for the build host; ssh does not pass it on.
+SLOT_DISK = int(os.environ.get("CAGENTS_OFFLOAD_SLOT_DISK_BYTES") or 50 * GIB)
+# Where memory and CPU figures are read. This too is for tests, whose results
+# must not depend on how busy the host running them is.
+FIGURES = os.environ.get("CAGENTS_OFFLOAD_FIGURES") or "/proc"
+# How long a new slot is taken to be filling to that size.
+SLOT_FILLS = 12 * 3600
+
+
+def available_memory():
+    try:
+        with open(f"{FIGURES}/meminfo") as file:
+            for line in file:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def memory_pressure(resource="memory"):
+    try:
+        with open(f"{FIGURES}/pressure/{resource}") as file:
+            for line in file:
+                if line.startswith("some "):
+                    return float(line.split("avg10=")[1].split()[0])
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+def resident(roots):
+    """The resident memory of each process tree rooted at a pid in `roots`."""
+    parent, size = {}, {}
+    page = os.sysconf("SC_PAGE_SIZE")
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as file:
+                fields = file.read().rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        parent[int(name)] = int(fields[1])
+        size[int(name)] = int(fields[21]) * page
+    held = dict.fromkeys(roots, 0)
+    for pid, rss in size.items():
+        node = pid
+        while node not in held and node in parent and node > 1:
+            node = parent[node]
+        if node in held:
+            held[node] += rss
+    return held
+
+
+def read_claim(slot):
+    try:
+        with open(os.path.join(slot, "claim")) as file:
+            claimed = json.load(file)
+        return claimed if isinstance(claimed, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def claim(slot):
+    """What a leased slot's build is expected to need and the process its
+    command runs as, once it has started."""
+    claimed = read_claim(slot)
+    try:
+        return int(claimed.get("cost") or LARGEST), claimed.get("pid")
+    except (ValueError, TypeError):
+        return LARGEST, None
+
+
+def slot_indices(base):
+    """The slots made so far, in order."""
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return []
+    return sorted(int(name[5:]) for name in names
+                  if name.startswith("slot-") and name[5:].isdigit())
+
+
+def leased(slot):
+    """Whether a build holds `slot`."""
+    try:
+        with open(os.path.join(slot, "lock"), "a") as lock:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return True
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            return False
+    except OSError:
+        return False
+
+
+def room(base, mine, cost):
+    """None when a build expected to need `cost` bytes fits beside the builds
+    in the other leased slots, as scripts/cargo-gate admits builds on its
+    host: the memory available now, less what those builds are expected to
+    take beyond what they already hold, covers it, and neither the memory nor
+    the CPUs are under pressure. A lone build always fits. Otherwise why it
+    waits."""
+    others = []
+    for index in slot_indices(base):
+        slot = os.path.join(base, f"slot-{index}")
+        if slot != mine and leased(slot):
+            others.append(claim(slot))
+    if not others:
+        return None
+    pressure = memory_pressure()
+    if pressure is not None and pressure >= MEMORY_PRESSURE_LIMIT:
+        return f"pressure {pressure:.0f} {MEMORY_PRESSURE_LIMIT}"
+    pressure = memory_pressure("cpu")
+    if pressure is not None and pressure >= CPU_PRESSURE_LIMIT:
+        return f"cpu {pressure:.0f} {CPU_PRESSURE_LIMIT}"
+    available = available_memory()
+    if available is None:
+        return None
+    held = resident([pid for _, pid in others if isinstance(pid, int)])
+    outstanding = sum(max(0, need - held.get(pid, 0)) for need, pid in others)
+    if available - outstanding >= cost:
+        return None
+    return f"memory {max(0, available - outstanding) / GIB:.1f} {cost / GIB:.1f} {len(others)}"
+
+
+def enclosing_checkout(path):
+    """A Git marker above `path`, under which tests that check Git ancestry
+    fail, or None."""
+    while path != os.path.dirname(path):
+        path = os.path.dirname(path)
+        if os.path.lexists(os.path.join(path, ".git")):
+            return os.path.join(path, ".git")
+    return None
+
+if command == "lease":
+    slots, key, floor = int(sys.argv[3]), sys.argv[4], int(sys.argv[5]) * 2**30
+    profiles = sys.argv[6]
+    cost = max(LEAST, int(sys.argv[7]) if len(sys.argv) > 7 and sys.argv[7] else LARGEST)
+    # The checkout and Cargo command this build is: another request for the
+    # same one waits for its slot rather than build it again elsewhere.
+    build = sys.argv[8] if len(sys.argv) > 8 else ""
+    os.makedirs(base, exist_ok=True)
+    leases = []
+    waiting_for = None
+    def release():
+        # The next build in this slot starts only once this one's command
+        # has ended, however this host's side of it was stopped.
+        if leases:
+            with open(os.path.join(leases[0], "running"), "a") as running:
+                fcntl.flock(running, fcntl.LOCK_EX)
+        os._exit(0)
+    until_closed(release)
+    # Waiters line up on a queue lock, and the one at its head takes the
+    # first slot that frees.
+    # Tests cannot run faithfully under a stray Git marker; the caller learns
+    # of one before waiting for a slot.
+    marker = enclosing_checkout(temporary_directory(os.path.join(base, "slot-0")))
+    if marker:
+        say("marker", json.dumps(marker))
+    announced = False
+    def join_queue():
+        global announced
+        queue = open(os.path.join(base, "queue"), "a")
+        try:
+            fcntl.flock(queue, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            say("wait")
+            announced = True
+            fcntl.flock(queue, fcntl.LOCK_EX)
+        return queue
+    queue = join_queue()
+    def owner(index):
+        try:
+            with open(os.path.join(base, f"slot-{index}", "owner")) as file:
+                return file.read().strip()
+        except OSError:
+            return ""
+    # This checkout's last slot, then one another checkout built in, whose
+    # compiled dependencies it shares, then an empty one. Up to `slots` are
+    # made, each only while the disk holds another build's output beside the
+    # floor; how many build at once is then down to memory and CPU, below.
+    def built(index):
+        return os.path.isdir(os.path.join(base, f"slot-{index}", "src", "target"))
+    def free():
+        stat = os.statvfs(base)
+        return stat.f_bavail * stat.f_frsize
+    def candidates():
+        existing = slot_indices(base)
+        # The same build, running: once it ends, this one has nothing left
+        # to compile in its slot.
+        def claimed(index):
+            return read_claim(os.path.join(base, f"slot-{index}"))
+        same = [index for index in existing
+                if build and claimed(index).get("build") == build
+                and claimed(index).get("key") == key and leased(os.path.join(base, f"slot-{index}"))]
+        if same:
+            return same, "same"
+        indices = existing[:]
+        # The first slot is always made; the disk floor below governs it. A
+        # further one needs room for its build output beyond what the slots
+        # made lately have yet to take as they fill.
+        def growing(index):
+            try:
+                made = os.stat(os.path.join(base, f"slot-{index}", "made")).st_mtime
+            except OSError:
+                return False
+            return time.time() - made < SLOT_FILLS
+        pending = SLOT_DISK * sum(1 for index in existing if growing(index))
+        if not existing or len(existing) < slots and free() - floor - pending >= SLOT_DISK:
+            indices.append(max(existing, default=-1) + 1)
+        return sorted(indices, key=lambda index: (owner(index) != key, not built(index), index)), None
+    while True:
+        order, why = candidates()
+        if why != "same" and queue.closed:
+            # The build it waited for has ended: back in line, behind the
+            # builds that went on meanwhile.
+            queue = join_queue()
+            order, why = candidates()
+        # A slot is taken only from the head of the queue: one that waited
+        # for the same build, once it ends, gets back in line first.
+        for index in order if why != "same" else ():
+            slot = os.path.join(base, f"slot-{index}")
+            if not os.path.isdir(slot):
+                os.makedirs(os.path.join(slot, "src"), exist_ok=True)
+                open(os.path.join(slot, "made"), "a").close()
+            os.makedirs(os.path.join(slot, "src"), exist_ok=True)
+            lock = open(os.path.join(slot, "lock"), "a")
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                continue
+            break
+        else:
+            if why == "same":
+                # Out of the queue meanwhile, which other builds go on through.
+                queue.close()
+                if waiting_for != why:
+                    say("wait same")
+                    announced = True
+                    waiting_for = why
+            elif not announced:
+                say("wait")
+                announced = True
+            time.sleep(0.5)
+            continue
+        break
+    leases.append(slot)
+    # What this build is, at once, so that builds deciding meanwhile price it
+    # and do not take it for a build it is not.
+    with open(os.path.join(slot, "claim.new"), "w") as file:
+        json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
+    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
+    # At the head of the queue: the build starts once the memory it is
+    # expected to need is free beside the builds already running here.
+    waiting = None
+    while True:
+        why = room(base, slot, cost)
+        if why is None:
+            break
+        if why.split()[0] != waiting:
+            say("wait", why)
+            announced = True
+            waiting = why.split()[0]
+        time.sleep(1)
+    queue.close()
+    # A previous build's command or prune may outlive its lease's
+    # connection; nothing in the slot changes until it has ended.
+    with open(os.path.join(slot, "running"), "a") as running:
+        try:
+            fcntl.flock(running, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if not announced:
+                say("wait")
+                announced = True
+            fcntl.flock(running, fcntl.LOCK_EX)
+    if free() < floor:
+        # This slot's build output is the one this build may discard.
+        say("wait")
+        shutil.rmtree(os.path.join(slot, "src", "target"), ignore_errors=True)
+        if free() < floor:
+            say("refuse", free() // 2**30, sys.argv[5])
+            sys.exit(0)
+    # Gates from before copies were compared by content keep each file's
+    # time from the calling host, under which the slot can hold a build of
+    # other sources than its copy has. They lease the slot without this
+    # marker, which records when this kind of gate last wrote the owner: when
+    # it is missing or another lease wrote the owner since, every source file
+    # is new to Cargo once.
+    owner = os.path.join(slot, "owner")
+    marker = os.path.join(slot, "synced-by-content")
+    def stamp():
+        try:
+            return str(os.stat(owner).st_mtime_ns)
+        except OSError:
+            return ""
+    try:
+        with open(marker) as file:
+            current = file.read().strip() == stamp() != ""
+    except OSError:
+        current = False
+    if not current:
+        now = time.time()
+        for directory, names, files in os.walk(os.path.join(slot, "src")):
+            names[:] = [name for name in names if name != "target"]
+            for name in files:
+                try:
+                    os.utime(os.path.join(directory, name), (now, now), follow_symlinks=False)
+                except OSError:
+                    pass
+    with open(owner, "w") as file:
+        file.write(key + "\n")
+    with open(marker, "w") as file:
+        file.write(stamp() + "\n")
+    # Files a command's settings name on the calling host, copied in beside
+    # the checkout: from the checkout's ignored files, or its target.
+    for kind in ("checkout", "target"):
+        os.makedirs(os.path.join(slot, "inputs", kind), exist_ok=True)
+    config = os.path.join(slot, ".cargo", "config.toml")
+    os.makedirs(os.path.dirname(config), exist_ok=True)
+    try:
+        current = open(config).read()
+    except OSError:
+        current = None
+    if current != profiles:
+        with open(config + ".new", "w") as file:
+            file.write(profiles)
+        os.replace(config + ".new", config)
+    say("slot", json.dumps({"index": index, "path": os.path.realpath(slot)}))
+    while True:
+        time.sleep(3600)
+
+elif command == "prune":
+    # Removes the slot checkout's files that are not in the list on standard
+    # input, keeping Cargo's target directory.
+    source = os.path.join(base, "src")
+    keep = set(filter(None, sys.stdin.buffer.read().split(b"\0")))
+    # A cancelled build's lease is released only after this ends, as after a
+    # command, so the next build's copy cannot lose files to this walk.
+    running = open(os.path.join(base, "running"), "a")
+    fcntl.flock(running, fcntl.LOCK_EX)
+    keep_dirs = {b"."}
+    for path in keep:
+        parts = path.split(b"/")
+        for depth in range(1, len(parts)):
+            keep_dirs.add(b"/".join(parts[:depth]))
+    root = os.fsencode(source)
+    directories = []
+    for directory, names, files in os.walk(root, topdown=True):
+        relative = os.path.relpath(directory, root)
+        if relative == b".":
+            names[:] = [name for name in names if name != b"target"]
+        else:
+            directories.append((directory, os.path.normpath(relative)))
+        links = [name for name in names if os.path.islink(os.path.join(directory, name))]
+        for name in files + links:
+            if os.path.normpath(os.path.join(relative, name)) not in keep:
+                os.unlink(os.path.join(directory, name))
+        names[:] = [name for name in names if name not in links]
+    for directory, relative in reversed(directories):
+        if relative not in keep_dirs and not os.listdir(directory):
+            os.rmdir(directory)
+
+elif command == "exists":
+    # Whether a result the caller may copy back is there.
+    sys.exit(0 if os.path.exists(base) else 1)
+
+elif command == "run":
+    # The environment and limits come first on standard input, never on the command
+    # line, which every user of the host can read.
+    directory, arguments = sys.argv[3], sys.argv[4:]
+    request = json.loads(sys.stdin.buffer.readline())
+    environment = request["environment"]
+    # The command may open as many files as the host allows. An ssh
+    # session's soft limit is the conventional 1024, which fails
+    # descriptor-heavy suites, and nothing gains from a low one.
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if soft != hard:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+        except (OSError, ValueError):
+            pass  # Beyond what the kernel allows; the session's own limit stands.
+    if not request.get("core_dumps"):
+        # A crashing test or compiler leaves no core: the host's
+        # systemd-coredump stores and compresses every one it is given, which
+        # filled its disk. Only the soft limit drops, so a test that wants a
+        # core can raise it again.
+        resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
+    running = open(os.path.join(base, "running"), "a")
+    fcntl.flock(running, fcntl.LOCK_EX)
+    # Builds admitted later price this one by what its processes hold.
+    cost, _ = claim(base)
+    with open(os.path.join(base, "claim.new"), "w") as file:
+        claimed = read_claim(base)
+        json.dump({"cost": cost, "pid": os.getpid(), "build": claimed.get("build", ""),
+                   "key": claimed.get("key", "")}, file)
+    os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
+    os.chdir(os.path.join(base, "src", directory))
+    environment = dict(os.environ, **environment)
+    if "CARGO_BUILD_JOBS" not in environment:
+        # The CPUs shared by the builds running now, this one included, but
+        # never so few that one build's slow crates stall it.
+        builds = sum(leased(os.path.join(os.path.dirname(base), f"slot-{index}"))
+                     for index in slot_indices(os.path.dirname(base)))
+        # At most 8 and half the CPUs, as scripts/cargo-gate gives builds on
+        # its host: the memory builds are expected to need was measured so.
+        cpus = len(os.sched_getaffinity(0))
+        environment["CARGO_BUILD_JOBS"] = str(
+            min(max(4, cpus // max(1, builds)), max(4, min(8, cpus // 2))))
+    # Temporary files go on disk in a directory of this slot's own, rather
+    # than in the host's /tmp, which may be memory and which others use. The
+    # path stays short: tests bind Unix sockets under it, whose paths are
+    # limited to 108 bytes. The slot runs one command at a time, so whatever
+    # the last one left there is stale.
+    environment["TMPDIR"] = temporary = temporary_directory(base)
+    clear(temporary)
+    os.makedirs(temporary, mode=0o700, exist_ok=True)
+
+    # build.rs asks Git for the version stamp only when it is not given; the
+    # slot is not a repository, and whatever encloses it is not this one.
+    environment["GIT_CEILING_DIRECTORIES"] = os.path.dirname(base)
+    # Tools the checkout pins with mise, such as Zig for Ghostty, resolve
+    # through its shims, which a login shell's prompt hook would otherwise add.
+    environment["MISE_TRUSTED_CONFIG_PATHS"] = os.path.join(base, "src")
+    shims = os.path.expanduser("~/.local/share/mise/shims")
+    if os.path.isdir(shims):
+        environment["PATH"] = shims + os.pathsep + environment.get("PATH", "")
+    if request.get("directories") is not None:
+        # Where this host's Cargo puts the build's results and intermediates,
+        # which its own configuration may move out of the slot: the caller
+        # maps the paths Cargo reports there onto its own.
+        found = subprocess.run(
+            [arguments[0], "metadata", "--format-version", "1", "--no-deps", "--offline",
+             *request["directories"]],
+            env=environment, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL)
+        try:
+            described = json.loads(found.stdout)
+            directories = {"target": described["target_directory"],
+                           "build": described.get("build_directory") or described["target_directory"]}
+        except (ValueError, KeyError, TypeError):
+            directories = {}
+        sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
+        sys.stdout.flush()
+    child = subprocess.Popen(arguments, env=environment, stdin=subprocess.DEVNULL,
+                             start_new_session=True)
+    def end(sent_first):
+        """Signals the command's process group until it is gone: children
+        that ignore an interrupt, as a shell's background jobs do, get a
+        termination and then a kill."""
+        for sent in (sent_first, signal.SIGTERM, signal.SIGKILL):
+            try:
+                os.killpg(child.pid, sent)
+            except ProcessLookupError:
+                return
+            for _ in range(50):
+                try:
+                    os.killpg(child.pid, 0)
+                except ProcessLookupError:
+                    return
+                time.sleep(0.1)
+    cancelling = threading.Event()
+    def cancel():
+        cancelling.set()
+        end(signal.SIGINT)
+        os._exit(130)
+    until_closed(cancel)
+    status = child.wait()
+    if cancelling.is_set():
+        # Ending the group exits.
+        while True:
+            time.sleep(3600)
+    # What the command left running would keep the connection open.
+    end(signal.SIGTERM)
+    os._exit(status if status >= 0 else 128 - status)
+'''
+
+
+def remote_command(arguments):
+    """The build host's command line for the agent with `arguments`. The
+    host's login shell parses it, and may not be a POSIX shell (fish treats
+    backslashes in quotes differently), so the agent and its arguments travel
+    as base64, which every shell leaves alone."""
+    payload = json.dumps([REMOTE_AGENT, [str(argument) for argument in arguments]])
+    encoded = base64.b64encode(payload.encode()).decode()
+    return ["python3", "-c", BOOTSTRAP, encoded]
+
+
+BOOTSTRAP = ("'import base64, json, sys; code, sys.argv[1:] = "
+             "json.loads(base64.b64decode(sys.argv[1])); exec(compile(code, \"cargo-offload\", \"exec\"))'")
+
+
+# ssh binds a build's connection at ControlPath plus a 17-byte suffix while
+# it creates it, and a socket's path holds at most 107 bytes.
+CONTROL_PATH_LIMIT = 107 - len("/m") - 17
+
+
+def owner_alive(name):
+    """Whether the build that made the connection directory `name`, which
+    carries its process ID, is still running. A name without one is from an
+    older gate: then it is judged by age."""
+    pid = name[len("cof-ssh-"):].split("-", 1)[0]
+    if not pid.isdigit() or "-" not in name[len("cof-ssh-"):]:
+        return None
+    try:
+        os.kill(int(pid), 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        pass  # Someone else's process: running.
+    return True
+
+
+def sweep_connections(directory, age=120):
+    """Removes the connection directories of builds that were killed before
+    they could, with no connection listening there. A build still waiting
+    for the host has never connected, so its directory goes only once that
+    build has ended and has not used it for a while: a build in another PID
+    namespace looks ended from here, but it renews the directory's time
+    whenever it connects."""
+    try:
+        names = [name for name in os.listdir(directory) if name.startswith("cof-ssh-")]
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(directory, name)
+        try:
+            status = os.lstat(path)
+        except OSError:
+            continue
+        if not os.path.isdir(path) or os.path.islink(path) or status.st_uid != os.getuid():
+            continue
+        alive = owner_alive(name)
+        if alive or time.time() - status.st_mtime < age:
+            continue
+        probe = socket.socket(socket.AF_UNIX)
+        try:
+            probe.connect(os.path.join(path, "m"))
+            continue  # A connection is still open; it ends when it persists no longer.
+        except OSError:
+            pass
+        finally:
+            probe.close()
+        shutil.rmtree(path, ignore_errors=True)
+
+
+class Offload:
+    def __init__(self, host, plan, environment):
+        self.host = host
+        self.plan = plan
+        self.environment = environment
+        self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 8)
+        # Unset: the host shares its CPUs among the builds running there.
+        self.jobs = positive(environment, "CAGENTS_BUILD_REMOTE_JOBS", 0) or None
+        self.floor = positive(environment, "CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB", 40)
+        self.answer = positive(environment, "CAGENTS_BUILD_REMOTE_ANSWER_SECONDS", 30)
+        self.retry = positive(environment, "CAGENTS_BUILD_REMOTE_RETRY_SECONDS", 15)
+        # What the build is expected to need at its peak, as scripts/cargo-gate
+        # prices it for its own admission; the build host admits by it too.
+        self.cost = positive(environment, "CAGENTS_BUILD_EXPECTED_KIB", 0) * 1024 or ""
+        self.ssh = [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
+        ]
+        self.control = None
+        self.children = []
+        self.command = None
+        self.lease = None
+        self.cancelled = 0
+
+    def remote(self, *arguments):
+        if self.control is not None:
+            try:
+                os.utime(self.control)  # In use: see sweep_connections.
+            except OSError:
+                pass
+        return self.ssh + [self.host] + remote_command(arguments)
+
+    def spawn(self, command, **options):
+        child = subprocess.Popen(command, start_new_session=True, **options)
+        self.children.append(child)
+        return child
+
+    def cancel(self, number, _frame):
+        """Ends what this build started. The remote command ends through its
+        connection, so this waits for it to end there; the lease outlives it
+        and ends after it. A second signal stops waiting for a connection
+        that may be dead; the host still ends the command when it notices."""
+        again = bool(self.cancelled)
+        if not self.cancelled:
+            self.cancelled = number
+        for child in self.children:
+            if child.poll() is not None or (child is self.lease and self.command is not None):
+                continue
+            if child is self.command and not again:
+                try:
+                    child.stdin.close()
+                except (OSError, ValueError):
+                    pass
+                continue
+            try:
+                child.terminate()
+            except ProcessLookupError:
+                pass
+
+    def run(self):
+        for number in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+            signal.signal(number, self.cancel)
+        cargo = real_cargo(self.environment)
+        metadata = subprocess.run(
+            [cargo, "metadata", "--format-version", "1", "--no-deps"],
+            capture_output=True, text=True, env=self.environment,
+        )
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True)
+        if metadata.returncode or top.returncode:
+            return self.refuse("this is not a Cargo workspace in a Git checkout, which is "
+                               f"what {self.host} builds")
+        try:
+            metadata = json.loads(metadata.stdout)
+            workspace = os.path.realpath(metadata["workspace_root"])
+            metadata["target_directory"]
+        except (ValueError, KeyError, TypeError):
+            return self.refuse(f"{cargo} metadata did not describe this workspace")
+        top = os.path.realpath(top.stdout.strip())
+        cwd = os.path.realpath(os.getcwd())
+        if os.path.commonpath([top, workspace, cwd]) != top:
+            return self.refuse("the workspace is outside its Git checkout, which is what "
+                               f"{self.host} builds")
+        if self.plan.fixes and not self.plan.flag("--allow-no-vcs"):
+            dirty, staged = uncommitted(top, workspace, self.environment)
+            allowed_dirty = self.plan.flag("--allow-dirty")
+            if dirty and not allowed_dirty:
+                return self.refuse("the working directory has uncommitted changes, which "
+                                   "fixes could mix with; commit them or pass --allow-dirty: "
+                                   + ", ".join(dirty[:10]))
+            if staged and not (allowed_dirty or self.plan.flag("--allow-staged")):
+                return self.refuse("the working directory has staged changes, which fixes "
+                                   "could mix with; commit them or pass --allow-staged: "
+                                   + ", ".join(staged[:10]))
+        common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                capture_output=True, text=True).stdout.strip()
+        repository = Path(common).parent.name or Path(top).name
+        base = f"~/.cache/cagents-offload/{repository}"
+
+        if self.cancelled:
+            return 128 + self.cancelled
+        self.share_connection()
+        try:
+            status, slot = self.lease_slot(base, top)
+            if slot is None:
+                return status
+            try:
+                return self.build(slot, top, workspace, cwd, metadata)
+            except Refusal as refusal:
+                if self.cancelled:
+                    return 128 + self.cancelled
+                return self.refuse(str(refusal))
+            finally:
+                self.lease.stdin.close()
+                try:
+                    self.lease.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.lease.kill()
+        finally:
+            self.close_connection()
+
+    def share_connection(self):
+        """Makes this build's steps (its lease, copies, command and the
+        results it takes back) one ssh session to the host rather than one
+        each: every session costs a login there, which its sshd audits. The
+        session is this build's alone, so cancelling it, which ends what it
+        started, cuts no other build's."""
+        candidates = [self.environment.get("XDG_RUNTIME_DIR") or "", tempfile.gettempdir(), "/tmp"]
+        for directory in dict.fromkeys(candidates):
+            if not os.path.isdir(directory):
+                continue
+            sweep_connections(directory)
+            try:
+                control = tempfile.mkdtemp(prefix=f"cof-ssh-{os.getpid()}-", dir=directory)
+            except OSError:
+                continue
+            if len(control) <= CONTROL_PATH_LIMIT:
+                break
+            os.rmdir(control)
+        else:
+            return  # No directory has a short enough path: each step connects on its own.
+        self.control = control
+        self.ssh += ["-o", "ControlMaster=auto", "-o", f"ControlPath={control}/m",
+                     "-o", "ControlPersist=60"]
+
+    def close_connection(self):
+        if self.control is None:
+            return
+        try:
+            subprocess.run([*self.ssh, "-O", "exit", self.host], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+        except subprocess.TimeoutExpired:
+            pass
+        shutil.rmtree(self.control, ignore_errors=True)
+        self.control = None
+
+    def refuse(self, reason):
+        say(reason)
+        return REFUSED
+
+    def lease_slot(self, base, top):
+        """(status, None) when no slot was leased, or (None, slot path).
+        While the host cannot take the build, waits for it and says so once a
+        minute, within the gate's admission budget."""
+        deadline = admission_deadline(self.environment)
+        since = said = reason = None
+        while True:
+            outcome, detail = self.try_lease(base, top, deadline)
+            if outcome == "slot":
+                return None, detail
+            if outcome in ("status", "cancelled"):
+                return detail, None
+            if outcome == "expired":
+                say(f"build admission timed out{': ' + reason if reason else ''}; {OPT_OUT}")
+                return EXPIRED, None
+            reason = detail
+            now = time.monotonic()
+            if since is None:
+                since = said = now
+                say(f"{detail}; waiting for it ({OPT_OUT})")
+            elif now - said >= 60:
+                said = now
+                say(f"{detail}; still waiting after {format_duration(now - since)}")
+            left = remaining(deadline)
+            if left is not None and left <= 0:
+                say(f"build admission timed out: {detail}; {OPT_OUT}")
+                return EXPIRED, None
+            pause = self.retry if left is None else min(self.retry, left)
+            end = time.monotonic() + pause
+            while time.monotonic() < end:
+                if self.cancelled:
+                    return 128 + self.cancelled, None
+                time.sleep(0.1)
+
+    def build_identity(self, directory):
+        """The Cargo command this is, run from `directory` of the checkout, for
+        a command that only builds there, without what only its tests take or
+        what only changes how Cargo reports; empty for one that also runs
+        tests there, which a request for the same build should not wait out."""
+        if self.plan.subcommand in ("test", "bench") and not self.plan.no_run:
+            return ""
+        options = [option for option in self.plan.options
+                   if option[0] is not None or self.plan.subcommand not in ("test", "bench")]
+        identity = json.dumps([self.plan.toolchain, self.plan.subcommand, directory, options,
+                               sorted((name, value) for name, value
+                                      in forwarded_environment(self.environment).items()
+                                      if not name.startswith(("CAGENTS_", "CARGO_TERM_"))
+                                      and name not in ("RUST_BACKTRACE", "RUST_LIB_BACKTRACE",
+                                                       "RUST_LOG"))])
+        return hashlib.sha256(identity.encode()).hexdigest()[:24]
+
+    def try_lease(self, base, top, deadline):
+        """("slot", path); ("waiting", why) when the host cannot take the build
+        now; ("expired", None) when the admission budget ran out; or
+        ("status"/"cancelled", exit status) when the command ends."""
+        lease = self.lease = self.spawn(
+            self.remote("lease", base, self.slots, f"{os.uname().nodename}:{top}", self.floor,
+                        profile_config(os.path.expanduser("~/.cargo/config.toml")), self.cost,
+                        self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top))),
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+        )
+        lines = Lines(lease.stdout)
+
+        def next_line(limit):
+            # The gate's admission budget covers the wait for a slot on the
+            # build host, as it does one here, but not the build.
+            left = remaining(deadline)
+            if left is not None and (limit is None or left <= limit):
+                try:
+                    return lines.next(max(0.0, left))
+                except TimeoutError:
+                    raise AdmissionExpired from None
+            return lines.next(limit)
+
+        try:
+            line = next_line(self.answer)
+            if line and line.startswith("marker ") and self.plan.subcommand in ("test", "bench"):
+                # Tests that check Git ancestry would fail there for a reason
+                # that is not theirs, so this stops and names it.
+                lease.kill()
+                say(f"{json.loads(line.removeprefix('marker '))} on {self.host} puts the tests "
+                    f"inside a Git checkout; something left it there. Remove it, or {OPT_OUT}.")
+                return "status", REFUSED
+            if line and line.startswith("marker "):
+                line = next_line(self.answer)
+            told = set()
+            while line is not None and (line == "wait" or line.startswith("wait ")):
+                words = line.split()
+                reason = words[1] if len(words) > 1 else "slot"
+                if reason not in told:
+                    told.add(reason)
+                    if reason == "memory":
+                        say(f"waiting for memory on {self.host}: {words[2]} GiB is free beside its "
+                            f"{words[4]} running builds, and this one is expected to need {words[3]} GiB")
+                    elif reason == "pressure":
+                        say(f"waiting for memory on {self.host}: its memory pressure is "
+                            f"{words[2]}%, at or above the {words[3]}% limit")
+                    elif reason == "cpu":
+                        say(f"waiting for CPU on {self.host}: its CPU pressure is "
+                            f"{words[2]}%, at or above the {words[3]}% limit")
+                    elif reason == "same":
+                        say(f"waiting for the same build of this checkout on {self.host} to "
+                            f"finish, which leaves this one little to compile")
+                    else:
+                        say(f"waiting for a build slot on {self.host}")
+                line = next_line(None)
+        except AdmissionExpired:
+            lease.kill()
+            return "expired", None
+        except TimeoutError:
+            lease.kill()
+            lease.wait()
+            return "waiting", f"{self.host} did not answer within {self.answer}s"
+        if self.cancelled:
+            return "cancelled", 128 + self.cancelled
+        words = (line or "").split()
+        if words[:1] == ["slot"]:
+            return "slot", json.loads(line.removeprefix("slot "))["path"]
+        if words[:1] == ["refuse"]:
+            lease.kill()
+            lease.wait()
+            return "waiting", f"{self.host} has {words[1]} GiB free, below its {words[2]} GiB floor"
+        try:
+            status = lease.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            lease.kill()
+            status = lease.wait()
+        if self.cancelled:
+            return "cancelled", 128 + self.cancelled
+        if status == 255:
+            # ssh's own failure: no connection.
+            return "waiting", f"{self.host} is unreachable"
+        say(f"{self.host} could not lease a build slot (status {status}); {OPT_OUT}")
+        return "status", UNAVAILABLE
+
+    def build(self, slot, top, workspace, cwd, metadata):
+        plan = self.plan
+        source = f"{slot}/src"
+        local_target = os.path.realpath(metadata["target_directory"])
+        local_build = os.path.realpath(metadata.get("build_directory") or local_target)
+        remote_target = os.path.normpath(os.path.join(source, os.path.relpath(workspace, top), "target"))
+        directories = {}
+
+        def translate(option, value):
+            """A path option's value as the build host has the path."""
+            if option == "--config" and "=" in value:
+                return value
+            if option == "--target" and not value.endswith(".json"):
+                return value
+            if option not in PATHS and option not in ("--config", "--target"):
+                return value
+            local = os.path.realpath(os.path.join(cwd, os.path.expanduser(value)))
+            if not inside(local, top):
+                raise Refusal(f"{option} {value} is outside this checkout, which is all "
+                              f"{self.host} has; {OPT_OUT}")
+            remote = os.path.join(source, os.path.relpath(local, top))
+            directories[option] = (remote, local)
+            return remote
+
+        extra = []
+        if plan.fixes:
+            # The slot is not a Git checkout; this side checked the checkout.
+            extra.append("--allow-no-vcs")
+        if plan.subcommand == "run":
+            extra += ["--config", f"target.{self.triple(plan)}.runner={json.dumps(RUNNER)}"]
+        arguments = plan.arguments(translate, extra)
+        if "--target-dir" in directories:
+            if local_build == local_target:
+                # Without a build directory of its own, Cargo builds in the
+                # target directory it was given.
+                local_build = directories["--target-dir"][1]
+            remote_target, local_target = directories["--target-dir"]
+        remote_build = remote_target
+        # The settings that may move the build host's directories, for it to
+        # describe them.
+        configs = [value for option, value in zip(arguments, arguments[1:]) if option == "--config"]
+        configs += [word.partition("=")[2] for word in arguments if word.startswith("--config=")]
+
+        listing = subprocess.run(
+            ["git", "-C", top, "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+            capture_output=True, check=True,
+        ).stdout
+        files = [name for name in dict.fromkeys(listing.split(b"\0")) if name and (
+            os.path.islink(os.path.join(os.fsencode(top), name))
+            or os.path.isfile(os.path.join(os.fsencode(top), name)))]
+        listing = b"\0".join(files) + b"\0"
+        environment = forwarded_environment(self.environment)
+        environment.update(self.inputs(slot, top, local_target, remote_target,
+                                       {os.fsdecode(name) for name in files}))
+        shell = " ".join(shlex.quote(word) for word in self.ssh)
+        sent = {}
+        if plan.fixes:
+            for name in files:
+                status = os.lstat(os.path.join(os.fsencode(top), name))
+                sent[os.fsdecode(name)] = (status.st_size, status.st_mtime_ns)
+        # Files are compared by content and a changed one is written with
+        # the time it arrives, not the time it has here. Cargo judges path
+        # crates, such as the vendored patches, by modification time: a
+        # worktree whose copy of a file is older than another worktree's
+        # build in the slot would otherwise build against that build.
+        sync = self.spawn(
+            ["rsync", "-rlpgoD", "--checksum", "-z", "--from0", "--files-from=-", "-e", shell,
+             "./", f"{self.host}:{source}/"],
+            cwd=top, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+        )
+        sync.communicate(listing)
+        if self.cancelled:
+            return 128 + self.cancelled
+        # 24: a file was removed while being copied; the next build copies
+        # the checkout as it is then.
+        if sync.returncode not in (0, 24):
+            say(f"could not copy the sources to {self.host} (rsync exited {sync.returncode})")
+            return sync.returncode
+        prune = self.spawn(self.remote("prune", slot), stdin=subprocess.PIPE)
+        prune.communicate(listing)
+        if self.cancelled:
+            return 128 + self.cancelled
+
+        root = next((package for package in metadata.get("packages", [])
+                     if os.path.dirname(os.path.realpath(package["manifest_path"])) == workspace),
+                    None)
+        if self.jobs:
+            environment["CARGO_BUILD_JOBS"] = str(self.jobs)
+        environment.setdefault("CARGO_TERM_PROGRESS_WHEN", "never")
+        if sys.stderr.isatty():
+            environment.setdefault("CARGO_TERM_COLOR", "always")
+        stamp = build_metadata(top, root["version"] if root else "", self.environment)
+        if stamp:
+            environment["CAGENTS_BUILD_METADATA"] = stamp
+
+        def mapped():
+            # Longest first, so the target directory wins over the checkout
+            # that holds it.
+            return sorted({remote: local for remote, local in [
+                (remote_build, local_build), (remote_target, local_target), (source, top),
+                *directories.values()]}.items(), key=lambda pair: -len(pair[0]))
+        mappings = mapped()
+        command = self.command = self.spawn(
+            self.remote("run", slot, os.path.relpath(cwd, top), "cargo", *arguments),
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE if plan.captures else None,
+        )
+        try:
+            request = {"environment": environment,
+                       "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
+            if plan.captures:
+                request["directories"] = [arg for value in configs for arg in ("--config", value)]
+            command.stdin.write((json.dumps(request) + "\n").encode())
+            command.stdin.flush()
+        except (BrokenPipeError, ValueError):
+            pass  # The connection failed or was cancelled; its status says which.
+        messages = []
+        launch = None
+        if plan.captures:
+            for line in command.stdout:
+                if line.startswith(DIRECTORIES_MARKER.encode()):
+                    there = json.loads(line[len(DIRECTORIES_MARKER):])
+                    if "target" in there:
+                        if "--target-dir" not in directories:
+                            remote_target = there["target"]
+                        remote_build = there["build"]
+                        if "--target-dir" in directories and there["build"] == there["target"]:
+                            remote_build = remote_target
+                        mappings = mapped()
+                    continue
+                if plan.subcommand == "run" and line.startswith(RUN_MARKER.encode()):
+                    launch = json.loads(line[len(RUN_MARKER):])
+                    continue
+                if line.startswith(b"{"):
+                    try:
+                        message = json.loads(line)
+                    except ValueError:
+                        message = None
+                    if message is not None:
+                        messages.append(message)
+                        if plan.caller_wants_json or not plan.executables and not plan.flag("--open"):
+                            line = (json.dumps(rewrite(message, mappings)) + "\n").encode()
+                        else:
+                            continue
+                sys.stdout.buffer.write(line)
+                sys.stdout.buffer.flush()
+        status = command.wait()
+        if self.cancelled:
+            return 128 + self.cancelled
+        if status == 255:
+            say(f"lost the connection to {self.host}")
+            return status
+
+        # What the command left for this host, whether or not it succeeded:
+        # fixes it applied before failing, and a failed build's timings.
+        back = 0
+        if plan.fixes:
+            back = back or self.take_fixes(source, top, listing, sent, shell)
+        if plan.timings:
+            back = back or self.fetch(f"{remote_target}/cargo-timings/",
+                                      os.path.join(local_target, "cargo-timings") + "/", shell,
+                                      missing_ok=True)
+            say(f"timing reports are in {os.path.join(local_target, 'cargo-timings')}")
+        if status:
+            return status
+        if plan.subcommand in ("doc", "rustdoc"):
+            # A target given by its specification file builds into a
+            # directory named for the file.
+            for triple in [""] + [
+                    os.path.splitext(os.path.basename(value))[0] if value.endswith(".json") else value
+                    for value in plan.values("--target")]:
+                back = back or self.fetch(
+                    os.path.join(remote_target, triple, "doc") + "/",
+                    os.path.join(local_target, triple, "doc") + "/", shell, delete=True,
+                    missing_ok=bool(triple) or plan.subcommand == "rustdoc")
+        if plan.executables:
+            here = dict(mappings)
+            for root, made in artifacts(messages, [remote_target, remote_build]).items():
+                os.makedirs(here[root], exist_ok=True)
+                back = back or self.fetch(f"{root}/", here[root] + "/", shell, files=made)
+        for option in ("--artifact-dir", "--out-dir"):
+            if option in directories:
+                remote, local = directories[option]
+                back = back or self.fetch(remote + "/", local + "/", shell)
+        if back:
+            say(f"could not copy the results back from {self.host} (rsync exited {back})")
+            return back
+        if plan.flag("--open"):
+            return self.open_documentation(messages, mappings)
+        if plan.subcommand == "run":
+            return self.launch(launch, mappings)
+        return 0
+
+    def inputs(self, slot, top, local_target, remote_target, synced):
+        """The settings naming files on this host, as the build host has
+        them: a checkout file it was sent, or a copy of a file in the
+        checkout or its target, such as the retained-actor helper. A copy of
+        an unchanged file is not sent again, and one the slot built itself
+        is linked rather than sent."""
+        mapped = {}
+        for name in path_settings(self.environment):
+            value = self.environment[name]
+            local = os.path.realpath(os.path.expanduser(value))
+            if inside(local, top) and os.path.relpath(local, top) in synced:
+                mapped[name] = os.path.join(slot, "src", os.path.relpath(local, top))
+                continue
+            if inside(local, local_target):
+                kind, base, link = "target", local_target, remote_target
+            elif inside(local, top):
+                kind, base, link = "checkout", top, os.path.join(slot, "src")
+            else:
+                raise Refusal(f"{name} names {value}, outside this checkout and its target, "
+                              f"which {self.host} cannot have; unset it or {OPT_OUT}")
+            if not os.path.isfile(local):
+                raise Refusal(f"{name} names {value}, which is not a file {self.host} can be "
+                              f"sent; {OPT_OUT}")
+            relative = os.path.relpath(local, base)
+            destination = os.path.join(slot, "inputs", kind)
+            shell = " ".join(shlex.quote(word) for word in self.ssh)
+            status = self.spawn(
+                ["rsync", "-a", "--modify-window=-1", "-z", "-R", f"--link-dest={link}", "-e", shell,
+                 f"{base}/./{relative}", f"{self.host}:{destination}/"]).wait()
+            if self.cancelled:
+                raise Refusal("cancelled")
+            if status:
+                raise Refusal(f"could not send {name} ({value}) to {self.host} "
+                              f"(rsync exited {status})")
+            mapped[name] = os.path.join(destination, relative)
+        return mapped
+
+    def fetch(self, remote, local, shell, *, files=None, delete=False, missing_ok=False):
+        """Copies `remote` from the build host into `local`: the listed
+        files, or the whole directory. Returns rsync's status. Times are
+        compared to the nanosecond: an executable rebuilt within the second
+        is often the same size."""
+        command = ["rsync", "-a", "--modify-window=-1", "-z", "-e", shell]
+        if delete:
+            command.append("--delete")
+        if files is not None:
+            command += ["--from0", "--files-from=-"]
+        if missing_ok:
+            # Only when the directory is there: a failed build may leave none.
+            probe = self.spawn(self.remote("exists", remote)).wait()
+            if probe:
+                return 0
+        os.makedirs(local, exist_ok=True)
+        back = self.spawn(command + [f"{self.host}:{remote}", local],
+                          stdin=subprocess.PIPE if files is not None else subprocess.DEVNULL)
+        if files is not None:
+            back.communicate(("\0".join(files) + "\0").encode())
+        else:
+            back.wait()
+        return 0 if self.cancelled else back.returncode
+
+    def take_fixes(self, source, top, listing, sent, shell):
+        """Brings back the sources Cargo fixed on the build host, unless the
+        file here changed after it was sent: that edit is newer, and is kept."""
+        differing = subprocess.run(
+            ["rsync", "-a", "-c", "-n", "--from0", "--files-from=-", "--out-format=%n",
+             "-e", shell, f"{self.host}:{source}/", top + "/"],
+            input=listing, capture_output=True)
+        if differing.returncode:
+            return differing.returncode
+        fixed, kept = [], []
+        for name in os.fsdecode(differing.stdout).splitlines():
+            if not name or name.endswith("/"):
+                continue
+            try:
+                status = os.lstat(os.path.join(top, name))
+                now = (status.st_size, status.st_mtime_ns)
+            except OSError:
+                now = None
+            (fixed if now == sent.get(name) else kept).append(name)
+        for name in kept:
+            say(f"not applying the build host's fixes to {name}, which changed here meanwhile")
+        if not fixed:
+            return 0
+        status = self.fetch(f"{source}/", top + "/", shell, files=fixed)
+        if not status:
+            say(f"applied fixes to {len(fixed)} file{'s' if len(fixed) != 1 else ''}")
+        return status
+
+    def triple(self, plan):
+        """The target `cargo run` builds for: the one given, or this host's."""
+        given = plan.values("--target")
+        if given:
+            return given[-1]
+        version = subprocess.run(["rustc", "-vV"], capture_output=True, text=True,
+                                 env=self.environment)
+        host = next((line.split(None, 1)[1] for line in version.stdout.splitlines()
+                     if line.startswith("host: ")), None)
+        if version.returncode or not host:
+            raise Refusal(f"cannot tell this host's target triple for `cargo run`; {OPT_OUT}")
+        return host
+
+    def launch(self, launch, mappings):
+        """Runs the program `cargo run` chose, here, as Cargo would have."""
+        if launch is None:
+            say("Cargo built the program but did not say which one it would run")
+            return 101
+        executable = rewrite(launch["program"], mappings)
+        environment = dict(self.environment)
+        for name, value in launch["environment"].items():
+            environment[name] = rewrite(value, mappings)
+        environment["CARGO"] = shutil.which(real_cargo(self.environment)) or environment.get("CARGO", "")
+        sys.stdout.flush()
+        sys.stderr.flush()
+        # The program replaces this process, and with it the cleanup at the
+        # end of the build. Closing the lease frees the slot; what this
+        # started ends and is reaped first, rather than becoming the
+        # program's children, which it would never wait for.
+        self.lease.stdin.close()
+        self.close_connection()
+        deadline = time.monotonic() + 10
+        for child in self.children:
+            try:
+                child.wait(timeout=max(0, deadline - time.monotonic()))
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.wait()
+        try:
+            os.execve(executable, [executable, *self.plan.program], environment)
+        except OSError as error:
+            say(f"could not run {executable}: {error}")
+            return 127
+
+    def open_documentation(self, messages, mappings):
+        """Opens the documentation Cargo made last, as `cargo doc --open` does."""
+        pages = [name for message in messages if message.get("reason") == "compiler-artifact"
+                 for name in message.get("filenames") or [] if name.endswith("/index.html")]
+        if not pages:
+            say("Cargo reported no documentation to open")
+            return 0
+        page = rewrite(pages[-1], mappings)
+        opener = self.environment.get("BROWSER") or "xdg-open"
+        say(f"opening {page}")
+        try:
+            subprocess.Popen([opener, page], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, start_new_session=True)
+        except OSError as error:
+            say(f"could not open {page} with {opener}: {error}")
+        return 0
+
+
+# The runner `cargo run` gets on the build host: it reports the program and
+# the environment Cargo gives it, and runs nothing there.
+RUNNER = ["python3", "-c",
+          "import json, os, sys; print(" + repr(RUN_MARKER) + " + json.dumps({'program': "
+          "sys.argv[1], 'environment': {name: value for name, value in os.environ.items() "
+          "if name.startswith('CARGO_PKG_') or name in ('CARGO_MANIFEST_DIR', "
+          "'CARGO_MANIFEST_PATH', 'CARGO_CRATE_NAME', 'CARGO_BIN_NAME', "
+          "'CARGO_PRIMARY_PACKAGE')}}), flush=True)"]
+
+
+def positive(environment, name, default):
+    value = environment.get(name, "")
+    if not value:
+        return default
+    if not value.isdigit() or value.startswith("0"):
+        say(f"{name} must be a positive integer")
+        sys.exit(2)
+    return int(value)
+
+
+def format_duration(seconds):
+    minutes = int(seconds // 60)
+    return f"{minutes} minute{'s' if minutes != 1 else ''}" if minutes else f"{int(seconds)}s"
+
+
+class AdmissionExpired(Exception):
+    """The gate's admission budget ran out before a slot was leased."""
+
+
+class Lines:
+    """A child's output lines, read on one thread, so a wait that gives up
+    does not lose the line that arrives after it."""
+
+    def __init__(self, stream):
+        self.queue = queue.Queue()
+        threading.Thread(target=self.read, args=(stream,), daemon=True).start()
+
+    def read(self, stream):
+        for line in stream:
+            self.queue.put(line.strip())
+        self.queue.put(None)
+
+    def next(self, timeout):
+        """The next line, or None once the output ends; TimeoutError if none
+        arrives within `timeout` seconds."""
+        try:
+            return self.queue.get(timeout=timeout)
+        except queue.Empty:
+            raise TimeoutError from None
+
+
+def admission_deadline(environment):
+    """The gate's admission deadline on this host's monotonic clock, if the
+    caller gave the gate an admission budget."""
+    value = environment.get("CAGENTS_BUILD_ADMISSION_DEADLINE", "")
+    return int(value) if value.isascii() and value.isdecimal() else None
+
+
+def remaining(deadline):
+    """Seconds left before `deadline`, or None without one."""
+    return None if deadline is None else (deadline - time.monotonic_ns()) / 1e9
+
+
+def say(message):
+    print(f"{program}: {message}", file=sys.stderr, flush=True)
+
+
+def main(arguments):
+    # The gate passes on where it found builds go, so this cannot decide
+    # otherwise, such as when a slow name lookup ends differently, and exit
+    # FALL_BACK having built nothing. Nothing this starts inherits it.
+    decided = os.environ.pop("CAGENTS_BUILD_OFFLOAD_HOST", "")
+    environment = dict(os.environ)
+    # Only `local` builds here; an empty setting is no setting.
+    host = decided or environment.get("CAGENTS_BUILD_REMOTE") or "fw16"
+    here = not decided and (host == "local" or is_this_host(host))
+    if arguments[:1] == ["--host"]:
+        # Where builds go: 0, printing the build host, or FALL_BACK when
+        # this host builds. Any other status is a failure.
+        if here:
+            return FALL_BACK
+        print(host)
+        return 0
+    if here:
+        return FALL_BACK
+    try:
+        plan = parse(arguments)
+    except Refusal as refusal:
+        say(str(refusal))
+        return REFUSED
+    if plan is None:
+        cargo = real_cargo(environment)
+        os.execvp(cargo, [cargo, *arguments])
+    return Offload(host, plan, environment).run()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

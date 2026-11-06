@@ -3157,6 +3157,30 @@ impl RepositoryRuntime {
         }
     }
 
+    /// Drives a document load as the shell would, including the re-read the
+    /// runtime starts when its watch invalidates a read, and reports whether
+    /// the real file worker answered. Other follow-up tasks are dropped.
+    #[cfg(test)]
+    pub(crate) async fn settle_document_read(&mut self, task: Task<RepositoryAction>) -> bool {
+        retained_save_tests::finish(self, task).await.answered()
+    }
+
+    /// Whether `action` is a file-read completion for the selected document.
+    /// Shell-level drivers check this before applying the action.
+    #[cfg(test)]
+    pub(crate) fn accepts_document_read(&self, action: &RepositoryAction) -> bool {
+        matches!(action,
+            RepositoryAction::FileLoadedAt { identity, .. }
+                | RepositoryAction::DocumentReloaded { identity, .. }
+                if self.accepts_selected(identity))
+    }
+
+    /// Whether an accepted read left the document loading behind a re-read.
+    #[cfg(test)]
+    pub(crate) fn rereading_document(&self) -> bool {
+        matches!(self.document, DocumentState::Loading { .. }) && self.document_reading
+    }
+
     /// Apply only navigation for this exact pane recipe. Shared projections can
     /// replace the recipe but cannot replace another window's local selection.
     pub(crate) fn restore_navigation(&mut self, navigation: &crate::model::RepositoryNavigation) {
@@ -5832,14 +5856,27 @@ impl RepositoryRuntime {
                     crate::filesystem_recovery_context::FilesystemRecoveryContext::acquire_for_save(
                         &root, &destination, &known,
                     )
-                    .map_err(|error| match error.authority {
-                        Some(authority) => {
-                            crate::editor::retained_save::RetainedSaveError::Recovery {
-                                message: error.message,
-                                authority,
-                            }
+                    .map_err(|error| {
+                        #[cfg(test)]
+                        {
+                            use std::io::Write as _;
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "[save-worker-diagnostic] stage=acquire_for_save boundary=Err fd_role=original_source source={:?} destination={:?} raw_errno=not_retained error={}",
+                                root.path(),
+                                destination,
+                                error,
+                            );
                         }
-                        None => crate::editor::retained_save::RetainedSaveError::Io(error.message),
+                        match error.authority {
+                            Some(authority) => {
+                                crate::editor::retained_save::RetainedSaveError::Recovery {
+                                    message: error.message,
+                                    authority,
+                                }
+                            }
+                            None => crate::editor::retained_save::RetainedSaveError::Io(error.message),
+                        }
                     })
                     .and_then(|context| {
                         let result = write(
@@ -5850,6 +5887,18 @@ impl RepositoryRuntime {
                             overwrite,
                             &context,
                         );
+                        #[cfg(test)]
+                        if let Err(error) = &result {
+                            use std::io::Write as _;
+                            let _ = writeln!(
+                                std::io::stderr().lock(),
+                                "[save-worker-diagnostic] stage=write boundary=Err fd_roles=original_source,recovery_placement source={:?} destination={:?} placement={:?} raw_errno=not_retained error={}",
+                                root.path(),
+                                destination,
+                                context.placement().directory().path(),
+                                error,
+                            );
+                        }
                         crate::editor::retained_save::finish_context(&context, result)
                     });
                 let authority = match &result {
@@ -11979,6 +12028,20 @@ struct DiffHorizontalContent<'a> {
     viewport: Option<iced::Size>,
 }
 
+impl DiffHorizontalContent<'_> {
+    /// The translated content, still in the enclosing scrollable's
+    /// coordinates. The real X translation is part of the child's layout, so
+    /// it must not consume the virtual offset descendants use for screen
+    /// positions, popup anchors and operation bounds.
+    fn content_layout(layout: Layout<'_>) -> Layout<'_> {
+        layout
+            .children()
+            .next()
+            .expect("diff content")
+            .with_virtual_offset(layout.virtual_offset())
+    }
+}
+
 impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizontalContent<'_> {
     fn children(&self) -> Vec<Tree> {
         vec![Tree::new(&self.content)]
@@ -12009,6 +12072,27 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
             vec![child.move_to(iced::Point::new(-self.offset, 0.0))],
         )
     }
+    fn drag_destinations(
+        &self,
+        tree: &Tree,
+        layout: Layout<'_>,
+        renderer: &cosmic::Renderer,
+        destinations: &mut cosmic::iced::advanced::clipboard::DndDestinationRectangles,
+    ) {
+        let Some(child) = layout.children().next() else {
+            return;
+        };
+        let mut inner = cosmic::iced::advanced::clipboard::DndDestinationRectangles::new();
+        self.content.as_widget().drag_destinations(
+            &tree.children[0],
+            child.with_virtual_offset(layout.virtual_offset()),
+            renderer,
+            &mut inner,
+        );
+        let mut rectangles = inner.into_rectangles();
+        crate::workspace_widget::clip_drag_destinations(&mut rectangles, layout.bounds());
+        destinations.append(&mut rectangles);
+    }
     fn operate(
         &mut self,
         tree: &mut Tree,
@@ -12018,7 +12102,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     ) {
         self.content.as_widget_mut().operate(
             &mut tree.children[0],
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             renderer,
             operation,
         );
@@ -12037,7 +12121,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
         self.content.as_widget_mut().update(
             &mut tree.children[0],
             event,
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             cursor,
             renderer,
             clipboard,
@@ -12063,7 +12147,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
                     renderer,
                     theme,
                     style,
-                    layout.children().next().expect("diff content"),
+                    Self::content_layout(layout),
                     cursor,
                     &clip,
                 );
@@ -12081,7 +12165,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     ) -> iced::mouse::Interaction {
         self.content.as_widget().mouse_interaction(
             &tree.children[0],
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             cursor,
             viewport,
             renderer,
@@ -12099,7 +12183,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
     > {
         self.content.as_widget_mut().overlay(
             &mut tree.children[0],
-            layout.children().next().expect("diff content"),
+            Self::content_layout(layout),
             renderer,
             viewport,
             translation,
@@ -12152,32 +12236,7 @@ impl Widget<RepositoryAction, cosmic::Theme, cosmic::Renderer> for DiffHorizonta
             || layout.bounds(),
             |size| iced::Rectangle::new(layout.position() + offset, size),
         );
-        for roots in [true, false] {
-            let nodes = if roots {
-                accessible.root_mut()
-            } else {
-                accessible.children_mut()
-            };
-            for accessible_node in nodes {
-                let node = accessible_node.node_mut();
-                if let Some(bounds) = node.bounds() {
-                    let x0 = bounds.x0.max(f64::from(clip.x));
-                    let y0 = bounds.y0.max(f64::from(clip.y));
-                    let x1 = bounds.x1.min(f64::from(clip.x + clip.width));
-                    let y1 = bounds.y1.min(f64::from(clip.y + clip.height));
-                    if x1 <= x0 || y1 <= y0 {
-                        node.set_hidden();
-                    } else {
-                        node.set_bounds(Rect::new(
-                            x0 - f64::from(offset.x),
-                            y0 - f64::from(offset.y),
-                            x1 - f64::from(offset.x),
-                            y1 - f64::from(offset.y),
-                        ));
-                    }
-                }
-            }
-        }
+        crate::ui_controls::accessible_bounds::place(&mut accessible, offset, Some(clip));
         accessible
     }
 }
@@ -12353,14 +12412,7 @@ mod tests {
     }
 
     async fn finish_navigation_task(runtime: &mut RepositoryRuntime, task: Task<RepositoryAction>) {
-        use cosmic::iced::futures::StreamExt;
-        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
-            while let Some(action) = stream.next().await {
-                if let iced::runtime::Action::Output(action) = action {
-                    drop(runtime.update(action));
-                }
-            }
-        }
+        drop(super::retained_save_tests::finish(runtime, task).await);
     }
 
     #[tokio::test]
@@ -12875,6 +12927,10 @@ mod tests {
         };
         let task = runtime.retarget_file(card, text_view.clone());
         finish_navigation_task(&mut runtime, task).await;
+        assert!(matches!(runtime.document, DocumentState::Editable(_)));
+        assert_eq!(runtime.selected_path(), Some(Path::new("notes.txt")));
+        assert_eq!(runtime.editor_text().as_deref(), Some("unsaved baseline"));
+        assert!(runtime.editable_surface_visible());
         drop(runtime.update(RepositoryAction::EditorAction {
             card,
             action: text_editor::Action::Edit(text_editor::Edit::Insert('!')),
@@ -12996,6 +13052,94 @@ mod tests {
             assert_eq!(document.content.text(), "working\n");
             assert!(!document.dirty);
             assert!(runtime.editor_focus_target(card).is_none());
+        }
+    }
+
+    #[test]
+    fn working_diff_worker_matches_the_native_source_and_leaves_the_editor_alone() {
+        use cosmic::iced::futures::StreamExt;
+
+        for cancelled in [false, true] {
+            let card = CardId::new();
+            let baseline = "xlet café = \"😀\";\nsecond\r\n\rthird\rfourth";
+            let saved = "let café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let after = "xlet café = \"😀\";\r\nsecond\n\rthird\rfourth\n";
+            let (mut runtime, _) = working_diff_runtime(card, baseline, saved);
+            runtime.set_lsp_document(None);
+            runtime.source_surface = SourceSurface::Editor;
+            drop(runtime.update(RepositoryAction::EditorAction {
+                card,
+                action: text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+            }));
+            runtime.working_diff.applied = None;
+            drop(runtime.working_diff_task(card));
+            let ticket = runtime.working_diff.timer.unwrap();
+            runtime.working_diff.deadline = Some(Instant::now());
+            let editor_state = |runtime: &RepositoryRuntime| {
+                let DocumentState::Editable(document) = &runtime.document else {
+                    panic!("native buffer")
+                };
+                (
+                    document.saved_text.clone(),
+                    document.saved_history_revision,
+                    document.dirty,
+                    document.revision,
+                    document.history.revision(),
+                    document.content.cursor(),
+                )
+            };
+            let original_state = editor_state(&runtime);
+            assert!(runtime.is_dirty());
+
+            let task = runtime.start_working_diff(card, ticket);
+            assert_eq!(editor_state(&runtime), original_state);
+            if cancelled {
+                runtime
+                    .working_diff
+                    .active
+                    .as_ref()
+                    .unwrap()
+                    .cancellation
+                    .cancel();
+            }
+
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let completion = executor.block_on(async {
+                let mut stream = iced::runtime::task::into_stream(task).unwrap();
+                while let Some(action) = stream.next().await {
+                    if let iced::runtime::Action::Output(action) = action {
+                        return action;
+                    }
+                }
+                panic!("the diff worker must return its completion")
+            });
+            let RepositoryAction::WorkingDiffLoaded { result, .. } = &completion else {
+                panic!("working diff completion")
+            };
+            if cancelled {
+                assert!(matches!(result, Ok(None)));
+            } else {
+                let model = result.as_ref().unwrap().as_ref().unwrap();
+                let expected = crate::diff_view::build_diff(baseline, after);
+                for marker in ["[LF]", "[CRLF]", "[no newline]"] {
+                    assert!(
+                        expected
+                            .inline_rows
+                            .iter()
+                            .any(|row| row.text.ends_with(marker))
+                    );
+                }
+                assert_eq!(model.line_counts, expected.line_counts);
+                assert_eq!(model.inline_rows, expected.inline_rows);
+                assert_eq!(model.split_rows, expected.split_rows);
+            }
+            drop(runtime.update(completion));
+            if !cancelled {
+                assert!(runtime.working_annotations_current());
+            }
+            assert_eq!(editor_state(&runtime), original_state);
         }
     }
 
@@ -20113,6 +20257,158 @@ mod tests {
     /// A buffer whose tokens are exactly the ones the smoke run found
     /// indistinguishable: a comment, a keyword, a string, and a macro call.
     const HIGHLIGHTABLE: &str = "// what main does\nfn main() {\n    let hello = \"world\";\n    println!(\"{hello}\");\n}\n";
+
+    #[test]
+    fn nested_horizontal_diff_preserves_virtual_offsets_for_descendants() {
+        use crate::workspace_widget::forwarding_test::{Traverse, leaf, renderer};
+        use cosmic::iced::{Point, Size, Vector};
+
+        let mut renderer = renderer();
+        // The canvas cancels horizontal scrolling while a row applies it to
+        // its text. Neither real translation may consume the enclosing
+        // scrollable's virtual offset before a descendant opens an overlay
+        // or participates in an operation.
+        for offset in [
+            Vector::ZERO,
+            Vector::new(4.0, -20.0),
+            Vector::new(-9.0, 35.0),
+        ] {
+            let (content, visits) = leaf::<RepositoryAction>(Size::new(500.0, 60.0), vec![]);
+            let row = Element::new(DiffHorizontalContent {
+                content,
+                width: Length::Fixed(300.0),
+                content_width: 500.0,
+                offset: 80.0,
+                accessible_text: None,
+                viewport: None,
+            });
+            let mut canvas = Element::new(DiffHorizontalContent {
+                content: row,
+                width: Length::Fixed(100.0),
+                content_width: 300.0,
+                offset: -80.0,
+                accessible_text: None,
+                viewport: None,
+            });
+            let mut tree = Tree::new(&canvas);
+            let node = canvas
+                .as_widget_mut()
+                .layout(
+                    &mut tree,
+                    &renderer,
+                    &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+                )
+                .move_to(Point::new(30.0, 40.0));
+            let layout = Layout::new(&node).with_virtual_offset(offset);
+            canvas
+                .as_widget_mut()
+                .operate(&mut tree, layout, &renderer, &mut Traverse);
+            assert!(
+                canvas
+                    .as_widget_mut()
+                    .overlay(&mut tree, layout, &renderer, &layout.bounds(), Vector::ZERO)
+                    .is_none()
+            );
+            let mut messages = Vec::new();
+            canvas.as_widget_mut().update(
+                &mut tree,
+                &iced::Event::Mouse(iced::mouse::Event::CursorMoved {
+                    position: Point::new(50.0, 50.0),
+                }),
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut Shell::new(&mut messages),
+                &layout.bounds(),
+            );
+            canvas.as_widget().mouse_interaction(
+                &tree,
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &layout.bounds(),
+                &renderer,
+            );
+            canvas.as_widget().draw(
+                &tree,
+                &mut renderer,
+                &cosmic::Theme::default(),
+                &renderer::Style::default(),
+                layout,
+                iced::mouse::Cursor::Unavailable,
+                &layout.bounds(),
+            );
+            for kind in ["operate", "overlay", "update", "mouse_interaction", "draw"] {
+                assert_eq!(visits.offsets(kind), vec![offset], "{kind}");
+            }
+        }
+    }
+
+    #[test]
+    fn horizontal_diff_forwards_translated_and_clipped_drop_targets() {
+        use crate::workspace_widget::forwarding_test::{leaf, renderer};
+        use cosmic::iced::{
+            Point, Rectangle, Size, Vector, advanced::clipboard::DndDestinationRectangles,
+        };
+        let renderer = renderer();
+        let (content, visits) = leaf::<RepositoryAction>(
+            Size::new(300.0, 60.0),
+            vec![
+                (1, Rectangle::new(Point::ORIGIN, Size::new(50.0, 60.0))),
+                (
+                    2,
+                    Rectangle::new(Point::new(60.0, 0.0), Size::new(80.0, 60.0)),
+                ),
+                (
+                    3,
+                    Rectangle::new(Point::new(150.0, 0.0), Size::new(80.0, 60.0)),
+                ),
+            ],
+        );
+        let mut widget = Element::new(DiffHorizontalContent {
+            content,
+            width: Length::Fixed(100.0),
+            content_width: 300.0,
+            offset: 80.0,
+            accessible_text: None,
+            viewport: None,
+        });
+        let mut tree = Tree::new(&widget);
+        let node = widget
+            .as_widget_mut()
+            .layout(
+                &mut tree,
+                &renderer,
+                &layout::Limits::new(Size::ZERO, Size::new(100.0, 60.0)),
+            )
+            .move_to(Point::new(30.0, 40.0));
+        let offset = Vector::new(4.0, -20.0);
+        let mut destinations = DndDestinationRectangles::new();
+        widget.as_widget().drag_destinations(
+            &tree,
+            Layout::new(&node).with_virtual_offset(offset),
+            &renderer,
+            &mut destinations,
+        );
+        let actual: Vec<_> = destinations
+            .into_native_rectangles()
+            .into_iter()
+            .map(|destination| {
+                (
+                    destination.id,
+                    destination.rectangle.x,
+                    destination.rectangle.y,
+                    destination.rectangle.width,
+                    destination.rectangle.height,
+                )
+            })
+            .collect();
+        assert_eq!(
+            actual,
+            vec![(3, 100.0, 40.0, 30.0, 60.0), (2, 30.0, 40.0, 60.0, 60.0)]
+        );
+        assert_eq!(visits.offsets("drag"), vec![offset]);
+    }
 
     /// A headless `cosmic::Renderer`. With no graphics device it falls back to
     /// `tiny-skia`, which needs neither a device nor a surface and which can

@@ -2426,6 +2426,7 @@ mod tests {
         .unwrap();
         let destination = repository.join("worktrees/zulu-new");
         let request = CreateWorktreeRequest {
+            resolution_warnings: Vec::new(),
             setup_intent: None,
             repository: repository.clone(),
             managed_root: repository.join("worktrees"),

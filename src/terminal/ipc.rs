@@ -228,7 +228,7 @@ pub fn daemon_socket_path() -> io::Result<PathBuf> {
             )
         })?;
     Ok(runtime
-        .join(instance::RUNTIME_SUBDIRECTORY)
+        .join(instance::runtime_subdirectory())
         .join(SOCKET_FILE_NAME))
 }
 

@@ -162,6 +162,7 @@ impl PrivateServer {
         };
         let lease = HostLease::acquire(&paths, &proof).unwrap();
         let mut state = HostState::new(proof.clone());
+        state.enable_holder_recovery();
         state.install_model(crate::host::model::Registry::at(&root.join("model.sqlite3")).unwrap());
         let host = Arc::new(HostLock::new(state));
         let listener = UnixListener::bind(&paths.socket).unwrap();
