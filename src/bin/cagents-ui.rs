@@ -8,6 +8,7 @@ use cagents::instance::{
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
+#[cfg(test)]
 cagents::refuse_filtered_test_run!();
 
 const PRODUCT: &str = "cagents-ui";

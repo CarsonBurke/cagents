@@ -1,3 +1,4 @@
+#[cfg(test)]
 cagents::refuse_filtered_test_run!();
 
 // No panic hook or file subscriber here: `cagents` is a short-lived foreground
