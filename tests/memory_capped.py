@@ -12,7 +12,7 @@ import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = ROOT / "scripts/memory-capped"
-CAPPED = "CAGENTS_MEMORY_CAPPED"
+LEAF = "sed -n 's|.*/||p' /proc/self/cgroup"
 
 
 def real_scopes_work():
@@ -49,11 +49,6 @@ class WithoutAScope(unittest.TestCase):
 
     def test_zero_turns_the_limit_off_without_looking_for_a_scope(self):
         result = self.run_tool("sh", "-c", "exit 7", CAGENTS_MEMORY_MAX="0")
-        self.assertEqual((result.returncode, result.stderr), (7, ""))
-        self.assertFalse((self.root / "scope").exists())
-
-    def test_a_command_already_under_a_limit_keeps_it(self):
-        result = self.run_tool("sh", "-c", "exit 7", **{CAPPED: "outer.scope"})
         self.assertEqual((result.returncode, result.stderr), (7, ""))
         self.assertFalse((self.root / "scope").exists())
 
@@ -97,8 +92,9 @@ class InARealScope(unittest.TestCase):
         survivor = self.root / "survivor"
         unit = self.root / "unit"
         script = textwrap.dedent(f"""
-            import os, pathlib, subprocess
-            pathlib.Path("{unit}").write_text(os.environ["{CAPPED}"])
+            import pathlib, subprocess
+            cgroup = pathlib.Path("/proc/self/cgroup").read_text().strip()
+            pathlib.Path("{unit}").write_text(cgroup.rsplit("/", 1)[1])
             child = subprocess.Popen(["sh", "-c", 'echo $$ >{survivor}; exec sleep 300'])
             # A ceiling, so that a mutant without the limit fails the test
             # instead of filling the host's memory and swap.
@@ -125,9 +121,9 @@ class InARealScope(unittest.TestCase):
         self.assertEqual((result.returncode, result.stdout, result.stderr), (9, "in\n", "err\n"))
 
     def test_the_command_says_it_is_limited_and_leaves_no_failed_unit(self):
-        result = self.run_tool("sh", "-c", f'printf %s "${CAPPED}"; exit 3')
+        result = self.run_tool("sh", "-c", f"{LEAF}; exit 3")
         self.assertEqual(result.returncode, 3)
-        unit = result.stdout
+        unit = result.stdout.strip()
         self.assertRegex(unit, r"^cagents-capped-.*\.scope$")
         state = subprocess.run(["systemctl", "--user", "is-failed", unit], capture_output=True, text=True)
         self.assertNotEqual(state.stdout.strip(), "failed")
@@ -145,6 +141,18 @@ class InARealScope(unittest.TestCase):
         wrapper.terminate()
         wrapper.wait(20)
         self.wait_for(lambda: not Path(f"/proc/{pid}").exists(), "it outlived the scope")
+
+    def test_a_command_in_a_limited_scope_stays_in_it_and_one_outside_gets_its_own(self):
+        inner = f'"{TOOL}" sh -c "{LEAF}"'
+        result = self.run_tool("sh", "-c", f"{LEAF}; {inner}")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        outer, nested = result.stdout.split()
+        self.assertEqual(nested, outer)
+        # A daemon's own scope, started from a limited one, isn't limited.
+        escaped = subprocess.run(
+            ["systemd-run", "--user", "--scope", "--quiet", "--collect", str(TOOL), "sh", "-c", LEAF],
+            env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertRegex(escaped.stdout.strip(), r"^cagents-capped-.*\.scope$", escaped.stderr)
 
     def test_a_missing_command_fails_as_it_would_alone(self):
         result = self.run_tool(str(self.root / "absent"))

@@ -25,6 +25,7 @@ is stopped and this exits 137. Interrupting this stops the scope too.
 """
 UNITS = {"": 1, "K": 2**10, "M": 2**20, "G": 2**30, "T": 2**40}
 PR_SET_PDEATHSIG = 1
+UNIT_PREFIX = "cagents-capped-"
 
 
 def size(setting, default):
@@ -34,6 +35,17 @@ def size(setting, default):
         print(f"{PROGRAM}: {setting} must be a size such as 16G: {text}", file=sys.stderr)
         raise SystemExit(2)
     return int(match[1]) * UNITS[match[2]]
+
+
+def already_limited():
+    """Whether this process is in one of these scopes now. Being started by one
+    wouldn't do: what starts in a scope of its own, such as a daemon and the
+    sessions it runs, carries the environment but not the limit."""
+    try:
+        with open("/proc/self/cgroup") as file:
+            return f"/{UNIT_PREFIX}" in file.read()
+    except OSError:
+        return False
 
 
 def scope_command(unit, limit, swap):
@@ -77,7 +89,7 @@ def main():
     if not command or command[0] in ("-h", "--help"):
         print(USAGE, end="", file=sys.stdout if command else sys.stderr)
         return 0 if command else 2
-    if os.environ.get("CAGENTS_MEMORY_MAX") == "0" or os.environ.get("CAGENTS_MEMORY_CAPPED"):
+    if os.environ.get("CAGENTS_MEMORY_MAX") == "0" or already_limited():
         os.execvp(command[0], command)
     limit = size("CAGENTS_MEMORY_MAX", DEFAULT_MAX)
     swap = size("CAGENTS_MEMORY_SWAP_MAX", DEFAULT_SWAP_MAX)
@@ -85,11 +97,10 @@ def main():
         print(f"{PROGRAM}: no systemd scope can limit memory here; running without a limit",
               file=sys.stderr)
         os.execvp(command[0], command)
-    unit = f"cagents-capped-{os.getpid()}-{time.monotonic_ns()}.scope"
+    unit = f"{UNIT_PREFIX}{os.getpid()}-{time.monotonic_ns()}.scope"
     parent = os.getpid()
     # The command runs as this child: systemd-run execs it after making the scope.
     child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap), *command],
-                             env=dict(os.environ, CAGENTS_MEMORY_CAPPED=unit),
                              preexec_fn=lambda: follow_parent(parent))
     interrupted = []
 
