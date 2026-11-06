@@ -31,6 +31,13 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# Isolated Python (-I) leaves this directory off sys.path.
+_custody_spec = importlib.util.spec_from_file_location("fixture_custody", ROOT / "tests/fixture_custody.py")
+_custody = importlib.util.module_from_spec(_custody_spec)
+_custody_spec.loader.exec_module(_custody)
+FixtureDirectory = _custody.FixtureDirectory
+
+
 def load_offload():
     loader = importlib.machinery.SourceFileLoader("cargo_offload", str(ROOT / "scripts/cargo-offload"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -247,13 +254,12 @@ def agent_function(name):
 
 class Resident(unittest.TestCase):
     def test_a_process_tree_holds_its_descendants_memory(self):
-        child = subprocess.Popen(["python3", "-c", "b = bytearray(64 << 20); import time; time.sleep(30)"])
-        self.addCleanup(child.wait)
-        self.addCleanup(child.kill)
-        time.sleep(1)
-        held = agent_function("resident")([os.getpid(), 999999999])
-        self.assertGreater(held[os.getpid()], 64 << 20)
-        self.assertEqual(held[999999999], 0)
+        with FixtureDirectory() as scope:
+            scope.popen([sys.executable, "-c", "b = bytearray(64 << 20); import time; time.sleep(30)"])
+            time.sleep(1)
+            held = agent_function("resident")([os.getpid(), 999999999])
+            self.assertGreater(held[os.getpid()], 64 << 20)
+            self.assertEqual(held[999999999], 0)
 
 
 # Sockets bind under these tests' directories, whose paths must stay short
@@ -548,9 +554,9 @@ class StandInHost(unittest.TestCase):
     """A tiny crate built through the gate on a stand-in build host."""
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cagents-offload-")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.scope = FixtureDirectory(prefix="cagents-offload-")
+        self.addCleanup(self.scope.close)
+        self.root = Path(self.scope.name)
         tools = self.root / "tools"
         tools.mkdir()
         # HOME changes below, so caller Python shims (such as mise's) may
@@ -581,7 +587,7 @@ class StandInHost(unittest.TestCase):
         (self.crate / ".gitignore").write_text("/target\n")
         # A host's default toolchain may predate CARGO_BUILD_BUILD_DIR.
         shutil.copy2(ROOT / "rust-toolchain.toml", self.crate)
-        subprocess.run(["git", "init", "-q"], cwd=self.crate, check=True)
+        self.scope.run(["git", "init", "-q"], cwd=self.crate, check=True)
         home = Path.home()
         self.env = {
             key: value for key, value in os.environ.items()
@@ -610,7 +616,7 @@ class StandInHost(unittest.TestCase):
         }
 
     def gate_run(self, *arguments, env, timeout=120):
-        return subprocess.run([str(self.gate), *arguments], cwd=self.crate, env=env,
+        return self.scope.run([str(self.gate), *arguments], cwd=self.crate, env=env,
                               capture_output=True, text=True, timeout=timeout)
 
     def remote_env(self):
@@ -626,7 +632,7 @@ class StandInHost(unittest.TestCase):
         self.assertTrue((slot / "src/main.rs").is_file())
         self.assertTrue((slot / "target/debug/probe").is_file())
         executable = self.crate / "target/debug/probe"
-        self.assertEqual(subprocess.run([executable], capture_output=True, text=True).stdout, "probe\n")
+        self.assertEqual(self.scope.run([executable], capture_output=True, text=True).stdout, "probe\n")
         # Nothing was built here.
         self.assertFalse((self.root / "local-build").exists())
 
@@ -656,7 +662,7 @@ class StandInHost(unittest.TestCase):
             (path / "src/main.rs").write_text('fn main() { println!("{}", dep::value()); }\n')
             (path / ".gitignore").write_text("/target\n")
             if not (path / ".git").exists():
-                subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+                self.scope.run(["git", "init", "-q"], cwd=path, check=True)
 
         worktree(self.crate, 11)
         other = self.root / "elsewhere" / "crate"
@@ -664,11 +670,11 @@ class StandInHost(unittest.TestCase):
         worktree(other, 22, mtime=time.time() - 3600)
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"}
         for path, expected in ((self.crate, "11\n"), (other, "22\n"), (self.crate, "11\n")):
-            result = subprocess.run([str(self.gate), "run", "--quiet"], cwd=path, env=env,
+            result = self.scope.run([str(self.gate), "run", "--quiet"], cwd=path, env=env,
                                     capture_output=True, text=True, timeout=120)
             self.assertEqual((result.returncode, result.stdout), (0, expected), result.stderr)
         # An unchanged worktree's next build there compiles nothing.
-        result = subprocess.run([str(self.gate), "build"], cwd=self.crate, env=env,
+        result = self.scope.run([str(self.gate), "build"], cwd=self.crate, env=env,
                                 capture_output=True, text=True, timeout=120)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("Compiling", result.stderr)
@@ -768,7 +774,7 @@ class StandInHost(unittest.TestCase):
                         executables[0])
         self.assertNotIn(str(self.host_home), result.stdout)
         self.assertTrue((self.host_home / "build").is_dir())
-        run = subprocess.run([executables[0]], capture_output=True, text=True)
+        run = self.scope.run([executables[0]], capture_output=True, text=True)
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertIn("test passes ... ok", run.stdout)
 
@@ -813,13 +819,13 @@ class StandInHost(unittest.TestCase):
         main = self.crate / "src/main.rs"
         main.write_text('fn main() {\n    let mut value = 1;\n    println!("{value}");\n}\n')
         git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
-        subprocess.run(git + ["add", "-A"], cwd=self.crate, check=True)
-        subprocess.run(git + ["commit", "-qm", "probe"], cwd=self.crate, check=True)
+        self.scope.run(git + ["add", "-A"], cwd=self.crate, check=True)
+        self.scope.run(git + ["commit", "-qm", "probe"], cwd=self.crate, check=True)
         main.write_text(main.read_text() + "// uncommitted\n")
         result = self.gate_run("fix", "--bin", "probe", env=self.remote_env())
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("uncommitted changes", result.stderr)
-        subprocess.run(["git", "checkout", "--", "src/main.rs"], cwd=self.crate, check=True)
+        self.scope.run(["git", "checkout", "--", "src/main.rs"], cwd=self.crate, check=True)
         result = self.gate_run("fix", "--bin", "probe", env=self.remote_env())
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("    let value = 1;", main.read_text())
@@ -1030,7 +1036,7 @@ class StandInHost(unittest.TestCase):
             }
         """))
         hard = resource.getrlimit(resource.RLIMIT_NOFILE)[1]
-        result = subprocess.run(
+        result = self.scope.run(
             [str(self.gate), "check"], cwd=self.crate, env=self.remote_env(),
             capture_output=True, text=True, timeout=120,
             preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (512, hard)))
@@ -1146,22 +1152,21 @@ class StandInHost(unittest.TestCase):
                 }
             """) % text)
             if not (path / ".git").exists():
-                subprocess.run(["git", "init", "-q"], cwd=path, check=True)
+                self.scope.run(["git", "init", "-q"], cwd=path, check=True)
         worktree(self.crate, "first")
         other = self.root / "elsewhere" / "crate"
         worktree(other, "second")
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE_SLOTS": "1"}
-        testing = subprocess.Popen([str(self.gate), "test", "--test", "slow"], cwd=self.crate,
+        testing = self.scope.popen([str(self.gate), "test", "--test", "slow"], cwd=self.crate,
                                    env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                    text=True)
-        self.addCleanup(testing.kill)
         deadline = time.monotonic() + 120
         # Beside the test executable, wherever the host's Cargo puts it.
         while not any(self.root.rglob("started")):
             self.assertIsNone(testing.poll(), "the tests ended before they were seen running")
             self.assertLess(time.monotonic(), deadline)
             time.sleep(0.1)
-        building = subprocess.run([str(self.gate), "test", "--no-run", "--test", "slow"],
+        building = self.scope.run([str(self.gate), "test", "--no-run", "--test", "slow"],
                                   cwd=other, env=env, capture_output=True, text=True,
                                   timeout=120)
         out, err = testing.communicate(timeout=60)
@@ -1238,7 +1243,7 @@ class StandInHost(unittest.TestCase):
         for env, expected in ((self.remote_env(), "core=0"),
                               (self.remote_env() | {"CAGENTS_BUILD_REMOTE_CORE_DUMPS": "1"},
                                "core=" + ("unlimited" if hard == resource.RLIM_INFINITY else str(hard)))):
-            result = subprocess.run([str(self.gate), "test", "--", "--nocapture"], cwd=self.crate,
+            result = self.scope.run([str(self.gate), "test", "--", "--nocapture"], cwd=self.crate,
                                     env=env, capture_output=True, text=True, timeout=120,
                                     preexec_fn=allow_cores)
             self.assertEqual(result.returncode, 0, result.stderr)
@@ -1260,9 +1265,8 @@ class StandInHost(unittest.TestCase):
                 std::thread::sleep(std::time::Duration::from_secs(120));
             }}
         """))
-        gate = subprocess.Popen([str(self.gate), "check"], cwd=self.crate, env=self.remote_env(),
+        gate = self.scope.popen([str(self.gate), "check"], cwd=self.crate, env=self.remote_env(),
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        self.addCleanup(lambda: gate.poll() is None and gate.kill())
         deadline = time.monotonic() + 120
         while not marker.exists() or not marker.read_text():
             self.assertLess(time.monotonic(), deadline, "build script never started")
@@ -1319,7 +1323,7 @@ class StandInHostPython(unittest.TestCase):
         self.assert_interpreter(result, caller="present")
 
     def test_clean_stand_in_host_ignores_callers_python_shim(self):
-        result = subprocess.run(["ssh", "stand-in", "python3", "-c", shlex.quote(self.probe)],
+        result = self.host.scope.run(["ssh", "stand-in", "python3", "-c", shlex.quote(self.probe)],
                                 cwd=self.host.crate, env=self.environment,
                                 capture_output=True, text=True, timeout=10)
         self.assert_interpreter(result, caller=None)
@@ -1333,14 +1337,13 @@ class RemoteRun(unittest.TestCase):
         # A cancelled build closes the lease and the command's connections
         # together; the next build must not start in the slot while the
         # command's process group is still being ended.
-        with tempfile.TemporaryDirectory() as base:
-            lease = subprocess.Popen(
-                ["python3", "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
+        with FixtureDirectory() as scope:
+            base = scope.name
+            lease = scope.popen(
+                [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
                 stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                 env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
-            self.addCleanup(lease.stdout.close)
-            self.addCleanup(lease.kill)
-            self.assertRegex(lease.stdout.readline(), r'^slot \{"index": 0, ')
+            self.assertRegex(offload.Lines(lease.stdout).next(10), r'^slot \{"index": 0, ')
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
                 lease.stdin.close()
@@ -1349,15 +1352,15 @@ class RemoteRun(unittest.TestCase):
             self.assertEqual(lease.wait(timeout=10), 0)
 
     def test_pruning_waits_for_the_slots_command_to_end(self):
-        with tempfile.TemporaryDirectory() as base:
+        with FixtureDirectory() as scope:
+            base = scope.name
             Path(base, "src").mkdir()
             stale = Path(base, "src", "stale.rs")
             stale.write_text("")
             with open(Path(base, "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                prune = subprocess.Popen(["python3", "-c", offload.REMOTE_AGENT, "prune", base],
+                prune = scope.popen([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base],
                                          stdin=subprocess.PIPE)
-                self.addCleanup(prune.kill)
                 prune.stdin.close()
                 with self.assertRaises(subprocess.TimeoutExpired):
                     prune.wait(timeout=1)
@@ -1367,16 +1370,15 @@ class RemoteRun(unittest.TestCase):
 
     def test_a_slot_is_handed_out_only_after_a_lingering_command_ends(self):
         # The previous lease's connection dropped while its command's did not.
-        with tempfile.TemporaryDirectory() as base:
+        with FixtureDirectory() as scope:
+            base = scope.name
             Path(base, "slot-0").mkdir()
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                lease = subprocess.Popen(
-                    ["python3", "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
+                lease = scope.popen(
+                    [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
                     env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
-                self.addCleanup(lease.stdout.close)
-                self.addCleanup(lease.kill)
                 lines = offload.Lines(lease.stdout)
                 # It says it is waiting, so a long wait is not taken for a
                 # host that does not answer.
@@ -1391,31 +1393,22 @@ class RemoteRun(unittest.TestCase):
 
     @contextlib.contextmanager
     def slots(self):
-        """A directory of slots, which leases still waiting would keep adding
-        to as it is removed."""
-        with tempfile.TemporaryDirectory() as base:
-            self.leases = []
-            try:
-                yield base
-            finally:
-                for lease in self.leases:
-                    lease.kill()
-                    lease.wait()
+        """Settle leases and their descendants before removing the slots."""
+        with FixtureDirectory() as scope:
+            self.scope = scope
+            yield scope.name
 
     def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None):
         if figures is None:
             figures = Path(base, "figures")
             write_figures(figures)
-        lease = subprocess.Popen(
-            ["python3", "-c", offload.REMOTE_AGENT, "lease", base, str(slots), "key", "0", "",
+        lease = self.scope.popen(
+            [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, str(slots), "key", "0", "",
              "", build],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
                               "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
                               "CAGENTS_OFFLOAD_FIGURES": str(figures)})
-        self.leases.append(lease)
-        self.addCleanup(lease.stdout.close)
-        self.addCleanup(lease.kill)
         return lease, offload.Lines(lease.stdout)
 
     def hold(self, base, index, claim=None):
@@ -1523,12 +1516,11 @@ class RemoteRun(unittest.TestCase):
             lease, lines = self.lease(base, build="same")
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
 
-    def run_agent(self, base, command):
+    def run_agent(self, scope, base, command):
         Path(base, "src").mkdir(exist_ok=True)
         # Its standard input stays open: closing it cancels the command.
-        agent = subprocess.Popen(["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+        agent = scope.popen([sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
                                   *command], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
-        self.addCleanup(agent.kill)
         agent.stdin.write(b'{"environment": {}}\n')
         agent.stdin.flush()
         output = agent.stdout.read()
@@ -1539,23 +1531,25 @@ class RemoteRun(unittest.TestCase):
 
     def test_a_build_shares_the_hosts_cpus_with_the_builds_running_there(self):
         cpus = len(os.sched_getaffinity(0))
-        with tempfile.TemporaryDirectory() as root:
+        with FixtureDirectory() as scope:
+            root = scope.name
             base = os.path.join(root, "slot-0")
             os.makedirs(base)
             self.hold(root, 0)
             echo = ["sh", "-c", "printf %s \"$CARGO_BUILD_JOBS\""]
             most = max(4, min(8, cpus // 2))
-            self.assertEqual(self.run_agent(base, echo), str(min(max(4, cpus), most)))
+            self.assertEqual(self.run_agent(scope, base, echo), str(min(max(4, cpus), most)))
             for index in (1, 2, 3):
                 self.hold(root, index)
-            self.assertEqual(self.run_agent(base, echo), str(min(max(4, cpus // 4), most)))
+            self.assertEqual(self.run_agent(scope, base, echo), str(min(max(4, cpus // 4), most)))
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
-        with tempfile.TemporaryDirectory() as base:
+        with FixtureDirectory() as scope:
+            base = scope.name
             Path(base, "src").mkdir()
             marker = Path(base, "pid")
-            agent = subprocess.Popen(
-                ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+            agent = scope.popen(
+                [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
                  "sh", "-c", f"sleep 120 & echo $! >{marker}; wait"],
                 stdin=subprocess.PIPE, start_new_session=True)
             agent.stdin.write(b'{"environment": {}}\n')
@@ -1566,7 +1560,15 @@ class RemoteRun(unittest.TestCase):
                 time.sleep(0.05)
             sleeper = int(marker.read_text())
             agent.stdin.close()
-            self.assertEqual(agent.wait(timeout=15), 130)
+            # This runner adopts the sleeper; reaping it as it dies, as init
+            # would, lets the agent see the command's group end.
+            deadline = time.monotonic() + 15
+            while agent.poll() is None:
+                self.assertLess(time.monotonic(), deadline, "the agent outlived its connection")
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(sleeper, os.WNOHANG)
+                time.sleep(0.05)
+            self.assertEqual(agent.returncode, 130)
             deadline = time.monotonic() + 5
             while Path(f"/proc/{sleeper}").exists() and Path(
                     f"/proc/{sleeper}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
@@ -1574,14 +1576,14 @@ class RemoteRun(unittest.TestCase):
                 time.sleep(0.05)
 
     def test_a_finished_command_keeps_its_status(self):
-        with tempfile.TemporaryDirectory() as base:
+        with FixtureDirectory() as scope:
+            base = scope.name
             Path(base, "src").mkdir()
             # The connection stays open, as it does while the gate waits.
-            agent = subprocess.Popen(
-                ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+            agent = scope.popen(
+                [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
                  "sh", "-c", 'test "$PROBE" = x && exit 7'],
                 stdin=subprocess.PIPE)
-            self.addCleanup(agent.stdin.close)
             agent.stdin.write(b'{"environment": {"PROBE": "x"}}\n')
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
@@ -1591,16 +1593,15 @@ class RemoteRun(unittest.TestCase):
         # An older gate's request still names a limit, which no longer
         # lowers it.
         for request in ({"environment": {}}, {"environment": {}, "open_files": 64}):
-            with self.subTest(request=request), tempfile.TemporaryDirectory() as base:
+            with self.subTest(request=request), FixtureDirectory() as scope:
+                base = scope.name
                 Path(base, "src").mkdir()
                 # The agent starts low, as an ssh session's 1024 does.
-                agent = subprocess.Popen(
-                    ["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+                agent = scope.popen(
+                    [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
                      "sh", "-c", "ulimit -Sn"],
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard)))
-                self.addCleanup(agent.stdout.close)
-                self.addCleanup(agent.stdin.close)
                 # The connection stays open, as it does while the gate waits.
                 agent.stdin.write(json.dumps(request).encode() + b"\n")
                 agent.stdin.flush()
@@ -1614,14 +1615,15 @@ class Prune(unittest.TestCase):
     """The build host's removal of sources the checkout no longer has."""
 
     def test_files_not_listed_go_and_the_target_directory_stays(self):
-        with tempfile.TemporaryDirectory() as base:
+        with FixtureDirectory() as scope:
+            base = scope.name
             source = Path(base, "src")
             for name in ("keep.rs", "a/keep.rs", "a/gone.rs", "b/gone.rs", "target/debug/x"):
                 Path(source, name).parent.mkdir(parents=True, exist_ok=True)
                 Path(source, name).write_text("")
             Path(source, "link").symlink_to("keep.rs")
-            subprocess.run(["python3", "-c", offload.REMOTE_AGENT, "prune", base],
-                           input=b"keep.rs\0a/keep.rs\0", check=True)
+            scope.run([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base],
+                           input=b"keep.rs\0a/keep.rs\0", check=True, timeout=15)
             left = sorted(str(path.relative_to(source)) for path in source.rglob("*"))
             self.assertEqual(left, ["a", "a/keep.rs", "keep.rs", "target", "target/debug",
                                     "target/debug/x"])
