@@ -1416,7 +1416,8 @@ impl Cagents {
 
     /// The pull request the detail shows instead of the active branch's:
     /// the one chosen from the list or, while the branch has none of its
-    /// own, the one the conversation worked on most.
+    /// own, the one the conversation worked on most, kept until it works on
+    /// another more closely or the worktree or conversation changes.
     fn shown_pull_request(&self) -> Option<PullRequestKey> {
         let state = &self.pull_request_inspector;
         state.chosen.clone().or_else(|| state.default.clone())
@@ -2453,7 +2454,7 @@ mod tests {
     }
 
     #[test]
-    fn a_chosen_pull_request_is_shown_until_its_conversation_no_longer_lists_it() {
+    fn a_chosen_or_default_pull_request_is_kept_while_its_conversation_lists_it() {
         let (mut app, conversation, terminal) = conversation_app();
         drop(app.sync_pull_request_inspector());
         assert_eq!(
@@ -2527,5 +2528,24 @@ mod tests {
         // An older revision does not bring it back.
         drop(app.handle_pull_request_ui(listed(conversation, 1, &[4, 5], false)));
         assert_eq!(app.pull_request_inspector.conversation.rows().len(), 1);
+
+        // Working on another pull request just as closely keeps the one
+        // already shown, until the worktree changes.
+        drop(app.handle_pull_request_ui(listed(conversation, 3, &[6, 5], false)));
+        assert_eq!(
+            app.pull_request_inspector.target,
+            Some(Target::PullRequest(five.clone()))
+        );
+        app.pull_request_inspector.default_in = Some(crate::sidebar::ActiveWorktreeKey {
+            project_id: ProjectId::new(),
+            worktree_id: crate::model::WorktreeId::new(),
+            canonical_path: PathBuf::from("/elsewhere"),
+        });
+        drop(app.sync_pull_request_inspector());
+        let six = PullRequestKey::new(key.repository.clone(), 6).unwrap();
+        assert_eq!(
+            app.pull_request_inspector.target,
+            Some(Target::PullRequest(six))
+        );
     }
 }
