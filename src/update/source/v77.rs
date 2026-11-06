@@ -540,6 +540,7 @@ mod tests {
             77u16,
             119,
             crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
+            crate::terminal_ipc::STARTUP_STATE_PROTOCOL,
             crate::terminal_ipc::PROTOCOL_VERSION,
         ] {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
@@ -821,8 +822,18 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn authenticated_candidate_line_source_previews_and_prepares_at_its_own_protocol() {
+        previews_and_prepares_at_its_own_protocol(crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn authenticated_startup_state_source_previews_and_prepares_at_its_own_protocol() {
+        previews_and_prepares_at_its_own_protocol(crate::terminal_ipc::STARTUP_STATE_PROTOCOL);
+    }
+
+    #[cfg(feature = "host")]
+    fn previews_and_prepares_at_its_own_protocol(protocol: u16) {
         use std::os::unix::net::UnixListener;
-        let protocol = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
         let paths = crate::daemon::RuntimePaths {

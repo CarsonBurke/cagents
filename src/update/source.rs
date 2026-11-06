@@ -188,7 +188,8 @@ impl Client {
     ) -> Result<Self, ControlError> {
         match protocol {
             crate::terminal_ipc::PROTOCOL_VERSION
-            | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL => {
+            | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+            | crate::terminal_ipc::STARTUP_STATE_PROTOCOL => {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -197,8 +198,9 @@ impl Client {
                 let peer = Peer::observe(&stream, socket).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
-                // The candidate line differs only by its number and by
-                // StartupState, which the update never sends.
+                // These sources differ from this release only by their number,
+                // by directory entries and, on the candidate line, by
+                // StartupState. The update uses neither.
                 let client =
                     ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
                 peer.verify(client.proof()).map_err(|error| {
@@ -346,6 +348,7 @@ pub(super) fn is_qualified_source(protocol: u16) -> bool {
         protocol,
         77 | 119
             | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+            | crate::terminal_ipc::STARTUP_STATE_PROTOCOL
             | crate::terminal_ipc::PROTOCOL_VERSION
     )
 }

@@ -287,7 +287,13 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![119, ipc::CANDIDATE_LINE_PROTOCOL, ipc::PROTOCOL_VERSION].contains(&self.protocol)
+        if ![
+            119,
+            ipc::CANDIDATE_LINE_PROTOCOL,
+            ipc::STARTUP_STATE_PROTOCOL,
+            ipc::PROTOCOL_VERSION,
+        ]
+        .contains(&self.protocol)
             || !source.is_saved_claude_history()
         {
             return Err("Saved history has no qualified read-only inspection API".into());
@@ -394,6 +400,7 @@ pub(super) fn supports_protocol(protocol: u16) -> bool {
         103,
         119,
         ipc::CANDIDATE_LINE_PROTOCOL,
+        ipc::STARTUP_STATE_PROTOCOL,
         ipc::PROTOCOL_VERSION,
     ]
     .contains(&protocol)
@@ -575,6 +582,7 @@ mod tests {
             103,
             119,
             ipc::CANDIDATE_LINE_PROTOCOL,
+            ipc::STARTUP_STATE_PROTOCOL,
             ipc::PROTOCOL_VERSION,
         ]
         .into()
