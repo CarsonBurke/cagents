@@ -15,7 +15,8 @@ def process_state(pid):
     directory = pathlib.Path('/proc') / str(pid)
     # In this order: a released process reports root as its owner, then has no stat to read.
     info = directory.stat()
-    text = (directory / 'stat').read_text()
+    # A process names itself, in bytes that needn't be text.
+    text = (directory / 'stat').read_text(errors='surrogateescape')
     values = text.rpartition(') ')[2].split()
     require(len(values) > 19, 'Invalid owned-process stat')
     return {'pid': pid, 'state': values[0], 'ppid': int(values[1]),
@@ -103,10 +104,20 @@ class Custody:
             current = self.current(node, executable=True)
             node.update({k: v for k, v in current.items() if k in ('executable', 'executable_identity')})
             return node
-        except BaseException:
+        except BaseException as error:
+            # A process being released can read as parentless before it has no
+            # entry to read. A check failing for one that remains still counts.
+            gone = isinstance(error, RuntimeError) and self.released(pid, descriptor)
             os.close(descriptor)
             self.nodes.pop(pid, None)
+            if gone: raise ProcessLookupError(errno.ESRCH, 'Child was released') from error
             raise
+
+    def released(self, pid, descriptor):
+        if not self.exited({'pidfd': descriptor}): return False
+        try: value = process_state(pid)
+        except (FileNotFoundError, ProcessLookupError): return True
+        return value['state'] == 'X' or value['ppid'] == 0
 
     def reap(self, node):
         if node.get('settled'): return True

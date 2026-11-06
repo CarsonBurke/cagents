@@ -16,6 +16,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -445,6 +446,41 @@ class ProcessCustodyExitTests(unittest.TestCase):
                 self.assertEqual(self.module.child_ids(node["pid"]), set())
             with mock.patch.object(Path, "read_text", side_effect=tasks):
                 self.assertEqual(self.module.child_ids(node["pid"]), set())
+
+    def test_a_child_read_as_parentless_is_only_believed_released_by_its_pidfd(self):
+        with OwnedFamily(self, self.module) as family:
+            owner, pid = family.owner, family.child_pid
+            released = {**self.module.process_state(pid), "ppid": 0, "state": "X"}
+            owner.nodes.pop(pid)
+            with mock.patch.object(self.module, "process_state", return_value=released):
+                with self.assertRaisesRegex(RuntimeError, "Child provenance"):
+                    owner.pin(pid, family.worker.pid)
+                with mock.patch.object(owner, "exited", return_value=True), \
+                        self.assertRaises(ProcessLookupError):
+                    owner.pin(pid, family.worker.pid)
+            # A zombie stays readable: its failed check still counts.
+            zombie = {**released, "ppid": owner.pid, "state": "Z", "uid": owner.uid + 1}
+            with mock.patch.object(self.module, "process_state", return_value=zombie), \
+                    mock.patch.object(owner, "exited", return_value=True), \
+                    self.assertRaisesRegex(RuntimeError, "not newly owned"):
+                owner.pin(pid, family.worker.pid)
+            self.assertNotIn(pid, owner.nodes)
+            owner.pin(pid, family.worker.pid)
+
+    def test_a_process_whose_name_is_not_text_can_be_read(self):
+        with tempfile.TemporaryDirectory() as directory:
+            # The kernel cuts the name to 15 bytes, in the middle of a character.
+            named = Path(directory) / ("\u00e9" * 8)
+            named.symlink_to(shutil.which("sleep"))
+            child = subprocess.Popen([named, "30"])
+            self.addCleanup(child.wait)
+            self.addCleanup(child.kill)
+            comm = Path("/proc") / str(child.pid) / "comm"
+            deadline = time.monotonic() + HANDSHAKE_SECONDS
+            while comm.read_bytes() == b"" or not comm.read_bytes().startswith(b"\xc3"):
+                self.assertLess(time.monotonic(), deadline, "The child did not exec")
+                time.sleep(0.01)
+            self.assertEqual(self.module.process_state(child.pid)["ppid"], os.getpid())
 
     def test_a_new_child_that_lost_its_metadata_is_waited_for(self):
         vanished = FileNotFoundError(errno.ENOENT, "Injected exiting executable")
