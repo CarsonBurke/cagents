@@ -3483,6 +3483,9 @@ mod tests {
 
     #[test]
     fn rejected_scope_request_still_starts_and_retires_a_real_retained_server() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_SCOPE_FALLBACK_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -3647,6 +3650,9 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
 
     #[test]
     fn serving_actor_reaps_exited_adopted_orphans_without_touching_live_ones() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_ORPHAN_SWEEP_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -4003,6 +4009,9 @@ while IFS= read -r frame; do :; done
     }
     #[test]
     fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_CLOSE_ONLY_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -4225,6 +4234,9 @@ while IFS= read -r frame; do :; done
     }
     #[test]
     fn authenticated_directory_pin_keeps_original_after_replacement_and_epoch_change() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_RETAINED_DIRECTORY_PIN_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir().unwrap();
@@ -4423,6 +4435,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn helper_restores_descriptor_seal_before_any_provider_exec() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_ACTOR_DESCRIPTOR_SEAL_TEST";
         if std::env::var_os(CHILD).is_none() {
             let isolated = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -5769,6 +5784,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn adopted_real_helper_reclaims_prior_acknowledgements_before_more_than_capacity_commands() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         const CHILD: &str = "CAGENTS_ACTOR_RECEIPT_RETIREMENT_TEST";
         if std::env::var_os(CHILD).is_none() {
             let root = tempfile::tempdir_in("/var/tmp").unwrap();

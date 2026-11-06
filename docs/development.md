@@ -848,6 +848,15 @@ this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
 
+Tests that spawn the retained helper call `retained_fixture::run_isolated()`
+first. The helper calls `setsid` and enters its own systemd scope, so killing a
+process group or cgroup misses it. `run_isolated()` reruns the exact test as a
+worker beneath a private subreaper. When the worker exits, for any reason, the
+subreaper kills and reaps every remaining descendant. After a passing worker it
+prints how many it killed: a nonzero count means the product left processes
+behind. Same-test reexecs that call `env_clear()` must pass
+`retained_fixture::owner_env()` through.
+
 Prefer the narrow target that covers the changed contract, for example:
 
 ```sh
