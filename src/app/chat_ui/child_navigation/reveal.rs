@@ -32,6 +32,7 @@ struct Reveal<'a> {
 #[derive(Default)]
 struct Memory {
     selected: Option<Id>,
+    selected_at: Option<f32>,
     focused: Option<(Id, f32, f32)>,
     width: Option<f32>,
 }
@@ -128,17 +129,25 @@ impl Reveal<'_> {
             let position = (id, bounds.x - scroll.content.x, bounds.width);
             (position, bounds)
         });
+        let selected_at = measure.selected.map(|bounds| bounds.x - scroll.content.x);
         let memory = tree.state.downcast_mut::<Memory>();
+        let resized = memory.width != Some(scroll.viewport.width);
         let target = if self.selected != memory.selected {
             measure.selected
-        } else if focused.as_ref().is_some_and(|(position, _)| {
-            Some(position) != memory.focused.as_ref() || memory.width != Some(scroll.viewport.width)
-        }) {
+        } else if focused
+            .as_ref()
+            .is_some_and(|(position, _)| Some(position) != memory.focused.as_ref() || resized)
+        {
             focused.as_ref().map(|(_, bounds)| *bounds)
+        } else if selected_at.is_some() && (selected_at != memory.selected_at || resized) {
+            // A re-sort can carry the selected tab past the edge; bring it
+            // back, but leave manual browsing alone while it stays put.
+            measure.selected
         } else {
             None
         };
         memory.selected.clone_from(&self.selected);
+        memory.selected_at = selected_at;
         memory.focused = focused.map(|(position, _)| position);
         memory.width = Some(scroll.viewport.width);
         if let Some(bounds) = target {
@@ -584,6 +593,62 @@ mod tests {
         assert!(
             runtime.child_cache.is_empty(),
             "revealing tabs must not prepare hidden transcripts"
+        );
+    }
+
+    #[test]
+    fn a_selected_tab_carried_off_screen_by_a_reorder_comes_back_into_view() {
+        let (mut runtime, _handle) = runtime();
+        let target = runtime.target;
+        let selected = card_control_id(target.card, "chat-subagent-tab-child-0");
+        let scroll_id = card_control_id(target.card, "chat-subagent-tabs");
+        runtime.selected_subagent = Some("child-0".into());
+        let mut renderer = crate::app::tests::headless_renderer();
+        let viewport = Size::new(360.0, 100.0);
+        let mut ui = UserInterface::build(
+            runtime.child_navigation(360.0),
+            viewport,
+            Cache::new(),
+            &mut renderer,
+        );
+        let before = measure(&mut ui, &renderer, target);
+        assert_visible(&ui, before, &selected);
+        let mut ui = UserInterface::build(
+            runtime.child_navigation(360.0),
+            viewport,
+            ui.into_cache(),
+            &mut renderer,
+        );
+        assert_eq!(
+            measure(&mut ui, &renderer, target).offset,
+            before.offset,
+            "an unmoved selected tab leaves the scroll alone"
+        );
+        ui.operate(&renderer, &mut Offset(&scroll_id, 0.0));
+        let cache = ui.into_cache();
+        // Finishing sends it behind every working agent, past the edge.
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].status =
+            crate::chat::ToolStatus::Succeeded;
+        let mut ui = UserInterface::build(
+            runtime.child_navigation(360.0),
+            viewport,
+            cache,
+            &mut renderer,
+        );
+        let after = measure(&mut ui, &renderer, target);
+        assert!(after.offset > 0.0, "the moved selection is revealed");
+        assert_visible(&ui, after, &selected);
+        ui.operate(&renderer, &mut Offset(&scroll_id, 0.0));
+        let mut ui = UserInterface::build(
+            runtime.child_navigation(360.0),
+            viewport,
+            ui.into_cache(),
+            &mut renderer,
+        );
+        assert_eq!(
+            measure(&mut ui, &renderer, target).offset,
+            0.0,
+            "manual browsing away from a settled selection does not snap back"
         );
     }
 }

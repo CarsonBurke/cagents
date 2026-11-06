@@ -1318,12 +1318,16 @@ impl Runtime {
             Self::native_child_status(agent),
             Self::short_description(model, 80),
         );
-        // A provider failure keeps its raw diagnostic for copying; the tab
-        // says what it means.
+        // A blocked or failed child's provider error keeps its raw diagnostic
+        // for copying; the tab says what it means. A finished child's detail
+        // is its own report, whose prose may merely mention such words.
         let detail = agent.detail.trim();
         if !detail.is_empty() {
             identity.push_str(" · ");
-            match chat::failure::Failure::parse(self.session.launch.provider, detail) {
+            let failure = (agent.waiting || agent.status == chat::ToolStatus::Failed)
+                .then(|| chat::failure::Failure::parse(self.session.launch.provider, detail))
+                .flatten();
+            match failure {
                 Some(failure) => identity.push_str(&failure.summary),
                 None => identity.push_str(&Self::short_description(detail, 120)),
             }
@@ -7397,6 +7401,13 @@ mod tests {
         let limited = runtime.native_child_identity(&child);
         assert!(limited.contains("Claude usage limit reached · resets 1:30pm"));
         assert!(!limited.contains("rate_limit_error"));
+        // A finished child's own report is quoted, never read as a failure.
+        child.waiting = false;
+        child.status = chat::ToolStatus::Succeeded;
+        child.detail = "psql gave connection refused until postgres started".into();
+        let report = runtime.native_child_identity(&child);
+        assert!(report.contains("psql gave connection refused"));
+        assert!(!report.contains("connection was interrupted"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
     }

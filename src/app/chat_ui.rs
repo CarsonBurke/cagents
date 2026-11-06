@@ -4490,7 +4490,7 @@ impl Runtime {
         source_clock: Option<chat::client::SourceClock>,
     ) {
         // Hidden publications number new children too, so a child keeps the
-        // number it first appeared with even if it was trimmed meanwhile.
+        // number it first appeared with for as long as it stays listed.
         self.child_ordinals.observe(&snapshot.subagents);
         if !self.visible.load(Ordering::Relaxed) {
             self.release_transcript_presentation();
