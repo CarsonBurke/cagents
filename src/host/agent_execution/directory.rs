@@ -28,7 +28,7 @@ pub(in crate::host) struct Live {
     pub(in crate::host) history_only: bool,
 }
 
-pub(super) fn read(
+pub(in crate::host) fn read(
     host: &SharedHost,
     authority: &Authority,
     scope: Scope,
