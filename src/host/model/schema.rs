@@ -1056,7 +1056,7 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20 and run-attention21.
+            // This current opener also applies retention20, run-attention21 and history22.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [

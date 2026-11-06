@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{
     notification_event, notifications,
-    precheck::worker::{Request, Status, Worker},
+    precheck::worker::{LaunchError, Request, Status, Worker},
     schedule::Compiled,
     service,
 };
@@ -292,7 +292,10 @@ impl Handle {
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(claim.firing.id, worker);
                 }
-                Err(error) => {
+                Err(LaunchError {
+                    error,
+                    nothing_created,
+                }) => {
                     let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         // A colliding private record could belong to an earlier
@@ -312,6 +315,16 @@ impl Handle {
                             service::now()?,
                             false,
                         )?;
+                        if nothing_created {
+                            match registry.confirm_unlaunched_automation_precheck(
+                                claim.firing.id,
+                                claim.firing.revision,
+                                service::now()?,
+                            ) {
+                                Ok(()) => return Ok(()),
+                                Err(error) => warn_history_maintenance(&error),
+                            }
+                        }
                         drop(registry);
                         // Failed launch may have written partial private proof.
                         // Retain actual Worker::retire custody even if no child

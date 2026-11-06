@@ -335,6 +335,177 @@ fn one_hundred_overlaps_keep_waiting_owner_and_one_exact_skip_group_after_reopen
 }
 
 #[test]
+fn skips_from_before_groups_collapse_so_the_waiting_run_stays_on_the_first_page() {
+    use crate::agent_execution::Update;
+    let (mut registry, _directory, mut definition) = fixture();
+    definition.session_mode = SessionMode::Fresh;
+    definition.schedule.pattern = SchedulePattern::Cron {
+        expression: "* * * * *".into(),
+    };
+    definition.schedule.timezone = "UTC".into();
+    let automation = registry
+        .create_automation(definition, 0, test_identity())
+        .unwrap();
+    let enabled = registry
+        .set_automation_enabled(
+            automation.id,
+            automation.revision,
+            Some(history_occurrence(1)),
+            true,
+            1,
+        )
+        .unwrap();
+    let (_, owner) =
+        history_claim_manual(&mut registry, enabled.id, enabled.execution_revision, 100);
+    let accepted = owner.accepted.unwrap();
+    let started = registry
+        .update_agent_run(
+            accepted.run.id,
+            accepted.run.revision,
+            Update::Started {
+                provider_key: "waiting-history".into(),
+            },
+            200,
+        )
+        .unwrap();
+    registry
+        .update_agent_run(started.id, started.revision, Update::Waiting, 300)
+        .unwrap();
+    registry.reconcile_automation_run(started.id, 301).unwrap();
+    let template = history_occurrence(1);
+    let skipped = registry
+        .claim_automation(
+            enabled.id,
+            enabled.execution_revision,
+            Some(&template),
+            crate::automations::Trigger::Scheduled {
+                occurrence: template.clone(),
+            },
+            Some(history_occurrence(2)),
+            false,
+            template.due_ms,
+        )
+        .unwrap();
+    assert!(skipped.accepted.is_none());
+    registry
+        .db
+        .execute(
+            "DELETE FROM automation_firings WHERE id=?1",
+            [skipped.firing.id.to_string()],
+        )
+        .unwrap();
+    // One row per occurrence, as a published daemon wrote them: a weekend of
+    // overlaps with one capacity skip in the middle that must stay its own group.
+    let tx = registry.db.transaction().unwrap();
+    for index in 1..=860 {
+        let occurrence = history_occurrence(index);
+        let mut row = skipped.firing.clone();
+        row.id = Uuid::new_v4();
+        row.trigger = crate::automations::Trigger::Scheduled {
+            occurrence: occurrence.clone(),
+        };
+        row.skip = Some(if index == 430 {
+            crate::automations::SkipReason::Capacity
+        } else {
+            crate::automations::SkipReason::Overlap
+        });
+        row.skipped_occurrences = None;
+        row.created_ms = occurrence.due_ms;
+        row.finished_ms = Some(occurrence.due_ms);
+        insert_firing(&tx, &row, &format!("scheduled:{index}")).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(history_count(&registry, automation.id), 861);
+
+    registry.maintain_automation_history(60_000_000).unwrap();
+
+    let page = registry
+        .automation_history(Some(automation.id), None, 100)
+        .unwrap();
+    assert!(page.next.is_none());
+    assert_eq!(page.firings.len(), 4);
+    assert!(
+        page.firings
+            .iter()
+            .any(|row| row.id == owner.firing.id && row.state == FiringState::Waiting)
+    );
+    let mut groups: Vec<_> = page
+        .firings
+        .iter()
+        .filter_map(|row| {
+            let group = row.skipped_occurrences.as_ref()?;
+            Some((
+                group.count,
+                group.first_occurrence_ms / 60_000,
+                group.last_occurrence_ms / 60_000,
+            ))
+        })
+        .collect();
+    groups.sort();
+    assert_eq!(groups, [(429, 1, 429), (430, 431, 860)]);
+    assert!(
+        page.firings
+            .iter()
+            .any(|row| row.skip == Some(crate::automations::SkipReason::Capacity)),
+        "another reason breaks the group"
+    );
+    // Later startups have nothing further to join.
+    registry.maintain_automation_history(60_000_001).unwrap();
+    assert_eq!(history_count(&registry, automation.id), 4);
+}
+
+#[test]
+fn a_run_that_left_history_explains_itself_instead_of_a_query_error() {
+    let (registry, _directory, _definition) = fixture();
+    let expected = "This run's details are no longer available. Run history keeps only the most recent entries.";
+    assert_eq!(
+        registry.automation_run_detail(Uuid::new_v4()).err().unwrap(),
+        expected
+    );
+    assert_eq!(
+        registry
+            .automation_detail_for_run(crate::model::RunId::new())
+            .err()
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn a_precheck_launch_that_left_nothing_needs_no_retirement() {
+    use history::PrecheckRetirement;
+    let (mut registry, _directory, definition) = fixture();
+    let automation = registry
+        .create_automation(history_precheck_definition(definition), 0, test_identity())
+        .unwrap();
+    let (_, claim) = history_claim_manual(&mut registry, automation.id, 1, 2);
+    registry
+        .fail_automation_start(claim.firing.id, "Cannot start the precheck".into(), 3, false)
+        .unwrap();
+    assert_eq!(
+        registry
+            .automation_precheck_retirement(claim.firing.id, 1)
+            .unwrap(),
+        PrecheckRetirement::ReleasedPending
+    );
+    registry
+        .confirm_unlaunched_automation_precheck(claim.firing.id, 1, 4)
+        .unwrap();
+    assert_eq!(
+        registry
+            .automation_precheck_retirement(claim.firing.id, 1)
+            .unwrap(),
+        PrecheckRetirement::Acknowledged
+    );
+    assert!(
+        !registry
+            .automation_precheck_retirement(claim.firing.id, 1)
+            .unwrap()
+            .is_protected()
+    );
+}
+
+#[test]
 fn exact_reason_manual_success_and_execution_revision_break_scheduled_groups() {
     use crate::automations::{SkipReason, Trigger};
     let (mut registry, _directory, definition) = fixture();

@@ -175,6 +175,17 @@ impl Registry {
         &self,
         id: Uuid,
     ) -> Result<crate::automations::RunDetail, String> {
+        let exists: bool = self
+            .db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_firings WHERE id=?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| e.to_string())?;
+        if !exists {
+            return Err(RUN_DETAILS_EXPIRED.into());
+        }
         let mut firing = read_firing(&self.db, id)?;
         let mut definition = read_definition(&self.db, firing.automation, firing.revision)?;
         if firing.name.is_empty() {
@@ -214,7 +225,9 @@ impl Registry {
                 [run.to_string()],
                 |row| row.get(0),
             )
-            .map_err(|e| e.to_string())?;
+            .optional()
+            .map_err(|e| e.to_string())?
+            .ok_or(RUN_DETAILS_EXPIRED)?;
         self.automation_run_detail(
             id.parse()
                 .map_err(|_| "Stored automation firing identity is invalid")?,
@@ -1698,6 +1711,10 @@ fn read_definition(db: &Connection, id: Uuid, revision: u64) -> Result<Definitio
         .map_err(|error| error.to_string())?;
     decode(&record)
 }
+/// An alert or a row on screen can outlive the history entry it points to.
+const RUN_DETAILS_EXPIRED: &str =
+    "This run's details are no longer available. Run history keeps only the most recent entries.";
+
 fn read_firing(db: &Connection, id: Uuid) -> Result<Firing, String> {
     let record = db
         .query_row(

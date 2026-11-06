@@ -635,8 +635,9 @@ a count of occurrences that were never individually recorded.
 
 Each automation retains up to 500 settled history entries; active or unresolved
 ownership and cleanup evidence remain until resolved. Removed automations keep
-eligible history for 30 days, after which its details and unreferenced execution
-revisions are removed. An old manual request ID still cannot run again when its
+eligible history for 30 days, after which its history entries and unreferenced
+execution revisions are removed. The automation's saved definition and its agent
+sessions stay, so this bounds history, not total storage. An old manual request ID still cannot run again when its
 details expire: retries report that the original request was recorded. Use a new
 request ID only for an intentional new run.
 

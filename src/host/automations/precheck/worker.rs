@@ -43,6 +43,15 @@ struct Retirement {
     inode: u64,
 }
 
+/// A launch that spawned no helper. `nothing_created` means this firing left no
+/// private files, so there is never anything to retire; the error alone does
+/// not establish that, because a partial directory may survive a failed launch.
+#[derive(Debug)]
+pub struct LaunchError {
+    pub error: io::Error,
+    pub nothing_created: bool,
+}
+
 fn retirement_name(firing: Uuid) -> String {
     format!("{firing}.retired")
 }
@@ -146,28 +155,85 @@ impl Worker {
         }
     }
 
-    pub fn launch(root: &Path, request: &Request) -> io::Result<Self> {
-        validate_request(request)?;
-        crate::secure_file::prepare_private_directory(root)?;
+    pub fn launch(root: &Path, request: &Request) -> Result<Self, LaunchError> {
+        let unclaimed = |error| LaunchError {
+            error,
+            nothing_created: true,
+        };
+        let held = |error| LaunchError {
+            error,
+            nothing_created: false,
+        };
+        validate_request(request).map_err(unclaimed)?;
+        crate::secure_file::prepare_private_directory(root).map_err(unclaimed)?;
         match root
             .join(retirement_name(request.firing))
             .symlink_metadata()
         {
             Ok(_) => {
-                return Err(io::Error::new(
+                return Err(held(io::Error::new(
                     io::ErrorKind::AlreadyExists,
                     "This precheck still has durable retirement custody",
-                ));
+                )));
             }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(error) => return Err(held(error)),
         }
         let directory = root.join(request.firing.to_string());
         // Never reuse a firing's files, even if a previous launch died before
         // its first receipt. Retrying an arbitrary precheck could charge twice.
         std::os::unix::fs::DirBuilderExt::mode(&mut fs::DirBuilder::new(), 0o700)
-            .create(&directory)?;
-        create_record(&directory, "request", request)?;
+            .create(&directory)
+            .map_err(|error| LaunchError {
+                nothing_created: error.kind() != io::ErrorKind::AlreadyExists,
+                error,
+            })?;
+        let (lease, mut command) = match Self::prepare_launch(&directory, request) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                // This call made the directory and no helper exists yet, so
+                // only a durable removal leaves nothing that needs retiring.
+                let nothing_created = fs::remove_dir_all(&directory)
+                    .and_then(|()| File::open(root)?.sync_all())
+                    .is_ok();
+                return Err(LaunchError {
+                    error,
+                    nothing_created,
+                });
+            }
+        };
+        let child = match command.spawn() {
+            Ok(child) => Some(child),
+            Err(error) => {
+                // spawn reports exec failure before any helper could launch
+                // the user's command. This is a proved safe terminal result.
+                create_record(
+                    &directory,
+                    "receipt",
+                    &Receipt {
+                        firing: request.firing,
+                        revision: request.revision,
+                        outcome: failed(format!("Precheck helper could not start: {error}")),
+                    },
+                )
+                .map_err(held)?;
+                None
+            }
+        };
+        drop(lease);
+        Ok(Self {
+            directory,
+            firing: request.firing,
+            revision: request.revision,
+            child,
+            retirement: None,
+            retirement_unlinked: false,
+        })
+    }
+
+    /// Everything before spawn: failure here proves no helper can exist.
+    fn prepare_launch(directory: &Path, request: &Request) -> io::Result<(File, Command)> {
+        create_record(directory, "request", request)?;
         let lease = OpenOptions::new()
             .read(true)
             .write(true)
@@ -179,7 +245,7 @@ impl Worker {
             return Err(io::Error::last_os_error());
         }
         lease.sync_all()?;
-        File::open(&directory)?.sync_all()?;
+        File::open(directory)?.sync_all()?;
         let fd = lease.as_raw_fd();
         #[cfg(not(test))]
         let mut command = Command::new(std::env::current_exe()?);
@@ -187,7 +253,7 @@ impl Worker {
         let mut command = Command::new(test_helper_executable()?);
         command
             .args([SUPERVISOR])
-            .arg(&directory)
+            .arg(directory)
             .arg(fd.to_string())
             .env_remove(crate::agent_execution::AUTHORITY_ENV)
             .stdin(Stdio::null())
@@ -206,32 +272,7 @@ impl Worker {
                 Ok(())
             });
         }
-        let child = match command.spawn() {
-            Ok(child) => Some(child),
-            Err(error) => {
-                // spawn reports exec failure before any helper could launch
-                // the user's command. This is a proved safe terminal result.
-                create_record(
-                    &directory,
-                    "receipt",
-                    &Receipt {
-                        firing: request.firing,
-                        revision: request.revision,
-                        outcome: failed(format!("Precheck helper could not start: {error}")),
-                    },
-                )?;
-                None
-            }
-        };
-        drop(lease);
-        Ok(Self {
-            directory,
-            firing: request.firing,
-            revision: request.revision,
-            child,
-            retirement: None,
-            retirement_unlinked: false,
-        })
+        Ok((lease, command))
     }
 
     pub fn recover(root: &Path, firing: Uuid, revision: u64) -> Self {
@@ -973,7 +1014,11 @@ mod tests {
                 },
             };
             assert_eq!(
-                Worker::launch(root.path(), &request).err().unwrap().kind(),
+                Worker::launch(root.path(), &request)
+                    .err()
+                    .unwrap()
+                    .error
+                    .kind(),
                 io::ErrorKind::AlreadyExists
             );
             let mut wrong = Worker::recover(root.path(), retirement.firing, 2);
@@ -1021,6 +1066,44 @@ mod tests {
                 "exact post-ACK fsync retry remains possible"
             );
         }
+    }
+
+    #[test]
+    fn only_a_launch_that_left_nothing_reports_nothing_created() {
+        let root = tempfile::tempdir().unwrap();
+        let firing = Uuid::new_v4();
+        let target = root.path().metadata().unwrap();
+        let request = Request {
+            firing,
+            revision: 1,
+            directory: root.path().into(),
+            target_identity: crate::automations::DirectoryIdentity {
+                device: target.dev(),
+                inode: target.ino(),
+            },
+            precheck: Precheck {
+                command: "exit 7".into(),
+                timeout_seconds: 5,
+            },
+        };
+        // The private root cannot exist: nothing was made.
+        let blocked = root.path().join("file");
+        fs::write(&blocked, b"").unwrap();
+        let failure = Worker::launch(&blocked, &request).err().unwrap();
+        assert!(failure.nothing_created, "{failure:?}");
+
+        // Another owner's directory or receipt is not ours to call absent.
+        let private = root.path().join("private");
+        crate::secure_file::prepare_private_directory(&private).unwrap();
+        fs::create_dir(private.join(firing.to_string())).unwrap();
+        let failure = Worker::launch(&private, &request).err().unwrap();
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!failure.nothing_created);
+        fs::remove_dir(private.join(firing.to_string())).unwrap();
+        fs::write(private.join(retirement_name(firing)), b"").unwrap();
+        let failure = Worker::launch(&private, &request).err().unwrap();
+        assert_eq!(failure.error.kind(), io::ErrorKind::AlreadyExists);
+        assert!(!failure.nothing_created);
     }
 
     #[test]

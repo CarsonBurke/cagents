@@ -2645,18 +2645,29 @@ impl State {
                     }
                     for firing in &self.history {
                         let origin = match &firing.trigger {
-                            crate::automations::Trigger::Manual { .. } => "Manual".to_owned(),
+                            // A group's state label already gives its time range.
+                            crate::automations::Trigger::Scheduled { .. }
+                                if firing.skipped_occurrences.is_some() =>
+                            {
+                                "Scheduled".to_owned()
+                            }
+                            crate::automations::Trigger::Manual { .. } => {
+                                format!("{} · Manual", timestamp(firing.created_ms))
+                            }
                             crate::automations::Trigger::Scheduled { occurrence } => {
-                                format!("Scheduled {}", occurrence.local)
+                                format!(
+                                    "{} · Scheduled {}",
+                                    timestamp(firing.created_ms),
+                                    occurrence.local
+                                )
                             }
                         };
                         content = content.push(crate::ui_controls::owned(
                             firing.id,
                             button_owned(
                                 format!(
-                                    "{} · {} · {} · {}{}",
+                                    "{} · {} · {}{}",
                                     firing.name,
-                                    timestamp(firing.created_ms),
                                     origin,
                                     firing_state_label(firing),
                                     if firing.release_pending {
@@ -2683,11 +2694,20 @@ impl State {
                         run.definition.name,
                         firing_state_label(&run.firing)
                     )))
-                    .push(crate::design::body(format!(
-                        "Started: {}\nTarget: {}",
-                        timestamp(run.firing.created_ms),
-                        run.definition.agent.target.directory.display()
-                    )));
+                    .push(crate::design::body(
+                        if run.firing.skipped_occurrences.is_some() {
+                            format!(
+                                "Target: {}",
+                                run.definition.agent.target.directory.display()
+                            )
+                        } else {
+                            format!(
+                                "Started: {}\nTarget: {}",
+                                timestamp(run.firing.created_ms),
+                                run.definition.agent.target.directory.display()
+                            )
+                        },
+                    ));
                 if let Some(finished) = run.firing.finished_ms {
                     content = content.push(crate::design::body(format!(
                         "Finished: {}",
@@ -3806,10 +3826,13 @@ mod tests {
                 ),
                 None => "Skipped".to_owned(),
             };
-            let row = format!(
-                "Daily review · {} · Scheduled fixture-first · {expected_state}",
-                timestamp(60_000),
-            );
+            let row = match count {
+                Some(_) => format!("Daily review · Scheduled · {expected_state}"),
+                None => format!(
+                    "Daily review · {} · Scheduled fixture-first · {expected_state}",
+                    timestamp(60_000),
+                ),
+            };
             for width in [300.0, 900.0] {
                 let history = Outline::of(&state, width, 700.0);
                 history.text(&row);

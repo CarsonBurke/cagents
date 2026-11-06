@@ -229,6 +229,46 @@ pub(super) fn insert_or_coalesce(
     Ok(())
 }
 
+/// History from before groups has one row per occurrence, all ahead of a run
+/// still waiting for someone. Join them once with the rule that governs new
+/// skips; rows that remain apart stay eligible but merge nothing further.
+fn coalesce_ungrouped_skips(tx: &Transaction<'_>) -> Result<(), String> {
+    let ids = tx
+        .prepare(
+            "SELECT id FROM automation_firings
+             WHERE json_extract(record,'$.state')='skipped'
+               AND json_extract(record,'$.skipped_occurrences') IS NULL
+             ORDER BY rowid",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    for id in ids {
+        let next: String = tx
+            .query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT p.record FROM automation_firings f
+                 JOIN automation_firings p ON p.id=f.previous_firing WHERE f.id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(previous) = previous {
+            merge(tx, &mut decode(&previous)?, &decode(&next)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Coalesce only adjacent insertion-order rows after actual cleanup, including
 /// a newer consecutive group which could not merge while this owner was live.
 fn compact(tx: &Transaction<'_>, firing: &mut Firing) -> Result<(), String> {
@@ -394,6 +434,8 @@ impl Registry {
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::super::schema::require_current(&tx)?;
+        coalesce_ungrouped_skips(&tx)?;
         prune(&tx, None, now_ms, HISTORY_RETAINED_ROWS)?;
         tx.commit().map_err(|e| e.to_string())
     }
@@ -434,8 +476,9 @@ impl Registry {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Only the broker's before-Worker::launch branch may record this evidence.
-    /// It proves no launch was attempted, not merely that a pathname is absent.
+    /// Only the broker may record this: before Worker::launch, or after one that
+    /// reports it spawned nothing and left no files. A pathname being absent is
+    /// not enough, since that says nothing about who else may have owned it.
     pub(crate) fn confirm_unlaunched_automation_precheck(
         &mut self,
         id: Uuid,
