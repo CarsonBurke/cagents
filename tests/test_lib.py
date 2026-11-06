@@ -319,7 +319,8 @@ class TestLib(unittest.TestCase):
                 pruner = str(self.root / "pruner")
                 self.assertEqual(self.events("prune")[0]["arguments"],
                                  ["--apply", "--max-idle", "7", "--lock", pruner + ".lock",
-                                  "--log", pruner + ".tsv", "--orphan-hours", "0"])
+                                  "--log", pruner + ".tsv", "--keep", str(self.root / "owned-build"),
+                                  "--orphan-hours", "0", "--budget", "300"])
                 self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])
                 self.assertFalse(Path(str(self.lock) + ".queue").exists(), "guard must refuse before admission")
                 self.assert_no_test()

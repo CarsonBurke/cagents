@@ -77,12 +77,14 @@ done
 cp -- "$source/install-cargo-gate" "$stage/install-cargo-gate"
 
 # Admits and runs a command through the gate at $1, on a private lock so the
-# check neither waits behind real builds nor holds a slot they need. It runs
-# outside any Cargo workspace, so it neither seeds nor checks free space.
+# check neither waits behind real builds nor holds a slot they need. It should
+# run outside any Cargo workspace; should a temporary directory be inside one,
+# it still neither seeds, checks free space nor starts the pruner.
 smoke() {
     lock=$(mktemp -d "${TMPDIR:-/tmp}/cagents-gate-smoke.XXXXXX")
     status=0
     output=$(cd "$lock" && CAGENTS_BUILD_LOCK="$lock/lock" CAGENTS_BUILD_SLOT_HELD= \
+        CAGENTS_BUILD_FREE_FLOOR_GIB=0 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_INSTALLED_GATE= \
         "$1" exec sh -c 'printf admitted' 2>"$lock/errors") || status=$?
     errors=$(cat -- "$lock/errors")

@@ -10,19 +10,22 @@ build output by what it holds rather than by where it is: Cargo writes
 directory in each profile, which nothing else does.
 
 A target directory is removed only when, at the time of removal:
-- no entry anywhere inside it was written within --max-idle days, or, for a
-  mirrored build directory whose workspace no longer exists, --orphan-hours;
-- every Cargo profile lock in it is free, and stays held by this program
-  until the directory is gone; and
+- no entry anywhere inside it was written or changed within --max-idle days,
+  or, for a mirrored build directory whose workspace no longer exists,
+  --orphan-hours;
+- every Cargo profile lock in it is free; and
 - no process has its working directory, root, executable, an open file or a
   mapping inside it.
 
-It is first renamed aside, under those locks, so a build that starts later
-finds no directory rather than a partly removed one; an interrupted removal
-leaves only the renamed copy, which the next run removes. Never touched: the
-directories given with --keep, ~/.local/share, the offload build slots
-(~/.cache/cagents-offload, whose leases manage them) and anything a symlink
-leads to. One run at a time per host.
+Under those locks it is renamed aside, so a build that starts later finds no
+directory rather than a partly removed one. The renamed copy is checked
+again, and put back if anything wrote to or opened it meanwhile; an
+interrupted removal leaves only the renamed copy, which the next run
+removes. Never touched: a main checkout's own build (its workspace has a
+`.git` directory; it seeds new worktrees), the directories given with
+--keep, ~/.local/share, the offload build slots (~/.cache/cagents-offload,
+whose leases manage them), other users' files and anything a symlink leads
+to. One run at a time per user.
 """
 from __future__ import annotations
 
@@ -34,6 +37,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -78,18 +82,37 @@ def directory(path: Path) -> bool:
 SKIPPED = {".git", "node_modules", "__pycache__"}
 
 
-def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path) -> list[Path]:
+def tracked_directories(checkout: Path) -> set[str]:
+    """A Cargo checkout's committed top-level directories: its sources, where
+    Cargo writes nothing. Its build output is in untracked ones, such as
+    target/. Empty when Git cannot say, and then everything is searched."""
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(checkout), "ls-tree", "-d", "--name-only", "-z", "HEAD"],
+            capture_output=True, timeout=30, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
+    except (OSError, subprocess.SubprocessError):
+        return set()
+    if result.returncode:
+        return set()
+    return {os.fsdecode(name) for name in result.stdout.split(b"\0") if name}
+
+
+def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path):
     """Build directories at most `depth` levels under the roots, or at any
     depth in the mirror, which holds nothing else, without descending into
-    them, into Git repositories, across file systems or through symlinks."""
-    found = []
+    them, into Git repositories or a checkout's committed sources, across
+    file systems or through symlinks. Yields each as it is found, so a run
+    with a budget removes what it can while it searches."""
+    seen = set()
     for root in roots:
         try:
             device = root.lstat().st_dev
         except OSError:
             continue
+        if deadline_passed():
+            break
         pending = [(root, 0)]
-        while pending:
+        while pending and not deadline_passed():
             directory_, level = pending.pop()
             if within(directory_, excluded):
                 continue
@@ -101,20 +124,24 @@ def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path) -> l
             names = {entry.name for entry in entries}
             if directory_ != root and (PRUNED.match(directory_.name)
                                        or is_build_output(directory_, names)):
-                found.append(directory_)
+                if directory_ not in seen:
+                    seen.add(directory_)
+                    yield directory_
                 continue
             # A bare Git repository holds no build output.
             if level >= depth or {"HEAD", "objects", "refs"} <= names:
                 continue
+            sources = tracked_directories(directory_) \
+                if {".git", "Cargo.toml"} <= names else set()
             for entry in entries:
-                if entry.name in SKIPPED:
+                if entry.name in SKIPPED or entry.name in sources:
                     continue
                 with contextlib.suppress(OSError):
                     info = entry.stat(follow_symlinks=False)
-                    if stat.S_ISDIR(info.st_mode) and info.st_dev == device:
+                    if stat.S_ISDIR(info.st_mode) and info.st_dev == device \
+                            and info.st_uid == os.geteuid():
                         child = Path(entry.path)
                         pending.append((child, -sys.maxsize if child == mirror else level + 1))
-    return sorted(set(found))
 
 
 def survey(root: Path, cutoff: float) -> tuple[int, list[Path]] | None:
@@ -127,7 +154,8 @@ def survey(root: Path, cutoff: float) -> tuple[int, list[Path]] | None:
             with os.scandir(directory) as entries:
                 for entry in entries:
                     info = entry.stat(follow_symlinks=False)
-                    if info.st_mtime > cutoff:
+                    # Copies keep their source's mtime; their ctime is new.
+                    if max(info.st_mtime, info.st_ctime) > cutoff:
                         return None
                     if stat.S_ISDIR(info.st_mode):
                         pending.append(Path(entry.path))
@@ -215,6 +243,29 @@ def orphaned(directory: Path, mirror: Path) -> bool:
     return False
 
 
+def workspace(directory: Path, mirror: Path) -> Path:
+    """The checkout a build directory belongs to: the one it mirrors, or the
+    one it sits in."""
+    try:
+        relative = directory.relative_to(mirror)
+    except ValueError:
+        return directory.parent
+    return Path("/", *relative.parts[:-1])
+
+
+def main_checkout(directory: Path, mirror: Path) -> bool:
+    """Whether this is a main checkout's own build: its `.git` is a
+    directory, where a worktree's is a file."""
+    return os.path.isdir(workspace(directory, mirror) / ".git")
+
+
+DEADLINE = [math.inf]
+
+
+def deadline_passed() -> bool:
+    return time.monotonic() >= DEADLINE[0]
+
+
 def nonnegative(value: str) -> float:
     number = float(value)
     if not math.isfinite(number) or number < 0:
@@ -248,6 +299,11 @@ def main() -> int:
                              "target or the mirror; repeatable")
     parser.add_argument("--log", type=Path, metavar="FILE",
                         help="append a tab-separated line per removal to FILE")
+    parser.add_argument("--budget", type=nonnegative, metavar="SECONDS",
+                        help="start no search or removal after this long, waiting for "
+                             "another run included (default: no limit)")
+    parser.add_argument("--verbose", action="store_true",
+                        help="also say why each build directory in use stays")
     parser.add_argument("--lock", type=Path, default=Path(f"/var/tmp/cagents-prune-build-dirs-{os.getuid()}.lock"),
                         metavar="FILE", help="one run at a time holds FILE (default: %(default)s)")
     arguments = parser.parse_args()
@@ -255,16 +311,29 @@ def main() -> int:
     configured = os.environ.get("CAGENTS_BUILD_PRUNE_ROOTS")
     roots = [Path(p) for p in configured.split(":") if p] if configured is not None \
         else default_roots()
-    roots = [Path(os.path.abspath(root)) for root in roots + arguments.root]
-    arguments.mirror = Path(os.path.abspath(arguments.mirror))
-    excluded = never() + [Path(os.path.abspath(keep)) for keep in arguments.keep]
+    # Descriptors inherited from a build must not stay open for the run.
+    os.closerange(3, 1024)
+    real = lambda path: Path(os.path.realpath(path))
+    roots = [real(root) for root in roots + arguments.root]
+    arguments.mirror = real(arguments.mirror)
+    excluded = [real(path) for path in never() + arguments.keep]
     for checkout in arguments.keep_checkout:
-        checkout = Path(os.path.abspath(checkout))
+        checkout = real(checkout)
         excluded += [checkout / "target",
                      arguments.mirror / checkout.relative_to("/") / "target"]
+    if arguments.budget is not None:
+        DEADLINE[0] = time.monotonic() + arguments.budget
 
     runs = open(arguments.lock, "a")
-    fcntl.flock(runs, fcntl.LOCK_EX)
+    while True:
+        try:
+            fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except BlockingIOError:
+            if deadline_passed():
+                print("another run is pruning; not waiting longer for it", flush=True)
+                return 0
+            time.sleep(1)
 
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400
@@ -272,13 +341,22 @@ def main() -> int:
     removed = kept = 0
     freed = 0
     failed = False
+    def note(message):
+        if arguments.verbose:
+            print(message, flush=True)
+
     for directory in find(roots, excluded, arguments.max_depth, arguments.mirror):
+        if deadline_passed():
+            print("out of time; the rest waits for the next run", flush=True)
+            break
         leftover = PRUNED.match(directory.name)
         if leftover:
             # Another run's renamed copy, which it did not finish removing.
             if alive(int(leftover["pid"])):
                 continue
             reason, cutoff = "interrupted removal", now
+        elif main_checkout(directory, arguments.mirror):
+            continue
         elif orphaned(directory, arguments.mirror):
             reason, cutoff = "workspace removed", max(idle_cutoff, orphan_cutoff)
         else:
@@ -288,28 +366,30 @@ def main() -> int:
             kept += 1
             continue
         size, locks = surveyed
+        if not arguments.apply:
+            user = in_use(directory)
+            if user is not None:
+                note(f"keep {directory}: process {user} uses it")
+                kept += 1
+                continue
+            print(f"would remove {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
+            freed += size
+            removed += 1
+            continue
+        aside = directory if leftover else \
+            directory.with_name(f".{directory.name}.cagents-pruned-{os.getpid()}")
+        # The locks are held only to look for users and rename: a build
+        # starting meanwhile waits for no more than that.
         with held(locks) as free:
             if not free:
-                print(f"keep {directory}: a build holds its lock", flush=True)
+                note(f"keep {directory}: a build holds its lock")
                 kept += 1
                 continue
             user = in_use(directory)
             if user is not None:
-                print(f"keep {directory}: process {user} uses it", flush=True)
+                note(f"keep {directory}: process {user} uses it")
                 kept += 1
                 continue
-            if not arguments.apply:
-                print(f"would remove {directory} ({size / 2**30:.1f} GiB, {reason})", flush=True)
-                freed += size
-                removed += 1
-                continue
-            # Writes after the survey would show in a second one; then rename
-            # it aside while the locks still keep Cargo out.
-            if survey(directory, cutoff) is None:
-                kept += 1
-                continue
-            aside = directory if leftover else \
-                directory.with_name(f".{directory.name}.cagents-pruned-{os.getpid()}")
             try:
                 if aside != directory:
                     os.rename(directory, aside)
@@ -317,6 +397,15 @@ def main() -> int:
                 print(f"failed to remove {directory}: {error}", file=sys.stderr, flush=True)
                 failed = True
                 continue
+        # Anything that wrote to or opened it since the first look keeps it.
+        user = in_use(aside)
+        if user is not None or survey(aside, cutoff) is None:
+            if aside != directory:
+                with contextlib.suppress(OSError):
+                    os.rename(aside, directory)
+            note(f"keep {directory}: used while it was being removed")
+            kept += 1
+            continue
         try:
             shutil.rmtree(aside)
         except OSError as error:

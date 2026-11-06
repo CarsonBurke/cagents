@@ -144,9 +144,31 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertIn("reclaiming unused build directories", result.stderr)
         (call,) = self.calls(calls, 1)
         self.assertIn("--apply --max-idle 7", call)
-        self.assertIn("--orphan-hours 0", call)
+        self.assertIn("--orphan-hours 0 --budget 300", call)
+        self.assertIn(f"--keep {self.root}", call)
         self.assertIn(f"--root {checkout.resolve()} --keep-checkout {checkout.resolve()}", call)
         self.assertIn(f"--log {self.root}/pruner.tsv", call)
+
+    def test_under_pressure_the_schedule_starts_nothing_more(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        result = self.guard(10**9, guard=guard)
+        self.assertEqual(result.returncode, 2)
+        time.sleep(0.5)
+        (call,) = self.calls(calls, 1)
+        self.assertIn("--budget", call)
+        # That run was this period's: a build with room starts none.
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        time.sleep(0.5)
+        self.assertEqual(len(self.calls(calls, 1)), 1)
+
+    def test_the_build_directory_it_guards_is_kept(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        build = self.root / "it's here/target"
+        self.assertEqual(self.guard(1, directory=build, guard=guard).returncode, 0)
+        (call,) = self.calls(calls, 1)
+        self.assertIn(f"--keep {build}", call)
 
     def test_on_schedule_it_prunes_in_the_background_whatever_the_space(self):
         guard, calls = self.stand_in_pruner()
@@ -171,7 +193,8 @@ class BuildDiskGuard(unittest.TestCase):
     def test_the_build_does_not_wait_for_the_scheduled_prune(self):
         guard = self.alone()
         pruner = guard.with_name("prune-build-dirs")
-        pruner.write_text("#!/bin/sh\nsleep 30\n")
+        pidfile = self.root / "pruner.pid"
+        pruner.write_text(f'#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n')
         pruner.chmod(0o755)
         del self.env["CAGENTS_BUILD_PRUNE"]
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
@@ -182,12 +205,18 @@ class BuildDiskGuard(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
         self.assertEqual(result.returncode, 0)
         self.assertLess(time.monotonic() - started, 10)
-        subprocess.run(["pkill", "-f", str(pruner)])
+        deadline = time.monotonic() + 10
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.kill(int(pidfile.read_text()), 9)
 
     def test_an_invalid_schedule_is_a_usage_error(self):
         for name, value in (("CAGENTS_BUILD_PRUNE_INTERVAL_HOURS", "08"),
-                            ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "week")):
-            with self.subTest(name=name):
+                            ("CAGENTS_BUILD_PRUNE_INTERVAL_HOURS", "999999"),
+                            ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "week"),
+                            ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "0"),
+                            ("CAGENTS_BUILD_PRUNE_BUDGET_SECONDS", "-1")):
+            with self.subTest(name=name, value=value):
                 self.env[name] = value
                 result = self.guard(1)
                 self.assertEqual(result.returncode, 2)
