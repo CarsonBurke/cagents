@@ -295,6 +295,8 @@ enum NoticeKey {
     SurfaceVisibility,
     /// Committing this exact project/worktree/path identity.
     GitCommit(ActiveWorktreeKey),
+    /// Saving this chat's return to a terminal.
+    ChatReturn(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -589,6 +591,20 @@ impl SaveHealthState {
             .iter()
             .any(|write| write.subject.is_window_state())
     }
+}
+
+fn terminal_handoff_pending_notice(error: String) -> TransientNotice {
+    TransientNotice::error(format!(
+        "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
+    ))
+}
+
+fn chat_return_unsaved_notice(card: CardId) -> TransientNotice {
+    TransientNotice::error("Return to terminal is not saved")
+        .with_details(
+            "The terminal keeps running in this pane, but the change is not saved. If saving does not recover, close the pane: that ends the terminal and clears this notice.",
+        )
+        .with_key(NoticeKey::ChatReturn(card))
 }
 
 impl TransientNotice {
@@ -5362,6 +5378,9 @@ pub struct Cagents {
     /// Restored ended terminals whose final screen the daemon was asked for.
     retained_outputs: HashMap<TerminalId, terminal_end_ui::RetainedOutput>,
     pending_terminal_handoffs: HashMap<TerminalId, TerminalSession>,
+    /// The handoffs above that a user's return to terminal started, with their
+    /// cards, until a flush has saved them. Others are ordinary terminal starts.
+    unsaved_chat_returns: HashMap<TerminalId, CardId>,
     terminal_handoff_commit_inflight: bool,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
@@ -7750,6 +7769,7 @@ impl Cagents {
         }
         self.pending_terminal_handoffs
             .insert(session.id, session.clone());
+        self.unsaved_chat_returns.insert(session.id, card);
         let commit = self.commit_terminal_handoffs();
         let attach = self.start_terminal(
             card,
@@ -7758,6 +7778,14 @@ impl Cagents {
             false,
         );
         Task::batch([commit, attach])
+    }
+
+    /// The open card of a return to terminal that no flush has saved yet.
+    fn unsaved_chat_return(&self) -> Option<CardId> {
+        self.unsaved_chat_returns.values().copied().find(|&card| {
+            self.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        })
     }
 
     /// The flush is ordered after conversion snapshots. Never release daemon
@@ -12381,7 +12409,7 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ NoticeKey::ChatAttach(card))
+                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
                     if self
                         .card_state(*card)
                         .is_none_or(|state| !state.existence.is_open()) =>
@@ -14494,6 +14522,7 @@ impl Application for Cagents {
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),
             pending_terminal_handoffs: HashMap::new(),
+            unsaved_chat_returns: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
@@ -14817,10 +14846,15 @@ impl Application for Cagents {
             ),
             Message::TerminalHandoffsCommitted { result } => {
                 self.terminal_handoff_commit_inflight = false;
-                let failure = match result {
+                let notice = match result {
                     Ok(results) => {
                         let mut failures = Vec::new();
                         for (terminal, result) in results {
+                            // The flush came first, so these are saved even
+                            // when the daemon has yet to take the receipt.
+                            if let Some(card) = self.unsaved_chat_returns.remove(&terminal.id) {
+                                self.resolve_notice(NoticeKey::ChatReturn(card));
+                            }
                             if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal) {
                                 continue;
                             }
@@ -14832,22 +14866,22 @@ impl Application for Cagents {
                             }
                         }
                         failures.first().map(|(id, error)| {
-                            format!(
+                            terminal_handoff_pending_notice(format!(
                                 "{} terminal(s) remain pending; terminal {id}: {error}",
                                 failures.len()
-                            )
+                            ))
                         })
                     }
-                    Err(error) => Some(error),
+                    Err(error) => Some(match self.unsaved_chat_return() {
+                        Some(card) => {
+                            tracing::warn!(%error, "could not save a return to terminal");
+                            chat_return_unsaved_notice(card)
+                        }
+                        None => terminal_handoff_pending_notice(error),
+                    }),
                 };
-                if let Some(error) = failure {
-                    self.status = Some(
-                        TransientNotice::error("Return to terminal is not saved yet").with_details(
-                            format!(
-                                "The terminal keeps running here. Saving retries when storage recovers or this window refreshes; closing the pane ends the terminal and clears the change.\n\n{error}"
-                            ),
-                        ),
-                    );
+                if let Some(notice) = notice {
+                    self.status = Some(notice);
                     Task::none()
                 } else {
                     self.commit_terminal_handoffs()
@@ -20330,7 +20364,7 @@ mod tests {
             .notices
             .entries
             .iter()
-            .map(|entry| entry.notice.details.as_deref().unwrap_or_default())
+            .map(|entry| entry.notice.message.as_str())
             .collect::<Vec<_>>();
         assert!(
             notices
@@ -20351,6 +20385,77 @@ mod tests {
         });
         assert!(!app.pending_terminal_handoffs.contains_key(&refused.id));
         assert_eq!(app.pending_terminal_handoffs.len(), 2);
+    }
+
+    #[test]
+    fn only_an_unsaved_return_to_terminal_is_reported_as_one() {
+        const UNSAVED: &str = "Return to terminal is not saved";
+        let flush_failed = || Message::TerminalHandoffsCommitted {
+            result: Err("session flush: refused".into()),
+        };
+        let reports = |app: &Cagents| {
+            app.notices
+                .entries
+                .iter()
+                .filter(|entry| entry.notice.message == UNSAVED)
+                .count()
+        };
+
+        // Every started terminal waits here too, and it returned from nothing.
+        let mut app = context_inspector_test_app(false);
+        let card = terminal_card_state();
+        let CardKind::Terminal(terminal) = card.kind.clone() else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut app.durable).cards.push(card.clone());
+        app.pending_terminal_handoffs
+            .insert(terminal.id, terminal.clone());
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 0);
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("session flush: refused"))
+        );
+
+        // The report names no pane or storage detail, and is withdrawn as soon
+        // as a flush saves the return, even if the daemon refuses the receipt.
+        app.unsaved_chat_returns.insert(terminal.id, card.id);
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 1);
+        let details = app
+            .notices
+            .entries
+            .iter()
+            .find(|entry| entry.notice.message == UNSAVED)
+            .and_then(|entry| entry.notice.details.clone())
+            .unwrap();
+        assert!(!details.contains("flush") && !details.contains(&card.id.to_string()));
+        let _ = app.update(Message::TerminalHandoffsCommitted {
+            result: Ok(vec![(terminal.clone(), Err("receipt refused".into()))]),
+        });
+        assert_eq!(reports(&app), 0);
+        assert!(app.unsaved_chat_returns.is_empty());
+
+        // Closing the pane ends what the report was about.
+        app.unsaved_chat_returns.insert(terminal.id, card.id);
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 1);
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card.id)
+            .unwrap()
+            .existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 0);
     }
 
     #[test]
@@ -30237,6 +30342,7 @@ mod tests {
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),
             pending_terminal_handoffs: HashMap::new(),
+            unsaved_chat_returns: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             settings_write_blocked: true,
             notices: NoticeLog::default(),

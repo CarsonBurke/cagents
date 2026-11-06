@@ -89,6 +89,8 @@ fn card_claims_terminal(card: &CardState, terminal: &TerminalSession) -> bool {
                 // The terminal this chat returned to, before its conversion is
                 // saved or while storage refuses it. A second card would own
                 // that terminal in storage, which refuses the conversion for good.
+                // A terminal spawned with this exact recipe is indistinguishable
+                // here; it gets its card once the chat closes or converts.
                 || (card.existence.is_open()
                     && session.launch.provider != crate::agent::Provider::Codex
                     && session.launch.resumes_in_terminal(&terminal.launch))
