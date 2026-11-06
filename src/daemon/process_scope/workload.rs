@@ -1,4 +1,4 @@
-//! Separate a direct provider from the commands it starts.
+//! Separate a provider from the commands it starts.
 //!
 //! systemd-oomd only chooses leaf cgroups, or cgroups with
 //! `memory.oom.group=1`, and kills every process in the one it chooses
@@ -18,7 +18,11 @@
 //! [`FAST`] while the provider is active, and [`SLOW`] otherwise. Memory a
 //! command allocated before it moved stays charged to the provider leaf,
 //! because cgroup v2 does not move charges, so the provider is woken early
-//! whenever it reports activity.
+//! whenever it reports activity. Command leaves are checked for memory kills
+//! and collected once they empty every [`SLOW`].
+//!
+//! The scope's `OOMPolicy=continue` keeps an OOM kill in one leaf from
+//! stopping the whole scope, which `stop` would do.
 //!
 //! Every move names a process by number, so each is pinned with a pidfd and
 //! confirmed to be in the provider leaf first. PIDs are issued cyclically,
@@ -399,20 +403,27 @@ fn migrate(pid: u32, from: &str, to: &fs::File) -> io::Result<()> {
 }
 
 fn killer(directory: &fs::File) -> Option<Killer> {
-    if xattr_count(directory, c"user.oomd_ooms").is_some_and(|count| count > 0) {
+    if oomd_marked(directory) {
         return Some(Killer::Oomd);
     }
-    // Readable only while the cgroup exists.
-    read_at(directory, "memory.events.local")
-        .ok()
-        .and_then(|events| {
-            events.lines().find_map(|line| {
-                line.strip_prefix("oom_kill ")
-                    .and_then(|count| count.trim().parse::<u64>().ok())
-            })
-        })
+    kernel_kills(directory)
         .filter(|count| *count > 0)
         .map(|_| Killer::Kernel)
+}
+
+/// systemd-oomd marks a cgroup before it kills it; the mark stays readable
+/// through an open descriptor after systemd removes the cgroup.
+fn oomd_marked(directory: &fs::File) -> bool {
+    xattr_count(directory, c"user.oomd_ooms").is_some_and(|count| count > 0)
+}
+
+/// Processes of this cgroup itself that the kernel's OOM killer ended.
+/// Readable only while the cgroup exists.
+fn kernel_kills(directory: &fs::File) -> Option<u64> {
+    read_at(directory, "memory.events.local")
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill ")?.trim().parse().ok())
 }
 
 fn xattr_count(directory: &fs::File, name: &std::ffi::CStr) -> Option<u64> {
@@ -481,9 +492,17 @@ impl Sweeper {
         let thread = thread::Builder::new()
             .name("cagents-commands".into())
             .spawn(move || {
+                let mut last_collect = Instant::now();
                 while !sweep.stop.load(Ordering::Acquire) {
                     let moved = leaves.sweep();
-                    let stops = leaves.collect();
+                    // Moving a new command is urgent; noticing one that
+                    // ended is not, and reads every leaf.
+                    let stops = if last_collect.elapsed() >= SLOW {
+                        last_collect = Instant::now();
+                        leaves.collect()
+                    } else {
+                        Vec::new()
+                    };
                     if moved {
                         sweep.hasten();
                     }
@@ -534,6 +553,8 @@ struct Leaf {
     directory: fs::File,
     path: PathBuf,
     membership: String,
+    /// Kernel OOM kills already reported.
+    kernel_kills: u64,
 }
 
 struct Leaves {
@@ -632,6 +653,7 @@ impl Leaves {
                         directory,
                         path,
                         membership,
+                        kernel_kills: 0,
                     });
                 }
                 Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
@@ -647,17 +669,25 @@ impl Leaves {
             let populated = read_at(&leaf.directory, "cgroup.events")
                 .map(|events| events.lines().any(|line| line == "populated 1"))
                 .unwrap_or(false);
+            if !populated && oomd_marked(&leaf.directory) {
+                // oomd ends the whole leaf.
+                stops.push(CommandStop {
+                    killer: Killer::Oomd,
+                    processes: xattr_count(&leaf.directory, c"user.oomd_kill"),
+                });
+            } else if let Some(kills) = kernel_kills(&leaf.directory)
+                && kills > leaf.kernel_kills
+            {
+                // The kernel ends single processes, which may leave the
+                // rest of a command running: report each as it happens.
+                stops.push(CommandStop {
+                    killer: Killer::Kernel,
+                    processes: Some(kills - leaf.kernel_kills),
+                });
+                leaf.kernel_kills = kills;
+            }
             if populated {
                 return true;
-            }
-            if let Some(killer) = killer(&leaf.directory) {
-                stops.push(CommandStop {
-                    killer,
-                    processes: match killer {
-                        Killer::Oomd => xattr_count(&leaf.directory, c"user.oomd_kill"),
-                        Killer::Kernel => None,
-                    },
-                });
             }
             match fs::remove_dir(&leaf.path) {
                 Ok(()) => false,

@@ -775,10 +775,16 @@ struct Residence {
     _working_directory: Option<std::fs::File>,
     provider_pidfd: std::fs::File,
     owner_application: String,
+    /// This holder's divided cgroup scope, when the user manager gave one.
+    /// The commands of the confirmed server are kept apart from it.
+    scope: Option<crate::daemon::process_scope::ProviderScope>,
 }
 
 impl Residence {
-    fn start(spawn: Spawn) -> Result<Self, String> {
+    fn start(
+        spawn: Spawn,
+        scope: Option<crate::daemon::process_scope::ProviderScope>,
+    ) -> Result<Self, String> {
         // Block before creating children so even a very short-lived tool cannot
         // disappear between the initial reap and the blocking poll.
         let child_events = ChildEvents::new().map_err(|error| error.to_string())?;
@@ -825,6 +831,7 @@ impl Residence {
         };
         let provider_pidfd = pin_provider_process(&record.root)?;
         let residence = Self {
+            scope,
             provider_pidfd,
             owner_application: crate::instance::APPLICATION_ID.into(),
             directory,
@@ -956,8 +963,10 @@ impl Residence {
                         .verify_server(&process)
                         .and_then(|()| pin_provider_process(&process))
                         .and_then(|pidfd| {
+                            let server = process.pid as u32;
                             self.recovery.confirm(thread, identity, process)?;
                             self.provider_pidfd = pidfd;
+                            self.keep_commands_apart(server);
                             Ok(())
                         }) {
                         Ok(()) => Report::Confirmed,
@@ -982,6 +991,17 @@ impl Residence {
             if send(&control, &response, TIMEOUT).is_err() {
                 return self.recovery.is_durable();
             }
+        }
+    }
+
+    /// Give each command the confirmed server starts a cgroup of its own, so
+    /// a memory kill ends the command rather than the conversation. The
+    /// server is only known here: a launcher may have spawned it. Without a
+    /// divided scope its commands stay with it, as before.
+    fn keep_commands_apart(&mut self, server: u32) {
+        if let Some(scope) = &mut self.scope {
+            let launcher = self.record.root.pid as u32;
+            let _ = scope.keep_commands_apart(server, vec![std::process::id(), launcher], None);
         }
     }
 
@@ -1112,8 +1132,9 @@ struct ChildEvents {
 
 impl ChildEvents {
     fn new() -> io::Result<Self> {
-        // SAFETY: both signal sets are live writable objects; this helper is
-        // single-threaded and is the sole owner of child wait statuses.
+        // SAFETY: both signal sets are live writable objects. This runs before
+        // the holder starts any thread, so every later thread inherits the
+        // blocked mask, and this helper is the sole owner of child statuses.
         unsafe {
             let mut mask = std::mem::zeroed();
             let mut previous = std::mem::zeroed();
@@ -1448,12 +1469,12 @@ extern "C" fn serve_if_requested() {
         };
         // This is an execed holder, not a post-fork pre_exec hook. Complete
         // scope enrollment before the provider's first process can exist.
-        // Divided, so the commands the provider starts get cgroups of their
-        // own: a memory kill then ends the command, not the conversation.
-        let mut scope = crate::daemon::process_scope::enroll_dividing_holder()
+        // Divided, so the commands the provider starts can get cgroups of
+        // their own once its server is confirmed.
+        let scope = crate::daemon::process_scope::enroll_dividing_holder()
             .ok()
             .flatten();
-        let mut residence = match Residence::start(spawn) {
+        let mut residence = match Residence::start(spawn, scope) {
             Ok(residence) => residence,
             Err(error) => {
                 // Only startup has no Started response yet. Preserve the
@@ -1467,14 +1488,6 @@ extern "C" fn serve_if_requested() {
                 return Err(error);
             }
         };
-        if let Some(scope) = &mut scope {
-            // Without it the provider's commands stay in its cgroup, as before.
-            let _ = scope.keep_commands_apart(
-                residence.record.root.pid as u32,
-                vec![std::process::id()],
-                None,
-            );
-        }
         send(
             &control,
             &Report::Started {
@@ -2180,7 +2193,6 @@ exec /bin/sleep 60
             record.holder.pid as u32,
             record.root.pid as u32,
         );
-        crate::daemon::process_scope::tests::assert_commands_apart(record.root.pid as u32);
         assert_eq!(
             std::fs::read_link(format!("/proc/{}/cwd", record.root.pid)).unwrap(),
             working.path()
@@ -2204,6 +2216,8 @@ exec /bin/sleep 60
                 record.root.clone(),
             )
             .unwrap();
+        // The confirmed server's commands get cgroups of their own.
+        crate::daemon::process_scope::tests::assert_commands_apart(record.root.pid as u32);
         holder.preserve();
         drop(lease);
         let mut successor = first;

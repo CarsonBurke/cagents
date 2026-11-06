@@ -366,7 +366,7 @@ fn enroll_proven_process(pid: u32, delegate: bool) -> io::Result<String> {
         "ssa(sv)a(sa(sv))",
         &unit,
         "fail",
-        if delegate { "4" } else { "3" },
+        if delegate { "5" } else { "3" },
         "PIDs",
         "au",
         "1",
@@ -379,7 +379,10 @@ fn enroll_proven_process(pid: u32, delegate: bool) -> io::Result<String> {
         "inactive-or-failed",
     ]);
     if delegate {
-        command.args(["Delegate", "b", "true"]);
+        // An OOM kill in one leaf must not stop the scope, and with it the
+        // provider: `continue` is systemd's default for delegated units, but
+        // the provider's survival depends on it, so it is stated.
+        command.args(["Delegate", "b", "true", "OOMPolicy", "s", "continue"]);
     }
     command
         .arg("0")
@@ -843,13 +846,19 @@ pub(crate) mod tests {
             eprintln!("command cgroups unqualified: provider scope undivided ({provider})");
             return;
         };
-        let children = std::fs::read_to_string(format!("/proc/{root}/task/{root}/children"))
-            .unwrap()
-            .split_whitespace()
-            .map(|pid| pid.parse::<u32>().unwrap())
-            .collect::<Vec<_>>();
-        assert!(!children.is_empty(), "the provider started no command");
         let deadline = Instant::now() + Duration::from_secs(5);
+        let children = loop {
+            let children = std::fs::read_to_string(format!("/proc/{root}/task/{root}/children"))
+                .unwrap()
+                .split_whitespace()
+                .map(|pid| pid.parse::<u32>().unwrap())
+                .collect::<Vec<_>>();
+            if !children.is_empty() {
+                break children;
+            }
+            assert!(Instant::now() < deadline, "the provider started no command");
+            std::thread::sleep(Duration::from_millis(20));
+        };
         for child in children {
             loop {
                 let leaf = cgroup(child).unwrap();

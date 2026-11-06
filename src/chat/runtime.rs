@@ -8827,6 +8827,16 @@ for line in sys.stdin:
         let provider_leaf = cgroup(root);
         assert!(provider_leaf.ends_with("/provider"), "{provider_leaf}");
         let scope_path = provider_leaf.trim_end_matches("/provider").to_owned();
+        let unit = scope_path.rsplit('/').next().unwrap();
+        let policy = std::process::Command::new("systemctl")
+            .args(["--user", "show", "-P", "OOMPolicy", unit])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&policy.stdout).trim(),
+            "continue",
+            "a memory kill in one leaf must not stop the provider's scope"
+        );
         // Commands start only after the split, as a provider's do.
         writeln!(provider.child.stdin.as_mut().unwrap(), "go").unwrap();
         let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
@@ -8907,6 +8917,47 @@ for line in sys.stdin:
             "the provider kept running"
         );
         assert_eq!(cgroup(inner), shell_leaf, "the other command kept running");
+
+        // The kernel's OOM killer ends one process of a command, not all of
+        // it: here a process over a small limit on the shell's leaf, which
+        // it joins before it allocates.
+        let leaf_path =
+            std::path::Path::new("/sys/fs/cgroup").join(shell_leaf.trim_start_matches('/'));
+        std::fs::write(leaf_path.join("memory.swap.max"), "0").unwrap();
+        std::fs::write(leaf_path.join("memory.max"), "32M").unwrap();
+        let mut hog = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-I",
+                "-c",
+                "import sys; sys.stdin.read(1); b = bytearray(256 << 20)",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::fs::write(leaf_path.join("cgroup.procs"), hog.id().to_string()).unwrap();
+        hog.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert_eq!(hog.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stops = loop {
+            let stops = scope.take_command_stops();
+            if !stops.is_empty() {
+                break stops;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the kernel's kill was never reported"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            stops,
+            vec![crate::daemon::process_scope::CommandStop {
+                killer: crate::daemon::process_scope::Killer::Kernel,
+                processes: Some(1),
+            }],
+            "reported while the rest of the command runs on"
+        );
+        assert_eq!(cgroup(inner), shell_leaf);
 
         // The provider's own leaf, and with it the provider.
         mark_and_kill(&provider_leaf);

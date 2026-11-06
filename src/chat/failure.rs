@@ -169,8 +169,6 @@ impl<'a> Failure<'a> {
             FailureKind::OutOfMemory
         } else if runtime_report.starts_with(COMMAND_OUT_OF_MEMORY) {
             FailureKind::CommandOutOfMemory
-        } else if runtime_report.starts_with(PROVIDER_EXITED) {
-            FailureKind::Exited
         } else if contains(&[
             "you've hit your limit",
             "you have hit your limit",
@@ -217,6 +215,9 @@ impl<'a> Failure<'a> {
             "turn was interrupted",
         ]) {
             FailureKind::Interrupted
+        } else if runtime_report.starts_with(PROVIDER_EXITED) {
+            // Last: the output it carries often names a more specific cause.
+            FailureKind::Exited
         } else {
             return None;
         };
@@ -898,6 +899,20 @@ mod tests {
             assert!(failure.action.starts_with("Resume"), "{raw}");
             assert_eq!(failure.details, raw);
         }
+    }
+
+    #[test]
+    fn an_exit_whose_output_names_its_cause_keeps_that_cause() {
+        let limit = "Provider exited with exit status: 1. Last ignored output: You've hit your limit · resets 3pm";
+        assert_eq!(
+            Failure::parse(Provider::Claude, limit).unwrap().kind,
+            FailureKind::AccountLimit
+        );
+        let auth = "Provider exited with exit status: 1. Last ignored output: Invalid API key · Please run /login";
+        assert_eq!(
+            Failure::parse(Provider::Claude, auth).unwrap().kind,
+            FailureKind::Authentication
+        );
     }
 
     #[test]
