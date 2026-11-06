@@ -16,6 +16,8 @@ const WINDOW_ITEMS: usize = 128;
 // missing records without renumbering the whole conversation on every page.
 const ORDINAL_STRIDE: i64 = 1 << 32;
 const ORDINAL_LIMIT: i64 = i64::MAX / 2;
+/// Matches `journal_size_limit`: the WAL bytes retained between writes.
+const WAL_LIMIT: u64 = 1024 * 1024;
 /// The serialized item carries identity only, so it is not pageable and must stay small.
 const METADATA_LIMIT: usize = 64 * 1024;
 /// An identity string a provider can make arbitrarily long is trimmed to this
@@ -286,7 +288,7 @@ impl Store {
                     }
                 }
             } else {
-                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA foreign_keys=ON;").map_err(|error| error.to_string())?;
+                db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA cache_size=-8192; PRAGMA wal_autocheckpoint=256; PRAGMA journal_size_limit=1048576; PRAGMA foreign_keys=ON;").map_err(|error| error.to_string())?;
             }
             db.execute_batch("CREATE TABLE items(id TEXT PRIMARY KEY, ordinal INTEGER UNIQUE NOT NULL, metadata BLOB NOT NULL, len0 INTEGER NOT NULL, len1 INTEGER NOT NULL, len2 INTEGER NOT NULL, spans BLOB NOT NULL);
                 CREATE TABLE chunks(id TEXT NOT NULL REFERENCES items(id) ON DELETE CASCADE, field INTEGER NOT NULL, position INTEGER NOT NULL, data BLOB NOT NULL, PRIMARY KEY(id,field,position));").map_err(|e| e.to_string())?;
@@ -332,6 +334,16 @@ impl Store {
             let _ = fs::remove_dir_all(&directory);
         }
         result
+    }
+    /// A single large transaction can grow the WAL past the autocheckpoint
+    /// size; truncate it now rather than at the next write. Best-effort: a
+    /// busy checkpoint is retried after the next write.
+    fn trim_wal(&self) {
+        if fs::metadata(self.directory.join("transcript.sqlite-wal"))
+            .is_ok_and(|wal| wal.len() > WAL_LIMIT)
+        {
+            let _ = self.db.execute_batch("PRAGMA wal_checkpoint(TRUNCATE)");
+        }
     }
     fn exists(&self, id: &str) -> Result<bool, String> {
         self.db
@@ -1022,6 +1034,7 @@ impl Store {
                 return Ok(out);
             }
         }
+        self.trim_wal();
         Ok(out)
     }
     fn flush_text(&mut self) -> Result<Option<String>, String> {
@@ -1099,6 +1112,7 @@ impl Store {
             transaction.commit().map_err(|e| e.to_string())?;
             self.changed(id);
         }
+        self.trim_wal();
         Ok(warning)
     }
     /// Returns true when earlier history is already cached (no provider command).
@@ -1701,9 +1715,99 @@ mod tests {
     use crate::chat::Role;
     use std::os::unix::fs::PermissionsExt;
 
+    fn wal_bytes(store: &Store) -> u64 {
+        match fs::metadata(store.directory.join("transcript.sqlite-wal")) {
+            Ok(metadata) => metadata.len(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+            Err(error) => panic!("WAL observation failed: {error}"),
+        }
+    }
+
+    fn assert_copy(store: &Store, id: &str, expected: &str) {
+        let source = store.copy_parent_source(id).unwrap().unwrap();
+        let mut copied = String::new();
+        loop {
+            let page = store.text_copy(&source, copied.len() as u64).unwrap();
+            copied.push_str(&page.text);
+            if page.done {
+                break;
+            }
+        }
+        assert_eq!(copied, expected);
+    }
+
     #[test]
-    fn diagnostic_backing_establishes_aggregate_disk_and_cache_limits_before_data() {
-        let store = Store::diagnostic_backing().unwrap();
+    fn repeated_large_rewrites_bound_retained_wal_without_changing_transcript() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::at(root.path().to_owned()).unwrap();
+        for revision in 0..64 {
+            let body = format!("{revision}:{}", "x".repeat(1024 * 1024));
+            store
+                .apply(Event::Item(history_item("same", &body)))
+                .unwrap();
+            let bytes = wal_bytes(&store);
+            assert!(
+                bytes <= WAL_LIMIT,
+                "rewrite {revision} retained {bytes} WAL bytes"
+            );
+            assert_eq!(
+                store.field("same", 0, 0, body.len()).unwrap(),
+                body.as_bytes()
+            );
+            assert_copy(&store, "same", &body);
+        }
+        for (pragma, expected) in [
+            ("synchronous", 1),
+            ("cache_size", -8192),
+            ("wal_autocheckpoint", 256),
+            ("journal_size_limit", WAL_LIMIT as i64),
+        ] {
+            let actual: i64 = store
+                .db
+                .pragma_query_value(None, pragma, |row| row.get(0))
+                .unwrap();
+            assert_eq!(actual, expected, "{pragma}");
+        }
+    }
+
+    #[test]
+    fn large_commit_wal_held_by_a_reader_is_trimmed_by_the_next_write() {
+        let root = tempfile::tempdir().unwrap();
+        let mut store = Store::at(root.path().to_owned()).unwrap();
+        let large = "large 🦀\n".repeat(1024 * 1024);
+        store
+            .apply(Event::Item(history_item("large", &large)))
+            .unwrap();
+        assert!(wal_bytes(&store) <= WAL_LIMIT);
+        // A reader snapshot keeps the checkpoint from resetting the WAL.
+        let reader = Connection::open(store.directory.join("transcript.sqlite")).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        reader
+            .query_row("SELECT count(*) FROM chunks", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .unwrap();
+        let pinned = "p".repeat(2 * 1024 * 1024);
+        store
+            .apply(Event::Item(history_item("pinned", &pinned)))
+            .unwrap();
+        assert!(wal_bytes(&store) > WAL_LIMIT);
+        drop(reader);
+        store
+            .apply(Event::Item(history_item("next", "next")))
+            .unwrap();
+        assert!(wal_bytes(&store) <= WAL_LIMIT);
+        assert_copy(&store, "large", &large);
+        assert_copy(&store, "pinned", &pinned);
+    }
+
+    #[test]
+    fn diagnostic_backing_keeps_aggregate_disk_and_cache_limits_across_writes() {
+        let mut store = Store::diagnostic_backing().unwrap();
+        for revision in 0..4 {
+            let body = format!("{revision}:{}", "x".repeat(1024 * 1024));
+            store.put(history_item("same", &body), false).unwrap();
+        }
         let mode: String = store
             .db
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
