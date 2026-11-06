@@ -241,7 +241,8 @@ class InstalledGateDeferral(unittest.TestCase):
 class InstalledGateSync(unittest.TestCase):
     """A gate change merged into main is installed by the next gate run."""
 
-    files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py", "cargo-offload",
+    files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py",
+             "cargo-gate-rustc-guard", "cargo-offload",
              "seed-build-dir", "build-disk-guard", "install-cargo-gate")
 
     def setUp(self):

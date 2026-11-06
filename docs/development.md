@@ -425,15 +425,30 @@ slot here. Commands that compile nothing, such as `metadata`, `tree` or
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as the development runner or
 `scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. On the build host itself, or with
+admission budget. A Cargo reached any other way inside COMMAND, by path,
+through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
+also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
+compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
 unless `CAGENTS_BUILD_REMOTE=local` is set.
 
-The host has a few build slots under
-`~/.cache/cagents-offload/<repository>/slot-N` (`CAGENTS_BUILD_REMOTE_SLOTS`,
-default 3), each with its own checkout and target directory, and Cargo runs
-there with `CAGENTS_BUILD_REMOTE_JOBS` jobs (default 6). A build copies the
+The host has build slots under
+`~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
+target directory. A further slot is made when every slot is leased, up to
+`CAGENTS_BUILD_REMOTE_SLOTS` (default 8), and only while the host's free space
+holds another 50 GiB of build output above its floor, beyond the 50 GiB each
+slot made in the last 12 hours is taken to be filling to; how many build at
+once is then down to memory and CPU, below. Unless `CAGENTS_BUILD_REMOTE_JOBS`
+is set, each build gets the host's CPUs divided among the builds leased when
+it starts, as `CARGO_BUILD_JOBS`: at least 4, and at most 8 or half the CPUs
+where that is more than 4, as builds here get. A request from the same worktree
+and directory for the same build as one building now, a command that runs
+nothing there, waits for that slot rather than build it again in another,
+outside the queue meanwhile, and then gets back in line: once it ends, little
+is left to compile. A
+build copies the
 checkout's tracked and untracked, not ignored, files into a free slot and
 removes the slot's other files. It prefers the slot this worktree used last,
 then one another worktree has built in. A slot's checkout path never changes,
@@ -446,8 +461,11 @@ place. A slot last leased by a gate from before this rule rebuilds its sources
 once. A slot is admitted as the gate admits builds here: beside other
 running builds, only when the host's available memory, less what those builds
 are expected to take beyond what they already hold, covers this build's
-expected peak, and while the host's memory pressure (`some avg10` in
-`/proc/pressure/memory`) is below 10%; a lone build always starts. One build's
+expected peak (at least 2 GiB), while the host's memory pressure (`some
+avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
+(`/proc/pressure/cpu`) is below 40%; a lone build always starts. A plain
+`cargo test` runs its tests there, in the slot, which stays leased until they
+end. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
