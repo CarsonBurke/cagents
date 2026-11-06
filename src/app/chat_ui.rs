@@ -980,7 +980,9 @@ impl ChangeToken {
                     duration_ms.unwrap_or(u64::MAX) ^ u64::from(*action as u8),
                 ),
             },
-            ItemContent::Changes { changes, status } => Self {
+            ItemContent::Changes {
+                changes, status, ..
+            } => Self {
                 shape: 9 + Self::status_offset(*status),
                 body: changes.last().map_or(0, |change| change.diff.len()),
                 digest: changes.iter().fold(
@@ -1791,7 +1793,9 @@ impl CachedItem {
                 }
                 cached.detail = Some(detail);
             }
-            ItemContent::Changes { changes, status } => {
+            ItemContent::Changes {
+                changes, status, ..
+            } => {
                 cached.detail = Some(match changes.len() {
                     0 | 1 => status_word(*status).to_owned(),
                     count => format!("{count} files"),
@@ -16608,6 +16612,7 @@ mod tests {
                 diff: "+line".into(),
             }],
             status: chat::ToolStatus::Succeeded,
+            omitted_files: 0,
         };
         assert!(contains_text(&change, "ÜBER"));
         assert!(!contains_text(&change, ""));
@@ -27168,6 +27173,7 @@ mod tests {
                 kind: chat::ChangeKind::Updated,
             }],
             status: chat::ToolStatus::Succeeded,
+            omitted_files: 0,
         };
         assert_eq!(
             copy_text(CopyPart::Text, &changes).as_deref(),
@@ -27213,6 +27219,7 @@ mod tests {
                 },
             }],
             status: chat::ToolStatus::Succeeded,
+            omitted_files: 0,
         };
         assert_ne!(
             ChangeToken::of(&renamed("src/old.rs")),

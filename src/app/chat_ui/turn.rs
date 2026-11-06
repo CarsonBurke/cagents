@@ -1465,6 +1465,7 @@ mod tests {
                 diff: String::new(),
             }],
             status: ToolStatus::Succeeded,
+            omitted_files: 0,
         };
         assert_eq!(step_label(&content), "src/app.rs");
         assert_eq!(step_verb(&content), "Renamed");

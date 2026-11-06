@@ -8708,6 +8708,7 @@ mod tests {
                                 diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
                             }],
                             status: ToolStatus::Succeeded,
+                            omitted_files: 0,
                         },
                     })],
                     ..Default::default()

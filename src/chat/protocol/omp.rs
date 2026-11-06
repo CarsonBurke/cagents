@@ -594,7 +594,11 @@ impl Omp {
                 status,
             };
         }
-        ItemContent::Changes { changes, status }
+        ItemContent::Changes {
+            changes,
+            status,
+            omitted_files: 0,
+        }
     }
     fn extension(&mut self, frame: &Value) -> Result<Step, String> {
         let id = text(frame, "id").to_owned();

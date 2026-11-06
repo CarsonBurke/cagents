@@ -277,7 +277,15 @@ impl Store {
         spans: &[usize],
     ) -> Result<(), String> {
         let mut changed = self.remove_file_item(source, &item.id)?;
-        if let ItemContent::Changes { changes, status } = &item.content {
+        if let ItemContent::Changes {
+            changes,
+            status,
+            omitted_files,
+        } = &item.content
+        {
+            if *omitted_files > 0 {
+                self.file_index_incomplete = true;
+            }
             let identity =
                 changes
                     .iter()
@@ -709,6 +717,7 @@ mod tests {
             started_at: None,
             at: None,
             content: ItemContent::Changes {
+                omitted_files: 0,
                 changes: vec![FileChange {
                     path: path.into(),
                     diff: diff.into(),
@@ -1061,6 +1070,35 @@ mod tests {
         );
         assert!(stale.error.is_some());
     }
+    #[test]
+    fn file_changes_coverage_includes_pre_reported_parent_and_child_omissions() {
+        for child in [false, true] {
+            let mut store = Store::new().unwrap();
+            let mut item = item(
+                "partial",
+                "a.rs",
+                DIFF,
+                ToolStatus::Succeeded,
+                ChangeKind::Updated,
+            );
+            if let ItemContent::Changes { omitted_files, .. } = &mut item.content {
+                *omitted_files = 4;
+            }
+            let event = if child {
+                Event::SubagentItem {
+                    id: "child".into(),
+                    item,
+                }
+            } else {
+                Event::Item(item)
+            };
+            store.apply(event).unwrap();
+            let result = summary(&mut store);
+            assert!(result.coverage.has_uncached_changes);
+            assert_eq!(result.total_files, 1);
+        }
+    }
+
     #[test]
     fn file_changes_lists_budget_metadata_and_refuse_colliding_truncated_keys() {
         let mut store = Store::new().unwrap();

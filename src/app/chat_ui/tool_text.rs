@@ -1263,6 +1263,7 @@ mod tests {
                 diff: diff.clone(),
             }],
             status: chat::ToolStatus::Succeeded,
+            omitted_files: 0,
         };
         let theme = crate::settings::EditorSyntaxTheme::default();
         let collapsed = CachedItem::updated(&item, theme, None, false, false, None);

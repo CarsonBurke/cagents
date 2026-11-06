@@ -3810,6 +3810,7 @@ fn parse_item_with_windows(
             content: ItemContent::Changes {
                 changes: file_changes(value)?,
                 status,
+                omitted_files: 0,
             },
             started_at: None,
             at: None,
@@ -8604,7 +8605,10 @@ mod tests {
             {"path":"src/fresh.rs","kind":{"type":"add"},"diff":"+fresh\n"}
         ]});
         let items = parse_item(&item, true, "turn").unwrap();
-        let ItemContent::Changes { changes, status } = &items[0].content else {
+        let ItemContent::Changes {
+            changes, status, ..
+        } = &items[0].content
+        else {
             panic!("A Codex fileChange must carry its patch, not a rendering of it");
         };
         assert_eq!(*status, ToolStatus::Succeeded);

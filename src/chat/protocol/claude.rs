@@ -4132,6 +4132,7 @@ fn tool_content(name: &str, input: &Value, cwd: &Path) -> ItemContent {
         return ItemContent::Changes {
             changes,
             status: ToolStatus::Running,
+            omitted_files: 0,
         };
     }
     let session = || cwd.to_string_lossy().into_owned();
@@ -4229,7 +4230,9 @@ fn apply_result(
         ToolStatus::Succeeded
     };
     match content {
-        ItemContent::Changes { changes, status } if !failed => {
+        ItemContent::Changes {
+            changes, status, ..
+        } if !failed => {
             super::claude_edits::applied(changes, structured);
             *status = result;
         }
@@ -9915,6 +9918,7 @@ mod tests {
                 diff: "@@ -1,1 +1,1 @@\n-let a = 1;\n+let a = 2;\n".into(),
             }],
             status: ToolStatus::Running,
+            omitted_files: 0,
         };
         let result = json!({"type":"user","uuid":"u1","tool_use_result":{
             "filePath":"/workspace/src/app.rs","oldString":"let a = 1;","newString":"let a = 2;","originalFile":null,
@@ -9929,6 +9933,7 @@ mod tests {
                     .into(),
             }],
             status: ToolStatus::Succeeded,
+            omitted_files: 0,
         };
 
         let mut whole = Claude::default();
@@ -9985,7 +9990,7 @@ mod tests {
             let mut adapter = Claude::default();
             let call = adapter.receive(json!({"type":"assistant","uuid":"a1","message":{"id":"msg-1","content":[{"type":"tool_use","id":"write","name":"Write","input":{"file_path":"notes.md","content":"# Notes\n"}}]}})).unwrap();
             assert!(matches!(&items(&call)[..],
-                [ItemContent::Changes { changes, status: ToolStatus::Running }]
+                [ItemContent::Changes { changes, status: ToolStatus::Running, .. }]
                 if changes[0].kind == ChangeKind::Added && changes[0].diff == "@@ -0,0 +1,1 @@\n+# Notes\n"));
             let mut result = json!({"type":"user","uuid":"u1","message":{"content":[{"type":"tool_result","tool_use_id":"write","content":"done"}]}});
             result[key] = structured;
@@ -9998,6 +10003,7 @@ mod tests {
                         diff: diff.into(),
                     }],
                     status: ToolStatus::Succeeded,
+                    omitted_files: 0,
                 }]
             );
         }
@@ -14258,6 +14264,7 @@ mod tests {
             if let ItemContent::Changes {
                 changes,
                 status: ToolStatus::Succeeded,
+                ..
             } = &item.content
             {
                 succeeded += 1;
@@ -14267,7 +14274,9 @@ mod tests {
         assert_eq!(succeeded, 145);
         assert_eq!(successful.len(), 141);
         for index in [46, 96] {
-            let ItemContent::Changes { changes, status } = &items[&format!("edit-{index}")].content
+            let ItemContent::Changes {
+                changes, status, ..
+            } = &items[&format!("edit-{index}")].content
             else {
                 panic!("boundary edit must be classified")
             };
@@ -14461,6 +14470,7 @@ mod tests {
                 content: ItemContent::Changes {
                     changes: vec![],
                     status: ToolStatus::Succeeded,
+                    omitted_files: 0,
                 },
             },
         );

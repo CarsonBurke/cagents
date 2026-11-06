@@ -1932,6 +1932,11 @@ pub enum ItemContent {
     Changes {
         changes: Vec<FileChange>,
         status: ToolStatus,
+        /// Additional files omitted from this provider item by the cache's
+        /// identity budget, beyond `changes`. On byte-paged items this report
+        /// appears only on the final part; it excludes files in other parts.
+        #[serde(default)]
+        omitted_files: usize,
     },
     WebSearch {
         query: String,
@@ -2778,6 +2783,30 @@ mod retained_native_pair_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn change_set_omissions_round_trip_and_legacy_json_defaults_to_complete() {
+        let legacy = serde_json::json!({
+            "Changes": {"changes": [], "status": "Succeeded"}
+        });
+        let mut content: super::ItemContent = serde_json::from_value(legacy).unwrap();
+        let super::ItemContent::Changes { omitted_files, .. } = &mut content else {
+            panic!("changes");
+        };
+        assert_eq!(*omitted_files, 0);
+        *omitted_files = 169;
+        let item = super::Item {
+            id: "edit".into(),
+            role: super::Role::Assistant,
+            content,
+            started_at: Some(10),
+            at: Some(20),
+        };
+        let bytes = postcard::to_stdvec(&item).unwrap();
+        assert_eq!(postcard::from_bytes::<super::Item>(&bytes).unwrap(), item);
+        let json = serde_json::to_value(&item).unwrap();
+        assert_eq!(serde_json::from_value::<super::Item>(json).unwrap(), item);
+    }
+
     #[test]
     fn transcript_part_ids_round_trip_and_reject_partial_claims() {
         let part = super::TranscriptPart {

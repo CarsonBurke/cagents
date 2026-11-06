@@ -1388,7 +1388,14 @@ impl Store {
                     // of. A path is what the view counts edited files by, so
                     // unlike a command's label it does not say which part
                     // this is.
-                    ItemContent::Changes { changes, .. } => {
+                    ItemContent::Changes {
+                        changes,
+                        omitted_files,
+                        ..
+                    } => {
+                        if part + 1 < parts {
+                            *omitted_files = 0;
+                        }
                         let mut lengths = spans.iter();
                         let mut from = 0;
                         changes.retain_mut(|change| {
@@ -1573,7 +1580,11 @@ fn shrink(content: &mut ItemContent) {
         // The patches are already chunks, so the paths are all there is to
         // bound. The files kept are the first ones, in order: `put_at` cuts
         // the patches to match by count.
-        ItemContent::Changes { changes, .. } => {
+        ItemContent::Changes {
+            changes,
+            omitted_files,
+            ..
+        } => {
             let mut budget = BULK_BYTES;
             let mut kept = 0;
             for change in changes.iter_mut() {
@@ -1591,6 +1602,7 @@ fn shrink(content: &mut ItemContent) {
                     None => break,
                 }
             }
+            *omitted_files = omitted_files.saturating_add(changes.len() - kept);
             changes.truncate(kept);
         }
         ItemContent::WebSearch { query, results } => {
@@ -2814,6 +2826,7 @@ mod tests {
             content: ItemContent::Changes {
                 changes,
                 status: crate::chat::ToolStatus::Succeeded,
+                omitted_files: 0,
             },
             started_at: None,
             at: None,
@@ -2941,11 +2954,10 @@ mod tests {
             [[("a.rs".to_owned(), "@@ -1 +1 @@\n-a\n+b\n".to_owned())]]
         );
     }
-    /// What cannot be paged is the list of paths, so a change set naming more
-    /// of them than fit keeps its first files, each with the whole of its own
-    /// patch and none of a dropped file's.
+    /// Retained files keep whole patches, and the item reports exactly how many
+    /// files could not fit rather than presenting its prefix as the whole edit.
     #[test]
-    fn a_change_set_of_too_many_paths_keeps_its_first_files_whole() {
+    fn a_change_set_of_too_many_paths_reports_omitted_files() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();
         let changes: Vec<_> = (0..200)
             .map(|index| {
@@ -2967,7 +2979,137 @@ mod tests {
         for ((path, diff), change) in kept.iter().zip(&changes) {
             assert_eq!((path, diff), (&change.path, &change.diff));
         }
+        let window = store.window().unwrap();
+        let content = serde_json::to_value(&window.items[0].content).unwrap();
+        assert_eq!(
+            content["Changes"]["omitted_files"],
+            serde_json::json!(changes.len() - kept.len())
+        );
     }
+    #[test]
+    fn shrinking_changes_accumulates_omissions_once_including_empty_renames() {
+        let mut content = ItemContent::Changes {
+            changes: (0..200)
+                .map(|index| crate::chat::FileChange {
+                    path: format!("{index:04}/{}", "p".repeat(NAME_BYTES - 5)),
+                    kind: crate::chat::ChangeKind::Renamed {
+                        from: format!("{index:04}/{}", "q".repeat(NAME_BYTES - 5)),
+                    },
+                    diff: String::new(),
+                })
+                .collect(),
+            status: crate::chat::ToolStatus::Succeeded,
+            omitted_files: 17,
+        };
+        shrink(&mut content);
+        let ItemContent::Changes {
+            changes,
+            omitted_files,
+            ..
+        } = &content
+        else {
+            panic!("changes");
+        };
+        assert!(!changes.is_empty() && changes.len() < 200);
+        assert_eq!(changes.len() + omitted_files, 217);
+        let once = content.clone();
+        shrink(&mut content);
+        assert_eq!(content, once);
+        if let ItemContent::Changes { omitted_files, .. } = &mut content {
+            *omitted_files = usize::MAX;
+        }
+        shrink(&mut content);
+    }
+
+    #[test]
+    fn replacing_a_truncated_change_set_clears_its_omission_report() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let changes = (0..200)
+            .map(|index| {
+                change(
+                    &format!("{index:04}/{}", "p".repeat(NAME_BYTES)),
+                    String::new(),
+                )
+            })
+            .collect();
+        store.apply(change_set(changes)).unwrap();
+        assert!(matches!(
+            &store.window().unwrap().items[0].content,
+            ItemContent::Changes { omitted_files, .. } if *omitted_files > 0
+        ));
+        store
+            .apply(change_set(vec![change("complete.rs", "+done\n".into())]))
+            .unwrap();
+        assert!(matches!(
+            &store.window().unwrap().items[0].content,
+            ItemContent::Changes { changes, omitted_files: 0, .. }
+                if changes.len() == 1 && changes[0].diff == "+done\n"
+        ));
+    }
+
+    #[test]
+    fn paged_changes_report_omissions_once_and_keep_every_retained_patch_byte() {
+        let mut store = Store::at(std::env::temp_dir()).unwrap();
+        let diff = "+λ\n".repeat(WINDOW_BYTES);
+        let changes = (0..200)
+            .map(|index| {
+                change(
+                    &format!("{index:04}/{}", "p".repeat(NAME_BYTES - 5)),
+                    if index == 0 {
+                        diff.clone()
+                    } else {
+                        String::new()
+                    },
+                )
+            })
+            .collect();
+        store.apply(change_set(changes)).unwrap();
+        let mut page = store.window().unwrap();
+        while page.has_earlier {
+            store.earlier().unwrap();
+            page = store.window().unwrap();
+        }
+        let mut seen = std::collections::HashSet::new();
+        let mut reports = Vec::new();
+        let mut restored = String::new();
+        let mut empty_files = 0;
+        loop {
+            for item in &page.items {
+                if !seen.insert(item.id.clone()) {
+                    continue;
+                }
+                let ItemContent::Changes {
+                    changes,
+                    omitted_files,
+                    ..
+                } = &item.content
+                else {
+                    panic!("changes");
+                };
+                if *omitted_files > 0 {
+                    assert!(!page.has_later);
+                    reports.push(*omitted_files);
+                }
+                for change in changes {
+                    if change.diff.is_empty() {
+                        empty_files += 1;
+                    } else {
+                        restored.push_str(&change.diff);
+                    }
+                }
+            }
+            if !page.has_later {
+                break;
+            }
+            store.later().unwrap();
+            page = store.window().unwrap();
+        }
+        assert_eq!(restored, diff);
+        assert_eq!(reports, [200 - empty_files - 1]);
+        assert!(reports[0] > 0);
+        assert!(empty_files > 0);
+    }
+
     /// Command output is the one field of a command that pages, so it must come
     /// back from the chunk it was written to rather than from an empty one.
     #[test]
@@ -3305,6 +3447,7 @@ mod tests {
             content: ItemContent::Changes {
                 changes: vec![change("a.rs", "@@ -1 +1 @@\n-old\n+new\n".into())],
                 status: crate::chat::ToolStatus::Succeeded,
+                omitted_files: 0,
             },
         };
         store
@@ -3396,6 +3539,7 @@ mod tests {
                 content: ItemContent::Changes {
                     changes: vec![change("wrong.rs", "@@ -1 +1 @@\n-old\n+new\n".into())],
                     status: recovered_status,
+                    omitted_files: 0,
                 },
             };
             store
