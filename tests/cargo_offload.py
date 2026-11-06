@@ -31,6 +31,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def records(registry):
+    """A build registry's records, without its decision lock."""
+    return [path for path in registry.iterdir() if not path.name.startswith(".")]
+
+
 def load_offload():
     loader = importlib.machinery.SourceFileLoader("cargo_offload", str(ROOT / "scripts/cargo-offload"))
     spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -1547,13 +1552,13 @@ class RemoteRun(unittest.TestCase):
             registry = Path(host, "registry")
             lease, lines = self.lease(base, registry=registry)
             self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
-            [entry] = registry.iterdir()
+            [entry] = records(registry)
             first, _since, lock = entry.read_text().splitlines()
             self.assertEqual(lock, os.path.join(base, "slot-0", "lock"))
             self.assertEqual(first, f"0 {9 * 2**20}")
             lease.stdin.close()
             lease.wait(timeout=10)
-            self.assertEqual(list(registry.iterdir()), [])
+            self.assertEqual(records(registry), [])
 
     def test_a_lone_build_starts_however_busy_the_host_is(self):
         with self.slots() as base:

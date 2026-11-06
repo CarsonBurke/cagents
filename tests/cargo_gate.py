@@ -22,6 +22,11 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+def records(registry):
+    """A build registry's records, without its decision lock."""
+    return [path for path in registry.iterdir() if not path.name.startswith(".")]
 # Admission must not follow the memory pressure of the host running these
 # tests, nor its registry of real builds; the tests about either set them.
 os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
@@ -1827,14 +1832,14 @@ class HostRegistry(TwoSlots):
 
     def test_a_build_in_another_family_is_priced_beside_this_one(self):
         self.hold(1, env=self.other)
-        [entry] = self.registry.iterdir()
+        [entry] = records(self.registry)
         self.assertEqual(entry.read_text().splitlines()[2], str(self.root / "other.lock"))
         # Alone in its own family, it would start whatever its cost.
         with self.assertRaises(subprocess.TimeoutExpired):
             self.build(10**6, timeout=2)
         (self.root / "release").touch()
         self.holder.wait(timeout=10)
-        self.assertEqual(list(self.registry.iterdir()), [])
+        self.assertEqual(records(self.registry), [])
         result = self.build(10**6, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
 

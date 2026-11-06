@@ -708,6 +708,26 @@ def room(base, mine, cost):
 REGISTRY = os.environ.get("CAGENTS_BUILD_REGISTRY", f"/var/tmp/cagents-builds-{os.getuid()}")
 
 
+class deciding:
+    """Holds the host's admission decision, which scripts/cargo-gate's
+    families take too, while this build is priced and recorded."""
+
+    def __enter__(self):
+        self.lock = None
+        if REGISTRY:
+            try:
+                os.makedirs(REGISTRY, mode=0o700, exist_ok=True)
+                self.lock = open(os.path.join(REGISTRY, ".decision"), "a")
+                fcntl.flock(self.lock, fcntl.LOCK_EX)
+            except OSError:
+                self.lock = None
+        return self
+
+    def __exit__(self, *_exception):
+        if self.lock is not None:
+            self.lock.close()
+
+
 def registry_entry(slot):
     return os.path.join(REGISTRY, "offload-" + hashlib.sha256(os.fsencode(slot)).hexdigest()[:16])
 
@@ -738,6 +758,8 @@ def registered(base):
     except OSError:
         return found
     for name in names:
+        if name.startswith(".") or name.endswith(".new"):
+            continue
         try:
             with open(os.path.join(REGISTRY, name)) as file:
                 first, _since, lock = (file.read().splitlines() + ["", "", ""])[:3]
@@ -884,14 +906,17 @@ if command == "lease":
     with open(os.path.join(slot, "claim.new"), "w") as file:
         json.dump({"cost": cost, "pid": None, "build": build, "key": key}, file)
     os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
-    register(slot, cost, None)
     # At the head of the queue: the build starts once the memory it is
     # expected to need is free beside the builds already running here.
     waiting = None
     while True:
-        why = room(base, slot, cost)
-        if why is None:
-            break
+        # Recorded only once admitted, and in the same decision, so that the
+        # host's other slot families neither miss it nor count it waiting.
+        with deciding():
+            why = room(base, slot, cost)
+            if why is None:
+                register(slot, cost, None)
+                break
         if why.split()[0] != waiting:
             say("wait", why)
             announced = True

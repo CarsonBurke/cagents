@@ -427,6 +427,21 @@ count_registered() {
     done
 }
 
+# Families decide one at a time: from pricing the running builds until this
+# one's record is written, on descriptor 5, so two families cannot each admit
+# a build into the same free memory.
+decide() {
+    [ -n "$registry" ] || return 0
+    mkdir -p -m 0700 "$registry" 2>/dev/null || return 0
+    exec 5>>"$registry/.decision"
+    flock 5
+}
+
+decided() {
+    [ -n "$registry" ] || return 0
+    exec 5>&-
+}
+
 # The registry record of this family's slot `$1`.
 registry_entry() {
     printf '%s/gate-%s' "$registry" "$(printf '%s' "$1" | cksum | cut -d ' ' -f 1)"
@@ -549,11 +564,13 @@ acquire() {
             wait "$waiter" 2>/dev/null || :
             waiter=
             exec 9>&6 6>&-
+            decide
             if fits 0; then
                 index=0
                 admitted
                 return
             fi
+            decided
             flock -u 9
             exec 9>&-
             sleep 0.5
@@ -573,6 +590,7 @@ acquire() {
         fi
         # Every free slot sees the same other builds, so price them once.
         fit=
+        decide
         index=$slots
         while [ "$index" -gt 1 ]; do
             index=$((index - 1))
@@ -592,6 +610,7 @@ acquire() {
             fi
             exec 9>&-
         done
+        decided
         announce
         sleep 0.2
     done
@@ -639,10 +658,10 @@ admitted() {
     since=$(uptime_seconds)
     printf '%s %s\n%s\n' "$$" "$cost" "$since" >"$(slot_path "$index").cost" 2>/dev/null || :
     if [ -n "$registry" ] && mkdir -p -m 0700 "$registry" 2>/dev/null; then
-        entry=$(registry_entry "$(slot_path "$index")")
-        printf '%s %s\n%s\n%s\n' "$$" "$cost" "$since" "$(slot_path "$index")" >"$entry.$$" 2>/dev/null &&
-            mv -f "$entry.$$" "$entry" 2>/dev/null || rm -f "$entry.$$"
+        printf '%s %s\n%s\n%s\n' "$$" "$cost" "$since" "$(slot_path "$index")" \
+            >"$(registry_entry "$(slot_path "$index")")" 2>/dev/null || :
     fi
+    decided
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
     # starts, replacing the repository's two-job default and capping a larger
