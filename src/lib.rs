@@ -7,9 +7,6 @@ include!("modules.rs");
 #[cfg(all(test, any(feature = "host", feature = "ui")))]
 mod sqlite_contracts;
 
-#[cfg(feature = "host")]
-pub(crate) mod transcript_cache;
-
 /// For the test harness of a binary with no tests of its own. `cargo test --bin
 /// NAME -- FILTER` would run nothing and exit 0, which reads as a pass; the
 /// product's tests live in the library. An unfiltered harness still runs, since

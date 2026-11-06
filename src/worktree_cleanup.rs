@@ -582,7 +582,7 @@ pub fn complete_standalone_editor_protection(paths: &[PathBuf]) -> io::Result<()
     if !STANDALONE_EDITOR.load(std::sync::atomic::Ordering::Acquire) {
         return Ok(());
     }
-    let _launch = crate::instance::recovery_launch_fence()?;
+    let _launch = crate::instance::editor_launch_fence()?;
     let runtime = crate::instance::runtime_directory()?;
     let guards = initial_editor_protections(&runtime, paths)?;
     EDITOR_STARTUP_PROTECTIONS

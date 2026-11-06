@@ -2,10 +2,10 @@
 """Exercise held-command lifetime with private locks and owned processes only."""
 
 import contextlib
-import ctypes
 import errno
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 from pathlib import Path
@@ -19,9 +19,15 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# Isolated Python (-I) leaves this directory off sys.path.
+_custody_spec = importlib.util.spec_from_file_location("fixture_custody", ROOT / "tests/fixture_custody.py")
+fixture_custody = importlib.util.module_from_spec(_custody_spec)
+_custody_spec.loader.exec_module(fixture_custody)
+FixtureDirectory = fixture_custody.FixtureDirectory
 
 
 class CargoGateApplicability(unittest.TestCase):
@@ -519,17 +525,7 @@ class HeldCommand(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             raise unittest.SkipTest("Linux pidfds are required")
-        cls.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
-        cls.previous_subreaper = previous.value
-        if cls.libc.prctl(36, 1, 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+        # Importing fixture_custody made this process the gates' subreaper.
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-held-")
@@ -1194,17 +1190,7 @@ class PreflightCancellation(unittest.TestCase):
     def setUpClass(cls):
         if sys.platform != "linux" or not hasattr(os, "pidfd_open"):
             raise unittest.SkipTest("Linux pidfds are required")
-        cls.libc = ctypes.CDLL(None, use_errno=True)
-        previous = ctypes.c_int()
-        if cls.libc.prctl(37, ctypes.byref(previous), 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot inspect child subreaper")
-        cls.previous_subreaper = previous.value
-        if cls.libc.prctl(36, 1, 0, 0, 0):
-            raise OSError(ctypes.get_errno(), "cannot own orphaned fixture descendants")
-
-    @classmethod
-    def tearDownClass(cls):
-        cls.libc.prctl(36, cls.previous_subreaper, 0, 0, 0)
+        # Importing fixture_custody made this process the gates' subreaper.
 
     def setUp(self):
         temporary = tempfile.TemporaryDirectory(prefix="gate-preflight-")
@@ -1414,9 +1400,9 @@ class TwoSlots(unittest.TestCase):
     """Two private slots, one of which a gated build can hold."""
 
     def setUp(self):
-        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-memory-")
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
+        self.scope = FixtureDirectory(prefix="cagents-gate-memory-")
+        self.addCleanup(self.scope.close)
+        self.root = Path(self.scope.name)
         self.gate = self.root / "cargo-gate"
         shutil.copy2(ROOT / "scripts/cargo-gate", self.gate)
         shutil.copy2(ROOT / "scripts/cargo-gate-command.py", self.root / "cargo-gate-command.py")
@@ -1428,13 +1414,12 @@ class TwoSlots(unittest.TestCase):
               "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
     def hold(self, cost):
-        holder = subprocess.Popen(
+        holder = self.scope.popen(
             [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/held; "
              f"while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
             env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             stderr=subprocess.DEVNULL,
         )
-        self.addCleanup(holder.wait, 10)
         self.holder = holder
         self.addCleanup((self.root / "release").touch)
         deadline = time.monotonic() + 10
@@ -1444,7 +1429,7 @@ class TwoSlots(unittest.TestCase):
         return holder
 
     def build(self, cost, timeout):
-        return subprocess.run(
+        return self.scope.run(
             [str(self.gate), "exec", "sh", "-c", 'printf "%s" "$CARGO_BUILD_JOBS"'],
             env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
@@ -1489,16 +1474,17 @@ class MemoryAdmission(TwoSlots):
         self.assertEqual(int(result.stdout), max(4, min(8, os.cpu_count() // 2)))
 
     def test_a_slot_held_by_a_plain_flock_is_priced_not_fatal(self):
-        holder = subprocess.Popen(
+        holder = self.scope.popen(
             ["flock", self.root / "slot.lock", "sh", "-c",
              f"touch {self.root}/held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
-        self.addCleanup(holder.wait, 10)
         self.addCleanup((self.root / "release").touch)
+        deadline = time.monotonic() + 10
         while not (self.root / "held").exists():
+            self.assertLess(time.monotonic(), deadline, "plain flock holder never admitted")
             time.sleep(0.02)
         # Priced as the largest build, so whether a small build fits depends
         # on this host; either way the gate admits or keeps waiting.
-        waiter = subprocess.Popen(
+        waiter = self.scope.popen(
             [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
             cwd=self.root, stderr=subprocess.PIPE, text=True)
         try:
@@ -1837,7 +1823,7 @@ class CpuPressureAdmission(TwoSlots):
     def test_a_build_waits_while_cpu_pressure_is_at_the_limit(self):
         self.report("60.00")
         self.hold(1)
-        waiter = subprocess.Popen(
+        waiter = self.scope.popen(
             [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
             cwd=self.root, stderr=subprocess.PIPE, text=True)
         self.addCleanup(waiter.stderr.close)
@@ -1858,7 +1844,7 @@ class CpuPressureAdmission(TwoSlots):
         self.report("0.00")
         self.hold(1)
         with self.assertRaises(subprocess.TimeoutExpired):
-            subprocess.run(
+            self.scope.run(
                 [str(self.gate), "exec", "true"],
                 env=self.env | {"CAGENTS_BUILD_COST_GIB": "1", "CAGENTS_BUILD_CPU_SETTLE_SECS": "3600"},
                 cwd=self.root, capture_output=True, timeout=2)
@@ -1890,12 +1876,13 @@ class CpuPressureAdmission(TwoSlots):
         """Holds slot `index` with a plain `flock` and prices it with `sidecar`,
         a gate's cost file, whose holder is this test."""
         path = self.root / ("slot.lock" if index == 0 else f"slot.lock.{index}")
-        holder = subprocess.Popen(
+        holder = self.scope.popen(
             ["flock", path, "sh", "-c",
              f"touch {path}.held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"])
-        self.addCleanup(holder.wait, 10)
         self.addCleanup((self.root / "release").touch)
+        deadline = time.monotonic() + 10
         while not Path(f"{path}.held").exists():
+            self.assertLess(time.monotonic(), deadline, "plain flock holder never admitted")
             time.sleep(0.02)
         Path(f"{path}.cost").write_text(sidecar.format(pid=os.getpid()))
 
@@ -1962,7 +1949,7 @@ class CpuPressureAdmission(TwoSlots):
                 cost = Path(str(path) + ".cost")
                 cost.write_text(f"{os.getpid()} 1\n{dates[start]}\n")
                 costs[cost] = cost.read_bytes()
-            process = subprocess.Popen(
+            process = self.scope.popen(
                 [str(self.gate), "exec", "/bin/sh", "-c", 'printf admitted > "$1"',
                  "fixture", str(command)], cwd=self.root, env=environment,
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
@@ -2018,7 +2005,7 @@ class CpuPressureAdmission(TwoSlots):
         self.hold(1)
         cost = next(self.root.glob("slot.lock*.cost")).read_text()
         # The one-line read of gates that predate dated starts.
-        result = subprocess.run(
+        result = self.scope.run(
             ["sh", "-c", 'read -r holder claimed; printf "%s:%s" "$holder" "$claimed"'],
             input=cost, capture_output=True, text=True, check=True)
         holder, claimed = result.stdout.split(":")
@@ -2042,6 +2029,33 @@ class CpuPressureAdmission(TwoSlots):
         if os.cpu_count() >= 20 and memory_gib >= 28:
             self.assertEqual(len(slots), 4)
 
+
+class FixtureCustody(unittest.TestCase):
+    def test_a_timed_out_command_and_its_new_session_child_end_before_the_directory_goes(self):
+        scope = FixtureDirectory()
+        self.addCleanup(scope.close)
+        root = Path(scope.name)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            # The command execs so nothing but the sweep can reap its children.
+            scope.run(["sh", "-c", f"sleep 60 & echo $! >{root}/ordinary; "
+                       f"setsid sleep 60 & echo $! >{root}/detached; exec sleep 60"], timeout=1)
+        pidfds = [os.pidfd_open(int((root / name).read_text())) for name in ("ordinary", "detached")]
+        self.addCleanup(lambda: [os.close(pidfd) for pidfd in pidfds])
+        # The command's group is gone; the child in its own session is not.
+        self.assertFalse(select.select([pidfds[1]], [], [], 0)[0])
+        settled = fixture_custody.settle
+        survivors = None
+
+        def settle():
+            nonlocal survivors
+            self.assertTrue(root.is_dir())
+            settled()
+            survivors = [pidfd for pidfd in pidfds if not select.select([pidfd], [], [], 0)[0]]
+
+        with unittest.mock.patch.object(fixture_custody, "settle", settle):
+            scope.close()
+        self.assertEqual(survivors, [])
+        self.assertFalse(root.exists())
 
 
 if __name__ == "__main__":
