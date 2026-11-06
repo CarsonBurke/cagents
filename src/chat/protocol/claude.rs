@@ -28,6 +28,9 @@ const MAX_IMAGE: u64 = ATTACHMENTS.max_image_bytes;
 const MAX_DOCUMENT: u64 = ATTACHMENTS.max_file_bytes.unwrap();
 const MAX_PAYLOAD: usize = 30 * 1024 * 1024;
 const HISTORY_PAGE: u64 = 4 * 1024 * 1024;
+/// How much of each recorded background task's summary a restored history
+/// keeps; a summary quotes a command that has no description.
+const RECORDED_SUMMARY_BYTES: usize = 4 * 1024;
 const MAX_TEXT: usize = 1024 * 1024;
 const MODES: &[&str] = &[
     "manual",
@@ -446,6 +449,18 @@ impl TaskOutcome {
         }
     }
 
+    /// The outcome as a restored history keeps it for every background task
+    /// it records: a summary long enough to say how the task ended, rather
+    /// than one quoting a whole command.
+    fn recorded(mut self) -> Self {
+        if self.summary.len() > RECORDED_SUMMARY_BYTES {
+            self.summary
+                .truncate(self.summary.floor_char_boundary(RECORDED_SUMMARY_BYTES));
+            self.summary.push('…');
+        }
+        self
+    }
+
     /// Settle the call that started the task. A command shows how it exited;
     /// any other call, such as a Monitor, only how it ended.
     fn settle(&self, content: &mut ItemContent) {
@@ -569,6 +584,11 @@ struct Claude {
     /// first: its status, the exit status its summary gave, and the summary.
     /// A replayed launch acknowledgement is settled from it.
     task_outcomes: VecDeque<(String, TaskOutcome)>,
+    /// How each background task ended, by the call that started it, as the
+    /// restored transcript and its agents' sidecars recorded it. It is kept
+    /// whole rather than bounded by count, since a replayed launch it does not
+    /// name is shown as never having been settled.
+    history_outcomes: HashMap<String, TaskOutcome>,
     /// Exact successful child failure/result and task-notification receipts,
     /// not bodies or running work. Changed payloads remain observable.
     failure_receipts: VecDeque<[u8; 32]>,
@@ -1927,8 +1947,14 @@ impl Claude {
         };
         output.clear();
         *status = ToolStatus::Running;
-        match self.task_outcomes.iter().find(|(call, _)| call == tool) {
-            Some((_, outcome)) => outcome.settle(content),
+        let outcome = self
+            .task_outcomes
+            .iter()
+            .find(|(call, _)| call == tool)
+            .map(|(_, outcome)| outcome)
+            .or_else(|| self.history_outcomes.get(tool));
+        match outcome {
+            Some(outcome) => outcome.settle(content),
             // A history that never recorded the outcome cannot be waited on:
             // the Claude Code process that ran the command ended, and its
             // background commands with it. How the command went is unknown,
@@ -2404,7 +2430,7 @@ impl Adapter for Claude {
         };
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
-            self.task_outcomes = std::mem::take(&mut history.call_outcomes);
+            self.history_outcomes = std::mem::take(&mut history.call_outcomes);
             let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
             calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
             for (tool, agent) in calls {
@@ -2444,8 +2470,19 @@ impl Adapter for Claude {
                     background: Some(false),
                 });
             }
-            for (parent, kind, description, frames) in history.subagent_frames().unwrap_or_default()
-            {
+            let children = history.subagent_frames().unwrap_or_default();
+            // An agent's own background commands are settled by the
+            // notifications its sidecar recorded, which follow their launches.
+            for frame in children.iter().flat_map(|(.., frames)| frames) {
+                if let Some(content) = recorded_notification(frame) {
+                    for (tool, outcome) in notified_calls(&content) {
+                        if !history.agent_tools.contains_key(&tool) {
+                            self.history_outcomes.insert(tool, outcome.recorded());
+                        }
+                    }
+                }
+            }
+            for (parent, kind, description, frames) in children {
                 history_step.events.push(Event::Subagent {
                     model: None,
                     waiting: None,
@@ -2824,6 +2861,7 @@ impl Adapter for Claude {
                 self.subagent_tasks.clear();
                 self.foreground_tasks.clear();
                 self.task_outcomes.clear();
+                self.history_outcomes.clear();
                 self.failure_receipts.clear();
                 self.agent_task_calls.clear();
                 self.ended_agents.clear();
@@ -5283,7 +5321,10 @@ impl Claude {
                     if let Some(text) = patch["description"].as_str() {
                         *description = text.into();
                     }
-                    if let Some(summary) = patch["summary"].as_str() {
+                    // A foreground command's summary repeats the command.
+                    if let Some(summary) = patch["summary"].as_str()
+                        && !foreground
+                    {
                         *output = summary.into();
                     }
                     // `SendMessage` restarts a finished agent under the same task.
@@ -5295,8 +5336,10 @@ impl Claude {
                 }
                 // Lifecycle bookkeeping and notification summaries still need
                 // the synthetic tool. Only its duplicate presentation is hidden.
-                let represented = subagent
-                    || call.is_some()
+                // A subagent's command is shown in its transcript when Claude
+                // Code forwards the call; until then this row is all that
+                // shows it ran, or how it failed.
+                let represented = call.is_some()
                     || known_tool
                         .as_deref()
                         .or_else(|| frame["tool_use_id"].as_str())
@@ -5468,8 +5511,10 @@ struct History {
     agent_status: HashMap<String, ToolStatus>,
     background_agent_tools: HashSet<String>,
     /// How the background work other calls started ended, by call, as the
-    /// transcript's notifications recorded it, oldest first and bounded.
-    call_outcomes: VecDeque<(String, TaskOutcome)>,
+    /// transcript's notifications recorded it. One entry per notified call,
+    /// each with a bounded summary, so that any page replayed later can tell
+    /// a launch that was settled from one that never was.
+    call_outcomes: HashMap<String, TaskOutcome>,
     /// Result carriers' preceding call locations in the selected visible
     /// chain. Offset metadata only; no input or patch bodies are retained.
     result_calls: HashMap<u64, Vec<(usize, (u64, u64, usize, usize))>>,
@@ -5579,7 +5624,7 @@ impl History {
         // Ended agents whose delayed launch acknowledgement, or refused result
         // after a stop, would otherwise overwrite their terminal outcome.
         let mut ended_agent_tools = HashMap::<String, ToolStatus>::new();
-        let mut call_outcomes = VecDeque::<(String, TaskOutcome)>::new();
+        let mut call_outcomes = HashMap::<String, TaskOutcome>::new();
         let mut position = 0;
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
@@ -5692,11 +5737,7 @@ impl History {
                     if agent_tools.contains_key(&tool) {
                         continue;
                     }
-                    call_outcomes.retain(|(known, _)| *known != tool);
-                    call_outcomes.push_back((tool, outcome));
-                    if call_outcomes.len() > MAX_TOOLS {
-                        call_outcomes.pop_front();
-                    }
+                    call_outcomes.insert(tool, outcome.recorded());
                 }
                 for (tool, task, status) in notification_outcomes(&content) {
                     // A resumed agent's notification names the `SendMessage`
@@ -11978,7 +12019,9 @@ mod tests {
     /// Bash, and Claude Code reported that command's task on the parent
     /// stream, naming the subagent's call. It is the subagent's command, so
     /// it settles that command's own row there, and this conversation shows
-    /// no "Subagent task" row and no notice it never received.
+    /// no "Subagent task" row and no notice it never received. When the
+    /// subagent's call was not forwarded, a command row is all that shows the
+    /// command ran and how it ended, so it stays until the call arrives.
     #[test]
     fn a_subagents_background_command_settles_its_own_call_and_adds_nothing_here() {
         let summary =
@@ -12008,11 +12051,23 @@ mod tests {
             let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"bhuyfvny2","owned_by_subagent":true,"tool_use_id":"child-bash","description":"Wait until a survey agent finishes","task_type":"local_bash","uuid":"start"})).unwrap();
             let notified = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"bhuyfvny2","tool_use_id":"child-bash","status":"completed","output_file":"/var/tmp/claude-1000/tasks/bhuyfvny2.output","summary":summary,"uuid":"notified"})).unwrap();
             for step in [&started, &notified] {
-                assert!(task_rows(step).is_empty(), "forwarded: {forwarded}");
+                assert_eq!(task_rows(step).is_empty(), forwarded);
                 assert!(notice_summaries(step).is_empty(), "forwarded: {forwarded}");
             }
-            assert!(adapter.visible_task_rows.is_empty());
+            assert_eq!(adapter.visible_task_rows.is_empty(), forwarded);
             let settled = shown_command(&notified, "child-bash");
+            if !forwarded {
+                let (scope, content) = shown_command(&notified, "claude-task:bhuyfvny2").unwrap();
+                assert_eq!(scope, None);
+                assert!(
+                    matches!(
+                        content,
+                        ItemContent::Command { ref label, status: ToolStatus::Succeeded, exit_code: Some(0), ref output, .. }
+                            if label == "Wait until a survey agent finishes" && output == summary
+                    ),
+                    "{content:?}"
+                );
+            }
             if forwarded {
                 let (scope, content) = settled.unwrap();
                 assert_eq!(scope.as_deref(), Some("agent-call"));
@@ -12286,6 +12341,97 @@ mod tests {
             Some((None, ItemContent::Command { status: ToolStatus::Stopped, output, .. }))
                 if output == UNRECORDED_BACKGROUND_RESULT
         ));
+    }
+
+    /// A replayed launch is shown as never settled only when nothing the
+    /// session recorded settled it: not when many later notifications follow
+    /// its own, and not when its agent's sidecar is where it was recorded.
+    #[test]
+    fn replayed_background_commands_settle_from_any_recorded_notification() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = "00000000-0000-4000-8000-000000000003";
+        let notification = |tool: &str, status: &str, summary: &str| {
+            format!(
+                "<task-notification>\n<task-id>t-{tool}</task-id>\n<tool-use-id>{tool}</tool-use-id>\n<output-file>/var/tmp/t.output</output-file>\n<status>{status}</status>\n<summary>{summary}</summary>\n</task-notification>"
+            )
+        };
+        let records = [
+            json!({"type":"assistant","uuid":"agent-launch","parentUuid":null,"sessionId":session,"message":{"id":"agent-message","content":[{"type":"tool_use","id":"agent-call","name":"Agent","input":{"description":"Survey","run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"agent-result","parentUuid":"agent-launch","sessionId":session,"toolUseResult":{"isAsync":true,"status":"async_launched","agentId":"one"},"message":{"content":[{"type":"tool_result","tool_use_id":"agent-call","content":"Async agent launched successfully."}]}}),
+            json!({"type":"assistant","uuid":"bash-call","parentUuid":"agent-result","sessionId":session,"message":{"id":"bash-message","content":[{"type":"tool_use","id":"bash-early","name":"Bash","input":{"command":"make","run_in_background":true}}]}}),
+            json!({"type":"user","uuid":"bash-result","parentUuid":"bash-call","sessionId":session,"toolUseResult":{"backgroundTaskId":"t-bash-early"},"message":{"content":[{"type":"tool_result","tool_use_id":"bash-early","content":"Command running in background with ID: t-bash-early."}]}}),
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":session,"content":notification("bash-early", "failed", "Background command \"make\" failed with exit code 2")}),
+            // More later notifications than any bounded window would keep.
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":session,"content":(0..MAX_TOOLS + 8)
+                .map(|n| notification(&format!("other-{n}"), "completed", "done"))
+                .collect::<String>()}),
+        ];
+        let root = directory.path().join("root.jsonl");
+        std::fs::write(
+            &root,
+            records
+                .iter()
+                .map(|record| format!("{record}\n"))
+                .collect::<String>(),
+        )
+        .unwrap();
+        let mut history = History::index(File::open(root).unwrap(), session).unwrap();
+        let children = directory.path().join("subagents");
+        std::fs::create_dir(&children).unwrap();
+        history.subagent_dir = Some(children.clone());
+        std::fs::write(
+            children.join("agent-one.meta.json"),
+            json!({"toolUseId":"agent-call","agentType":"general-purpose","description":"Survey"})
+                .to_string(),
+        )
+        .unwrap();
+        let child = |uuid: &str, frame: Value| {
+            let mut frame = frame;
+            frame["uuid"] = json!(uuid);
+            frame["sessionId"] = json!(session);
+            frame["agentId"] = json!("one");
+            frame["isSidechain"] = json!(true);
+            format!("{frame}\n")
+        };
+        std::fs::write(
+            children.join("agent-one.jsonl"),
+            [
+                child("child-call", json!({"type":"assistant","message":{"id":"child-message","content":[{"type":"tool_use","id":"child-bash","name":"Bash","input":{"command":"sleep 30","run_in_background":true}}]}})),
+                child("child-result", json!({"type":"user","toolUseResult":{"backgroundTaskId":"t-child-bash"},"message":{"content":[{"type":"tool_result","tool_use_id":"child-bash","content":"Command running in background with ID: t-child-bash."}]}})),
+                child("child-notified", json!({"type":"user","origin":{"kind":"task-notification"},"message":{"role":"user","content":notification("child-bash", "failed", "Background command \"sleep 30\" failed with exit code 1")}})),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        let replayed = adapter.initialize().unwrap();
+        assert!(
+            matches!(
+                shown_command(&replayed, "bash-early"),
+                Some((
+                    None,
+                    ItemContent::Command {
+                        status: ToolStatus::Failed,
+                        exit_code: Some(2),
+                        ..
+                    }
+                ))
+            ),
+            "{:?}",
+            shown_command(&replayed, "bash-early")
+        );
+        assert!(
+            matches!(
+                shown_command(&replayed, "child-bash"),
+                Some((Some(ref scope), ItemContent::Command { status: ToolStatus::Failed, exit_code: Some(1), .. }))
+                    if scope == "agent-call"
+            ),
+            "{:?}",
+            shown_command(&replayed, "child-bash")
+        );
     }
 
     /// Claude Code reports a refused or interrupted call as an error in fixed
