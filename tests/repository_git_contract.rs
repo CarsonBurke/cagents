@@ -1134,6 +1134,74 @@ fn staging_leaves_entries_outside_a_sparse_checkout_alone() {
     );
 }
 
+/// `git reset` keeps skip-worktree on an entry and sets it on one restored
+/// outside the sparse checkout. Losing it would make the next stage record
+/// the absent file as a deletion.
+#[test]
+fn unstaging_keeps_entries_outside_a_sparse_checkout_skip_worktree() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("hidden.txt", b"one\n");
+    fixture.write("in/kept.txt", b"one\n");
+    fixture.write("out/removed.txt", b"one\n");
+    fixture.commit_all("initial");
+    fixture.write("hidden.txt", b"two\n");
+    fixture.git_in_work(&["add", "hidden.txt"]);
+    fixture.git_in_work(&["update-index", "--skip-worktree", "hidden.txt"]);
+    assert!(matches!(
+        unstage(&fixture, &["hidden.txt"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        fixture.text(&["ls-files", "-t", "hidden.txt"]),
+        "S hidden.txt"
+    );
+    assert_eq!(fixture.text(&["diff", "--cached", "--name-only"]), "");
+
+    fixture.git_in_work(&["update-index", "--no-skip-worktree", "hidden.txt"]);
+    fixture.git_in_work(&["checkout", "--", "hidden.txt"]);
+    fixture.git_in_work(&["sparse-checkout", "set", "in"]);
+    fixture.git_in_work(&["rm", "--quiet", "--cached", "--sparse", "out/removed.txt"]);
+    assert!(matches!(
+        unstage(&fixture, &["out/removed.txt"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        fixture.text(&["ls-files", "-t", "out/removed.txt"]),
+        "S out/removed.txt"
+    );
+    assert_eq!(fixture.porcelain(), "");
+}
+
+#[test]
+fn staging_refuses_a_path_inside_a_submodule() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("a.txt", b"one\n");
+    let nested = fixture.work().join("deps/sub");
+    fs::create_dir_all(&nested).expect("nested directory");
+    fixture.run(&nested, &["init", "-b", "main", "."]);
+    fixture.run(
+        &nested,
+        &["commit", "--quiet", "--allow-empty", "-m", "nested"],
+    );
+    fixture.commit_all("initial");
+    let committed = index_entries(&fixture);
+    fixture.write("deps/sub/inner.txt", b"inner\n");
+    fixture.write("a.txt", b"two\n");
+
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = stage(&fixture, &["a.txt", "deps/sub/inner.txt"])
+    else {
+        panic!("a path inside a submodule must not be staged");
+    };
+    assert!(reason.contains("submodule 'deps/sub'"), "{reason}");
+    assert_eq!(index_entries(&fixture), committed);
+}
+
 #[test]
 fn staging_applies_attributes_resolves_conflicts_and_records_gitlinks() {
     let Some(fixture) = Fixture::new() else {
