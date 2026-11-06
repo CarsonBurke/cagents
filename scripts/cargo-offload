@@ -1213,6 +1213,8 @@ elif command == "run":
     shims = os.path.expanduser("~/.local/share/mise/shims")
     if os.path.isdir(shims):
         environment["PATH"] = shims + os.pathsep + environment.get("PATH", "")
+        # See the note at the top of scripts/cargo-gate: a test's fixture may move HOME.
+        environment.setdefault("MISE_DATA_DIR", os.path.dirname(shims))
     if request.get("directories") is not None:
         # Where this host's Cargo puts the build's results and intermediates,
         # which its own configuration may move out of the slot: the caller

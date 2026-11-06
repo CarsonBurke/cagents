@@ -10,11 +10,30 @@
 # further build only slows the running ones and every other workload.
 set -eu
 
+# A mise shim finds its target on PATH, passing over its own directory only if
+# that is the shims directory of mise's data directory. With HOME or XDG_DATA_HOME
+# moved, as in a fixture, the shim finds itself and re-executes without end. Naming
+# the directory here covers this gate's helpers and whatever moves HOME below it.
+if [ -z "${MISE_DATA_DIR+set}" ]; then
+    rest=$PATH:
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        case $entry in
+        /*/mise/shims)
+            MISE_DATA_DIR=${entry%/shims}
+            export MISE_DATA_DIR
+            break
+            ;;
+        esac
+    done
+fi
+
 # Raise this whenever the gate or a helper beside it changes what it does. A
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=11
+gate_version=12
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
