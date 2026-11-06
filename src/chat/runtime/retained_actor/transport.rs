@@ -46,6 +46,15 @@ const ACKNOWLEDGEMENT_WAIT: Duration = Duration::from_secs(10);
 /// Delay before the second retransmission of an input whose `input` call
 /// failed. Later delays double, up to `TIMEOUT`.
 const RETRANSMIT_DELAY: Duration = Duration::from_millis(100);
+/// How long before its caller stops waiting an unconfirmed input is settled,
+/// so a caller still waiting hears the outcome.
+const SETTLE_MARGIN: Duration = Duration::from_secs(1);
+/// Why an input whose delivery was never confirmed is settled as not sent.
+const UNCONFIRMED_INPUT: &str = "Claude did not receive this request in time, so it was not sent";
+/// Why a caller stops waiting for an input whose outcome is still unknown.
+const UNACKNOWLEDGED_INPUT: &str = "Claude has not confirmed this request yet. It may still arrive, so check the conversation before sending it again";
+/// Why a new input is refused while an earlier one is still unconfirmed.
+const UNSETTLED_INPUT: &str = "Claude has not confirmed your previous request yet, so this one was not sent. Try again in a moment.";
 fn payload_digest(bytes: &[u8]) -> [u8; 32] {
     use sha2::{Digest, Sha256};
     Sha256::digest(bytes).into()
@@ -213,6 +222,17 @@ struct UncertainInput {
     acknowledgement_deadline: Instant,
     /// Set once the original `input` call has failed.
     retransmit: Option<Retransmit>,
+    /// The helper's latest refusal of the input, given without a receipt.
+    refusal: Option<String>,
+}
+impl UncertainInput {
+    /// When the helper is asked to settle the input rather than receive it
+    /// again.
+    fn settle_at(&self) -> Instant {
+        self.acknowledgement_deadline
+            .checked_sub(SETTLE_MARGIN)
+            .unwrap_or(self.acknowledgement_deadline)
+    }
 }
 struct Retransmit {
     next: Instant,
@@ -236,6 +256,8 @@ struct Remote {
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
     uncertain_input: Mutex<Option<UncertainInput>>,
+    /// Signalled when the uncertain input is settled.
+    input_settled: std::sync::Condvar,
     pending: Mutex<Vec<Pending>>,
     retiring_inputs: Mutex<Vec<InputIdentity>>,
     recovering_inputs: AtomicBool,
@@ -428,6 +450,7 @@ impl RemoteActor {
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(1),
             uncertain_input: Mutex::new(None),
+            input_settled: std::sync::Condvar::new(),
             pending: Mutex::new(Vec::new()),
             retiring_inputs: Mutex::new(Vec::new()),
             recovering_inputs: AtomicBool::new(false),
@@ -1047,6 +1070,7 @@ impl RemoteActor {
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(attached.resident.next_input),
             uncertain_input: Mutex::new(None),
+            input_settled: std::sync::Condvar::new(),
             state: Mutex::new(Arc::new(attached.resident)),
             publication: Mutex::new(()),
             final_snapshot: Mutex::new(None),
@@ -1129,7 +1153,7 @@ impl RemoteActor {
                     {
                         actor.apply_receipts(&receipts);
                     }
-                    actor.retransmit_uncertain_input();
+                    actor.resolve_uncertain_input();
                     let _ = actor.flush_input_retirements();
                     drop(actor);
                     thread::sleep(Duration::from_millis(50));
@@ -1353,8 +1377,26 @@ impl RemoteActor {
         args: Value,
         deadline: Instant,
     ) -> Result<T, String> {
+        self.answer_until(method, args, deadline)?
+    }
+    fn answer<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+    ) -> Result<Result<T, String>, String> {
+        self.answer_until(method, args, Instant::now() + TIMEOUT)
+    }
+    /// One request, keeping the helper's own refusal apart from a failed
+    /// exchange. The outer error means the request may or may not have
+    /// reached the helper; the inner one is the helper's answer.
+    fn answer_until<T: DeserializeOwned>(
+        &self,
+        method: &str,
+        args: Value,
+        deadline: Instant,
+    ) -> Result<Result<T, String>, String> {
         if self.0.close_only && !close_only_method(method) {
-            return Err(close_only_refusal());
+            return Ok(Err(close_only_refusal()));
         }
         let response: Result<Value, String> = exchange(
             &self.0.socket,
@@ -1367,7 +1409,12 @@ impl RemoteActor {
             },
             deadline,
         )?;
-        serde_json::from_value(response?).map_err(|error| error.to_string())
+        match response {
+            Ok(value) => serde_json::from_value(value)
+                .map(Ok)
+                .map_err(|error| error.to_string()),
+            Err(refusal) => Ok(Err(refusal)),
+        }
     }
     pub fn enqueue(
         &self,
@@ -1394,6 +1441,21 @@ impl RemoteActor {
         })?
         .map_err(String::from)
     }
+    /// Admit one command input without waiting behind an unconfirmed one.
+    #[cfg(test)]
+    fn enqueue_now(
+        &self,
+        command: Command,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_within(
+            InputPayload::Command {
+                run: None,
+                command,
+                decline_only: false,
+            },
+            Duration::ZERO,
+        )
+    }
     pub fn pending_inputs(&self) -> Vec<InputIdentity> {
         self.0
             .pending
@@ -1407,6 +1469,15 @@ impl RemoteActor {
         &self,
         payload: InputPayload,
     ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
+        self.enqueue_payload_within(payload, ACKNOWLEDGEMENT_WAIT)
+    }
+    /// Admit one input, waiting up to `settle` for an earlier unconfirmed
+    /// input to be settled first.
+    fn enqueue_payload_within(
+        &self,
+        payload: InputPayload,
+        settle: Duration,
+    ) -> Result<crossbeam_channel::Receiver<Result<(), Rejection>>, String> {
         if self.0.close_only {
             return Err(close_only_refusal());
         }
@@ -1418,9 +1489,11 @@ impl RemoteActor {
         }
         let payload = serde_json::to_value(payload).map_err(|error| error.to_string())?;
         let bytes = serde_json::to_vec(&payload).map_err(|error| error.to_string())?;
+        let settle_deadline = Instant::now() + settle;
         let identity;
         let response;
-        {
+        loop {
+            self.await_settled_input(settle_deadline)?;
             let mut pending = self.0.pending.lock().unwrap_or_else(|p| p.into_inner());
             if pending.len() >= 65 {
                 return Err("Remote actor pending input capacity reached".into());
@@ -1437,16 +1510,14 @@ impl RemoteActor {
                     "Input outcome retirement is pending; no new command was admitted".into(),
                 );
             }
-            if let Some(UncertainInput { identity, .. }) = &*self
+            let mut uncertain = self
                 .0
                 .uncertain_input
                 .lock()
-                .unwrap_or_else(|p| p.into_inner())
-            {
-                return Err(format!(
-                    "Resolve retained input {} sequence {} before admitting another input",
-                    identity.id, identity.sequence
-                ));
+                .unwrap_or_else(|p| p.into_inner());
+            if uncertain.is_some() {
+                // Another caller was admitted first; wait for that input too.
+                continue;
             }
             let retained: usize = pending
                 .iter()
@@ -1484,14 +1555,11 @@ impl RemoteActor {
                 .ok_or("Remote actor input sequence exhausted")?;
             let (reply, receiver) = crossbeam_channel::bounded(1);
             response = receiver;
-            *self
-                .0
-                .uncertain_input
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = Some(UncertainInput {
+            *uncertain = Some(UncertainInput {
                 identity: identity.clone(),
                 acknowledgement_deadline: Instant::now() + ACKNOWLEDGEMENT_WAIT,
                 retransmit: None,
+                refusal: None,
             });
             pending.push(Pending {
                 identity: identity.clone(),
@@ -1499,76 +1567,179 @@ impl RemoteActor {
                 bytes: bytes.len(),
                 reply: Some(reply),
             });
+            break;
         }
         // Preserve the exact identity and envelope before crossing the socket.
         // An ambiguous write keeps the receipt pending and fences new input
-        // until the metadata pump observes or retransmits it.
-        match self.call::<InputReceipt>("input", json!([identity, payload])) {
-            Ok(receipt) => self.apply_receipts(&[receipt]),
-            Err(_) => {
-                if let Some(uncertain) = self
-                    .0
-                    .uncertain_input
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .as_mut()
-                    .filter(|uncertain| uncertain.identity == identity)
-                {
-                    uncertain.retransmit = Some(Retransmit {
-                        next: Instant::now(),
-                        delay: RETRANSMIT_DELAY,
-                    });
-                }
+        // until the metadata pump observes, retransmits or settles it.
+        let refusal = match self.answer::<InputReceipt>("input", json!([identity, payload])) {
+            Ok(Ok(receipt)) => {
+                self.apply_receipts(&[receipt]);
+                return Ok(response);
             }
+            Ok(Err(refusal)) => {
+                tracing::warn!(
+                    sequence = identity.sequence,
+                    %refusal,
+                    "the retained actor refused an input without a receipt"
+                );
+                Some(refusal)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    sequence = identity.sequence,
+                    %error,
+                    "a retained input call failed; its delivery is unknown"
+                );
+                None
+            }
+        };
+        if let Some(uncertain) = self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_mut()
+            .filter(|uncertain| uncertain.identity == identity)
+        {
+            // The caller's wait for the outcome starts now.
+            uncertain.acknowledgement_deadline = Instant::now() + ACKNOWLEDGEMENT_WAIT;
+            uncertain.retransmit = Some(Retransmit {
+                next: Instant::now(),
+                delay: RETRANSMIT_DELAY,
+            });
+            uncertain.refusal = refusal;
         }
         Ok(response)
     }
-    /// A failed `input` call may never have reached the helper, so no receipt
-    /// would ever resolve its fence. Retransmit the exact envelope once that
-    /// call has failed, backing off while the helper stays unreachable or
-    /// refuses it. The helper admits each identity once and otherwise returns
-    /// its existing receipt, so this never executes an input twice.
+    /// Inputs reach the helper one at a time, so a caller who arrives while
+    /// an earlier input is unconfirmed waits for it to be settled rather
+    /// than being refused for the other input's delay.
+    fn await_settled_input(&self, deadline: Instant) -> Result<(), String> {
+        let mut uncertain = self
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
+        while let Some(outstanding) = &*uncertain {
+            if self.0.stop.load(Ordering::Acquire) {
+                return Err(
+                    "Retained actor proxy is unavailable; no new input was admitted".into(),
+                );
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                tracing::warn!(
+                    sequence = outstanding.identity.sequence,
+                    "a retained input is still unconfirmed; the next input was refused"
+                );
+                return Err(UNSETTLED_INPUT.into());
+            }
+            // Stopping does not signal this condition; recheck it regularly.
+            uncertain = self
+                .0
+                .input_settled
+                .wait_timeout(uncertain, (deadline - now).min(RETRANSMIT_DELAY))
+                .unwrap_or_else(|p| p.into_inner())
+                .0;
+        }
+        Ok(())
+    }
+    /// A failed `input` call may never have reached the helper, and a refused
+    /// one has no receipt, so no receipt would resolve either fence. While its
+    /// caller waits, the exact envelope is retransmitted, backing off while the
+    /// helper stays unreachable or refuses it. The helper admits each identity
+    /// once and otherwise returns its existing receipt, so this never executes
+    /// an input twice.
     ///
-    /// Retransmission is part of the caller's own delivery attempt, so it
-    /// stops when the caller reports the outcome as unknown. An input never
-    /// starts long after its caller was told not to resend it; the fence
-    /// then awaits an explicit retry or a receipt.
-    fn retransmit_uncertain_input(&self) {
-        let due = {
-            let mut uncertain = self
+    /// Shortly before the caller stops waiting, the helper is asked to settle
+    /// the input instead: it returns the receipt of an input it admitted, and
+    /// otherwise records the input as refused, so it never starts after its
+    /// caller was told its outcome is unknown. Either answer lifts the fence,
+    /// and a caller still waiting hears it.
+    fn resolve_uncertain_input(&self) {
+        let (identity, settle_at, settle) = {
+            let uncertain = self
                 .0
                 .uncertain_input
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
-            let Some(uncertain) = uncertain.as_mut() else {
+            let Some(uncertain) = uncertain.as_ref() else {
                 return;
             };
             let now = Instant::now();
-            if now >= uncertain.acknowledgement_deadline {
-                uncertain.retransmit = None;
-            }
+            let settle_at = uncertain.settle_at();
             match &uncertain.retransmit {
-                Some(retransmit) if retransmit.next <= now => uncertain.identity.clone(),
+                Some(retransmit) if retransmit.next <= now => {}
                 _ => return,
             }
+            let settle = (now >= settle_at).then(|| match &uncertain.refusal {
+                Some(refusal) => {
+                    format!("Claude refused this request, so it was not sent: {refusal}")
+                }
+                None => UNCONFIRMED_INPUT.to_owned(),
+            });
+            (uncertain.identity.clone(), settle_at, settle)
         };
-        if self.retry_input(&due).is_ok() {
-            return;
-        }
+        let answer = match &settle {
+            None => self.answer_input(&identity),
+            Some(reason) => self.answer("abandon_input", json!([identity, reason])),
+        };
+        let refusal = match answer {
+            Ok(Ok(receipt)) => {
+                if settle.is_some() && matches!(&receipt.state, InputState::Acknowledged(Err(_))) {
+                    tracing::warn!(
+                        sequence = identity.sequence,
+                        "an unconfirmed retained input was settled as not sent"
+                    );
+                }
+                self.apply_receipts(&[receipt]);
+                return;
+            }
+            // A helper that cannot settle inputs, such as an older one, keeps
+            // the fence; it is asked again after the backoff.
+            Ok(Err(refusal)) => settle.is_none().then_some(refusal),
+            Err(_) => None,
+        };
         if let Some(UncertainInput {
-            identity,
+            identity: current,
             retransmit: Some(retransmit),
+            refusal: recorded,
             ..
         }) = &mut *self
             .0
             .uncertain_input
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            && *identity == due
+            && *current == identity
         {
-            retransmit.next = Instant::now() + retransmit.delay;
+            let now = Instant::now();
+            retransmit.next = now + retransmit.delay;
+            if now < settle_at {
+                // Settle on time even while backing off.
+                retransmit.next = retransmit.next.min(settle_at);
+            }
             retransmit.delay = retransmit.delay.saturating_mul(2).min(TIMEOUT);
+            if refusal.is_some() {
+                *recorded = refusal;
+            }
         }
+    }
+    /// Send the exact original envelope of a pending input again.
+    fn answer_input(
+        &self,
+        identity: &InputIdentity,
+    ) -> Result<Result<InputReceipt, String>, String> {
+        let payload = self
+            .0
+            .pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .find(|pending| &pending.identity == identity)
+            .map(|pending| pending.payload.clone())
+            .ok_or("The original input envelope is unavailable; never reconstruct it")?;
+        self.answer("input", json!([identity, payload]))
     }
     /// Explicit retransmission of the exact protocol envelope. Existing helper
     /// receipts return the original outcome without invoking the adapter again.
@@ -1579,16 +1750,7 @@ impl RemoteActor {
                 "Retained actor proxy is unavailable; original input was not replayed".into(),
             );
         }
-        let payload = self
-            .0
-            .pending
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .iter()
-            .find(|pending| &pending.identity == identity)
-            .map(|pending| pending.payload.clone())
-            .ok_or("The original input envelope is unavailable; never reconstruct it")?;
-        let receipt = self.call("input", json!([identity, payload]))?;
+        let receipt = self.answer_input(identity)??;
         self.apply_receipts(std::slice::from_ref(&receipt));
         Ok(receipt)
     }
@@ -1630,6 +1792,10 @@ impl RemoteActor {
                 InputState::Accepted => true,
             }
         });
+        if uncertain.is_none() {
+            self.0.input_settled.notify_all();
+        }
+        drop(uncertain);
         let mut retiring = self
             .0
             .retiring_inputs
@@ -1706,14 +1872,17 @@ impl RemoteActor {
         command: Command,
     ) -> Result<(), Rejection> {
         let receiver = self.enqueue(run, command).map_err(Rejection::Refused)?;
-        receiver.recv_timeout(ACKNOWLEDGEMENT_WAIT).map_err(|_|Rejection::Unacknowledged("Retained actor input acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
+        receiver
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+            .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
     pub fn try_idle_prompt(&self, text: String) -> Result<(), Rejection> {
         let receiver = self
             .enqueue_payload(InputPayload::IdlePrompt { text })
             .map_err(Rejection::Refused)?;
-        receiver.recv_timeout(ACKNOWLEDGEMENT_WAIT)
-            .map_err(|_| Rejection::Unacknowledged("Retained idle prompt acknowledgement is pending; use its stable receipt, never resend blindly".into()))?
+        receiver
+            .recv_timeout(ACKNOWLEDGEMENT_WAIT)
+            .map_err(|_| Rejection::Unacknowledged(UNACKNOWLEDGED_INPUT.into()))?
     }
     pub fn interrupt(
         &self,
@@ -2726,6 +2895,20 @@ impl Server {
                         }
                     }
                 }
+                value!(receipt)
+            }
+            "abandon_input" => {
+                // The proxy gives up on an input whose delivery it could not
+                // confirm. This helper decides its outcome once: the receipt
+                // of an admitted input, or else a refusal that no later copy
+                // of the frame can turn into an admission.
+                let (identity, reason) = decode!((InputIdentity, String));
+                let receipt = self
+                    .journal
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .refuse_unadmitted(&identity, reason)?;
+                self.changed.fetch_add(1, Ordering::Release);
                 value!(receipt)
             }
             "snapshot" => {
@@ -5652,7 +5835,7 @@ exec /bin/sleep 60
         ));
     }
     #[test]
-    fn failed_input_call_is_retransmitted_until_its_receipt_lifts_the_fence() {
+    fn failed_input_call_is_retransmitted_then_settled_by_the_helper() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let socket = directory.path().join("actor.sock");
         let actor = RemoteActor::fixture_at(socket.clone());
@@ -5660,9 +5843,11 @@ exec /bin/sleep 60
         // its delivery is unknown: it may never have reached the helper.
         let response = actor.enqueue(None, Command::Refresh).unwrap();
         let identity = actor.pending_inputs().pop().unwrap();
-        let fenced = actor.enqueue(None, Command::Refresh).unwrap_err();
-        assert!(fenced.starts_with("Resolve retained input"), "{fenced}");
-        actor.retransmit_uncertain_input();
+        assert_eq!(
+            actor.enqueue_now(Command::Refresh).unwrap_err(),
+            UNSETTLED_INPUT
+        );
+        actor.resolve_uncertain_input();
         let retransmit = |actor: &RemoteActor| {
             let uncertain = actor.0.uncertain_input.lock().unwrap();
             let retransmit = uncertain.as_ref().unwrap().retransmit.as_ref();
@@ -5672,7 +5857,7 @@ exec /bin/sleep 60
         assert!(next > Instant::now() && delay > RETRANSMIT_DELAY);
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
-        actor.retransmit_uncertain_input();
+        actor.resolve_uncertain_input();
         assert_eq!(
             listener.accept().unwrap_err().kind(),
             std::io::ErrorKind::WouldBlock,
@@ -5714,16 +5899,18 @@ exec /bin/sleep 60
                 .next = Instant::now();
         };
         backdate(&actor);
-        actor.retransmit_uncertain_input();
+        actor.resolve_uncertain_input();
         helper.join().unwrap();
         assert!(actor.0.uncertain_input.lock().unwrap().is_none());
         assert_eq!(response.try_recv(), Ok(Ok(())));
         assert!(actor.pending_inputs().is_empty());
 
-        // Retransmission ends with the caller's acknowledgement wait: an input
-        // never starts after its caller reported the outcome as unknown.
+        // Once its caller stops waiting, the input is never sent again: the
+        // helper settles it instead, so it cannot start after the caller was
+        // told its outcome is unknown, and the fence lifts.
         std::fs::remove_file(&socket).unwrap();
-        let _unknown = actor.enqueue(None, Command::Refresh).unwrap();
+        let unknown = actor.enqueue(None, Command::Refresh).unwrap();
+        let expected = actor.pending_inputs().pop().unwrap();
         backdate(&actor);
         actor
             .0
@@ -5734,16 +5921,180 @@ exec /bin/sleep 60
             .unwrap()
             .acknowledgement_deadline = Instant::now();
         let listener = UnixListener::bind(&socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        actor.retransmit_uncertain_input();
+        let settle = |listener: &UnixListener, answer: Result<Value, String>| {
+            let (stream, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+            assert_eq!(request.method, "abandon_input", "never the input itself");
+            let (identity, reason): (InputIdentity, String) =
+                serde_json::from_value(request.args).unwrap();
+            assert_eq!(identity, expected);
+            assert_eq!(reason, UNCONFIRMED_INPUT);
+            send(&stream, &answer, TIMEOUT).unwrap();
+        };
+        // A helper that cannot settle inputs leaves the fence in place, and
+        // the proxy asks again after its backoff.
+        let older = thread::scope(|scope| {
+            let helper = scope.spawn(|| {
+                settle(
+                    &listener,
+                    Err("Unknown retained actor method/version".into()),
+                )
+            });
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+            retransmit(&actor)
+        });
+        assert!(older.is_some(), "the input stays fenced");
+        backdate(&actor);
+        let settled = InputReceipt {
+            identity: expected.clone(),
+            state: InputState::Acknowledged(Err(UNCONFIRMED_INPUT.into())),
+        };
+        thread::scope(|scope| {
+            let helper =
+                scope.spawn(|| settle(&listener, Ok(serde_json::to_value(&settled).unwrap())));
+            actor.resolve_uncertain_input();
+            helper.join().unwrap();
+        });
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
         assert_eq!(
-            listener.accept().unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock,
-            "nothing is retransmitted after the caller stopped waiting"
+            unknown.try_recv(),
+            Ok(Err(Rejection::Refused(UNCONFIRMED_INPUT.into())))
         );
-        assert_eq!(retransmit(&actor), None);
-        let fenced = actor.enqueue(None, Command::Refresh).unwrap_err();
-        assert!(fenced.starts_with("Resolve retained input"), "{fenced}");
+        assert!(actor.pending_inputs().is_empty());
+        drop(listener);
+        actor.enqueue_now(Command::Refresh).unwrap();
+        assert_eq!(actor.pending_inputs()[0].sequence, 3);
+    }
+    /// #2242: an input the helper refused without a receipt fenced every
+    /// later input of the conversation for good.
+    #[test]
+    fn refused_input_is_settled_and_the_next_input_is_admitted() {
+        let mut fixture = resident_fixture();
+        // The helper refuses input before installation, without a receipt.
+        fixture.server.installed = false;
+        fixture.server.listener.set_nonblocking(true).unwrap();
+        let attached = fixture.server.attached().unwrap();
+        let proof = fixture.server.proof.clone();
+        let socket = fixture.server.socket.clone();
+        let fixture = Arc::new(Mutex::new(fixture));
+        let requests = Arc::new(Mutex::new(Vec::<(String, Value)>::new()));
+        let stop = Arc::new(AtomicBool::new(false));
+        // Serve the real helper's request handling, as its serve loop does.
+        let helper = {
+            let (fixture, requests, stop) = (fixture.clone(), requests.clone(), stop.clone());
+            thread::spawn(move || {
+                while !stop.load(Ordering::Acquire) {
+                    let mut fixture = fixture.lock().unwrap();
+                    fixture.server.finish_inputs();
+                    let control = match fixture.server.listener.accept() {
+                        Ok((control, _)) => control,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            drop(fixture);
+                            thread::sleep(Duration::from_millis(5));
+                            continue;
+                        }
+                        Err(error) => panic!("{error}"),
+                    };
+                    let request: Invocation = receive(&control, TIMEOUT).unwrap();
+                    requests
+                        .lock()
+                        .unwrap()
+                        .push((request.method.clone(), request.args.clone()));
+                    let response = fixture.server.invoke(request);
+                    let _ = send(&control, &response, TIMEOUT);
+                }
+            })
+        };
+        let actor = RemoteActor::from_attached_at(attached, proof, None, socket, |_| {}).unwrap();
+        let installed = |installed| fixture.lock().unwrap().server.installed = installed;
+        // A refusal that ends while its caller waits is still delivered.
+        let model = Command::SetModel {
+            model: "haiku".into(),
+            reasoning: None,
+        };
+        let delivered = actor.enqueue(None, model).unwrap();
+        thread::sleep(RETRANSMIT_DELAY * 3);
+        installed(true);
+        assert_eq!(
+            delivered.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(),
+            Ok(())
+        );
+        // A refusal that lasts until its caller stops waiting is settled: the
+        // caller hears it, rather than an unknown outcome, and the
+        // conversation takes the next input.
+        installed(false);
+        let refused = actor.enqueue(None, Command::Refresh).unwrap();
+        actor
+            .0
+            .uncertain_input
+            .lock()
+            .unwrap()
+            .as_mut()
+            .expect("the refused input is fenced")
+            .acknowledgement_deadline = Instant::now();
+        match refused.recv_timeout(Duration::from_secs(3)) {
+            Ok(Err(Rejection::Refused(reason))) => assert_eq!(
+                reason,
+                "Claude refused this request, so it was not sent: Retained actor installation is not confirmed; provider input is refused"
+            ),
+            outcome => panic!("the refused input was never settled: {outcome:?}"),
+        }
+        assert!(actor.0.uncertain_input.lock().unwrap().is_none());
+        installed(true);
+        let next = actor.enqueue(None, Command::Refresh).unwrap();
+        assert_eq!(next.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(), Ok(()));
+        // A late copy of the refused frame never runs: it is answered with
+        // the refusal or, once the proxy retired that, refused as retired.
+        let (_, args) = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(method, args)| method == "input" && args[0]["sequence"] == 2)
+            .cloned()
+            .unwrap();
+        let mut fixture_guard = fixture.lock().unwrap();
+        let server = &mut fixture_guard.server;
+        let late = server.invoke(Invocation {
+            proof: server.proof.clone(),
+            epoch: Some(server.epoch),
+            method: "input".into(),
+            args,
+        });
+        match late.map(serde_json::from_value::<InputReceipt>) {
+            Ok(Ok(InputReceipt {
+                state: InputState::Acknowledged(Err(_)),
+                ..
+            })) => {}
+            Err(refusal) if refusal.contains("never replay") => {}
+            late => panic!("a late copy of a refused input was admitted: {late:?}"),
+        }
+        assert!(server.pending.is_empty());
+        drop(fixture_guard);
+        actor.0.stop.store(true, Ordering::Release);
+        stop.store(true, Ordering::Release);
+        helper.join().unwrap();
+    }
+    #[test]
+    fn a_new_input_waits_for_an_unconfirmed_one_to_settle() {
+        let actor = RemoteActor::fixture();
+        let _first = actor.enqueue(None, Command::Refresh).unwrap();
+        let first = actor.pending_inputs().pop().unwrap();
+        thread::scope(|scope| {
+            let next = scope.spawn(|| actor.enqueue(None, Command::Interrupt));
+            // The second caller waits rather than being refused.
+            thread::sleep(RETRANSMIT_DELAY * 2);
+            assert!(!next.is_finished());
+            assert_eq!(actor.pending_inputs(), vec![first.clone()]);
+            actor.apply_receipts(&[InputReceipt {
+                identity: first.clone(),
+                state: InputState::Accepted,
+            }]);
+            next.join().unwrap().unwrap();
+        });
+        let pending = actor.pending_inputs();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(pending[1].sequence, 2);
     }
     #[test]
     fn lost_input_reply_keeps_the_original_envelope_and_fences_new_input() {
@@ -5751,7 +6102,7 @@ exec /bin/sleep 60
         let response = actor.enqueue(None, Command::Interrupt).unwrap();
         let identity = actor.pending_inputs().pop().unwrap();
         assert_eq!(identity.sequence, 1);
-        assert!(actor.enqueue(None, Command::Interrupt).is_err());
+        assert!(actor.enqueue_now(Command::Interrupt).is_err());
         assert_eq!(actor.pending_inputs(), vec![identity.clone()]);
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut journal = Journal::open(directory.path()).unwrap();
@@ -5980,47 +6331,28 @@ done"#;
         while total < journal::MAX_INPUTS + 33 {
             let count = 32.min(journal::MAX_INPUTS + 33 - total);
             let mut replies: Vec<crossbeam_channel::Receiver<_>> = Vec::new();
-            let mut settled = Vec::new();
-            while replies.len() + settled.len() < count {
+            while replies.len() < count {
                 match actor.enqueue(None, Command::Refresh) {
                     Ok(reply) => replies.push(reply),
-                    // A slow `input` call leaves its newest input uncertain,
-                    // which fences admission until that input's receipt
-                    // arrives. Its reply is sent after the fence clears.
-                    Err(error) if error.starts_with("Resolve retained input") => {
-                        let uncertain = replies.pop().expect("the fenced input was admitted here");
-                        // Resolve it as the fence asks, as a caller must once
-                        // the proxy's bounded retransmission gives up: retry
-                        // the exact envelope until the helper's receipt lands.
+                    // A helper slower than this caller's whole wait leaves
+                    // the newest input unconfirmed. The metadata pump
+                    // settles it; then this command is admitted again.
+                    Err(error) if error == UNSETTLED_INPUT => {
                         let deadline = Instant::now() + HANG_GUARD;
-                        loop {
-                            // Release the fence's lock before retrying: a
-                            // landed receipt lifts the fence under that lock.
-                            let uncertain = actor
-                                .0
-                                .uncertain_input
-                                .lock()
-                                .unwrap()
-                                .as_ref()
-                                .map(|uncertain| uncertain.identity.clone());
-                            let Some(identity) = uncertain else {
-                                break;
-                            };
+                        while actor.0.uncertain_input.lock().unwrap().is_some() {
                             assert!(Instant::now() < deadline, "{error}");
-                            if actor.retry_input(&identity).is_err() {
-                                thread::sleep(Duration::from_millis(10));
-                            }
+                            thread::sleep(Duration::from_millis(10));
                         }
-                        settled.push(uncertain.recv_timeout(HANG_GUARD).unwrap());
                     }
                     Err(error) => panic!("{error}"),
                 }
             }
             for reply in replies {
-                settled.push(reply.recv_timeout(HANG_GUARD).unwrap());
-            }
-            for outcome in settled {
-                outcome.unwrap();
+                match reply.recv_timeout(HANG_GUARD).unwrap() {
+                    // Settled as never sent after its caller stopped waiting.
+                    Err(Rejection::Refused(reason)) if reason == UNCONFIRMED_INPUT => {}
+                    outcome => outcome.unwrap(),
+                }
             }
             total += count;
         }
