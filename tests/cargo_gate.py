@@ -1432,8 +1432,8 @@ class TwoSlots(unittest.TestCase):
               "CAGENTS_BUILD_REGISTRY": "", "CAGENTS_BUILD_REMOTE": "local",
               "CAGENTS_BUILD_INSTALLED_GATE": ""}
 
-    def hold(self, cost, env=None):
-        holder = self.scope.popen(
+    def hold(self, cost, env=None, scope=None):
+        holder = (scope or self.scope).popen(
             [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/held; "
              f"while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
             env=(env or self.env) | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
@@ -1870,31 +1870,32 @@ class HostRegistry(TwoSlots):
         self.assertFalse((self.root / "gone.lock").exists())
 
     def test_a_private_family_has_no_registry_unless_named(self):
-        # In a directory named as the shared locks are, as this suite's are.
-        with FixtureDirectory(prefix="cagents-gate-", dir="/var/tmp") as fixture:
-            private = fixture.name
-            lock = os.path.join(private, "slot.lock")
-            env = self.env | {"CAGENTS_BUILD_LOCK": lock}
-            del env["CAGENTS_BUILD_REGISTRY"]
-            def name(path):
-                return subprocess.run(["cksum"], input=path.encode(), capture_output=True,
-                                      check=True).stdout.split()[0].decode()
-            host = Path(f"/var/tmp/cagents-builds-{os.getuid()}")
-            self.hold(1, env=env)
-            held = self.scope.popen(
-                [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/second; sleep 1"],
-                env=env | {"CAGENTS_BUILD_COST_GIB": "1"}, cwd=self.root,
-                stderr=subprocess.DEVNULL)
-            deadline = time.monotonic() + 10
-            while not (self.root / "second").exists():
-                self.assertLess(time.monotonic(), deadline, "second build never admitted")
-                time.sleep(0.02)
-            for record in (f"gate-{name(lock)}", f"gate-{name(lock + '.1')}",
-                           f"wait-gate-{name(lock)}"):
-                self.assertFalse((host / record).exists(), record)
-            self.assertEqual(held.wait(timeout=10), 0)
-            (self.root / "release").touch()
-            self.holder.wait(timeout=10)
+        # In a directory named as the shared locks are, as this suite's are,
+        # whose builds end before it is removed.
+        fixture = FixtureDirectory(prefix="cagents-gate-", dir="/var/tmp")
+        self.addCleanup(fixture.close)
+        lock = os.path.join(fixture.name, "slot.lock")
+        env = self.env | {"CAGENTS_BUILD_LOCK": lock}
+        del env["CAGENTS_BUILD_REGISTRY"]
+        def name(path):
+            return fixture.run(["cksum"], input=path.encode(), capture_output=True,
+                               check=True).stdout.split()[0].decode()
+        host = Path(f"/var/tmp/cagents-builds-{os.getuid()}")
+        self.hold(1, env=env, scope=fixture)
+        held = fixture.popen(
+            [str(self.gate), "exec", "sh", "-c", f"touch {self.root}/second; sleep 1"],
+            env=env | {"CAGENTS_BUILD_COST_GIB": "1"}, cwd=self.root,
+            stderr=subprocess.DEVNULL)
+        deadline = time.monotonic() + 10
+        while not (self.root / "second").exists():
+            self.assertLess(time.monotonic(), deadline, "second build never admitted")
+            time.sleep(0.02)
+        for record in (f"gate-{name(lock)}", f"gate-{name(lock + '.1')}",
+                       f"wait-gate-{name(lock)}"):
+            self.assertFalse((host / record).exists(), record)
+        self.assertEqual(held.wait(timeout=10), 0)
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
         self.assertFalse(self.registry.exists())
 
     def test_the_callers_descriptor_5_reaches_the_command(self):
@@ -2062,7 +2063,7 @@ class MemoryPressureAdmission(TwoSlots):
     def test_a_build_waits_while_tasks_stall_on_memory(self):
         self.report("10.00")
         self.hold(1)
-        waiter = subprocess.Popen(
+        waiter = self.scope.popen(
             [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
             cwd=self.root, stderr=subprocess.PIPE, text=True)
         self.addCleanup(waiter.stderr.close)
@@ -2083,7 +2084,7 @@ class MemoryPressureAdmission(TwoSlots):
         self.hold(1)
         self.assertEqual(self.build(1, timeout=10).returncode, 0)
         for value in ("010", "101", "high"):
-            result = subprocess.run(
+            result = self.scope.run(
                 [str(self.gate), "exec", "true"],
                 env=self.env | {"CAGENTS_BUILD_MEMORY_PRESSURE": value},
                 cwd=self.root, capture_output=True, text=True, timeout=10)
