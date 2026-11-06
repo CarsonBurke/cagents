@@ -1560,7 +1560,15 @@ class RemoteRun(unittest.TestCase):
                 time.sleep(0.05)
             sleeper = int(marker.read_text())
             agent.stdin.close()
-            self.assertEqual(agent.wait(timeout=15), 130)
+            # This runner adopts the sleeper; reaping it as it dies, as init
+            # would, lets the agent see the command's group end.
+            deadline = time.monotonic() + 15
+            while agent.poll() is None:
+                self.assertLess(time.monotonic(), deadline, "the agent outlived its connection")
+                with contextlib.suppress(ChildProcessError):
+                    os.waitpid(sleeper, os.WNOHANG)
+                time.sleep(0.05)
+            self.assertEqual(agent.returncode, 130)
             deadline = time.monotonic() + 5
             while Path(f"/proc/{sleeper}").exists() and Path(
                     f"/proc/{sleeper}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z":
