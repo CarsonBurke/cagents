@@ -52,15 +52,19 @@ const SETTLE_MARGIN: Duration = Duration::from_secs(1);
 /// How many times the helper is asked to settle an unconfirmed input before
 /// the proxy stops asking. Retries back off to `TIMEOUT`, so this spans up to
 /// about a minute: long enough for a busy journal to clear, and bounded for a
-/// helper that can never answer, such as one that already retired the input.
+/// helper that keeps refusing, such as one that already retired the input.
 const SETTLE_ATTEMPTS: u32 = 12;
 /// How long new input waits on a helper that does not answer requests to
 /// settle an unconfirmed input. Missed answers are not counted toward
 /// `SETTLE_ATTEMPTS`, as the helper may return and settle it, but a helper
 /// that is alive and never answers in time, such as one wedged on its
 /// journal, would otherwise fence input for good. After this, new input is
-/// refused at once while the helper is still asked.
+/// refused at once while the helper is still asked, every `OVERDUE_RETRY`.
 const SETTLE_LIMIT: Duration = Duration::from_secs(120);
+/// How often a helper is asked to settle an input once new input no longer
+/// waits for it. Each request can occupy the helper, and this pump, for up to
+/// `TIMEOUT`, so a slow helper is not kept from serving state meanwhile.
+const OVERDUE_RETRY: Duration = Duration::from_secs(60);
 // These reach the person through the chat pane, attached to a message, a
 // model choice or a stop. They say what happened to it and what to do; the
 // helper's own reasons stay in the logs.
@@ -1775,7 +1779,7 @@ impl RemoteActor {
                 if overdue {
                     tracing::warn!(
                         sequence = identity.sequence,
-                        "the retained actor has not answered requests to settle an unconfirmed input; new input is refused"
+                        "the retained actor has not settled an unconfirmed input in time; new input is refused"
                     );
                     self.0.input_settled.notify_all();
                 }
@@ -1788,6 +1792,7 @@ impl RemoteActor {
             identity: current,
             retransmit: Some(retransmit),
             refusal: recorded,
+            unsettleable,
             ..
         }) = &mut *self
             .0
@@ -1802,7 +1807,12 @@ impl RemoteActor {
                 // Settle on time even while backing off.
                 retransmit.next = retransmit.next.min(settle_at);
             }
-            retransmit.delay = retransmit.delay.saturating_mul(2).min(TIMEOUT);
+            let longest = if *unsettleable {
+                OVERDUE_RETRY
+            } else {
+                TIMEOUT
+            };
+            retransmit.delay = retransmit.delay.saturating_mul(2).min(longest);
             if refusal.is_some() {
                 *recorded = refusal;
             }
@@ -6229,8 +6239,25 @@ exec /bin/sleep 60
         }
         // A wedged helper takes the request and never answers it.
         let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let accept = |listener: &UnixListener| {
+            let deadline = Instant::now() + TIMEOUT;
+            loop {
+                match listener.accept() {
+                    Ok((stream, _)) => {
+                        stream.set_nonblocking(false).unwrap();
+                        return stream;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(Instant::now() < deadline, "the proxy never asked");
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            }
+        };
         let wedged = |listener: &UnixListener| {
-            let (stream, _) = listener.accept().unwrap();
+            let stream = accept(listener);
             let request: Invocation = receive(&stream, TIMEOUT).unwrap();
             assert_eq!(request.method, "abandon_input");
             // Hold the connection until the proxy gives up on the answer.
@@ -6266,6 +6293,17 @@ exec /bin/sleep 60
             helper.join().unwrap();
         });
         assert_eq!(state(&actor), (true, 0, true, true), "refused, still asked");
+        let delay = |actor: &RemoteActor| {
+            let uncertain = actor.0.uncertain_input.lock().unwrap();
+            uncertain
+                .as_ref()
+                .unwrap()
+                .retransmit
+                .as_ref()
+                .unwrap()
+                .delay
+        };
+        assert!(delay(&actor) > TIMEOUT, "asked less often once overdue");
         let started = Instant::now();
         assert_eq!(
             actor.enqueue(None, Command::Refresh).unwrap_err(),
@@ -6283,7 +6321,7 @@ exec /bin/sleep 60
         };
         thread::scope(|scope| {
             let helper = scope.spawn(|| {
-                let (stream, _) = listener.accept().unwrap();
+                let stream = accept(&listener);
                 let request: Invocation = receive(&stream, TIMEOUT).unwrap();
                 assert_eq!(request.method, "abandon_input");
                 send(

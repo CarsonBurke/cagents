@@ -24314,7 +24314,8 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|note| note.text.contains("does not offer gpt-b")),
+                .any(|note| note.text
+                    == "This conversation does not offer gpt-b, so this message will use its default model."),
             "{:?}",
             runtime.failures
         );
@@ -24356,6 +24357,30 @@ mod tests {
                 remembered
             );
         }
+        // Any other refusal gives the model up, and its reason goes to the
+        // log rather than the transcript.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let listed = vec![fixture_model("gpt-a", &[]), fixture_model("gpt-b", &[])];
+        let card = queued_on(&mut app, "gpt-b", listed);
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+        settle(
+            &mut app,
+            card,
+            Err("model gpt-b requires another plan".into()),
+        );
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        let notes = &chat_runtime(&app, card).failures;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.text == "gpt-b couldn't be chosen, so this message won't use it."),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.text.contains("another plan")),
+            "{notes:?}"
+        );
+        assert!(!app.chat_ui.last_models.contains_key(&Provider::Codex));
     }
 
     /// A conversation that has not listed its models yet is given time to,
