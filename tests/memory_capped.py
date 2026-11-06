@@ -25,6 +25,21 @@ def real_scopes_work():
     return found.returncode == 0 and found.stdout.strip() == "67108864"
 
 
+class UnderAMovedHome(unittest.TestCase):
+    """A mise shim for python3 re-executes itself forever under a fixture's HOME,
+    and the app and sessions start here from one, so this can't go through PATH."""
+
+    def test_it_starts_without_consulting_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            shim = Path(directory) / "python3"
+            shim.write_text('#!/bin/sh\nexec "$0" "$@"\n')
+            shim.chmod(0o755)
+            result = subprocess.run([TOOL, "--help"], capture_output=True, text=True, timeout=20,
+                                    env=os.environ | {"PATH": f"{directory}:{os.defpath}"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("usage:", result.stdout)
+
+
 class WithoutAScope(unittest.TestCase):
     """A host with no user manager, through a stand-in systemd-run that fails."""
 

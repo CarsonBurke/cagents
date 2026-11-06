@@ -1,4 +1,4 @@
-#!/usr/bin/env -S python3 -I
+#!/usr/bin/python3 -I
 """Runs a command in a systemd scope with a memory limit, so a runaway dies
 early instead of filling the host's memory and swap. Without a working scope
 the command runs anyway, uncapped, with a note."""
