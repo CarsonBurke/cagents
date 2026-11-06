@@ -203,6 +203,10 @@ use crate::{
 /// daemons are update sources this release inspects and replaces, not peers.
 /// Version 129 is this release's matched set with the same extension.
 pub const PROTOCOL_VERSION: u16 = 129;
+/// The install candidate line's protocol. Its wire is this release's except
+/// for the version and the appended requests that 129 also appends, so an
+/// update may speak it as a source with this release's client.
+pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
