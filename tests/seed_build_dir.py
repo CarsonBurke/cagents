@@ -375,8 +375,8 @@ class CopiedFingerprints(unittest.TestCase):
         result = subprocess.run([SEED, "--forget-local", ""], cwd=worktree,
                                 env={**self.env, "PATH": f"{tools}:{os.environ['PATH']}"},
                                 capture_output=True, text=True, timeout=30)
-        self.assertEqual(result.returncode, 2)
         self.assertFalse(searched.exists())
+        self.assertEqual(result.returncode, 2)
 
     def test_a_lock_file_awk_could_not_finish_is_not_believed(self):
         worktree = self.worktree("worktree")
@@ -630,7 +630,12 @@ printf '%s\\n' '{{"workspace_root":"{self.checkout}",{metadata}}}'
     def test_cargo_failing_to_describe_the_workspace_leaves_seeding_undone(self):
         tools = self.root / "tools"
         tools.mkdir()
-        (tools / "cargo").write_text("#!/bin/sh\nexit 37\n")
+        # What it printed before failing is not believed.
+        (tools / "cargo").write_text(
+            f"""#!/bin/sh
+printf '%s\\n' '{{"workspace_root":"{self.checkout}","target_directory":"{self.destination}"}}'
+exit 37
+""")
         (tools / "cargo").chmod(0o755)
         result = self.seed_to_cargos_choice(tools)
         self.assertEqual(result.returncode, 0, result.stderr)

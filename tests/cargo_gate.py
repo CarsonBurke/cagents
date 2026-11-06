@@ -1072,6 +1072,9 @@ if phase == "metadata":
     metadata = (dict(target_directory=config["target_directory"]) if "target_directory" in config else
                 dict(build_directory=config.get("build_directory", str(root / "owned-build"))))
     print(json.dumps(metadata, separators=(",", ":")))
+    sys.stdout.flush()
+    if config.get("metadata_exit_after_output"):
+        raise SystemExit(config["metadata_exit_after_output"])
 elif phase == "compiler":
     data = sys.stdin.buffer.read()
     if "FIXTURE_OUTPUT_FD" in os.environ:
@@ -1278,8 +1281,21 @@ class PreflightCancellation(unittest.TestCase):
         self.assertEqual([event["phase"] for event in calls], ["metadata", "guard"])
         self.assertEqual(calls[1]["arguments"], [target])
 
+    def test_a_named_cargo_is_the_one_asked_for_the_directory(self):
+        (self.root / "named").mkdir()
+        named = self.root / "named/cargo"
+        (self.root / "bin/cargo").rename(named)
+        target = str(self.root / "owned-target")
+        self.configure(guard_exit=2, target_directory=target)
+        process = self.start(environment=self.env | {"CAGENTS_BUILD_CARGO": str(named)})
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 2, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard"])
+        self.assertEqual(calls[1]["arguments"], [target])
+
     def test_failed_or_empty_metadata_still_skips_helpers_and_builds(self):
-        for config in ({"metadata_exit": 37}, {"build_directory": ""}):
+        for config in ({"metadata_exit": 37}, {"metadata_exit_after_output": 37}, {"build_directory": ""}):
             with self.subTest(config=config):
                 self.clear()
                 self.configure(guard_exit=2, **config)
