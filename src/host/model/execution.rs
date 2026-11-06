@@ -18,6 +18,36 @@ pub(in crate::host) enum ResidentRelease {
     CompletedWriter,
 }
 
+/// A chat's capability from an earlier kernel boot: every holder of its token is
+/// gone. It stays recorded and proves nothing beyond belonging to this pane.
+pub(in crate::host) fn earlier_boot_self_authority(
+    stored: &HostedSession,
+    reader: &HostedSession,
+) -> bool {
+    let (HostedSession::Chat(stored), HostedSession::Chat(reader)) = (stored, reader) else {
+        return false;
+    };
+    stored.id == reader.id
+        && stored.launch.provider == reader.launch.provider
+        && stored.launch.recipe == reader.launch.recipe
+        && stored
+            .proof
+            .as_ref()
+            .zip(reader.proof.as_ref())
+            .is_some_and(|(stored, reader)| {
+                stored.is_complete() && reader.is_complete() && stored.boot_id != reader.boot_id
+            })
+}
+
+/// `reader` is the saved reader of this agent's own provider, lost with an
+/// earlier boot. The conversation must be the agent's own: a capability may lag
+/// a later-learned identity, but `learn_lost_agent_conversations` has settled
+/// the agent's record by the time any client can ask.
+fn lost_provider_reader(expected: &HostedSession, reader: &HostedSession) -> bool {
+    matches!((expected, reader), (HostedSession::Chat(expected), HostedSession::Chat(reader))
+        if crate::chat::is_lost_holder_history(expected, reader))
+}
+
 /// A self capability is not a managed agent binding. A history reader cannot
 /// prove teardown of a former writer, so only a completed writer may retire it.
 fn resident_release_authority(
@@ -74,6 +104,10 @@ fn resident_release_authority(
         .map_err(|error| error.to_string())?;
     if let Some((_, stored)) = &authority {
         if matches!(kind, ResidentRelease::ReadOnlyHistory) {
+            // Nothing to prove torn down, and nothing for this release to revoke.
+            if earlier_boot_self_authority(&decode::<HostedSession>(stored)?, source) {
+                return Ok(None);
+            }
             return Err("A retained provider or managed agent authority remains; a history reader cannot prove its teardown".into());
         }
         // Provider-confirmed thread metadata can advance after startup; the
@@ -247,6 +281,197 @@ impl Registry {
         Ok(blockers)
     }
 
+    /// An agent's record keeps the descriptor its spawn bound, so it never names
+    /// the conversation Claude reported afterwards; the agent's shared pane does.
+    /// Once a changed boot has ended that exact process, nothing can move the
+    /// conversation again, so the record takes it from the pane and every later
+    /// proof (reader, Resume, Close) has one answer. A pane of another process,
+    /// or an agent of this boot, teaches nothing.
+    pub(in crate::host) fn learn_lost_agent_conversations(
+        &mut self,
+        live: &crate::model::HostSessionProof,
+    ) -> Result<(), String> {
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let records = tx
+            .prepare("SELECT record FROM agents WHERE closed=0 AND session_id IS NOT NULL")
+            .map_err(|error| error.to_string())?
+            .query_map([], |row| row.get::<_, String>(0))
+            .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+            .map_err(|error| error.to_string())?;
+        let mut learned = false;
+        for record in records {
+            let mut agent: Agent = decode(&record)?;
+            let automated = matches!(agent.origin, Origin::Automation { .. });
+            let Some(HostedSession::Chat(bound)) = &mut agent.session else {
+                continue;
+            };
+            if automated || bound.launch.session_id.is_some() {
+                continue;
+            }
+            let Some(crate::model::CardKind::Chat(pane)) =
+                super::views::agent_pane(&tx, agent.id)?.map(|pane| pane.kind)
+            else {
+                continue;
+            };
+            if !crate::agent_execution::same_chat_process(bound, &pane) {
+                continue;
+            }
+            let mut named = bound.clone();
+            named.launch.session_id = pane.launch.session_id;
+            if named.lost_holder_history(live).is_none() {
+                continue;
+            }
+            *bound = named;
+            tx.execute(
+                "UPDATE agents SET record=?2 WHERE id=?1",
+                params![agent.id.to_string(), encode(&agent)?],
+            )
+            .map_err(|error| error.to_string())?;
+            learned = true;
+        }
+        if learned {
+            tx.execute(
+                "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
+                [],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
+    }
+
+    /// Whether every durable claim on `reader`'s allocation is its own record
+    /// from an earlier kernel boot, so opening a page reader contradicts none
+    /// of them. An unconfirmed launch and a scheduled agent stay refused: those
+    /// are not a conversation a person chose to read.
+    pub(in crate::host) fn lost_holder_reader_admitted(
+        &self,
+        reader: &HostedSession,
+    ) -> Result<bool, String> {
+        if self.has_agent_launch_for_session(reader.id())?
+            || self
+                .agent_for_session(reader.id())?
+                .is_some_and(|agent| matches!(agent.origin, Origin::Automation { .. }))
+        {
+            return Ok(false);
+        }
+        if let Some(agent) = self.agent_for_session(reader.id())?
+            && !matches!((&agent.session, reader),
+                (Some(HostedSession::Chat(bound)), HostedSession::Chat(reader))
+                    if bound.launch.session_id.is_some()
+                        && bound.launch.session_id == reader.launch.session_id)
+        {
+            return Ok(false);
+        }
+        Ok(self
+            .retained_agent_sources(reader.id())?
+            .iter()
+            .all(|source| earlier_boot_self_authority(source, reader)))
+    }
+
+    pub(in crate::host) fn has_agent_launch_for_session(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE session_id = ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
+    /// Whether a Start of `session` under this allocation could only take over
+    /// another conversation's agent. An agent lost with an earlier boot resumes
+    /// through its exact reader; a same-boot agent keeps its existing fences.
+    pub(in crate::host) fn start_contradicts_lost_agent(
+        &self,
+        session: &HostedSession,
+    ) -> Result<bool, String> {
+        Ok(self
+            .agent_for_session(session.id())?
+            .and_then(|agent| agent.session)
+            .is_some_and(|bound| {
+                earlier_boot_self_authority(&bound, session)
+                    && !lost_provider_reader(&bound, session)
+            }))
+    }
+
+    /// What a person reading a saved transcript lost with an earlier boot should
+    /// know about the work around it, when there is any: an agent's unfinished
+    /// run, or agents it started. Reads only.
+    pub(in crate::host) fn lost_holder_summary(
+        &self,
+        reader: &HostedSession,
+    ) -> Result<Option<String>, String> {
+        let id = reader.id();
+        let agent = self.agent_for_session(id)?;
+        let run = match &agent {
+            Some(agent) => Some(self.latest_agent_run(agent.id)?),
+            None => {
+                let lost = self
+                    .retained_agent_authority_source(id)?
+                    .is_some_and(|stored| earlier_boot_self_authority(&stored, reader));
+                if !lost {
+                    return Ok(None);
+                }
+                None
+            }
+        };
+        let lineage: String = self
+            .db
+            .query_row(
+                "SELECT coalesce((SELECT lineage FROM session_lineages WHERE session_id=?1), ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let parent = Lineage(
+            lineage
+                .parse()
+                .map_err(|_| "Stored session lineage is invalid")?,
+        );
+        let children: i64 = self
+            .db
+            .query_row(
+                "SELECT count(*) FROM agents WHERE origin=?1 AND closed=0",
+                [encode(&Origin::Child { parent })?],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if agent.is_none() && children == 0 {
+            return Ok(None);
+        }
+        let mut summary = format!(
+            "{} It's read-only until you resume it.",
+            crate::chat::LOST_PROVIDER_REASON
+        );
+        if run.is_some_and(|run| run.state == State::Interrupted) {
+            summary.push_str(
+                " Its last prompt has no confirmed outcome and may have had effects; it was not resent.",
+            );
+        }
+        match children {
+            0 => {}
+            1 => summary.push_str(
+                " It started 1 agent that is still open, which stays open whether this is resumed or closed.",
+            ),
+            count => summary.push_str(&format!(
+                " It started {count} agents that are still open, which stay open whether this is resumed or closed."
+            )),
+        }
+        summary.push_str(
+            " Resuming doesn't resend its prompt, and delivers any messages waiting for it.",
+        );
+        if agent.is_some() {
+            summary.push_str(" Closing this pane ends the agent.");
+        }
+        Ok(Some(summary))
+    }
+
     /// Caller has authenticated every retained descriptor with the actual
     /// holder. A same-ID recipe is not sufficient evidence for this operation.
     /// Authority and public/private ownership advance in one transaction; a
@@ -285,10 +510,20 @@ impl Registry {
                 return Err("A retired agent cannot regain process authority".into());
             }
             if let Some(source) = &agent.session {
-                if !recognizes(source) {
+                // An authenticated holder under this allocation, in place of
+                // one from a boot that cannot still be running, is its resume,
+                // whether or not the daemon lived to record that.
+                let lost = earlier_boot_self_authority(source, successor)
+                    && matches!((source, successor),
+                        (HostedSession::Chat(source), HostedSession::Chat(next))
+                            if source.launch.session_id.is_some()
+                                && source.launch.session_id == next.launch.session_id);
+                if !recognizes(source) && !lost {
                     return Err("The durable agent belongs to another session lineage".into());
                 }
-                if let Some(console) = &agent.console {
+                // A resumed provider has no console yet. The record of the
+                // earlier one stays for its pane, which relaunches it on request.
+                if let Some(console) = agent.console.as_ref().filter(|_| !lost) {
                     let HostedSession::Chat(next) = successor else {
                         return Err("A provider console needs its retained native actor".into());
                     };
@@ -1505,7 +1740,8 @@ impl Registry {
             .optional()
             .map_err(|e| e.to_string())?;
         if let Some(authority) = authority
-            && source.same_process(&decode::<HostedSession>(&authority)?)
+            && (source.same_process(&decode::<HostedSession>(&authority)?)
+                || earlier_boot_self_authority(&decode::<HostedSession>(&authority)?, source))
         {
             tx.execute(
                 "DELETE FROM agent_authorities WHERE session_id = ?1",
@@ -1530,7 +1766,9 @@ impl Registry {
                 .session
                 .as_ref()
                 .or(pending.as_ref())
-                .is_some_and(|expected| expected.same_process(source))
+                .is_some_and(|expected| {
+                    expected.same_process(source) || lost_provider_reader(expected, source)
+                })
             {
                 // A launch that never bound has no conversation to resume, so
                 // even a daemon stop retires it as before.
@@ -1883,7 +2121,9 @@ impl Registry {
                 .session
                 .as_ref()
                 .or(pending.as_ref())
-                .is_some_and(|expected| expected.same_process(source))
+                .is_some_and(|expected| {
+                    expected.same_process(source) || lost_provider_reader(expected, source)
+                })
             {
                 super::views::preflight_retire_agent(&tx, &agent)?;
             }
@@ -2786,6 +3026,112 @@ mod tests {
                     case == 0 || case == 6,
                     "pending_only={pending_only} case={case}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn a_lost_agent_learns_its_conversation_only_from_its_own_panes_exact_process() {
+        use crate::{
+            model::{CardId, CardKind},
+            workspace_model::views::{Pane, Scope},
+        };
+        let live = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("host"),
+            boot_id: crate::model::BootId::new("after-reboot"),
+            host_incarnation: crate::model::HostIncarnation::new("new"),
+        };
+        // 0 learns. 1 same boot, 2 another process's pane, 3 a pane that never
+        // heard an ID, 4 no pane, 5 a scheduled agent, 6 a record that already
+        // has its conversation.
+        for case in 0..7 {
+            let (mut registry, directory, request) = fixture();
+            let origin = if case == 5 {
+                Origin::Automation {
+                    id: uuid::Uuid::new_v4(),
+                }
+            } else {
+                Origin::User
+            };
+            let accepted = registry.submit_agent(&origin, &request, 1).unwrap();
+            let HostedSession::Chat(mut pane) = source() else {
+                unreachable!()
+            };
+            pane.native_continuity =
+                crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            if case == 1 {
+                pane.proof.as_mut().unwrap().boot_id = live.boot_id.clone();
+            }
+            let conversation = pane.launch.session_id.clone();
+            let mut spawned = pane.clone();
+            if case != 6 {
+                spawned.launch.session_id = None;
+            }
+            registry
+                .bind_agent(
+                    accepted.agent.id,
+                    None,
+                    HostedSession::Chat(spawned.clone()),
+                )
+                .unwrap();
+            let repository = directory.path().to_owned();
+            if case == 2 {
+                pane.launch.recipe.program = "/another/claude".into();
+            }
+            if case == 3 {
+                pane.launch.session_id = None;
+            }
+            if case == 6 {
+                pane.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+            }
+            if case != 4 {
+                registry
+                    .apply(&ModelEdit::SeedView {
+                        scope: Scope::Worktree {
+                            repository: repository.clone(),
+                            path: repository,
+                        },
+                        panes: vec![Pane {
+                            id: CardId::from_uuid(accepted.agent.id.as_uuid()),
+                            title: "agent".into(),
+                            user_title: None,
+                            pending_terminal_start: false,
+                            width_fraction: 0.5,
+                            scope: None,
+                            kind: CardKind::Chat(pane),
+                        }],
+                        closed: vec![],
+                    })
+                    .unwrap();
+            }
+            let sequence = |registry: &Registry| -> u64 {
+                registry
+                    .db
+                    .query_row("SELECT sequence FROM metadata WHERE key=0", [], |row| {
+                        row.get(0)
+                    })
+                    .unwrap()
+            };
+            let before = sequence(&registry);
+            registry.learn_lost_agent_conversations(&live).unwrap();
+            let bound = registry.agent(accepted.agent.id).unwrap().session.unwrap();
+            let HostedSession::Chat(bound) = bound else {
+                unreachable!()
+            };
+            if case == 0 {
+                assert_eq!(bound.launch.session_id, conversation);
+                assert_eq!(sequence(&registry), before + 1);
+                // Settled once: asking again changes nothing.
+                registry.learn_lost_agent_conversations(&live).unwrap();
+                assert_eq!(sequence(&registry), before + 1);
+                let reader = bound.lost_holder_history(&live).unwrap();
+                assert!(lost_provider_reader(
+                    &HostedSession::Chat(bound),
+                    &HostedSession::Chat(reader)
+                ));
+            } else {
+                assert_eq!(bound, spawned, "case {case}");
+                assert_eq!(sequence(&registry), before, "case {case}");
             }
         }
     }

@@ -187,6 +187,7 @@ enum UpgradeRecoveryKind {
     Exact,
     FirstIdentity,
     BoundRetainedReset,
+    LostHolderHistory,
 }
 
 impl UpgradeRecovery {
@@ -197,6 +198,9 @@ impl UpgradeRecovery {
     }
 
     fn candidate(source: &Session, replacement: &Session) -> Option<UpgradeRecoveryKind> {
+        if super::is_lost_holder_history(source, replacement) {
+            return Some(UpgradeRecoveryKind::LostHolderHistory);
+        }
         if super::is_upgrade_recovery(source, replacement) {
             return Some(UpgradeRecoveryKind::Exact);
         }
@@ -263,6 +267,10 @@ impl UpgradeRecovery {
                 | (
                     UpgradeRecoveryKind::BoundRetainedReset,
                     Some(UpgradeRecoveryKind::BoundRetainedReset)
+                )
+                | (
+                    UpgradeRecoveryKind::LostHolderHistory,
+                    Some(UpgradeRecoveryKind::LostHolderHistory)
                 )
         )
     }
@@ -1275,10 +1283,15 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
-    if matches!(
-        session.native_continuity,
-        super::NativeContinuity::RetainedClaudeActor { .. }
-    ) && session.launch.provider == crate::agent::Provider::Claude
+    // A conversation lost with an earlier boot resumes only when the person asks,
+    // so a refusal of its reader stands rather than starting a provider in its place.
+    let reader_refused = refusal.is_some() && session.lost_holder_history(proof).is_some();
+    if !reader_refused
+        && matches!(
+            session.native_continuity,
+            super::NativeContinuity::RetainedClaudeActor { .. }
+        )
+        && session.launch.provider == crate::agent::Provider::Claude
     {
         return resume_retained_claude(
             stream,
@@ -1289,6 +1302,11 @@ fn restore(
             resumed_from,
             refusal,
         );
+    }
+    if refusal.is_some()
+        && let Some(explanation) = session.lost_holder_explanation(proof)
+    {
+        return Err(StartFailure::fresh(explanation));
     }
     if session.native_continuity.retains_provider() {
         return Err(StartFailure::from(format!(
@@ -1366,6 +1384,9 @@ fn resume_retained_claude(
         Ok(ServerResponse::ChatResumePrepared { session: prepared }) => prepared,
         Ok(_) => return Err("The daemon did not answer the saved conversation's resume".into()),
         Err(reason) => {
+            if let Some(explanation) = session.lost_holder_explanation(proof) {
+                return Err(StartFailure::fresh(explanation));
+            }
             return Err(StartFailure::retry(format!(
                 "The saved conversation could not be reopened yet, so nothing was restarted or resent. {reason}"
             )));
@@ -4435,6 +4456,62 @@ mod tests {
             matches!(outcome, Ok(ClientRequest::ChatStart { .. })),
             "a mismatched lineage falls back to resuming, never to attaching"
         );
+    }
+
+    /// A provider lost with an earlier boot gets a plain account of what is
+    /// gone, only where no exact way back exists, and never starts anything.
+    #[test]
+    fn a_provider_lost_with_an_earlier_boot_is_explained_without_starting_one() {
+        let live = host_proof("live");
+        let mut earlier = live.clone();
+        earlier.boot_id = crate::model::BootId::new("earlier");
+        let refused = || {
+            ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
+                crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+                "No authenticated holder",
+                false,
+            ))
+        };
+        let card = |provider, thread: Option<&str>, proof: &HostSessionProof| {
+            let mut card = omp_card(thread, Some(proof.clone()));
+            card.launch.provider = provider;
+            card.native_continuity = if provider == crate::agent::Provider::Codex {
+                super::super::NativeContinuity::Durable {
+                    provider_version: "test".into(),
+                }
+            } else {
+                super::super::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            };
+            card
+        };
+        use crate::agent::Provider::{Claude, Codex};
+        let (outcome, _) = negotiate(&live, card(Codex, Some(CONVERSATION), &earlier), refused());
+        let failure = outcome.expect_err("nothing starts");
+        assert_eq!(failure.recovery, crate::chat::Recovery::Fresh);
+        assert!(failure.message.contains("Codex conversation's server"));
+        assert!(failure.message.contains("Nothing was restarted"));
+        // An unnamed Claude pane asks the daemon first, since a retirement may
+        // name its conversation. When none does, it says why nothing can resume.
+        let mut unnamed = stranded_claude(None);
+        unnamed.proof.as_mut().unwrap().boot_id = crate::model::BootId::new("earlier");
+        let (outcome, resumed, _) = resume_stranded(unnamed, move |_| refused());
+        let failure = outcome.expect_err("nothing starts");
+        assert_eq!(failure.recovery, crate::chat::Recovery::Fresh);
+        assert!(failure.message.contains("before Claude reported"));
+        assert!(resumed.is_none());
+        // Within one boot a missing holder proves nothing.
+        let (outcome, _) = negotiate(
+            &live,
+            card(Codex, Some(CONVERSATION), &host_proof("old")),
+            refused(),
+        );
+        let failure = outcome.expect_err("nothing starts");
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+        assert!(failure.message.contains("could not be reattached"));
+        // A named Claude conversation has its reader; a refusal of that stays exact.
+        let (outcome, _) = negotiate(&live, card(Claude, Some(CONVERSATION), &earlier), refused());
+        let failure = outcome.expect_err("nothing starts");
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
     }
 
     /// A conversation that cannot be resumed and cannot be named is the one

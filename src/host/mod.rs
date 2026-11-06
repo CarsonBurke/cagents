@@ -308,6 +308,19 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             // A committed acceptance is not proof of provider delivery. Until a
             // restored actor supplies exact run evidence, never authorize a resend.
             if let Ok(registry) = agent_execution::registry(&host) {
+                let live = host
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .proof()
+                    .clone();
+                // A failure leaves those agents refused, not the daemon down.
+                if let Err(error) = registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .learn_lost_agent_conversations(&live)
+                {
+                    tracing::warn!(%error, "could not settle agents lost with an earlier boot");
+                }
                 registry
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())

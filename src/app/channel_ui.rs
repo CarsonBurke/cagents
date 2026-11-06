@@ -51,10 +51,11 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
             let Some(live) = chats.iter().find(|live| live.id == session.id) else {
                 if may_have_retained_owner(session)
                     || (open_agents == OpenAgents::Retire
-                        && bound_to_open_agent(
-                            session,
-                            read_open_agents(&mut agents, &mut client)?,
-                        ))
+                        && (missing_actor_needs_daemon(session)
+                            || bound_to_open_agent(
+                                session,
+                                read_open_agents(&mut agents, &mut client)?,
+                            )))
                 {
                     client
                         .close_retained_chat(session.clone())
@@ -182,6 +183,15 @@ fn bound_to_open_agent(
                 Some(crate::agent_execution::HostedSession::Chat(bound)) if bound.id == session.id
             )
     })
+}
+
+/// A retained Claude conversation with no actor may still name an agent, lost
+/// with an earlier boot, that only the daemon can end. Nothing to close otherwise.
+fn missing_actor_needs_daemon(session: &crate::chat::Session) -> bool {
+    matches!(
+        session.native_continuity,
+        crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+    ) || session.is_saved_claude_history()
 }
 
 fn no_daemon_close_result(sessions: &[CardKind]) -> Result<(), String> {
@@ -2917,5 +2927,25 @@ mod close_tests {
             bound.closed = true;
             assert!(!bound_to_open_agent(&session, &[bound]));
         }
+    }
+}
+
+#[cfg(test)]
+mod lost_agent_close_tests {
+    use super::*;
+
+    #[test]
+    fn a_pane_with_no_actor_still_asks_the_daemon_when_it_may_name_an_agent() {
+        let mut session = crate::chat::fresh_session(
+            crate::agent::Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/fixture".into(),
+            &crate::account::Account::system(crate::agent::Provider::Claude),
+        )
+        .unwrap();
+        assert!(!missing_actor_needs_daemon(&session), "a draft has nothing");
+        session.native_continuity =
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        assert!(missing_actor_needs_daemon(&session));
     }
 }
