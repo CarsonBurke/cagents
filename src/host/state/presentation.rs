@@ -235,7 +235,7 @@ pub(in crate::host) fn snapshot(
     after: u64,
 ) -> Result<Option<TerminalSnapshot>, ProtocolError> {
     for _ in 0..4 {
-        let (handle, offset, rows, epoch) = {
+        let (handle, offset, rows, epoch, visible) = {
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             let handle = state.history_handle(client, id)?;
             let revision = state.presentation_revision(client, id);
@@ -246,14 +246,25 @@ pub(in crate::host) fn snapshot(
             (
                 handle.clone(),
                 view.offset,
-                view.size
-                    .map_or(handle.snapshot().rows.max(1), |size| size.rows),
+                view.size.map(|size| size.rows),
                 view.epoch,
+                state
+                    .subscriptions
+                    .by_client
+                    .get(&client)
+                    .and_then(|terminals| terminals.get(&id))
+                    == Some(&TerminalVisibility::Visible),
             )
         };
-        let capture = handle.viewport_snapshot(offset, rows).map_err(|message| {
-            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
-        })?;
+        // Visibility is enqueued on the worker. A visible pull must follow that
+        // command rather than return the last grid published while hidden.
+        // Hidden attachment replay stays nonblocking; absent an explicit size,
+        // the worker resolves the rows after the queued reveal and resize.
+        let capture = handle
+            .viewport_snapshot(offset, rows, visible)
+            .map_err(|message| {
+                ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+            })?;
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if !state.subscriptions.attached(client, id) {
             return Err(ProtocolError::new(

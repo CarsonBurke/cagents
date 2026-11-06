@@ -123,7 +123,7 @@ enum Command {
     Mouse(MouseInput),
     ReadViewport {
         offset: Option<u64>,
-        rows: u16,
+        rows: Option<u16>,
         reply: Sender<Result<Arc<RenderSnapshot>, String>>,
     },
     Focus(bool),
@@ -767,7 +767,7 @@ impl PublishedState {
                     } => {
                         let _ = reply.send(Ok(history.snapshot_at(
                             offset,
-                            rows,
+                            rows.unwrap_or_else(|| self.snapshot.load().rows),
                             self.published_generation.load(Ordering::Acquire),
                         )));
                         return Ok(());
@@ -1240,17 +1240,24 @@ impl TerminalHandle {
     pub(crate) fn viewport_snapshot(
         &self,
         offset: Option<u64>,
-        rows: u16,
+        rows: Option<u16>,
+        visible: bool,
     ) -> Result<Arc<RenderSnapshot>, String> {
         let published = self.snapshot();
-        if published.detached || published.rows == 0 {
-            return Ok(published);
-        }
-        if offset.is_none()
-            && rows == published.rows
-            && published.scroll.offset == published.scroll.max_offset()
-        {
-            return Ok(published);
+        // Hidden attachment replay must not activate a parked terminal. A
+        // completed worker likewise serves its retained grid without a query.
+        // A visible live read must follow the queued reveal/resize instead of
+        // returning the last grid from before the terminal was hidden.
+        if !visible || self.is_completed() {
+            if published.detached || published.rows == 0 {
+                return Ok(published);
+            }
+            if offset.is_none()
+                && rows.is_none_or(|rows| rows == published.rows)
+                && published.scroll.offset == published.scroll.max_offset()
+            {
+                return Ok(published);
+            }
         }
         let (reply, receive) = crossbeam_channel::bounded(1);
         self.try_command(Command::ReadViewport {
@@ -2591,7 +2598,7 @@ struct Worker {
     capture_dirty: bool,
     viewport_reads: Vec<(
         Option<u64>,
-        u16,
+        Option<u16>,
         Sender<Result<Arc<RenderSnapshot>, String>>,
         Option<Arc<admission::Permit>>,
     )>,
@@ -4298,8 +4305,18 @@ impl Worker {
         }
         let base = self.published.snapshot.load_full();
         for (offset, rows, reply, _permit) in std::mem::take(&mut self.viewport_reads) {
-            let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
-                .map_err(|error| error.to_string());
+            let rows = rows.unwrap_or(self.applied_parser_size.rows);
+            let result = if !base.detached
+                && base.rows != 0
+                && offset.is_none()
+                && rows == base.rows
+                && base.scroll.offset == base.scroll.max_offset()
+            {
+                Ok(Arc::clone(&base))
+            } else {
+                super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
+                    .map_err(|error| error.to_string())
+            };
             let _ = reply.send(result);
         }
     }
@@ -7854,6 +7871,231 @@ mod tests {
         worker.published.acknowledge(worker.generation);
     }
 
+    // The test owns the worker loop, so queued commands cannot run until it
+    // explicitly dispatches them. The handle still takes the real query path.
+    fn controlled_viewport_handle(worker: &mut Worker) -> TerminalHandle {
+        let (commands, pending) = command_channel(8);
+        worker.commands = pending;
+        TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: crossbeam_channel::never(),
+                published: Arc::clone(&worker.published),
+                worker: joins::JoinOwner::empty(Arc::clone(&worker.published)),
+            }),
+        }
+    }
+
+    fn next_viewport_command(worker: &Worker) -> Command {
+        worker
+            .commands
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the first visible read must queue behind reveal")
+    }
+
+    fn assert_viewport_text(snapshot: &RenderSnapshot, expected: &str) {
+        let text = snapshot.lines.first().map_or_else(String::new, |row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .trim_end()
+                .to_owned()
+        });
+        assert_eq!(text, expected, "the first visible read returned stale text");
+    }
+
+    fn next_viewport_query(
+        worker: &Worker,
+        result: &Receiver<Result<Arc<RenderSnapshot>, String>>,
+    ) -> Result<Command, Result<Arc<RenderSnapshot>, String>> {
+        crossbeam_channel::select! {
+            recv(worker.commands) -> command => Ok(command.unwrap()),
+            recv(result) -> snapshot => Err(snapshot.unwrap()),
+            default(Duration::from_secs(5)) => panic!("the first viewport read made no progress"),
+        }
+    }
+
+    #[test]
+    fn first_visible_default_viewport_follows_queued_reveal() {
+        for hibernated in [false, true] {
+            let (mut worker, _) = capture_worker();
+            worker.process_output(b"old frame".to_vec());
+            worker.publish_snapshot(true);
+            assert_eq!(published_row(&worker, 0), "old frame");
+            if hibernated {
+                worker.hibernate_visuals();
+            } else {
+                worker.set_hidden();
+            }
+            worker.process_output(b"\r\x1b[2Knew frame".to_vec());
+            let cached = worker.published.snapshot.load_full();
+            assert!(cached.detached || published_row(&worker, 0) == "old frame");
+            let handle = controlled_viewport_handle(&mut worker);
+            assert!(Arc::ptr_eq(
+                &handle.viewport_snapshot(None, None, false).unwrap(),
+                &cached,
+            ));
+            assert!(worker.commands.is_empty(), "hidden replay must stay cached");
+
+            handle
+                .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+                .unwrap();
+            let reader = handle.clone();
+            let (finished, result) = crossbeam_channel::bounded(1);
+            let read = thread::spawn(move || {
+                finished
+                    .send(reader.viewport_snapshot(None, None, true))
+                    .unwrap();
+            });
+            let reveal = next_viewport_command(&worker);
+            let query = next_viewport_query(&worker, &result);
+            // The worker has not handled reveal, so the cached grid is still old.
+            assert!(Arc::ptr_eq(&worker.published.snapshot.load_full(), &cached));
+            let snapshot = match query {
+                Ok(query) => {
+                    worker.handle_command(reveal);
+                    worker.handle_command(query);
+                    result.recv_timeout(Duration::from_secs(5)).unwrap()
+                }
+                Err(snapshot) => {
+                    drop(reveal);
+                    snapshot
+                }
+            };
+            read.join().unwrap();
+            let rows = worker.applied_parser_size.rows;
+            drop(handle);
+            worker.run();
+            let snapshot = snapshot.unwrap();
+            assert_viewport_text(&snapshot, "new frame");
+            assert!(!snapshot.detached);
+            assert_eq!(snapshot.rows, rows);
+        }
+    }
+
+    #[test]
+    fn first_visible_empty_viewport_resolves_default_rows_after_queued_resize() {
+        let (mut worker, _) = capture_worker();
+        worker.set_hidden();
+        worker.process_output(b"hidden first frame".to_vec());
+        assert_eq!(worker.published.snapshot.load().rows, 0);
+        let handle = controlled_viewport_handle(&mut worker);
+        handle
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+            .unwrap();
+        handle
+            .resize(TerminalSize {
+                columns: 40,
+                rows: 7,
+                ..worker.current_size
+            })
+            .unwrap();
+        let reader = handle.clone();
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let read = thread::spawn(move || {
+            finished
+                .send(reader.viewport_snapshot(None, None, true))
+                .unwrap();
+        });
+        let queued = (0..2)
+            .map(|_| next_viewport_command(&worker))
+            .collect::<Vec<_>>();
+        let query = next_viewport_query(&worker, &result);
+        assert_eq!(worker.published.snapshot.load().rows, 0);
+        let snapshot = match query {
+            Ok(query) => {
+                for command in queued {
+                    worker.handle_command(command);
+                }
+                worker.handle_command(query);
+                result.recv_timeout(Duration::from_secs(5)).unwrap()
+            }
+            Err(snapshot) => {
+                drop(queued);
+                snapshot
+            }
+        };
+        read.join().unwrap();
+        drop(handle);
+        worker.run();
+        let snapshot = snapshot.unwrap();
+        assert_viewport_text(&snapshot, "hidden first frame");
+        assert_eq!((snapshot.columns, snapshot.rows), (40, 7));
+        assert_eq!(snapshot.lines.len(), 7);
+    }
+
+    #[test]
+    fn first_visible_default_viewport_waits_for_synchronized_frame() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"old frame".to_vec());
+        worker.set_hidden();
+        worker.process_output(b"\x1b[?2026h\x1b[H\x1b[2Jpartial".to_vec());
+        let handle = controlled_viewport_handle(&mut worker);
+        handle
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+            .unwrap();
+        let reader = handle.clone();
+        let (finished, result) = crossbeam_channel::bounded(1);
+        let read = thread::spawn(move || {
+            finished
+                .send(reader.viewport_snapshot(None, None, true))
+                .unwrap();
+        });
+        let reveal = next_viewport_command(&worker);
+        let query = next_viewport_query(&worker, &result);
+        let (snapshot, held) = match query {
+            Ok(query) => {
+                worker.handle_command(reveal);
+                worker.handle_command(query);
+                let pending = worker.viewport_reads.len() == 1;
+                let early = result.try_recv().ok();
+                let held = pending && early.is_none();
+                worker.process_output(b" frame\x1b[?2026l".to_vec());
+                (
+                    early.unwrap_or_else(|| result.recv_timeout(Duration::from_secs(5)).unwrap()),
+                    held,
+                )
+            }
+            Err(snapshot) => {
+                drop(reveal);
+                (snapshot, false)
+            }
+        };
+        read.join().unwrap();
+        drop(handle);
+        worker.run();
+        assert_viewport_text(&snapshot.unwrap(), "partial frame");
+        assert!(held, "partial frame must remain held");
+    }
+
+    #[test]
+    fn completed_default_and_custom_viewports_use_retained_history() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"first\r\nsecond\r\nthird".to_vec());
+        let cached = worker.published.snapshot.load_full();
+        let history =
+            archive::History::capture(&mut worker.terminal, &cached, holder::MAX_SCREEN).unwrap();
+        *worker.published.archive.lock().unwrap() = ArchivePhase::Frozen {
+            history: Ok(history),
+            events: worker.events.clone(),
+        };
+        worker.published.completed.store(true, Ordering::Release);
+        let handle = controlled_viewport_handle(&mut worker);
+        assert!(Arc::ptr_eq(
+            &handle.viewport_snapshot(None, None, true).unwrap(),
+            &cached,
+        ));
+        let custom = handle.viewport_snapshot(Some(0), Some(2), true).unwrap();
+        assert_eq!(custom.rows, 2);
+        assert_eq!(custom.lines[0].cells[0].text, "f");
+        let default = handle.viewport_snapshot(Some(0), None, true).unwrap();
+        assert_eq!(default.rows, cached.rows);
+        assert!(worker.commands.is_empty(), "completed reads must not queue");
+        drop(handle);
+        worker.run();
+    }
+
     #[test]
     fn synchronized_update_publishes_only_its_finished_frame() {
         let (mut worker, _) = capture_worker();
@@ -7893,7 +8135,7 @@ mod tests {
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
             offset: Some(0),
-            rows: 10,
+            rows: Some(10),
             reply,
         });
         let capture = receive
@@ -7920,7 +8162,7 @@ mod tests {
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
             offset: Some(0),
-            rows: 10,
+            rows: Some(10),
             reply,
         });
         assert!(receive.try_recv().is_err());
