@@ -497,7 +497,9 @@ daemon is still starting and offers **Retry**. An exclusive holder without the
 declaration is treated as an update: the reviewed update coordinator, an
 installer's inherited guard, a daemon admitted under one of those, and builds
 that predate the declaration. An update that takes the fence while a window
-is waiting therefore still opens the update progress window.
+is waiting therefore still opens the update progress window. A standalone
+editor does not wait: while a daemon is starting it opens without its folders
+and says they cannot be opened safely yet.
 
 An incompatible window, or an older window without this capability, refuses
 startup before socket or daemon state changes. Close that window through the

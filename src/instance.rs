@@ -656,8 +656,16 @@ fn editor_ready_path(runtime: &Path, pid: u32) -> PathBuf {
     runtime.join(format!("{product}.worktrees-ready.{pid}"))
 }
 
+/// The launch fence for a standalone editor, which takes it on its UI thread
+/// while it opens. It never waits: a daemon still starting fails this at once
+/// with [`DaemonStillStarting`], and the editor says it cannot open its
+/// folders yet rather than freezing until the daemon is ready.
+pub(crate) fn editor_launch_fence() -> io::Result<OwnedLock> {
+    daemon_admission::shared_launch_fence(&runtime_directory()?, Duration::ZERO, &mut |_| {})
+}
+
 pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
-    let _launch = recovery_launch_fence()?;
+    let _launch = editor_launch_fence()?;
     if EDITOR_PROTECTION_READY.get().is_none() {
         let lock = owned_lock(
             &editor_ready_path(&runtime_directory()?, process::id()),
