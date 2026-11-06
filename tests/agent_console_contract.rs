@@ -155,16 +155,16 @@ impl Fixture {
     /// Runs an `agent spawn` that names an idempotency key, repeating it with
     /// that key while the daemon's acceptance goes unanswered, as the CLI's
     /// error instructs. Acceptance commits durably before the daemon answers,
-    /// and on a loaded disk that commit alone can outlast the CLI's 5 s reply
-    /// budget, which this capacity contract does not test. The key keeps a
-    /// repeat from starting the work twice. Says whether it repeated.
+    /// and a stalled disk can hold that commit past even the CLI's 30 s
+    /// acceptance budget, which this capacity contract does not test. The key
+    /// keeps a repeat from starting the work twice. Says whether it repeated.
     fn answered_spawn(&self, arguments: &[&str]) -> (Output, bool) {
         let hang_guard = Instant::now() + Duration::from_secs(120);
         let mut repeated = false;
         loop {
-            // Five seconds per submit, its built-in retry and the 10 s wait
-            // can together use output()'s whole 20 s, so allow more here.
-            let output = self.output_until(arguments, Instant::now() + Duration::from_secs(60));
+            // Thirty seconds per submit, its built-in retry and the 10 s wait
+            // can together outlast output()'s whole 20 s, so allow more here.
+            let output = self.output_until(arguments, Instant::now() + Duration::from_secs(80));
             let unanswered = !output.status.success()
                 && serde_json::from_slice::<Value>(&output.stderr).is_ok_and(|error| {
                     error["error"]["details"]["idempotency_key"].is_string()

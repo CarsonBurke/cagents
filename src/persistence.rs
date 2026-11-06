@@ -11401,7 +11401,7 @@ mod tests {
         }
         let seen = Arc::new(AtomicUsize::new(0));
         let subscriber = tracing_subscriber::registry().with(Count(seen.clone()));
-        tracing::subscriber::with_default(subscriber, body);
+        crate::test_tracing::with_thread_subscriber(subscriber, body);
         seen.load(Ordering::Relaxed)
     }
 
