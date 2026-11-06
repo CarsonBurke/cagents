@@ -1878,15 +1878,16 @@ impl Claude {
         Ok(())
     }
     /// The one call, in any transcript, a task's `tool_use_id` names, unless
-    /// that call is an Agent, whose task is its subagent rather than work the
-    /// call itself started.
+    /// that call starts or resumes a subagent. An Agent's task is its
+    /// subagent, and a resumed agent's task names the `SendMessage` that
+    /// resumed it: both report on the agent, not on work the call started.
     fn task_call(&self, tool: &str) -> Option<ScopedId> {
         let mut calls = self.tools.keys().filter(|key| key.id == tool);
         let call = calls.next()?;
         (calls.next().is_none()
             && !matches!(
                 &self.tools[call].content,
-                ItemContent::Tool { name, .. } if name == "Agent"
+                ItemContent::Tool { name, .. } if name == "Agent" || name == "SendMessage"
             ))
         .then(|| call.clone())
     }
@@ -1911,10 +1912,12 @@ impl Claude {
         match self.task_outcomes.iter().find(|(call, _)| call == tool) {
             Some((_, outcome)) => outcome.settle(content),
             // A history that never recorded the outcome cannot be waited on:
-            // the process that ran the command is gone.
+            // the Claude Code process that ran the command ended, and its
+            // background commands with it. How the command went is unknown,
+            // so it is not shown as having succeeded.
             None if history => {
-                *status = ToolStatus::Succeeded;
-                output.push_str("Started in the background. No result was recorded.");
+                *status = ToolStatus::Stopped;
+                output.push_str(UNRECORDED_BACKGROUND_RESULT);
             }
             None => {}
         }
@@ -4049,7 +4052,11 @@ fn notification_elements(content: &str) -> Vec<&str> {
     elements
 }
 
-/// The trimmed text of the `name` child of a task notification's `inner` text.
+/// What a restored background command says when its session ended before
+/// its notification was recorded.
+const UNRECORDED_BACKGROUND_RESULT: &str =
+    "Ran in the background until the session ended. Its result was not recorded.";
+
 /// The calls a notification reports background work they started ended
 /// for, each with how it ended. Only a notification that names its call and
 /// says how it ended settles one: a Monitor's event names neither.
@@ -4066,6 +4073,7 @@ fn notified_calls(content: &str) -> Vec<(String, TaskOutcome)> {
         .collect()
 }
 
+/// The trimmed text of the `name` child of a task notification's `inner` text.
 fn notification_field(inner: &str, name: &str) -> Option<String> {
     let open = format!("<{name}>");
     let close = format!("</{name}>");
@@ -12113,6 +12121,60 @@ mod tests {
         }
     }
 
+    /// A resumed agent's notification names the `SendMessage` call that
+    /// resumed it. How the agent ended is the agent's, not the message's: the
+    /// delivered message stays as it settled.
+    #[test]
+    fn a_resumed_agents_notification_leaves_the_message_that_resumed_it() {
+        let mut adapter = Claude::default();
+        adapter
+            .receive(scoped_call(
+                None,
+                "launch",
+                "agent",
+                "Agent",
+                json!({"description":"Review"}),
+            ))
+            .unwrap();
+        adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"a1","tool_use_id":"agent","task_type":"local_agent"})).unwrap();
+        adapter
+            .receive(scoped_result(None, "agent-result", "agent", false))
+            .unwrap();
+        adapter
+            .receive(scoped_call(
+                None,
+                "resume-call",
+                "resume",
+                "SendMessage",
+                json!({"to":"a1","message":"Check the docs too."}),
+            ))
+            .unwrap();
+        adapter
+            .receive(scoped_result(None, "resume-result", "resume", false))
+            .unwrap();
+        for notification in [
+            json!({"type":"user","uuid":"queued","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<task-id>a1</task-id>\n<tool-use-id>resume</tool-use-id>\n<status>killed</status>\n<summary>Agent \"Review\" was stopped</summary>\n</task-notification>"}}),
+            json!({"type":"system","subtype":"task_notification","uuid":"n","task_id":"a1","tool_use_id":"resume","status":"stopped","summary":"Agent \"Review\" was stopped"}),
+        ] {
+            let step = adapter.receive(notification).unwrap();
+            assert!(
+                !step.events.iter().any(|event| matches!(
+                    event,
+                    Event::Item(item) if item.id == "resume"
+                )),
+                "{step:?}"
+            );
+            let message = adapter.tools.get(&ScopedId::new(None, "resume")).unwrap();
+            assert!(matches!(
+                message.content,
+                ItemContent::Tool {
+                    status: ToolStatus::Succeeded,
+                    ..
+                }
+            ));
+        }
+    }
+
     /// A command Claude Code backgrounded only because it outlived its
     /// timeout is acknowledged the same way, and settles the same way.
     #[test]
@@ -12169,8 +12231,8 @@ mod tests {
         ));
         assert!(matches!(
             shown_command(&replayed, "bash-unrecorded"),
-            Some((None, ItemContent::Command { status: ToolStatus::Succeeded, output, .. }))
-                if output == "Started in the background. No result was recorded."
+            Some((None, ItemContent::Command { status: ToolStatus::Stopped, output, .. }))
+                if output == UNRECORDED_BACKGROUND_RESULT
         ));
     }
 
