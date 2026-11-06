@@ -402,11 +402,15 @@ locks and owned fixture processes only: `python3 tests/cargo_gate.py -v`.
 
 `scripts/lock-holders [LOCK...]` shows who holds each lock under
 `/var/tmp/cagents-*.lock*`, whether they or their descendants are using CPU, and who
-is waiting. It warns when no holder is a build or a session, which usually means a
-leftover process inherited the lock, and it notes a lock whose holders used no CPU
-during its one-second sample. A leftover that looks like a build, or a script that
-doesn't, can still fool the warning, so read the holders it lists. It only reads
-`/proc`, so ending a process stays your decision.
+is waiting. It notes a lock whose holders aren't a recognized build or session, and
+one whose holders used no CPU during its one-second sample. Neither makes a holder a
+leftover: a script can hold a lock and sleep between its own steps, and only its
+owner can say. Nor does a recognized name clear one: a leftover that looks like a
+build gets at most the idle note, so read the holders it lists. Process age isn't
+hold time: a process can start long before it takes a lock, or after the lock was
+taken if it inherited it. The kernel doesn't record when a lock was taken, but a
+holder that took the lock itself is marked, and took it at most its age ago. The tool
+only reads `/proc`, so ending a process stays your decision.
 
 The feature lanes coexist in one build directory: a no-op check of one lane
 stays a no-op after building the others. With a per-checkout build directory,
