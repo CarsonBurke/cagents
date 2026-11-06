@@ -3313,16 +3313,20 @@ impl Runtime {
                 detail.push_str(label);
                 cost_shown = true;
             }
+            // The ring is a glyph; a screen reader hears what its tooltip
+            // says, which in the tightest pane is also the only figure.
+            let ring = crate::ui_controls::labelled(
+                crate::ui_controls::budget_radial(used),
+                detail.clone(),
+            );
             spend.push(crate::interaction::tooltip_above(
-                widget::row::with_children(
-                    std::iter::once(crate::ui_controls::budget_radial(used)).chain(
-                        (fit != FooterFit::Tight).then(|| {
-                            design::caption(format!("{:.0}%", used * 100.0))
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .into()
-                        }),
-                    ),
-                )
+                widget::row::with_children(std::iter::once(ring).chain(
+                    (fit != FooterFit::Tight).then(|| {
+                        design::caption(format!("{:.0}%", used * 100.0))
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into()
+                    }),
+                ))
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center),
                 detail,
@@ -3382,12 +3386,17 @@ impl Runtime {
             // One line: the trailing controls keep their width and the
             // leading group gives up what is left, cutting its permission
             // label before either group is pushed out of the pane.
+            // The filling container holds the trailing group at the far
+            // edge, as in a wide pane, while the shrinkable inside it keeps
+            // the leading group at its natural width.
             widget::row::with_children(vec![
-                crate::ui_controls::shrinkable(
+                widget::container(crate::ui_controls::shrinkable(
                     widget::row::with_children(leading)
                         .spacing(step::GAP_S)
                         .align_y(Alignment::Center),
-                ),
+                ))
+                .width(Length::Fill)
+                .into(),
                 trailing,
             ])
             .spacing(step::GAP_S)
@@ -4014,16 +4023,18 @@ impl Runtime {
         if transitioning || !self.choosing() {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
+            let avatar = crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE);
+            // Without its caption the avatar alone says nothing to a screen
+            // reader, so it carries the account's name.
+            let avatar = if named {
+                avatar
+            } else {
+                crate::ui_controls::labelled(avatar, format!("Account: {}", accounts.current))
+            };
             return crate::interaction::tooltip_above(
-                widget::row::with_children(
-                    std::iter::once(crate::ui_controls::passive_icon(
-                        icon,
-                        design::COMPACT_ICON_SIZE,
-                    ))
-                    .chain(named.then(label)),
-                )
-                .spacing(step::GAP_XS)
-                .align_y(Alignment::Center),
+                widget::row::with_children(std::iter::once(avatar).chain(named.then(label)))
+                    .spacing(step::GAP_XS)
+                    .align_y(Alignment::Center),
                 format!(
                     "This conversation runs on {}. {}",
                     accounts.current,
@@ -11146,6 +11157,10 @@ mod tests {
         footer: iced::Rectangle,
         controls: HashMap<String, iced::Rectangle>,
         footer_text: Vec<String>,
+        /// What assistive technology is told inside the footer.
+        footer_names: Vec<String>,
+        /// The far edge of whatever the footer draws, text or named glyph.
+        footer_drawn_right: f32,
     }
 
     fn lay_out(
@@ -11230,15 +11245,43 @@ mod tests {
             .as_widget_mut()
             .operate(&mut tree, Layout::new(&node), &renderer, &mut probe);
         let footer = probe.footer.expect("footer mounted");
+        let accessible = element.as_widget().a11y_nodes(
+            Layout::new(&node),
+            &tree,
+            iced::mouse::Cursor::Unavailable,
+        );
+        let named: Vec<(iced::Rectangle, String)> = accessible
+            .root()
+            .iter()
+            .chain(accessible.children())
+            .filter_map(|node| {
+                let node = node.node();
+                let bounds = node.bounds()?;
+                Some((
+                    iced::Rectangle::new(
+                        iced::Point::new(bounds.x0 as f32, bounds.y0 as f32),
+                        iced::Size::new(bounds.width() as f32, bounds.height() as f32),
+                    ),
+                    node.label()?.to_owned(),
+                ))
+            })
+            .filter(|(bounds, _)| footer.contains(bounds.center()))
+            .collect();
+        let text: Vec<(iced::Rectangle, String)> = probe
+            .text
+            .into_iter()
+            .filter(|(bounds, _)| footer.contains(bounds.center()))
+            .collect();
         Laid {
             footer,
             controls: probe.controls,
-            footer_text: probe
-                .text
-                .into_iter()
-                .filter(|(bounds, _)| footer.contains(bounds.center()))
-                .map(|(_, text)| text)
-                .collect(),
+            footer_drawn_right: text
+                .iter()
+                .chain(&named)
+                .map(|(bounds, _)| bounds.x + bounds.width)
+                .fold(f32::MIN, f32::max),
+            footer_text: text.into_iter().map(|(_, text)| text).collect(),
+            footer_names: named.into_iter().map(|(_, name)| name).collect(),
         }
     }
 
@@ -11394,6 +11437,30 @@ mod tests {
             assert_eq!(text.contains("Claude Sonnet 4.5"), roomy, "{text}");
             assert_eq!(text.contains("42%"), roomy, "{text}");
             assert_eq!(text.contains("$1.23"), roomy, "{text}");
+            // The trailing group holds the footer's far edge at every width,
+            // so model and spend never jump sides as the pane narrows.
+            let inner_right = footer.x + footer.width - (step::GAP_M + COMPOSER_PADDING);
+            assert!(
+                (inner_right - laid.footer_drawn_right).abs() <= 1.0,
+                "trailing group ends at the footer's edge at {width}: drawn to {} in {footer:?}",
+                laid.footer_drawn_right
+            );
+            // What a narrow pane hides from sight stays in what a screen
+            // reader is told.
+            let names = laid.footer_names.join(" | ");
+            assert_eq!(
+                names.contains("Account: Synthetic account with a long name"),
+                fit != FooterFit::Wide,
+                "{names}"
+            );
+            let ring = laid
+                .footer_names
+                .iter()
+                .find(|name| name.starts_with("42% of context"))
+                .unwrap_or_else(|| panic!("the ring is named at {width}: {names}"));
+            // Where the cost is no longer drawn, the ring says it.
+            assert_eq!(ring.contains("$1.23"), !roomy, "{ring}");
+            assert!(names.contains("$1.23"), "{names}");
             // The conversation's state closes the transcript, never the footer.
             for status in ["Finished", "Ready", "Working", "Responding"] {
                 assert!(
