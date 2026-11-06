@@ -21,6 +21,8 @@ import time
 import unittest
 
 
+# Tests run on shared hosts: other builds there must not decide whether a fixture starts.
+os.environ |= {"CAGENTS_BUILD_CLAIMS": "", "CAGENTS_BUILD_MEMORY_PRESSURE": "0"}
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -1323,7 +1325,8 @@ class TwoSlots(unittest.TestCase):
             if not key.startswith("CAGENTS_BUILD_") and key != "CARGO_BUILD_JOBS"
         } | {"CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_SLOTS": "2",
               "CAGENTS_BUILD_CPU_PRESSURE": "0", "CAGENTS_BUILD_REMOTE": "local",
-              "CAGENTS_BUILD_INSTALLED_GATE": ""}
+              "CAGENTS_BUILD_INSTALLED_GATE": "", "CAGENTS_BUILD_CLAIMS": "",
+              "CAGENTS_BUILD_MEMORY_PRESSURE": "0"}
 
     def hold(self, cost):
         holder = subprocess.Popen(
@@ -1347,6 +1350,97 @@ class TwoSlots(unittest.TestCase):
             env=self.env | {"CAGENTS_BUILD_COST_GIB": str(cost)}, cwd=self.root,
             capture_output=True, text=True, timeout=timeout,
         )
+
+
+class HostClaims(TwoSlots):
+    """Builds admitted through another lock or path, seen only through the claims."""
+
+    def setUp(self):
+        super().setUp()
+        self.claims = self.root / "claims"
+        self.claims.mkdir()
+        self.env["CAGENTS_BUILD_CLAIMS"] = str(self.claims)
+        self.env["CAGENTS_BUILD_SLOTS"] = "1"
+
+    def claim(self, name, pid, gib, since=0):
+        (self.claims / name).write_text(f"{pid} {gib * 1024 * 1024}\n{since}\n")
+
+    def sleeper(self):
+        process = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        return process
+
+    def test_a_build_on_another_lock_is_priced_even_with_one_slot_here(self):
+        process = self.sleeper()
+        self.claim("offload-cagents-slot-0", process.pid, 10**6)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=2)
+        process.kill()
+        process.wait()
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_build_alone_on_the_host_always_starts(self):
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_a_claim_from_a_dead_process_or_before_a_reboot_or_unreadable_is_dropped(self):
+        finished = subprocess.run(["sh", "-c", "echo $$"], capture_output=True, text=True).stdout.strip()
+        process = self.sleeper()
+        self.claim("gone", finished, 10**6)
+        self.claim("rebooted", process.pid, 10**6, since=10**12)
+        (self.claims / "garbled").write_text("not a claim\n")
+        result = self.build(10**6, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(sorted(path.name for path in self.claims.iterdir()), [".admission"])
+
+    def test_an_admitted_build_claims_until_it_ends(self):
+        self.hold(1)
+        names = [path.name for path in self.claims.iterdir() if path.name != ".admission"]
+        self.assertEqual(len(names), 1)
+        self.assertRegex(names[0], r"^local-\d+$")
+        holder, cost = (self.claims / names[0]).read_text().split("\n")[0].split()
+        self.assertEqual(int(cost), 1024 * 1024)
+        self.assertTrue(Path(f"/proc/{holder}").is_dir())
+        (self.root / "release").touch()
+        self.holder.wait(timeout=10)
+        self.assertFalse((self.claims / names[0]).exists())
+
+    def test_two_locks_see_each_others_builds(self):
+        self.hold(10**6)
+        other = self.env | {"CAGENTS_BUILD_LOCK": str(self.root / "other.lock")}
+        with self.assertRaises(subprocess.TimeoutExpired):
+            subprocess.run([str(self.gate), "exec", "true"], env=other | {"CAGENTS_BUILD_COST_GIB": "1"},
+                           cwd=self.root, capture_output=True, timeout=2)
+
+    def test_an_empty_setting_leaves_the_build_out(self):
+        process = self.sleeper()
+        self.claim("elsewhere", process.pid, 10**6)
+        self.env["CAGENTS_BUILD_CLAIMS"] = ""
+        result = self.build(1, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.claims / "elsewhere").exists())
+
+    def test_memory_pressure_keeps_a_build_from_starting_beside_another(self):
+        report = self.root / "memory-pressure"
+        report.write_text("some avg10=10.00 avg60=0.00 avg300=0.00 total=0\n")
+        self.env |= {"CAGENTS_BUILD_MEMORY_PRESSURE": "10", "CAGENTS_BUILD_MEMORY_PRESSURE_FILE": str(report)}
+        process = self.sleeper()
+        self.claim("elsewhere", process.pid, 0)
+        waiter = subprocess.Popen(
+            [str(self.gate), "exec", "true"], env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=2)
+        report.write_text("some avg10=9.99 avg60=0.00 avg300=0.00 total=0\n")
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        self.assertIn("memory under pressure (10%, limit 10%)", waiter.stderr.read())
+
+    def build_with(self, env):
+        return subprocess.run([str(self.gate), "exec", "true"], env=env, cwd=self.root,
+                              capture_output=True, text=True, timeout=10)
 
 
 class MemoryAdmission(TwoSlots):

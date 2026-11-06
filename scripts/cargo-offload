@@ -622,6 +622,84 @@ def resident(roots):
     return held
 
 
+def host_claims_directory():
+    if "CAGENTS_BUILD_CLAIMS" in os.environ:
+        return os.environ["CAGENTS_BUILD_CLAIMS"]
+    return f"/var/tmp/cagents-build-claims.{os.getuid()}"
+
+
+def host_admission():
+    """Decides one build at a time across this host's gates, as scripts/cargo-gate
+    does, until the returned file closes. None when there is nowhere to record."""
+    directory = host_claims_directory()
+    if not directory:
+        return None
+    try:
+        os.makedirs(directory, exist_ok=True)
+        lock = open(os.path.join(directory, ".admission"), "a")
+    except OSError:
+        return None
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def host_claim_name(slot):
+    return f"offload-{os.path.basename(os.path.dirname(slot))}-{os.path.basename(slot)}"
+
+
+def write_host_claim(slot, pid, cost):
+    """Records a slot's build for gates on this host admitting through any lock,
+    in their format: its PID and cost in KiB, then its start in seconds since boot."""
+    directory = host_claims_directory()
+    if not directory:
+        return
+    try:
+        with open("/proc/uptime") as file:
+            since = int(float(file.read().split()[0]))
+        name = os.path.join(directory, host_claim_name(slot))
+        with open(name + ".new", "w") as file:
+            file.write(f"{pid} {cost // 1024}\n{since}\n")
+        os.replace(name + ".new", name)
+    except (OSError, ValueError, IndexError):
+        pass
+
+
+def host_claims(base):
+    """What builds claimed through other paths on this host need and the process
+    each runs as. Slots under `base` are read by `room` itself."""
+    directory = host_claims_directory()
+    if not directory:
+        return []
+    own = f"offload-{os.path.basename(base)}-"
+    found = []
+    try:
+        names = os.listdir(directory)
+        with open("/proc/uptime") as file:
+            uptime = int(float(file.read().split()[0]))
+    except (OSError, ValueError, IndexError):
+        return []
+    for name in names:
+        if name.startswith((".", own)) or name.endswith(".new"):
+            continue
+        path = os.path.join(directory, name)
+        try:
+            with open(path) as file:
+                pid, cost = file.readline().split()
+                since = int(file.readline())
+            pid, cost = int(pid), int(cost) * 1024
+            # Gone, or dated after now and so from before a reboot.
+            if not os.path.isdir(f"/proc/{pid}") or since > uptime:
+                raise ValueError
+        except (ValueError, OSError):
+            try:
+                os.unlink(path)
+            except OSError:
+                pass
+            continue
+        found.append((cost, pid))
+    return found
+
+
 def read_claim(slot):
     try:
         with open(os.path.join(slot, "claim")) as file:
@@ -667,16 +745,17 @@ def leased(slot):
 
 def room(base, mine, cost):
     """None when a build expected to need `cost` bytes fits beside the builds
-    in the other leased slots, as scripts/cargo-gate admits builds on its
-    host: the memory available now, less what those builds are expected to
-    take beyond what they already hold, covers it, and neither the memory nor
-    the CPUs are under pressure. A lone build always fits. Otherwise why it
-    waits."""
+    in the other leased slots and those claimed elsewhere on this host, as
+    scripts/cargo-gate admits builds: the memory available now, less what those
+    builds are expected to take beyond what they already hold, covers it, and
+    neither the memory nor the CPUs are under pressure. A lone build always
+    fits. Otherwise why it waits."""
     others = []
     for index in slot_indices(base):
         slot = os.path.join(base, f"slot-{index}")
         if slot != mine and leased(slot):
             others.append(claim(slot))
+    others.extend(host_claims(base))
     if not others:
         return None
     pressure = memory_pressure()
@@ -827,9 +906,15 @@ if command == "lease":
     # expected to need is free beside the builds already running here.
     waiting = None
     while True:
+        admission = host_admission()
         why = room(base, slot, cost)
         if why is None:
+            write_host_claim(slot, os.getpid(), cost)
+            if admission:
+                admission.close()
             break
+        if admission:
+            admission.close()
         if why.split()[0] != waiting:
             say("wait", why)
             announced = True
@@ -967,6 +1052,7 @@ elif command == "run":
         json.dump({"cost": cost, "pid": os.getpid(), "build": claimed.get("build", ""),
                    "key": claimed.get("key", "")}, file)
     os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
+    write_host_claim(base, os.getpid(), cost)
     os.chdir(os.path.join(base, "src", directory))
     environment = dict(os.environ, **environment)
     if "CARGO_BUILD_JOBS" not in environment:

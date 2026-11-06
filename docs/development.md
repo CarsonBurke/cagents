@@ -355,9 +355,15 @@ GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
 script such as the development runner; a slot held by a plain `flock` counts as
 9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
-beyond what they already hold, covers its own. A lone build always starts,
-whatever the memory or pressure, so no build waits forever. Each build gets a
-share of the CPUs among the builds running once it starts, between 4 and 8 (the
+beyond what they already hold, covers its own, and tasks stall on memory (`some
+avg10` in `/proc/pressure/memory`, `CAGENTS_BUILD_MEMORY_PRESSURE`) less than
+10% of the time. The running builds are all of this host's, whichever lock or
+offload slot admitted them: each records itself in
+`/var/tmp/cagents-build-claims.UID` (`CAGENTS_BUILD_CLAIMS`; empty opts out), and
+one decision is made at a time, because pressure and available memory only show a
+build once it has reached its peak, minutes after it starts. A build alone on the
+host always starts, whatever the memory or pressure, so no build waits forever.
+Each build gets a share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
 `test`, `bench` and `run` only the build holds a slot, and the tests or program
@@ -463,8 +469,9 @@ gets the time it arrives: Cargo judges the checkout's crates, including the
 checkout's older time would leave another worktree's build of that file in
 place. A slot last leased by a gate from before this rule rebuilds its sources
 once. A slot is admitted as the gate admits builds here: beside other
-running builds, only when the host's available memory, less what those builds
-are expected to take beyond what they already hold, covers this build's
+running builds, its own and those admitted through any lock on the host, only
+when the host's available memory, less what those builds are expected to take
+beyond what they already hold, covers this build's
 expected peak (at least 2 GiB), while the host's memory pressure (`some
 avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
 (`/proc/pressure/cpu`) is below 40%; a lone build always starts. A plain

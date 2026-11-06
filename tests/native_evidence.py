@@ -15,6 +15,8 @@ import time
 import unittest
 from pathlib import Path
 
+# Tests run on shared hosts: other builds there must not decide whether a fixture starts.
+os.environ |= {"CAGENTS_BUILD_CLAIMS": "", "CAGENTS_BUILD_MEMORY_PRESSURE": "0"}
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts" / "native-evidence"
 AUTHORITY_NAMES = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")

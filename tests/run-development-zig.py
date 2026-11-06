@@ -12,6 +12,8 @@ import time
 import unittest
 
 
+# Tests run on shared hosts: other builds there must not decide whether a fixture starts.
+os.environ |= {"CAGENTS_BUILD_CLAIMS": "", "CAGENTS_BUILD_MEMORY_PRESSURE": "0"}
 SOURCE = Path(__file__).resolve().parents[1] / "scripts/run-development"
 GATE = SOURCE.with_name("cargo-gate")
 

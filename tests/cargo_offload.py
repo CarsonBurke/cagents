@@ -26,6 +26,8 @@ import time
 import unittest
 
 
+# Tests run on shared hosts: other builds there must not decide whether a fixture starts.
+os.environ |= {"CAGENTS_BUILD_CLAIMS": "", "CAGENTS_BUILD_MEMORY_PRESSURE": "0"}
 ROOT = Path(__file__).resolve().parents[1]
 
 
@@ -523,7 +525,7 @@ if [ "$1" = marked ]; then
     shift
     cd "$HOME"
     exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-        CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
+        CAGENTS_BUILD_CLAIMS="" CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
         sh -c "mkdir -p '$HOME/stray/.git'; $*"
 fi
 shift
@@ -537,7 +539,7 @@ ulimit -Sn 256
 # removes.
 exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
-    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+    CAGENTS_BUILD_CLAIMS="" CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
 
 
@@ -1305,7 +1307,8 @@ class RemoteRun(unittest.TestCase):
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
                               "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
-                              "CAGENTS_OFFLOAD_FIGURES": str(figures)})
+                              "CAGENTS_OFFLOAD_FIGURES": str(figures),
+                              "CAGENTS_BUILD_CLAIMS": str(self.claims if hasattr(self, "claims") else "")})
         self.leases.append(lease)
         self.addCleanup(lease.stdout.close)
         self.addCleanup(lease.kill)
@@ -1387,6 +1390,31 @@ class RemoteRun(unittest.TestCase):
                 waits.next(1.5)
             line.close()
             self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_a_build_through_any_gate_on_the_host_is_priced_and_this_one_is_recorded(self):
+        with self.slots() as base:
+            self.claims = Path(base, "claims")
+            self.addCleanup(lambda: delattr(self, "claims"))
+            self.claims.mkdir()
+            elsewhere = subprocess.Popen(["sleep", "60"])
+            self.addCleanup(elsewhere.wait)
+            self.addCleanup(elsewhere.kill)
+            (self.claims / "local-1").write_text(f"{elsewhere.pid} {10**9}\n0\n")
+            # Dated after now, so from before a reboot; the PID is someone else's by now.
+            (self.claims / "local-2").write_text(f"{os.getpid()} {10**9}\n{10**12}\n")
+            stand_in = Path(base, "figures")
+            write_figures(stand_in, available_gib=64)
+            _, lines = self.lease(base, figures=stand_in)
+            self.assertRegex(lines.next(10), r"^wait memory 0\.0 9\.0 1$")
+            elsewhere.kill()
+            elsewhere.wait()
+            slot = json.loads(lines.next(10).removeprefix("slot "))
+            name = f"offload-{os.path.basename(base)}-slot-{slot['index']}"
+            pid, cost = (self.claims / name).read_text().split("\n")[0].split()
+            self.assertEqual(int(cost), 9 * 1024 * 1024)
+            self.assertEqual(int(pid), self.leases[-1].pid)
+            self.assertFalse((self.claims / "local-1").exists())
+            self.assertFalse((self.claims / "local-2").exists())
 
     def test_a_build_beside_another_waits_until_the_host_has_room(self):
         for figures, reason in (({"cpu": 90}, "wait cpu 90 40"),
