@@ -2877,6 +2877,26 @@ pub(in crate::host) mod tests {
         }
     }
 
+    /// A Close reserves the terminal while its pane stays open, and the app names
+    /// every open pane in its presence. A pane with no terminal here reserves
+    /// nothing, so closing one that's proven gone can't be refused this way.
+    #[test]
+    fn notification_presence_is_refused_only_for_a_terminal_mid_close() {
+        let (host, _directory, session, handle) = retention_client_host("presence-close");
+        let id = session.id;
+        let presence = |id| ClientRequest::NotificationPresence {
+            presence: terminal_presence(id),
+        };
+        process_request(&host, 1, presence(TerminalId::new())).unwrap();
+        host.lock()
+            .unwrap()
+            .terminal_retirements
+            .insert(id, super::super::state::Retirement::explicit_close(handle));
+        let error = process_request(&host, 1, presence(id)).unwrap_err();
+        assert_eq!(error.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(error.retryable);
+    }
+
     #[test]
     fn notification_presence_reservation_fences_durable_pins_and_shutdown() {
         let (host, directory, session, handle) = retention_client_host("presence-retention");
