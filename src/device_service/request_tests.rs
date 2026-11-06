@@ -268,6 +268,28 @@ fn scoped_request_keeps_captured_authority_through_selection_and_device_refusal(
 }
 
 #[test]
+fn a_refusal_shown_to_its_reader_is_the_daemons_own_wording() {
+    let (_directory, socket, worker) = server(move |peer| {
+        let auth = authenticate(peer, &Authority::default());
+        accepted(peer, &auth);
+        let operation: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+        reply(peer, &operation, denied());
+    });
+    let error = super::request_described(
+        Operation::Home,
+        Authority::default(),
+        true,
+        false,
+        || Ok(socket),
+        || panic!("no daemon is started"),
+        super::reader_message,
+    )
+    .unwrap_err();
+    assert_eq!(error, "The fixture refused this scope");
+    finished(worker);
+}
+
+#[test]
 fn refused_present_authority_never_dispatches_or_falls_back_to_user() {
     for authority in [
         Authority::session("fixture-invalid-device-capability".into()),

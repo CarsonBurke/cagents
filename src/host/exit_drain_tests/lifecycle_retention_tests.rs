@@ -150,3 +150,76 @@ fn lifecycle_idle_exit_drains_a_late_original_before_releasing_listener_and_leas
     );
     drop(fresh);
 }
+
+/// An attached completed terminal arms no deadline, so the listener parks with
+/// nothing due. The final Detach on a connection that stays open must therefore
+/// wake maintenance itself: no new connection, disconnect or direct call helps.
+#[test]
+fn final_detach_on_an_open_connection_wakes_completed_terminal_retirement() {
+    const NAME: &str = "host::exit_drain_tests::lifecycle_retention_tests::final_detach_on_an_open_connection_wakes_completed_terminal_retirement";
+    let Some(root) = private_runtime(NAME) else {
+        return;
+    };
+    // SAFETY: this exact self-exec runs one test. Configure its private HOST
+    // before starting any HOST/worker thread; inherited authority is untouched.
+    unsafe {
+        std::env::set_var("CAGENTS_EXITED_TERMINAL_RETENTION_SECS", "0");
+    }
+    let paths = RuntimePaths::discover().unwrap();
+    let (host, completed, running) = run_host();
+    let mut rpc = Rpc::connect(&paths.socket);
+    let source = session(&root);
+    assert!(
+        matches!(rpc.request(ClientRequest::Spawn { session: source.clone(), options: TerminalSpawnOptions::default() }).unwrap(), ServerResponse::Spawned { terminal } if terminal.session.id == source.id)
+    );
+    let handle = host.lock().unwrap().terminals[&source.id].handle.clone();
+    let owner = handle.holder_identity().unwrap().clone();
+    let mut root_pin = OriginalPin::new(owner.root.pid as u32);
+    let mut holder_pin = OriginalPin::new(owner.holder.pid as u32);
+    // Actual cat EOF on the PTY, so the worker completes and joins for itself.
+    assert!(matches!(
+        rpc.request(ClientRequest::Input {
+            terminal_id: source.id,
+            bytes: vec![4],
+        })
+        .unwrap(),
+        ServerResponse::Accepted
+    ));
+    wait_for(|| handle.is_completed());
+    // Completion's own wakes have long drained by here, leaving a parked listener.
+    thread::sleep(Duration::from_millis(500));
+    {
+        let state = host.lock().unwrap();
+        assert!(
+            state.terminals.contains_key(&source.id),
+            "attached final output must remain available"
+        );
+        assert!(state.terminal_retirements.is_empty());
+    }
+    drop(handle);
+    assert!(matches!(
+        rpc.request(ClientRequest::Detach {
+            terminal_id: source.id,
+        })
+        .unwrap(),
+        ServerResponse::Detached
+    ));
+    wait_for(|| {
+        let state = host.lock().unwrap();
+        !state.terminals.contains_key(&source.id) && state.terminal_retirements.is_empty()
+    });
+    root_pin.prove_reaped();
+    holder_pin.prove_reaped();
+    assert!(matches!(
+        rpc.request(ClientRequest::Shutdown).unwrap(),
+        ServerResponse::ShutdownAccepted
+    ));
+    assert!(
+        completed
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_ok()
+    );
+    running.join().unwrap();
+    drop(rpc);
+}

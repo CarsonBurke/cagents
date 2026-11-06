@@ -39,6 +39,15 @@ pub(crate) enum InputState {
     Acknowledged(Result<(), String>),
     Unknown(String),
 }
+impl InputState {
+    /// Keep a stored outcome's error within a fixed size.
+    fn bounded(mut self) -> Self {
+        if let Self::Acknowledged(Err(error)) | Self::Unknown(error) = &mut self {
+            error.truncate(error.floor_char_boundary(4096));
+        }
+        self
+    }
+}
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct InputReceipt {
     pub identity: InputIdentity,
@@ -96,7 +105,19 @@ impl Journal {
         let retention = crate::transcript_cache::ActorJournalRetention::create(directory, &created)
             .map_err(|error| error.to_string())?;
         let db = Connection::open(path).map_err(|error| error.to_string())?;
-        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=FULL;
+        // This journal lives exactly as long as its helper process: it is
+        // created exclusively above and never reopened. It must survive a
+        // daemon crash or upgrade, which the live helper and the kernel page
+        // cache already guarantee. An OS crash ends the helper and invalidates
+        // its boot-bound records, so fsync protects no reachable reader. Each
+        // fsync also stalls the helper's single request loop, by seconds on a
+        // host with heavy write load, so RPCs queued behind it can miss their
+        // deadlines (#2180). Commits therefore reach the kernel without fsync.
+        //
+        // Keep the rollback journal: closing a WAL connection checkpoints
+        // into this file after its drained disposition records the file's
+        // size and mtime, so the cache could never reclaim it.
+        db.execute_batch("PRAGMA journal_mode=DELETE; PRAGMA synchronous=OFF;
             CREATE TABLE outcomes(sequence INTEGER PRIMARY KEY AUTOINCREMENT,payload BLOB NOT NULL);
             CREATE TABLE retained_runs(run TEXT PRIMARY KEY,finished INTEGER);
             CREATE TABLE inputs(sequence INTEGER PRIMARY KEY,id TEXT UNIQUE NOT NULL,hash BLOB NOT NULL,state BLOB NOT NULL);
@@ -139,8 +160,8 @@ impl Journal {
         if bytes.len() > 4 * 1024 * 1024 {
             return Err("Retained source lineage capacity reached".into());
         }
-        // synchronous=FULL is established at journal creation. Publish the
-        // in-memory view only after the exact aggregate commits successfully.
+        // Publish the in-memory view only after the exact aggregate commits
+        // successfully.
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO metadata(key,value) VALUES('published_sources',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -448,6 +469,39 @@ impl Journal {
         if self.loss()?.is_some() {
             return Err("Actor outcome continuity is unconfirmed; new input is refused".into());
         }
+        if let Some(run) = run {
+            self.check_run_capacity(run)?;
+        }
+        self.record_input(identity, run, InputState::Accepted)
+    }
+    /// Settle an input this journal never admitted as refused, without
+    /// running it. The refusal is its receipt: a copy of the same frame that
+    /// arrives later returns it rather than being admitted. An input that was
+    /// already admitted keeps, and returns, its existing receipt.
+    pub fn refuse_unadmitted(
+        &mut self,
+        identity: &InputIdentity,
+        reason: String,
+    ) -> Result<InputReceipt, String> {
+        if let Some(receipt) = self.input(identity)? {
+            return Ok(receipt);
+        }
+        self.ensure_writable()?;
+        let receipt = self.record_input(
+            identity,
+            None,
+            InputState::Acknowledged(Err(reason)).bounded(),
+        )?;
+        self.acknowledged_inputs.insert(identity.sequence);
+        Ok(receipt)
+    }
+    /// Durably record the next contiguous input with its first state.
+    fn record_input(
+        &mut self,
+        identity: &InputIdentity,
+        run: Option<crate::model::RunId>,
+        state: InputState,
+    ) -> Result<InputReceipt, String> {
         if identity.sequence
             != self
                 .number("input_sequence")?
@@ -463,10 +517,6 @@ impl Journal {
         if count >= MAX_INPUTS {
             return Err("Actor input receipt capacity reached; commit completed receipts before sending more".into());
         }
-        if let Some(run) = run {
-            self.check_run_capacity(run)?;
-        }
-        let state = InputState::Accepted;
         let tx = self.db.transaction().map_err(|error| error.to_string())?;
         tx.execute(
             "INSERT INTO inputs(sequence,id,hash,state) VALUES(?1,?2,?3,?4)",
@@ -500,25 +550,9 @@ impl Journal {
             state,
         })
     }
-    pub fn finish(
-        &mut self,
-        identity: &InputIdentity,
-        mut state: InputState,
-    ) -> Result<(), String> {
+    pub fn finish(&mut self, identity: &InputIdentity, state: InputState) -> Result<(), String> {
         self.ensure_writable()?;
-        let error = match &mut state {
-            InputState::Acknowledged(Err(error)) | InputState::Unknown(error) => Some(error),
-            _ => None,
-        };
-        if let Some(error) = error
-            && error.len() > 4096
-        {
-            let mut end = 4096;
-            while !error.is_char_boundary(end) {
-                end -= 1;
-            }
-            error.truncate(end);
-        }
+        let state = state.bounded();
         let receipt = self
             .input(identity)?
             .ok_or("Input receipt does not exist")?;
@@ -731,6 +765,38 @@ mod tests {
         bytes
             .map(|bytes| serde_json::from_slice(&bytes).unwrap())
             .unwrap_or_default()
+    }
+
+    #[test]
+    fn journal_commits_without_fsync_in_rollback_mode() {
+        let root = tempfile::tempdir().unwrap();
+        let mut journal = Journal::open(root.path()).unwrap();
+        // 0 is OFF: the helper's request loop never waits for the disk.
+        let synchronous: i64 = journal
+            .db
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(synchronous, 0);
+        let mode: String = journal
+            .db
+            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(mode, "delete");
+        // A committed transaction leaves no sidecar file behind. Reclamation
+        // after a drained disposition is covered by
+        // checked_retirement_fences_mutation_and_allows_delayed_reader_store_drop.
+        let source = super::super::transport::fixture_source();
+        journal.remember_published_source(&source).unwrap();
+        assert_eq!(durable_sources(root.path()), vec![source]);
+        for sidecar in ["-journal", "-wal", "-shm"] {
+            assert!(
+                !root
+                    .path()
+                    .join(format!("actor-journal.sqlite{sidecar}"))
+                    .exists(),
+                "{sidecar}"
+            );
+        }
     }
 
     #[test]
@@ -1293,6 +1359,56 @@ mod tests {
         assert_eq!(
             serde_json::from_slice::<InputState>(&state).unwrap(),
             InputState::Accepted
+        );
+    }
+
+    #[test]
+    fn refusal_settles_only_unadmitted_inputs_and_outlasts_late_copies() {
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut journal = Journal::open(dir.path()).unwrap();
+        let identity = |sequence| InputIdentity {
+            sequence,
+            id: uuid::Uuid::new_v4(),
+            hash: [7; 32],
+        };
+        let refused = InputState::Acknowledged(Err("not sent".into()));
+        let lost = identity(1);
+        assert_eq!(
+            journal
+                .refuse_unadmitted(&lost, "not sent".into())
+                .unwrap()
+                .state,
+            refused
+        );
+        // A late copy of the frame gets the refusal, never an admission.
+        assert_eq!(journal.admit(&lost).unwrap().state, refused);
+        assert_eq!(journal.acknowledged_input_count(), 1);
+        // An admitted input keeps its own receipt.
+        let admitted = identity(2);
+        journal.admit(&admitted).unwrap();
+        assert_eq!(
+            journal
+                .refuse_unadmitted(&admitted, "not sent".into())
+                .unwrap()
+                .state,
+            InputState::Accepted
+        );
+        assert!(
+            journal
+                .refuse_unadmitted(&identity(4), "not sent".into())
+                .is_err(),
+            "the input sequence stays contiguous"
+        );
+        let long = identity(3);
+        let receipt = journal.refuse_unadmitted(&long, "é".repeat(4096)).unwrap();
+        let InputState::Acknowledged(Err(reason)) = receipt.state else {
+            panic!("{:?}", receipt.state);
+        };
+        assert!(reason.len() <= 4096);
+        journal.retire_acknowledged_inputs(&[lost.clone()]).unwrap();
+        assert!(
+            journal.admit(&lost).is_err(),
+            "a retired refusal is never admitted"
         );
     }
 

@@ -102,7 +102,21 @@ pub(super) fn selected_account(spec: &Spec) -> Result<Account, String> {
             .accounts(homes.as_ref())
             .into_iter()
             .find(|account| account.provider == spec.provider && account.id() == *id)
-            .ok_or_else(|| "The selected provider account was removed".into()),
+            .ok_or_else(|| {
+                // A home a lost account list no longer names is not removed:
+                // the daemon restores it if its provider confirms the login.
+                let kept = id
+                    .as_str()
+                    .split_once('/')
+                    .and_then(|(_, key)| uuid::Uuid::parse_str(key).ok())
+                    .zip(homes.as_ref())
+                    .is_some_and(|(key, homes)| homes.is_unregistered(&accounts, spec.provider, key));
+                if kept {
+                    "The selected provider account isn't in the account list, but its files are still on this device. cagents restores it if its provider still reports a sign-in to it, so try again shortly; otherwise choose another account.".into()
+                } else {
+                    "The selected provider account was removed".into()
+                }
+            }),
         None => {
             let preferred = accounts.project_default_account(
                 &spec.target.repository,
@@ -255,6 +269,116 @@ fn launch_options(spec: &crate::agent_execution::Spec) -> Vec<String> {
     arguments
 }
 
+/// The run whose dispatcher released the agent's gate to wait for its
+/// provider to become ready. Its prompt stays undelivered until that
+/// dispatcher reclaims it, so an interrupt in the meantime withdraws the run
+/// instead of interrupting a turn the provider never started.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::host) struct Undelivered {
+    run: RunId,
+    withdrawn: bool,
+}
+
+/// Clears a dispatcher's claim if readiness polling unwinds, so a panic cannot
+/// leave reconciliation waiting on a dispatcher that no longer exists.
+struct ClaimUnwind<'a> {
+    gate: &'a Mutex<Option<Undelivered>>,
+    run: RunId,
+}
+
+impl Drop for ClaimUnwind<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.gate
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .take_if(|claim| claim.run == self.run);
+        }
+    }
+}
+
+/// Cancels the run whose dispatcher is still waiting for the provider, or only
+/// `run` when given. The dispatcher finds its claim withdrawn and submits
+/// nothing. Returns whether such a run existed, including one an earlier
+/// interrupt already withdrew. Requires the agent's gate, whose value
+/// `dispatch` is.
+fn withdraw_undelivered(
+    host: &SharedHost,
+    dispatch: &mut Option<Undelivered>,
+    run: Option<RunId>,
+) -> Result<bool, String> {
+    let Some(claim) = dispatch
+        .as_mut()
+        .filter(|claim| run.is_none_or(|run| claim.run == run))
+    else {
+        return Ok(false);
+    };
+    if !claim.withdrawn {
+        let registry = registry(host)?;
+        claim.withdrawn = true;
+        // A failed write still leaves the claim withdrawn: the dispatcher
+        // then reports this cancellation and finish_failure retries it.
+        if finish_failure_registry(
+            &registry,
+            claim.run,
+            State::Cancelled,
+            UNDELIVERED_CANCELLATION.into(),
+        ) {
+            announce(host, &registry);
+        }
+    }
+    Ok(true)
+}
+
+const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received the prompt";
+
+/// Waits, without the agent's gate, until a bound provider can take its
+/// first prompt.
+fn await_provider_ready(handle: &chat::runtime::Handle) -> Result<(), (State, String)> {
+    await_provider_ready_until(handle, Instant::now() + Duration::from_secs(30))
+}
+
+fn await_provider_ready_until(
+    handle: &chat::runtime::Handle,
+    deadline: Instant,
+) -> Result<(), (State, String)> {
+    let before = |message| (State::Failed, message);
+    loop {
+        // A retained snapshot is a helper RPC, and one call can miss its
+        // deadline on a busy host while the helper stays healthy. Reading a
+        // snapshot sends no prompt, so keep polling within the launch budget.
+        // Stop at once when the attachment itself records a failure or exit.
+        let snapshot = match provider_launch_snapshot(handle) {
+            Ok(snapshot) => snapshot,
+            Err(unconfirmed) => {
+                if handle.failure().is_some() || handle.is_completed() || Instant::now() >= deadline
+                {
+                    return Err(unconfirmed);
+                }
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+        };
+        if snapshot.exited || handle.is_completed() {
+            return Err(before("Provider exited before accepting the prompt".into()));
+        }
+        if snapshot.ready {
+            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
+                return Err(before(
+                    "The hosted provider is not idle; no additional prompt was submitted".into(),
+                ));
+            }
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(before(
+                "Provider did not become ready before the launch deadline".into(),
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// An unavailable remote snapshot proves neither provider exit nor safe retry.
 fn provider_launch_snapshot(
     handle: &chat::runtime::Handle,
@@ -277,7 +401,7 @@ fn dispatch(
     let _control = control.read().unwrap_or_else(|p| p.into_inner());
     super::client::ensure_control_open(host).map_err(|error| before(error.message))?;
     let gate = agent_gate(host, accepted.agent.id);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let registry = registry(host).map_err(before)?;
     let mut context = Arc::new(chat::protocol::ExecutionContext::new(directory));
     context
@@ -336,6 +460,16 @@ fn dispatch(
         .agent_request(accepted.run.id)
         .map_err(before)?;
     let (session, handle) = if let Some(HostedSession::Chat(session)) = &accepted.agent.session {
+        let ended = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_process_ended(accepted.agent.id)
+            .map_err(before)?;
+        if ended {
+            return Err(before(
+                "This agent's process has stopped; reopen its conversation to resume it. The prompt was not sent".into(),
+            ));
+        }
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
@@ -462,32 +596,27 @@ fn dispatch(
         announce(host, &registry);
         (session, handle)
     };
-    // A visible, bound startup may be closed while a provider is initializing.
-    // Reacquire and revalidate before the first external prompt, rather than
-    // making interactive close wait through the whole readiness deadline.
-    drop(_dispatch);
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let snapshot = provider_launch_snapshot(&handle)?;
-        if snapshot.exited || handle.is_completed() {
-            return Err(before("Provider exited before accepting the prompt".into()));
-        }
-        if snapshot.ready {
-            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
-                return Err(before(
-                    "The hosted provider is not idle; no additional prompt was submitted".into(),
-                ));
-            }
-            break;
-        }
-        if Instant::now() >= deadline {
-            return Err(before(
-                "Provider did not become ready before the launch deadline".into(),
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(20));
+    // A visible, bound startup may be closed or interrupted while a provider
+    // is initializing. Reacquire and revalidate before the first external
+    // prompt, rather than making those wait through the readiness deadline.
+    *dispatch = Some(Undelivered {
+        run: accepted.run.id,
+        withdrawn: false,
+    });
+    drop(dispatch);
+    let ready = {
+        let _unwind = ClaimUnwind {
+            gate: &gate,
+            run: accepted.run.id,
+        };
+        await_provider_ready(&handle)
+    };
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let claim = dispatch.take_if(|claim| claim.run == accepted.run.id);
+    ready?;
+    if claim.is_none_or(|claim| claim.withdrawn) {
+        return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
     }
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         if registry.agent(accepted.agent.id).map_err(before)?.closed
@@ -525,6 +654,7 @@ fn dispatch(
         // still requires its explicitly selected account to be registered.
         selected_account(&accepted.agent.spec).map_err(before)?;
     }
+    given_work(host, session.id);
     // Once command submission begins an absent acknowledgement is ambiguous.
     // Only the adapter's exact correlated result may declare success.
     handle
@@ -669,6 +799,14 @@ pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle_adoptions
+        .remove(&session.id)
+    {
+        return stopped(host, session);
+    }
     // Normal interactive sessions still work without the optional registry.
     let Ok(registry) = registry(host) else {
         return Ok(());
@@ -681,6 +819,107 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
         announce(host, &registry);
     }
     Ok(())
+}
+
+/// Daemon shutdown stopped this exact provider after confirmed teardown. Its
+/// authority and unfinished runs end, but the agent keeps its pane, placement
+/// and channel so the conversation resumes in place after restart.
+pub(super) fn stopped(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(());
+    };
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .stop_agent_process(&HostedSession::Chat(session.clone()), now())?;
+    if changed {
+        announce(host, &registry);
+    }
+    Ok(())
+}
+
+/// The conversation `chat` is being given work, so it no longer only reopens
+/// its agent's conversation: ending it from now on retires that agent.
+pub(in crate::host) fn given_work(host: &SharedHost, chat: TerminalId) {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle_adoptions
+        .remove(&chat);
+}
+
+/// Bind the agent of a resumed conversation to `successor`, the process that
+/// just started under a new chat ID. The predecessor is found through the
+/// lineage the successor joined when its resume was prepared, so a retry after
+/// a failed start, or a daemon restart between preparation and start, still
+/// finds it. A successor that started its own lineage adopts nothing.
+pub(in crate::host) fn adopt_resumed(
+    host: &SharedHost,
+    successor: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let agents = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .lineage_agents(successor.id)?;
+    let mut predecessors = agents.into_iter().filter_map(|agent| match agent.session {
+        Some(HostedSession::Chat(session)) => Some(session),
+        _ => None,
+    });
+    let Some(predecessor) = predecessors.next() else {
+        return Ok(false);
+    };
+    if predecessors.next().is_some() {
+        return Err("More than one open agent claims the resumed conversation's lineage".into());
+    }
+    adopt_successor(host, &predecessor, successor)
+}
+
+/// Bind a stopped agent to the process that resumed its conversation under a
+/// new chat ID. `Registry::adopt_successor` states the exact contract; no
+/// execution authority is issued here. Takes the agent's dispatch gate, so
+/// call it without holding that gate or the host lock.
+pub(in crate::host) fn adopt_successor(
+    host: &SharedHost,
+    predecessor: &chat::Session,
+    successor: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let Some(agent) = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(predecessor.id)?
+    else {
+        return Ok(false);
+    };
+    // Close and dispatch decide under this gate whether the agent's process
+    // ended; adoption must not change that between their check and commit.
+    let gate = agent_gate(host, agent.id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .chats
+            .get(&predecessor.id)
+            .is_some_and(|record| !record.handle.is_completed())
+        {
+            return Err("The predecessor is still running in this daemon".into());
+        }
+        if successor.proof.as_ref() != Some(state.proof()) {
+            return Err("The successor was not started by this daemon".into());
+        }
+    }
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_successor(predecessor, successor)?;
+    if changed {
+        announce(host, &registry);
+    }
+    Ok(changed)
 }
 
 /// Reads only the managed presentation. No registry means ordinary interactive
@@ -699,7 +938,10 @@ pub(super) fn preflight_retirement(
     result
 }
 
-fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
+/// Serializes an agent's operations. The value is the run whose dispatcher
+/// released the gate to await provider readiness: until that dispatcher
+/// takes it back, the provider has not received the run's prompt.
+fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<Option<Undelivered>>> {
     let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
     // A holder or waiter keeps its Arc alive, so pruning cannot split an
     // active agent's serialization. Failed and repeated closes need no
@@ -714,7 +956,7 @@ fn agent_gate(host: &SharedHost, id: AgentId) -> Arc<Mutex<()>> {
     {
         return gate;
     }
-    let gate = Arc::new(Mutex::new(()));
+    let gate = Arc::new(Mutex::new(None));
     state.execution_gates.insert(id, Arc::downgrade(&gate));
     gate
 }
@@ -739,11 +981,21 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         announce(host, &registry);
         return Ok(agent);
     }
-    let pending = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pending_agent_launch(id)?;
-    if let Some(source) = agent.session.as_ref().or(pending.as_ref()) {
+    let (pending, ended) = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            store.pending_agent_launch(id)?,
+            store.agent_process_ended(id)?,
+        )
+    };
+    // A daemon stop already proved this agent's process ended and revoked its
+    // authority; only its saved conversation remains to retire.
+    if let Some(source) = agent
+        .session
+        .as_ref()
+        .or(pending.as_ref())
+        .filter(|_| !ended)
+    {
         match source {
             HostedSession::Chat(session) => {
                 let hosted = {
@@ -836,6 +1088,21 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     Ok(result)
 }
 
+/// Preserve typed mailbox backpressure at the service boundary. Existing
+/// operations retain their original validation and String-returning API.
+pub(super) fn process_request(
+    host: &SharedHost,
+    authority: Authority,
+    operation: crate::agent_execution::Operation,
+) -> Result<crate::agent_execution::Reply, crate::agent_execution::AcceptanceError> {
+    match operation {
+        crate::agent_execution::Operation::SendMessage(outgoing) => {
+            mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
+        }
+        other => process(host, authority, other).map_err(Into::into),
+    }
+}
+
 pub(super) fn process(
     host: &SharedHost,
     authority: Authority,
@@ -886,14 +1153,15 @@ pub(super) fn process(
         }
         Operation::Requests(id) => {
             let (_, _, handle) = owned_provider(host, &authority, id)?;
+            refresh_retained_requests(&handle);
             Ok(Reply::Requests(displayed_requests(&handle)))
         }
         Operation::Control { agent, command } => {
             control(host, &authority, agent, command).map(Reply::Requests)
         }
-        Operation::SendMessage(outgoing) => {
-            mailbox::send(host, &authority, outgoing).map(Reply::Sent)
-        }
+        Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
+            .map(Reply::Sent)
+            .map_err(|error| error.to_string()),
         Operation::Inbox(query) => mailbox::inbox(host, &authority, query).map(Reply::Inbox),
         Operation::PeekInbox(query) => mailbox::peek(host, &authority, query).map(Reply::Inbox),
         Operation::AcknowledgeInbox(receipt) => {
@@ -932,6 +1200,14 @@ fn owned_provider(
     Ok((agent, run, handle))
 }
 
+/// A retained provider reports its run Waiting through the durable outbox,
+/// which can overtake the proxy's cached metadata, so a caller reading a
+/// Waiting run's requests refreshes that metadata first. A failed refresh
+/// leaves the cached requests, which the actor's own pump keeps converging.
+fn refresh_retained_requests(handle: &chat::runtime::Handle) {
+    let _ = handle.refresh_retained_state();
+}
+
 /// Pending requests as a caller may see them: a secret field's prefilled
 /// value is never sent back out of the provider.
 fn displayed_requests(handle: &chat::runtime::Handle) -> Vec<chat::Request> {
@@ -968,7 +1244,7 @@ fn control(
     // agent it does not own.
     status(host, authority, id)?;
     let gate = agent_gate(host, id);
-    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
     let (_, run, handle) = owned_provider(host, authority, id)?;
     if registry(host)?
         .lock()
@@ -987,7 +1263,9 @@ fn control(
         Control::Interrupt {
             including_subagents,
         } => {
-            handle.interrupt_owned(Some(run.id), including_subagents)?;
+            if !withdraw_undelivered(host, &mut dispatch, Some(run.id))? {
+                handle.interrupt_owned(Some(run.id), including_subagents)?;
+            }
             None
         }
         Control::Answer {
@@ -995,6 +1273,7 @@ fn control(
             action,
             answers,
         } => {
+            refresh_retained_requests(&handle);
             let requests = handle.requests();
             let request = requests
                 .iter()
@@ -1307,8 +1586,10 @@ fn console(
             including_subagents,
         } => {
             let gate = agent_gate(host, id);
-            let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            handle.interrupt_owned(None, including_subagents)?;
+            let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+            if !withdraw_undelivered(host, &mut dispatch, None)? {
+                handle.interrupt_owned(None, including_subagents)?;
+            }
             registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

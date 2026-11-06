@@ -82,6 +82,7 @@ pub(crate) fn execute(
             )
             .map(Reply::History),
     }
+    // The GitHub service already charged this failure to the host budget.
     .map_err(|error| error.to_string())
 }
 

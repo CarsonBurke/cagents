@@ -142,6 +142,16 @@ impl Registry {
         read_pending(&self.db, limit)
     }
 
+    pub(crate) fn has_pending_automation_attention(&self) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM automation_run_attention)",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     /// Serialize source read + bounded NONBLOCKING enqueue with every Registry
     /// writer, including independent WAL connections. The callback must never
     /// wait for a journal receipt or acquire HostState/control admission. It

@@ -498,6 +498,15 @@ mod tests {
     };
     use std::{cell::Cell, rc::Rc, time::Duration};
 
+    fn fixture_dir() -> tempfile::TempDir {
+        // Normalize only the ambient parent. Paths created inside the fixture
+        // remain unchanged so admission still checks their actual spelling.
+        let parent = tempfile::env::temp_dir()
+            .canonicalize()
+            .expect("canonical schema fixture parent");
+        tempfile::tempdir_in(parent).expect("schema fixture directory")
+    }
+
     fn legacy(path: &Path, version: u32) -> (String, ChannelId) {
         let mut db = Connection::open(path).unwrap();
         let tx = db.transaction().unwrap();
@@ -540,7 +549,7 @@ mod tests {
 
     fn refuse_damaged_twelve(damage: &str, object: &str) {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("damaged12.sqlite3");
         legacy(&path, 12);
         let db = Connection::open(&path).unwrap();
@@ -622,7 +631,7 @@ mod tests {
     #[test]
     fn published_twelve_wal_damage_preserves_primary_wal_and_permissions() {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("damaged12-wal.sqlite3");
         legacy(&path, 12);
         let writer = connect(&path, false).unwrap();
@@ -651,7 +660,7 @@ mod tests {
             TerminalSession,
         };
         use crate::workspace_model::views::{Pane, Scope};
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("nonempty12.sqlite3");
         let (identity, channel) = legacy(&path, 12);
         let scope = Scope::Channel(channel);
@@ -746,7 +755,7 @@ mod tests {
 
     #[test]
     fn published_thirteen_missing_provenance_is_not_recreated() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("damaged13.sqlite3");
         legacy(&path, 13);
         let db = Connection::open(&path).unwrap();
@@ -839,7 +848,7 @@ mod tests {
                 "ALTER TABLE native_actor_ownerships ADD COLUMN foreign_payload TEXT;",
             ),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("damaged-native-actor.sqlite3");
             legacy(&path, version);
             Connection::open(&path)
@@ -875,7 +884,7 @@ mod tests {
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
         for version in [13, 14, 15, 16, 17, 18] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
             let db = Connection::open(&path).unwrap();
@@ -939,7 +948,7 @@ mod tests {
     #[test]
     fn every_published_version_preserves_nonempty_model_identity_and_ordinals() {
         for version in 0..=SCHEMA_VERSION {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("registry.sqlite3");
             let (identity, channel) = legacy(&path, version);
             let registry = Registry::at(&path).unwrap_or_else(|e| panic!("version {version}: {e}"));
@@ -977,7 +986,7 @@ mod tests {
                 SessionMode,
             },
         };
-        let directory = tempfile::tempdir().unwrap();
+        let directory = fixture_dir();
         let path = directory.path().join("attention18.sqlite3");
         let (identity, channel) = legacy(&path, 18);
         let mut db = Connection::open(&path).unwrap();
@@ -1078,7 +1087,7 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20 and run-attention21.
+            // This current opener also applies retention20, run-attention21 and history22.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1125,16 +1134,20 @@ mod tests {
                     0
                 );
             }
-            // History22 appends only this column to an existing table. Compare
-            // the exact original published DDL after removing that known suffix.
+            // History22 adds only this column to an existing table. SQLite writes
+            // it after the last column, ahead of the table constraints. Compare
+            // the exact original published DDL after removing those tokens.
             let firing = inventory
                 .iter_mut()
                 .find(|object| object.1 == "automation_firings")
                 .unwrap();
-            let suffix = tokens(", previous_firing TEXT").unwrap();
-            let close = firing.3.len() - 2; // final ')' then STRICT
-            assert_eq!(&firing.3[close - suffix.len()..close], &suffix);
-            firing.3.drain(close - suffix.len()..close);
+            let column = tokens(", previous_firing TEXT").unwrap();
+            let start = firing
+                .3
+                .windows(column.len())
+                .position(|tokens| tokens == column)
+                .unwrap();
+            firing.3.drain(start..start + column.len());
             // Schema24 appends exactly these checked delivery counters. Keep
             // the original published metadata DDL comparison after proving
             // and removing only their known token suffix.
@@ -1173,7 +1186,7 @@ mod tests {
     #[test]
     fn failed_eighteen_to_nineteen_rolls_back_outbox_and_published_header() {
         let _clear = Clear;
-        let directory = tempfile::tempdir().unwrap();
+        let directory = fixture_dir();
         let path = directory.path().join("attention18-rollback.sqlite3");
         let (identity, channel) = legacy(&path, 18);
         let before = bytes(&path);
@@ -1214,7 +1227,7 @@ mod tests {
         use crate::channel_work::{Change, Home, Mutation, Origin, Page, Role, Target};
         use crate::github_identity::{GitHubRepoKey, PullRequestKey};
 
-        let directory = tempfile::tempdir().unwrap();
+        let directory = fixture_dir();
         let path = directory.path().join("channel-work16.sqlite3");
         let (identity, channel) = legacy(&path, 16);
         // A historical title mentioning a PR is metadata, never work intent.
@@ -1298,7 +1311,7 @@ mod tests {
         let _clear = Clear;
         // Synthesized compatibility fixture for the actual version-eight
         // reader; the old version-seven CREATE writer is not in Git history.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("legacy7.sqlite3");
         let (_, channel) = legacy(&path, 6);
         let db = Connection::open(&path).unwrap();
@@ -1391,7 +1404,7 @@ mod tests {
             "CREATE INDEX unknown_legacy_index ON workspace_views(revision);",
             "CREATE TRIGGER unknown_legacy_trigger BEFORE DELETE ON workspace_views BEGIN SELECT RAISE(ABORT, 'keep'); END;",
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("unknown-legacy.sqlite3");
             let (_, channel) = legacy(&path, 6);
             let db = Connection::open(&path).unwrap();
@@ -1480,7 +1493,7 @@ mod tests {
         for step in [
             1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
             legacy(&path, 0);
             let before = bytes(&path);
@@ -1505,7 +1518,7 @@ mod tests {
 
     #[test]
     fn future_delete_and_wal_refusal_preserves_database_and_wal_bytes() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let delete = dir.path().join("future-delete.sqlite3");
         legacy(&delete, 12);
         let db = Connection::open(&delete).unwrap();
@@ -1543,7 +1556,7 @@ mod tests {
     fn unjournaled_wal_refusal_preserves_absent_sidecars_and_literal_filename() {
         use std::os::unix::{ffi::OsStringExt, fs::MetadataExt};
         for future in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             // URI metacharacters and a non-UTF8 byte are literal filename data.
             let path = dir.path().join(std::ffi::OsString::from_vec(
                 b"refusal ?#%\xff.sqlite3".to_vec(),
@@ -1591,7 +1604,7 @@ mod tests {
     fn immutable_precheck_cannot_admit_a_later_writer_or_new_wal() {
         let _clear = Clear;
         for future in [false, true] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("prechecked.sqlite3");
             drop(Registry::at(&path).unwrap());
             // Prepare a current WAL database without sidecars, just as after
@@ -1650,7 +1663,7 @@ mod tests {
             format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
             "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".into(),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("stale-wal.sqlite3");
             drop(Registry::at(&path).unwrap());
             let saved = Rc::new(std::cell::RefCell::new(None));
@@ -1682,7 +1695,7 @@ mod tests {
     #[test]
     fn current_delete_writer_lock_spans_commit_and_persistent_wal_conversion() {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("current-delete.sqlite3");
         legacy(&path, 12);
         let observed = Rc::new(Cell::new(0));
@@ -1739,7 +1752,7 @@ mod tests {
     #[test]
     fn wal_opener_has_no_persistent_configuration_after_migration_commit() {
         let _clear = Clear;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("current-wal.sqlite3");
         drop(Registry::at(&path).unwrap());
         let saved = Rc::new(std::cell::RefCell::new(None));
@@ -1779,7 +1792,7 @@ mod tests {
             format!("PRAGMA user_version={};", SCHEMA_VERSION + 1),
             "ALTER TABLE projects RENAME COLUMN name TO nameifnotexists;".into(),
         ] {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = fixture_dir();
             let path = dir.path().join("outer.sqlite3");
             let (_, channel) = legacy(&path, 12);
             let mut registry = Registry::at(&path).unwrap();
@@ -1841,7 +1854,7 @@ mod tests {
 
     #[test]
     fn current_edits_keep_cascade_sequence_and_reopen_semantics() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("current.sqlite3");
         let (_, channel) = legacy(&path, 12);
         let mut registry = Registry::at(&path).unwrap();
@@ -1870,7 +1883,7 @@ mod tests {
 
     #[test]
     fn current_header_preserves_the_unversioned_legacy_project_kind_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = fixture_dir();
         let path = dir.path().join("legacy-kind.sqlite3");
         legacy(&path, 12);
         let mut registry = Registry::at(&path).unwrap();

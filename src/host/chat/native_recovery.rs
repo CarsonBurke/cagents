@@ -217,7 +217,19 @@ pub(super) fn restore_with_admission(
         {
             return Err("Native conversation ownership or capacity prevents adoption".into());
         }
-        if !state.chats.contains_key(&source.id) && admission.is_none() {
+        // A prepublication failure still owns a slot. Only its complete issued
+        // source may reuse that slot, even when the daemon has spare capacity.
+        // This is admission bookkeeping; restore_reserved still authenticates
+        // the retained holder before it can publish an actor.
+        let retained_startup = if let Some(pending) = state.native_actor_startups.get(&source.id) {
+            if &pending.source != source {
+                return Err("The retained startup belongs to another exact descriptor".into());
+            }
+            true
+        } else {
+            false
+        };
+        if !state.chats.contains_key(&source.id) && admission.is_none() && !retained_startup {
             capacity::require_available(&state).map_err(|error| error.message)?;
         }
         capacity::Reservation::install(&mut admission, host, &mut state, source)
@@ -547,6 +559,14 @@ pub(in crate::host) fn restore_orphaned_native(
             continue;
         }
         let result = if Handle::is_remote_record(&record) {
+            match super::retained_actor::finish_interrupted_exit(host, &record) {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(session = %record.terminal, %error, "an interrupted exit could not be finished; holder evidence preserved");
+                    continue;
+                }
+            }
             Handle::inspect_remote(&record, proof.clone())
                 .and_then(|inspection| restore(host, 0, &inspection.source))
         } else {

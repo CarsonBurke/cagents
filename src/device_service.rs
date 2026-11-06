@@ -1650,6 +1650,32 @@ pub fn request(operation: Operation) -> Result<Reply, String> {
     )
 }
 
+/// [`request`] for an operation whose refusal is shown to the person who
+/// asked for it in place of its result. The daemon words its own refusals for
+/// them; the protocol code it attaches is for programs, so only a transport
+/// failure keeps the client's framing.
+#[cfg(feature = "ui")]
+pub fn request_for_reader(operation: Operation) -> Result<Reply, String> {
+    let authority = crate::agent_execution::Authority::from_environment();
+    request_described(
+        operation,
+        authority,
+        crate::control::daemon_autostart_disabled(),
+        crate::device::is_remote(),
+        || crate::terminal::ipc::daemon_socket_path().map_err(|error| error.to_string()),
+        || crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string()),
+        reader_message,
+    )
+}
+
+#[cfg(any(feature = "ui", test))]
+fn reader_message(error: crate::control::ControlError) -> String {
+    match error {
+        crate::control::ControlError::Remote { message, .. } => message,
+        error => error.to_string(),
+    }
+}
+
 fn request_as(
     operation: Operation,
     authority: crate::agent_execution::Authority,
@@ -1657,6 +1683,26 @@ fn request_as(
     remote: bool,
     selected_socket: impl FnOnce() -> Result<PathBuf, String>,
     ready_socket: impl FnOnce() -> Result<PathBuf, String>,
+) -> Result<Reply, String> {
+    request_described(
+        operation,
+        authority,
+        no_start,
+        remote,
+        selected_socket,
+        ready_socket,
+        |error| error.to_string(),
+    )
+}
+
+fn request_described(
+    operation: Operation,
+    authority: crate::agent_execution::Authority,
+    no_start: bool,
+    remote: bool,
+    selected_socket: impl FnOnce() -> Result<PathBuf, String>,
+    ready_socket: impl FnOnce() -> Result<PathBuf, String>,
+    describe: impl FnOnce(crate::control::ControlError) -> String,
 ) -> Result<Reply, String> {
     // Resolving a remote socket can launch its SSH bridge before authentication.
     // Device operations are reserved for User, so refuse scoped remote callers
@@ -1679,11 +1725,11 @@ fn request_as(
     client
         .authenticate(authority)
         .map_err(|error| error.to_string())?;
-    client
-        .device_operation(operation)
-        .map_err(|error| error.to_string())
+    client.device_operation(operation).map_err(describe)
 }
 
+#[cfg(test)]
+mod no_start_entry_tests;
 #[cfg(test)]
 mod request_tests;
 

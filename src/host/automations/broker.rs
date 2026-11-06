@@ -12,7 +12,7 @@ use uuid::Uuid;
 
 use super::{
     notification_event, notifications,
-    precheck::worker::{Request, Status, Worker},
+    precheck::worker::{LaunchError, Request, Status, Worker},
     proposal_notifications,
     schedule::Compiled,
     service,
@@ -295,7 +295,10 @@ impl Handle {
                         .unwrap_or_else(|p| p.into_inner())
                         .insert(claim.firing.id, worker);
                 }
-                Err(error) => {
+                Err(LaunchError {
+                    error,
+                    nothing_created,
+                }) => {
                     let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
                     if error.kind() == std::io::ErrorKind::AlreadyExists {
                         // A colliding private record could belong to an earlier
@@ -315,6 +318,16 @@ impl Handle {
                             service::now()?,
                             false,
                         )?;
+                        if nothing_created {
+                            match registry.confirm_unlaunched_automation_precheck(
+                                claim.firing.id,
+                                claim.firing.revision,
+                                service::now()?,
+                            ) {
+                                Ok(()) => return Ok(()),
+                                Err(error) => warn_history_maintenance(&error),
+                            }
+                        }
                         drop(registry);
                         // Failed launch may have written partial private proof.
                         // Retain actual Worker::retire custody even if no child
@@ -523,48 +536,17 @@ impl Handle {
             .copied()
             .collect::<Vec<_>>();
         for id in candidates {
-            // A manual request can add a worker after the active census. The
-            // absent snapshot entry alone never authorizes deleting its proof.
             let revision = self
                 .0
-                .registry
+                .workers
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?;
+                .get(&id)
+                .map(Worker::revision);
             let Some(revision) = revision else {
                 continue;
             };
-            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
-            let Some(worker) = workers.get_mut(&id) else {
-                continue;
-            };
-            match worker.retire() {
-                Ok(true) => {
-                    // Keep this reaped Worker until the SQLite ACK commits.
-                    // On ACK error the next tick retries retire(true), without
-                    // launching anything or losing cleanup custody.
-                    drop(workers);
-                    self.0
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
-                    self.0
-                        .workers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&id);
-                }
-                Ok(false) => {} // Reap/reclaim again on the next bounded tick.
-                Err(error) => {
-                    tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
-                    // A reaped owner may leave inaccessible files for the next
-                    // startup census; never spin on permanent storage errors.
-                    if worker.reaped().unwrap_or(false) {
-                        workers.remove(&id);
-                    }
-                }
-            }
+            self.retire_precheck(id, revision)?;
         }
         checking |= self.sweep_prechecks()?;
         for firing in active {
@@ -789,6 +771,85 @@ impl Handle {
         Ok(false)
     }
 
+    fn retire_precheck(&self, id: Uuid, revision: u64) -> Result<(), String> {
+        // Neither an absent active-census entry nor a missing proof directory
+        // authorizes retirement. Distinguish the exact durable model states.
+        let state = self
+            .0
+            .registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .automation_precheck_retirement(id, revision)?;
+        if state.is_protected() {
+            return Ok(());
+        }
+        let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let directory_missing = match self.0.root.join(id.to_string()).symlink_metadata() {
+            Ok(_) => false,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+            Err(error) => return Err(error.to_string()),
+        };
+        if !workers.contains_key(&id)
+            && directory_missing
+            && Worker::retirement_revision(&self.0.root, id)
+                .map_err(|error| error.to_string())?
+                .is_none()
+        {
+            // A census can contain both names, or a cached DirEntry already
+            // removed by the first pass. Absence skips work; it proves no ACK.
+            return Ok(());
+        }
+        let worker = workers
+            .entry(id)
+            .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
+        if worker.revision() != revision {
+            return Err("Precheck retirement does not match its mapped worker".into());
+        }
+        if state.is_missing()
+            && !worker.retirement_is_unlinked()
+            && Worker::retirement_revision(&self.0.root, id).map_err(|error| error.to_string())?
+                != Some(revision)
+        {
+            return Err("Missing firing has no exact durable retirement receipt".into());
+        }
+        match worker.retire() {
+            Ok(false) => return Ok(()),
+            Err(error) => {
+                tracing::warn!(%id, %error, "retired precheck files could not be reclaimed");
+                // Proofs (or their durable retirement receipt) remain on disk.
+                // Keep live Child custody, but avoid retaining and rescanning
+                // every inaccessible historical directory on ordinary ticks.
+                if worker.reaped().unwrap_or(false) {
+                    workers.remove(&id);
+                }
+                return Ok(());
+            }
+            Ok(true) => {}
+        }
+        // The actual mapped Child is reaped, and a durable exact receipt now
+        // survives both directory deletion and ACK-triggered compaction.
+        drop(workers);
+        if state.needs_ack() {
+            self.0
+                .registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .confirm_retired_automation_precheck(id, revision, service::now()?)?;
+        }
+        let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
+        let worker = workers
+            .get_mut(&id)
+            .ok_or("Precheck retirement lost its mapped owner")?;
+        if worker.revision() != revision {
+            return Err("Precheck retirement does not match its mapped worker".into());
+        }
+        worker
+            .forget_retirement()
+            .map_err(|error| error.to_string())?;
+        workers.remove(&id);
+        Ok(())
+    }
+
     fn sweep_prechecks(&self) -> Result<bool, String> {
         let (entries, more) = {
             let mut scan = self.0.cleanup.lock().unwrap_or_else(|p| p.into_inner());
@@ -806,50 +867,39 @@ impl Handle {
             (entries, more)
         };
         for entry in entries {
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            let Some(id) = entry
-                .file_name()
-                .to_str()
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let (id, revision) = if let Some(id) = name
+                .strip_suffix(".retired")
                 .and_then(|name| Uuid::parse_str(name).ok())
-            else {
+            {
+                let revision = match Worker::retirement_revision(&self.0.root, id) {
+                    Ok(Some(revision)) => revision,
+                    Ok(None) => continue,
+                    Err(error) => {
+                        tracing::warn!(%id, %error, "precheck retirement receipt could not be verified");
+                        continue;
+                    }
+                };
+                (id, revision)
+            } else if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                let Some(id) = Uuid::parse_str(name).ok() else {
+                    continue;
+                };
+                let Some(revision) = self
+                    .0
+                    .registry
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .retired_automation_precheck(id)?
+                else {
+                    continue;
+                };
+                (id, revision)
+            } else {
                 continue;
             };
-            let revision = self
-                .0
-                .registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .retired_automation_precheck(id)?;
-            let Some(revision) = revision else {
-                continue;
-            };
-            let mut workers = self.0.workers.lock().unwrap_or_else(|p| p.into_inner());
-            let worker = workers
-                .entry(id)
-                .or_insert_with(|| Worker::recover(&self.0.root, id, revision));
-            match worker.retire() {
-                Ok(true) => {
-                    // Retire the actual mapped owner, including its Child. A
-                    // recovered observer cannot replace that reaping custody.
-                    drop(workers);
-                    self.0
-                        .registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .confirm_retired_automation_precheck(id, revision, service::now()?)?;
-                    self.0
-                        .workers
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .remove(&id);
-                }
-                Ok(false) => {} // Keep the actual mapped owner for retry.
-                Err(error) => {
-                    tracing::warn!(%id, %error, "retired precheck files could not be reclaimed")
-                }
-            }
+            self.retire_precheck(id, revision)?;
         }
         Ok(more)
     }
@@ -927,14 +977,13 @@ impl AttentionTransfer {
         self.retry_at = None;
         match self.pump_ready(registry, notifications) {
             Ok(AttentionProgress::Retry) => Ok(Some(self.defer_retry())),
-            Ok(progress) => {
+            Ok(AttentionProgress::Idle) => {
                 self.retry_delay = Duration::ZERO;
-                Ok(match progress {
-                    AttentionProgress::Idle => None,
-                    AttentionProgress::Waiting => Some(Duration::from_millis(250)),
-                    AttentionProgress::Retry => unreachable!(),
-                })
+                Ok(None)
             }
+            // Queue admission and pending receipts do not prove recovery.
+            // Preserve prior failures until the durable handoff is idle.
+            Ok(AttentionProgress::Waiting) => Ok(Some(Duration::from_millis(250))),
             Err(error) => {
                 self.defer_retry();
                 Err(error)
@@ -1009,6 +1058,12 @@ impl AttentionTransfer {
             return Ok(AttentionProgress::Waiting);
         }
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        // Nothing owed: a read settles an idle tick without waiting on another
+        // connection's write lock while this registry mutex is held. A row
+        // committed just after this read is the same as one after the transaction.
+        if self.in_flight.is_empty() && !registry.has_pending_automation_attention()? {
+            return Ok(AttentionProgress::Idle);
+        }
         // A short Immediate source transaction also excludes writers using a
         // separate execution connection. A stale loaded edge must not enqueue
         // after its committed replacement. Handle admission is only a bounded

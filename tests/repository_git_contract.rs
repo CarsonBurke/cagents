@@ -224,6 +224,11 @@ impl Fixture {
         self.head()
     }
 
+    fn commit_all(&self, message: &str) -> Oid {
+        self.git_in_work(&["add", "-A"]);
+        self.commit(message)
+    }
+
     fn head(&self) -> Oid {
         Oid::parse(self.text(&["rev-parse", "HEAD"])).expect("full object id")
     }
@@ -1023,6 +1028,343 @@ fn an_untracked_nested_repository_is_listed_as_its_directory() {
     assert!(snapshot.files.paths.contains(&path("subclone")));
 }
 
+fn index_entries(fixture: &Fixture) -> String {
+    fixture.text(&["ls-files", "--stage", "-t"])
+}
+
+fn stage(fixture: &Fixture, paths: &[&str]) -> MutationOutcome {
+    fixture
+        .service()
+        .stage(
+            &StageRequest {
+                worktree: fixture.work(),
+                selection: paths
+                    .iter()
+                    .map(|name| PathSelection::new(path(name)))
+                    .collect(),
+            },
+            &CancellationToken::new(),
+        )
+        .expect("stage")
+}
+
+fn unstage(fixture: &Fixture, paths: &[&str]) -> MutationOutcome {
+    fixture
+        .service()
+        .unstage(
+            &UnstageRequest {
+                worktree: fixture.work(),
+                selection: paths
+                    .iter()
+                    .map(|name| PathSelection::new(path(name)))
+                    .collect(),
+            },
+            &CancellationToken::new(),
+        )
+        .expect("unstage")
+}
+
+/// Staging looks paths up directly rather than through `git add` pathspecs,
+/// so each case below pins the index `git add -A` would have produced.
+#[test]
+fn staging_replaces_files_and_directories_in_either_direction() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("file/x", b"x\n");
+    fixture.write("dir", b"file\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    let committed = index_entries(&fixture);
+    fs::remove_dir_all(fixture.work().join("file")).expect("remove directory");
+    fixture.write("file", b"now a file\n");
+    fs::remove_file(fixture.work().join("dir")).expect("remove file");
+    fixture.write("dir/y", b"now a directory\n");
+
+    // Each row alone, in the order a status listing gives them.
+    for name in ["dir", "dir/y", "file", "file/x"] {
+        assert!(matches!(
+            stage(&fixture, &[name]),
+            MutationOutcome::Applied { .. }
+        ));
+    }
+    assert_eq!(fixture.text(&["ls-files"]), "dir/y\nfile");
+    assert_eq!(
+        fixture.text(&["status", "--porcelain", "--untracked-files=all"]),
+        "D  dir\nA  dir/y\nA  file\nD  file/x"
+    );
+
+    assert!(matches!(
+        unstage(&fixture, &["dir", "dir/y", "file", "file/x"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(index_entries(&fixture), committed);
+    assert_eq!(
+        fs::read(fixture.work().join("file")).unwrap(),
+        b"now a file\n"
+    );
+}
+
+#[test]
+fn staging_leaves_entries_outside_a_sparse_checkout_alone() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("sparse.txt", b"one\n");
+    fixture.write("dense.txt", b"one\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    fixture.git_in_work(&["update-index", "--skip-worktree", "sparse.txt"]);
+    let sparse = fixture.text(&["ls-files", "--stage", "-t", "sparse.txt"]);
+    fs::remove_file(fixture.work().join("sparse.txt")).expect("remove sparse file");
+    fixture.write("dense.txt", b"two\n");
+
+    assert!(matches!(
+        stage(&fixture, &["sparse.txt", "dense.txt"]),
+        MutationOutcome::Applied { .. }
+    ));
+    // Absent by design, not deleted.
+    assert_eq!(
+        fixture.text(&["ls-files", "--stage", "-t", "sparse.txt"]),
+        sparse
+    );
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--name-only"]),
+        "dense.txt"
+    );
+}
+
+/// `git reset` keeps skip-worktree on an entry and sets it on one restored
+/// outside the sparse checkout. Losing it would make the next stage record
+/// the absent file as a deletion.
+#[test]
+fn unstaging_keeps_entries_outside_a_sparse_checkout_skip_worktree() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("hidden.txt", b"one\n");
+    fixture.write("in/kept.txt", b"one\n");
+    fixture.write("out/removed.txt", b"one\n");
+    fixture.commit_all("initial");
+    fixture.write("hidden.txt", b"two\n");
+    fixture.git_in_work(&["add", "hidden.txt"]);
+    fixture.git_in_work(&["update-index", "--skip-worktree", "hidden.txt"]);
+    assert!(matches!(
+        unstage(&fixture, &["hidden.txt"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        fixture.text(&["ls-files", "-t", "hidden.txt"]),
+        "S hidden.txt"
+    );
+    assert_eq!(fixture.text(&["diff", "--cached", "--name-only"]), "");
+
+    fixture.git_in_work(&["update-index", "--no-skip-worktree", "hidden.txt"]);
+    fixture.git_in_work(&["checkout", "--", "hidden.txt"]);
+    fixture.git_in_work(&["sparse-checkout", "set", "in"]);
+    fixture.git_in_work(&["rm", "--quiet", "--cached", "--sparse", "out/removed.txt"]);
+    assert!(matches!(
+        unstage(&fixture, &["out/removed.txt"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        fixture.text(&["ls-files", "-t", "out/removed.txt"]),
+        "S out/removed.txt"
+    );
+    assert_eq!(fixture.porcelain(), "");
+
+    // Staging keeps `git add`'s refusal of paths outside the checkout, and
+    // its partial result.
+    fixture.write("in/kept.txt", b"two\n");
+    fixture.write("out/new.txt", b"new\n");
+    assert!(matches!(
+        stage(&fixture, &["in/kept.txt", "out/new.txt"]),
+        MutationOutcome::OutcomeUnknown { .. }
+    ));
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--name-only"]),
+        "in/kept.txt"
+    );
+    assert_eq!(fixture.text(&["ls-files", "out/new.txt"]), "");
+}
+
+#[test]
+fn staging_records_a_file_replaced_by_a_repository_and_refuses_a_ghost() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("dep", b"file\n");
+    fixture.commit_all("initial");
+    fs::remove_file(fixture.work().join("dep")).expect("remove file");
+    let nested = fixture.work().join("dep");
+    fs::create_dir(&nested).expect("nested directory");
+    fixture.run(&nested, &["init", "-b", "main", "."]);
+    fixture.run(
+        &nested,
+        &["commit", "--quiet", "--allow-empty", "-m", "nested"],
+    );
+    let commit = String::from_utf8(fixture.run(&nested, &["rev-parse", "HEAD"])).unwrap();
+
+    assert!(matches!(
+        stage(&fixture, &["dep"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        index_entries(&fixture),
+        format!("H 160000 {} 0\tdep", commit.trim())
+    );
+
+    let before = index_entries(&fixture);
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = stage(&fixture, &["gone.txt"])
+    else {
+        panic!("a path that matches nothing must not be reported staged");
+    };
+    assert!(reason.starts_with("gone.txt:"), "{reason}");
+    assert_eq!(index_entries(&fixture), before);
+}
+
+#[test]
+fn staging_refuses_a_path_inside_a_submodule() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("a.txt", b"one\n");
+    let nested = fixture.work().join("deps/sub");
+    fs::create_dir_all(&nested).expect("nested directory");
+    fixture.run(&nested, &["init", "-b", "main", "."]);
+    fixture.run(
+        &nested,
+        &["commit", "--quiet", "--allow-empty", "-m", "nested"],
+    );
+    fixture.commit_all("initial");
+    let committed = index_entries(&fixture);
+    fixture.write("deps/sub/inner.txt", b"inner\n");
+    fixture.write("a.txt", b"two\n");
+
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = stage(&fixture, &["a.txt", "deps/sub/inner.txt"])
+    else {
+        panic!("a path inside a submodule must not be staged");
+    };
+    assert!(reason.contains("submodule 'deps/sub'"), "{reason}");
+    assert_eq!(index_entries(&fixture), committed);
+}
+
+#[test]
+fn staging_applies_attributes_resolves_conflicts_and_records_gitlinks() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write(".gitattributes", b"*.txt text\n");
+    fixture.write("c.txt", b"base\n");
+    fixture.write(".gitignore", b"*.log\n");
+    fixture.write("tracked.log", b"one\n");
+    fixture.git_in_work(&["add", "-A", "--force"]);
+    fixture.commit("initial");
+    fixture.git_in_work(&["checkout", "--quiet", "-b", "side"]);
+    fixture.write("c.txt", b"theirs\n");
+    fixture.commit_all("theirs");
+    fixture.git_in_work(&["checkout", "--quiet", "main"]);
+    fixture.write("c.txt", b"ours\n");
+    fixture.commit_all("ours");
+    fixture.run_failing(&fixture.work(), &["merge", "--no-edit", "side"]);
+    fixture.write("c.txt", b"resolved\r\n");
+    // An ignored file that is already tracked is staged like any other.
+    fixture.write("tracked.log", b"two\n");
+    fs::create_dir(fixture.work().join("nested")).expect("nested directory");
+    fixture.run(&fixture.work().join("nested"), &["init", "-b", "main", "."]);
+    fixture.run(
+        &fixture.work().join("nested"),
+        &["commit", "--quiet", "--allow-empty", "-m", "nested"],
+    );
+    let nested = fixture.run(&fixture.work().join("nested"), &["rev-parse", "HEAD"]);
+
+    assert!(matches!(
+        stage(&fixture, &["c.txt", "tracked.log", "nested"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(fixture.text(&["ls-files", "--unmerged"]), "");
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", ":c.txt"]),
+        b"resolved\n"
+    );
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", ":tracked.log"]),
+        b"two\n"
+    );
+    let gitlink = fixture.text(&["ls-files", "--stage", "nested"]);
+    assert_eq!(
+        gitlink,
+        format!(
+            "160000 {} 0\tnested",
+            String::from_utf8_lossy(&nested).trim()
+        )
+    );
+
+    assert!(matches!(
+        unstage(&fixture, &["nested"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(fixture.text(&["ls-files", "nested"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_and_unstaging_keep_newline_and_non_utf8_names_exact() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("base.txt", b"base\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    let names = [
+        b"line\nbreak".as_slice(),
+        b"non-utf8-\xff",
+        b"-leading space",
+    ];
+    for name in names {
+        fs::write(fixture.work().join(OsStr::from_bytes(name)), b"new\n").expect("write");
+    }
+    let selection: Vec<_> = names
+        .iter()
+        .map(|name| PathSelection::new(RepoPath::from_bytes(name).expect("path")))
+        .collect();
+    let service = fixture.service();
+    assert!(matches!(
+        service
+            .stage(
+                &StageRequest {
+                    worktree: fixture.work(),
+                    selection: selection.clone(),
+                },
+                &CancellationToken::new(),
+            )
+            .expect("stage"),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        fixture.git_in_work(&["diff", "--cached", "--name-only", "-z"]),
+        b"-leading space\0line\nbreak\0non-utf8-\xff\0"
+    );
+    assert!(matches!(
+        service
+            .unstage(
+                &UnstageRequest {
+                    worktree: fixture.work(),
+                    selection,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("unstage"),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(fixture.text(&["ls-files"]), "base.txt");
+}
+
 #[test]
 fn literal_pathspecs_stage_only_the_named_file() {
     let Some(fixture) = Fixture::new() else {
@@ -1442,10 +1784,9 @@ fn a_commit_date_git_cannot_normalise_costs_only_its_own_row() {
 ///
 /// This is a claim about a refusal and not about `restore` as a whole:
 /// `a_restore_that_failed_inside_its_write_loop_never_says_nothing_happened`
-/// covers the other side, where Git exits 255 having destroyed work. `git add`
-/// is different again and genuinely applies what it could.
+/// covers the other side, where Git exits 255 having destroyed work.
 #[test]
-fn a_refused_restore_changed_nothing_and_a_refused_add_may_have() {
+fn a_refused_restore_or_stage_changed_nothing() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -1531,23 +1872,10 @@ fn a_refused_restore_changed_nothing_and_a_refused_add_may_have() {
     );
     fixture.git_in_work(&["merge", "--abort"]);
 
-    // `git add` really is partial: it stages what it could before failing.
+    // `git add` refuses an untracked ignored file, as must staging one that
+    // became ignored after status listed it; this refuses the whole request.
     fixture.write("ignored.txt", b"ignored\n");
     fixture.write("good.txt", b"good\n");
-    let stderr = fixture.run_failing(
-        &fixture.work(),
-        &["add", "-A", "--", "good.txt", "ignored.txt"],
-    );
-    assert!(
-        stderr.contains("ignored by one of your .gitignore files"),
-        "git's reason changed: {stderr}"
-    );
-    assert_eq!(
-        fixture.text(&["diff", "--cached", "--name-only"]),
-        "good.txt"
-    );
-    fixture.git_in_work(&["restore", "--staged", "good.txt"]);
-
     let outcome = service
         .stage(
             &StageRequest {
@@ -1560,15 +1888,14 @@ fn a_refused_restore_changed_nothing_and_a_refused_add_may_have() {
             &CancellationToken::new(),
         )
         .expect("stage");
-    assert!(
-        matches!(outcome, MutationOutcome::OutcomeUnknown { .. }),
-        "an add that staged one of two paths is exactly an unknown outcome: {outcome:?}"
-    );
-    assert_eq!(
-        fixture.text(&["diff", "--cached", "--name-only"]),
-        "good.txt",
-        "and the outcome is unknown because this really did happen"
-    );
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = outcome
+    else {
+        panic!("an ignored path refuses the stage: {outcome:?}");
+    };
+    assert!(reason.starts_with("ignored.txt:"), "{reason}");
+    assert_eq!(fixture.text(&["diff", "--cached", "--name-only"]), "");
 }
 
 /// Git reports an untracked nested repository as its directory even under
@@ -2129,6 +2456,90 @@ fn a_push_moves_the_remote_branch_and_invents_no_ref_in_the_remote() {
             behind: 0,
         }
     );
+
+    // The panel captured this branch while it existed. External Git can move
+    // away and delete it before the push worker reads the source.
+    let stale = Fixture::new().expect("Git remains available after the success control");
+    let published = publish_main(&stale);
+    stale.git_in_work(&["checkout", "--quiet", "-b", "topic"]);
+    stale.write("a.txt", b"selected topic history\n");
+    stale.git_in_work(&["add", "a.txt"]);
+    let selected = stale.commit("selected topic");
+    stale.git_in_work(&["branch", "--set-upstream-to=origin/main", "topic"]);
+    let branch = ValidatedBranchName::parse("topic").unwrap();
+    let service = stale.service();
+    let target = service
+        .upstream_push_target(&stale.work(), &branch, &CancellationToken::new())
+        .unwrap()
+        .expect("the captured branch has a real configured upstream");
+    let request = PushRequest {
+        worktree: stale.work(),
+        branch,
+        target,
+    };
+    assert_eq!(
+        stale.text(&["show-ref", "--verify", "--hash", "--", "refs/heads/topic"]),
+        selected.as_str()
+    );
+
+    stale.git_in_work(&["checkout", "--quiet", "main"]);
+    stale.write("a.txt", b"tag-only descendant of the remote\n");
+    stale.git_in_work(&["add", "a.txt"]);
+    let decoy = stale.commit("decoy tag history");
+    assert_ne!(decoy, selected);
+    assert_ne!(decoy, published);
+    stale.git_in_work(&["update-ref", "refs/tags/refs/heads/topic", decoy.as_str()]);
+    stale.git_in_work(&["branch", "-D", "topic"]);
+    stale.write("a.txt", b"uncommitted local work\n");
+    stale.write("draft.txt", b"untracked local draft\n");
+    let origin = stale.origin();
+    let remote_refs = stale.run(&origin, &["show-ref"]);
+    let remote_head = stale.run(&origin, &["symbolic-ref", "HEAD"]);
+    let remote_head_oid = stale.run(&origin, &["rev-parse", "HEAD"]);
+    let local_refs = stale.git_in_work(&["show-ref"]);
+    let local_status = stale.porcelain();
+
+    let outcome = service
+        .push(&request, &CancellationToken::new())
+        .expect("a stale source is a definite push refusal");
+    assert_eq!(
+        stale.run(&origin, &["show-ref"]),
+        remote_refs,
+        "a stale branch must not push a similarly named tag: {outcome:?}"
+    );
+    assert_eq!(stale.run(&origin, &["symbolic-ref", "HEAD"]), remote_head);
+    assert_eq!(stale.run(&origin, &["rev-parse", "HEAD"]), remote_head_oid);
+    assert!(
+        matches!(
+            &outcome,
+            PushOutcome::NotPushed {
+                failure: MutationFailure::Rejected { reason }
+            } if reason.contains("refs/heads/topic") && reason.contains("does not exist")
+        ),
+        "{outcome:?}"
+    );
+    assert_eq!(stale.git_in_work(&["show-ref"]), local_refs);
+    assert_eq!(stale.text(&["symbolic-ref", "HEAD"]), "refs/heads/main");
+    assert_eq!(stale.head(), decoy);
+    assert_eq!(stale.porcelain(), local_status);
+    assert_eq!(
+        fs::read(stale.work().join("a.txt")).unwrap(),
+        b"uncommitted local work\n"
+    );
+    assert_eq!(
+        fs::read(stale.work().join("draft.txt")).unwrap(),
+        b"untracked local draft\n"
+    );
+    assert_eq!(
+        stale.text(&[
+            "show-ref",
+            "--verify",
+            "--hash",
+            "--",
+            "refs/tags/refs/heads/topic"
+        ]),
+        decoy.as_str()
+    );
 }
 
 /// A branch published under a different name follows the *upstream's* branch
@@ -2317,7 +2728,7 @@ fn bare_refs(fixture: &Fixture) -> Vec<String> {
 /// Pathspec magic, whitespace, newlines and leading dashes remain literal
 /// paths in the NUL-delimited stdin protocol rather than becoming arguments.
 #[test]
-fn staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin() {
+fn staging_command_keeps_literal_paths_in_nul_delimited_stdin() {
     let service: RepositoryService<IsolatedExecutor> =
         RepositoryService::new("git", Arc::new(IsolatedExecutor(SystemProcessExecutor)));
     let command = service
@@ -2331,11 +2742,7 @@ fn staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin() {
             ],
         )
         .expect("stage command");
-    assert_eq!(command.arguments[0], OsString::from("--literal-pathspecs"));
-    assert_eq!(
-        &command.arguments[command.arguments.len() - 4..],
-        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"].map(OsString::from)
-    );
+    assert_eq!(command.arguments.last(), Some(&OsString::from("--stdin")));
     assert_eq!(
         command.stdin.as_deref(),
         Some(b":(top)magic.txt\0space name.txt\0line\nbreak.txt\0-leading.txt\0".as_slice())
@@ -4394,4 +4801,109 @@ fn successful_push_refuses_a_changed_source_oid_and_preserves_first_publish() {
             after.as_str()
         );
     }
+
+    // A successful push can also be followed by external deletion. A tag at
+    // the same OID is not evidence that the captured source branch survived.
+    struct RemoveSourceAfterPush {
+        worktree: PathBuf,
+        source: Oid,
+    }
+    impl ProcessExecutor for RemoveSourceAfterPush {
+        fn execute(
+            &self,
+            command: &CommandSpec,
+            cancellation: &CancellationToken,
+        ) -> Result<ProcessOutput, ProcessFailure> {
+            let output = SystemProcessExecutor.execute(&isolate(command.clone()), cancellation)?;
+            if command.arguments.iter().any(|argument| argument == "push") {
+                assert!(output.success, "the real first-publish push succeeds");
+                for arguments in [
+                    vec![
+                        "update-ref",
+                        "refs/tags/refs/heads/main",
+                        self.source.as_str(),
+                    ],
+                    vec!["update-ref", "-d", "refs/heads/main", self.source.as_str()],
+                ] {
+                    let update = CommandSpec::new(&command.program)
+                        .cwd(&self.worktree)
+                        .args(arguments);
+                    let changed = SystemProcessExecutor.execute(&isolate(update), cancellation)?;
+                    assert!(changed.success);
+                }
+            }
+            Ok(output)
+        }
+    }
+    let fixture = Fixture::new().expect("Git remains available after the source-race controls");
+    let first = publish_main(&fixture);
+    fixture.write("a.txt", b"source committed before first publish\n");
+    fixture.git_in_work(&["add", "a.txt"]);
+    let source = fixture.commit("source later removed externally");
+    let service = RepositoryService::new(
+        &fixture.git,
+        Arc::new(RemoveSourceAfterPush {
+            worktree: fixture.work(),
+            source: source.clone(),
+        }),
+    );
+    let outcome = service
+        .push(
+            &PushRequest {
+                worktree: fixture.work(),
+                branch: ValidatedBranchName::parse("main").unwrap(),
+                target: PushTarget::SetUpstream {
+                    remote: "origin".into(),
+                    remote_branch: ValidatedBranchName::parse("published-after-removal").unwrap(),
+                },
+            },
+            &CancellationToken::new(),
+        )
+        .unwrap();
+    assert!(
+        matches!(
+            &outcome,
+            PushOutcome::OutcomeUnknown {
+                failure: MutationFailure::Reconciliation { .. }
+            }
+        ),
+        "a same-OID tag cannot confirm a deleted branch: {outcome:?}"
+    );
+    assert_eq!(
+        bare_refs(&fixture),
+        ["refs/heads/main", "refs/heads/published-after-removal"]
+    );
+    assert_eq!(remote_oid(&fixture, "refs/heads/main"), first);
+    assert_eq!(
+        remote_oid(&fixture, "refs/heads/published-after-removal"),
+        source
+    );
+    assert_eq!(fixture.text(&["config", "branch.main.remote"]), "origin");
+    assert_eq!(
+        fixture.text(&["config", "branch.main.merge"]),
+        "refs/heads/published-after-removal"
+    );
+    assert_eq!(
+        fixture
+            .run_failing_status(
+                &fixture.work(),
+                &["show-ref", "--verify", "--quiet", "--", "refs/heads/main"]
+            )
+            .0,
+        Some(1)
+    );
+    assert_eq!(
+        fixture.text(&[
+            "show-ref",
+            "--verify",
+            "--hash",
+            "--",
+            "refs/tags/refs/heads/main"
+        ]),
+        source.as_str()
+    );
+    assert_eq!(
+        fs::read(fixture.work().join("a.txt")).unwrap(),
+        b"source committed before first publish\n"
+    );
 }

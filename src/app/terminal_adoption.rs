@@ -86,6 +86,14 @@ fn card_claims_terminal(card: &CardState, terminal: &TerminalSession) -> bool {
                     .terminal
                     .as_ref()
                     .is_some_and(|saved| saved_terminal_claims_host(saved, terminal))
+                // The terminal this chat returned to, before its conversion is
+                // saved or while storage refuses it. A second card would own
+                // that terminal in storage, which refuses the conversion for good.
+                // A terminal spawned with this exact recipe is indistinguishable
+                // here; it gets its card once the chat closes or converts.
+                || (card.existence.is_open()
+                    && session.launch.provider != crate::agent::Provider::Codex
+                    && session.launch.resumes_in_terminal(&terminal.launch))
         }
         CardKind::Browser(_)
         | CardKind::PullRequests(_)
@@ -228,6 +236,7 @@ impl Cagents {
         }
         let mut tasks = Vec::new();
         for session in terminals {
+            tasks.extend(self.recheck_saved_terminal(&session));
             let waiting = self
                 .durable
                 .cards
@@ -291,7 +300,11 @@ impl Cagents {
             let pending = std::mem::take(&mut self.pending_adoptions);
             self.observe_hosted_terminals(pending)
         };
-        Task::batch([adopted, self.attach_next_restored_agent()])
+        Task::batch([
+            adopted,
+            self.attach_next_restored_agent(),
+            self.start_next_saved_terminal(),
+        ])
     }
 
     pub(super) fn terminal_starts_in_flight(&self) -> usize {
@@ -556,6 +569,76 @@ mod tests {
         );
         assert!(app.restored_agent_attaches.is_empty());
         assert_eq!(app.terminal_starts_in_flight(), 1);
+    }
+
+    /// After a reopen the chat card storage kept and the terminal it returned
+    /// to are both present. Adopting the terminal as well put it in a second
+    /// card, whose saved ownership then refused the conversion for good.
+    #[test]
+    fn the_terminal_a_chat_returned_to_is_not_adopted_as_another_card() {
+        let conversation = "d1714898-6c54-4727-8113-0d5b9db7aeb9";
+        let mut chat = hosted("/repo");
+        chat.launch.program = "claude".into();
+        let chat = crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: chat.id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: chat.launch,
+                session_id: Some(conversation.into()),
+            },
+            proof: None,
+            terminal: None,
+        };
+        let terminal = |mode: Option<&str>| {
+            let mut terminal = hosted("/repo");
+            terminal.launch = chat
+                .launch
+                .terminal_recipe_with_permission_mode(mode)
+                .unwrap();
+            terminal
+        };
+
+        let app_with_chat = |open: bool| {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            register_worktrees(&mut app, &["/repo"]);
+            let _ = app.select_worktree("/repo".into(), false);
+            let mut card = super::super::tests::terminal_card_state();
+            card.kind = CardKind::Chat(chat.clone());
+            if !open {
+                card.existence = Existence::Closed {
+                    tombstone: crate::model::Tombstone {
+                        operation_id: None,
+                        closed_at_unix_ms: 1,
+                        reason: Some("closed by user".into()),
+                    },
+                };
+            }
+            Arc::make_mut(&mut app.durable).cards.push(card);
+            app
+        };
+        for mode in [None, Some("manual"), Some("acceptEdits")] {
+            let returned = terminal(mode);
+            let mut app = app_with_chat(true);
+            let _ = app.observe_hosted_terminals(vec![returned.clone()]);
+            assert!(cards_for(&app, returned.id).is_empty(), "{mode:?}");
+
+            // A closed chat holds nothing, so its conversation's CLI gets a card.
+            let mut app = app_with_chat(false);
+            let _ = app.observe_hosted_terminals(vec![returned.clone()]);
+            assert_eq!(cards_for(&app, returned.id).len(), 1, "{mode:?}");
+        }
+
+        // Another conversation's CLI is nothing to do with this chat.
+        let mut other = terminal(None);
+        other.launch.arguments = vec![
+            "--resume".into(),
+            "88888888-1111-4111-8111-111111111111".into(),
+        ];
+        let mut app = app_with_chat(true);
+        let _ = app.observe_hosted_terminals(vec![other.clone()]);
+        assert_eq!(cards_for(&app, other.id).len(), 1);
     }
 
     #[test]

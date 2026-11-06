@@ -386,7 +386,15 @@ impl Actor {
                         let frame = serde_json::from_str(&text).map_err(|error| {
                             format!("Codex WebSocket text is not JSON: {error}")
                         })?;
-                        let step = self.adapter.receive(frame)?;
+                        let mut step = self.adapter.receive(frame)?;
+                        if close_sent || peer_closed {
+                            // An in-flight reply may request another catalog
+                            // or history page. After Close no application
+                            // writes can be sent: queuing one would also block
+                            // reading the close acknowledgement. Keep its
+                            // final events, but admit no further requests.
+                            step.writes.clear();
+                        }
                         self.provider_step(step)?;
                         read_again = true;
                     }
@@ -479,6 +487,115 @@ impl Actor {
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn in_flight_response_after_close_keeps_final_events_without_queuing_new_requests() {
+        use serde_json::{Value, json};
+
+        struct LateResponse {
+            ready: crossbeam_channel::Sender<()>,
+        }
+        impl Adapter for LateResponse {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step {
+                    writes: vec![json!({"method":"initialize"})],
+                    ..Step::default()
+                })
+            }
+
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture does not accept provider commands".into())
+            }
+
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                if frame["ready"] == true {
+                    self.ready.send(()).unwrap();
+                    return Ok(Step {
+                        events: vec![Event::Ready(true)],
+                        ..Step::default()
+                    });
+                }
+                assert_eq!(frame, json!({"late":true}));
+                // Catalog/history replies can finish setup or start a next
+                // page even after the transport has sent its Close frame.
+                Ok(Step {
+                    writes: vec![json!({"method":"follow-up"})],
+                    events: vec![Event::Session {
+                        id: "retained-thread".into(),
+                        title: Some("Final provider title".into()),
+                    }],
+                    ..Step::default()
+                })
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("late-response.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let server = thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            stream
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut socket = tungstenite::accept(stream).unwrap();
+            assert!(matches!(socket.read().unwrap(), Message::Text(_)));
+            socket
+                .send(Message::Text(json!({"ready":true}).to_string().into()))
+                .unwrap();
+            assert!(matches!(socket.read().unwrap(), Message::Close(_)));
+            // Model an application reply already in flight when the client
+            // closes. Write its server frame directly because tungstenite's
+            // server API forbids starting Text after observing the Close.
+            let response = br#"{"late":true}"#;
+            let mut frames = vec![0x81, response.len() as u8];
+            frames.extend_from_slice(response);
+            frames.extend_from_slice(&[0x88, 0]);
+            socket.get_mut().write_all(&frames).unwrap();
+        });
+        let spec = ProcessSpec {
+            execution: None,
+            messages: None,
+            stdout_noise: None,
+            transport: TransportSpec::UnixWebSocket {
+                socket: path,
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            },
+            program: "/nonexistent/late-response-fixture".into(),
+            arguments: Vec::new(),
+            working_directory: directory.path().into(),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        };
+        let (ready, initialized) = crossbeam_channel::bounded(1);
+        let mut adapter: Box<dyn Adapter> = Box::new(LateResponse { ready });
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, |_| {}).unwrap();
+        initialized.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (closed, settled) = crossbeam_channel::bounded(1);
+        let closing = handle.clone();
+        let closer = thread::spawn(move || closed.send(closing.close()).unwrap());
+        let timely = settled.recv_timeout(Duration::from_secs(5));
+        // Join even on failure: the old pending-write deadlock times out in
+        // its own close bound, and must not leak a worker into another test.
+        closer.join().unwrap();
+        server.join().unwrap();
+        timely
+            .expect("a late response wedged the WebSocket close handshake")
+            .unwrap();
+        assert_eq!(handle.failure(), None);
+        assert!(!handle.owns_work());
+        assert_eq!(
+            handle.snapshot(None).unwrap().title.as_deref(),
+            Some("Final provider title"),
+            "closing must retain semantic events from the in-flight response"
+        );
+    }
 
     #[test]
     fn partial_message_deadline_survives_read_ahead_and_interleaved_ping() {
@@ -574,12 +691,11 @@ mod tests {
     fn launched_server_exit_observation_preserves_original_child_ownership() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("missing.sock");
-        let child = Process::new("/bin/sh")
-            .args(["-c", "exit 7"])
-            .process_group(0)
-            .spawn()
-            .unwrap();
-        let mut provider = ChildGuard::new(child).unwrap();
+        let mut provider = ChildGuard::spawn(
+            Process::new("/bin/sh")
+                .args(["-c", "exit 7"])
+                .process_group(0),
+        );
         assert_eq!(
             join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),
             "Codex server exited before opening its local socket"
@@ -591,8 +707,7 @@ mod tests {
         provider.terminate().unwrap();
         assert_eq!(provider.child.try_wait().unwrap().unwrap().code(), Some(7));
 
-        let child = Process::new("/bin/true").process_group(0).spawn().unwrap();
-        let mut provider = ChildGuard::new(child).unwrap();
+        let mut provider = ChildGuard::spawn(Process::new("/bin/true").process_group(0));
         provider.child.wait().unwrap();
         assert_eq!(
             join_launched(&path, || startup_halt_reason(Some(&provider), false)).unwrap_err(),

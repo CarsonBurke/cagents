@@ -263,6 +263,38 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
     Ok(removed)
 }
 
+/// Sweeps until the dropped lease's cache is reclaimed. A concurrent test's
+/// fork duplicates every descriptor, close-on-exec or not, until its child
+/// execs, and that copy keeps the dropped lease locked. Each attempt first
+/// waits until the last copy closes; a fork can also copy that probe, so a
+/// lost race retries rather than failing. A lease that stays held fails
+/// after a hang guard instead of blocking the test forever.
+#[cfg(all(test, feature = "host"))]
+pub(crate) fn sweep_reclaiming(root: &Path, proc_root: &Path, directory: &Path) -> Usage {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let mut swept = Usage::default();
+    for _ in 0..100 {
+        let probe = private_file(&directory.join(LEASE)).unwrap();
+        while let Err(error) = lock(&probe, libc::LOCK_EX | libc::LOCK_NB) {
+            assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "{} stayed leased",
+                directory.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        drop(probe);
+        let attempt = sweep_with_procfs(root, proc_root).unwrap();
+        swept.count += attempt.count;
+        swept.bytes += attempt.bytes;
+        if !directory.exists() {
+            return swept;
+        }
+    }
+    panic!("{} was never reclaimed", directory.display());
+}
+
 #[cfg(all(test, feature = "host"))]
 mod tests {
     use super::*;
@@ -288,7 +320,7 @@ mod tests {
             fd.join("4"),
         )
         .unwrap();
-        let removed = sweep_with_procfs(root.path(), proc_root.path()).unwrap();
+        let removed = sweep_reclaiming(root.path(), proc_root.path(), &orphan);
         assert_eq!(removed.count, 1);
         assert!(!orphan.exists());
         assert!(legacy.exists());
@@ -362,9 +394,7 @@ mod tests {
         let unavailable_procfs = root.path().join("not-a-proc-directory");
         fs::write(&unavailable_procfs, b"inaccessible scan fixture").unwrap();
         assert_eq!(
-            sweep_with_procfs(root.path(), &unavailable_procfs)
-                .unwrap()
-                .count,
+            sweep_reclaiming(root.path(), &unavailable_procfs, &orphan).count,
             1
         );
         assert!(legacy.exists());
@@ -387,7 +417,10 @@ mod tests {
         });
         assert!(directory.exists());
         drop(lease);
-        assert_eq!(sweep(root.path()).unwrap().count, 1);
+        assert_eq!(
+            sweep_reclaiming(root.path(), Path::new("/proc"), &directory).count,
+            1
+        );
     }
 
     #[test]
@@ -456,5 +489,34 @@ mod tests {
         assert_eq!(usage(root.path()).unwrap().count, 0);
         assert_eq!(sweep(root.path()).unwrap().count, 0);
         assert!(unrelated.path().join("keep").exists());
+    }
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_counts_cache_directories_and_their_direct_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("payload"), b"outside").unwrap();
+        let cache = root
+            .path()
+            .join(format!("chat-{}", uuid::Uuid::from_u128(1)));
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("transcript.sqlite"), b"abc").unwrap();
+        fs::create_dir(cache.join("nested")).unwrap();
+        fs::write(cache.join("nested/file"), b"not direct").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("payload"), cache.join("link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            root.path()
+                .join(format!("chat-{}", uuid::Uuid::from_u128(2))),
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("chat-not-a-uuid")).unwrap();
+        let observed = usage(root.path()).unwrap();
+        assert_eq!((observed.count, observed.bytes), (1, 3));
     }
 }

@@ -5,6 +5,28 @@ use crate::automations::{HISTORY_RETAINED_ROWS, SkipReason, SkippedOccurrences, 
 pub(super) const REMOVED_TTL_MS: u64 =
     crate::automations::REMOVED_HISTORY_RETENTION_DAYS * 24 * 60 * 60 * 1_000;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PrecheckRetirement {
+    ReleasedPending,
+    Acknowledged,
+    Missing,
+    Protected,
+}
+
+impl PrecheckRetirement {
+    pub(crate) fn is_protected(self) -> bool {
+        self == Self::Protected
+    }
+
+    pub(crate) fn needs_ack(self) -> bool {
+        self == Self::ReleasedPending
+    }
+
+    pub(crate) fn is_missing(self) -> bool {
+        self == Self::Missing
+    }
+}
+
 // SQL aliases f/a/r are shared by these two bounded writer entrypoints.
 const ELIGIBLE: &str = "(a.active_firing IS NULL OR a.active_firing<>f.id)
             AND json_extract(a.record,'$.blocked') IS NULL
@@ -207,6 +229,46 @@ pub(super) fn insert_or_coalesce(
     Ok(())
 }
 
+/// History from before groups has one row per occurrence, all ahead of a run
+/// still waiting for someone. Join them once with the rule that governs new
+/// skips; rows that remain apart stay eligible but merge nothing further.
+fn coalesce_ungrouped_skips(tx: &Transaction<'_>) -> Result<(), String> {
+    let ids = tx
+        .prepare(
+            "SELECT id FROM automation_firings
+             WHERE json_extract(record,'$.state')='skipped'
+               AND json_extract(record,'$.skipped_occurrences') IS NULL
+             ORDER BY rowid",
+        )
+        .map_err(|error| error.to_string())?
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .map_err(|error| error.to_string())?;
+    for id in ids {
+        let next: String = tx
+            .query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())?;
+        let previous: Option<String> = tx
+            .query_row(
+                "SELECT p.record FROM automation_firings f
+                 JOIN automation_firings p ON p.id=f.previous_firing WHERE f.id=?1",
+                [&id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(previous) = previous {
+            merge(tx, &mut decode(&previous)?, &decode(&next)?)?;
+        }
+    }
+    Ok(())
+}
+
 /// Coalesce only adjacent insertion-order rows after actual cleanup, including
 /// a newer consecutive group which could not merge while this owner was live.
 fn compact(tx: &Transaction<'_>, firing: &mut Firing) -> Result<(), String> {
@@ -235,6 +297,46 @@ fn compact(tx: &Transaction<'_>, firing: &mut Firing) -> Result<(), String> {
     Ok(())
 }
 
+// Keep scoped writes indexable: an optional-filter OR scans unrelated
+// automations even when its bound identity is present. The global startup
+// pass deliberately retains its independent, unscoped query.
+pub(super) fn prune_candidates_sql(scoped: bool) -> String {
+    let (scope, firing_scope) = if scoped {
+        ("automation=?1", "f.automation=?1")
+    } else {
+        ("?1 IS NULL", "?1 IS NULL")
+    };
+    format!(
+        "WITH latest AS (
+          SELECT automation,max(rowid) AS tail FROM automation_firings
+          WHERE {scope} GROUP BY automation
+        ) INSERT INTO automation_history_prune SELECT id FROM (
+          SELECT f.id,a.deleted_ms,row_number() OVER(PARTITION BY f.automation ORDER BY
+            (f.rowid=latest.tail) DESC,
+            coalesce(json_extract(f.record,'$.finished_ms'),f.created_ms) DESC,f.rowid DESC) AS rank
+          FROM automation_firings f JOIN automations a ON a.id=f.automation
+          JOIN latest ON latest.automation=f.automation
+          JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
+          WHERE {firing_scope}
+            AND {ELIGIBLE}
+        ) WHERE rank>?3 OR deleted_ms<?2"
+    )
+}
+
+pub(super) fn prune_revisions_sql(scoped: bool) -> String {
+    let scope = if scoped {
+        "automation=?1"
+    } else {
+        "?1 IS NULL"
+    };
+    format!(
+        "DELETE FROM automation_revisions WHERE {scope}
+        AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=automation_revisions.automation AND f.revision=automation_revisions.revision)
+        AND NOT EXISTS(SELECT 1 FROM automations a WHERE a.id=automation_revisions.automation
+          AND (a.deleted_ms IS NULL OR a.deleted_ms>=?2) AND json_extract(a.record,'$.execution_revision')=automation_revisions.revision)"
+    )
+}
+
 pub(super) fn prune(
     tx: &Transaction<'_>,
     automation: Option<Uuid>,
@@ -250,21 +352,7 @@ pub(super) fn prune(
     tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS automation_history_prune(id TEXT PRIMARY KEY); DELETE FROM automation_history_prune;")
         .map_err(|error|error.to_string())?;
     tx.execute(
-        &format!(
-            "WITH latest AS (
-          SELECT automation,max(rowid) AS tail FROM automation_firings
-          WHERE (?1 IS NULL OR automation=?1) GROUP BY automation
-        ) INSERT INTO automation_history_prune SELECT id FROM (
-          SELECT f.id,a.deleted_ms,row_number() OVER(PARTITION BY f.automation ORDER BY
-            (f.rowid=latest.tail) DESC,
-            coalesce(json_extract(f.record,'$.finished_ms'),f.created_ms) DESC,f.rowid DESC) AS rank
-          FROM automation_firings f JOIN automations a ON a.id=f.automation
-          JOIN latest ON latest.automation=f.automation
-          JOIN automation_revisions r ON r.automation=f.automation AND r.revision=f.revision
-          WHERE (?1 IS NULL OR f.automation=?1)
-            AND {ELIGIBLE}
-        ) WHERE rank>?3 OR deleted_ms<?2"
-        ),
+        &prune_candidates_sql(automation.is_some()),
         params![automation.map(|id| id.to_string()), cutoff, limit],
     )
     .map_err(|error| error.to_string())?;
@@ -277,20 +365,77 @@ pub(super) fn prune(
         [],
     )
     .map_err(|error| error.to_string())?;
-    tx.execute("DELETE FROM automation_revisions WHERE (?1 IS NULL OR automation=?1)
-        AND NOT EXISTS(SELECT 1 FROM automation_firings f WHERE f.automation=automation_revisions.automation AND f.revision=automation_revisions.revision)
-        AND NOT EXISTS(SELECT 1 FROM automations a WHERE a.id=automation_revisions.automation
-          AND (a.deleted_ms IS NULL OR a.deleted_ms>=?2) AND json_extract(a.record,'$.execution_revision')=automation_revisions.revision)",
-        params![automation.map(|id|id.to_string()),cutoff]).map_err(|error|error.to_string())?;
+    tx.execute(
+        &prune_revisions_sql(automation.is_some()),
+        params![automation.map(|id| id.to_string()), cutoff],
+    )
+    .map_err(|error| error.to_string())?;
     Ok(())
 }
 
 impl Registry {
+    /// Missing means the exact firing is genuinely absent, not active or
+    /// protected. A verified filesystem receipt may then be reclaimed, but
+    /// must not manufacture a cleanup ACK for another owner or revision.
+    pub(crate) fn automation_precheck_retirement(
+        &self,
+        id: Uuid,
+        revision: u64,
+    ) -> Result<PrecheckRetirement, String> {
+        let raw: Option<String> = self
+            .db
+            .query_row(
+                "SELECT record FROM automation_firings WHERE id=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        let Some(raw) = raw else {
+            return Ok(PrecheckRetirement::Missing);
+        };
+        let firing: Firing = decode(&raw)?;
+        let owner: Automation = decode(
+            &self
+                .db
+                .query_row(
+                    "SELECT record FROM automations WHERE id=?1",
+                    [firing.automation.to_string()],
+                    |row| row.get::<_, String>(0),
+                )
+                .map_err(|error| error.to_string())?,
+        )?;
+        if firing.revision != revision
+            || owner.active_firing == Some(id)
+            || owner.blocked.is_some()
+            || firing.state.is_active()
+            || firing.release_pending
+        {
+            return Ok(PrecheckRetirement::Protected);
+        }
+        let acknowledged: Option<u64> = self
+            .db
+            .query_row(
+                "SELECT revision FROM automation_precheck_history_cleanup WHERE firing=?1",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        Ok(match acknowledged {
+            Some(exact) if exact == revision => PrecheckRetirement::Acknowledged,
+            Some(_) => PrecheckRetirement::Protected,
+            None => PrecheckRetirement::ReleasedPending,
+        })
+    }
+
     pub(crate) fn maintain_automation_history(&mut self, now_ms: u64) -> Result<(), String> {
         let tx = self
             .db
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|e| e.to_string())?;
+        super::super::schema::require_current(&tx)?;
+        coalesce_ungrouped_skips(&tx)?;
         prune(&tx, None, now_ms, HISTORY_RETAINED_ROWS)?;
         tx.commit().map_err(|e| e.to_string())
     }
@@ -331,8 +476,9 @@ impl Registry {
         tx.commit().map_err(|e| e.to_string())
     }
 
-    /// Only the broker's before-Worker::launch branch may record this evidence.
-    /// It proves no launch was attempted, not merely that a pathname is absent.
+    /// Only the broker may record this: before Worker::launch, or after one that
+    /// reports it spawned nothing and left no files. A pathname being absent is
+    /// not enough, since that says nothing about who else may have owned it.
     pub(crate) fn confirm_unlaunched_automation_precheck(
         &mut self,
         id: Uuid,

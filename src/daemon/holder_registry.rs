@@ -30,13 +30,23 @@ pub(crate) struct Process {
 
 impl Process {
     pub fn read(pid: i32) -> io::Result<Self> {
-        let stat = fs::read(format!("/proc/{pid}/stat"))?;
+        let stat = fs::read(format!("/proc/{pid}/stat")).map_err(exited_as_absent)?;
         let (_, start) = crate::model::agent_recovery::process_identity(&stat)
             .ok_or_else(|| io::Error::other("invalid process identity"))?;
         Ok(Self { pid, start })
     }
     pub fn is_current(&self) -> bool {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
+    }
+}
+
+/// A process reaped between opening and reading its stat file fails the read
+/// with ESRCH. It is as absent as one whose entry is already gone.
+fn exited_as_absent(error: io::Error) -> io::Error {
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        io::Error::new(io::ErrorKind::NotFound, error)
+    } else {
+        error
     }
 }
 
@@ -328,6 +338,10 @@ impl Record {
         directory.join(format!("{}.json", self.terminal))
     }
 
+    /// Writes without fsync: the record carries its boot ID, so no reader
+    /// accepts it after an OS crash, and the page cache serves every reader in
+    /// this boot. An fsync on a disk-backed runtime directory can instead hold
+    /// a holder's launch for seconds under write load (#2180).
     pub fn create(&self, directory: &Path) -> io::Result<()> {
         let path = self.path(directory);
         let mut file = OpenOptions::new()
@@ -339,8 +353,7 @@ impl Record {
         let identity = file.metadata()?;
         let result = (|| {
             serde_json::to_writer(&mut file, self).map_err(io::Error::other)?;
-            file.flush()?;
-            file.sync_all()
+            file.flush()
         })();
         if result.is_err()
             && fs::symlink_metadata(&path).is_ok_and(|actual| {
@@ -561,6 +574,16 @@ fn discover_inner(
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn a_process_reaped_while_its_stat_is_read_is_absent() {
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let mut stat = fs::File::open(format!("/proc/{}/stat", child.id())).unwrap();
+        child.wait().unwrap();
+        let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
+        assert_eq!(exited_as_absent(error).kind(), io::ErrorKind::NotFound);
+    }
 
     #[test]
     fn retained_claude_family_visibility_keeps_original_record_and_codex_isolation() {

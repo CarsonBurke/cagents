@@ -97,6 +97,10 @@ cagents daemon stop --confirm
   valid for 60 seconds; inventory changes require a new one.
 - A successful stop means **termination requested**, not that every PTY has
   exited. Plain `daemon stop` without these flags is a force stop.
+- Stopping the daemon ends each agent's provider process and any turn in
+  progress, but does not close the agent. The agent keeps its ID, and its card
+  stays in its channel, where its saved conversation can be resumed. A turn
+  the stop cut short is never resent. Only closing an agent removes it.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
 - Inside a hosted session, `terminal write` and `close` reach only the
@@ -223,7 +227,9 @@ Close to finish after daemon restart. A terminal receipt proves its root and PTY
 owner were released (active close also stops the inspected terminal family); it
 makes no claim about previously disowned processes outside that family. Native
 provider holders separately reap all owned provider/tool descendants before
-confirming their release.
+confirming their release. While they run, native holders and retained Claude
+actors also reap tool processes that their provider left behind and that have
+exited, without signalling any process that is still running.
 The live emulator's screen before an unexpected crash is unavailable; the UI
 warns once for the affected pane, preserves subsequent output, and requests that
 foreground programs redraw through the PTY. That redraw temporarily toggles one
@@ -465,15 +471,11 @@ without that feature are production builds.
 
 Manual sidebar order is stored by the selected device daemon and shared across windows. Drag worktree or channel titles within a project to arrange them; the project menu’s **Reset sidebar order** restores automatic channel and worktree sorting. Missing worktree paths retain their position if they reappear. The registry bounds each retained order at 4096 entries; resetting also discards obsolete paths. Navigation changes require a matched CLI, UI and daemon (wire protocol 56).
 
-### Automatic merged worktree cleanup
+### Merged worktree notices
 
-Settings → General → **Merged worktree cleanup** is disabled by default. When enabled, sidebar PR refreshes propose one clean, inactive GitHub worktree at a time. The daemon confirms that its exact branch and current commit were merged before removing its directory and catalog entry. Branches remain intact. Cleanup never forces Git removal, discards changes, closes sessions, or removes the primary checkout, main branches, locked worktrees, selected scopes, or open editors.
-
-Cleanup waits for every hosted process and accepted/background operation to retire. Offline GitHub, unknown ownership, pending saves, and older windows or independent editors without directory protection all postpone removal. Inactive file-list browser tabs can be retired with the removed worktree. An independent ceditor window conservatively protects its original startup folders until that editor process exits, including folders whose startup tabs have since closed.
+Settings → General → **Merged worktrees** is disabled by default. When enabled, sidebar PR refreshes look for GitHub worktrees whose exact branch and current commit were merged, one at a time, and show a notice naming what deleting each would discard, such as uncommitted changes or an ignored `.env`. The worktree, its catalog entry and its branch are always kept: an inventory cannot exclude files another program writes later, so only an explicitly confirmed **Delete worktree** removes it. The daemon refuses automatic-removal requests from older clients. See [Merged worktree notices and ignored files](configuration.md#merged-worktree-notices-and-ignored-files).
 
 Directory protection covers both the pathname and a held directory identity. Moving an open checkout with `git worktree move` preserves its protection, and replacing its old pathname does not bypass the original path lease.
-
-Independent editor detection covers the installed `ceditor` and `ceditor-development` executable names. If Linux hides an executable path, the census checks only its main-thread process name: an editor name postpones cleanup, while an unrelated hardened process does not. Custom-renamed editor binaries are outside this identity contract.
 
 Use matched CLI, UI, daemon, and ceditor builds when enabling this option (wire protocol 66).
 
@@ -486,6 +488,23 @@ belongs to the exact kernel lease owner, process lifetime, boot, and executable;
 it does not depend on the installation pathname. Compatible windows can
 reconnect to a matched daemon, including development builds in their separate
 runtime namespace.
+
+A daemon that takes the fence itself declares it as an admission until its
+listener is ready, and so does a worktree removal that briefly checks the
+running windows. A window opened meanwhile waits for that admission instead of
+reporting an update, then opens normally. If the wait passes two seconds it
+shows a **Starting cagents** notice, which closes when the workspace opens;
+launches that wait together share one notice. A
+daemon that dies during admission releases the waiting window at once, and
+that window starts a daemon itself. The wait is bounded by the daemon's own
+startup allowance plus ten seconds; past that, the window reports that the
+daemon is still starting and offers **Retry**. An exclusive holder without the
+declaration is treated as an update: the reviewed update coordinator, an
+installer's inherited guard, a daemon admitted under one of those, and builds
+that predate the declaration. An update that takes the fence while a window
+is waiting therefore still opens the update progress window. A standalone
+editor does not wait: while a daemon is starting it opens without its folders
+and says they cannot be opened safely yet.
 
 An incompatible window, or an older window without this capability, refuses
 startup before socket or daemon state changes. Close that window through the

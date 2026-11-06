@@ -2,7 +2,7 @@ use std::{
     io::{self, Read},
     net::Shutdown,
     os::unix::net::UnixStream,
-    sync::{Arc, RwLock},
+    sync::{Arc, RwLock, RwLockWriteGuard, TryLockError},
     thread,
     time::{Duration, Instant},
 };
@@ -27,6 +27,8 @@ use super::{
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
+#[cfg(test)]
+mod workspace_progress_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
@@ -146,6 +148,38 @@ fn peer_pid(stream: &UnixStream) -> Option<u32> {
         && credentials.uid == unsafe { libc::geteuid() }
         && credentials.pid > 0)
         .then_some(credentials.pid as u32)
+}
+
+/// Lifecycle parks without a timer, so a request that removes a retention
+/// exclusion (final Detach, handoff commit, failed startup, unpinned pane) must
+/// wake it. Only terminal data and read traffic is exempt: a request missing
+/// here costs one maintenance pass, while the reverse would strand a worker.
+/// Startup reservations can also drop off the request path, so they wake too.
+fn may_release_retention(request: &ClientRequest) -> bool {
+    !matches!(
+        request,
+        ClientRequest::List
+            | ClientRequest::Input { .. }
+            | ClientRequest::Key { .. }
+            | ClientRequest::Mouse { .. }
+            | ClientRequest::Focus { .. }
+            | ClientRequest::Scroll { .. }
+            | ClientRequest::Resize { .. }
+            | ClientRequest::Paste { .. }
+            | ClientRequest::SetVisibility { .. }
+            | ClientRequest::Snapshot { .. }
+            | ClientRequest::AcknowledgeRedraw { .. }
+            | ClientRequest::TerminalAcknowledge { .. }
+            | ClientRequest::SearchTerminal { .. }
+            | ClientRequest::CopyTerminalSelection { .. }
+            | ClientRequest::ChatCommand { .. }
+            | ClientRequest::ChatVisibility { .. }
+            | ClientRequest::ChatRead { .. }
+            | ClientRequest::ChatAcknowledge { .. }
+            | ClientRequest::ChatList
+            | ClientRequest::ReadWorkspaceModel
+            | ClientRequest::ReadNotifications
+    )
 }
 
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
@@ -285,6 +319,7 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         // it is caught here, so it costs its sender one failed request rather
         // than the connection. The panic hook has already recorded it.
         let request = envelope.request;
+        let releases_retention = may_release_retention(&request);
         // Register even before ordinary exit starts: its writer can enter
         // after process_request releases control, before this reply is queued.
         // The final HostMutex seal closes acquisition before any handler effect.
@@ -295,6 +330,10 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 | ClientRequest::ShutdownTerminal { .. }
                 | ClientRequest::ChatClose { .. }
                 | ClientRequest::ChatCloseRetained { .. }
+                | ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Close(_),
+                    ..
+                }
         ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
@@ -316,6 +355,9 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                 false,
             ))
         });
+        if releases_retention {
+            crate::daemon::wake();
+        }
         match outcome {
             Ok((response, extras, shutdown)) => {
                 let proof = current_proof(&host);
@@ -413,6 +455,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
     if matches!(
         request,
         ClientRequest::BuildInfo
+            | ClientRequest::StartupState
             | ClientRequest::List
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
@@ -485,7 +528,8 @@ fn ensure_startup_recovery_request(
     };
     let inspection = matches!(
         request,
-        ClientRequest::List
+        ClientRequest::StartupState
+            | ClientRequest::List
             | ClientRequest::ChatList
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
@@ -594,6 +638,7 @@ struct TerminalCloseRetirement {
     proof: Arc<HostSessionProof>,
     generation: Result<Option<String>, String>,
     ticket: uuid::Uuid,
+    deadline: Instant,
     _interrupted: ExplicitCloseGuard,
     previous: Option<super::state::Retirement>,
 }
@@ -629,6 +674,53 @@ impl Drop for ExplicitCloseGuard {
     }
 }
 
+/// One close outlasts a slow commit or shared request, then asks for a retry.
+/// The client allows TERMINAL_CLOSE_TIMEOUT, which also covers its teardown.
+const CLOSE_FENCE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Take the writer only while it is free and read the saved pin under it. A
+/// queued writer would hold back every client's input behind the slowest shared
+/// request, and a held one must not wait out another thread's durable commit.
+fn close_fence<'gate>(
+    host: &SharedHost,
+    gate: &'gate RwLock<()>,
+    terminal: crate::model::TerminalId,
+    deadline: Instant,
+) -> Result<(RwLockWriteGuard<'gate, ()>, Result<Option<String>, String>), ProtocolError> {
+    let registry = super::agent_execution::registry(host);
+    loop {
+        let admission = match gate.try_write() {
+            Ok(admission) => Some(admission),
+            Err(TryLockError::Poisoned(poisoned)) => Some(poisoned.into_inner()),
+            Err(TryLockError::WouldBlock) => None,
+        };
+        if let Some(admission) = admission {
+            let registry = match &registry {
+                Ok(registry) => registry,
+                Err(cause) => return Ok((admission, Err(cause.clone()))),
+            };
+            let pin = match registry.try_lock() {
+                Ok(registry) => Some(registry.retention_pin_generation(terminal)),
+                Err(TryLockError::Poisoned(poisoned)) => {
+                    Some(poisoned.into_inner().retention_pin_generation(terminal))
+                }
+                Err(TryLockError::WouldBlock) => None,
+            };
+            if let Some(pin) = pin {
+                return Ok((admission, pin));
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::TerminalUnavailable,
+                "Cagents is busy; retry closing this terminal",
+                true,
+            ));
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+}
+
 /// The caller dropped its shared reader. Drain earlier publications and reserve
 /// this exact owner under the writer BEFORE any destructive close or cache release.
 fn reserve_terminal_close(
@@ -640,7 +732,8 @@ fn reserve_terminal_close(
     generation: Result<Option<String>, String>,
 ) -> Result<TerminalCloseRetirement, ProtocolError> {
     let gate = control_gate(host);
-    let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
+    let deadline = Instant::now() + CLOSE_FENCE_BUDGET;
+    let (_admission, current) = close_fence(host, &gate, terminal, deadline)?;
     ensure_terminal_close_open(host)?;
     let unavailable =
         |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
@@ -649,7 +742,7 @@ fn reserve_terminal_close(
             "Saved terminal ownership was unknown before close: {cause}"
         ))
     })?;
-    let current = retention_pin_generation(host, terminal).map_err(|cause| {
+    let current = current.map_err(|cause| {
         unavailable(format!(
             "Saved terminal ownership cannot be revalidated before close: {cause}"
         ))
@@ -711,6 +804,7 @@ fn reserve_terminal_close(
             proof: state.proof_handle(),
             generation,
             ticket: entry.ticket,
+            deadline,
             _interrupted: ExplicitCloseGuard {
                 host: Arc::downgrade(host),
                 terminal,
@@ -745,8 +839,6 @@ fn finish_terminal_close(
         }
         crate::terminal::TerminalRetirement::Retained(error) => Err(error),
     };
-    let gate = control_gate(host);
-    let _admission = gate.write().unwrap_or_else(|p| p.into_inner());
     let error = |message| ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true);
     if let Err(message) = result {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -759,17 +851,18 @@ fn finish_terminal_close(
         }
         return Err(error(message));
     }
+    let gate = control_gate(host);
+    let (mut admission, current) = close_fence(host, &gate, close.terminal, close.deadline)?;
     ensure_terminal_close_open(host)?;
     // None is a known unpinned local window, not an unavailable Registry.
     // The writer also drains publications that passed their initial check
-    // before our reservation. It fences local/shared edits through the final
-    // removal and conditional generation DELETE.
+    // before our reservation. It fences local/shared edits through removal.
     let captured = close.generation.as_ref().map_err(|cause| {
         error(format!(
             "Saved terminal ownership was unknown before close: {cause}"
         ))
     })?;
-    let current = retention_pin_generation(host, close.terminal).map_err(|cause| {
+    let current = current.map_err(|cause| {
         error(format!(
             "Saved terminal ownership cannot be revalidated: {cause}"
         ))
@@ -786,6 +879,9 @@ fn finish_terminal_close(
         ));
     }
     if let Ok(Some(generation)) = &close.generation {
+        // This commit runs outside the writer. The DELETE fences itself on the
+        // generation, and the fresh read below refuses any newer publication.
+        drop(admission);
         let result = super::agent_execution::registry(host).and_then(|registry| {
             registry
                 .lock()
@@ -806,6 +902,19 @@ fn finish_terminal_close(
             }
             return Err(error(message));
         }
+        let (fenced, current) = close_fence(host, &gate, close.terminal, close.deadline)?;
+        admission = fenced;
+        ensure_terminal_close_open(host)?;
+        let current = current.map_err(|cause| {
+            error(format!(
+                "Saved terminal ownership cannot be revalidated: {cause}"
+            ))
+        })?;
+        if current.is_some() {
+            return Err(error(
+                "Saved terminal ownership changed during close; retry the retained result".into(),
+            ));
+        }
     }
     let retired = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -822,6 +931,7 @@ fn finish_terminal_close(
     };
     let retired =
         retired.ok_or_else(|| error("The exact closed terminal is no longer available".into()))?;
+    drop(admission);
     drop(retired);
     crate::daemon::wake();
     Ok(())
@@ -906,7 +1016,12 @@ pub(super) fn process_request(
             ensure_control_open(host)?;
             super::agent_execution::terminals::admit(host, client_id, &request)?;
         }
-        let reservation = super::account_lifecycle::Reservation::for_operation(host, operation)?;
+        let reservation = match operation {
+            crate::account::remote::Operation::Restore { .. } => {
+                super::account_lifecycle::reserve_restore(host, operation)?
+            }
+            _ => super::account_lifecycle::Reservation::for_operation(host, operation)?,
+        };
         let value = crate::account::remote::execute_reserved(operation.clone(), &reservation)
             .map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
@@ -1106,9 +1221,14 @@ pub(super) fn process_request(
             authority,
             operation,
         } => {
-            let reply =
-                super::agent_execution::process(host, authority, operation).map_err(|message| {
-                    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            let reply = super::agent_execution::process_request(host, authority, operation)
+                .map_err(|error| match error {
+                    crate::agent_execution::AcceptanceError::Invalid(message) => {
+                        ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+                    }
+                    crate::agent_execution::AcceptanceError::MailboxFull(message) => {
+                        ProtocolError::new(ProtocolErrorCode::QueueFull, message, true)
+                    }
                 })?;
             Ok((ServerResponse::Agent(reply), Vec::new(), false))
         }
@@ -1166,22 +1286,38 @@ pub(super) fn process_request(
                 ));
             }
             if presence.application == crate::notifications::Application::Cagents {
-                let registry = {
+                let (registry, unclaimed) = {
                     let state = host.lock().unwrap_or_else(|p| p.into_inner());
                     state.ensure_retention_available(&presence.sessions)?;
-                    state.execution_registry.clone()
+                    (
+                        state.execution_registry.clone(),
+                        state.notification_sessions_unclaimed(&presence),
+                    )
                 };
                 // The shared control reader spans selection and publication;
                 // automatic cleanup takes its writer before reserving an ID.
-                // Disconnect is not card closure, so these pins are durable.
+                // Disconnect is not card closure, so these pins outlive it.
                 if let Some(registry) = registry {
-                    registry
-                        .lock()
-                        .unwrap_or_else(|p| p.into_inner())
-                        .pin_window_terminals(&presence.sessions)
-                        .map_err(|message| {
-                            ProtocolError::new(ProtocolErrorCode::Internal, message, true)
-                        })?;
+                    let internal =
+                        |message| ProtocolError::new(ProtocolErrorCode::Internal, message, true);
+                    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                    // Windows republish on any workspace change. Only a new
+                    // claim, or a pin that a close removed, needs a write, and
+                    // rotating any other would refuse its close in progress.
+                    let mut claims = unclaimed;
+                    for terminal in &presence.sessions {
+                        if !claims.contains(terminal)
+                            && registry
+                                .retention_pin_generation(*terminal)
+                                .map_err(internal)?
+                                .is_none()
+                        {
+                            claims.push(*terminal);
+                        }
+                    }
+                    if !claims.is_empty() {
+                        registry.pin_window_terminals(&claims).map_err(internal)?;
+                    }
                 }
                 // Missing Registry keeps the old UI delivery behavior. The
                 // automatic census separately refuses unknown ownership.
@@ -1267,6 +1403,15 @@ pub(super) fn process_request(
             ServerResponse::BuildInfo {
                 version: crate::VERSION.into(),
             },
+            Vec::new(),
+            false,
+        )),
+        ClientRequest::StartupState => Ok((
+            ServerResponse::StartupState(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .startup_state(),
+            ),
             Vec::new(),
             false,
         )),
@@ -1382,24 +1527,15 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .watch_model(client_id)?;
+            let model = super::workspace::snapshot(host, Some(client_id))?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::ReadWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .read_model()?;
+            let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .edit_model(client_id, edit)?;
+            let model = super::workspace::edit(host, client_id, edit)?;
             crate::daemon::wake();
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
@@ -2126,7 +2262,7 @@ fn write_failure(error: &FrameError) -> String {
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::host) mod tests {
     use super::*;
     use crate::model::TerminalId;
 
@@ -2866,6 +3002,133 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn close_waits_beside_other_clients_input_instead_of_ahead_of_it() {
+        let (host, _directory, session, handle) = retention_client_host("close-fence");
+        let id = session.id;
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let pin = retention_pin_generation(&host, id);
+        assert!(pin.as_ref().unwrap().is_some());
+        handle.shutdown().unwrap();
+        let gate = control_gate(&host);
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        let input_can_enter = || {
+            (0..500).any(|_| {
+                thread::sleep(Duration::from_millis(1));
+                gate.try_read().is_ok()
+            })
+        };
+        let slow_request = gate.read().unwrap();
+        let worker = {
+            let (host, handle) = (host.clone(), handle.clone());
+            thread::spawn(move || finish_test_terminal_close(&host, id, &handle, pin))
+        };
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            input_can_enter(),
+            "close queued ahead of other clients' input"
+        );
+        let slow_commit = registry.lock().unwrap();
+        drop(slow_request);
+        thread::sleep(Duration::from_millis(50));
+        assert!(
+            input_can_enter(),
+            "close held the writer while another thread committed"
+        );
+        drop(slow_commit);
+        worker.join().unwrap().unwrap();
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+        assert_eq!(retention_pin_generation(&host, id), Ok(None));
+    }
+
+    #[test]
+    fn a_close_refused_after_removing_its_pin_can_retry() {
+        let (host, _directory, session, handle) = retention_client_host("close-refused");
+        let id = session.id;
+        process_request(
+            &host,
+            1,
+            ClientRequest::NotificationPresence {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let pin = retention_pin_generation(&host, id);
+        handle.shutdown().unwrap();
+        let gate = control_gate(&host);
+        let slow_request = gate.read().unwrap();
+        let refusal = close_fence(&host, &gate, id, Instant::now()).unwrap_err();
+        assert_eq!(refusal.code, ProtocolErrorCode::TerminalUnavailable);
+        assert!(refusal.retryable);
+        drop(slow_request);
+
+        let source = host.lock().unwrap().terminals[&id].session.clone();
+        let close = reserve_terminal_close(&host, id, &handle, &source, None, pin.clone()).unwrap();
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .forget_retention_pin(id, pin.as_ref().unwrap().as_ref().unwrap())
+            .unwrap();
+        drop(close);
+        assert!(host.lock().unwrap().terminals.contains_key(&id));
+
+        finish_test_terminal_close(&host, id, &handle, Ok(None)).unwrap();
+        assert!(!host.lock().unwrap().terminals.contains_key(&id));
+    }
+
+    #[test]
+    fn republishing_a_window_writes_only_new_or_restored_claims() {
+        let (host, _directory, session, _handle) = retention_client_host("republish");
+        let id = session.id;
+        host.lock().unwrap().register_client(7);
+        process_request(
+            &host,
+            7,
+            ClientRequest::WatchNotifications {
+                presence: terminal_presence(id),
+            },
+        )
+        .unwrap();
+        let publish = |presence| {
+            process_request(&host, 1, ClientRequest::NotificationPresence { presence }).unwrap();
+        };
+        let claimed = retention_pin_generation(&host, id);
+        assert!(claimed.as_ref().unwrap().is_some());
+        publish(terminal_presence(id));
+        assert_eq!(retention_pin_generation(&host, id), claimed);
+
+        // Adding a card leaves the existing claim, so its close can proceed,
+        // and dropping that card again claims nothing new.
+        let other = TerminalId::new();
+        let mut both = terminal_presence(id);
+        both.sessions.push(other);
+        publish(both);
+        assert_eq!(retention_pin_generation(&host, id), claimed);
+        assert!(retention_pin_generation(&host, other).unwrap().is_some());
+        publish(terminal_presence(id));
+        assert_eq!(retention_pin_generation(&host, id), claimed);
+
+        // A close removed this claim while the window still reports the card.
+        super::super::agent_execution::registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .forget_retention_pin(id, claimed.as_ref().unwrap().as_ref().unwrap())
+            .unwrap();
+        publish(terminal_presence(id));
+        let restored = retention_pin_generation(&host, id);
+        assert!(restored.as_ref().unwrap().is_some());
+        assert_ne!(restored, claimed);
     }
 
     #[test]
@@ -3863,7 +4126,10 @@ mod tests {
     }
 
     #[test]
-    fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+    pub(in crate::host) fn slow_chat_close_allows_list_but_fences_upgrade_and_shutdown() {
+        if !super::super::state::tests::upgrade_fixture_in_fresh_process() {
+            return;
+        }
         use crate::{
             agent::Provider,
             chat::{
@@ -4405,6 +4671,217 @@ mod tests {
             super::super::state::HostState::new(proof.clone()),
         ));
         (proof, host)
+    }
+
+    #[test]
+    fn agent_close_reply_drains_before_ordinary_exit_seals_delivery() {
+        use crate::agent_execution::{
+            Destination, Operation, Origin, Reply, Spec, Submit, Surface, Target,
+        };
+        use std::sync::mpsc;
+        let name = thread::current().name().unwrap().to_owned();
+        let Some(_root) = super::super::exit_drain_tests::private_runtime_case(&name, None) else {
+            return;
+        };
+        thread_local! {
+            static PAUSE: std::cell::RefCell<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>> =
+                const { std::cell::RefCell::new(None) };
+        }
+        fn close_then_pause(
+            host: &SharedHost,
+            client: ClientId,
+            request: ClientRequest,
+        ) -> Result<RequestOutcome, ProtocolError> {
+            let result = process_request(host, client, request);
+            if matches!(&result, Ok((ServerResponse::Agent(crate::agent_execution::Reply::Closed(agent)), _, _)) if agent.closed)
+            {
+                PAUSE.with(|pause| {
+                    let (closed, resume) = pause.borrow_mut().take().unwrap();
+                    closed.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(5)).unwrap();
+                });
+            }
+            result
+        }
+        fn send(
+            stream: &mut UnixStream,
+            proof: &HostSessionProof,
+            request_id: u64,
+            request: ClientRequest,
+        ) {
+            FrameCodec::new(MAX_CLIENT_FRAME_BYTES)
+                .write(
+                    stream,
+                    &ClientEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id,
+                        proof: Some(proof.clone()),
+                        request,
+                    },
+                )
+                .unwrap();
+        }
+        fn reply(stream: &mut UnixStream, request_id: u64) -> ServerMessage {
+            let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+            loop {
+                let envelope = codec
+                    .read::<ServerEnvelope>(stream)
+                    .unwrap()
+                    .expect("Agent Close reply was lost before delivery drained");
+                if envelope.request_id == Some(request_id) {
+                    return envelope.message;
+                }
+            }
+        }
+        let (proof, host) = panic_test_host("agent-close-reply-custody");
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().canonicalize().unwrap();
+        let mut registry =
+            super::super::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        registry
+            .apply(&crate::workspace_model::ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "Close fixture".into(),
+                kind: crate::model::ProjectKind::Folder,
+            })
+            .unwrap();
+        // Accept a fixture-owned pending run without dispatching any actor.
+        // Close still crosses the real origin/ownership checks and durable
+        // terminal-state transition, and may release the last run owner.
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: None,
+                    destination: Destination::New(Spec {
+                        provider: crate::agent::Provider::Claude,
+                        account: None,
+                        target: Target {
+                            repository: repository.clone(),
+                            directory: repository,
+                            placement: None,
+                        },
+                        surface: Surface::Chat,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Never dispatched".into(),
+                    idempotency_key: "close-reply-fixture".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let agent = accepted.agent.id;
+        host.lock().unwrap().install_model(registry);
+        let (mut stream, server_stream) = UnixStream::pair().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let (closed_tx, closed_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let serving_host = Arc::clone(&host);
+        let serving = thread::spawn(move || {
+            PAUSE.with(|pause| *pause.borrow_mut() = Some((closed_tx, resume_rx)));
+            serve_with(server_stream, 1, serving_host, close_then_pause);
+        });
+        send(
+            &mut stream,
+            &proof,
+            1,
+            ClientRequest::Connect {
+                expected_host: Some(proof.clone()),
+                resume: Vec::new(),
+            },
+        );
+        assert!(matches!(
+            reply(&mut stream, 1),
+            ServerMessage::Response {
+                response: ServerResponse::Connected { .. }
+            }
+        ));
+        send(
+            &mut stream,
+            &proof,
+            2,
+            ClientRequest::Agent {
+                authority: crate::agent_execution::Authority::default(),
+                operation: Operation::Close(crate::model::AgentId::new()),
+            },
+        );
+        assert!(matches!(reply(&mut stream, 2), ServerMessage::Error(_)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+            assert!(
+                Instant::now() < deadline,
+                "refused Agent Close leaked reply custody"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        send(
+            &mut stream,
+            &proof,
+            3,
+            ClientRequest::Agent {
+                authority: crate::agent_execution::Authority::default(),
+                operation: Operation::Close(agent),
+            },
+        );
+        closed_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let registry = super::super::agent_execution::registry(&host).unwrap();
+        assert!(registry.lock().unwrap().agent(agent).unwrap().closed);
+        assert_eq!(
+            registry
+                .lock()
+                .unwrap()
+                .agent_run(accepted.run.id)
+                .unwrap()
+                .state,
+            crate::agent_execution::State::Cancelled
+        );
+        let drain = super::super::begin_ordinary_exit(&host).unwrap();
+        assert!(drain.try_seal_absence());
+        let mut cleanup_error = None;
+        assert!(host.lock().unwrap().ordinary_exit_cleanup_blocked());
+        assert!(!super::super::finish_shutdown_owners(
+            &host,
+            &mut cleanup_error,
+            false
+        ));
+        resume_tx.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while host.lock().unwrap().ordinary_exit_cleanup_blocked() {
+            assert!(
+                Instant::now() < deadline,
+                "Agent Close reply guard did not release"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(super::super::finish_shutdown_owners(
+            &host,
+            &mut cleanup_error,
+            false
+        ));
+        assert!(cleanup_error.is_none());
+        let deliveries = {
+            let mut state = host.lock().unwrap();
+            assert!(drain.try_seal_absence());
+            state.close_ordinary_exit_registration()
+        };
+        super::super::close_shutdown_deliveries(&host, &deliveries);
+        assert!(matches!(reply(&mut stream, 3), ServerMessage::Response {
+            response: ServerResponse::Agent(Reply::Closed(closed)),
+        } if closed.id == agent && closed.closed));
+        let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
+        while let Some(envelope) = codec.read::<ServerEnvelope>(&mut stream).unwrap() {
+            assert_eq!(envelope.request_id, None);
+            assert!(matches!(envelope.message, ServerMessage::HostShuttingDown));
+        }
+        serving.join().unwrap();
+        assert!(!host.lock().unwrap().ordinary_exit_cleanup_blocked());
     }
 
     /// The host mutex panics when its holder locks it again, on the promise

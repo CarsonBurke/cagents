@@ -24,8 +24,10 @@ use crate::{
     workspace_model::{ModelChannel, ModelEdit, ModelProject, WorkspaceModel},
 };
 
+mod archived_history;
 mod automation_attention;
 mod automation_audit;
+pub(super) use archived_history::ArchivedHistory;
 pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomationAttention};
 pub(super) mod automation_notifications;
 pub(super) mod automation_proposal_notifications;
@@ -48,6 +50,8 @@ mod schema;
 mod terminal_owners;
 mod terminal_retention;
 mod views;
+#[cfg(test)]
+mod workspace_snapshot_tests;
 
 const SCHEMA_VERSION: u32 = 24;
 
@@ -59,10 +63,44 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
+/// Test pause points for interleaving another writer with `apply`/`model`.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Pause {
+    SequenceRead,
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAUSE: std::cell::RefCell<Option<(Pause, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once, the next time this thread reaches `at`.
+#[cfg(test)]
+pub(super) fn pause_at(at: Pause, hook: impl FnOnce() + 'static) {
+    PAUSE.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
+}
+
+#[cfg(test)]
+fn pause(at: Pause) {
+    let hook = PAUSE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.take_if(|(point, _)| *point == at)
+    });
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
 /// The outcome of one edit.
 #[derive(Debug)]
 pub(crate) struct Applied {
     pub(crate) model: WorkspaceModel,
+    /// This transaction's sequence, even if another writer commits before the
+    /// response snapshot is read. Only this sequence labels the edit's edge.
+    pub(crate) sequence: u64,
     /// Whether the edit changed anything. A retitle to the same title, or a
     /// delete of a channel that is already gone, must neither bump `sequence`
     /// nor wake a watcher: a window that reacted to it would redraw for nothing
@@ -101,6 +139,15 @@ impl Registry {
 
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Independent execution and workspace writers can commit between SQL
+        // statements. Pin one WAL snapshot for metadata and every model table.
+        let snapshot = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let model = self.model_snapshot()?;
+        snapshot.commit().map_err(|e| e.to_string())?;
+        Ok(model)
+    }
+
+    fn model_snapshot(&self) -> Result<WorkspaceModel, String> {
         let (identity, sequence) = self
             .db
             .query_row(
@@ -109,6 +156,8 @@ impl Registry {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        pause(Pause::SequenceRead);
         let identity = identity.parse::<Uuid>().map_err(|error| {
             format!("stored registry identity `{identity}` is unreadable: {error}")
         })?;
@@ -446,9 +495,19 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        let sequence = transaction
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())? as u64;
+        #[cfg(test)]
+        pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        pause(Pause::AfterCommit);
         Ok(Applied {
             model: self.model()?,
+            sequence,
             changed,
         })
     }
@@ -859,6 +918,94 @@ mod tests {
             })
             .unwrap();
         assert!(registry.model().unwrap().navigation_orders.is_empty());
+    }
+
+    #[test]
+    fn a_noop_drag_keeps_new_channels_above_saved_order_in_fold_peers_and_restart() {
+        use crate::workspace_model::NavigationItem;
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("navigation.sqlite3");
+        let mut registry = Registry::at(&database).unwrap();
+        registry.apply(&open("/repo")).unwrap();
+        let old = ChannelId::new();
+        registry
+            .apply(&create(old, "/repo", "Saved conversation"))
+            .unwrap();
+        let worktree = NavigationItem::Worktree("/repo".into());
+        let old = NavigationItem::Channel(old);
+        let manual = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: worktree.clone(),
+            before: Some(old.clone()),
+            fallback: vec![old.clone(), worktree.clone()],
+        };
+        let saved = registry.apply(&manual).unwrap().model;
+        assert_eq!(
+            saved.navigation_orders[0].items,
+            vec![worktree.clone(), old.clone()]
+        );
+        let newest = ChannelId::new();
+        let create = create(newest, "/repo", "New conversation");
+        let created = registry.apply(&create).unwrap().model;
+        let newest = NavigationItem::Channel(newest);
+        let added_worktree = NavigationItem::Worktree("/repo/.worktrees/new".into());
+        // This is precisely the visible list after creation. Dropping W before
+        // its existing next sibling O is visually unchanged, including N above.
+        let visible = vec![
+            newest.clone(),
+            worktree.clone(),
+            old.clone(),
+            added_worktree.clone(),
+        ];
+        let drag = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: worktree.clone(),
+            before: Some(old.clone()),
+            fallback: visible.clone(),
+        };
+        let applied = registry.apply(&drag).unwrap();
+        assert_eq!(applied.model.navigation_orders[0].items, visible);
+        assert_eq!(
+            applied.model.channels, created.channels,
+            "drag changes no channel identity, title or rank"
+        );
+        let mut folded = saved;
+        folded.fold(created.sequence, &create);
+        folded.fold(applied.model.sequence, &drag);
+        assert_eq!(folded.navigation_orders, applied.model.navigation_orders);
+        let repeated = registry.apply(&drag).unwrap();
+        assert!(!repeated.changed);
+        assert_eq!(repeated.model.sequence, applied.model.sequence);
+        let mut peer = Registry::at(&database).unwrap();
+        assert_eq!(
+            peer.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        drop(registry);
+        let mut registry = Registry::at(&database).unwrap();
+        assert_eq!(
+            registry.model().unwrap().navigation_orders,
+            applied.model.navigation_orders
+        );
+        // An intentional later move of N is still authoritative.
+        let move_newest = ModelEdit::ReorderNavigation {
+            repository: "/repo".into(),
+            source: newest.clone(),
+            before: None,
+            fallback: visible,
+        };
+        let moved = registry.apply(&move_newest).unwrap();
+        assert!(moved.changed);
+        assert_eq!(
+            moved.model.navigation_orders[0].items,
+            vec![worktree, old, added_worktree, newest]
+        );
+        folded.fold(moved.model.sequence, &move_newest);
+        assert_eq!(folded.navigation_orders, moved.model.navigation_orders);
+        assert_eq!(
+            peer.model().unwrap().navigation_orders,
+            moved.model.navigation_orders
+        );
     }
 
     #[test]

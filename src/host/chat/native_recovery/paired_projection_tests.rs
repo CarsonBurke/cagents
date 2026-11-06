@@ -132,6 +132,50 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
 }
 
 #[test]
+fn ordinary_close_retires_paired_owner_after_local_protocol_failure() {
+    if isolated("ordinary_close_retires_paired_owner_after_local_protocol_failure") {
+        return;
+    }
+    let fixture = Fixture::new();
+    restore(&fixture.host, CLIENT, &fixture.source).unwrap();
+    let (source, actor) = {
+        let state = fixture.host.lock().unwrap();
+        let record = &state.chats[&fixture.source.id];
+        (record.session.clone(), record.handle.clone())
+    };
+    wait_durable(&actor);
+    fs::write(fixture.root.join("fail-next-request"), []).unwrap();
+    actor.command(crate::chat::Command::Refresh).unwrap();
+    wait_until(
+        || actor.is_completed(),
+        "failed local attachment never finished teardown",
+    );
+    assert!(actor.failure().is_some());
+    assert!(actor.owns_work(), "failure must retain recovery ownership");
+    fixture.assert_one_provider();
+    // An unattached retained-close request cannot bypass the hosted actor,
+    // even after a protocol failure. Ordinary close joins that exact actor
+    // and proves its provider teardown before cleaning the paired terminal.
+    assert_eq!(
+        crate::host::chat::close_retained_native(&fixture.host, &source).unwrap_err(),
+        "The native actor still owns work; use its existing close path"
+    );
+    let response = crate::host::chat::process(
+        &fixture.host,
+        CLIENT,
+        crate::terminal::ipc::ClientRequest::ChatClose { chat_id: source.id },
+    )
+    .unwrap();
+    assert!(matches!(response, ServerResponse::ChatClosed { .. }));
+    assert!(actor.failure().is_some(), "close must retain the diagnosis");
+    assert!(!fixture.native.root.is_current());
+    let state = fixture.host.lock().unwrap();
+    assert!(!state.chats.contains_key(&source.id));
+    assert!(!state.terminals.contains_key(&source.id));
+    assert!(!state.native_closing.contains_key(&source.id));
+}
+
+#[test]
 fn retained_close_refuses_changed_pair_fields_and_unissued_sources() {
     if isolated("retained_close_refuses_changed_pair_fields_and_unissued_sources") {
         return;
@@ -449,6 +493,99 @@ fn refused_source_update_ack_preserves_exact_holder_thread_and_provider() {
     assert_eq!(
         fs::read_to_string(fixture.root.join("provider-launches")).unwrap(),
         "launch\n"
+    );
+}
+
+#[test]
+fn final_retirement_reservation_defers_adoption_without_releasing_original_provider() {
+    if isolated("final_retirement_reservation_defers_adoption_without_releasing_original_provider")
+    {
+        return;
+    }
+    let fixture = Fixture::new();
+    let raw = fixture.raw();
+    let id = fixture.source.id;
+    let reserved_worker = fixture.worker.clone();
+    let ticket = std::sync::Arc::new(std::sync::Mutex::new(None));
+    struct ReservationCleanup<'a> {
+        fixture: &'a Fixture,
+        ticket: std::sync::Arc<std::sync::Mutex<Option<uuid::Uuid>>>,
+    }
+    impl Drop for ReservationCleanup<'_> {
+        fn drop(&mut self) {
+            let ticket = *self.ticket.lock().unwrap_or_else(|p| p.into_inner());
+            let mut state = self.fixture.host.lock().unwrap_or_else(|p| p.into_inner());
+            let id = self.fixture.source.id;
+            if state.terminal_retirements.get(&id).is_some_and(|entry| {
+                Some(entry.ticket) == ticket && entry.handle.same_worker(&self.fixture.worker)
+            }) {
+                state.terminal_retirements.remove(&id);
+            }
+        }
+    }
+    let _reservation_cleanup = ReservationCleanup {
+        fixture: &fixture,
+        ticket: ticket.clone(),
+    };
+    let hook_ticket = ticket.clone();
+    let _hook = before_publication_for_test(move |host| {
+        // Enter the real exact-worker reservation after the holder acknowledged
+        // its projected source, while the native attachment is uncommitted.
+        let mut state = host.lock().unwrap();
+        assert!(state.terminals[&id].handle.same_worker(&reserved_worker));
+        assert!(!state.terminal_retirements.contains_key(&id));
+        let reservation = crate::host::state::Retirement::submitting(reserved_worker);
+        *hook_ticket.lock().unwrap() = Some(reservation.ticket);
+        assert!(state.terminal_retirements.insert(id, reservation).is_none());
+    });
+    let refusal = restore(&fixture.host, CLIENT, &fixture.source).unwrap_err();
+    assert_eq!(
+        refusal,
+        "Native adoption changed before attachment publication"
+    );
+    fixture.assert_unpublished_and_preserved();
+    assert_eq!(fixture.raw(), raw, "refusal must not rewrite raw custody");
+    let (acknowledged, exited) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert!(!exited);
+    assert_eq!(acknowledged.source.proof.as_ref(), Some(&fixture.proof));
+    assert_eq!(
+        acknowledged.source.terminal.as_ref(),
+        Some(
+            &fixture
+                .host
+                .lock()
+                .unwrap()
+                .native_terminal_projection(id)
+                .unwrap()
+        )
+    );
+    assert_eq!(
+        acknowledged.paired_holder.as_ref(),
+        fixture.worker.holder_identity()
+    );
+    {
+        let mut state = fixture.host.lock().unwrap();
+        assert!(state.ensure_retention_available(&[id]).is_err());
+        let reservation = &state.terminal_retirements[&id];
+        assert_eq!(Some(reservation.ticket), *ticket.lock().unwrap());
+        assert!(reservation.handle.same_worker(&fixture.worker));
+        let reservation = state.terminal_retirements.remove(&id).unwrap();
+        assert!(reservation.handle.same_worker(&fixture.worker));
+        assert!(state.ensure_retention_available(&[id]).is_ok());
+    }
+    // Clearing that exact reservation permits the same issued source to attach;
+    // no replacement provider, new thread, or invented ownership is needed.
+    restore(&fixture.host, CLIENT, &fixture.source).unwrap();
+    crate::host::chat::process(
+        &fixture.host,
+        CLIENT,
+        crate::terminal::ipc::ClientRequest::ChatClose { chat_id: id },
+    )
+    .unwrap();
+    wait_until(
+        || !fixture.native.root.is_current(),
+        "ordinary close after deferred adoption did not retire original provider",
     );
 }
 
@@ -1285,6 +1422,13 @@ fn provider() {
             let frame: Value = serde_json::from_str(text).unwrap();
             let Some(id) = frame.get("id") else { continue };
             let method = frame["method"].as_str().unwrap();
+            if method == "thread/read" && root.join("fail-next-request").exists() {
+                fs::remove_file(root.join("fail-next-request")).unwrap();
+                websocket
+                    .send(tungstenite::Message::Binary(Vec::new().into()))
+                    .unwrap();
+                continue;
+            }
             let mut log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)

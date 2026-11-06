@@ -1,4 +1,66 @@
 // Included in the existing Registry automation tests; no provider or shell runs.
+#[test]
+fn precheck_retirement_distinguishes_pending_acknowledged_pruned_and_protected_owners() {
+    use history::PrecheckRetirement;
+    let (mut registry, _directory, definition) = fixture();
+    let automation = registry
+        .create_automation(history_precheck_definition(definition), 1, test_identity())
+        .unwrap();
+    let (_, claim) = history_claim_manual(&mut registry, automation.id, 1, 2);
+    let id = claim.firing.id;
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Protected
+    );
+    history_stop_precheck(&mut registry, &claim.firing, 3, false);
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 2).unwrap(),
+        PrecheckRetirement::Protected
+    );
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::ReleasedPending
+    );
+    registry.db.execute(
+        "INSERT INTO automation_precheck_history_cleanup(firing,revision,evidence) VALUES(?1,2,'retired')",
+        [id.to_string()],
+    ).unwrap();
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Protected
+    );
+    registry
+        .db
+        .execute(
+            "DELETE FROM automation_precheck_history_cleanup WHERE firing=?1",
+            [id.to_string()],
+        )
+        .unwrap();
+    registry
+        .confirm_retired_automation_precheck(id, 1, 4)
+        .unwrap();
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Acknowledged
+    );
+    registry
+        .remove_automation(automation.id, automation.revision, 5)
+        .unwrap();
+    registry
+        .maintain_removed_automation_history(6 + history::REMOVED_TTL_MS)
+        .unwrap();
+    assert_eq!(history_count(&registry, automation.id), 0);
+    assert_eq!(
+        registry.automation_precheck_retirement(id, 1).unwrap(),
+        PrecheckRetirement::Missing
+    );
+    assert_eq!(
+        history_count(&registry, automation.id),
+        0,
+        "observation must not invent an ACK or firing"
+    );
+}
+
 fn history_occurrence(index: u64) -> Occurrence {
     Occurrence {
         due_ms: index * 60_000,
@@ -269,6 +331,177 @@ fn one_hundred_overlaps_keep_waiting_owner_and_one_exact_skip_group_after_reopen
     assert_eq!(
         registry.agent_run(started.id).unwrap().state,
         crate::agent_execution::State::Waiting
+    );
+}
+
+#[test]
+fn skips_from_before_groups_collapse_so_the_waiting_run_stays_on_the_first_page() {
+    use crate::agent_execution::Update;
+    let (mut registry, _directory, mut definition) = fixture();
+    definition.session_mode = SessionMode::Fresh;
+    definition.schedule.pattern = SchedulePattern::Cron {
+        expression: "* * * * *".into(),
+    };
+    definition.schedule.timezone = "UTC".into();
+    let automation = registry
+        .create_automation(definition, 0, test_identity())
+        .unwrap();
+    let enabled = registry
+        .set_automation_enabled(
+            automation.id,
+            automation.revision,
+            Some(history_occurrence(1)),
+            true,
+            1,
+        )
+        .unwrap();
+    let (_, owner) =
+        history_claim_manual(&mut registry, enabled.id, enabled.execution_revision, 100);
+    let accepted = owner.accepted.unwrap();
+    let started = registry
+        .update_agent_run(
+            accepted.run.id,
+            accepted.run.revision,
+            Update::Started {
+                provider_key: "waiting-history".into(),
+            },
+            200,
+        )
+        .unwrap();
+    registry
+        .update_agent_run(started.id, started.revision, Update::Waiting, 300)
+        .unwrap();
+    registry.reconcile_automation_run(started.id, 301).unwrap();
+    let template = history_occurrence(1);
+    let skipped = registry
+        .claim_automation(
+            enabled.id,
+            enabled.execution_revision,
+            Some(&template),
+            crate::automations::Trigger::Scheduled {
+                occurrence: template.clone(),
+            },
+            Some(history_occurrence(2)),
+            false,
+            template.due_ms,
+        )
+        .unwrap();
+    assert!(skipped.accepted.is_none());
+    registry
+        .db
+        .execute(
+            "DELETE FROM automation_firings WHERE id=?1",
+            [skipped.firing.id.to_string()],
+        )
+        .unwrap();
+    // One row per occurrence, as a published daemon wrote them: a weekend of
+    // overlaps with one capacity skip in the middle that must stay its own group.
+    let tx = registry.db.transaction().unwrap();
+    for index in 1..=860 {
+        let occurrence = history_occurrence(index);
+        let mut row = skipped.firing.clone();
+        row.id = Uuid::new_v4();
+        row.trigger = crate::automations::Trigger::Scheduled {
+            occurrence: occurrence.clone(),
+        };
+        row.skip = Some(if index == 430 {
+            crate::automations::SkipReason::Capacity
+        } else {
+            crate::automations::SkipReason::Overlap
+        });
+        row.skipped_occurrences = None;
+        row.created_ms = occurrence.due_ms;
+        row.finished_ms = Some(occurrence.due_ms);
+        insert_firing(&tx, &row, &format!("scheduled:{index}")).unwrap();
+    }
+    tx.commit().unwrap();
+    assert_eq!(history_count(&registry, automation.id), 861);
+
+    registry.maintain_automation_history(60_000_000).unwrap();
+
+    let page = registry
+        .automation_history(Some(automation.id), None, 100)
+        .unwrap();
+    assert!(page.next.is_none());
+    assert_eq!(page.firings.len(), 4);
+    assert!(
+        page.firings
+            .iter()
+            .any(|row| row.id == owner.firing.id && row.state == FiringState::Waiting)
+    );
+    let mut groups: Vec<_> = page
+        .firings
+        .iter()
+        .filter_map(|row| {
+            let group = row.skipped_occurrences.as_ref()?;
+            Some((
+                group.count,
+                group.first_occurrence_ms / 60_000,
+                group.last_occurrence_ms / 60_000,
+            ))
+        })
+        .collect();
+    groups.sort();
+    assert_eq!(groups, [(429, 1, 429), (430, 431, 860)]);
+    assert!(
+        page.firings
+            .iter()
+            .any(|row| row.skip == Some(crate::automations::SkipReason::Capacity)),
+        "another reason breaks the group"
+    );
+    // Later startups have nothing further to join.
+    registry.maintain_automation_history(60_000_001).unwrap();
+    assert_eq!(history_count(&registry, automation.id), 4);
+}
+
+#[test]
+fn a_run_that_left_history_explains_itself_instead_of_a_query_error() {
+    let (registry, _directory, _definition) = fixture();
+    let expected = "This run's details are no longer available. Run history keeps only the most recent entries.";
+    assert_eq!(
+        registry.automation_run_detail(Uuid::new_v4()).err().unwrap(),
+        expected
+    );
+    assert_eq!(
+        registry
+            .automation_detail_for_run(crate::model::RunId::new())
+            .err()
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn a_precheck_launch_that_left_nothing_needs_no_retirement() {
+    use history::PrecheckRetirement;
+    let (mut registry, _directory, definition) = fixture();
+    let automation = registry
+        .create_automation(history_precheck_definition(definition), 0, test_identity())
+        .unwrap();
+    let (_, claim) = history_claim_manual(&mut registry, automation.id, 1, 2);
+    registry
+        .fail_automation_start(claim.firing.id, "Cannot start the precheck".into(), 3, false)
+        .unwrap();
+    assert_eq!(
+        registry
+            .automation_precheck_retirement(claim.firing.id, 1)
+            .unwrap(),
+        PrecheckRetirement::ReleasedPending
+    );
+    registry
+        .confirm_unlaunched_automation_precheck(claim.firing.id, 1, 4)
+        .unwrap();
+    assert_eq!(
+        registry
+            .automation_precheck_retirement(claim.firing.id, 1)
+            .unwrap(),
+        PrecheckRetirement::Acknowledged
+    );
+    assert!(
+        !registry
+            .automation_precheck_retirement(claim.firing.id, 1)
+            .unwrap()
+            .is_protected()
     );
 }
 
@@ -1102,5 +1335,129 @@ fn terminal_prelaunch_failure_and_dispatch_cancellation_prune_newly_eligible_his
             dispatches, 0,
             "neither terminal path may dispatch or require a provider"
         );
+    }
+}
+
+#[test]
+fn scoped_history_prune_work_does_not_grow_with_unrelated_inventory() {
+    use crate::automations::{HISTORY_RETAINED_ROWS, SkipReason, Trigger};
+    use rusqlite::StatementStatus;
+
+    fn seed(tx: &Transaction<'_>, definition: &Definition, count: usize) -> Uuid {
+        let automation =
+            create_automation_in(tx, definition.clone(), 0, test_identity(), None).unwrap();
+        // An unreferenced execution revision makes revision pruning do actual
+        // work, independently of the firing candidate selection.
+        let mut unused = automation.clone();
+        unused.revision = 2;
+        write_revision(tx, &unused).unwrap();
+        for index in 0..count {
+            let request = Uuid::new_v4();
+            let firing = Firing {
+                id: Uuid::new_v4(),
+                automation: automation.id,
+                name: definition.name.clone(),
+                revision: 1,
+                trigger: Trigger::Manual { request },
+                state: FiringState::Skipped,
+                release_pending: false,
+                cancel_requested: false,
+                created_ms: index as u64,
+                started_ms: None,
+                finished_ms: Some(index as u64),
+                agent: None,
+                run: None,
+                skip: Some(SkipReason::Overlap),
+                diagnostic: None,
+                skipped_occurrences: None,
+            };
+            insert_firing(tx, &firing, &occurrence_key(1, &firing.trigger)).unwrap();
+        }
+        automation.id
+    }
+
+    fn scoped_work(registry: &mut Registry, automation: Uuid) -> [i32; 2] {
+        let tx = registry.db.transaction().unwrap();
+        tx.execute_batch("CREATE TEMP TABLE IF NOT EXISTS automation_history_prune(id TEXT PRIMARY KEY); DELETE FROM automation_history_prune;")
+            .unwrap();
+        let work = {
+            // These are the production prepared statements, rather than an
+            // EXPLAIN spelling or a second approximation of the query.
+            let mut candidates = tx.prepare(&history::prune_candidates_sql(true)).unwrap();
+            assert_eq!(
+                candidates
+                    .execute(params![
+                        automation.to_string(),
+                        0,
+                        HISTORY_RETAINED_ROWS - 1
+                    ])
+                    .unwrap(),
+                1
+            );
+            let mut revisions = tx.prepare(&history::prune_revisions_sql(true)).unwrap();
+            assert_eq!(
+                revisions
+                    .execute(params![automation.to_string(), 0])
+                    .unwrap(),
+                1
+            );
+            [
+                candidates.get_status(StatementStatus::VmStep),
+                revisions.get_status(StatementStatus::VmStep),
+            ]
+        };
+        tx.rollback().unwrap();
+        work
+    }
+
+    let (mut registry, _directory, definition) = fixture();
+    let tx = registry.db.transaction().unwrap();
+    let target = seed(&tx, &definition, HISTORY_RETAINED_ROWS);
+    tx.commit().unwrap();
+    let before = scoped_work(&mut registry, target);
+
+    let tx = registry.db.transaction().unwrap();
+    let unrelated: Vec<_> = (0..100).map(|_| seed(&tx, &definition, 100)).collect();
+    tx.commit().unwrap();
+    let after = scoped_work(&mut registry, target);
+    for (statement, (before, after)) in ["firing candidates", "revision deletion"]
+        .into_iter()
+        .zip(before.into_iter().zip(after))
+    {
+        assert!(
+            after <= before + 128,
+            "scoped {statement} visited unrelated inventory: {before} -> {after} VM steps"
+        );
+    }
+
+    history_prune_to(&mut registry, target, HISTORY_RETAINED_ROWS - 1, 1_000);
+    assert_eq!(history_count(&registry, target), HISTORY_RETAINED_ROWS - 1);
+    for &automation in &unrelated {
+        assert_eq!(history_count(&registry, automation), 100);
+        let revisions: usize = registry
+            .db
+            .query_row(
+                "SELECT count(*) FROM automation_revisions WHERE automation=?1",
+                [automation.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            revisions, 2,
+            "a scoped pass cannot prune another definition"
+        );
+    }
+    // Startup still visits every automation and removes its unused revision.
+    registry.maintain_automation_history(1_001).unwrap();
+    let revisions: usize = registry
+        .db
+        .query_row("SELECT count(*) FROM automation_revisions", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(revisions, unrelated.len() + 1);
+    assert_eq!(history_count(&registry, target), HISTORY_RETAINED_ROWS - 1);
+    for automation in unrelated {
+        assert_eq!(history_count(&registry, automation), 100);
     }
 }
