@@ -3550,6 +3550,17 @@ impl Runtime {
 
     /// Whether the composer takes a message now. A first or queued message
     /// still waiting goes before anything else is sent.
+    /// A conversation attached to here whose provider has yet to come up. It
+    /// would refuse a message, so one waits in the composer until it can go.
+    pub(super) fn provider_coming_up(&self) -> bool {
+        !self.is_draft()
+            && self.connected()
+            && !self.snapshot.ready
+            && !self.snapshot.exited
+            && self.snapshot.error.is_none()
+            && self.queued.is_none()
+    }
+
     pub(super) fn composer_available(&self, transitioning: bool) -> bool {
         !transitioning
             && !self.closed_elsewhere
@@ -11217,7 +11228,8 @@ impl Cagents {
                 if !runtime.is_draft()
                     && (runtime.disconnected
                         || runtime.snapshot.exited
-                        || runtime.snapshot.read_only_reason.is_some())
+                        || runtime.snapshot.read_only_reason.is_some()
+                        || runtime.provider_coming_up())
                 {
                     return Task::none();
                 }

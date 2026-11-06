@@ -2132,13 +2132,9 @@ impl Runtime {
                 // of an invitation; the status line is where a state belongs.
                 // A conversation another window started is not asking for a
                 // first message, so it does not invite one while it comes up.
-                let coming_up = !self.is_draft()
-                    && self.connected()
-                    && !self.snapshot.ready
-                    && !self.snapshot.exited;
                 transcript.push(
                     widget::container(
-                        design::body(if coming_up {
+                        design::body(if self.provider_coming_up() {
                             "This conversation is starting."
                         } else {
                             "Your conversation appears here. Send a message to begin."
@@ -3067,7 +3063,8 @@ impl Runtime {
                         design::muted_icon_color
                     }))
                     .on_press_maybe(
-                        (available && has_draft).then(|| action(Action::Submit(target, *mode))),
+                        (available && has_draft && !self.provider_coming_up())
+                            .then(|| action(Action::Submit(target, *mode))),
                     )
                     .into(),
             );

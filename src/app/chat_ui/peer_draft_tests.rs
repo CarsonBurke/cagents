@@ -938,6 +938,34 @@ fn an_answer_to_a_question_that_ended_does_not_answer_the_next() {
     );
 }
 
+/// A window attached to a conversation another window is starting holds its
+/// message rather than sending it to a provider that would refuse it.
+#[test]
+fn a_message_written_while_the_provider_comes_up_waits_in_the_composer() {
+    let mut peer = peer();
+    attached_with_update_pending(&mut peer);
+    let target = {
+        let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+            panic!("expected a chat runtime");
+        };
+        Arc::make_mut(&mut runtime.snapshot).ready = false;
+        runtime.replace_draft(text_editor::Content::with_text("from this window"));
+        runtime.target
+    };
+
+    drop(
+        peer.app
+            .update(Message::ChatUi(Action::Submit(target, PromptMode::Send))),
+    );
+
+    let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
+        panic!("expected a chat runtime");
+    };
+    assert!(runtime.pending.is_none());
+    assert!(runtime.error.is_none());
+    assert_eq!(runtime.unsent_text(), "from this window");
+}
+
 /// A provider coming up and in error is not going to work on anything.
 #[test]
 fn a_provider_that_failed_coming_up_closes_without_asking() {
