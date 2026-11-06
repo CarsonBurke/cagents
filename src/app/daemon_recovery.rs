@@ -281,7 +281,8 @@ fn reconcile_with(
                 continue;
             }
             if let Some(pid) = holder(terminal, kind).map_err(|error| {
-                format!("cannot check for a process behind this terminal: {error}")
+                tracing::warn!(%error, %terminal, "could not read the holder record for Retry");
+                unfinished_check_refusal()
             })? {
                 return Err(format!(
                     "This terminal may still be running in process {pid}, which the daemon isn't showing, {NOTHING_STARTED}: a second copy would run beside it. If you no longer need what it was running, stop that process, then use Retry or Close again. Otherwise leave the pane in place."
@@ -292,9 +293,7 @@ fn reconcile_with(
     if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root)
         .map_err(|error| {
             tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Retry");
-            format!(
-                "Cagents couldn't check every running process, {NOTHING_STARTED}: this terminal may still be running. Try Retry again in a moment. If this keeps happening, leave the pane in place."
-            )
+            unfinished_check_refusal()
         })?
     {
         return Err(survivor_refusal(
@@ -499,6 +498,12 @@ fn prove_not_hosted_at(
 }
 
 const NOTHING_STARTED: &str = "so nothing was started";
+
+fn unfinished_check_refusal() -> String {
+    format!(
+        "Cagents couldn't check every running process, {NOTHING_STARTED}: this terminal may still be running. Try Retry again in a moment. If this keeps happening, leave the pane in place."
+    )
+}
 
 /// A refusal written for the reader. Any other start error is a raw backend
 /// string, which a failed pane doesn't show or copy.
@@ -1201,6 +1206,26 @@ mod tests {
             panic!("nothing should start beside the holder");
         };
         assert!(reason.contains("process 4242"), "{reason}");
+    }
+
+    /// An unreadable holder record is unknown, and its OS error isn't for the reader.
+    #[test]
+    fn retry_says_plainly_when_it_cannot_read_a_holder_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, Vec::new(), 1);
+        let recovered = reconcile_with(original, true, &socket, directory.path(), |_, _| {
+            Err("Permission denied (os error 13)".to_owned())
+        });
+        server.join().unwrap();
+        let Err(reason) = recovered else {
+            panic!("an unreadable record is not an absent one");
+        };
+        assert!(is_retry_refusal(&reason), "{reason}");
+        assert!(!reason.contains("os error"), "{reason}");
     }
 
     /// A completed terminal can still own a native provider, under the same ID.

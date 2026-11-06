@@ -270,15 +270,18 @@ impl State {
 /// publishes names each open pane, so the daemon refuses it until that terminal
 /// has gone. The retry publishes it again, and there's nothing for anyone to do.
 fn presence_refusal_notice(error: &crate::control::ControlError) -> Option<String> {
-    (!matches!(
+    let settles_on_retry = matches!(
         error,
         crate::control::ControlError::Remote {
             code: crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
             retryable: true,
             ..
         }
-    ))
-    .then(|| error.to_string())
+    );
+    if settles_on_retry {
+        tracing::debug!(%error, "presence refused for now; publishing it again");
+    }
+    (!settles_on_retry).then(|| error.to_string())
 }
 
 fn connect() -> Result<ControlClient, String> {

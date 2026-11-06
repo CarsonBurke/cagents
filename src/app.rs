@@ -5932,7 +5932,7 @@ impl Cagents {
                             }
                         }
                     }
-                    let hosted=hosted.ok_or("This shared terminal is disconnected; another client must restore its hosted session")?;
+                    let hosted=hosted.ok_or("This terminal isn't connected. Use Retry or Close on its pane.")?;
                     let proof = client.proof().clone();
                     (daemon_recovery::RecoveredTerminal { session: hosted.session,
                         expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
