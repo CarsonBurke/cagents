@@ -1600,3 +1600,34 @@ fn a_saved_record_with_no_attachment_does_not_update_the_registry() {
         model.views[1].panes[0].kind
     );
 }
+
+/// An ended record is newer than an attachment made before the terminal ended,
+/// so the update stays on its saved base, which the daemon refuses.
+#[test]
+fn an_attachment_is_not_rebased_over_an_ended_registry_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut window, mut model, rx) = window_seeding_a_saved_terminal();
+    let card = window.cached.id;
+    let saved = session(&window.cached);
+    let started = attached(directory.path(), &saved);
+    let live = started.session.clone();
+    window.app.card_state_mut(card).unwrap().kind = CardKind::Terminal(live);
+    window
+        .app
+        .cards
+        .insert(card, CardRuntime::Terminal(started.handle));
+    let mut ended = saved.clone();
+    ended.continuity = TerminalContinuity::RelaunchAvailable {
+        recipe: ended.launch.clone(),
+        last_exit: None,
+    };
+    model.sequence += 1;
+    model.views[1].panes[0].kind = CardKind::Terminal(ended);
+
+    let updates = acknowledge_seed(&mut window, &model, &rx);
+
+    let [(before, _)] = updates.as_slice() else {
+        panic!("expected one update, got {updates:?}");
+    };
+    assert_eq!(before.kind, CardKind::Terminal(saved));
+}

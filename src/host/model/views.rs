@@ -1532,6 +1532,112 @@ mod tests {
         );
     }
 
+    /// A pane under `live_source_pane`'s terminal, attached under another proof.
+    fn attached_under(original: &Pane, host: &str) -> Pane {
+        let mut attached = original.clone();
+        if let CardKind::Terminal(terminal) = &mut attached.kind {
+            terminal.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new(host),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new(host),
+            };
+        }
+        attached
+    }
+
+    /// Commits `advance` through another writer, then applies a stale client's
+    /// update from `original` to `requested`, read before that commit.
+    fn stale_update_after(
+        original: Pane,
+        requested: Pane,
+        advance: impl FnOnce(&mut Registry, ChannelId, &Pane),
+    ) -> (Result<(), String>, Vec<Pane>, Vec<crate::model::CardId>) {
+        let (mut registry, directory, channel, _) = setup();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let mut stale = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: requested,
+            },
+        );
+        let mut writer = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        advance(&mut writer, channel, &original);
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut stale
+        {
+            *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+        }
+        let result = registry.apply(&stale).map(|_| ());
+        let view = read(&registry.db, &Scope::Channel(channel)).unwrap();
+        (result, view.panes, view.retired)
+    }
+
+    #[test]
+    fn a_stale_client_cannot_overwrite_a_newer_attachment() {
+        let original = live_source_pane();
+        let requested = attached_under(&original, "older");
+        let newer = attached_under(&original, "newer");
+        let committed = newer.clone();
+        let (result, panes, _) =
+            stale_update_after(original, requested, |writer, channel, base| {
+                let change = edit(
+                    writer,
+                    channel,
+                    Change::Update {
+                        before: base.clone(),
+                        pane: committed,
+                    },
+                );
+                writer.apply(&change).unwrap();
+            });
+        assert_eq!(result.unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+        assert_eq!(panes, vec![newer]);
+    }
+
+    #[test]
+    fn a_stale_client_cannot_revive_an_ended_terminal() {
+        let original = live_source_pane();
+        let requested = attached_under(&original, "attached");
+        // The terminal reached this proof and then ended, so the requested
+        // record is one the registry has already moved past.
+        let attached = requested.clone();
+        let mut ended = requested.clone();
+        if let CardKind::Terminal(terminal) = &mut ended.kind {
+            terminal.continuity = crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe: terminal.launch.clone(),
+                last_exit: None,
+            };
+        }
+        let committed = ended.clone();
+        let (result, panes, _) =
+            stale_update_after(original, requested, |writer, channel, base| {
+                for (before, pane) in [(base.clone(), attached.clone()), (attached, committed)] {
+                    let change = edit(writer, channel, Change::Update { before, pane });
+                    writer.apply(&change).unwrap();
+                }
+            });
+        assert_eq!(result.unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+        assert_eq!(panes, vec![ended]);
+    }
+
+    #[test]
+    fn a_stale_client_cannot_bring_back_a_retired_terminal() {
+        let original = live_source_pane();
+        let id = original.id;
+        let requested = attached_under(&original, "attached");
+        let (result, panes, retired) =
+            stale_update_after(original, requested, |writer, channel, _| {
+                let change = edit(writer, channel, Change::Remove { id });
+                writer.apply(&change).unwrap();
+            });
+        assert!(result.is_err(), "a retired pane accepted an update");
+        assert!(panes.is_empty(), "the retired pane came back: {panes:?}");
+        assert!(retired.contains(&id));
+    }
+
     #[test]
     fn exact_source_basis_allows_lifecycle_updates_and_durable_replay() {
         let (mut registry, directory, channel, _) = setup();

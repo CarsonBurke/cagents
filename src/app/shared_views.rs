@@ -2536,12 +2536,14 @@ impl Cagents {
 // A layout snapshot can predate a runtime exit. Missing recipe metadata cannot
 // revoke a settled exit for that exact terminal; new identities and live host
 // proofs still adopt normally, as do the incoming launch and other metadata.
-/// `attached` holds a complete live proof for the terminal `shared` records.
+/// `attached` holds a complete live proof for the terminal `shared` records as
+/// still running. An ended record is newer than any attachment made to it.
 fn attached_to_same_terminal(attached: &CardKind, shared: &CardKind) -> bool {
     matches!(
         (attached, shared),
         (CardKind::Terminal(attached), CardKind::Terminal(shared))
             if attached.id == shared.id
+                && shared.continuity.live_proof().is_some()
                 && matches!(attached.continuity, TerminalContinuity::Live { .. })
                 && attached
                     .continuity
