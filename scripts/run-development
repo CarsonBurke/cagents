@@ -307,11 +307,15 @@ if [ "$hot" = true ]; then
     exec "$root/scripts/hot-development" "$@"
 fi
 
+# Only the UI differs between the lanes. The CLI and daemon are built
+# without `full`, which selects the shipped product's application ID, peer
+# package and self-update, none of which a development build uses, so both
+# lanes share one build of each.
 if [ "$browserless" = true ]; then
-    default_features=--no-default-features
+    ui_features='--no-default-features --features development,ui'
     ui_feature=ui
 else
-    default_features=
+    ui_features='--features development,integrated-browser'
     ui_feature=integrated-browser
 fi
 
@@ -352,15 +356,15 @@ build_products() {
     "$@" sh -ec '
         gate=$1
         shift
-        "$gate" build --locked --profile dev-runtime $1 --features development --bin cagents
-        "$gate" build --locked --profile dev-runtime $1 --features development,host --bin cagentsd
-        "$gate" build --locked --profile dev-runtime $1 --features "development,$2" --bin cagents-ui
-        if [ -n "$3" ]; then
+        "$gate" build --locked --profile dev-runtime --no-default-features --features development --bin cagents
+        "$gate" build --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd
+        "$gate" build --locked --profile dev-runtime $1 --bin cagents-ui
+        if [ -n "$2" ]; then
             for executable in cagents cagentsd cagents-ui; do
-                stat -c "%n %i %s %.9Y" "$4/$executable"
-            done >"$3"
+                stat -c "%n %i %s %.9Y" "$3/$executable"
+            done >"$2"
         fi
-    ' build-products "$root/scripts/cargo-gate" "$default_features" "$ui_feature" "${built:-}" "$products"
+    ' build-products "$root/scripts/cargo-gate" "$ui_features" "${built:-}" "$products"
 }
 
 # A launch with nothing to build skips the build gate, whose queue can be long
@@ -521,8 +525,7 @@ run_cli() {
 instance_cli_path() {
     find_products
     if [ ! -x "$products/cagents" ]; then
-        # shellcheck disable=SC2086 # empty when the default features apply
-        "$root/scripts/cargo-gate" build --locked --profile dev-runtime $default_features \
+        "$root/scripts/cargo-gate" build --locked --profile dev-runtime --no-default-features \
             --features development --bin cagents >&2
     fi
     printf '%s\n' "$products/cagents"

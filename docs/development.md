@@ -158,8 +158,10 @@ How the runner works:
 - A launch with nothing to build skips the gate and starts at once, printing
   `The matched set is already built for this checkout; skipping the build.`
   See [Up-to-date launches](#up-to-date-launches).
-- The normal runner enables `integrated-browser` only for the UI; the matched
-  CLI and daemon keep the same full-product identity without resolving Servo.
+- The normal runner enables `integrated-browser` only for the UI. Both lanes
+  build the same CLI and daemon, without `full`: that feature selects the
+  shipped product's application ID, peer package and self-update, none of which
+  a development build uses, so switching lanes rebuilds only the UI.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
   usable performance while the ordinary `dev` profile stays cheap for checks.
 - The development instance has its own application ID, configuration, session

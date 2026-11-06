@@ -766,6 +766,20 @@ exit 83
                      if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
 
+    def test_both_lanes_build_one_cli_and_daemon_and_differ_only_in_the_ui(self):
+        _, browserless = self.launch("--browserless")
+        _, integrated = self.launch()
+        common = "build --locked --profile dev-runtime"
+        self.assertEqual(browserless[:2], [
+            f"{common} --no-default-features --features development --bin cagents",
+            f"{common} --no-default-features --features development,host --bin cagentsd",
+        ])
+        self.assertEqual(integrated[:2], browserless[:2])
+        self.assertEqual(browserless[2:], [
+            f"{common} --no-default-features --features development,ui --bin cagents-ui"])
+        self.assertEqual(integrated[2:], [
+            f"{common} --features development,integrated-browser --bin cagents-ui"])
+
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")
         self.assert_built()
