@@ -49,6 +49,8 @@ mod schema;
 mod terminal_owners;
 mod terminal_retention;
 mod views;
+#[cfg(test)]
+mod workspace_snapshot_tests;
 
 const SCHEMA_VERSION: u32 = 22;
 
@@ -60,10 +62,44 @@ const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
 const DIRECTORY_MODE: u32 = 0o700;
 const FILE_MODE: u32 = 0o600;
 
+/// Test pause points for interleaving another writer with `apply`/`model`.
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq)]
+pub(super) enum Pause {
+    SequenceRead,
+    BeforeCommit,
+    AfterCommit,
+}
+
+#[cfg(test)]
+thread_local! {
+    static PAUSE: std::cell::RefCell<Option<(Pause, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `hook` once, the next time this thread reaches `at`.
+#[cfg(test)]
+pub(super) fn pause_at(at: Pause, hook: impl FnOnce() + 'static) {
+    PAUSE.with(|slot| *slot.borrow_mut() = Some((at, Box::new(hook))));
+}
+
+#[cfg(test)]
+fn pause(at: Pause) {
+    let hook = PAUSE.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        slot.take_if(|(point, _)| *point == at)
+    });
+    if let Some((_, hook)) = hook {
+        hook();
+    }
+}
+
 /// The outcome of one edit.
 #[derive(Debug)]
 pub(crate) struct Applied {
     pub(crate) model: WorkspaceModel,
+    /// This transaction's sequence, even if another writer commits before the
+    /// response snapshot is read. Only this sequence labels the edit's edge.
+    pub(crate) sequence: u64,
     /// Whether the edit changed anything. A retitle to the same title, or a
     /// delete of a channel that is already gone, must neither bump `sequence`
     /// nor wake a watcher: a window that reacted to it would redraw for nothing
@@ -102,6 +138,15 @@ impl Registry {
 
     /// The whole model, ordered by the ranks the registry assigned.
     pub(crate) fn model(&self) -> Result<WorkspaceModel, String> {
+        // Independent execution and workspace writers can commit between SQL
+        // statements. Pin one WAL snapshot for metadata and every model table.
+        let snapshot = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
+        let model = self.model_snapshot()?;
+        snapshot.commit().map_err(|e| e.to_string())?;
+        Ok(model)
+    }
+
+    fn model_snapshot(&self) -> Result<WorkspaceModel, String> {
         let (identity, sequence) = self
             .db
             .query_row(
@@ -110,6 +155,8 @@ impl Registry {
                 |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
             )
             .map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        pause(Pause::SequenceRead);
         let identity = identity.parse::<Uuid>().map_err(|error| {
             format!("stored registry identity `{identity}` is unreadable: {error}")
         })?;
@@ -447,9 +494,19 @@ impl Registry {
                 )
                 .map_err(|error| error.to_string())?;
         }
+        let sequence = transaction
+            .query_row("SELECT sequence FROM metadata WHERE key = 0", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| error.to_string())? as u64;
+        #[cfg(test)]
+        pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
+        #[cfg(test)]
+        pause(Pause::AfterCommit);
         Ok(Applied {
             model: self.model()?,
+            sequence,
             changed,
         })
     }

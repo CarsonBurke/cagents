@@ -235,6 +235,24 @@ enum NativeOwnership {
         crate::daemon::holder_registry::Process,
     ),
 }
+/// Why the provider actor did not queue a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueRefusal {
+    /// The actor has finished or is shutting down.
+    Closed,
+    /// Its command queue is full for now.
+    Full,
+}
+impl From<QueueRefusal> for String {
+    fn from(refusal: QueueRefusal) -> Self {
+        match refusal {
+            QueueRefusal::Closed => "Provider actor is no longer accepting commands",
+            QueueRefusal::Full => "Chat command queue is full",
+        }
+        .into()
+    }
+}
+
 impl LocalHandle {
     #[cfg(test)]
     pub(crate) fn start(
@@ -725,18 +743,21 @@ impl LocalHandle {
     pub(super) fn enqueue_actor(
         &self,
         command: ActorCommand,
-    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, QueueRefusal> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
             || self.0.stop.load(Ordering::Acquire)
         {
-            return Err("Provider actor is no longer accepting commands".into());
+            return Err(QueueRefusal::Closed);
         }
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
             .try_send((command, reply))
-            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) => QueueRefusal::Full,
+                crossbeam_channel::TrySendError::Disconnected(_) => QueueRefusal::Closed,
+            })?;
         self.wake();
         Ok(response)
     }
