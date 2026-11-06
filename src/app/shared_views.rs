@@ -1423,9 +1423,48 @@ impl Cagents {
                 .retain(|(id, _, _)| *id != operation);
         } else {
             self.shared_views.seeding.remove(&scope);
-            self.shared_views.initialized.insert(scope);
+            self.shared_views.initialized.insert(scope.clone());
+            self.rebase_seeded_attachments(&scope);
             // Preserve edits made while the seed snapshot was in flight.
             self.publish_view_changes();
+        }
+    }
+
+    /// A seed's baseline is what this window saved, but the registry keeps the
+    /// panes it already holds. A terminal attached while the seed was in flight
+    /// has proved its same session under the running daemon, so that update is
+    /// based on the registry's record. Based on the saved one it is refused, and
+    /// the record then stays behind the attachment until another window writes.
+    fn rebase_seeded_attachments(&mut self, scope: &Scope) {
+        let local = self.local_views().panes.remove(scope).unwrap_or_default();
+        let Some(view) = self
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == *scope)
+        else {
+            return;
+        };
+        let Some(baseline) = self.shared_views.baseline.get_mut(scope) else {
+            return;
+        };
+        for seeded in baseline {
+            let same_id = |pane: &&Pane| pane.id == seeded.id;
+            let (Some(current), Some(shared)) =
+                (local.iter().find(same_id), view.panes.iter().find(same_id))
+            else {
+                continue;
+            };
+            if current.kind != seeded.kind
+                && current.scope == shared.scope
+                && current.pending_terminal_start == shared.pending_terminal_start
+                && matches!(self.cards.get(&seeded.id), Some(CardRuntime::Terminal(_)))
+                && attached_to_same_terminal(&current.kind, &shared.kind)
+            {
+                seeded.kind = shared.kind.clone();
+                seeded.pending_terminal_start = shared.pending_terminal_start;
+                seeded.scope = shared.scope.clone();
+            }
         }
     }
 
@@ -2497,6 +2536,20 @@ impl Cagents {
 // A layout snapshot can predate a runtime exit. Missing recipe metadata cannot
 // revoke a settled exit for that exact terminal; new identities and live host
 // proofs still adopt normally, as do the incoming launch and other metadata.
+/// `attached` holds a complete live proof for the terminal `shared` records.
+fn attached_to_same_terminal(attached: &CardKind, shared: &CardKind) -> bool {
+    matches!(
+        (attached, shared),
+        (CardKind::Terminal(attached), CardKind::Terminal(shared))
+            if attached.id == shared.id
+                && matches!(attached.continuity, TerminalContinuity::Live { .. })
+                && attached
+                    .continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
+    )
+}
+
 fn preserve_observed_terminal_exit(card: &CardState, incoming: &mut CardKind) {
     let Some(observed) = ended_terminal(Some(card)) else {
         return;

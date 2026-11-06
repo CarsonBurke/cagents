@@ -603,17 +603,25 @@ pub(super) fn apply(
                     // a successor or undo host-owned start/location changes.
                     // Reject the whole edit before recording its operation ID;
                     // the client can refuse source intent and retry presentation
-                    // separately against the authoritative pane.
+                    // separately against the authoritative pane. A source that
+                    // already holds replays nothing: windows reopening together
+                    // all report the same attachment.
                     let source_changed = before.kind != pane.kind
                         || before.pending_terminal_start != pane.pending_terminal_start
                         || before.scope != pane.scope;
+                    let holds =
+                        |current: &crate::workspace_model::views::Pane,
+                         source: &crate::workspace_model::views::Pane| {
+                            current.id == source.id
+                                && current.kind == source.kind
+                                && current.pending_terminal_start == source.pending_terminal_start
+                                && current.scope == source.scope
+                        };
                     if source_changed
-                        && !view.panes.iter().any(|current| {
-                            current.id == before.id
-                                && current.kind == before.kind
-                                && current.pending_terminal_start == before.pending_terminal_start
-                                && current.scope == before.scope
-                        })
+                        && !view
+                            .panes
+                            .iter()
+                            .any(|current| holds(current, before) || holds(current, pane))
                     {
                         return Err(Registry::VIEW_SOURCE_CONFLICT.into());
                     }
@@ -1469,6 +1477,59 @@ mod tests {
             );
             assert_eq!(registry.model().unwrap(), before);
         }
+    }
+
+    #[test]
+    fn a_source_update_whose_result_already_holds_applies_its_presentation() {
+        let (mut registry, directory, channel, _) = setup();
+        let original = live_source_pane();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let mut attached = original.clone();
+        if let CardKind::Terminal(terminal) = &mut attached.kind {
+            terminal.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("replacement"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("replacement"),
+            };
+        }
+        // Each window read the old record, and each reports the same attachment.
+        let mut peer = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: attached.clone(),
+            },
+        );
+        let mut writer = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let first = edit(
+            &mut writer,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: attached.clone(),
+            },
+        );
+        writer.apply(&first).unwrap();
+        let mut titled = attached.clone();
+        titled.title = "independent title".into();
+        if let ModelEdit::ChangeView {
+            expected_revision,
+            change,
+            ..
+        } = &mut peer
+        {
+            *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+            *change = Change::Update {
+                before: original,
+                pane: titled.clone(),
+            };
+        }
+        registry.apply(&peer).unwrap();
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+            vec![titled]
+        );
     }
 
     #[test]

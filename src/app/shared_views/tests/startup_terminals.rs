@@ -174,9 +174,13 @@ impl Window {
 /// it is not showing. Nothing is on screen, so no start of a card's own can
 /// release or carry the attach queue.
 fn reopened_window(with_projected: bool) -> Window {
+    reopened_window_saving(with_projected, live_terminal())
+}
+
+fn reopened_window_saving(with_projected: bool, saved: TerminalSession) -> Window {
     let (mut app, active, hidden, _) = fixture();
     let identity = app.workspace_model.identity;
-    let cached = offscreen(&live_terminal());
+    let cached = offscreen(&saved);
     let projected = with_projected.then(|| offscreen(&live_terminal()));
     let durable = Arc::make_mut(&mut app.durable);
     durable.workspace_model_identity = Some(identity);
@@ -1483,4 +1487,116 @@ fn a_failure_after_the_report_is_shown_until_a_later_attach_succeeds() {
     }));
     assert!(!window.app.startup_terminal_gave_up(card));
     assert_eq!(window.app.startup_terminal_latest(card), None);
+}
+
+/// What a window saved when it closed for the update, while the registry still
+/// records the same terminal as live under the daemon being replaced.
+fn window_seeding_a_saved_terminal() -> (
+    Window,
+    crate::workspace_model::WorkspaceModel,
+    async_channel::Receiver<ModelEdit>,
+) {
+    let registered = live_terminal();
+    let mut saved = registered.clone();
+    let proof = saved.continuity.live_proof().unwrap();
+    saved.continuity = TerminalContinuity::DetachedSameBoot {
+        host_session_id: proof.host_session_id,
+        boot_id: proof.boot_id,
+        host_incarnation: proof.host_incarnation,
+    };
+    let mut window = reopened_window_saving(false, saved);
+    let (tx, rx) = async_channel::unbounded();
+    window.app.workspace_model_tx = tx;
+    let mut view = View::empty(Scope::Channel(window.hidden));
+    let mut registered_card = window.cached.clone();
+    registered_card.kind = CardKind::Terminal(registered);
+    view.panes = vec![Pane::from_card(&registered_card, None).unwrap()];
+    let model = crate::workspace_model::WorkspaceModel {
+        identity: window.app.durable.workspace_model_identity.unwrap(),
+        sequence: 1,
+        channels: [window.active, window.hidden]
+            .into_iter()
+            .map(|id| crate::workspace_model::ModelChannel {
+                id,
+                repository: PathBuf::from("/fixture-project"),
+                title: "view".into(),
+                title_source: Default::default(),
+                ordinal: 1,
+            })
+            .collect(),
+        views: vec![View::empty(Scope::Channel(window.active)), view],
+        ..Default::default()
+    };
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::Connected(model.clone())),
+    );
+    (window, model, rx)
+}
+
+fn acknowledge_seed(
+    window: &mut Window,
+    model: &crate::workspace_model::WorkspaceModel,
+    rx: &async_channel::Receiver<ModelEdit>,
+) -> Vec<(Pane, Pane)> {
+    while rx.try_recv().is_ok() {}
+    drop(
+        window
+            .app
+            .apply_workspace_model_update(ModelUpdate::ViewApplied {
+                scope: Scope::Channel(window.hidden),
+                operation: None,
+                model: model.clone(),
+            }),
+    );
+    std::iter::from_fn(|| rx.try_recv().ok())
+        .filter_map(|edit| match edit {
+            ModelEdit::ChangeView {
+                change: Change::Update { before, pane },
+                ..
+            } => Some((before, pane)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// An update based on the saved record is refused, which projects the old
+/// proof over the attachment; only another window's write then repairs it, and
+/// the update's windows open one after another, so the first reads as failed.
+#[test]
+fn an_attachment_made_while_seeding_updates_the_registry_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut window, model, rx) = window_seeding_a_saved_terminal();
+    let card = window.cached.id;
+    let started = attached(directory.path(), &session(&window.cached));
+    let live = started.session.clone();
+    window.app.card_state_mut(card).unwrap().kind = CardKind::Terminal(live.clone());
+    window
+        .app
+        .cards
+        .insert(card, CardRuntime::Terminal(started.handle));
+
+    let updates = acknowledge_seed(&mut window, &model, &rx);
+
+    let registered = &model.views[1].panes[0];
+    let [(before, pane)] = updates.as_slice() else {
+        panic!("expected one update, got {updates:?}");
+    };
+    assert_eq!(before.kind, registered.kind);
+    assert_eq!(pane.kind, CardKind::Terminal(live.clone()));
+    assert_eq!(session(window.app.card_state(card).unwrap()), live);
+}
+
+/// A saved record is not an edit: the registry's stays authoritative, whichever
+/// of the two is newer.
+#[test]
+fn a_saved_record_with_no_attachment_does_not_update_the_registry() {
+    let (mut window, model, rx) = window_seeding_a_saved_terminal();
+    let updates = acknowledge_seed(&mut window, &model, &rx);
+    assert!(updates.is_empty(), "unexpected updates: {updates:?}");
+    assert_eq!(
+        window.app.card_state(window.cached.id).unwrap().kind,
+        model.views[1].panes[0].kind
+    );
 }
