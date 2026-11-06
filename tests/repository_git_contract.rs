@@ -1172,6 +1172,57 @@ fn unstaging_keeps_entries_outside_a_sparse_checkout_skip_worktree() {
         "S out/removed.txt"
     );
     assert_eq!(fixture.porcelain(), "");
+
+    // Staging keeps `git add`'s refusal of paths outside the checkout, and
+    // its partial result.
+    fixture.write("in/kept.txt", b"two\n");
+    fixture.write("out/new.txt", b"new\n");
+    assert!(matches!(
+        stage(&fixture, &["in/kept.txt", "out/new.txt"]),
+        MutationOutcome::OutcomeUnknown { .. }
+    ));
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--name-only"]),
+        "in/kept.txt"
+    );
+    assert_eq!(fixture.text(&["ls-files", "out/new.txt"]), "");
+}
+
+#[test]
+fn staging_records_a_file_replaced_by_a_repository_and_refuses_a_ghost() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("dep", b"file\n");
+    fixture.commit_all("initial");
+    fs::remove_file(fixture.work().join("dep")).expect("remove file");
+    let nested = fixture.work().join("dep");
+    fs::create_dir(&nested).expect("nested directory");
+    fixture.run(&nested, &["init", "-b", "main", "."]);
+    fixture.run(
+        &nested,
+        &["commit", "--quiet", "--allow-empty", "-m", "nested"],
+    );
+    let commit = String::from_utf8(fixture.run(&nested, &["rev-parse", "HEAD"])).unwrap();
+
+    assert!(matches!(
+        stage(&fixture, &["dep"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        index_entries(&fixture),
+        format!("H 160000 {} 0\tdep", commit.trim())
+    );
+
+    let before = index_entries(&fixture);
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = stage(&fixture, &["gone.txt"])
+    else {
+        panic!("a path that matches nothing must not be reported staged");
+    };
+    assert!(reason.starts_with("gone.txt:"), "{reason}");
+    assert_eq!(index_entries(&fixture), before);
 }
 
 #[test]

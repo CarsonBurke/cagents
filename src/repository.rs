@@ -1423,6 +1423,11 @@ pub enum MutationOutcome {
 /// request it applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationScope {
+    /// The command works through its pathspecs and reports the ones it could
+    /// not handle at the end: `git add -A -- good outside-sparse` exits 1
+    /// *having staged* `good`, so a non-zero exit leaves the split between
+    /// the two halves unknown.
+    Incremental,
     /// The command assembles its whole result in memory and commits it with a
     /// single write, so a non-zero exit means nothing was written at all:
     /// `git update-index` and path-limited `git reset --no-refresh` each
@@ -1457,6 +1462,7 @@ impl MutationScope {
     /// not tie this to the wording of a Git diagnostic.
     fn classify(self, exit_code: Option<i32>, failure: MutationFailure) -> MutationOutcome {
         match self {
+            Self::Incremental => MutationOutcome::OutcomeUnknown { failure },
             Self::AllOrNothing => MutationOutcome::NotApplied { failure },
             Self::AtomicRefusal if exit_code == Some(1) => MutationOutcome::NotApplied { failure },
             Self::AtomicRefusal => MutationOutcome::OutcomeUnknown { failure },
@@ -4631,11 +4637,11 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// Stages exactly these paths with one index write.
     ///
     /// `git add` matches every pathspec against every index entry, which
-    /// takes minutes for tens of thousands of selected files; `update-index`
+    /// takes tens of seconds for tens of thousands of selected files; `update-index`
     /// looks each path up directly. `--remove` stages deletions and
     /// `--replace` a file that became a directory or the reverse, as `add -A`
-    /// does. Entries outside a sparse checkout are absent by design, so they
-    /// are left alone rather than staged as deletions. A path it cannot stage,
+    /// does. Skip-worktree entries are absent by design, so they are left
+    /// alone rather than staged as deletions. A path it cannot stage,
     /// such as a plain directory or one beyond a symlink, stops it before the
     /// index is written.
     pub fn stage_command(
@@ -4672,11 +4678,26 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let paths =
-            self.matchable_pathspecs(&request.worktree, &request.selection, cancellation)?;
-        let command = self.stage_command(&request.worktree, &paths)?;
+        let worktree = &request.worktree;
+        let paths = self.matchable_pathspecs(worktree, &request.selection, cancellation)?;
+        if paths.is_empty() {
+            return Err(ValidationError::EmptySelection.into());
+        }
+        if self.sparse_checkout(worktree, cancellation)? {
+            // `git add` refuses paths outside the sparse checkout, which
+            // update-index would stage, along with present files whose
+            // skip-worktree Git clears on reading the index. This costs
+            // selected paths times index entries.
+            let command = self.git_pathspec_mutation(worktree, ["add", "-A"], &paths);
+            return Ok(self.run_mutation(
+                &command,
+                paths,
+                MutationScope::Incremental,
+                cancellation,
+            ));
+        }
         let indexed: HashSet<_> = self
-            .indexed_paths(&request.worktree, &paths, cancellation)?
+            .indexed_paths(worktree, &paths, cancellation)?
             .into_iter()
             .collect();
         let untracked: Vec<_> = paths
@@ -4685,27 +4706,49 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .cloned()
             .collect();
         if !untracked.is_empty() {
-            if let Some(reason) =
-                self.untracked_refusal(&request.worktree, &untracked, cancellation)?
-            {
+            if let Some(reason) = self.untracked_refusal(worktree, &untracked, cancellation)? {
                 return Ok(MutationOutcome::NotApplied {
                     failure: MutationFailure::Rejected { reason },
                 });
             }
         }
+        // update-index only removes a tracked file that has become a nested
+        // repository; naming it again adds the repository's gitlink.
+        let mut input = paths.clone();
+        input.extend(
+            paths
+                .iter()
+                .filter(|path| {
+                    indexed.contains(*path)
+                        && fs::symlink_metadata(worktree.join(path.as_os_str()).join(".git"))
+                            .is_ok()
+                })
+                .cloned(),
+        );
+        let command = self.stage_command(worktree, &input)?;
         Ok(self.run_mutation(&command, paths, MutationScope::AllOrNothing, cancellation))
     }
 
     /// Why `git add` would refuse one of these untracked paths, which
-    /// `update-index` would add regardless: it is ignored, perhaps only since
-    /// status listed it, or it lies inside a submodule, whose gitlink
-    /// `--replace` would otherwise overwrite.
+    /// `update-index` would add or report staged regardless: it no longer
+    /// exists, it is ignored, perhaps only since status listed it, or it lies
+    /// inside a submodule, whose gitlink `--replace` would overwrite.
     fn untracked_refusal(
         &self,
         worktree: &Path,
         untracked: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Option<String>, RepositoryError> {
+        // `git add` refuses the whole request for a path that matches
+        // nothing; update-index would report it staged.
+        if let Some(ghost) = untracked.iter().find(|path| {
+            fs::symlink_metadata(worktree.join(path.as_os_str()))
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        }) {
+            return Ok(Some(format!(
+                "{ghost}: path does not match anything known to git"
+            )));
+        }
         // check-ignore rejects --literal-pathspecs. Git reads magic only at
         // the start of a pathspec, so a "./" prefix keeps ":(top)x" literal.
         // --no-index skips matching each path against the whole index, which
@@ -9463,13 +9506,23 @@ mod tests {
             path: path("new name.txt"),
             old_path: Some(path("old name.txt")),
         }];
+        let worktree = tempfile::tempdir().unwrap();
+        fs::write(worktree.path().join("new name.txt"), b"renamed").unwrap();
+        // Sources, sparse checkout, index, ignore rules, then update-index.
+        let unset = exit(1, b"");
 
         // The index no longer has the source: only HEAD does.
-        let service = fake_service(vec![success(b""), success(b""), exit(1, b""), success(b"")]);
+        let service = fake_service(vec![
+            success(b""),
+            unset.clone(),
+            success(b""),
+            exit(1, b""),
+            success(b""),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {
-                    worktree: PathBuf::from("/repo"),
+                    worktree: worktree.path().into(),
                     selection: selection.clone(),
                 },
                 &CancellationToken::new(),
@@ -9483,7 +9536,7 @@ mod tests {
         );
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(
-            commands[3].stdin.as_deref(),
+            commands[4].stdin.as_deref(),
             Some(b"new name.txt\0".as_slice())
         );
         drop(commands);
@@ -9492,6 +9545,7 @@ mod tests {
         // application also has to stage as a pair.
         let service = fake_service(vec![
             success(b"H old name.txt\0"),
+            unset,
             success(b"H old name.txt\0"),
             exit(1, b""),
             success(b""),
@@ -9499,7 +9553,7 @@ mod tests {
         let outcome = service
             .stage(
                 &StageRequest {
-                    worktree: PathBuf::from("/repo"),
+                    worktree: worktree.path().into(),
                     selection,
                 },
                 &CancellationToken::new(),
@@ -9518,43 +9572,53 @@ mod tests {
     /// tracked paths skip the untracked checks entirely.
     #[test]
     fn stage_checks_only_untracked_paths_and_refuses_a_path_inside_a_gitlink() {
-        let selection: Vec<_> = ["a", "b", "dir/new", "dir/sub/new"]
-            .into_iter()
-            .map(|name| PathSelection::new(path(name)))
-            .collect();
-        let request = StageRequest {
-            worktree: PathBuf::from("/repo"),
-            selection,
+        let worktree = tempfile::tempdir().unwrap();
+        let root = worktree.path();
+        // `b` was a tracked file and is now a nested repository.
+        fs::create_dir_all(root.join("b/.git")).unwrap();
+        fs::create_dir_all(root.join("dir/sub")).unwrap();
+        fs::write(root.join("dir/new"), b"new").unwrap();
+        fs::write(root.join("dir/sub/new"), b"new").unwrap();
+        let request = |names: &[&str]| StageRequest {
+            worktree: root.into(),
+            selection: names
+                .iter()
+                .map(|name| PathSelection::new(path(name)))
+                .collect(),
         };
+        let selected = request(&["a", "b", "dir/new", "dir/sub/new"]);
         let cancel = CancellationToken::new();
-        let index = success(b"H a\0S b\0");
+        let unset = exit(1, b"");
+        let index = success(b"H a\0H b\0");
         let service = fake_service(vec![
+            unset.clone(),
             index.clone(),
             exit(1, b""),
             success(b":0:dir missing\0100644\0"),
             success(b""),
         ]);
         assert!(matches!(
-            service.stage(&request, &cancel).unwrap(),
+            service.stage(&selected, &cancel).unwrap(),
             MutationOutcome::Applied { .. }
         ));
         let commands = service.executor.commands.lock().unwrap();
         assert!(
-            commands[1]
+            commands[2]
                 .arguments
                 .contains(&OsString::from("--no-index"))
         );
         assert_eq!(
-            commands[1].stdin.as_deref(),
+            commands[2].stdin.as_deref(),
             Some(b"./dir/new\0./dir/sub/new\0".as_slice())
         );
         assert_eq!(
-            commands[2].stdin.as_deref(),
+            commands[3].stdin.as_deref(),
             Some(b":0:dir\0:0:dir/sub\0".as_slice())
         );
+        // Naming `b` again adds the gitlink after its file entry is removed.
         assert_eq!(
-            commands[3].stdin.as_deref(),
-            Some(b"a\0b\0dir/new\0dir/sub/new\0".as_slice())
+            commands[4].stdin.as_deref(),
+            Some(b"a\0b\0dir/new\0dir/sub/new\0b\0".as_slice())
         );
         drop(commands);
 
@@ -9563,16 +9627,44 @@ mod tests {
             let mut records = b":0:dir missing\0".to_vec();
             records.extend_from_slice(gitlink.as_bytes());
             records.push(0);
-            let service = fake_service(vec![index.clone(), exit(1, b""), success(&records)]);
+            let service = fake_service(vec![
+                unset.clone(),
+                index.clone(),
+                exit(1, b""),
+                success(&records),
+            ]);
             let MutationOutcome::NotApplied {
                 failure: MutationFailure::Rejected { reason },
-            } = service.stage(&request, &cancel).unwrap()
+            } = service.stage(&selected, &cancel).unwrap()
             else {
                 panic!("a path inside a submodule must not be staged");
             };
             assert_eq!(reason, "dir/sub/new: path is in submodule 'dir/sub'");
-            assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+            assert_eq!(service.executor.commands.lock().unwrap().len(), 4);
         }
+
+        // An untracked path that no longer exists is refused before Git runs.
+        let service = fake_service(vec![unset.clone(), success(b"")]);
+        let MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { reason },
+        } = service
+            .stage(&request(&["dir/new", "gone"]), &cancel)
+            .unwrap()
+        else {
+            panic!("a ghost must not be reported staged");
+        };
+        assert_eq!(reason, "gone: path does not match anything known to git");
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 2);
+
+        // A sparse checkout keeps `git add`, which refuses paths outside it.
+        let service = fake_service(vec![success(b"true\n"), success(b"")]);
+        assert!(matches!(
+            service.stage(&selected, &cancel).unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].arguments.contains(&OsString::from("add")));
     }
 
     /// `core.fsmonitor` set to a non-boolean value names a program Git runs
@@ -9710,7 +9802,11 @@ mod tests {
 
     #[test]
     fn stage_that_never_started_is_definitively_not_applied() {
-        let service = fake_service(vec![success(b""), exit(1, b""), Err(unstarted_failure())]);
+        let service = fake_service(vec![
+            exit(1, b""),
+            success(b"H a.txt\0"),
+            Err(unstarted_failure()),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {
@@ -9722,7 +9818,11 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
 
-        let service = fake_service(vec![success(b""), exit(1, b""), Err(launched_failure(b""))]);
+        let service = fake_service(vec![
+            exit(1, b""),
+            success(b"H a.txt\0"),
+            Err(launched_failure(b"")),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {
