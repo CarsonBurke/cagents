@@ -393,6 +393,11 @@ own. Building here, it holds one slot until the command exits, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
+Queue and slot lock requests die with their gate, including when it is killed
+without a chance to handle a signal. Waiters retain only their lock descriptor
+and standard streams; inherited pipes and locks remain with the gate for the
+admitted command.
+
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
 shared two-second grace period, then kills and reaps remaining descendants,
