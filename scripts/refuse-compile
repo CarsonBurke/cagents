@@ -11,5 +11,5 @@ for argument do
     [ "$previous" != --crate-name ] || crate=$argument
     previous=$argument
 done
-printf '%s\n' "refusing to compile ${crate:-this checkout} while holding the native lock ${CAGENTS_NATIVE_LOCK_HELD:-}: other native sessions queue behind it. Release it, build the same lane, for example with scripts/native-evidence build, then take it again." >&2
+printf '%s\n' "refusing to compile ${crate:-this checkout} while holding the native lock ${CAGENTS_NATIVE_LOCK_HELD:-}: other native sessions queue behind it. Release it, build this lane into the same target, then take it again." >&2
 exit 78

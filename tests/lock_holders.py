@@ -283,6 +283,25 @@ class LockHolders(unittest.TestCase):
         self.assertIn(f"waiting for {other},", text)
         self.assertNotIn("nothing holding this used CPU", text)
 
+    def test_a_gates_queue_head_waiting_for_a_slot_gets_no_note(self):
+        other = self.root / "slot.lock"
+        other.touch()
+        self.start("flock", str(other), "sleep", "60")
+        original = self.lock
+        self.lock = other
+        self.wait_for(self.holds, "slot holder")
+        self.lock = self.root / "gate.lock.queue"
+        self.lock.touch()
+        queue = self.lock
+        self.start("flock", "--close", str(queue), "flock", str(other), "true")
+        self.wait_for(self.holds, "queue head")
+        self.lock = original
+        report = subprocess.run(
+            [sys.executable, "-I", "-B", str(TOOL), str(queue)], capture_output=True, text=True,
+            timeout=30, env=os.environ | {"CAGENTS_BUILD_LOCK": str(other)},
+        ).stdout
+        self.assertNotIn(f"waiting for {other}", report)
+
     def test_a_queued_request_is_not_taken_for_a_hidden_holder(self):
         loader = importlib.machinery.SourceFileLoader("lock_holders_tool", str(TOOL))
         spec = importlib.util.spec_from_loader(loader.name, loader)
