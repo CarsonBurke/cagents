@@ -10,6 +10,7 @@ use crate::{
     },
 };
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -71,6 +72,7 @@ struct Source {
     records: usize,
     charged: usize,
     failed: bool,
+    prefix: Sha256,
     entries: HashMap<String, Entry>,
     carriers: HashMap<String, Vec<String>>,
     ambiguous_carriers: HashSet<String>,
@@ -135,6 +137,9 @@ impl CachedContext {
                 || stamp.len < source.stamp.len
                 || (stamp.len == source.stamp.len && source.stamp != stamp)
                 || (source.failed && source.stamp != stamp)
+                || (!source.failed
+                    && (stamp.len > source.stamp.len || source.offset < stamp.len)
+                    && !source.prefix_matches(&mut file))
         });
         let mut changed = false;
         if reset {
@@ -149,6 +154,7 @@ impl CachedContext {
                 records: 0,
                 charged: 0,
                 failed: false,
+                prefix: Sha256::new(),
                 entries: HashMap::new(),
                 carriers: HashMap::new(),
                 ambiguous_carriers: HashSet::new(),
@@ -167,9 +173,8 @@ impl CachedContext {
             .metadata()
             .ok()
             .and_then(|metadata| Stamp::of(&metadata));
-        // The scan is bounded by its original EOF. A provider appending its
-        // next record does not invalidate that prefix; each projected slice
-        // is independently checked against its current raw bytes below.
+        // Growth leaves a resumable prefix, but cannot authorize projection
+        // until the worker has indexed the complete current EOF.
         let stable = after.is_some_and(|after| {
             stamp.same_file(after) && (after == stamp || after.len > stamp.len)
         }) && source.scope.revalidate().is_ok();
@@ -193,6 +198,31 @@ impl CachedContext {
             .is_some_and(|source| !source.entries.is_empty())
     }
 
+    pub(crate) fn same_version(&self, other: &Self) -> bool {
+        match (&self.source, &other.source) {
+            (None, None) => true,
+            (Some(left), Some(right)) => {
+                left.path == right.path
+                    && left.scope == right.scope
+                    && left.session == right.session
+                    && left.stamp == right.stamp
+                    && left.offset == right.offset
+                    && left.failed == right.failed
+            }
+            _ => false,
+        }
+    }
+    pub(crate) fn ready(&self) -> bool {
+        self.source.as_ref().is_some_and(Source::ready)
+    }
+    pub(crate) fn needs_refresh(&self, items: &[Arc<Item>]) -> bool {
+        self.source.as_ref().is_some_and(|source| {
+            !source.failed
+                && items.iter().any(|item| source.candidate(item).is_some())
+                && !source.ready()
+        })
+    }
+
     /// Copy only immutable read proofs for publication. Scanner cursors and
     /// carrier bookkeeping stay with the worker, and no message bodies are
     /// retained in either copy. Only the original scanner should be refreshed.
@@ -204,10 +234,11 @@ impl CachedContext {
                 cwd: source.cwd.clone(),
                 session: source.session.clone(),
                 stamp: source.stamp,
-                offset: 0,
+                offset: source.offset,
                 records: 0,
                 charged: 0,
                 failed: source.failed,
+                prefix: Sha256::new(),
                 entries: source.entries.clone(),
                 carriers: HashMap::new(),
                 ambiguous_carriers: source.ambiguous_carriers.clone(),
@@ -229,7 +260,7 @@ impl CachedContext {
         let Some(frame) = source.read(entry) else {
             return false;
         };
-        if !matches_frame(item, &frame, entry, paged) {
+        if !matches_frame(item, &frame, entry, paged) || !source.ready() {
             return false;
         }
         project(item);
@@ -240,12 +271,23 @@ impl CachedContext {
     /// many blocks or paged slices it supplies. The single decoded record is
     /// dropped before reading another and never retained between publications.
     pub(crate) fn classify_items(&mut self, items: &mut [Arc<Item>]) -> bool {
+        self.classify_items_with(items, || {})
+    }
+    fn classify_items_with(
+        &mut self,
+        items: &mut [Arc<Item>],
+        before_finish: impl FnOnce(),
+    ) -> bool {
         let Some(source) = &self.source else {
             return false;
         };
+        if !source.ready() {
+            return false;
+        }
+        let original = items.to_vec();
         let mut decoded: Option<((u64, usize), Option<Value>)> = None;
         let mut changed = false;
-        for item in items {
+        for item in items.iter_mut() {
             let Some((entry, paged)) = source.candidate(item) else {
                 continue;
             };
@@ -262,6 +304,11 @@ impl CachedContext {
                 project(Arc::make_mut(item));
                 changed = true;
             }
+        }
+        before_finish();
+        if !source.ready() {
+            items.clone_from_slice(&original);
+            return false;
         }
         changed
     }
@@ -287,6 +334,34 @@ fn open(path: &std::path::Path) -> Option<File> {
 }
 
 impl Source {
+    fn ready(&self) -> bool {
+        !self.failed
+            && self.offset == self.stamp.len
+            && self.scope.revalidate().is_ok()
+            && std::fs::symlink_metadata(&self.path)
+                .ok()
+                .and_then(|metadata| Stamp::of(&metadata))
+                == Some(self.stamp)
+    }
+    fn prefix_matches(&self, file: &mut File) -> bool {
+        let actual = (|| {
+            file.seek(SeekFrom::Start(0)).ok()?;
+            let mut reader = file.take(self.offset);
+            let mut digest = Sha256::new();
+            let mut buffer = [0; 64 * 1024];
+            let mut count = 0;
+            loop {
+                let bytes = reader.read(&mut buffer).ok()?;
+                if bytes == 0 {
+                    break;
+                }
+                digest.update(&buffer[..bytes]);
+                count += bytes as u64;
+            }
+            (count == self.offset).then(|| digest.finalize())
+        })();
+        actual.is_some_and(|actual| actual == self.prefix.clone().finalize())
+    }
     fn candidate(&self, item: &Item) -> Option<(Entry, bool)> {
         if item.role != Role::User
             || !matches!(
@@ -331,6 +406,7 @@ impl Source {
             }
             let offset = self.offset;
             self.offset += count as u64;
+            self.prefix.update(&line);
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
@@ -348,11 +424,24 @@ impl Source {
     }
 
     fn note(&mut self, frame: &Value, offset: u64, bytes: usize) -> Option<bool> {
+        let mut changed = false;
+        if let Some(alias) = frame["message"]["id"].as_str()
+            && frame["uuid"].as_str() != Some(alias)
+            && !self.ambiguous_carriers.contains(alias)
+        {
+            self.charge(alias.len().checked_add(32)?)?;
+            self.ambiguous_carriers.insert(alias.to_owned());
+            if let Some(keys) = self.carriers.get_mut(alias) {
+                for key in std::mem::take(keys) {
+                    changed |= self.entries.remove(&key).is_some();
+                }
+            }
+        }
         if !matches!(frame["type"].as_str(), Some("user" | "assistant")) {
-            return Some(false);
+            return Some(changed);
         }
         let Some(carrier) = frame["uuid"].as_str() else {
-            return Some(false);
+            return Some(changed);
         };
         let content = &frame["message"]["content"];
         // Charge cumulative input, including replacements, before allocating
@@ -364,11 +453,10 @@ impl Source {
         let previous = self.carriers.remove(carrier);
         // A repeated carrier no longer proves an immutable cached identity.
         // Replaying ordinary assistant frames must not wake presentation.
-        let mut changed = false;
         if let Some(previous) = previous {
             if self.ambiguous_carriers.insert(carrier.to_owned()) {
                 self.charge(carrier.len().checked_add(32)?)?;
-                changed = !previous.is_empty();
+                changed |= !previous.is_empty();
             }
             for key in previous {
                 self.entries.remove(&key);
@@ -416,21 +504,22 @@ impl Source {
         #[cfg(test)]
         self.reads
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.scope.revalidate().ok()?;
+        if !self.ready() {
+            return None;
+        }
         let mut file = open(&self.path)?;
         let stamp = Stamp::of(&file.metadata().ok()?)?;
-        if !stamp.same_file(self.stamp)
-            || stamp.len < self.stamp.len
-            || (stamp.len == self.stamp.len && stamp != self.stamp)
-        {
+        if stamp != self.stamp {
             return None;
         }
         file.seek(SeekFrom::Start(entry.offset)).ok()?;
         let mut bytes = vec![0; entry.bytes];
         file.read_exact(&mut bytes).ok()?;
         let frame: Value = serde_json::from_slice(&bytes).ok()?;
-        self.scope.revalidate().ok()?;
-        same_session(&frame, &self.session).then_some(frame)
+        (Stamp::of(&file.metadata().ok()?) == Some(self.stamp)
+            && self.ready()
+            && same_session(&frame, &self.session))
+        .then_some(frame)
     }
 }
 
@@ -800,11 +889,99 @@ mod tests {
         fixture.append(row.clone());
         assert!(fixture.refresh());
         assert!(fixture.classifies("A:0", "identical"));
+        let published = fixture.index.projection();
         row["message"]["id"] = json!("B");
-        // Same-sized first record followed by growth exercises reread guards,
-        // rather than the equal-length modification rejection.
+        // Growth must not conceal a same-sized rewrite of the indexed prefix.
         std::fs::write(&fixture.path, format!("{row}\n{{}}\n")).unwrap();
         assert!(!fixture.classifies("A:0", "identical"));
+        assert!(
+            fixture.refresh(),
+            "prefix rewrite retires published context proof"
+        );
+        assert!(!fixture.index.same_version(&published));
+        assert!(fixture.index.ready());
+        assert!(!fixture.classifies("A:0", "identical"));
+    }
+
+    #[test]
+    fn explicit_aliases_exclude_uuid_proofs_in_either_record_order() {
+        use crate::chat::Event;
+        for alias_first in [true, false] {
+            let mut fixture = Fixture::new();
+            let mut alias = frame("B", "identical");
+            alias["isSynthetic"] = json!(false);
+            alias["message"] = json!({"id":"A","content":[{"type":"text","text":"identical"}]});
+            let mut context = frame("A", "identical");
+            context["message"]["content"] = json!([{"type":"text","text":"identical"}]);
+            let rows = if alias_first {
+                [alias, context]
+            } else {
+                [context, alias]
+            };
+            let mut launch = fixture.launch.clone();
+            launch.session_id = None;
+            let (_, mut live) = super::super::claude::create(&launch).unwrap();
+            let mut genuine = None;
+            for row in rows {
+                for event in live.receive(row.clone()).unwrap().events {
+                    if let Event::Item(item) = event
+                        && item.role == Role::User
+                    {
+                        genuine = Some(item);
+                    }
+                }
+                fixture.append(row);
+                fixture.refresh();
+            }
+            let mut genuine = genuine.unwrap();
+            assert_eq!(genuine.id, if alias_first { "A:0" } else { "A:1" });
+            assert!(!fixture.index.classify(&mut genuine));
+            assert!(!fixture.classifies("A:0", "identical"));
+        }
+    }
+
+    #[test]
+    fn appended_replay_and_mid_batch_changes_never_publish_stale_attribution() {
+        let mut fixture = Fixture::new();
+        fixture.append(frame("A", "identical"));
+        fixture.append(frame("B", "other context"));
+        assert!(fixture.refresh());
+        let mut published = fixture.index.projection();
+        let mut items = vec![
+            Arc::new(text("A:0", "identical")),
+            Arc::new(text("B:0", "other context")),
+        ];
+        let original = items.clone();
+        let path = fixture.path.clone();
+        assert!(!published.classify_items_with(&mut items, move || {
+            let mut replay = frame("A", "identical");
+            replay["isSynthetic"] = json!(false);
+            writeln!(File::options().append(true).open(path).unwrap(), "{replay}").unwrap();
+        }));
+        assert!(
+            items
+                .iter()
+                .zip(&original)
+                .all(|(after, before)| Arc::ptr_eq(after, before))
+        );
+        assert!(published.needs_refresh(&items));
+        assert!(!published.classify(&mut text("A:0", "identical")));
+        assert!(fixture.refresh());
+        assert!(!fixture.index.same_version(&published));
+        assert!(fixture.index.classify_items(&mut items));
+        assert_eq!((items[0].role, items[1].role), (Role::User, Role::System));
+        let old = fixture.index.projection();
+        fixture.append(json!({"type":"assistant","uuid":"answer","sessionId":SESSION,"message":{"content":"answer"}}));
+        assert!(
+            !fixture.refresh(),
+            "ordinary append has no semantic proof change"
+        );
+        assert!(
+            !fixture.index.same_version(&old),
+            "the fresh stamp still needs publication"
+        );
+        assert!(fixture.index.ready());
+        assert!(fixture.index.same_version(&fixture.index.projection()));
     }
 
     #[test]
@@ -1003,7 +1180,11 @@ mod tests {
                     writeln!(file, "{}", frame("tail", "concurrent instructions")).unwrap();
                 })
         );
-        assert!(fixture.classifies("prefix:0", "existing instructions"));
+        assert!(
+            !fixture.index.ready(),
+            "post-scan append is not an indexed complete EOF"
+        );
+        assert!(!fixture.classifies("prefix:0", "existing instructions"));
         assert!(!fixture.classifies("tail:0", "concurrent instructions"));
         assert!(fixture.refresh());
         assert!(fixture.classifies("prefix:0", "existing instructions"));

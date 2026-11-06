@@ -12,8 +12,9 @@ pub(super) struct ContextProjection {
     // Every subscriber at or behind this helper generation needs a full resync.
     // A consumed dirty bit would repair only the first subscriber to read.
     invalidated_through: Option<u64>,
+    needs_resync: bool,
     #[cfg(test)]
-    worker_waiting: bool,
+    pub(super) worker_waiting: bool,
 }
 
 #[cfg(test)]
@@ -47,6 +48,22 @@ mod tests {
         assert!(
             remote.context_invalidates(Some(7)),
             "cover the served RPC generation, not just resident metadata"
+        );
+        let mut appended = std::fs::read(&path).unwrap();
+        appended.extend_from_slice(b"{}\n");
+        std::fs::write(&path, appended).unwrap();
+        assert_eq!(
+            remote.project_snapshot(snapshot.clone()).items[0].role,
+            chat::Role::User,
+            "a read fails open until the new source version is indexed"
+        );
+        let before = notices.load(Ordering::Relaxed);
+        remote.scan_context(&mut scanner, &mut session);
+        assert_eq!(notices.load(Ordering::Relaxed), before + 1);
+        assert_eq!(
+            remote.project_snapshot(snapshot.clone()).items[0].role,
+            chat::Role::System,
+            "unchanged proofs at a new source version still repair stale readers"
         );
         let id = remote.0.source.id;
         let listener = UnixListener::bind(&remote.0.socket).unwrap();
@@ -141,8 +158,14 @@ impl ContextProjection {
     fn snapshot(&mut self, snapshot: &mut Snapshot) {
         self.latest_generation = self.latest_generation.max(snapshot.generation);
         if self.session.is_some() && self.session == snapshot.session_id {
-            self.context.classify_items(&mut snapshot.items);
+            self.classify_items(&mut snapshot.items);
         }
+    }
+
+    fn classify_items(&mut self, items: &mut [Arc<chat::Item>]) {
+        self.needs_resync |= self.context.needs_refresh(items);
+        self.context.classify_items(items);
+        self.needs_resync |= self.context.needs_refresh(items);
     }
 }
 
@@ -175,19 +198,26 @@ impl RemoteActor {
                 previous.is_some()
             }
         };
-        if changed || *previous != session {
-            let proof = scanner.projection();
-            {
-                let mut projection = self.0.context.lock().unwrap_or_else(|p| p.into_inner());
-                projection.context = proof;
-                projection.session = session.clone();
+        let notify = {
+            let mut projection = self.0.context.lock().unwrap_or_else(|p| p.into_inner());
+            let ready = scanner.ready();
+            let notify = changed || *previous != session || (projection.needs_resync && ready);
+            if changed || !scanner.same_version(&projection.context) {
+                projection.context = scanner.projection();
+            }
+            projection.session = session.clone();
+            if notify {
                 projection.latest_generation = projection.latest_generation.max(
                     finalized
                         .as_ref()
                         .map_or(state.generation, |snapshot| snapshot.generation),
                 );
                 projection.invalidated_through = Some(projection.latest_generation);
+                projection.needs_resync = false;
             }
+            notify
+        };
+        if notify {
             // All subscribers need this wake, including idle readers whose
             // helper generation did not change while raw provenance arrived.
             (self.0.notify)(Update::Presentation);
@@ -313,7 +343,7 @@ impl RemoteActor {
                                 _ => None,
                             })
                             .collect();
-                        projection.context.classify_items(&mut items);
+                        projection.classify_items(&mut items);
                         let mut items = items.into_iter();
                         for change in &mut update.changes {
                             if let ItemChange::Replace(item) = change {
