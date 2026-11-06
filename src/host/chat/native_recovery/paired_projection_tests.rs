@@ -132,6 +132,50 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
 }
 
 #[test]
+fn ordinary_close_retires_paired_owner_after_local_protocol_failure() {
+    if isolated("ordinary_close_retires_paired_owner_after_local_protocol_failure") {
+        return;
+    }
+    let fixture = Fixture::new();
+    restore(&fixture.host, CLIENT, &fixture.source).unwrap();
+    let (source, actor) = {
+        let state = fixture.host.lock().unwrap();
+        let record = &state.chats[&fixture.source.id];
+        (record.session.clone(), record.handle.clone())
+    };
+    wait_durable(&actor);
+    fs::write(fixture.root.join("fail-next-request"), []).unwrap();
+    actor.command(crate::chat::Command::Refresh).unwrap();
+    wait_until(
+        || actor.is_completed(),
+        "failed local attachment never finished teardown",
+    );
+    assert!(actor.failure().is_some());
+    assert!(actor.owns_work(), "failure must retain recovery ownership");
+    fixture.assert_one_provider();
+    // An unattached retained-close request cannot bypass the hosted actor,
+    // even after a protocol failure. Ordinary close joins that exact actor
+    // and proves its provider teardown before cleaning the paired terminal.
+    assert_eq!(
+        crate::host::chat::close_retained_native(&fixture.host, &source).unwrap_err(),
+        "The native actor still owns work; use its existing close path"
+    );
+    let response = crate::host::chat::process(
+        &fixture.host,
+        CLIENT,
+        crate::terminal::ipc::ClientRequest::ChatClose { chat_id: source.id },
+    )
+    .unwrap();
+    assert!(matches!(response, ServerResponse::ChatClosed { .. }));
+    assert!(actor.failure().is_some(), "close must retain the diagnosis");
+    assert!(!fixture.native.root.is_current());
+    let state = fixture.host.lock().unwrap();
+    assert!(!state.chats.contains_key(&source.id));
+    assert!(!state.terminals.contains_key(&source.id));
+    assert!(!state.native_closing.contains_key(&source.id));
+}
+
+#[test]
 fn retained_close_refuses_changed_pair_fields_and_unissued_sources() {
     if isolated("retained_close_refuses_changed_pair_fields_and_unissued_sources") {
         return;
@@ -1378,6 +1422,13 @@ fn provider() {
             let frame: Value = serde_json::from_str(text).unwrap();
             let Some(id) = frame.get("id") else { continue };
             let method = frame["method"].as_str().unwrap();
+            if method == "thread/read" && root.join("fail-next-request").exists() {
+                fs::remove_file(root.join("fail-next-request")).unwrap();
+                websocket
+                    .send(tungstenite::Message::Binary(Vec::new().into()))
+                    .unwrap();
+                continue;
+            }
             let mut log = fs::OpenOptions::new()
                 .create(true)
                 .append(true)
