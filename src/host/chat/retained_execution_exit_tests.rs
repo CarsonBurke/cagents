@@ -9,6 +9,9 @@ use std::{fs, path::Path};
 
 #[test]
 fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_adoption() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const MODE: &str = "CAGENTS_RETAINED_EXECUTION_EXIT_TEST";
     if std::env::var_os(MODE).is_none() {
         for mode in ["cold-close", "reconcile"] {
@@ -29,6 +32,7 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &exact, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(MODE, mode)
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
