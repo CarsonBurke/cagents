@@ -446,7 +446,7 @@ impl Registry {
             return Ok(None);
         }
         let mut summary = format!(
-            "{} Its saved conversation is read-only; no provider was started.",
+            "{} It's read-only until you resume it.",
             crate::chat::LOST_PROVIDER_REASON
         );
         if run.is_some_and(|run| run.state == State::Interrupted) {
@@ -464,7 +464,7 @@ impl Registry {
             )),
         }
         summary.push_str(
-            " Resume reopens this conversation without resending its prompt; messages waiting from other agents are delivered once it is running.",
+            " Resuming doesn't resend its prompt, and delivers any messages waiting for it.",
         );
         if agent.is_some() {
             summary.push_str(" Closing this pane ends the agent.");

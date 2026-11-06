@@ -606,7 +606,7 @@ impl NativeContinuity {
 /// How a reader of a lost provider opens its read-only reason, when that reason
 /// also says what is known about the work around it.
 pub(crate) const LOST_PROVIDER_REASON: &str =
-    "This conversation's provider stopped when the computer restarted.";
+    "This conversation stopped when the computer restarted.";
 
 /// Whether `replacement` is exactly the reader of `source`'s lost holder.
 pub(crate) fn is_lost_holder_history(source: &Session, replacement: &Session) -> bool {

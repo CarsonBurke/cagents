@@ -2618,8 +2618,7 @@ impl Runtime {
                 .width(Length::Fill)
                 .into(),
                 if saved_history {
-                    widget::button::custom(design::caption("Resume conversation"))
-                        .class(crate::ui_controls::control_style(false, None))
+                    crate::ui_controls::button::primary("Resume conversation")
                         .on_press_maybe(enabled.then(|| action(Action::ResumeSaved(target))))
                         .into()
                 } else { icon(
