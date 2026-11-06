@@ -3928,8 +3928,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             .join(format!("{}.json", record.terminal));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snapshot = server.actor.snapshot(None).unwrap();
+            // Completion is published after the exit is applied, so a snapshot
+            // taken once completion is seen includes it; one taken before may not.
             if server.actor.is_completed() {
+                let snapshot = server.actor.snapshot(None).unwrap();
                 assert!(snapshot.exited);
                 assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
                 assert!(snapshot.items.iter().any(|item| matches!(
