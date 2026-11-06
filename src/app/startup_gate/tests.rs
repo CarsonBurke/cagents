@@ -39,7 +39,7 @@ fn fixture_proof() -> crate::model::HostSessionProof {
 
 /// Complete one issued observation without starting a daemon or executing Tasks.
 fn inspection(app: &mut Cagents, state: Result<StartupState, String>) -> Inspection {
-    let pending = app.startup_pending().unwrap().unwrap();
+    let pending = app.startup_pending().unwrap();
     let owners = app.startup_connected_owners();
     let gate = &mut app.startup_gate;
     let ticket = gate.next_inspection.checked_add(1).unwrap();
@@ -72,10 +72,7 @@ fn deliver(app: &mut Cagents, state: Result<StartupState, String>) -> Task<Messa
         .unwrap_or_else(|| InspectionContext {
             ticket: app.startup_gate.next_inspection,
             opened: app.startup_gate.opened.unwrap(),
-            pending: app.startup_gate.pending.clone().unwrap_or(Pending {
-                admission: false,
-                panes: vec![],
-            }),
+            pending: app.startup_gate.pending.clone(),
             owners: app.startup_connected_owners(),
         });
     let inspection = if app.startup_gate.reported || app.startup_gate.saving {
@@ -99,6 +96,8 @@ fn elapse(app: &mut Cagents, by: Duration) {
     let back = |at: Instant| at.checked_sub(by).unwrap();
     gate.opened = gate.opened.map(back);
     gate.progressed = gate.progressed.map(back);
+    gate.settled = gate.settled.map(back);
+    gate.asked = gate.asked.map(back);
     gate.inspected = gate.inspected.map(back);
     if let Some(context) = &mut gate.inspecting {
         context.opened = back(context.opened);
@@ -203,7 +202,7 @@ fn panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_re
     assert_readable(reason);
     assert!(reason.starts_with("3 saved panes"), "{reason}");
     assert!(reason.contains("made no progress"), "{reason}");
-    let answer = stalled_reason(&Pending {
+    let answer = app.stalled_reason(&Pending {
         admission: false,
         panes: cards.clone(),
     });
@@ -211,7 +210,9 @@ fn panes_without_progress_fail_before_the_inventory_budget_once_the_daemon_is_re
         answer.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX),
         "{answer}"
     );
-    assert!(reason.contains(&cards[0].to_string()), "{reason}");
+    // Panes are named as their tabs are, not by internal identifiers.
+    assert!(reason.contains("\u{201c}Terminal\u{201d}"), "{reason}");
+    assert!(!reason.contains(&cards[0].to_string()), "{reason}");
 }
 
 #[test]
@@ -274,8 +275,11 @@ fn the_inventory_budget_still_caps_a_daemon_that_keeps_restoring() {
     ));
     drop(app.verify_startup_gate());
     let reason = reported(&app).expect("the absolute cap still applies");
-    assert!(reason.starts_with("Saved conversations"), "{reason}");
-    assert!(reason.contains("still reconnecting"), "{reason}");
+    assert_readable(reason);
+    assert!(
+        reason.starts_with("1 saved pane did not reconnect in time: \u{201c}Terminal\u{201d}"),
+        "{reason}"
+    );
 }
 
 #[test]
@@ -552,9 +556,11 @@ fn delayed_retained_cannot_override_current_readiness_or_save_completion() {
         end_terminals(&mut app, &cards);
         assert_eq!(app.startup_pane_check(), Ok(true));
         let save = if before_save {
-            app.startup_state_inspected(old)
+            assert_eq!(app.startup_state_inspected(old).units(), 0);
+            assert!(!app.startup_gate.saving && !app.startup_gate.reported);
+            save_on_ready(&mut app)
         } else {
-            let save = app.verify_startup_gate();
+            let save = save_on_ready(&mut app);
             drop(app.startup_state_inspected(old));
             save
         };
@@ -608,6 +614,44 @@ fn delayed_retained_cannot_override_current_readiness_or_save_completion() {
             );
         }
     }
+}
+
+/// Answers the inspection the gate itself reserved, as its worker would.
+fn answer_reserved(app: &mut Cagents, state: Result<StartupState, String>) -> Task<Message> {
+    let context = app
+        .startup_gate
+        .inspecting
+        .clone()
+        .expect("the gate reserved no inspection");
+    assert_eq!(app.startup_gate.outstanding, Some(context.ticket));
+    let socket = app.startup_gate.fixture_endpoint.clone().unwrap();
+    app.startup_state_inspected(Inspection {
+        context,
+        outcome: state.map(|state| Observation {
+            socket,
+            proof: fixture_proof(),
+            state,
+        }),
+    })
+}
+
+/// Settles the gate on a fresh Ready answer for exactly its current owners and
+/// returns the save it starts. A fixture's earlier worker that still holds the
+/// slot is answered past it, through a context built for the settled phase.
+fn save_on_ready(app: &mut Cagents) -> Task<Message> {
+    drop(app.verify_startup_gate());
+    assert!(
+        !app.startup_gate.saving,
+        "settled panes alone must not save"
+    );
+    if app.startup_gate.inspecting.is_some() {
+        drop(answer_reserved(app, Ok(StartupState::Ready)));
+    } else {
+        drop(deliver(app, Ok(StartupState::Ready)));
+    }
+    let save = app.verify_startup_gate();
+    assert!(app.startup_gate.saving);
+    save
 }
 
 /// Poll only the gate's original save Task, never its poll/inspection/provider
@@ -695,6 +739,11 @@ fn a_retired_worker_keeps_occupancy_until_its_original_completion() {
             .await
             .expect("original inspection worker did not enter");
             end_terminals(&mut app, &cards);
+            // The held worker keeps the settled phase from asking, so the
+            // gate saves once an earlier worker and its own would be done.
+            drop(app.verify_startup_gate());
+            assert!(!app.startup_gate.saving);
+            elapse(&mut app, SETTLED_ANSWER_BOUND * 2);
             let save = app.verify_startup_gate();
             assert!(app.startup_gate.saving);
             assert!(app.startup_gate.inspecting.is_none());
@@ -780,8 +829,8 @@ fn a_stale_inspection_does_not_hide_a_real_save_error() {
     );
     end_terminals(&mut app, &cards);
     assert!(app.session.is_none());
-    let save = app.verify_startup_gate();
     drop(app.startup_state_inspected(old));
+    let save = save_on_ready(&mut app);
     let Message::StartupPanesSaved(settings, workspace) = saved_message(save) else {
         unreachable!()
     };
@@ -820,4 +869,212 @@ fn an_inspection_that_sees_panes_move_leaves_polling_to_the_running_check() {
     app.startup_gate.inspected = Some(Instant::now());
     drop(app.verify_startup_gate());
     assert_ne!(app.startup_gate.progressed, progressed);
+}
+
+/// Settles every pane and checks the gate asked the daemon through its own
+/// reservation, bound to the settled phase.
+fn settle(app: &mut Cagents, cards: &[CardId]) {
+    end_terminals(app, cards);
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving && app.startup_gate.daemon.is_none());
+    assert_eq!(reported(app), None);
+    let reserved = app
+        .startup_gate
+        .inspecting
+        .as_ref()
+        .expect("settled gate did not ask");
+    assert_eq!(reserved.pending, None);
+    assert_eq!(reserved.owners, app.startup_connected_owners());
+    assert!(app.startup_gate.asked.is_some());
+}
+
+#[test]
+fn settled_panes_wait_for_the_daemon_and_report_a_retained_restore() {
+    // A terminal can attach while the daemon keeps its original owners, so
+    // panes that settled do not prove the update recovered them.
+    let (mut app, cards) = waiting(2);
+    connected_chat(&mut app);
+    // Ready from the waiting phase does not vouch for the settled one.
+    drop(deliver(&mut app, Ok(StartupState::Ready)));
+    assert!(app.startup_gate.daemon.is_some());
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Retained {
+            detail: DETAIL.into(),
+        }),
+    ));
+    let reason = reported(&app).expect("retained recovery must answer the launcher");
+    assert_readable(reason);
+    assert_eq!(reported_details(&app), Some(DETAIL));
+    assert!(!app.startup_gate.saving);
+}
+
+#[test]
+fn a_slow_settled_answer_still_reports_a_retained_restore() {
+    let (mut app, cards) = waiting(2);
+    // A waiting-phase worker holds the slot when the panes settle.
+    let earlier = inspection(&mut app, Ok(StartupState::Ready));
+    end_terminals(&mut app, &cards);
+    drop(app.verify_startup_gate());
+    assert!(app.startup_gate.asked.is_none(), "the slot was held");
+    elapse(&mut app, Duration::from_secs(4));
+    drop(app.startup_state_inspected(earlier));
+    assert!(app.startup_gate.daemon.is_none());
+    app.startup_gate.inspected = None;
+    drop(app.verify_startup_gate());
+    assert!(app.startup_gate.asked.is_some());
+    // The settled worker takes almost its whole bound to answer.
+    elapse(&mut app, SETTLED_ANSWER_BOUND - Duration::from_secs(1));
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Retained {
+            detail: DETAIL.into(),
+        }),
+    ));
+    assert_eq!(reported_details(&app), Some(DETAIL));
+}
+
+#[test]
+fn settled_panes_save_once_the_daemon_is_ready_unreachable_or_past_its_bound() {
+    for answer in [
+        Some(Ok(StartupState::Ready)),
+        Some(Err("daemon socket connection deadline elapsed".to_owned())),
+        None,
+    ] {
+        let (mut app, cards) = waiting(2);
+        settle(&mut app, &cards);
+        match answer {
+            Some(answer) => drop(answer_reserved(&mut app, answer)),
+            None => {
+                elapse(&mut app, SETTLED_ANSWER_BOUND - Duration::from_secs(1));
+                drop(app.verify_startup_gate());
+                assert!(!app.startup_gate.saving);
+                elapse(&mut app, Duration::from_secs(1));
+            }
+        }
+        drop(app.verify_startup_gate());
+        assert!(app.startup_gate.saving);
+        assert_eq!(reported(&app), None);
+    }
+}
+
+#[test]
+fn settled_panes_wait_out_a_restore_until_the_inventory_cap() {
+    let (mut app, cards) = waiting(2);
+    settle(&mut app, &cards);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Restoring { awaiting: 1 }),
+    ));
+    // A restore still under way can end Retained; it is not a verdict.
+    elapse(&mut app, SETTLED_ANSWER_BOUND * 2);
+    drop(app.verify_startup_gate());
+    assert!(!app.startup_gate.saving);
+    assert_eq!(reported(&app), None);
+    // Settled panes leave only the base 30 s budget.
+    elapse(&mut app, Duration::from_secs(30));
+    drop(app.verify_startup_gate());
+    let reason = reported(&app).expect("the cap bounds a restore");
+    assert_readable(reason);
+    assert!(
+        reason.contains("still restoring 1 saved session"),
+        "{reason}"
+    );
+    assert!(!app.startup_gate.saving);
+
+    // Its finishing lets the gate save.
+    let (mut app, cards) = waiting(2);
+    settle(&mut app, &cards);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Restoring { awaiting: 1 }),
+    ));
+    drop(app.verify_startup_gate());
+    app.startup_gate.inspected = None;
+    drop(app.verify_startup_gate());
+    drop(answer_reserved(&mut app, Ok(StartupState::Ready)));
+    drop(app.verify_startup_gate());
+    assert!(app.startup_gate.saving);
+}
+
+#[test]
+fn an_answer_to_an_earlier_pending_set_stays_rejected_after_it_returns() {
+    let (mut app, cards) = waiting(3);
+    let original = app.startup_pending().unwrap();
+    let earlier = inspection(
+        &mut app,
+        Ok(StartupState::Retained {
+            detail: DETAIL.into(),
+        }),
+    );
+    // Hold the throttle so no new reservation replaces the earlier one.
+    app.startup_gate.inspected = Some(Instant::now());
+    let failed = app.cards.insert(
+        cards[0],
+        CardRuntime::Failed("Fixture attach failed".into()),
+    );
+    drop(app.verify_startup_gate());
+    app.cards.insert(cards[0], failed.unwrap());
+    assert_eq!(app.startup_pending().unwrap(), original);
+    drop(app.verify_startup_gate());
+    drop(app.startup_state_inspected(earlier));
+    assert_eq!(reported(&app), None);
+    assert!(app.startup_gate.daemon.is_none());
+}
+
+#[test]
+fn notices_name_failed_panes_by_title_and_say_what_to_do() {
+    let (mut app, cards) = waiting(1);
+    app.cards.insert(
+        cards[0],
+        CardRuntime::Failed("Fixture attach failed".into()),
+    );
+    drop(app.verify_startup_gate());
+    let reason = reported(&app).expect("a failed pane answers the launcher");
+    assert_readable(reason);
+    assert!(
+        reason.starts_with("1 saved pane could not reconnect: \u{201c}Terminal\u{201d}. Open it to see why and retry"),
+        "{reason}"
+    );
+    assert!(!reason.contains(&cards[0].to_string()), "{reason}");
+    let long = pane_title(&"Very long\ntitle ".repeat(40));
+    assert!(!long.contains('\n'));
+    assert_eq!(long.chars().count(), MAX_PANE_TITLE_CHARS + 1);
+}
+
+#[test]
+fn an_inspection_that_sees_panes_settle_leaves_the_save_to_the_running_check() {
+    let (mut app, cards) = waiting(3);
+    let stale = inspection(&mut app, Ok(StartupState::Ready));
+    end_terminals(&mut app, &cards);
+    // The gate's own check is scheduled beside every inspection; starting a
+    // check here could leave two poll loops once a save finds panes pending.
+    assert_eq!(app.startup_state_inspected(stale).units(), 0);
+    assert!(!app.startup_gate.saving);
+    assert_eq!(reported(&app), None);
+    assert!(app.startup_gate.outstanding.is_none());
+}
+
+#[test]
+fn a_waiting_phase_failure_does_not_excuse_the_settled_answer() {
+    let (mut app, cards) = waiting(2);
+    drop(deliver(
+        &mut app,
+        Err("daemon socket connection deadline elapsed".into()),
+    ));
+    assert!(app.startup_gate.unavailable);
+    app.startup_gate.inspected = None;
+    settle(&mut app, &cards);
+    assert!(!app.startup_gate.unavailable);
+    drop(answer_reserved(
+        &mut app,
+        Ok(StartupState::Retained {
+            detail: DETAIL.into(),
+        }),
+    ));
+    assert_eq!(reported_details(&app), Some(DETAIL));
 }

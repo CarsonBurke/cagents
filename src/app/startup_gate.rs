@@ -10,6 +10,14 @@ use crate::terminal::ipc::StartupState;
 const NO_PROGRESS: Duration = Duration::from_secs(90);
 /// How often the gate asks the daemon about its startup recovery.
 const INSPECT_EVERY: Duration = Duration::from_secs(1);
+/// How long a window whose panes have all settled waits for the answer to its
+/// first settled-phase inspection before saving without one. A local worker
+/// gives up within two 5 s control IO bounds: the handshake and the request.
+const SETTLED_ANSWER_BOUND: Duration = Duration::from_secs(12);
+/// Most panes a notice names; the rest are counted.
+const NAMED_PANES: usize = 8;
+/// Longest pane title a notice repeats, in characters.
+const MAX_PANE_TITLE_CHARS: usize = 60;
 /// The launcher reads one handshake line of at most 4 KiB; the daemon's
 /// reason must leave room for the rest of the sentence.
 const MAX_DAEMON_DETAIL_BYTES: usize = 1024;
@@ -22,6 +30,14 @@ pub(super) struct State {
     /// What the gate last waited for, and when that or the daemon last moved.
     pending: Option<Pending>,
     progressed: Option<Instant>,
+    /// Since when every pane has settled while the gate waits for the daemon,
+    /// and when it first asked the daemon in that phase.
+    settled: Option<Instant>,
+    asked: Option<Instant>,
+    /// The latest inspection in this phase could not reach the daemon.
+    unavailable: bool,
+    /// An unreachable daemon is logged once per opening.
+    warned: bool,
     /// A successful answer remains bound to its waiting phase and exact owner.
     daemon: Option<Observed>,
     inspecting: Option<InspectionContext>,
@@ -37,7 +53,8 @@ pub(super) struct State {
 struct InspectionContext {
     ticket: u64,
     opened: Instant,
-    pending: Pending,
+    /// `None` once every pane has settled.
+    pending: Option<Pending>,
     owners: Vec<(CardId, crate::model::HostSessionProof)>,
 }
 
@@ -72,6 +89,9 @@ impl State {
         self.inspecting = None;
         self.daemon = None;
         self.pending = None;
+        self.settled = None;
+        self.asked = None;
+        self.unavailable = false;
     }
 
     pub(super) fn window_opened(&self) -> bool {
@@ -179,15 +199,14 @@ impl Cagents {
             return Ok(Some(Pending { admission, panes }));
         }
         if !failures.is_empty() {
+            let (them, their) = match failures.len() {
+                1 => ("it", "its"),
+                _ => ("them", "their"),
+            };
             return Err(format!(
-                "recovery-incomplete: {} saved panes could not reconnect (panes {}). Open the affected panes and use their recovery controls. Their drafts and recovery evidence are retained; this window remains available.",
-                failures.len(),
-                failures
-                    .iter()
-                    .take(12)
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                "recovery-incomplete: {} could not reconnect: {}. Open {them} to see why and retry; {their} drafts and recovery evidence are kept, and this window remains available.",
+                saved_panes(failures.len()),
+                self.startup_pane_names(&failures),
             ));
         }
         Ok(None)
@@ -214,6 +233,7 @@ impl Cagents {
             return report(Ok(()));
         }
         self.startup_gate.retire_inspections();
+        self.startup_gate.warned = false;
         self.startup_gate.opened = Some(Instant::now());
         let count = self.startup_conversation_count();
         let attach = self.qualify_startup_terminals();
@@ -240,24 +260,22 @@ impl Cagents {
             Err(reason) => self.fail_startup_gate(reason),
             Ok(Some(pending)) => {
                 let now = Instant::now();
-                let current =
-                    self.startup_gate.daemon.as_ref().is_none_or(|observed| {
-                        self.startup_observation_current(observed, &pending)
-                    });
+                self.retire_stale_observation(Some(&pending));
                 let gate = &mut self.startup_gate;
-                if !current {
-                    gate.daemon = None;
-                }
-                if gate.pending.as_ref() != Some(&pending) {
+                let resumed = gate.settled.take().is_some();
+                if resumed || gate.pending.as_ref() != Some(&pending) {
                     gate.progressed = Some(now);
+                    // An answer to another set, even one this set returns to,
+                    // describes owners and refusals that have since changed.
+                    gate.inspecting = None;
                     gate.pending = Some(pending);
                 }
                 // The inventory budget remains an absolute cap, even while the
                 // daemon reports that it is still restoring.
-                let count = self.startup_conversation_count();
-                let timeout = Duration::from_secs(30 + 30 * count as u64);
-                if now.duration_since(self.startup_gate.opened.unwrap()) >= timeout {
-                    return self.fail_startup_gate("recovery-incomplete: saved conversations are still reconnecting. The window remains available; open the affected chats to inspect their recovery controls. The update has not been verified.".to_owned());
+                if self.startup_budget_spent(now) {
+                    let reason =
+                        self.reconnecting_reason(self.startup_gate.pending.as_ref().unwrap());
+                    return self.fail_startup_gate(reason);
                 }
                 let gate = &self.startup_gate;
                 if gate
@@ -268,16 +286,18 @@ impl Cagents {
                         .progressed
                         .is_some_and(|progressed| now.duration_since(progressed) >= NO_PROGRESS)
                 {
-                    let reason = stalled_reason(gate.pending.as_ref().unwrap());
+                    let reason = self.stalled_reason(gate.pending.as_ref().unwrap());
                     return self.fail_startup_gate(reason);
                 }
-                let poll = cosmic::task::future(async {
-                    tokio::time::sleep(Duration::from_millis(200)).await;
-                    Message::VerifyStartupPanes
-                });
-                Task::batch([poll, self.inspect_daemon_startup()])
+                Task::batch([poll(), self.inspect_daemon_startup()])
             }
             Ok(None) => {
+                let now = Instant::now();
+                match self.settled_verdict(now) {
+                    Settled::Save => {}
+                    Settled::Wait => return Task::batch([poll(), self.inspect_daemon_startup()]),
+                    Settled::Report(reason) => return self.fail_startup_gate(reason),
+                }
                 self.startup_gate.retire_inspections();
                 self.startup_gate.saving = true;
                 self.persist();
@@ -287,6 +307,114 @@ impl Cagents {
                     Message::StartupPanesSaved(settings, workspace)
                 })
             }
+        }
+    }
+
+    /// A terminal can attach while the daemon keeps its original owners, so
+    /// panes that all settled do not prove the update recovered them: the
+    /// gate saves once the daemon reports Ready for exactly these owners or
+    /// cannot be reached. A Retained answer was reported when it arrived.
+    fn settled_verdict(&mut self, now: Instant) -> Settled {
+        self.retire_stale_observation(None);
+        let gate = &mut self.startup_gate;
+        if gate.settled.is_none() {
+            // Answers, failed ones included, belong to the phase that asked.
+            gate.settled = Some(now);
+            gate.asked = None;
+            gate.unavailable = false;
+            gate.inspecting = None;
+            gate.pending = None;
+            gate.progressed = Some(now);
+        }
+        let gate = &self.startup_gate;
+        match gate.daemon.as_ref().map(|observed| &observed.daemon.state) {
+            Some(StartupState::Ready) => Settled::Save,
+            // Its restore can still end Retained; the inventory cap bounds it.
+            Some(StartupState::Restoring { awaiting }) => {
+                if self.startup_budget_spent(now) {
+                    Settled::Report(restoring_reason(*awaiting))
+                } else {
+                    Settled::Wait
+                }
+            }
+            Some(StartupState::Retained { .. }) => Settled::Wait,
+            None => {
+                let answered_late = gate
+                    .asked
+                    .is_some_and(|asked| now.duration_since(asked) >= SETTLED_ANSWER_BOUND);
+                // An earlier phase's worker can hold the one slot for its own
+                // bound before this phase may ask.
+                let never_asked = gate
+                    .settled
+                    .is_some_and(|settled| now.duration_since(settled) >= SETTLED_ANSWER_BOUND * 2);
+                if gate.unavailable || answered_late || never_asked {
+                    Settled::Save
+                } else {
+                    Settled::Wait
+                }
+            }
+        }
+    }
+
+    fn startup_budget_spent(&self, now: Instant) -> bool {
+        let count = self.startup_conversation_count();
+        let timeout = Duration::from_secs(30 + 30 * count as u64);
+        now.duration_since(self.startup_gate.opened.unwrap()) >= timeout
+    }
+
+    /// The panes named as their tabs are, on one bounded line.
+    fn startup_pane_names(&self, panes: &[CardId]) -> String {
+        let mut names = panes
+            .iter()
+            .take(NAMED_PANES)
+            .map(|card| {
+                let title = self
+                    .card_state(*card)
+                    .map_or("Untitled", |state| self.card_display_title(state));
+                format!("\u{201c}{}\u{201d}", pane_title(title))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        if panes.len() > NAMED_PANES {
+            names.push_str(&format!(" and {} more", panes.len() - NAMED_PANES));
+        }
+        names
+    }
+
+    fn reconnecting_reason(&self, pending: &Pending) -> String {
+        if pending.panes.is_empty() {
+            return "recovery-incomplete: this window's shared workspace did not finish loading in time. The window remains available; its saved panes are kept. The update has not been verified.".to_owned();
+        }
+        format!(
+            "recovery-incomplete: {} did not reconnect in time: {}. The window remains available and keeps reconnecting them. The update has not been verified.",
+            saved_panes(pending.panes.len()),
+            self.startup_pane_names(&pending.panes),
+        )
+    }
+
+    fn stalled_reason(&self, pending: &Pending) -> String {
+        if pending.panes.is_empty() {
+            return format!(
+                "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window remains available; its saved panes are kept. The update has not been verified.",
+                NO_PROGRESS.as_secs()
+            );
+        }
+        format!(
+            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. The window remains available with its saved panes. The update has not been verified.",
+            saved_panes(pending.panes.len()),
+            NO_PROGRESS.as_secs(),
+            self.startup_pane_names(&pending.panes),
+        )
+    }
+
+    fn retire_stale_observation(&mut self, pending: Option<&Pending>) {
+        let current = self
+            .startup_gate
+            .daemon
+            .as_ref()
+            .is_none_or(|observed| self.startup_observation_current(observed, pending));
+        if !current {
+            self.startup_gate.daemon = None;
         }
     }
 
@@ -324,13 +452,18 @@ impl Cagents {
         {
             return None;
         }
-        let (Some(opened), Some(pending), Some(ticket)) = (
-            gate.opened,
-            gate.pending.clone(),
-            gate.next_inspection.checked_add(1),
-        ) else {
+        let (Some(opened), Some(ticket)) = (gate.opened, gate.next_inspection.checked_add(1))
+        else {
             return None;
         };
+        // A waiting gate records what it waits for; a settled one has nothing.
+        if gate.pending.is_none() && gate.settled.is_none() {
+            return None;
+        }
+        if gate.settled.is_some() && gate.asked.is_none() {
+            gate.asked = Some(Instant::now());
+        }
+        let pending = gate.pending.clone();
         let context = InspectionContext {
             ticket,
             opened,
@@ -361,12 +494,11 @@ impl Cagents {
         }
         match self.startup_pending() {
             Err(reason) => return self.fail_startup_gate(reason),
-            Ok(Some(pending)) if pending == inspection.context.pending => {}
-            // The gate's own check is already rescheduled and records this
-            // progress; starting another here would add a poll loop for every
-            // inspection that saw the panes move.
-            Ok(Some(_)) => return Task::none(),
-            Ok(None) => return self.verify_startup_gate(),
+            Ok(pending) if pending == inspection.context.pending => {}
+            // Every inspection is issued beside the gate's own rescheduled
+            // check, which records this move, settled panes included; starting
+            // another here would add a poll loop for each such inspection.
+            Ok(_) => return Task::none(),
         }
         let now = Instant::now();
         self.startup_gate.inspected = Some(now);
@@ -376,13 +508,18 @@ impl Cagents {
                     context: inspection.context,
                     daemon,
                 };
-                if !self.startup_observation_current(&observed, &observed.context.pending) {
+                if !self.startup_observation_current(&observed, observed.context.pending.as_ref()) {
                     return Task::none();
                 }
+                self.startup_gate.unavailable = false;
                 Some(observed)
             }
             Err(error) => {
-                tracing::debug!(%error, "daemon startup state is unavailable");
+                if !self.startup_gate.warned {
+                    tracing::warn!(%error, "daemon startup state is unavailable");
+                    self.startup_gate.warned = true;
+                }
+                self.startup_gate.unavailable = true;
                 None
             }
         };
@@ -415,9 +552,9 @@ impl Cagents {
         self.report_startup_failure(reason, notice)
     }
 
-    fn startup_observation_current(&self, observed: &Observed, pending: &Pending) -> bool {
+    fn startup_observation_current(&self, observed: &Observed, pending: Option<&Pending>) -> bool {
         if self.startup_gate.opened != Some(observed.context.opened)
-            || &observed.context.pending != pending
+            || observed.context.pending.as_ref() != pending
             || !observed.daemon.proof.is_complete()
             || self.startup_inspection_endpoint().as_ref() != Some(&observed.daemon.socket)
         {
@@ -573,25 +710,49 @@ fn retained_reason(detail: &str) -> String {
     )
 }
 
-fn stalled_reason(pending: &Pending) -> String {
-    if pending.panes.is_empty() {
-        return format!(
-            "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window remains available; its saved panes are retained. The update has not been verified.",
-            NO_PROGRESS.as_secs()
-        );
-    }
+/// What a settled gate does next.
+enum Settled {
+    Save,
+    Wait,
+    Report(String),
+}
+
+/// Every pane this window shows reconnected, but the daemon's restore can
+/// still keep their original owners; the update is not verified.
+fn restoring_reason(awaiting: u64) -> String {
     format!(
-        "recovery-incomplete: {} saved panes made no progress reconnecting for {} seconds (panes {}). The window remains available with its saved panes. The update has not been verified.",
-        pending.panes.len(),
-        NO_PROGRESS.as_secs(),
-        pending
-            .panes
-            .iter()
-            .take(12)
-            .map(ToString::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
+        "recovery-incomplete: this window's saved panes reconnected, but the terminal service was still restoring {} after the update. The window remains available. The update has not been verified.",
+        match awaiting {
+            1 => "1 saved session".to_owned(),
+            count => format!("{count} saved sessions"),
+        }
     )
+}
+
+fn saved_panes(count: usize) -> String {
+    match count {
+        1 => "1 saved pane".to_owned(),
+        count => format!("{count} saved panes"),
+    }
+}
+
+/// A pane title on one line, bounded so a notice naming several still fits
+/// the launcher's handshake line.
+fn pane_title(title: &str) -> String {
+    let mut title = title.split_whitespace().collect::<Vec<_>>().join(" ");
+    if let Some((end, _)) = title.char_indices().nth(MAX_PANE_TITLE_CHARS) {
+        title.truncate(end);
+        title.push('\u{2026}');
+    }
+    title
+}
+
+/// The gate's own next check; it is the only poll loop.
+fn poll() -> Task<Message> {
+    cosmic::task::future(async {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        Message::VerifyStartupPanes
+    })
 }
 
 fn report(result: Result<(), String>) -> Task<Message> {
