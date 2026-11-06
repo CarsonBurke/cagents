@@ -548,6 +548,8 @@ class HeldCommand(unittest.TestCase):
             # This copy of the gate, not a newer installed one, building here.
             "CAGENTS_BUILD_INSTALLED_GATE": "",
             "CAGENTS_BUILD_REMOTE": "local",
+            # A gate these tests kill leaves its command directory behind.
+            "TMPDIR": str(self.root),
         }
         self.env.pop("CAGENTS_BUILD_SLOT_HELD", None)
         self.children = []
@@ -1067,8 +1069,12 @@ if config.get("hold") == phase:
 if phase == "metadata":
     if config.get("metadata_exit"):
         raise SystemExit(config["metadata_exit"])
-    print(json.dumps(dict(build_directory=config.get("build_directory", str(root / "owned-build"))),
-                     separators=(",", ":")))
+    metadata = (dict(target_directory=config["target_directory"]) if "target_directory" in config else
+                dict(build_directory=config.get("build_directory", str(root / "owned-build"))))
+    print(json.dumps(metadata, separators=(",", ":")))
+    sys.stdout.flush()
+    if config.get("metadata_exit_after_output"):
+        raise SystemExit(config["metadata_exit_after_output"])
 elif phase == "compiler":
     data = sys.stdin.buffer.read()
     if "FIXTURE_OUTPUT_FD" in os.environ:
@@ -1265,8 +1271,31 @@ class PreflightCancellation(unittest.TestCase):
                     self.assertEqual((self.root / "caller-output").read_text(), "")
                 self.assertTrue(self.slot_is_free())
 
+    def test_a_cargo_reporting_no_build_directory_is_guarded_at_its_target(self):
+        target = str(self.root / "owned-target")
+        self.configure(guard_exit=2, target_directory=target)
+        process = self.start()
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 2, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard"])
+        self.assertEqual(calls[1]["arguments"], [target])
+
+    def test_a_named_cargo_is_the_one_asked_for_the_directory(self):
+        (self.root / "named").mkdir()
+        named = self.root / "named/cargo"
+        (self.root / "bin/cargo").rename(named)
+        target = str(self.root / "owned-target")
+        self.configure(guard_exit=2, target_directory=target)
+        process = self.start(environment=self.env | {"CAGENTS_BUILD_CARGO": str(named)})
+        _stdout, stderr = process.communicate("", timeout=5)
+        self.assertEqual(process.returncode, 2, stderr)
+        calls = self.calls()
+        self.assertEqual([event["phase"] for event in calls], ["metadata", "guard"])
+        self.assertEqual(calls[1]["arguments"], [target])
+
     def test_failed_or_empty_metadata_still_skips_helpers_and_builds(self):
-        for config in ({"metadata_exit": 37}, {"build_directory": ""}):
+        for config in ({"metadata_exit": 37}, {"metadata_exit_after_output": 37}, {"build_directory": ""}):
             with self.subTest(config=config):
                 self.clear()
                 self.configure(guard_exit=2, **config)

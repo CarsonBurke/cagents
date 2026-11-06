@@ -571,6 +571,8 @@ class StandInHost(unittest.TestCase):
         """))
         (self.crate / "src/main.rs").write_text('fn main() { println!("probe"); }\n')
         (self.crate / ".gitignore").write_text("/target\n")
+        # A host's default toolchain may predate CARGO_BUILD_BUILD_DIR.
+        shutil.copy2(ROOT / "rust-toolchain.toml", self.crate)
         subprocess.run(["git", "init", "-q"], cwd=self.crate, check=True)
         home = Path.home()
         self.env = {
