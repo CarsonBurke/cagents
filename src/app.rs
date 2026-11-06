@@ -14666,6 +14666,14 @@ impl Application for Cagents {
 
     fn update(&mut self, message: Message) -> Task<Message> {
         if let Some(settled) = self.settle_chat_close_confirm() {
+            // An answer to the question that just ended must not answer the
+            // next one, which the reader has not seen.
+            if matches!(
+                message,
+                Message::ConfirmChatClose | Message::CancelChatClose
+            ) {
+                return settled;
+            }
             return Task::batch([settled, self.update(message)]);
         }
         // Pane callbacks retain their rendering origin while queued. Unwrap

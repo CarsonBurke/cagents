@@ -6,6 +6,8 @@ use super::*;
 
 const CANCEL: &str = "dialog.chat-close.cancel";
 const CONFIRM: &str = "dialog.chat-close.confirm";
+/// How much of a first message can stand in for a conversation's name.
+const FIRST_MESSAGE_NAME_CHARS: usize = 60;
 
 #[derive(Debug, Clone)]
 pub(super) struct ChatCloseConfirm {
@@ -144,13 +146,31 @@ impl Cagents {
     pub(super) fn chat_close_dialog(&self) -> Element<'_, Message> {
         let intent = self.chat_close_confirm.as_ref();
         // Several closes can ask in turn, so each says which conversation it means.
-        let title = intent
-            .and_then(|intent| self.card_chrome.get(&intent.card))
-            .map_or_else(
-                || "Stop this conversation?".to_owned(),
-                |chrome| format!("Stop \u{201c}{}\u{201d}?", chrome.title),
-            );
-        let body = if intent.is_some_and(|intent| intent.certain) {
+        // A conversation still sending its first message has no name of its
+        // own yet; that message is what the reader knows it by.
+        let first_message =
+            intent.and_then(|intent| self.chat_first_message_on_its_way(intent.card));
+        let name = first_message
+            .as_deref()
+            .and_then(|message| message.lines().next())
+            .map(
+                |line| match line.char_indices().nth(FIRST_MESSAGE_NAME_CHARS) {
+                    Some((end, _)) => format!("{}\u{2026}", &line[..end]),
+                    None => line.to_owned(),
+                },
+            )
+            .or_else(|| {
+                intent
+                    .and_then(|intent| self.card_chrome.get(&intent.card))
+                    .map(|chrome| chrome.title.to_string())
+            });
+        let title = name.map_or_else(
+            || "Stop this conversation?".to_owned(),
+            |name| format!("Stop \u{201c}{name}\u{201d}?"),
+        );
+        let body = if first_message.is_some() {
+            "Its first message is still on its way. Closing it stops the conversation, discards that message and closes it in every window."
+        } else if intent.is_some_and(|intent| intent.certain) {
             "It is still working. Closing it stops it and closes it in every window."
         } else {
             "It may still be working. Closing it stops anything it is doing and closes it in every window."

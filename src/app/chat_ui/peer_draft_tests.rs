@@ -893,6 +893,64 @@ fn closes_waiting_on_a_question_go_on_when_it_ends_elsewhere() {
     assert!(!peer.app.pane_close_owned(waiting));
 }
 
+/// An answer that arrives just as its question ends must not answer the next
+/// question, which the reader has not seen.
+#[test]
+fn an_answer_to_a_question_that_ended_does_not_answer_the_next() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let mut working = |thread| {
+        let card = super::tests::live_chat_for_provider(&mut app, Provider::Claude, Some(thread));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("expected a chat runtime");
+        };
+        let handle = runtime.handle().unwrap();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.busy = true;
+        handle.publish_snapshot_for_test(snapshot);
+        card
+    };
+    let asked = working("asked-thread");
+    let next = working("next-thread");
+
+    drop(app.update(Message::CloseCard(asked)));
+    assert!(app.chat_close_asked(asked));
+    drop(app.begin_card_close(next));
+    assert_eq!(app.queued_card_closes.len(), 1);
+    let Some(CardKind::Chat(session)) = app.card_state(asked).map(|state| state.kind.clone())
+    else {
+        panic!("expected a chat");
+    };
+    app.replace_chat_conversation(
+        asked,
+        chat::Session {
+            id: TerminalId::new(),
+            ..session
+        },
+    );
+
+    drop(app.update(Message::ConfirmChatClose));
+
+    assert!(app.chat_close_asked(next));
+    assert!(!app.chat_close_owned(next));
+    assert!(
+        app.card_state(next)
+            .is_some_and(|state| state.existence.is_open())
+    );
+}
+
+/// A provider coming up and in error is not going to work on anything.
+#[test]
+fn a_provider_that_failed_coming_up_closes_without_asking() {
+    let mut peer = peer();
+    attached_with_update_pending(&mut peer);
+    publish_activity(&peer, |snapshot| {
+        snapshot.ready = false;
+        snapshot.error = Some("the provider could not start".into());
+    });
+
+    assert!(peer.app.chat_working_session(peer.card).is_none());
+}
+
 /// A popup that closes under the question hands it the reader's keyboard state.
 #[test]
 fn answering_restores_the_keyboard_state_a_popup_handed_over() {

@@ -8026,6 +8026,7 @@ impl Cagents {
         // only says not to keep its terminal.
         if (session.is_unstarted() && !pending)
             || self.chat_close_owned(card)
+            || self.chat_closed_elsewhere(card)
             || matches!(
                 self.chat_ui.phases.get(&card),
                 Some(Phase::Returning { .. })
@@ -8051,7 +8052,11 @@ impl Cagents {
                     // The provider says nothing of what it has not been handed.
                     crate::agent::ActivityState::Idle if runtime.message_on_its_way() => true,
                     // Nor can one that has not come up yet say it is idle.
-                    crate::agent::ActivityState::Idle if !snapshot.ready => false,
+                    crate::agent::ActivityState::Idle
+                        if !snapshot.ready && snapshot.error.is_none() =>
+                    {
+                        false
+                    }
                     crate::agent::ActivityState::Idle => return None,
                 }
             }
@@ -8071,6 +8076,18 @@ impl Cagents {
             _ => return None,
         };
         Some((session.id, certain))
+    }
+
+    /// The first message this window is still sending, which closing would
+    /// discard.
+    pub(super) fn chat_first_message_on_its_way(&self, card: CardId) -> Option<String> {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime
+                .queued
+                .as_ref()
+                .map(|queued| queued.source.text().to_owned()),
+            _ => None,
+        }
     }
 
     /// Whether closing or a close-after-return already owns this card.
@@ -20704,7 +20721,7 @@ mod tests {
     fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
         live_chat_for_provider(app, Provider::Codex, session_id)
     }
-    fn live_chat_for_provider(
+    pub(super) fn live_chat_for_provider(
         app: &mut Cagents,
         provider: Provider,
         session_id: Option<&str>,

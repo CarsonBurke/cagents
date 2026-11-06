@@ -2125,15 +2125,25 @@ impl Runtime {
                     self.disconnected || self.paging().is_some(),
                 ));
             }
-            if self.turns.is_empty() && self.queued.is_none() {
+            if self.turns.is_empty() && self.queued.is_none() && !self.closed_elsewhere {
                 // The empty state says what to do. It used to show whatever the
                 // adapter's last status detail was, which meant an empty
                 // conversation greeted the reader with a connection state instead
                 // of an invitation; the status line is where a state belongs.
+                // A conversation another window started is not asking for a
+                // first message, so it does not invite one while it comes up.
+                let coming_up = !self.is_draft()
+                    && self.connected()
+                    && !self.snapshot.ready
+                    && !self.snapshot.exited;
                 transcript.push(
                     widget::container(
-                        design::body("Your conversation appears here. Send a message to begin.")
-                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                        design::body(if coming_up {
+                            "This conversation is starting."
+                        } else {
+                            "Your conversation appears here. Send a message to begin."
+                        })
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
                     )
                     .center_x(Length::Fill)
                     .padding(space::XXL)

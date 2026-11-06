@@ -353,6 +353,7 @@ mod tests {
         assert!(runtime.closed_elsewhere);
         assert!(runtime.queued.is_none());
         assert_eq!(runtime.unsent_text(), "the first message");
+        assert!(app.chat_working_session(target.card).is_none());
         let text = visible_text(&app, target.card).join("\n");
         assert!(!text.contains("Starting"), "{text}");
     }
