@@ -399,17 +399,18 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
         let mut notice_shown = false;
-        let lease = cagents::instance::WindowLease::acquire(new_window, slot, &mut |waited| {
-            if notice_shown || waited < STARTUP_WAIT_NOTICE_DELAY {
-                return;
-            }
-            notice_shown = true;
-            if let Err(error) =
-                cagents::instance::show_startup_wait_notice(spawn_startup_wait_notice)
-            {
-                tracing::warn!(%error, "could not show the daemon startup notice");
-            }
-        })?;
+        let lease =
+            cagents::instance::WindowLease::acquire_waiting(new_window, slot, &mut |waited| {
+                if notice_shown || waited < STARTUP_WAIT_NOTICE_DELAY {
+                    return;
+                }
+                notice_shown = true;
+                if let Err(error) =
+                    cagents::instance::show_startup_wait_notice(spawn_startup_wait_notice)
+                {
+                    tracing::warn!(%error, "could not show the daemon startup notice");
+                }
+            })?;
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
         } else {

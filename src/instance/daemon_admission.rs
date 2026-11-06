@@ -708,7 +708,7 @@ mod tests {
         // A daemon started on its own holds the fence until it is ready.
         let mut daemon = Some(DaemonAdmissionGuard::acquire().unwrap());
         let mut checks = 0;
-        let lease = WindowLease::acquire(false, None, &mut |_| {
+        let lease = WindowLease::acquire_waiting(false, None, &mut |_| {
             checks += 1;
             daemon.take();
         })
@@ -731,7 +731,7 @@ mod tests {
         let daemon = DaemonAdmissionGuard::acquire().unwrap();
         // SAFETY: as above.
         unsafe { env::remove_var(DAEMON_FENCE_ENV) };
-        let error = WindowLease::acquire(false, None, &mut |_| {
+        let error = WindowLease::acquire_waiting(false, None, &mut |_| {
             panic!("a window must not wait out an inherited update fence")
         })
         .err()
@@ -741,7 +741,7 @@ mod tests {
         drop(launcher);
         // The reviewed update coordinator holds the same fence for an update.
         let update = UiUpdateGuard::acquire().unwrap();
-        let error = WindowLease::acquire(true, None, &mut |_| {
+        let error = WindowLease::acquire_waiting(true, None, &mut |_| {
             panic!("a window must not wait out an update")
         })
         .err()

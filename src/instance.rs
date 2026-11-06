@@ -286,12 +286,18 @@ pub struct WindowLease {
 }
 
 impl WindowLease {
+    /// Take this window's lease, waiting quietly while a starting daemon
+    /// holds the launch fence. See [`WindowLease::acquire_waiting`].
+    pub fn acquire(new_window: bool, requested: Option<&str>) -> io::Result<Self> {
+        Self::acquire_waiting(new_window, requested, &mut |_| {})
+    }
+
     /// Take this window's lease. While a starting daemon holds the launch
     /// fence for its admission, wait for it: `waiting` hears each check that
     /// finds it still starting, with the time waited so far. An update fails
     /// at once with [`UpdateInProgress`]; a daemon that does not finish in
     /// time fails with [`DaemonStillStarting`].
-    pub fn acquire(
+    pub fn acquire_waiting(
         new_window: bool,
         requested: Option<&str>,
         waiting: &mut dyn FnMut(Duration),
