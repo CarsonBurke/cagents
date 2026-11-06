@@ -581,6 +581,19 @@ exit 83
         self.assert_built("--browserless")
         self.assertTrue(ran.read_text().strip().endswith("/cagents-ui"))
 
+    def test_an_instance_runs_under_a_memory_limit(self):
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text('#!/bin/sh\nexec "$@"\n')
+        limit.chmod(0o755)
+        started = self.root / "started"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(f'#!/bin/sh\ncase " $* " in *" start "*) printf "%s\\n" "$@" >"{started}" ;; *) exit 1 ;; esac\n')
+        harness.chmod(0o755)
+        self.launch("--browserless", "--instance", "capped")
+        words = started.read_text().splitlines()
+        program = words.index(str(limit))
+        self.assertTrue(words[program + 1].endswith("/cagents-ui"), words)
+
     def test_the_memory_limit_speaks_to_the_terminal_and_the_app_to_the_log(self):
         limit = self.runner.with_name("memory-capped")
         limit.write_text('#!/bin/sh\n"$@"\necho limit-message >&2\n')
