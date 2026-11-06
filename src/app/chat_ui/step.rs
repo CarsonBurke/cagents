@@ -397,26 +397,45 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let open = self.item_expanded(&item.id);
-        let header = self.step_header(item, cached, open);
         if !open {
-            return header;
+            return self.step_header(item, cached, open);
         }
         let detail = self.step_detail(item, cached, settings);
-        widget::column::with_children(vec![
-            header,
-            widget::container(detail)
-                .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(GAP_XS)
-        .width(Length::Fill)
-        .into()
+        // The step's actions stay beside its header, and its detail keeps to
+        // the header's width rather than running out under them, so an open
+        // step ends at one right edge.
+        hover::beside_first(
+            widget::column::with_children(vec![
+                self.step_button(item, cached, open),
+                widget::container(detail)
+                    .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
+                    .width(Length::Fill)
+                    .into(),
+            ])
+            .spacing(GAP_XS)
+            .width(Length::Fill),
+            self.message_copy(item),
+            GAP_XS,
+        )
     }
 
     /// A step's summary line, which is the whole of a closed step and owns
     /// what it draws, so a finished exchange can keep it between frames.
     pub(super) fn step_header(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        open: bool,
+    ) -> Element<'static, Message> {
+        hover::view(
+            self.step_button(item, cached, open),
+            self.message_copy(item),
+            GAP_XS,
+        )
+    }
+
+    /// The summary line's toggle, without the actions placed beside it.
+    fn step_button(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
@@ -428,10 +447,10 @@ impl Runtime {
         let coordinated = cached.coordination.as_deref();
         let (verb, label) = match coordinated {
             Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
-            None => (
-                turn::step_verb(&item.content).to_owned(),
-                turn::step_label(&item.content).to_owned(),
-            ),
+            None => {
+                let (verb, label) = turn::step_title(&item.content);
+                (verb.to_owned(), label.into_owned())
+            }
         };
         let glyph = coordinated
             .and_then(Coordinated::glyph)
@@ -507,7 +526,7 @@ impl Runtime {
         if let Some(description) = turn::command_description(&item.content) {
             name = format!("{name} · {description}");
         }
-        let header = widget::button::custom(
+        widget::button::custom(
             widget::row::with_children(line)
                 .spacing(GAP_S)
                 .align_y(Alignment::Start),
@@ -516,8 +535,8 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
-        .on_press(action(Action::Toggle(target, item.id.clone())));
-        hover::view(header, self.message_copy(item), GAP_XS)
+        .on_press(action(Action::Toggle(target, item.id.clone())))
+        .into()
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it

@@ -102,6 +102,7 @@ mod stopped;
 mod text_copy;
 mod thumbnails;
 mod tool_text;
+mod tool_title;
 mod turn;
 mod view;
 mod virtualized;
@@ -1174,6 +1175,13 @@ fn carry_step_disclosures(
     }
 }
 
+/// How a step stands when that is worth a word: still running, or ended
+/// without doing what it was asked. A step that worked says nothing, as its
+/// group's mark already does.
+fn unsettled_word(status: chat::ToolStatus) -> Option<&'static str> {
+    (status != chat::ToolStatus::Succeeded).then(|| status_word(status))
+}
+
 fn status_word(status: chat::ToolStatus) -> &'static str {
     match status {
         chat::ToolStatus::Running => "Running",
@@ -1791,25 +1799,34 @@ impl CachedItem {
                     }
                     detail.push_str(&format_duration(*elapsed));
                 }
-                if detail.is_empty() {
-                    detail.push_str(status_word(*status));
+                // A command that ended without an exit code to say so says
+                // how it ended; one that worked needs no word for it.
+                if !matches!(exit_code, Some(code) if *code != 0)
+                    && let Some(word) = unsettled_word(*status)
+                {
+                    detail = if detail.is_empty() {
+                        word.to_owned()
+                    } else {
+                        format!("{word} · {detail}")
+                    };
                 }
-                cached.detail = Some(detail);
+                cached.detail = (!detail.is_empty()).then_some(detail);
             }
-            ItemContent::Changes { changes, status } => {
-                cached.detail = Some(match changes.len() {
-                    0 | 1 => status_word(*status).to_owned(),
-                    count => format!("{count} files"),
-                });
+            ItemContent::Changes { status, .. } => {
+                // The row counts the files; this says only how the edit went.
+                cached.detail = unsettled_word(*status).map(str::to_owned);
             }
             ItemContent::WebSearch { results, .. } => {
-                cached.detail = Some(match results.len() {
-                    1 => "1 result".to_owned(),
-                    count => format!("{count} results"),
-                });
+                // A search reported without its results, as Codex reports
+                // one, found nothing a reader could count.
+                cached.detail = match results.len() {
+                    0 => None,
+                    1 => Some("1 result".to_owned()),
+                    count => Some(format!("{count} results")),
+                };
             }
             ItemContent::Tool { status, .. } => {
-                cached.detail = Some(status_word(*status).to_owned());
+                cached.detail = unsettled_word(*status).map(str::to_owned);
             }
             ItemContent::Image { .. } => {}
         }

@@ -17,7 +17,10 @@
 
 use super::coordination::Coordinated;
 use crate::chat::{self, Item, ItemContent, Phase, Role, ToolStatus};
-use std::{borrow::Borrow, collections::HashSet};
+use std::{
+    borrow::{Borrow, Cow},
+    collections::HashSet,
+};
 
 /// Where an item belongs inside its group.
 ///
@@ -173,10 +176,9 @@ impl Turn {
                     if let Some(coordinated) = coordinated(item) {
                         coordinated.summary()
                     } else {
-                        let verb = step_verb(&item.content);
-                        let label = step_label(&item.content);
+                        let (verb, label) = step_title(&item.content);
                         if verb.is_empty() {
-                            label.to_owned()
+                            label.into_owned()
                         } else {
                             format!("{verb} {label}")
                         }
@@ -444,8 +446,8 @@ pub(super) fn slot_of(item: &Item) -> Slot {
 /// one, because the provider knows what it was doing; the fallbacks exist so an
 /// adapter that cannot supply a label still produces something a reader can act
 /// on rather than the word "Tool".
-pub(super) fn step_label(content: &ItemContent) -> &str {
-    match content {
+pub(super) fn step_label(content: &ItemContent) -> Cow<'_, str> {
+    Cow::Borrowed(match content {
         ItemContent::Text { .. } => "Thinking",
         ItemContent::Command {
             label,
@@ -478,10 +480,15 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             // whether it adds or edits a file, is not known yet.
             [] if *status == ToolStatus::Running => "Preparing an edit",
             [single] => single.path.as_str(),
-            _ => "File changes",
+            changes => return Cow::Owned(format!("{} files", changes.len())),
         },
         ItemContent::WebSearch { query, .. } => query.as_str(),
-        ItemContent::Tool { name, .. } => name.as_str(),
+        ItemContent::Tool {
+            name,
+            input,
+            status,
+            ..
+        } => return super::tool_title::title(name, input, *status).label,
         ItemContent::Image { description, .. } => description.as_str(),
         // As `chat::delivery_heading` has it, less a named sender's summary.
         ItemContent::Delivery {
@@ -498,7 +505,7 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
                 sender.get(..8).unwrap_or(sender)
             }
         }
-    }
+    })
 }
 
 /// What a provider said a shell command was for, when it said something the
@@ -550,6 +557,23 @@ fn target(action: chat::CommandAction, label: &str) -> &str {
     }
 }
 
+/// A step's verb and label together, reading a tool call's input once for
+/// both.
+pub(super) fn step_title(content: &ItemContent) -> (&'static str, Cow<'_, str>) {
+    match content {
+        ItemContent::Tool {
+            name,
+            input,
+            status,
+            ..
+        } => {
+            let title = super::tool_title::title(name, input, *status);
+            (title.verb, title.label)
+        }
+        content => (step_verb(content), step_label(content)),
+    }
+}
+
 /// The verb a step is introduced with, kept separate from its target so the two
 /// can be typeset differently.
 pub(super) fn step_verb(content: &ItemContent) -> &'static str {
@@ -572,7 +596,12 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
             _ => "Edited",
         },
         ItemContent::WebSearch { .. } => "Searched the web for",
-        ItemContent::Tool { .. } => "Called",
+        ItemContent::Tool {
+            name,
+            input,
+            status,
+            ..
+        } => super::tool_title::title(name, input, *status).verb,
         ItemContent::Image { .. } => "Viewed",
         ItemContent::Delivery { from, summary, .. } if from.is_empty() && !summary.is_empty() => "",
         ItemContent::Delivery { kind, .. } => kind.verb(),
@@ -590,7 +619,7 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     coordinated: &impl Fn(&Item) -> Option<&'c Coordinated>,
 ) -> Option<String> {
     let mut edited = std::collections::BTreeSet::new();
-    let (mut ran, mut read, mut searched, mut listed, mut web, mut called, mut viewed) =
+    let (mut ran, mut read, mut searched, mut listed, mut web, mut used, mut viewed) =
         (0, 0, 0, 0, 0, 0, 0);
     // An edit whose input is still arriving names no file yet, and a
     // summary that left it out would hide a step that is still working.
@@ -618,7 +647,7 @@ fn summarize_steps<'c, T: Borrow<Item>>(
                 chat::CommandAction::List => listed += 1,
             },
             ItemContent::WebSearch { .. } => web += 1,
-            ItemContent::Tool { .. } => called += 1,
+            ItemContent::Tool { .. } => used += 1,
             ItemContent::Image { .. } => viewed += 1,
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {}
         }
@@ -658,8 +687,8 @@ fn summarize_steps<'c, T: Borrow<Item>>(
             count => format!("searched the web {count} times"),
         });
     }
-    if called > 0 {
-        parts.push(format!("called {}", counted(called, "tool", "tools")));
+    if used > 0 {
+        parts.push(format!("used {}", counted(used, "tool", "tools")));
     }
     if viewed > 0 {
         parts.push(format!("viewed {}", counted(viewed, "image", "images")));
@@ -1531,6 +1560,61 @@ mod tests {
         assert_eq!(
             turns[0].summary,
             "Preparing an edit, ran a command · working"
+        );
+    }
+
+    /// Tool rows say what each call did, and the group counts them as tools
+    /// it used, so neither repeats "Called" on every line. A group of several
+    /// files counts them rather than reading "Edited File changes".
+    #[test]
+    fn tool_rows_say_what_they_did_and_groups_count_them_once() {
+        let tool = |id: &str, name: &str, input: &str| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: name.into(),
+                input: input.into(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        };
+        let skill = tool("t1", "Skill", r#"{"skill":"writing-copy"}"#);
+        assert_eq!(
+            (
+                step_verb(&skill.content),
+                step_label(&skill.content).as_ref()
+            ),
+            ("Used skill", "writing-copy")
+        );
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            skill,
+            tool("t2", "mcp__linear__get_issue", r#"{"id":"ENG-1"}"#),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns[0].summary, "Used 2 tools");
+        let only = vec![
+            text("u1", Role::User, Phase::Final, false),
+            tool("t1", "mcp__linear__get_issue", "{}"),
+        ];
+        assert_eq!(
+            group(&only, &unasked(), plain)[0].summary,
+            "Used Linear: get issue"
+        );
+        let change = |path: &str| chat::FileChange {
+            path: path.into(),
+            kind: chat::ChangeKind::Updated,
+            diff: String::new(),
+        };
+        let edits = ItemContent::Changes {
+            changes: vec![change("a.rs"), change("b.rs")],
+            status: ToolStatus::Succeeded,
+        };
+        assert_eq!(
+            format!("{} {}", step_verb(&edits), step_label(&edits)),
+            "Edited 2 files"
         );
     }
 }
