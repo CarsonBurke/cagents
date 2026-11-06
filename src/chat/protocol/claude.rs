@@ -19,6 +19,7 @@ use std::{
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
+use streamed_input::StreamedInput;
 
 const MAX_PENDING: usize = 64;
 const MAX_TOOLS: usize = 512;
@@ -470,6 +471,13 @@ impl TaskOutcome {
     }
 }
 
+/// A content block of a message still streaming: the item it is, and for a
+/// tool call, what its input says so far.
+struct Block {
+    item: Item,
+    input: StreamedInput,
+}
+
 #[derive(Default)]
 struct Claude {
     session_id: Option<String>,
@@ -508,7 +516,7 @@ struct Claude {
     /// Blocks of the messages still streaming. Claude emits each block's
     /// assistant frame before that block stops, so a message's blocks are
     /// dropped at its `message_stop`, or when its stream starts another message.
-    blocks: HashMap<(ScopedId, u64), Item>,
+    blocks: HashMap<(ScopedId, u64), Block>,
     /// Unknown block types still own their stream index. Their later deltas
     /// must not mutate an older block or look like an orphan known block.
     ignored_blocks: HashSet<(ScopedId, u64)>,
@@ -1516,7 +1524,7 @@ impl Claude {
                 let index = self
                     .blocks
                     .iter()
-                    .filter(|((message, block_index), item)| {
+                    .filter(|((message, block_index), Block { item, .. })| {
                         message == &message_key
                             && *block_index >= base as u64
                             && match (&item.content, string(block, "type")) {
@@ -2266,8 +2274,8 @@ impl Claude {
                 let key = ScopedId::new(parent, id);
                 self.forget_tool(&key);
                 self.tool_order.retain(|known| known != &key);
-                self.blocks.retain(|(message, _), item| {
-                    message.parent.as_deref() != parent || &item.id != id
+                self.blocks.retain(|(message, _), block| {
+                    message.parent.as_deref() != parent || &block.item.id != id
                 });
             }
         }
@@ -4341,9 +4349,18 @@ fn tool_content(name: &str, input: &Value, cwd: &Path) -> ItemContent {
 /// with whatever of its input has arrived. An edit's verb depends on what it
 /// replaces, so it is an edit not yet described; any other call is shown as
 /// the tool call it stays.
-fn streamed(item: &Item, cwd: &Path) -> Item {
-    let ItemContent::Tool { name, input, .. } = &item.content else {
+fn streamed(item: &Item, input: &StreamedInput, cwd: &Path) -> Item {
+    let ItemContent::Tool { name, .. } = &item.content else {
         return item.clone();
+    };
+    // Only the presentation is new: the call's raw input, which a command
+    // row does not carry, is not copied for every fragment.
+    let shown = |content| Item {
+        started_at: item.started_at,
+        id: item.id.clone(),
+        role: item.role,
+        content,
+        at: item.at,
     };
     let action = match name.as_str() {
         "Bash" => CommandAction::Run,
@@ -4351,17 +4368,14 @@ fn streamed(item: &Item, cwd: &Path) -> Item {
         "Grep" => CommandAction::Search,
         "Glob" => CommandAction::List,
         "Edit" | "MultiEdit" | "Write" => {
-            return Item {
-                content: ItemContent::Changes {
-                    changes: Vec::new(),
-                    status: ToolStatus::Running,
-                },
-                ..item.clone()
-            };
+            return shown(ItemContent::Changes {
+                changes: Vec::new(),
+                status: ToolStatus::Running,
+            });
         }
         _ => return item.clone(),
     };
-    let content = match tool_content(name, &partial_json(input), cwd) {
+    let content = match tool_content(name, input.value(), cwd) {
         content @ ItemContent::Command { .. } => content,
         _ => command_content(
             String::new(),
@@ -4370,68 +4384,9 @@ fn streamed(item: &Item, cwd: &Path) -> Item {
             action,
         ),
     };
-    Item {
-        content,
-        ..item.clone()
-    }
+    shown(content)
 }
 
-/// The value a prefix of a JSON document describes so far: a string cut off
-/// part-way holds what has arrived of it, and a member whose value has not
-/// begun is left out. `Value::Null` where nothing of it can be read yet.
-fn partial_json(prefix: &str) -> Value {
-    let mut closers = Vec::new();
-    // Where the prefix can be cut to leave only whole members, and what is
-    // open there: just inside a container, or before a separating comma.
-    let mut whole = (0, Vec::new());
-    let mut string = false;
-    // Where an escape that has not finished began.
-    let mut escape: Option<usize> = None;
-    for (index, byte) in prefix.bytes().enumerate() {
-        if string {
-            match escape {
-                // `\u` is followed by four hex digits; any other escape is
-                // one character.
-                Some(at) if index == at + 1 && byte == b'u' => {}
-                Some(at) if index == at + 1 || index == at + 5 => escape = None,
-                Some(_) => {}
-                None if byte == b'\\' => escape = Some(index),
-                None if byte == b'"' => string = false,
-                None => {}
-            }
-            continue;
-        }
-        match byte {
-            b'"' => string = true,
-            b'{' | b'[' => {
-                closers.push(if byte == b'{' { b'}' } else { b']' });
-                whole = (index + 1, closers.clone());
-            }
-            b'}' | b']' => {
-                closers.pop();
-            }
-            b',' => whole = (index, closers.clone()),
-            _ => {}
-        }
-    }
-    let close = |text: &str, closers: &[u8]| {
-        let mut text = text.to_owned();
-        text.extend(closers.iter().rev().map(|&byte| byte as char));
-        serde_json::from_str(&text).ok()
-    };
-    let attempt = if string {
-        // A value cut off inside an escape keeps what came before it.
-        close(
-            &format!("{}\"", &prefix[..escape.unwrap_or(prefix.len())]),
-            &closers,
-        )
-    } else {
-        close(prefix, &closers)
-    };
-    attempt
-        .or_else(|| close(&prefix[..whole.0], &whole.1))
-        .unwrap_or(Value::Null)
-}
 fn command_content(
     label: String,
     command: String,
@@ -4863,13 +4818,18 @@ impl Claude {
                 if parent.is_empty() {
                     self.turn_visible_content = true;
                 }
-                if !matches!(&item.content, ItemContent::Tool { .. })
-                    || !self.completed_tool(Some(&parent), &item.id)
+                let block = Block {
+                    item,
+                    input: StreamedInput::default(),
+                };
+                if !matches!(&block.item.content, ItemContent::Tool { .. })
+                    || !self.completed_tool(Some(&parent), &block.item.id)
                 {
-                    step.events.push(Event::Item(streamed(&item, &self.cwd)));
+                    step.events
+                        .push(Event::Item(streamed(&block.item, &block.input, &self.cwd)));
                 }
                 self.blocks
-                    .insert((ScopedId::new(Some(&parent), &message), index), item);
+                    .insert((ScopedId::new(Some(&parent), &message), index), block);
             }
             "content_block_delta" => {
                 let stream = self
@@ -4908,7 +4868,10 @@ impl Claude {
                     }
                     .into());
                 }
-                let Some(item) = self
+                let Some(Block {
+                    item,
+                    input: streamed_input,
+                }) = self
                     .blocks
                     .get_mut(&(ScopedId::new(Some(&parent), &stream.message), index))
                 else {
@@ -4953,7 +4916,9 @@ impl Claude {
                             );
                         }
                         input.push_str(value);
-                        step.events.push(Event::Item(streamed(item, &self.cwd)));
+                        streamed_input.push(value);
+                        step.events
+                            .push(Event::Item(streamed(item, streamed_input, &self.cwd)));
                     }
                     (_, other) => step.events.push(Event::Error {
                         message: format!("Unsupported Claude stream delta {other}"),
@@ -4977,11 +4942,8 @@ impl Claude {
                 {
                     return Ok(());
                 }
-                if let Some(mut item) = self
-                    .blocks
-                    .get(&(ScopedId::new(Some(&parent), &message), index))
-                    .cloned()
-                {
+                let key = (ScopedId::new(Some(&parent), &message), index);
+                if let Some(mut item) = self.blocks.get(&key).map(|block| block.item.clone()) {
                     if self.completed_tool(Some(&parent), &item.id) {
                         return Ok(());
                     }
@@ -5014,9 +4976,12 @@ impl Claude {
                         }
                         // The view last saw the call as it streamed, which a
                         // plain tool call already matches.
-                        let shown = streamed(&item, &self.cwd).content;
+                        let shown = self
+                            .blocks
+                            .get(&key)
+                            .map(|block| streamed(&block.item, &block.input, &self.cwd).content);
                         item.content = content;
-                        if item.content != shown {
+                        if shown.as_ref() != Some(&item.content) {
                             step.events.push(Event::Item(item.clone()));
                         }
                         self.tool(Some(&parent), item);
@@ -6443,6 +6408,7 @@ fn elicitation_value(schema: &Value, values: &[String]) -> Result<Value, String>
 
 #[cfg(test)]
 mod history_tests;
+mod streamed_input;
 
 #[cfg(test)]
 mod tests {
@@ -6736,7 +6702,7 @@ mod tests {
             assert_eq!(adapter.blocks.len(), 1);
             assert!(adapter.ignored_blocks.is_empty());
             assert!(matches!(
-                &adapter.blocks[&(ScopedId::new(None, "m"), 0)].content,
+                &adapter.blocks[&(ScopedId::new(None, "m"), 0)].item.content,
                 ItemContent::Text { text, .. } if text == "retained"
             ));
 
@@ -11632,46 +11598,6 @@ mod tests {
                 (_, []) if name != "Edit" => {}
                 (_, stopped) => panic!("{name} stopped as {stopped:?}"),
             }
-        }
-    }
-
-    #[test]
-    fn a_prefix_of_streamed_json_reads_as_what_has_arrived() {
-        for (prefix, value) in [
-            ("", Value::Null),
-            ("{", json!({})),
-            ("{\"comm", json!({})),
-            ("{\"command\"", json!({})),
-            ("{\"command\":", json!({})),
-            ("{\"command\":\"", json!({"command": ""})),
-            ("{\"command\":\"ls -", json!({"command": "ls -"})),
-            ("{\"command\":\"ls\",", json!({"command": "ls"})),
-            (
-                "{\"command\":\"ls\",\"timeout\":12",
-                json!({"command": "ls", "timeout": 12}),
-            ),
-            (
-                "{\"command\":\"ls\",\"run_in_background\":tr",
-                json!({"command": "ls"}),
-            ),
-            // An escape cut off part-way keeps what preceded it.
-            ("{\"command\":\"echo \\", json!({"command": "echo "})),
-            ("{\"command\":\"echo \\u00", json!({"command": "echo "})),
-            (
-                "{\"command\":\"echo \\u00e9",
-                json!({"command": "echo \u{e9}"}),
-            ),
-            (
-                "{\"command\":\"echo \\\"hi\\\" ",
-                json!({"command": "echo \"hi\" "}),
-            ),
-            ("{\"command\":\"a, {b}\"", json!({"command": "a, {b}"})),
-            (
-                "{\"edits\":[{\"old\":\"a\"},{\"ol",
-                json!({"edits": [{"old": "a"}, {}]}),
-            ),
-        ] {
-            assert_eq!(partial_json(prefix), value, "{prefix}");
         }
     }
 
