@@ -9,6 +9,11 @@ use std::{
     path::{Path, PathBuf},
 };
 
+#[cfg(any(feature = "host", feature = "ui"))]
+mod manual;
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) use manual::ManualRemoval;
+
 #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct RemovalRequest {
     pub repository: PathBuf,

@@ -1,5 +1,5 @@
 use super::*;
-use crate::repository::{CommandSpec, ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
+use crate::repository::{ProcessExecutor, RemovedWorktree, SystemProcessExecutor};
 use crate::{
     github::avatar::{self, OwnerKey},
     model::{ChannelId, WorktreeId},
@@ -1729,7 +1729,6 @@ impl Cagents {
             let result = tokio::task::spawn_blocking(move || {
                 let removed = delete_worktree(&request)?;
                 if let Some(store) = store
-                    && let Some(removed) = removed
                     && let Err(errors) =
                         crate::repository::release_deleted_worktree_creations(&store, &removed)
                 {
@@ -2519,9 +2518,8 @@ fn remove_project_from_cagents(
 /// moments ago. The deletion is recorded in the catalog afterwards, on the same
 /// ordered lane as every other catalog write.
 ///
-/// Returns what was removed, by which its creation is released, or `None`
-/// when Git could not say where the worktree's administrative files were.
-fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
+/// Returns what was removed, by which its creation is released.
+fn delete_worktree(target: &Target) -> Result<RemovedWorktree, String> {
     let id = target
         .worktree
         .ok_or("The primary repository cannot be deleted.")?;
@@ -2540,28 +2538,18 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
     if record.lock.locked {
         return Err("The worktree is locked; unlock it explicitly in Git first.".into());
     }
-    let removed = service
-        .common_dir(&target.repository, &cancellation)
-        .and_then(|common_dir| {
-            Ok(RemovedWorktree {
-                common_dir,
-                admin_dir: service.git_dir(&target.path, &cancellation)?,
-                path: target.path.clone(),
-                branch: record.branch.clone(),
-            })
-        })
-        .inspect_err(|error| {
-            tracing::warn!(
-                worktree = %target.path.display(),
-                %error,
-                "could not identify a worktree being deleted"
-            );
-        })
-        .ok();
+    // Cached sidebar status and a generic confirmation do not authorize
+    // discarding files or commits. Refuse before stopping any sessions, then
+    // inspect again after they have settled in case they wrote more work.
+    let safety = crate::worktree_cleanup::ManualRemoval::capture(
+        &target.repository,
+        &target.path,
+        &cancellation,
+    )?;
+    let removed = safety.removed();
     close_worktree_sessions(target)?;
-    // Confirmation authorizes discarding this worktree's changes. Git owns
-    // directory removal and still refuses locked worktrees with one --force.
-    let command = worktree_removal_command(target);
+    safety.verify(&cancellation)?;
+    let command = safety.command();
     let result = SystemProcessExecutor
         .execute(&command, &cancellation)
         .and_then(|output| output.require_success(&command.program));
@@ -2577,15 +2565,6 @@ fn delete_worktree(target: &Target) -> Result<Option<RemovedWorktree>, String> {
         }
     }
     Ok(removed)
-}
-
-fn worktree_removal_command(target: &Target) -> CommandSpec {
-    CommandSpec::new("git")
-        .cwd(&target.repository)
-        .args(["worktree", "remove", "--force", "--"])
-        .arg(target.path.as_os_str())
-        .timeout(Duration::from_secs(30))
-        .output_limits(64 * 1024, 64 * 1024)
 }
 
 #[cfg(test)]
@@ -4634,7 +4613,7 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_removal_discards_worktree_changes_and_retains_the_branch() {
+    fn confirmed_removal_preserves_changes_before_closing_sessions_and_keeps_clean_branch() {
         let directory = tempfile::tempdir().unwrap();
         let root = directory.path().canonicalize().unwrap();
         let repository = root.join("checkout");
@@ -4667,8 +4646,38 @@ mod tests {
             path: linked.clone(),
             label: "feature".into(),
         };
-        // Exercise the actual Git removal command without reaching a user's daemon.
-        let command = worktree_removal_command(&target);
+        // This reaches the actual deletion entry point. Unsafe content must
+        // refuse before trying to connect to (or stop) a user's daemon.
+        assert!(delete_worktree(&target).unwrap_err().contains("changes"));
+        assert_eq!(
+            std::fs::read(linked.join("tracked.txt")).unwrap(),
+            b"unstaged\n"
+        );
+        assert_eq!(
+            std::fs::read(linked.join("untracked.txt")).unwrap(),
+            b"untracked\n"
+        );
+
+        git(
+            &linked,
+            &["restore", "--staged", "--worktree", "tracked.txt"],
+        );
+        assert!(delete_worktree(&target).unwrap_err().contains("untracked"));
+        std::fs::remove_file(linked.join("untracked.txt")).unwrap();
+        std::fs::write(repository.join(".git/info/exclude"), ".env\n").unwrap();
+        std::fs::write(linked.join(".env"), "fixture data\n").unwrap();
+        assert!(delete_worktree(&target).unwrap_err().contains("ignored"));
+        assert_eq!(
+            std::fs::read(linked.join(".env")).unwrap(),
+            b"fixture data\n"
+        );
+        std::fs::remove_file(linked.join(".env")).unwrap();
+
+        // Exercise clean removal without connecting to a user's daemon.
+        let safety =
+            crate::worktree_cleanup::ManualRemoval::capture(&repository, &linked, &cancellation)
+                .unwrap();
+        let command = safety.command();
         SystemProcessExecutor
             .execute(&command, &cancellation)
             .unwrap()

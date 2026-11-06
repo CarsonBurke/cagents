@@ -632,7 +632,11 @@ fn git(root: PathBuf, operation: GitOperation) -> Result<String, String> {
             let destination = root.join(".worktrees").join(name);
             crate::secure_file::reject_symlink_components(&destination)
                 .map_err(|error| error.to_string())?;
-            command.args(["worktree", "remove", "--"]).arg(destination)
+            let cancellation = CancellationToken::new();
+            let safety =
+                crate::worktree_cleanup::ManualRemoval::capture(root, &destination, &cancellation)?;
+            safety.verify(&cancellation)?;
+            safety.command()
         }
         GitOperation::Diff { staged } => {
             let command = command.args(["diff", "--no-ext-diff", "--no-textconv"]);
@@ -1343,8 +1347,35 @@ mod tests {
         assert!(invoke(GitOperation::RemoveWorktree { name: "dev".into() }).is_err());
         assert!(root.join(".worktrees/dev/untracked").exists());
         std::fs::remove_file(root.join(".worktrees/dev/untracked")).unwrap();
+        // Git's ordinary worktree remove still deletes ignored files and
+        // detached-only commits. The device API must guard both itself.
+        std::fs::write(root.join(".git/info/exclude"), ".env\n/.worktrees/\n").unwrap();
+        std::fs::write(root.join(".worktrees/dev/.env"), "fixture data\n").unwrap();
+        assert!(
+            invoke(GitOperation::RemoveWorktree { name: "dev".into() })
+                .unwrap_err()
+                .contains("ignored")
+        );
+        assert_eq!(
+            std::fs::read(root.join(".worktrees/dev/.env")).unwrap(),
+            b"fixture data\n"
+        );
+        std::fs::remove_file(root.join(".worktrees/dev/.env")).unwrap();
+        run(&["-C", ".worktrees/dev", "checkout", "--detach"]);
+        run(&[
+            "-C",
+            ".worktrees/dev",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "detached work",
+        ]);
+        assert!(invoke(GitOperation::RemoveWorktree { name: "dev".into() }).is_err());
+        assert!(root.join(".worktrees/dev").is_dir());
+        run(&["-C", ".worktrees/dev", "switch", "-c", "rescue/dev"]);
         invoke(GitOperation::RemoveWorktree { name: "dev".into() }).unwrap();
         assert!(!root.join(".worktrees/dev").exists());
+        run(&["show-ref", "--verify", "refs/heads/rescue/dev"]);
         // The remote project can itself be an external linked checkout.
         // Remove the prior rule so this exercises its real policy write.
         let linked_directory = crate::repository::retained_managed_fixture_directory();
