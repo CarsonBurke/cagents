@@ -491,3 +491,32 @@ mod tests {
         assert!(unrelated.path().join("keep").exists());
     }
 }
+
+#[cfg(test)]
+mod usage_tests {
+    use super::*;
+
+    #[test]
+    fn usage_counts_cache_directories_and_their_direct_regular_files() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::write(outside.path().join("payload"), b"outside").unwrap();
+        let cache = root
+            .path()
+            .join(format!("chat-{}", uuid::Uuid::from_u128(1)));
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join("transcript.sqlite"), b"abc").unwrap();
+        fs::create_dir(cache.join("nested")).unwrap();
+        fs::write(cache.join("nested/file"), b"not direct").unwrap();
+        std::os::unix::fs::symlink(outside.path().join("payload"), cache.join("link")).unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            root.path()
+                .join(format!("chat-{}", uuid::Uuid::from_u128(2))),
+        )
+        .unwrap();
+        fs::create_dir(root.path().join("chat-not-a-uuid")).unwrap();
+        let observed = usage(root.path()).unwrap();
+        assert_eq!((observed.count, observed.bytes), (1, 3));
+    }
+}

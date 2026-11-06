@@ -393,6 +393,11 @@ own. Building here, it holds one slot until the command exits, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
+Queue and slot lock requests die with their gate, including when it is killed
+without a chance to handle a signal. Waiters retain only their lock descriptor
+and standard streams; inherited pipes and locks remain with the gate for the
+admitted command.
+
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
 shared two-second grace period, then kills and reaps remaining descendants,
@@ -433,6 +438,9 @@ admission budget. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+Programs launched by `cargo run` inside that `exec` inherit the same Cargo
+shim and guard. Their named `cargo` reenters the gate after the program's
+build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
@@ -774,9 +782,9 @@ be outside the account home reported by `getent passwd "$(id -u)"`, even when
 `HOME` points elsewhere: bundled-skill tests deliberately refuse installation
 beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
-On fw16, `/opt/resolve/.cot` is the existing user-owned private disk-backed base
-used for this preparation. On another host, select and verify a suitable base;
-do not create directories in an unrelated application's tree or change shared
+Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
+with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
+host. Do not borrow another application's tree, and do not change shared
 directories or Git markers. The **final** nested Unix
 socket path must be shorter than 108 bytes, including fixture suffixes. For
 example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
@@ -784,8 +792,9 @@ bytes, so that layout requires a temporary base of at most 28 bytes. Longer
 fixture layouts need more room; a short base alone is not proof.
 
 ```sh
-# Set this only after verifying the base above; this value is specific to fw16.
-export CAGENTS_TEST_TMP_BASE=/opt/resolve/.cot
+# Set this only after verifying the base above.
+mkdir -p -m 700 /var/tmp/ct
+export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
     TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
     export TMPDIR

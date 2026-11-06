@@ -24,9 +24,10 @@ use std::{
 };
 
 mod daemon_admission;
+pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, has_inherited_daemon_fence,
-    inherit_daemon_fence,
+    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence,
+    has_inherited_daemon_fence, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -52,11 +53,13 @@ const LEGACY_PROCESS_NAME: &str = "cagents-ui";
 pub const CONFIRM_DAEMON_STOP_MODE: &str = "--confirm-daemon-stop";
 pub const STARTUP_ERROR_MODE: &str = "--startup-error";
 pub const STARTUP_UPDATE_MODE: &str = "--startup-update";
+pub const STARTUP_WAIT_MODE: &str = "--startup-wait";
 pub const RENDER_PAGE_MODE: &str = "--internal-render-page";
-const HELPER_MODES: [&str; 4] = [
+const HELPER_MODES: [&str; 5] = [
     CONFIRM_DAEMON_STOP_MODE,
     STARTUP_ERROR_MODE,
     STARTUP_UPDATE_MODE,
+    STARTUP_WAIT_MODE,
     RENDER_PAGE_MODE,
 ];
 const LEASE_MARKER_FILE: &str = ".cagents-ui-lease-v1";
@@ -207,28 +210,27 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
 pub struct UpdateInProgress;
 
 pub fn is_update_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    caused_by::<UpdateInProgress>(error)
+}
+
+/// Whether a window gave up waiting for a daemon that is still starting.
+pub fn is_daemon_still_starting(error: &(dyn std::error::Error + 'static)) -> bool {
+    caused_by::<DaemonStillStarting>(error)
+}
+
+fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(error) = current {
-        if error.is::<UpdateInProgress>()
-            || error.downcast_ref::<io::Error>().is_some_and(|error| {
-                error
-                    .get_ref()
-                    .is_some_and(|inner| inner.is::<UpdateInProgress>())
-            })
+        if error.is::<T>()
+            || error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.get_ref().is_some_and(|inner| inner.is::<T>()))
         {
             return true;
         }
         current = error.source();
     }
     false
-}
-
-fn update_lock_error(error: io::Error) -> io::Error {
-    if error.kind() == io::ErrorKind::WouldBlock {
-        io::Error::new(error.kind(), UpdateInProgress)
-    } else {
-        error
-    }
 }
 
 /// Observe an existing private lock without creating, repairing, or retaining
@@ -284,8 +286,29 @@ pub struct WindowLease {
 }
 
 impl WindowLease {
+    /// Take this window's lease, waiting quietly while a starting daemon
+    /// holds the launch fence. See [`WindowLease::acquire_waiting`].
     pub fn acquire(new_window: bool, requested: Option<&str>) -> io::Result<Self> {
-        let (lease, slot) = Self::acquire_in(&runtime_directory()?, new_window, requested)?;
+        Self::acquire_waiting(new_window, requested, &mut |_| {})
+    }
+
+    /// Take this window's lease. While a starting daemon holds the launch
+    /// fence for its admission, wait for it: `waiting` hears each check that
+    /// finds it still starting, with the time waited so far. An update fails
+    /// at once with [`UpdateInProgress`]; a daemon that does not finish in
+    /// time fails with [`DaemonStillStarting`].
+    pub fn acquire_waiting(
+        new_window: bool,
+        requested: Option<&str>,
+        waiting: &mut dyn FnMut(Duration),
+    ) -> io::Result<Self> {
+        let (lease, slot) = Self::acquire_waiting_in(
+            &runtime_directory()?,
+            new_window,
+            requested,
+            daemon_admission::admission_wait_timeout(),
+            waiting,
+        )?;
         let mut identity = owned_lock(
             &runtime_directory()?.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
             libc::LOCK_EX,
@@ -301,17 +324,24 @@ impl WindowLease {
         Ok(lease)
     }
 
+    #[cfg(test)]
     fn acquire_in(
         runtime: &Path,
         new_window: bool,
         requested: Option<&str>,
     ) -> io::Result<(Self, String)> {
+        Self::acquire_waiting_in(runtime, new_window, requested, Duration::ZERO, &mut |_| {})
+    }
+
+    fn acquire_waiting_in(
+        runtime: &Path,
+        new_window: bool,
+        requested: Option<&str>,
+        admission_timeout: Duration,
+        waiting: &mut dyn FnMut(Duration),
+    ) -> io::Result<(Self, String)> {
         require_owned_runtime_directory(runtime)?;
-        let _launch = owned_lock(
-            &runtime.join(format!("{APPLICATION_LOCK_FILE}.update")),
-            libc::LOCK_SH | libc::LOCK_NB,
-        )
-        .map_err(update_lock_error)?;
+        let _launch = daemon_admission::shared_launch_fence(runtime, admission_timeout, waiting)?;
         if !IS_DEVELOPMENT && peer_ui_predates_lease(Path::new(PEER_PACKAGE_DIRECTORY)) {
             return Err(io::Error::other(
                 "installed peer UI predates the shared-session lease; upgrade that package first",
@@ -362,6 +392,65 @@ impl WindowLease {
         }
         Err(io::Error::other("all window slots are occupied"))
     }
+}
+
+/// The detached notice a starting window shows while it waits for the daemon,
+/// with the lock that makes it the only one on screen.
+#[cfg(feature = "ui")]
+static STARTUP_WAIT_NOTICE: std::sync::Mutex<Option<(process::Child, OwnedLock)>> =
+    std::sync::Mutex::new(None);
+
+/// Show a starting window's wait notice until [`dismiss_startup_wait_notice`].
+///
+/// Launches that wait together wait for the same daemon, so one notice speaks
+/// for all of them: while another starting window shows one, this does
+/// nothing. The lock outside the window slot namespace ends with its holder.
+#[cfg(feature = "ui")]
+pub fn show_startup_wait_notice(
+    spawn: impl FnOnce() -> io::Result<process::Child>,
+) -> io::Result<()> {
+    let lock = match owned_lock(
+        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}-startup-notice")),
+        libc::LOCK_EX | libc::LOCK_NB,
+    ) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let notice = spawn()?;
+    let previous = STARTUP_WAIT_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .replace((notice, lock));
+    if let Some((previous, _)) = previous {
+        close_startup_wait_notice(previous);
+    }
+    Ok(())
+}
+
+/// Close the wait notice, if one is showing: the window it stood in for has
+/// opened, or startup has ended in another way that explains itself.
+#[cfg(feature = "ui")]
+pub fn dismiss_startup_wait_notice() {
+    let notice = STARTUP_WAIT_NOTICE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some((notice, _lock)) = notice {
+        close_startup_wait_notice(notice);
+    }
+}
+
+#[cfg(feature = "ui")]
+fn close_startup_wait_notice(mut notice: process::Child) {
+    // The notice holds no state. Signal it here and reap it elsewhere, so
+    // neither the UI thread nor an exiting launch waits for its teardown.
+    let _ = notice.kill();
+    let _ = thread::Builder::new()
+        .name("cagents-startup-notice-reaper".into())
+        .spawn(move || {
+            let _ = notice.wait();
+        });
 }
 
 pub fn ui_launch_handshake_requested() -> bool {
@@ -578,12 +667,13 @@ fn running_window_slots(runtime: &Path) -> io::Result<Vec<String>> {
 
 /// A shared launch fence prevents a reviewed handoff from committing while a
 /// public launcher authenticates and restores the surviving window's daemon.
+/// Like a window, it waits out a daemon admission and refuses an update.
 pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
-    owned_lock(
-        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
-        libc::LOCK_SH | libc::LOCK_NB,
+    daemon_admission::shared_launch_fence(
+        &runtime_directory()?,
+        daemon_admission::admission_wait_timeout(),
+        &mut |_| {},
     )
-    .map_err(update_lock_error)
 }
 
 static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
@@ -597,8 +687,16 @@ fn editor_ready_path(runtime: &Path, pid: u32) -> PathBuf {
     runtime.join(format!("{product}.worktrees-ready.{pid}"))
 }
 
+/// The launch fence for a standalone editor, which takes it on its UI thread
+/// while it opens. It never waits: a daemon still starting fails this at once
+/// with [`DaemonStillStarting`], and the editor says it cannot open its
+/// folders yet rather than freezing until the daemon is ready.
+pub(crate) fn editor_launch_fence() -> io::Result<OwnedLock> {
+    daemon_admission::shared_launch_fence(&runtime_directory()?, Duration::ZERO, &mut |_| {})
+}
+
 pub(crate) fn standalone_editor_protection_ready() -> io::Result<()> {
-    let _launch = recovery_launch_fence()?;
+    let _launch = editor_launch_fence()?;
     if EDITOR_PROTECTION_READY.get().is_none() {
         let lock = owned_lock(
             &editor_ready_path(&runtime_directory()?, process::id()),
@@ -746,11 +844,9 @@ pub(crate) fn window_protection_ready() -> io::Result<OwnedLock> {
 }
 
 /// Blocks new windows while automatic cleanup authenticates existing owners.
-pub(crate) fn worktree_mutation_launch_fence() -> io::Result<OwnedLock> {
-    owned_lock(
-        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}.update")),
-        libc::LOCK_EX | libc::LOCK_NB,
-    )
+/// Windows launched meanwhile wait for it rather than report an update.
+pub(crate) fn worktree_mutation_launch_fence() -> io::Result<AdmissionFence> {
+    AdmissionFence::acquire()
 }
 
 pub(crate) struct VerifiedWindow {
@@ -3212,13 +3308,50 @@ mod startup_update_tests {
             io::ErrorKind::PermissionDenied,
             "not an update"
         )));
-        assert!(!is_update_in_progress(&update_lock_error(
-            io::Error::from_raw_os_error(libc::EACCES)
-        )));
         assert!(!is_update_in_progress(&io::Error::from_raw_os_error(
             libc::EAGAIN
         )));
     }
+    #[test]
+    fn a_window_launched_during_daemon_admission_waits_and_then_takes_its_lease() {
+        let runtime = tempfile::tempdir().unwrap();
+        fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut admission =
+            Some(daemon_admission::AdmissionFence::acquire_in(runtime.path()).unwrap());
+        let mut waited = Vec::new();
+        let (lease, slot) = WindowLease::acquire_waiting_in(
+            runtime.path(),
+            false,
+            None,
+            Duration::from_secs(30),
+            &mut |elapsed| {
+                waited.push(elapsed);
+                if waited.len() == 2 {
+                    admission.take();
+                }
+            },
+        )
+        .expect("a window opened during daemon startup opens once it is ready");
+        assert_eq!(slot, PRIMARY_WINDOW);
+        assert_eq!(waited.len(), 2);
+        assert!(waited[1] > waited[0], "progress reports the time waited");
+        drop(lease);
+
+        // The launch decision distinguishes the outcomes by type, not text.
+        let _admission = daemon_admission::AdmissionFence::acquire_in(runtime.path()).unwrap();
+        let error = WindowLease::acquire_waiting_in(
+            runtime.path(),
+            false,
+            None,
+            Duration::from_millis(60),
+            &mut |_| {},
+        )
+        .err()
+        .unwrap();
+        assert!(!is_update_in_progress(&error));
+        assert!(is_daemon_still_starting(&error));
+    }
+
     #[test]
     fn existing_window_activation_still_uses_the_original_private_protocol_during_an_update() {
         let runtime = tempfile::tempdir().unwrap();
