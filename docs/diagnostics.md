@@ -66,3 +66,12 @@ only chooses its filter and does not enable raw capture on its own. Raw debug
 output can contain application data: its caller-selected file has caller-managed
 retention and is never returned by `cagents diagnostics`. No support upload or
 network telemetry is performed.
+
+`cagents diagnostics` also reports how many transcript-cache directories exist
+under this instance's runtime directory and the total bytes of their direct
+regular files (database, WAL, journal, image and lease files). This is a
+filesystem observation: it never contacts the daemon, opens a database or
+reclaims anything. The count includes active, orphaned and retained caches.
+Symlinks are not followed. A missing runtime directory reports zero; an
+unavailable runtime path or failed scan reports unavailable
+(`transcript_caches: null` in JSON).

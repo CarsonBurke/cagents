@@ -129,10 +129,11 @@ built() {
     return 1
 }
 
-# Cargo tags only a build directory it creates, and prune-cargo-build-dirs
-# reclaims only tagged ones, so tag those this script created, including ones
-# seeded before seeding tagged them. Never others: the main checkout's build
-# directory, which seeds the rest, must not become prunable.
+# Cargo tags only a build directory it creates, and pruners such as
+# prune-cargo-build-dirs reclaim only tagged ones, so tag those this script
+# created, including ones seeded before seeding tagged them. Never others.
+# scripts/prune-build-dirs goes by Cargo's other markers instead, and keeps
+# a main checkout's build directory, which seeds the rest, however tagged.
 tag() {
     [ -e "$1/CACHEDIR.TAG" ] || printf '%s\n' \
         'Signature: 8a477f597d28d172789f06886806bc55' \

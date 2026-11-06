@@ -4,7 +4,7 @@ use std::os::unix::process::CommandExt;
 use cagents::design::space;
 use cagents::instance::{
     CONFIRM_DAEMON_STOP_MODE as CONFIRM_DAEMON_STOP, STARTUP_ERROR_MODE as STARTUP_ERROR,
-    STARTUP_UPDATE_MODE as STARTUP_UPDATE,
+    STARTUP_UPDATE_MODE as STARTUP_UPDATE, STARTUP_WAIT_MODE as STARTUP_WAIT,
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
@@ -12,8 +12,13 @@ const PRODUCT: &str = "cagents-ui";
 const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 /// argv has a hard size limit and a dialog cannot show a novel either.
 const MAX_REPORTED_ERROR_BYTES: usize = 2048;
-/// The internal `--confirm-daemon-stop`, `--startup-error`, `--startup-update` and
-/// `--internal-render-page` modes are deliberately absent: cagents spawns
+/// Marks a startup error dialog for a daemon that had not finished starting.
+const STILL_STARTING: &str = "--still-starting";
+/// A daemon admission this long is worth explaining. Shorter ones pass for
+/// ordinary startup, as when this window starts the daemon itself.
+const STARTUP_WAIT_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+/// The internal `--confirm-daemon-stop`, `--startup-error`, `--startup-update`,
+/// `--startup-wait` and `--internal-render-page` modes are deliberately absent: cagents spawns
 /// itself with those, and documenting them would invite a user to hand-craft
 /// a capability payload.
 const USAGE: &str = "\
@@ -64,7 +69,10 @@ pub(crate) fn main_with_before_start(
     // here: otherwise a "ready"/"error: ..." line lands inside the status the
     // user reads as the outcome of their shutdown request.
     let standalone = arguments.first().is_some_and(|argument| {
-        argument == CONFIRM_DAEMON_STOP || argument == STARTUP_ERROR || argument == STARTUP_UPDATE
+        argument == CONFIRM_DAEMON_STOP
+            || argument == STARTUP_ERROR
+            || argument == STARTUP_UPDATE
+            || argument == STARTUP_WAIT
     });
     if standalone {
         cagents::instance::install_panic_hook(PRODUCT);
@@ -110,6 +118,8 @@ pub(crate) fn main_with_before_start(
     #[cfg(feature = "integrated-browser")]
     let _browser_cleanup = cagents::browser::ProcessShutdown;
     let result = run(options);
+    // Whatever ended startup explains itself from here; the wait is over.
+    cagents::instance::dismiss_startup_wait_notice();
     match &result {
         Err(error) if cagents::instance::is_update_in_progress(error.as_ref()) => {
             // Expected coordinator ownership is not a crash. Preserve the
@@ -129,7 +139,10 @@ pub(crate) fn main_with_before_start(
             }
             let _ = cagents::instance::report_ui_startup(&Err("an update is in progress".into()));
         }
-        Err(error) => report_startup_failure(&error.to_string()),
+        Err(error) => report_startup_failure(
+            &error.to_string(),
+            cagents::instance::is_daemon_still_starting(error.as_ref()),
+        ),
         // The window reports readiness from its first frame, so reaching here
         // with the handshake unclaimed means no window ever opened.
         Ok(()) => {
@@ -160,7 +173,7 @@ fn report(result: Result<(), Box<dyn std::error::Error>>) -> std::process::ExitC
 /// Makes a startup failure observable. Panics were already durable; an
 /// ordinary `Err` was reported only down a pipe whose reader prints it into a
 /// stderr the desktop session discards.
-fn report_startup_failure(message: &str) {
+fn report_startup_failure(message: &str, still_starting: bool) {
     let message = truncated(message);
     tracing::error!(error = message, "cagents-ui startup failed");
     cagents::instance::report_startup_failure();
@@ -171,11 +184,19 @@ fn report_startup_failure(message: &str) {
     // A terminal run already prints the error. A desktop launch has none, so
     // without this the user double-clicks the icon and nothing happens.
     if !already_running && !std::io::stderr().is_terminal() {
-        let _ = spawn_startup_error_dialog(message);
+        let _ = spawn_startup_error_dialog(message, still_starting);
     }
     // Reported last: the launcher kills this process as soon as it reads a
     // handshake error, so the dialog has to be detached before then.
     let _ = cagents::instance::report_ui_startup(&Err(message.to_owned()));
+}
+
+/// An error message, which starts in lower case, as a sentence of its own.
+fn sentence(message: &str) -> String {
+    let mut characters = message.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().chain(characters).collect::<String>() + "."
+    })
 }
 
 fn truncated(message: &str) -> &str {
@@ -188,10 +209,13 @@ fn truncated(message: &str) -> &str {
 /// Re-runs this executable as a detached dialog. The failing process cannot
 /// show the dialog itself: it must answer the launcher's handshake, and the
 /// launcher kills it the moment that answer is an error.
-fn spawn_startup_error_dialog(message: &str) -> std::io::Result<()> {
-    std::process::Command::new(std::env::current_exe()?)
-        .arg(STARTUP_ERROR)
-        .arg(message)
+fn spawn_startup_error_dialog(message: &str, still_starting: bool) -> std::io::Result<()> {
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.arg(STARTUP_ERROR).arg(message);
+    if still_starting {
+        command.arg(STILL_STARTING);
+    }
+    command
         .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
         .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
         .stdin(std::process::Stdio::null())
@@ -200,6 +224,36 @@ fn spawn_startup_error_dialog(message: &str) -> std::io::Result<()> {
         .process_group(0)
         .spawn()
         .map(|_| ())
+}
+
+/// Tells the user why no window has appeared yet while the daemon finishes
+/// starting. The waiting process closes it once its own window opens.
+fn spawn_startup_wait_notice() -> std::io::Result<std::process::Child> {
+    let parent = std::process::id();
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command
+        .arg(STARTUP_WAIT)
+        .env_remove(cagents::instance::UI_LAUNCH_HANDSHAKE_ENV)
+        .env_remove(cagents::instance::UI_LAUNCH_RECOVERY_PROGRESS_ENV)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .process_group(0);
+    // SAFETY: the hook makes only async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(move || {
+            // A notice must not outlive the startup it describes, even when
+            // that process dies without dismissing it.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::getppid() as u32 != parent {
+                return Err(std::io::Error::other("the waiting window has exited"));
+            }
+            Ok(())
+        });
+    }
+    command.spawn()
 }
 
 fn spawn_startup_update_dialog(request: &cagents::update::startup::Request) -> std::io::Result<()> {
@@ -229,6 +283,13 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         let request: cagents::update::startup::Request = serde_json::from_str(payload)?;
         return cagents::update::startup::run(request);
     }
+    if arguments.peek() == Some(&STARTUP_WAIT) {
+        arguments.next();
+        if arguments.next().is_some() {
+            return Err("invalid startup wait arguments".into());
+        }
+        return run_startup_wait_notice();
+    }
     if arguments.peek() == Some(&CONFIRM_DAEMON_STOP) {
         arguments.next();
         let payload = arguments
@@ -242,10 +303,11 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
     }
     arguments.next();
     let message = arguments.next().ok_or("missing startup error message")?;
+    let still_starting = arguments.next_if_eq(&STILL_STARTING).is_some();
     if arguments.next().is_some() {
         return Err("invalid startup error arguments".into());
     }
-    run_startup_error_dialog(message)
+    run_startup_error_dialog(message, still_starting)
 }
 
 struct Options<'a> {
@@ -336,7 +398,19 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
     let fixture =
         cfg!(feature = "latency-harness") && std::env::var_os("CAGENTS_LATENCY_OUTPUT").is_some();
     let startup = (|| -> Result<_, Box<dyn std::error::Error>> {
-        let lease = cagents::instance::WindowLease::acquire(new_window, slot)?;
+        let mut notice_shown = false;
+        let lease =
+            cagents::instance::WindowLease::acquire_waiting(new_window, slot, &mut |waited| {
+                if notice_shown || waited < STARTUP_WAIT_NOTICE_DELAY {
+                    return;
+                }
+                notice_shown = true;
+                if let Err(error) =
+                    cagents::instance::show_startup_wait_notice(spawn_startup_wait_notice)
+                {
+                    tracing::warn!(%error, "could not show the daemon startup notice");
+                }
+            })?;
         let device_source = if device_window_scoped && source.is_some() {
             source.map(str::to_owned)
         } else {
@@ -426,6 +500,9 @@ fn run(options: Options<'_>) -> Result<(), Box<dyn std::error::Error>> {
 struct StartupError {
     core: Core,
     message: String,
+    /// The daemon had not finished starting when the window stopped waiting:
+    /// nothing failed, and Retry waits for it again.
+    still_starting: bool,
     /// Why the last retry could not even start the launcher, shown in place
     /// of a dialog that silently did nothing.
     retry_failure: Option<String>,
@@ -439,15 +516,19 @@ enum StartupErrorMessage {
 
 impl cosmic::Application for StartupError {
     type Executor = cosmic::executor::Default;
-    type Flags = String;
+    type Flags = (String, bool);
     type Message = StartupErrorMessage;
     const APP_ID: &'static str = "dev.cagents.Cagents.StartupError";
 
-    fn init(core: Core, message: String) -> (Self, cosmic::app::Task<StartupErrorMessage>) {
+    fn init(
+        core: Core,
+        (message, still_starting): (String, bool),
+    ) -> (Self, cosmic::app::Task<StartupErrorMessage>) {
         (
             Self {
                 core,
                 message,
+                still_starting,
                 retry_failure: None,
             },
             cosmic::app::Task::none(),
@@ -480,18 +561,27 @@ impl cosmic::Application for StartupError {
     }
 
     fn view(&self) -> cosmic::Element<'_, StartupErrorMessage> {
-        let mut rows = vec![
-            cagents::design::title("cagents could not start").into(),
-            cagents::design::body(&self.message).into(),
-            cagents::design::body(
-                "This may be temporary. Retry starts cagents again; Close leaves no window open.",
-            )
-            .into(),
-            cagents::design::body(
-                "Run `cagents diagnostics` to inspect retained private startup evidence.",
-            )
-            .into(),
-        ];
+        let mut rows = if self.still_starting {
+            vec![
+                cagents::design::title("cagents is taking longer than usual to start").into(),
+                cagents::design::body(sentence(&self.message)).into(),
+                cagents::design::body("Retry waits for it again; Close leaves no window open.")
+                    .into(),
+            ]
+        } else {
+            vec![
+                cagents::design::title("cagents could not start").into(),
+                cagents::design::body(&self.message).into(),
+                cagents::design::body(
+                    "This may be temporary. Retry starts cagents again; Close leaves no window open.",
+                )
+                .into(),
+                cagents::design::body(
+                    "Run `cagents diagnostics` to inspect retained private startup evidence.",
+                )
+                .into(),
+            ]
+        };
         if let Some(failure) = &self.retry_failure {
             rows.push(cagents::design::body(format!("Retry failed: {failure}")).into());
         }
@@ -513,6 +603,110 @@ impl cosmic::Application for StartupError {
             .height(iced::Length::Fill)
             .into()
     }
+}
+
+/// Explains a window that has not appeared yet because the daemon is still
+/// starting. It changes nothing: the waiting process opens the workspace by
+/// itself and closes this notice when it does, or when startup fails.
+struct StartupWait {
+    core: Core,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum StartupWaitMessage {
+    Hide,
+}
+
+impl cosmic::Application for StartupWait {
+    type Executor = cosmic::executor::Default;
+    type Flags = ();
+    type Message = StartupWaitMessage;
+    const APP_ID: &'static str = "dev.cagents.Cagents.StartupWait";
+
+    fn init(core: Core, _: ()) -> (Self, cosmic::app::Task<StartupWaitMessage>) {
+        // The spinner is the only thing on screen; let it turn at full rate.
+        cagents::ui_controls::animate_activity(true);
+        (Self { core }, cosmic::app::Task::none())
+    }
+
+    fn core(&self) -> &Core {
+        &self.core
+    }
+
+    fn core_mut(&mut self) -> &mut Core {
+        &mut self.core
+    }
+
+    fn on_close_requested(&self, _: iced::window::Id) -> Option<StartupWaitMessage> {
+        Some(StartupWaitMessage::Hide)
+    }
+
+    fn update(&mut self, message: StartupWaitMessage) -> cosmic::app::Task<StartupWaitMessage> {
+        match message {
+            StartupWaitMessage::Hide => iced::exit().map(cosmic::Action::App),
+        }
+    }
+
+    fn view(&self) -> cosmic::Element<'_, StartupWaitMessage> {
+        let heading = cosmic::widget::row::with_children(vec![
+            cagents::ui_controls::activity_spinner(20.0, cagents::design::accent_color),
+            cagents::design::title("Starting cagents").into(),
+        ])
+        .spacing(space::M)
+        .align_y(iced::Alignment::Center);
+        cosmic::widget::container(
+            cosmic::widget::column::with_children(vec![
+                heading.into(),
+                cagents::design::body(
+                    "The cagents daemon is still starting. Your workspace opens as soon as it is ready.",
+                )
+                .into(),
+                cagents::design::caption(
+                    "Starting can take longer while it restores your sessions. Hiding this message does not stop cagents from opening.",
+                )
+                .into(),
+                cagents::ui_controls::button::secondary("Hide")
+                    .on_press(StartupWaitMessage::Hide)
+                    .into(),
+            ])
+            .spacing(space::L),
+        )
+        .padding(space::XL)
+        .width(iced::Length::Fill)
+        .height(iced::Length::Fill)
+        .into()
+    }
+}
+
+fn run_startup_wait_notice() -> Result<(), Box<dyn std::error::Error>> {
+    type Shell = Cosmic<StartupWait>;
+    cosmic::icon_theme::set_default(cosmic::config::icon_theme());
+    iced::daemon(
+        move || {
+            let (window, open) = iced::window::open(iced::window::Settings {
+                size: iced::Size::new(620.0, 280.0),
+                exit_on_close_request: false,
+                icon: Some(cagents::app::application_window_icon()),
+                ..iced::window::Settings::default()
+            });
+            let mut core = Core::default();
+            core.set_main_window_id(Some(window));
+            let (shell, task) = Shell::init((core, ()));
+            (shell, iced::Task::batch([open.discard(), task]))
+        },
+        Shell::update,
+        Shell::view,
+    )
+    .subscription(Shell::subscription)
+    .title(|_: &Shell, _| "cagents".to_owned())
+    .style(Shell::style)
+    .theme(Shell::theme)
+    .settings(iced::Settings {
+        is_daemon: false,
+        ..iced::Settings::default()
+    })
+    .run()?;
+    Ok(())
 }
 
 /// Starts the launcher that produced this dialog, detached from it.
@@ -545,7 +739,10 @@ fn relaunch() -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-fn run_startup_error_dialog(message: &str) -> Result<(), Box<dyn std::error::Error>> {
+fn run_startup_error_dialog(
+    message: &str,
+    still_starting: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     type Shell = Cosmic<StartupError>;
     let message = message.to_owned();
     cosmic::icon_theme::set_default(cosmic::config::icon_theme());
@@ -561,7 +758,7 @@ fn run_startup_error_dialog(message: &str) -> Result<(), Box<dyn std::error::Err
             });
             let mut core = Core::default();
             core.set_main_window_id(Some(window));
-            let (shell, task) = Shell::init((core, message.clone()));
+            let (shell, task) = Shell::init((core, (message.clone(), still_starting)));
             (shell, iced::Task::batch([open.discard(), task]))
         },
         Shell::update,

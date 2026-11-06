@@ -320,7 +320,8 @@ class LockHolders(unittest.TestCase):
         self.assertNotIn("note:", self.report())
 
     def test_each_kind_of_session_or_build_counts_without_a_warning(self):
-        for name in ("kwin_wayland", "niri", "native-evidence", "rustc", "cagents-cargo-gate", "build-disk-guard"):
+        for name in ("kwin_wayland", "niri", "native-evidence", "rustc", "cagents-cargo-gate", "build-disk-guard",
+                     "prune-build-dirs"):
             with self.subTest(name=name):
                 program = self.root / name
                 program.write_text(f'#!/bin/sh\nexec 9>>"{self.lock}"\nflock 9\nsleep 60 9>&- &\nwait\n')
