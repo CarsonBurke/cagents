@@ -627,6 +627,37 @@ fn a_long_transcript_is_read_from_its_newest_part_and_says_so() {
 }
 
 #[test]
+fn an_over_long_line_is_skipped_without_making_the_list_partial() {
+    let file = Transcript::new("image");
+    // Longer than a line may be, such as an attached image; it spans reads
+    // and also fits in one, and either way is skipped whole.
+    for length in [MAX_LINE + 1, READ_PER_PASS as usize + 1] {
+        file.append(&format!(
+            "{}\n",
+            serde_json::json!({"type": "user", "message": {"content":
+                format!("https://github.com/me/repo/pull/9 {}", "x".repeat(length))}})
+        ));
+    }
+    file.append(&mention(8));
+    let mut watched = Watched::new();
+    watched.source = located(&file.0);
+    for _ in 0..4 {
+        read(&mut watched);
+    }
+    assert_eq!(numbers(&watched), vec![8]);
+    assert_eq!(watched.coverage, TranscriptCoverage::Complete);
+}
+
+#[test]
+fn a_codex_search_that_finds_nothing_waits_longer_each_time() {
+    assert_eq!(search_backoff(1), Duration::from_secs(5));
+    assert_eq!(search_backoff(2), Duration::from_secs(10));
+    assert_eq!(search_backoff(5), Duration::from_secs(80));
+    assert_eq!(search_backoff(6), Duration::from_secs(120));
+    assert_eq!(search_backoff(u32::MAX), Duration::from_secs(120));
+}
+
+#[test]
 fn work_on_the_current_branch_stays_with_that_branch_after_a_switch() {
     let mut watched = Watched::new();
     let push = |directory: Option<&str>| transcript::Found {

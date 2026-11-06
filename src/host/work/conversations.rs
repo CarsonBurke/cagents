@@ -48,17 +48,23 @@ const KEPT_UNWATCHED: Duration = Duration::from_secs(10 * 60);
 const READ_PER_PASS: u64 = 8 * 1024 * 1024;
 /// The newest part of a transcript read when it is first watched.
 const FIRST_READ: u64 = 64 * 1024 * 1024;
-/// Lines longer than this, such as a huge tool output, are skipped.
+/// Lines longer than this, such as an attached image or a huge tool output,
+/// are skipped. They name no pull request worth listing, so skipping one
+/// does not make the list partial.
 const MAX_LINE: usize = 4 * 1024 * 1024;
 /// Distinct references kept per conversation; the oldest mentions go first.
 const REFERENCES: usize = 256;
-/// Subagent transcripts read per conversation.
-const SUBAGENTS: usize = 64;
+/// Subagent transcripts read per conversation, the most recently written
+/// first.
+const SUBAGENTS: usize = 256;
 /// Forge lookups per pass, across every watched conversation.
 const LOOKUPS_PER_PASS: usize = 4;
 /// Of the mentions, only the most recent are looked up.
 const MENTIONS_LOOKED_UP: usize = 24;
 const OPEN_FOR: Duration = Duration::from_secs(60);
+/// An open pull request only mentioned shows its state, not its checks or
+/// review, so it is asked about less often.
+const MENTIONED_OPEN_FOR: Duration = Duration::from_secs(10 * 60);
 const FINISHED_FOR: Duration = Duration::from_secs(30 * 60);
 const NOT_A_PULL_REQUEST_FOR: Duration = Duration::from_secs(24 * 60 * 60);
 const BRANCH_FOUND_FOR: Duration = Duration::from_secs(15 * 60);
@@ -121,7 +127,7 @@ struct Observed {
 }
 
 impl Observed {
-    fn due(&self) -> bool {
+    fn due(&self, worked_on: bool) -> bool {
         let Some(checked) = self.checked else {
             return true;
         };
@@ -134,8 +140,10 @@ impl Observed {
                 pull_request.state != crate::work::PullRequestState::Open
             }) {
                 FINISHED_FOR
-            } else {
+            } else if worked_on {
                 OPEN_FOR
+            } else {
+                MENTIONED_OPEN_FOR
             };
         checked.elapsed() >= wait
     }
@@ -160,6 +168,19 @@ struct Watched {
     /// The provider's conversation ID `source` was located for, so finding
     /// the transcript, a search for Codex, happens once per conversation ID.
     located_id: Option<String>,
+    /// Searching for a Codex rollout walks its dated directories, so a
+    /// search that found nothing is not repeated before this.
+    search_after: Option<Instant>,
+    searches_missed: u32,
+}
+
+/// Where a pass found the conversation's transcript.
+enum Location {
+    /// As before, or not looked for this pass.
+    Unchanged,
+    Found(String, Source),
+    /// A search found no transcript for the conversation's ID yet.
+    Missed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,6 +232,8 @@ impl Watched {
             sent: None,
             unwatched_since: None,
             located_id: None,
+            search_after: None,
+            searches_missed: 0,
         }
     }
 
@@ -445,19 +468,34 @@ impl Handle {
         }
         let mut facts = BTreeMap::new();
         for conversation in &conversations {
-            let known = self
+            let (known, search_due) = self
                 .conversations()
                 .watched
                 .get(conversation)
-                .and_then(|watched| watched.located_id.clone());
-            let located = locate(host, *conversation, known.as_deref());
+                .map(|watched| {
+                    (
+                        watched.located_id.clone(),
+                        watched
+                            .search_after
+                            .is_none_or(|after| Instant::now() >= after),
+                    )
+                })
+                .unwrap_or_default();
+            let located = locate(host, *conversation, known.as_deref(), search_due);
             facts.insert(*conversation, self.facts(host, *conversation));
             let (source, mut cursors) = {
                 let mut state = self.conversations();
                 let Some(watched) = state.watched.get_mut(conversation) else {
                     continue;
                 };
-                if let Some((id, source)) = located {
+                if matches!(located, Location::Missed) {
+                    watched.searches_missed = watched.searches_missed.saturating_add(1);
+                    watched.search_after =
+                        Some(Instant::now() + search_backoff(watched.searches_missed));
+                }
+                if let Location::Found(id, source) = located {
+                    watched.searches_missed = 0;
+                    watched.search_after = None;
                     watched.located_id = Some(id);
                     if watched.source != source {
                         // A new conversation ID, after `/clear` or a resume,
@@ -571,14 +609,14 @@ impl Handle {
 
     /// Asks GitHub about the few pull requests and branches most worth it.
     fn look_up(&self, conversations: &[TerminalId], facts: &BTreeMap<TerminalId, Option<Facts>>) {
-        // In rank order, so the budget goes to worked-on pull requests first.
-        let (keys, branches) = {
+        // In rank order across conversations, so the budget goes to what
+        // they worked on before what they mentioned.
+        let lookups = {
             let state = self.conversations();
             if !state.lookups_due() {
                 return;
             }
-            let mut keys = Vec::new();
-            let mut branches = Vec::new();
+            let mut lookups: Vec<(Relation, Lookup)> = Vec::new();
             for conversation in conversations {
                 let (Some(watched), Some(Some(facts))) =
                     (state.watched.get(conversation), facts.get(conversation))
@@ -587,24 +625,28 @@ impl Handle {
                 };
                 let mut mentions = 0;
                 for (reference, aggregate) in ranked(watched) {
-                    if !aggregate.relation.worked_on() {
+                    let worked_on = aggregate.relation.worked_on();
+                    if !worked_on {
                         mentions += 1;
                         if mentions > MENTIONS_LOOKED_UP {
                             break;
                         }
                     }
-                    match resolve(reference, facts, &state.branches) {
+                    let lookup = match resolve(reference, facts, &state.branches) {
                         Resolved::Key(key) => {
                             let listed = facts
                                 .project
                                 .as_ref()
                                 .is_some_and(|project| project.listed(&key).is_some());
-                            if !listed
-                                && state.observed.get(&key).is_none_or(Observed::due)
-                                && !keys.contains(&key)
+                            if listed
+                                || !state
+                                    .observed
+                                    .get(&key)
+                                    .is_none_or(|observed| observed.due(worked_on))
                             {
-                                keys.push(key);
+                                continue;
                             }
+                            Lookup::PullRequest(key)
                         }
                         // A name merely checked out may be a path or a branch
                         // never pushed; GitHub is asked about it only while a
@@ -615,96 +657,114 @@ impl Handle {
                                 && !facts
                                     .project
                                     .as_ref()
-                                    .is_some_and(|project| project.has_branch(&branch)) => {}
-                        Resolved::Branch { base, head, branch } => {
-                            let lookup = (RepoKeyOrd::from(&base), RepoKeyOrd::from(&head), branch);
-                            if !branches.contains(&lookup) {
-                                branches.push(lookup);
-                            }
+                                    .is_some_and(|project| project.has_branch(&branch)) =>
+                        {
+                            continue;
                         }
-                        Resolved::Nothing => {}
+                        Resolved::Branch { base, head, branch } => Lookup::Branch {
+                            base: RepoKeyOrd::from(&base),
+                            head: RepoKeyOrd::from(&head),
+                            branch,
+                        },
+                        Resolved::Nothing => continue,
+                    };
+                    match lookups.iter_mut().find(|(_, known)| *known == lookup) {
+                        Some((relation, _)) => *relation = (*relation).min(aggregate.relation),
+                        None => lookups.push((aggregate.relation, lookup)),
                     }
                 }
             }
-            (keys, branches)
+            lookups.sort_by_key(|(relation, _)| *relation);
+            lookups
         };
-        if keys.is_empty() && branches.is_empty() {
-            return;
-        }
         let gh = GitHubService::system("gh");
         let cancellation = &self.0.cancellation;
-        let mut budget = LOOKUPS_PER_PASS;
-        for (base_key, head, branch) in branches {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            let base = GitHubRepoKey::from(&base_key);
-            let head = GitHubRepoKey::from(&head);
-            let result = gh.resolve_branch(&base, &head, &branch, None, cancellation);
-            let mut state = self.conversations();
-            match result {
-                Ok(found) => {
-                    if let Some(found) = &found
-                        && let Ok(key) = PullRequestKey::new(base.clone(), found.number)
-                    {
-                        state
-                            .observed
-                            .insert((&key).into(), observed_now(board::convert(found, false)));
+        for (_, lookup) in lookups.into_iter().take(LOOKUPS_PER_PASS) {
+            match lookup {
+                Lookup::Branch {
+                    base: base_key,
+                    head,
+                    branch,
+                } => {
+                    let base = GitHubRepoKey::from(&base_key);
+                    let head = GitHubRepoKey::from(&head);
+                    let result = gh.resolve_branch(&base, &head, &branch, None, cancellation);
+                    let mut state = self.conversations();
+                    match result {
+                        Ok(found) => {
+                            if let Some(found) = &found
+                                && let Ok(key) = PullRequestKey::new(base.clone(), found.number)
+                            {
+                                state.observed.insert(
+                                    (&key).into(),
+                                    observed_now(board::convert(found, false)),
+                                );
+                            }
+                            state.branches.insert(
+                                (base_key, branch),
+                                BranchLookup {
+                                    number: found.map(|found| found.number),
+                                    checked: Instant::now(),
+                                },
+                            );
+                            state.succeeded();
+                        }
+                        // GitHub answered, about this branch only: it has no
+                        // single pull request here. That is not GitHub being
+                        // unreachable.
+                        Err(error) if answered(&error) => {
+                            state.branches.insert(
+                                (base_key, branch),
+                                BranchLookup {
+                                    number: None,
+                                    checked: Instant::now(),
+                                },
+                            );
+                        }
+                        Err(error) => {
+                            state.failed(&error);
+                            return;
+                        }
                     }
-                    state.branches.insert(
-                        (base_key, branch),
-                        BranchLookup {
-                            number: found.map(|found| found.number),
-                            checked: Instant::now(),
-                        },
-                    );
-                    state.succeeded();
                 }
-                // GitHub answered, about this branch only: it has no single
-                // pull request here. That is not GitHub being unreachable.
-                Err(error) if answered(&error) => {
-                    state.branches.insert(
-                        (base_key, branch),
-                        BranchLookup {
-                            number: None,
-                            checked: Instant::now(),
-                        },
-                    );
-                }
-                Err(error) => {
-                    state.failed(&error);
-                    return;
-                }
-            }
-        }
-        for key in keys {
-            if budget == 0 {
-                break;
-            }
-            budget -= 1;
-            let pull_request_key = PullRequestKey::from(&key);
-            let result = gh.view_with_timeout(&pull_request_key, cancellation, LOOKUP_TIMEOUT);
-            let mut state = self.conversations();
-            let entry = state.observed.entry(key).or_default();
-            entry.checked = Some(Instant::now());
-            match result {
-                Ok(found) => {
-                    *entry = observed_now(board::convert(&found, false));
-                    state.succeeded();
-                }
-                Err(error) if answered(&error) => {
-                    entry.missing = true;
-                    entry.failures = 0;
-                }
-                Err(error) => {
-                    entry.failures = entry.failures.saturating_add(1);
-                    state.failed(&error);
-                    return;
+                Lookup::PullRequest(key) => {
+                    let pull_request_key = PullRequestKey::from(&key);
+                    let result =
+                        gh.view_with_timeout(&pull_request_key, cancellation, LOOKUP_TIMEOUT);
+                    let mut state = self.conversations();
+                    let entry = state.observed.entry(key).or_default();
+                    entry.checked = Some(Instant::now());
+                    match result {
+                        Ok(found) => {
+                            *entry = observed_now(board::convert(&found, false));
+                            state.succeeded();
+                        }
+                        Err(error) if answered(&error) => {
+                            entry.missing = true;
+                            entry.failures = 0;
+                        }
+                        Err(error) => {
+                            entry.failures = entry.failures.saturating_add(1);
+                            state.failed(&error);
+                            return;
+                        }
+                    }
                 }
             }
         }
     }
+}
+
+/// A question for GitHub.
+#[derive(PartialEq, Eq)]
+enum Lookup {
+    PullRequest(PullRequestKeyOrd),
+    /// Which pull request `head`'s `branch` opens against `base`.
+    Branch {
+        base: RepoKeyOrd,
+        head: RepoKeyOrd,
+        branch: String,
+    },
 }
 
 fn observed_now(pull_request: PullRequest) -> Observed {
@@ -997,14 +1057,25 @@ fn assemble(
 /// reported which conversation it is.
 ///
 /// Returns nothing new while the conversation ID is still `known`.
+/// Waits between searches that found nothing: 5 s, doubling to 2 min.
+fn search_backoff(missed: u32) -> Duration {
+    (Duration::from_secs(5) * 2_u32.saturating_pow(missed.saturating_sub(1).min(5)))
+        .min(Duration::from_secs(120))
+}
+
+/// Finds the conversation's transcript when its provider ID is new. A
+/// Codex search runs only while `search_due`.
 fn locate(
     host: &SharedHost,
     conversation: TerminalId,
     known: Option<&str>,
-) -> Option<(String, Source)> {
+    search_due: bool,
+) -> Location {
     let (provider, recipe, session_id) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        let record = state.chats.get(&conversation)?;
+        let Some(record) = state.chats.get(&conversation) else {
+            return Location::Unchanged;
+        };
         (
             record.session.launch.provider,
             record.session.launch.recipe.clone(),
@@ -1014,17 +1085,20 @@ fn locate(
                 .or_else(|| record.session.launch.session_id.clone()),
         )
     };
-    let id = session_id?;
-    if known == Some(id.as_str()) {
-        return None;
-    }
-    let root = provider.session_root(&recipe)?;
+    let Some(id) = session_id.filter(|id| known != Some(id.as_str())) else {
+        return Location::Unchanged;
+    };
+    let Some(root) = provider.session_root(&recipe) else {
+        return Location::Unchanged;
+    };
     let directory = std::fs::canonicalize(&recipe.working_directory)
         .unwrap_or_else(|_| recipe.working_directory.clone());
     match provider {
         Provider::Claude => {
-            let transcript = crate::agent::claude_transcript(&root, &directory, &id).ok()?;
-            Some((
+            let Ok(transcript) = crate::agent::claude_transcript(&root, &directory, &id) else {
+                return Location::Unchanged;
+            };
+            Location::Found(
                 id,
                 Source::Located(Located {
                     format: Format::Claude,
@@ -1032,11 +1106,11 @@ fn locate(
                     subagents: Some(transcript.with_extension("").join("subagents")),
                     transcript,
                 }),
-            ))
+            )
         }
-        Provider::Codex => {
-            let transcript = codex_rollout(&root.join("sessions"), &id)?;
-            Some((
+        Provider::Codex if !search_due => Location::Unchanged,
+        Provider::Codex => match codex_rollout(&root.join("sessions"), &id) {
+            Some(transcript) => Location::Found(
                 id,
                 Source::Located(Located {
                     format: Format::Codex,
@@ -1044,9 +1118,10 @@ fn locate(
                     transcript,
                     subagents: None,
                 }),
-            ))
-        }
-        Provider::Omp => Some((id, Source::Unsupported)),
+            ),
+            None => Location::Missed,
+        },
+        Provider::Omp => Location::Found(id, Source::Unsupported),
     }
 }
 
@@ -1229,7 +1304,7 @@ fn read_file(
     while let Some(newline) = rest.iter().position(|byte| *byte == b'\n') {
         let (line, after) = rest.split_at(newline);
         rest = &after[1..];
-        if cursor.skipping {
+        if cursor.skipping || cursor.partial.len() + line.len() > MAX_LINE {
             cursor.skipping = false;
             cursor.partial.clear();
             continue;
@@ -1247,7 +1322,6 @@ fn read_file(
         if cursor.partial.len() > MAX_LINE {
             cursor.partial.clear();
             cursor.skipping = true;
-            cursor.truncated = true;
         }
     }
     Ok(end == size)

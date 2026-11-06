@@ -85,6 +85,35 @@ fn gh_flags_with_and_without_values_keep_the_selector() {
 }
 
 #[test]
+fn short_flags_that_are_switches_in_one_subcommand_do_not_swallow_the_selector() {
+    assert_eq!(
+        of(&command("gh pr merge -r -d 12", "", Some(true))),
+        vec![(Reference::Number(12), Relation::Updated)]
+    );
+    assert_eq!(
+        of(&command("gh pr merge -m 12", "", Some(true))),
+        vec![(Reference::Number(12), Relation::Updated)]
+    );
+    assert_eq!(
+        of(&command("gh pr review -a 12", "", Some(true))),
+        vec![(Reference::Number(12), Relation::Reviewed)]
+    );
+    assert_eq!(
+        of(&command(
+            "gh pr review -r -b 'needs tests' 14",
+            "",
+            Some(true)
+        )),
+        vec![(Reference::Number(14), Relation::Reviewed)]
+    );
+    // In `edit` and `create` they take values.
+    assert_eq!(
+        of(&command("gh pr edit -m v2 15", "", Some(true))),
+        vec![(Reference::Number(15), Relation::Updated)]
+    );
+}
+
+#[test]
 fn an_existing_pull_request_reported_by_create_is_the_branch_s_not_a_new_one() {
     let signals = command(
         "gh pr create --fill",
@@ -106,6 +135,20 @@ fn git_push_output_names_branches_and_the_repository_they_went_to() {
     assert_eq!(
         of(&signals),
         vec![(branch(Some(("me", "r")), "feat/x"), Relation::Pushed)]
+    );
+}
+
+#[test]
+fn a_fetch_beside_a_push_in_one_script_is_not_a_push() {
+    let output = "From github.com:o/r\n \
+        * [new branch]      other      -> origin/other\n \
+        * branch            main       -> FETCH_HEAD\n\
+        To github.com:o/r.git\n   \
+        1a2b3c4..5d6e7f8  feat -> feat\n";
+    let signals = command("git pull origin main && git push", output, Some(true));
+    assert_eq!(
+        of(&signals),
+        vec![(branch(Some(("o", "r")), "feat"), Relation::Pushed)]
     );
 }
 

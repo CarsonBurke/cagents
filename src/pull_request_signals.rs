@@ -531,10 +531,21 @@ fn output_says_nothing_pushed(output: &str) -> bool {
 fn pushed_branches(output: &str) -> Vec<(Option<GitHubRepoKey>, String)> {
     let mut branches = Vec::new();
     let mut repository = None;
+    // A script's `git fetch` or `git pull` reports its updates the same way
+    // under a `From` line; those are not pushes.
+    let mut fetched = false;
     for line in output.lines() {
         let trimmed = line.trim();
         if let Some(remote) = trimmed.strip_prefix("To ") {
             repository = crate::github::remote_repository_key(remote.trim());
+            fetched = false;
+            continue;
+        }
+        if trimmed.starts_with("From ") {
+            fetched = true;
+            continue;
+        }
+        if fetched {
             continue;
         }
         // Human: ` * [new branch]      feat -> feat`, `   1a..2b  feat -> feat`,
@@ -582,6 +593,57 @@ fn pushed_branches(output: &str) -> Vec<(Option<GitHubRepoKey>, String)> {
     branches
 }
 
+/// Whether a `gh pr` flag takes a value. Some short flags take one in one
+/// subcommand and are switches in another: `-r` is `--reviewer` to
+/// `create` but `--rebase` to `merge` and `--request-changes` to `review`.
+fn takes_value(subcommand: Option<&str>, flag: &str) -> bool {
+    match flag {
+        "-a" | "-r" => matches!(subcommand, Some("create" | "new")),
+        "-m" => matches!(subcommand, Some("create" | "new" | "edit")),
+        "-A" => subcommand == Some("merge"),
+        "-i" => subcommand == Some("checks"),
+        _ => matches!(
+            flag,
+            "-t" | "--title"
+                | "-b"
+                | "--body"
+                | "-F"
+                | "--body-file"
+                | "-B"
+                | "--base"
+                | "-H"
+                | "--head"
+                | "-l"
+                | "--label"
+                | "--assignee"
+                | "--reviewer"
+                | "--milestone"
+                | "-p"
+                | "--project"
+                | "--json"
+                | "-q"
+                | "--jq"
+                | "--template"
+                | "-T"
+                | "--add-label"
+                | "--remove-label"
+                | "--add-reviewer"
+                | "--remove-reviewer"
+                | "--add-assignee"
+                | "--remove-assignee"
+                | "--add-project"
+                | "--remove-project"
+                | "--subject"
+                | "--match-head-commit"
+                | "--author-email"
+                | "--branch"
+                | "--remote-name"
+                | "--interval"
+                | "--color"
+        ),
+    }
+}
+
 fn gh(
     args: &[String],
     output: &str,
@@ -601,48 +663,9 @@ fn gh(
         } else if arg == "-R" || arg == "--repo" {
             repository = iter.next().and_then(|value| repository_selector(value));
         } else if arg.starts_with('-') {
-            // Flags whose value would otherwise read as the selector.
-            if matches!(
-                arg.as_str(),
-                "-t" | "--title"
-                    | "-b"
-                    | "--body"
-                    | "-F"
-                    | "--body-file"
-                    | "-B"
-                    | "--base"
-                    | "-H"
-                    | "--head"
-                    | "-l"
-                    | "--label"
-                    | "-a"
-                    | "--assignee"
-                    | "-r"
-                    | "--reviewer"
-                    | "-m"
-                    | "--milestone"
-                    | "-p"
-                    | "--project"
-                    | "--json"
-                    | "-q"
-                    | "--jq"
-                    | "--template"
-                    | "-T"
-                    | "--add-label"
-                    | "--remove-label"
-                    | "--add-reviewer"
-                    | "--remove-reviewer"
-                    | "--add-assignee"
-                    | "--remove-assignee"
-                    | "--subject"
-                    | "--match-head-commit"
-                    | "--author-email"
-                    | "--branch"
-                    | "--remote-name"
-                    | "--interval"
-                    | "--color"
-            ) && !arg.contains('=')
-            {
+            // Flags whose value would otherwise read as the selector. The
+            // subcommand precedes its flags.
+            if !arg.contains('=') && takes_value(positionals.get(1).copied(), arg) {
                 iter.next();
             }
         } else {
