@@ -626,6 +626,9 @@ impl Handle {
         {
             return Ok(());
         }
+        if let Some(host) = self.0.host.upgrade() {
+            super::given_work(&host, session);
+        }
         match handle.try_idle_prompt(self.0.seal.seal(message, super::now())) {
             Ok(()) => {}
             Err(Rejection::Refused(error)) => {

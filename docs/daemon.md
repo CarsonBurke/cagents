@@ -97,6 +97,10 @@ cagents daemon stop --confirm
   valid for 60 seconds; inventory changes require a new one.
 - A successful stop means **termination requested**, not that every PTY has
   exited. Plain `daemon stop` without these flags is a force stop.
+- Stopping the daemon ends each agent's provider process and any turn in
+  progress, but does not close the agent. The agent keeps its ID, and its card
+  stays in its channel, where its saved conversation can be resumed. A turn
+  the stop cut short is never resent. Only closing an agent removes it.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
 - Inside a hosted session, `terminal write` and `close` reach only the

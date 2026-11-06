@@ -149,7 +149,8 @@ class InstallCargoGate(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         names = ["build-disk-guard", "cagents-cargo-gate", "cargo-gate-command.py",
-                 "cargo-gate-sync.py", "cargo-offload", "seed-build-dir"]
+                 "cargo-gate-rustc-guard", "cargo-gate-sync.py", "cargo-offload",
+                 "seed-build-dir"]
         self.assertEqual(
             sorted(path.name for path in self.root.iterdir()),
             sorted(names + ["cagents-cargo-gate.d", "cagents-cargo-gate.install.lock",
@@ -192,7 +193,8 @@ class InstallCargoGate(unittest.TestCase):
         scripts = self.root / "checkout/scripts"
         scripts.mkdir(parents=True)
         for name in ("install-cargo-gate", "cargo-gate", "cargo-gate-command.py",
-                     "cargo-gate-sync.py", "cargo-offload", "seed-build-dir",
+                     "cargo-gate-sync.py", "cargo-gate-rustc-guard", "cargo-offload",
+                     "seed-build-dir",
                      "build-disk-guard"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (scripts / "cargo-gate-command.py").write_text("import sys\nsys.exit(3)\n")

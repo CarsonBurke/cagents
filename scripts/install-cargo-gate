@@ -23,7 +23,8 @@ usage() {
 Usage: scripts/install-cargo-gate [DIRECTORY]
 
 Installs scripts/cargo-gate as DIRECTORY/cagents-cargo-gate, with
-cargo-gate-command.py, cargo-gate-sync.py, cargo-offload, seed-build-dir and
+cargo-gate-command.py, cargo-gate-sync.py, cargo-gate-rustc-guard,
+cargo-offload, seed-build-dir and
 build-disk-guard beside it (default DIRECTORY: /var/tmp). Exits 3, changing
 nothing, when the installed gate's version is newer than this checkout's.
 EOF
@@ -40,6 +41,7 @@ source=$(cd "$(dirname "$0")" && pwd -P)
 # Installed name, then this checkout's file. The gate goes last.
 files='cargo-gate-command.py:cargo-gate-command.py
 cargo-gate-sync.py:cargo-gate-sync.py
+cargo-gate-rustc-guard:cargo-gate-rustc-guard
 cargo-offload:cargo-offload
 seed-build-dir:seed-build-dir
 build-disk-guard:build-disk-guard

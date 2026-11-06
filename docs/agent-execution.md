@@ -53,6 +53,15 @@ preview and confirm again. An update with **When idle** waits for background wor
 to finish; **Interrupt** previews which background tasks will stop. New affected
 tasks require fresh update confirmation.
 
+Stopping the daemon does not close its agents. Each agent's provider and any
+turn in progress end, and the stopped provider can no longer act for the agent,
+but the agent stays open: `agent list` still shows it, and its card stays in its
+channel, where its saved conversation can be resumed. A turn the stop cut short
+ends with a note that it may be incomplete and is never resent, so inspect the
+conversation before sending more work. Until the conversation is resumed, a new
+prompt to the agent fails without being sent. `agent close` still retires a
+stopped agent.
+
 Every command takes an agent by its exact name, or an agent or run by its whole ID or any unique prefix of one, matched against the caller's open agents and their latest runs; an ambiguous prefix fails and names the candidates. An agent handle stands for its latest run, and a run handle for its agent. A whole ID outside that list is passed on as an agent, or to `wait` as an older run. Names resolve without case sensitivity and take precedence over ID prefixes. People read eight-character IDs; JSON always carries whole ones.
 
 Human output is compact: one line per agent, and a run's state followed by the last 20 lines of its result (`--tail N`, or `--full`). `--json` before `agent` selects the regular CLI envelope. Spawn/send return `data.agent`, `data.run`, `data.created`, and `data.idempotency_key`, plus `data.timed_out` with `--wait`; status returns `data.agent`, `data.run`, and `data.timed_out`; wait always returns `data.results` (each with `agent`, `run`, and `outcome`), `data.timed_out`, `data.ended_by`, and the aggregate `data.outcome`; list returns `data.agents`; requests, answer, and interrupt return `data.requests`, the requests still pending.
@@ -65,7 +74,7 @@ Waiting commands use exit code **0** for success, **3** for timeout, **4** for f
 
 A run moves from `Accepted` to `Running`, may enter `Waiting`, and finishes as `Succeeded`, `Failed`, `Cancelled`, or `Interrupted`. Waiting returns promptly so a caller can route the approval/question to a person. It is not successful completion. The result contains provider-correlated text, usage, an optional diagnostic, and an explicit truncation flag. Text is bounded to 1 MiB; diagnostics to 16 KiB. Terminal output is never scraped to infer completion.
 
-Acceptance and its dispatch claim commit to the daemon's SQLite registry with `synchronous=FULL` before spawning a provider or submitting a prompt. An identical request with the same caller and idempotency key returns the original IDs; it does not send the prompt again. Reusing a key for different content fails. The CLI generates a key when `--idempotency-key` is omitted and retries once with it, on a new connection, when the daemon's answer is lost. A submission that still fails reports its key in the error; retry by hand with the identical request and that key.
+Acceptance and its dispatch claim commit to the daemon's SQLite registry with `synchronous=FULL` before spawning a provider or submitting a prompt. An identical request with the same caller and idempotency key returns the original IDs; it does not send the prompt again. Reusing a key for different content fails. Because each commit waits on the disk, the CLI allows the daemon 30 seconds to answer a submission, rather than the 5 seconds it allows ordinary requests. The CLI generates a key when `--idempotency-key` is omitted and retries once with it, on a new connection, when the daemon's answer is lost. A submission that still fails reports its key in the error; retry by hand with the identical request and that key.
 
 If a daemon restart loses proof of an accepted prompt's outcome, the run becomes `Interrupted`. Its external effects may already have happened. It is never resent automatically and retains its concurrency reservation until explicitly reconciled/closed. A private pending launch record preserves ownership if a process started but its final descriptor could not be committed. Such a record is not exposed as an adoptable UI session. A startup failure that retains a known hosted session reports that descriptor; inspect or close it before deciding how to proceed.
 

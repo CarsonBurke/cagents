@@ -166,6 +166,12 @@ impl Handle {
     ) -> Result<super::RetirementInspection, String> {
         RemoteActor::inspect_retained_retirement(record, proof)
     }
+    pub(crate) fn inspect_abandoned_actor(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<bool, String> {
+        RemoteActor::inspect_abandoned(record, proof)
+    }
     pub(crate) fn retired_actor_receipt(
         record: &crate::daemon::holder_registry::Record,
         proof: &crate::model::HostSessionProof,
@@ -541,6 +547,12 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.session_id(),
             Owner::Remote(remote) => remote.state().session_id.clone(),
+        }
+    }
+    pub(crate) fn is_ready(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.is_ready(),
+            Owner::Remote(remote) => remote.state().ready,
         }
     }
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {

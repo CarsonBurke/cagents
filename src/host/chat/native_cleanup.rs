@@ -123,7 +123,12 @@ fn close_retained_inner(
             return Err("The exact hosted attachment changed before native cleanup".into());
         }
         let actor = if let Some(record) = state.chats.get(&source.id) {
-            if record.handle.owns_work() {
+            // Ordinary close has joined this exact captured attachment and
+            // proved its provider teardown. A retained protocol diagnosis must
+            // not block its paired cleanup; unattached cleanup still cannot
+            // bypass a failed or live actor's own close path.
+            let closed_capture = expected.is_some() && record.handle.is_completed();
+            if record.handle.owns_work() && !closed_capture {
                 return Err("The native actor still owns work; use its existing close path".into());
             }
             // Identity/continuity are cached actor metadata; never hydrate a

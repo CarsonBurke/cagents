@@ -9,11 +9,13 @@ in a temporary directory. Cargo builds only a tiny private crate.
 import importlib.machinery
 import importlib.util
 import ast
+import contextlib
 import fcntl
 import json
 import os
 import resource
 from pathlib import Path
+import shlex
 import shutil
 import signal
 import socket
@@ -23,6 +25,7 @@ import tempfile
 import textwrap
 import time
 import unittest
+from unittest.mock import patch
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,6 +40,18 @@ def load_offload():
 
 
 offload = load_offload()
+
+
+def write_figures(directory, *, available_gib=1024, cpu=0, memory=0):
+    """A build host's memory and CPU figures, standing in for /proc. Unless a
+    test is about them, an idle, roomy host: admission otherwise holds builds
+    back by the real figures, which change as tests run."""
+    directory = Path(directory)
+    (directory / "pressure").mkdir(parents=True, exist_ok=True)
+    (directory / "meminfo").write_text(f"MemAvailable: {available_gib * 2**20} kB\n")
+    for resource_name, value in (("cpu", cpu), ("memory", memory)):
+        (directory / "pressure" / resource_name).write_text(
+            f"some avg10={value:.2f} avg60=0.00 avg300=0.00 total=0\n")
 
 
 class Parsing(unittest.TestCase):
@@ -104,6 +119,33 @@ class Parsing(unittest.TestCase):
                          ["check", "--message-format=short"])
         self.assertEqual(words("doc", "--open"), ["doc", "--message-format=json-render-diagnostics"])
         self.assertEqual(words("test", "--", "--nocapture"), ["test", "--", "--nocapture"])
+
+
+class BuildIdentity(unittest.TestCase):
+    def identity(self, *arguments, environment=None, directory="."):
+        return offload.Offload("host", offload.parse(list(arguments)),
+                               environment or {}).build_identity(directory)
+
+    def test_a_build_is_the_same_whatever_tests_it_would_pick(self):
+        self.assertEqual(self.identity("test", "--no-run", "--lib", "app::"),
+                         self.identity("test", "--no-run", "--lib", "--", "chat::"))
+        self.assertNotEqual(self.identity("test", "--no-run", "--lib"),
+                            self.identity("test", "--no-run", "--lib", "--features", "ui"))
+        self.assertNotEqual(self.identity("check"),
+                            self.identity("check", environment={"RUSTFLAGS": "-Dwarnings"}))
+
+    def test_a_build_is_the_same_however_it_is_named_or_reported(self):
+        self.assertEqual(self.identity("b"), self.identity("build"))
+        self.assertEqual(self.identity("check"),
+                         self.identity("check", environment={"CARGO_TERM_COLOR": "always",
+                                                             "RUST_BACKTRACE": "1"}))
+
+    def test_a_build_from_another_directory_of_the_checkout_is_another_build(self):
+        self.assertNotEqual(self.identity("check", directory="crates/a"),
+                            self.identity("check", directory="crates/b"))
+
+    def test_a_command_that_runs_tests_there_is_no_build_to_wait_for(self):
+        self.assertEqual(self.identity("test", "--lib"), "")
 
 
 class Rewrite(unittest.TestCase):
@@ -483,7 +525,8 @@ if [ "$1" = marked ]; then
     shift
     cd "$HOME"
     exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" RUSTUP_HOME="$RUSTUP_HOME" \
-        CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" sh -c "mkdir -p '$HOME/stray/.git'; $*"
+        CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/stray/cof" \
+        sh -c "mkdir -p '$HOME/stray/.git'; $*"
 fi
 shift
 cd "$HOME"
@@ -496,7 +539,7 @@ ulimit -Sn 256
 # removes.
 exec env -i HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
-    CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
 """
 
 
@@ -510,13 +553,21 @@ class StandInHost(unittest.TestCase):
         self.root = Path(temporary.name)
         tools = self.root / "tools"
         tools.mkdir()
-        for name in ("cargo-gate", "cargo-gate-command.py", "cargo-offload"):
+        # HOME changes below, so caller Python shims (such as mise's) may
+        # no longer resolve their interpreter. Keep the test's own Python
+        # first without changing which Cargo or rustup each side finds.
+        python_tools = self.root / "python"
+        python_tools.mkdir()
+        (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
+        for name in ("cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
+                     "cargo-offload"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
         (tools / "ssh").write_text(STAND_IN_SSH)
         (tools / "ssh").chmod(0o755)
         self.gate = tools / "cargo-gate"
         self.host_home = self.root / "host"
         self.host_home.mkdir()
+        write_figures(self.host_home / "figures")
         self.crate = self.root / "crate"
         (self.crate / "src").mkdir(parents=True)
         (self.crate / "Cargo.toml").write_text(textwrap.dedent("""
@@ -528,17 +579,20 @@ class StandInHost(unittest.TestCase):
         """))
         (self.crate / "src/main.rs").write_text('fn main() { println!("probe"); }\n')
         (self.crate / ".gitignore").write_text("/target\n")
+        # A host's default toolchain may predate CARGO_BUILD_BUILD_DIR.
+        shutil.copy2(ROOT / "rust-toolchain.toml", self.crate)
         subprocess.run(["git", "init", "-q"], cwd=self.crate, check=True)
         home = Path.home()
         self.env = {
             key: value for key, value in os.environ.items()
             if not key.startswith(("CAGENTS_BUILD_", "CARGO_BUILD_"))
         } | {
-            "PATH": f"{tools}:{os.environ['PATH']}",
+            "PATH": os.pathsep.join([str(python_tools), str(tools), os.environ["PATH"]]),
             # A build host's `cargo` is rustup's, as fw16's is, rather than
             # whatever wraps it first on this host's PATH: mise's shim, for
             # one, raises the open-file limit the build is meant to keep.
             "STAND_IN_HOST_PATH": os.pathsep.join([
+                str(python_tools),
                 os.path.join(os.environ.get("CARGO_HOME", str(home / ".cargo")), "bin"),
                 os.environ["PATH"]]),
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
@@ -823,6 +877,22 @@ class StandInHost(unittest.TestCase):
         self.assertTrue((self.crate / "target/debug/probe").is_file())
         self.assertFalse((self.root / "local-build").exists())
 
+    def test_cargo_in_an_exec_command_reached_by_path_does_not_compile_here(self):
+        cargo = os.path.join(self.env["CARGO_HOME"], "bin", "cargo")
+        for command in (f"'{cargo}' build --bin probe", '"$CARGO_PATH" build --bin probe'):
+            with self.subTest(command=command):
+                result = self.gate_run("exec", "sh", "-ec", command,
+                                       env=self.remote_env() | {"CARGO_PATH": cargo}, timeout=60)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("would compile on this host", result.stderr)
+                # Cargo made its directories here, and compiled nothing.
+                self.assertEqual([path for path in self.root.rglob("probe*")
+                                  if path.is_file() and "host" not in path.parts], [])
+        # Cargo's own queries of rustc still answer.
+        result = self.gate_run("exec", "sh", "-ec", f"'{cargo}' metadata --format-version 1 "
+                               ">/dev/null && printf ok", env=self.remote_env(), timeout=60)
+        self.assertEqual((result.returncode, result.stdout), (0, "ok"), result.stderr)
+
     def test_documentation_opens_here(self):
         (self.crate / "src/lib.rs").write_text("//! Probe documentation.\n")
         opened = self.root / "opened"
@@ -1070,7 +1140,7 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertLess(time.monotonic() - started, 30)
-        self.assertIn("waiting for one of 2 build slots on stand-in", result.stderr)
+        self.assertIn("waiting for a build slot on stand-in", result.stderr)
         self.assertIn("cargo-gate: build admission timed out", result.stderr)
         self.assertFalse((self.root / "local-build").exists())
 
@@ -1087,7 +1157,7 @@ class StandInHost(unittest.TestCase):
         result = self.gate_run("check", env=env)
         self.assertEqual(result.returncode, 124, result.stderr)
         self.assertIn("waiting for memory on stand-in", result.stderr)
-        self.assertNotIn("waiting for one of", result.stderr)
+        self.assertNotIn("waiting for a build slot", result.stderr)
         # Alone there, the same build starts: nothing else is expected to
         # take the memory it sees.
         fcntl.flock(lock, fcntl.LOCK_UN)
@@ -1157,6 +1227,51 @@ class StandInHost(unittest.TestCase):
             time.sleep(0.1)
 
 
+class StandInHostPython(unittest.TestCase):
+    """Interpreter selection needs no Cargo build or real SSH connection."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-python-shim-")
+        self.addCleanup(temporary.cleanup)
+        caller_tools = Path(temporary.name)
+        self.shim_calls = caller_tools / "invocations"
+        shim = caller_tools / "python3"
+        # Fail promptly instead of reproducing a shim's recursive exec loop.
+        shim.write_text('#!/bin/sh\nprintf "%s\\n" "$*" >> "${0%/*}/invocations"\nexit 86\n')
+        shim.chmod(0o755)
+        with patch.dict(os.environ, {"PATH": f"{caller_tools}:{os.environ['PATH']}"}):
+            self.host = StandInHost()
+            self.addCleanup(self.host.doCleanups)
+            self.host.setUp()
+        self.environment = self.host.remote_env() | {"CAGENTS_FIXTURE_CALLER_ONLY": "present"}
+        self.probe = (
+            "import json, os, pathlib, sys; "
+            "print(json.dumps({'executable': str(pathlib.Path(sys.executable).resolve()), "
+            "'home': os.environ['HOME'], "
+            "'caller': os.environ.get('CAGENTS_FIXTURE_CALLER_ONLY')}))"
+        )
+
+    def assert_interpreter(self, result, *, caller):
+        self.assertFalse(self.shim_calls.exists(), "the caller's python3 shim ran")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout), {
+            "executable": str(Path(sys.executable).resolve()),
+            "home": str(self.host.host_home),
+            "caller": caller,
+        })
+
+    def test_copied_gate_ignores_callers_python_shim(self):
+        result = self.host.gate_run("exec", "python3", "-c", self.probe,
+                                    env=self.environment, timeout=10)
+        self.assert_interpreter(result, caller="present")
+
+    def test_clean_stand_in_host_ignores_callers_python_shim(self):
+        result = subprocess.run(["ssh", "stand-in", "python3", "-c", shlex.quote(self.probe)],
+                                cwd=self.host.crate, env=self.environment,
+                                capture_output=True, text=True, timeout=10)
+        self.assert_interpreter(result, caller=None)
+
+
 class RemoteRun(unittest.TestCase):
     """The build host's end of a command: it ends what it started when the
     connection to this host closes, outside any supervisor here."""
@@ -1220,6 +1335,167 @@ class RemoteRun(unittest.TestCase):
                              {"index": 0, "path": os.path.realpath(Path(base, "slot-0"))})
             lease.stdin.close()
             self.assertEqual(lease.wait(timeout=10), 0)
+
+    @contextlib.contextmanager
+    def slots(self):
+        """A directory of slots, which leases still waiting would keep adding
+        to as it is removed."""
+        with tempfile.TemporaryDirectory() as base:
+            self.leases = []
+            try:
+                yield base
+            finally:
+                for lease in self.leases:
+                    lease.kill()
+                    lease.wait()
+
+    def lease(self, base, *, slots=2, build="", slot_disk=0, figures=None):
+        if figures is None:
+            figures = Path(base, "figures")
+            write_figures(figures)
+        lease = subprocess.Popen(
+            ["python3", "-c", offload.REMOTE_AGENT, "lease", base, str(slots), "key", "0", "",
+             "", build],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
+                              "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
+                              "CAGENTS_OFFLOAD_FIGURES": str(figures)})
+        self.leases.append(lease)
+        self.addCleanup(lease.stdout.close)
+        self.addCleanup(lease.kill)
+        return lease, offload.Lines(lease.stdout)
+
+    def hold(self, base, index, claim=None):
+        """Leases slot `index` as another build would."""
+        slot = Path(base, f"slot-{index}")
+        (slot / "src").mkdir(parents=True, exist_ok=True)
+        (slot / "owner").write_text("key\n")
+        if claim is not None:
+            (slot / "claim").write_text(json.dumps(claim))
+        lock = open(slot / "lock", "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        return lock
+
+    def test_a_further_slot_is_made_while_the_disk_holds_one(self):
+        with self.slots() as base:
+            self.hold(base, 0, {"cost": 1, "pid": None})
+            lease, lines = self.lease(base)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot ")),
+                             {"index": 1, "path": os.path.realpath(Path(base, "slot-1"))})
+
+    def test_no_further_slot_is_made_without_disk_for_one_or_beyond_the_most(self):
+        for slots, slot_disk in ((2, 2**62), (1, 0)):
+            with self.subTest(slots=slots, slot_disk=slot_disk), \
+                    self.slots() as base:
+                lock = self.hold(base, 0, {"cost": 1, "pid": None})
+                lease, lines = self.lease(base, slots=slots, slot_disk=slot_disk)
+                self.assertEqual(lines.next(10), "wait")
+                with self.assertRaises(TimeoutError):
+                    lines.next(1.5)
+                self.assertFalse(Path(base, "slot-1").exists())
+                fcntl.flock(lock, fcntl.LOCK_UN)
+                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_slots_made_lately_count_as_full_until_they_fill(self):
+        with self.slots() as base:
+            stat = os.statvfs(base)
+            slot_disk = int(stat.f_bavail * stat.f_frsize * 0.6)
+            self.hold(base, 0, {"cost": 1, "pid": None})
+            first, lines = self.lease(base, slots=8, slot_disk=slot_disk)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+            # Slot 1 holds nothing yet, but will.
+            second, lines = self.lease(base, slots=8, slot_disk=slot_disk)
+            self.assertEqual(lines.next(10), "wait")
+            with self.assertRaises(TimeoutError):
+                lines.next(1.5)
+            self.assertFalse(Path(base, "slot-2").exists())
+
+    def test_the_same_build_waits_for_its_slot_rather_than_build_again_elsewhere(self):
+        with self.slots() as base:
+            lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
+            lease, lines = self.lease(base, build="same")
+            self.assertEqual(lines.next(10), "wait same")
+            with self.assertRaises(TimeoutError):
+                lines.next(1.5)
+            self.assertFalse(Path(base, "slot-1").exists())
+            # Another build goes ahead of it, into a further slot.
+            other, others = self.lease(base, build="other")
+            self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 1)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_a_build_that_waited_for_the_same_one_gets_back_in_line(self):
+        with self.slots() as base:
+            lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
+            waiter, waits = self.lease(base, slots=1, build="same")
+            self.assertEqual(waits.next(10), "wait same")
+            # The head of the line meanwhile, as another build would be.
+            line = open(Path(base, "queue"), "a")
+            self.addCleanup(line.close)
+            fcntl.flock(line, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            # The slot is free, and it still takes its turn.
+            self.assertEqual(waits.next(10), "wait")
+            with self.assertRaises(TimeoutError):
+                waits.next(1.5)
+            line.close()
+            self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_a_build_beside_another_waits_until_the_host_has_room(self):
+        for figures, reason in (({"cpu": 90}, "wait cpu 90 40"),
+                                ({"memory": 50}, "wait pressure 50 10"),
+                                ({"available_gib": 1}, "wait memory 1.0 9.0 1")):
+            with self.subTest(reason), self.slots() as base:
+                stand_in = Path(base, "figures")
+                write_figures(stand_in, **figures)
+                self.hold(base, 0, {"cost": 1, "pid": None})
+                _, lines = self.lease(base, figures=stand_in)
+                self.assertEqual(lines.next(10), reason)
+                with self.assertRaises(TimeoutError):
+                    lines.next(1.5)
+                write_figures(stand_in)
+                self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+
+    def test_a_lone_build_starts_however_busy_the_host_is(self):
+        with self.slots() as base:
+            stand_in = Path(base, "figures")
+            write_figures(stand_in, available_gib=1, cpu=90, memory=50)
+            _, lines = self.lease(base, figures=stand_in)
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 0)
+
+    def test_the_same_build_from_another_checkout_is_not_waited_for(self):
+        with self.slots() as base:
+            self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "elsewhere"})
+            lease, lines = self.lease(base, build="same")
+            self.assertEqual(json.loads(lines.next(10).removeprefix("slot "))["index"], 1)
+
+    def run_agent(self, base, command):
+        Path(base, "src").mkdir(exist_ok=True)
+        # Its standard input stays open: closing it cancels the command.
+        agent = subprocess.Popen(["python3", "-c", offload.REMOTE_AGENT, "run", base, ".",
+                                  *command], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        self.addCleanup(agent.kill)
+        agent.stdin.write(b'{"environment": {}}\n')
+        agent.stdin.flush()
+        output = agent.stdout.read()
+        self.assertEqual(agent.wait(timeout=30), 0)
+        agent.stdin.close()
+        agent.stdout.close()
+        return output.decode()
+
+    def test_a_build_shares_the_hosts_cpus_with_the_builds_running_there(self):
+        cpus = len(os.sched_getaffinity(0))
+        with tempfile.TemporaryDirectory() as root:
+            base = os.path.join(root, "slot-0")
+            os.makedirs(base)
+            self.hold(root, 0)
+            echo = ["sh", "-c", "printf %s \"$CARGO_BUILD_JOBS\""]
+            most = max(4, min(8, cpus // 2))
+            self.assertEqual(self.run_agent(base, echo), str(min(max(4, cpus), most)))
+            for index in (1, 2, 3):
+                self.hold(root, index)
+            self.assertEqual(self.run_agent(base, echo), str(min(max(4, cpus // 4), most)))
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
         with tempfile.TemporaryDirectory() as base:

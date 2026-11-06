@@ -14,7 +14,7 @@ set -eu
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=3
+gate_version=7
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -99,9 +99,11 @@ Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
   CAGENTS_BUILD_REMOTE_SLOTS, CAGENTS_BUILD_REMOTE_JOBS,
   CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB
-                         Builds at once on that host (default 3), Cargo jobs
-                         for each (6), and the free space below which it
-                         builds nothing (40 GiB)
+                         Most slots on that host (default 8; further ones
+                         are made while disk allows, and builds start as
+                         memory and CPU allow), Cargo jobs for each (default:
+                         its CPUs shared among the running builds), and the
+                         free space below which it builds nothing (40 GiB)
   CAGENTS_BUILD_INSTALLED_GATE
                          The installed gate a checkout's older gate defers
                          to (default /var/tmp/cagents-cargo-gate); empty
@@ -165,6 +167,18 @@ if [ -n "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
         fi
     done
     export PATH
+    # The guard against compiling here, below, is for Cargo that bypassed
+    # the shim; this gate's own Cargo gets the wrapper the caller had, from
+    # whichever gate's exec set it.
+    case ${RUSTC_WRAPPER-} in
+    */cargo-gate-rustc-guard)
+        if [ -n "${CAGENTS_BUILD_EXEC_RUSTC_WRAPPER-}" ]; then
+            RUSTC_WRAPPER=$CAGENTS_BUILD_EXEC_RUSTC_WRAPPER
+        else
+            unset RUSTC_WRAPPER
+        fi
+        ;;
+    esac
 fi
 named=false
 case $1 in
@@ -424,8 +438,9 @@ acquire() {
         # The shared descriptor locks only once the queued request is granted:
         # the kernel never leaves slot 0 free while a request waits for it.
         if flock -n 6; then
+            # `2>/dev/null`: dash reports "Terminated" for a job it kills and then waits for.
             kill "$waiter" 2>/dev/null || :
-            wait "$waiter" || :
+            wait "$waiter" 2>/dev/null || :
             waiter=
             exec 9>&6 6>&-
             if fits 0; then
@@ -440,7 +455,7 @@ acquire() {
         fi
         # Queue again if the request itself was killed.
         if waiter_gone; then
-            wait "$waiter" || :
+            wait "$waiter" 2>/dev/null || :
             waiter=
             exec 6>&-
             continue
@@ -489,7 +504,7 @@ check_admission() {
 withdraw() {
     if [ -n "$waiter" ]; then
         kill "$waiter" 2>/dev/null || :
-        wait "$waiter" || :
+        wait "$waiter" 2>/dev/null || :
     fi
     exec 6>&-
     waiter=
@@ -741,9 +756,12 @@ if [ "$where" -eq 0 ]; then
     quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
     printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
     chmod 755 "$shims/cargo"
+    # Cargo reached some other way would compile here; see the guard.
+    CAGENTS_BUILD_EXEC_RUSTC_WRAPPER=${RUSTC_WRAPPER-}
     CAGENTS_BUILD_EXEC_SHIMS=$shims
     PATH=$shims:$PATH
-    export CAGENTS_BUILD_EXEC_SHIMS PATH
+    RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
+    export CAGENTS_BUILD_EXEC_SHIMS CAGENTS_BUILD_EXEC_RUSTC_WRAPPER PATH RUSTC_WRAPPER
     status=0
     supervised '' "$@" || status=$?
     rm -rf -- "$shims"
@@ -777,8 +795,12 @@ if [ -x "$guard" ] || [ -x "$seed" ]; then
     supervised '' /bin/sh -c '
         guard=$1
         seed=$2
-        build_dir=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null |
-            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'') || build_dir=
+        metadata=$("${CAGENTS_BUILD_CARGO:-cargo}" metadata --format-version 1 --no-deps 2>/dev/null) || metadata=
+        build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"build_directory":"\([^"]*\)".*/\1/p'\'')
+        # A Cargo that reports no build directory builds in the target.
+        [ -n "$build_dir" ] || build_dir=$(printf "%s\n" "$metadata" |
+            sed -n '\''s/.*"target_directory":"\([^"]*\)".*/\1/p'\'')
         if [ -n "$build_dir" ]; then
             [ ! -x "$guard" ] || "$guard" "$build_dir" || exit "$?"
             [ ! -x "$seed" ] || "$seed" --to "$build_dir" || :

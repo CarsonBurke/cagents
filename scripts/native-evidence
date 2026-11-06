@@ -213,6 +213,7 @@ run_build() {
         rm -rf -- "$target.partial"
         cp -a --reflink=always -- "$seed_target" "$target.partial"
         rm -f -- "$target.partial/evidence-source"
+        (cd -- "$checkout" && "$tool_root/scripts/seed-build-dir" --forget-local "$target.partial")
         mv -- "$target.partial" "$target"
     fi
     revision=$(source_state "$checkout")
@@ -397,7 +398,7 @@ wait_for_native_lock() {
         if [ "$waited" -ge "$wait_lock" ]; then
             kill -KILL "$waiter" 2>/dev/null || true
             wait "$waiter" 2>/dev/null || true
-            printf 'the native lock stayed busy for %s seconds\n' "$wait_lock" >"$state/failed"
+            printf 'the native lock stayed busy for %s seconds (see scripts/lock-holders %s)\n' "$wait_lock" "$native_lock" >"$state/failed"
             return 1
         fi
         sleep 1

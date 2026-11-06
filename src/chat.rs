@@ -708,6 +708,56 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
     }
 }
 
+/// Whether `successor` is exactly the daemon's prepared resume of the stranded
+/// retained Claude card `source`: the same conversation, launch and account
+/// under a new allocation with no ownership proof yet. This shape is
+/// no authority by itself; only an authenticated `ChatPrepareResume` answer on
+/// the same daemon stream may produce one.
+pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    let valid = |id: &String| uuid::Uuid::parse_str(id).is_ok();
+    // A pane whose actor never reported its conversation resumes the one the
+    // daemon proved that actor confirmed, or, when it confirmed none, starts
+    // one: either way nothing else of its launch changes.
+    let launch = if source.has_unnamed_retained_claude_actor()
+        && successor.launch.session_id.as_ref().is_none_or(valid)
+    {
+        Launch {
+            session_id: None,
+            ..successor.launch.clone()
+        }
+    } else {
+        successor.launch.clone()
+    };
+    matches!(
+        source.native_continuity,
+        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ) && source.has_valid_native_continuity()
+        && source.launch.provider == Provider::Claude
+        && (source.launch.session_id.as_ref().is_some_and(valid)
+            || source.has_unnamed_retained_claude_actor())
+        && successor.id != source.id
+        && launch == source.launch
+        && successor.proof.is_none()
+        && successor.terminal.is_none()
+        && successor.owned_codex_listener.is_none()
+        && successor.native_continuity == NativeContinuity::ReconnectOnly
+}
+
+/// Whether `started` is the daemon's started form of a prepared resume
+/// successor of `source`: started under a complete ownership proof, on the
+/// exact saved conversation, with only the continuity it learned on install.
+pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
+    let mut prepared = started.clone();
+    prepared.proof = None;
+    prepared.native_continuity = NativeContinuity::ReconnectOnly;
+    is_retained_resume_successor(source, &prepared)
+        && started
+            .proof
+            .as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete)
+        && started.has_valid_native_continuity()
+}
+
 /// A formerly hosted pane may never have observed its first provider identity.
 /// This narrow transition is usable only after authenticated upgrade resolution,
 /// exact attachment and snapshot confirmation, followed by a writer receipt.
@@ -1521,6 +1571,41 @@ pub struct TextCopySources {
     pub conversation_revision: u64,
     pub conversation: Vec<Option<TextCopySource>>,
     pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
+}
+
+impl Command {
+    /// Whether the command gives the provider work: a turn, a reply to its
+    /// question, or a queued or provider command it runs.
+    ///
+    /// Exhaustive on purpose, so that a new command has to be classified.
+    pub fn gives_work(&self) -> bool {
+        match self {
+            Self::ResumeAfterLogin { .. }
+            | Self::Prompt { .. }
+            | Self::Answer { .. }
+            | Self::Compact
+            | Self::Slash { .. }
+            | Self::StartQueued { .. }
+            | Self::Branch { .. } => true,
+            Self::Interrupt
+            | Self::StopSubagent { .. }
+            | Self::SetModel { .. }
+            | Self::SetFastMode { .. }
+            | Self::SetPermissionMode { .. }
+            | Self::RefreshPermissions
+            | Self::UpdatePermissionSettings { .. }
+            | Self::DismissPermissionDenial { .. }
+            | Self::Refresh
+            | Self::LoadEarlier
+            | Self::RemoveQueued { .. }
+            | Self::SetInterruptMode { .. }
+            | Self::ListBranches
+            | Self::LoadLater
+            | Self::LoadFileChanges { .. }
+            | Self::LoadFileChangePatches { .. }
+            | Self::ReadTextCopy { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

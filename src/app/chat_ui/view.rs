@@ -100,6 +100,8 @@ pub(super) const DELIVERY_FOLDED_HEIGHT: f32 = 180.0;
 pub(super) const NOTICE_LINES: usize = 3;
 
 const MESSAGE_ACTION_HEIGHT: f32 = 24.0;
+/// The most characters a footer name shows before it is cut.
+const FOOTER_LABEL: usize = 32;
 const MESSAGE_ACTION_FOOTER: f32 = MESSAGE_ACTION_HEIGHT + step::GAP_XS;
 
 /// Existing action footers provide separation. Count that space toward the
@@ -716,6 +718,47 @@ fn completion_kind(kind: completion::Kind) -> &'static str {
     }
 }
 
+/// A footer name, said whole on hover where it was cut. Names have no
+/// bound, and a footer item does not wrap within itself.
+fn bounded<'a>(content: Element<'a, Message>, name: &str, kind: &str) -> Element<'a, Message> {
+    if name.chars().count() > FOOTER_LABEL {
+        crate::interaction::tooltip_above(content, format!("{kind}: {name}"))
+    } else {
+        content
+    }
+}
+
+/// How a turn that finished with `snapshot` ended, as its provider said.
+pub(super) fn turn_outcome(snapshot: &chat::Snapshot) -> &'static str {
+    match snapshot.detail.as_str() {
+        "Turn interrupted" => "Interrupted",
+        "Turn failed" => "Failed",
+        _ => "Finished",
+    }
+}
+
+/// The row that closes a working transcript: a small muted spinner, or the
+/// waiting glyph, beside what the agent is doing.
+fn activity_row<'a>(glyph: Icon, label: String) -> Element<'a, Message> {
+    let glyph = if glyph == Icon::AgentWorking {
+        crate::ui_controls::activity_spinner(
+            f32::from(design::COMPACT_ICON_SIZE),
+            design::muted_icon_color,
+        )
+    } else {
+        crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
+    };
+    widget::row::with_children(vec![
+        glyph,
+        design::caption(label)
+            .class(cosmic::theme::Text::Custom(design::muted_text))
+            .into(),
+    ])
+    .spacing(step::GAP_XS)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 /// A one-line row of a composer list: an optional icon, a name, what it
 /// does in muted text cut to the room left, and what kind of thing it is.
 fn menu_row<'a>(
@@ -1143,8 +1186,12 @@ fn activity_label(snapshot: &chat::Snapshot) -> &'static str {
     if snapshot.has_later {
         return "Working";
     }
-    match snapshot
-        .items
+    items_activity(&snapshot.items)
+}
+
+/// What the newest of `items` says an agent is doing.
+fn items_activity(items: &[Arc<chat::Item>]) -> &'static str {
+    match items
         .last()
         .filter(|item| item.role == chat::Role::Assistant)
         .map(|item| &item.content)
@@ -1226,13 +1273,13 @@ impl Runtime {
             text
         }
     }
+    /// The agent's own name: Codex's nickname, the name Claude was asked to
+    /// give an agent, else its type, or OMP's agent name. The description is
+    /// the task it was given, which says what it does rather than who it is,
+    /// so it never stands in for the name.
     pub(super) fn native_child_name(agent: &chat::Subagent) -> &str {
-        agent
-            .description
-            .lines()
-            .map(str::trim)
-            .find(|line| !line.is_empty())
-            .or_else(|| (!agent.kind.trim().is_empty()).then_some(agent.kind.trim()))
+        Some(agent.kind.trim())
+            .filter(|name| !name.is_empty())
             .unwrap_or("Subagent")
     }
 
@@ -1248,6 +1295,12 @@ impl Runtime {
     }
 
     pub(super) fn native_child_identity(&self, agent: &chat::Subagent) -> String {
+        self.child_description(agent, &self.child_label(agent, 80))
+    }
+
+    /// What a child's tab and rows say beyond its name: its state, where it
+    /// runs and the task it was given. `label` is its name as listed.
+    pub(super) fn child_description(&self, agent: &chat::Subagent, label: &str) -> String {
         let provider = match self.session.launch.provider {
             Provider::Codex => "Codex",
             Provider::Claude => "Claude",
@@ -1260,16 +1313,40 @@ impl Runtime {
             .filter(|model| !model.is_empty())
             .unwrap_or("Model not reported");
         let mut identity = format!(
-            "{provider} native subagent · {} · {} · {}",
-            Self::short_description(Self::native_child_name(agent), 80),
+            "{} · {} · {provider} native subagent · {}",
+            Self::short_description(label, 80),
+            Self::native_child_status(agent),
             Self::short_description(model, 80),
-            Self::native_child_status(agent)
         );
-        if !agent.detail.trim().is_empty() {
+        // A blocked or failed child's provider error keeps its raw diagnostic
+        // for copying; the tab says what it means. A finished child's detail
+        // is its own report, whose prose may merely mention such words.
+        let detail = agent.detail.trim();
+        if !detail.is_empty() {
             identity.push_str(" · ");
-            identity.push_str(&Self::short_description(agent.detail.trim(), 120));
+            let failure = (agent.waiting || agent.status == chat::ToolStatus::Failed)
+                .then(|| chat::failure::Failure::parse(self.session.launch.provider, detail))
+                .flatten();
+            match failure {
+                Some(failure) => identity.push_str(&failure.summary),
+                None => identity.push_str(&Self::short_description(detail, 120)),
+            }
+        }
+        if let Some(task) = Self::native_child_task(agent) {
+            identity.push_str(" · Task: ");
+            identity.push_str(&Self::short_description(task, 120));
         }
         identity
+    }
+
+    /// The first line of the task a child was given, which can be a whole
+    /// prompt. It describes a child's tab; it never names one.
+    pub(super) fn native_child_task(agent: &chat::Subagent) -> Option<&str> {
+        agent
+            .description
+            .lines()
+            .map(str::trim)
+            .find(|line| !line.is_empty())
     }
 
     /// Completion requires provider evidence. An unstarted conversation is a
@@ -1281,7 +1358,7 @@ impl Runtime {
             || self.queued.is_some()
             || transitioning
             || self.attachment_chooser_pending.is_some()
-            || self.pending.is_some()
+            || self.sending()
             || self.disconnected
             || snapshot.exited
         {
@@ -1336,14 +1413,21 @@ impl Runtime {
             || snapshot.subagents.len() > 1
             || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
         {
+            let subagents = |count: usize| {
+                if count == 1 {
+                    "1 subagent".to_owned()
+                } else {
+                    format!("{count} subagents")
+                }
+            };
             if working > 0 {
-                parts.push(format!("{working} working"));
+                parts.push(format!("{} working", subagents(working)));
             }
             if waiting > 0 {
-                parts.push(format!("{waiting} waiting"));
+                parts.push(format!("{} waiting", subagents(waiting)));
             }
             if failed > 0 {
-                parts.push(format!("{failed} failed"));
+                parts.push(format!("{} failed", subagents(failed)));
             }
             if !parts.is_empty() {
                 return (
@@ -1361,7 +1445,98 @@ impl Runtime {
         (glyph, Self::short_description(label, 100))
     }
 
-    fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
+    /// What the agent is doing now, for the row that closes the transcript:
+    /// the parent's work and its subagents', or the selected subagent's own.
+    /// `None` once nothing runs, so the row settles into the finished stamp,
+    /// and wherever the transcript already says what is happening: a first
+    /// message starting shows it on the message, and switching, closing, a
+    /// lost connection or a stopped agent each say so with their controls.
+    pub(super) fn timeline_activity(
+        &self,
+        transitioning: bool,
+        selected: Option<&chat::Subagent>,
+    ) -> Option<(Icon, String)> {
+        let snapshot = &self.snapshot;
+        if self.closed_elsewhere
+            || transitioning
+            || self.queued.is_some()
+            || self.attachment_chooser_pending.is_some()
+            || self.disconnected
+            || snapshot.exited
+        {
+            return None;
+        }
+        if let Some(agent) = selected {
+            return (agent.status == chat::ToolStatus::Running).then(|| {
+                if agent.waiting {
+                    (Icon::AgentWaiting, "Waiting for you".to_owned())
+                } else {
+                    let activity = items_activity(&agent.items);
+                    let label = if activity == "Working" && !agent.detail.trim().is_empty() {
+                        Self::short_description(agent.detail.trim(), 100)
+                    } else {
+                        activity.to_owned()
+                    };
+                    (Icon::AgentWorking, label)
+                }
+            });
+        }
+        // Newer turns are not shown, so the end of this page is not now.
+        if snapshot.has_later {
+            return None;
+        }
+        let (glyph, label) = self.conversation_status(transitioning);
+        match glyph {
+            Some(glyph @ (Icon::AgentWorking | Icon::AgentWaiting)) => Some((glyph, label)),
+            // A failure stands in the transcript on its own; a subagent still
+            // waiting on the reader is not settled by it.
+            Some(Icon::Warning)
+                if snapshot
+                    .subagents
+                    .iter()
+                    .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running) =>
+            {
+                Some((Icon::AgentWaiting, label))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether a message is on its way to the provider. Other commands -
+    /// choosing a model or permissions, paging history, answering, stopping -
+    /// leave what the conversation is doing as it was until it says otherwise.
+    pub(super) fn sending(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.sent.is_some() || !pending.sent_attachments.is_empty())
+    }
+
+    /// How the last turn ended, for the stamp that closes a settled
+    /// transcript. The turn's own outcome is kept from when it finished, so a
+    /// later notice does not rewrite it; an error standing now is still said,
+    /// since a reader may have nowhere else to learn of it.
+    pub(super) fn finished_label(&self) -> &'static str {
+        let ended = self
+            .finished_stamp
+            .as_ref()
+            .filter(|stamp| Some(stamp.at) == self.snapshot.finished_at)
+            .map_or_else(|| turn_outcome(&self.snapshot), |stamp| stamp.outcome);
+        // The closing of a card moved elsewhere is not the agent's error;
+        // the closed card says what happened.
+        if ended == "Finished"
+            && self
+                .error
+                .iter()
+                .chain(&self.snapshot.error)
+                .any(|error| !self.expected_remote_close_error(error))
+        {
+            "Finished with error"
+        } else {
+            ended
+        }
+    }
+
+    pub(super) fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
         let snapshot = &self.snapshot;
         if self.closed_elsewhere {
             (
@@ -1378,7 +1553,7 @@ impl Runtime {
             (Some(Icon::AgentWorking), "Switching session")
         } else if self.attachment_chooser_pending.is_some() {
             (Some(Icon::AgentWorking), "Choosing attachments")
-        } else if self.pending.is_some() {
+        } else if self.sending() {
             (Some(Icon::AgentWorking), "Sending")
         } else if self.disconnected {
             (Some(Icon::Warning), "Disconnected")
@@ -1411,14 +1586,15 @@ impl Runtime {
                 },
             )
         } else if snapshot.finished_at.is_some() {
-            match snapshot.detail.as_str() {
-                "Turn interrupted" => (Some(Icon::Cancel), "Interrupted"),
-                "Turn failed" => (Some(Icon::Warning), "Failed"),
-                _ if self.error.is_some() || snapshot.error.is_some() => {
-                    (Some(Icon::Warning), "Finished with error")
-                }
-                _ => (Some(Icon::Check), "Finished"),
-            }
+            let label = self.finished_label();
+            (
+                Some(match label {
+                    "Interrupted" => Icon::Cancel,
+                    "Finished" => Icon::Check,
+                    _ => Icon::Warning,
+                }),
+                label,
+            )
         } else if self.error.is_some() || snapshot.error.is_some() {
             (Some(Icon::Warning), "Error")
         } else if self.is_draft() {
@@ -1797,9 +1973,9 @@ impl Runtime {
                 .map(str::trim)
                 .filter(|model| !model.is_empty())
                 .unwrap_or("Model not reported");
-            let heading: Element<'_, Message> = widget::column::with_children(vec![
+            let mut heading = vec![
                 widget::row::with_children(vec![
-                    chat_title(Self::short_description(Self::native_child_name(agent), 80))
+                    chat_title(self.child_label(agent, 80))
                         .width(Length::Fill)
                         .into(),
                     design::heading(Self::native_child_status(agent))
@@ -1809,6 +1985,17 @@ impl Runtime {
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .into(),
+            ];
+            // The name titles the transcript; the task it was given sits
+            // beneath it, quieter, so the reader knows what it is for.
+            if let Some(task) = Self::native_child_task(agent) {
+                heading.push(
+                    design::caption(Self::short_description(task, 80))
+                        .class(cosmic::theme::Text::Custom(design::muted_text))
+                        .into(),
+                );
+            }
+            heading.push(
                 crate::interaction::tooltip(
                     design::caption(format!(
                         "Native subagent · {provider} · {}",
@@ -1817,10 +2004,11 @@ impl Runtime {
                     self.native_child_identity(agent),
                 )
                 .into(),
-            ])
-            .spacing(step::GAP_XS)
-            .width(Length::Fill)
-            .into();
+            );
+            let heading: Element<'_, Message> = widget::column::with_children(heading)
+                .spacing(step::GAP_XS)
+                .width(Length::Fill)
+                .into();
             selected_identity = Some(
                 if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
                 {
@@ -2067,14 +2255,14 @@ impl Runtime {
                 && snapshot.queued_messages.is_empty()
                 && self.queued.is_none()
                 && self.followups.is_empty()
-                && self.pending.is_none()
-                && let Some((_, label, full)) = &self.finished_stamp
+                && !self.sending()
+                && let Some(stamp) = &self.finished_stamp
             {
                 transcript.push(
                     widget::tooltip(
-                        design::caption(label.clone())
+                        design::caption(format!("{} at {}", self.finished_label(), stamp.clock))
                             .class(cosmic::theme::Text::Custom(design::muted_text)),
-                        design::caption(full.clone()),
+                        design::caption(stamp.full.clone()),
                         widget::tooltip::Position::Top,
                     )
                     .into(),
@@ -2091,6 +2279,13 @@ impl Runtime {
             if let Some(queued) = &self.queued {
                 transcript.push(self.queued_view(queued));
             }
+        }
+        // What the agent is doing now closes the transcript, so it scrolls
+        // away with the turns it follows rather than holding a row above the
+        // composer, and each change redraws this one row rather than adding
+        // another.
+        if let Some((glyph, label)) = self.timeline_activity(transitioning, selected) {
+            transcript.push(activity_row(glyph, label));
         }
         // A chat's heading is the conversation's own name or nothing at all.
         //
@@ -2966,54 +3161,18 @@ impl Runtime {
             action(Action::ComposerActions(target, false)),
         ));
         let usage = &snapshot.usage;
-        // Prefer a wider chat over hiding its status and settings behind a
-        // scrollbar. Narrow panes keep the primary status on one line and move
-        // secondary details into the overflow control.
-        // The line always says what the conversation is doing, idle
-        // included: a reader glancing at a card should never have to infer
-        // its state from the absence of a word. The order is the order of
-        // what a reader most needs to know first - that the card is between
-        // sessions, that something is being sent, that the agent has stopped
-        // or failed, that it is waiting on them, that it is working.
+        // Prefer a wider chat over hiding its settings behind a scrollbar.
+        // Narrow panes move them into the overflow control. What the agent is
+        // doing is not repeated here: it closes the transcript, where it
+        // scrolls with the turns it belongs to.
+        //
+        // The leading group says where the conversation is and who acts in it
+        // under which permissions; the trailing group what it runs on and
+        // what that has cost.
         let mut status: Vec<Element<'_, Message>> = Vec::new();
-        let (glyph, state) = if matches!(transition, ViewTransition::FirstStart) {
-            (Some(Icon::AgentWorking), "Starting".to_owned())
-        } else {
-            self.conversation_status(transitioning)
-        };
-        if let Some(glyph) = glyph {
-            status.push(if glyph == Icon::AgentWorking {
-                crate::ui_controls::activity_spinner(
-                    f32::from(design::ROW_ICON_SIZE),
-                    design::accent_color,
-                )
-            } else {
-                crate::ui_controls::passive_icon(glyph, design::COMPACT_ICON_SIZE)
-            });
-        }
-        if !state.is_empty() {
-            status.push(
-                design::heading(if selected.is_some() {
-                    format!("Main: {state}")
-                } else {
-                    state.to_owned()
-                })
-                .size(design::TEXT_CAPTION)
-                .class(
-                    if glyph == Some(Icon::Warning) && !transitioning && self.pending.is_none() {
-                        cosmic::theme::Text::Custom(design::warning_text)
-                    } else {
-                        cosmic::theme::Text::default()
-                    },
-                )
-                .width(Length::Shrink)
-                .into(),
-            );
-        }
-        let primary_status_count = status.len();
         if let Some(channel) = &place.channel {
             status.push(
-                crate::interaction::tooltip(
+                crate::interaction::tooltip_above(
                     design::caption(format!("# {}", Self::short_description(channel, 24)))
                         .wrapping(iced::widget::text::Wrapping::None),
                     format!("Channel: {channel}"),
@@ -3022,17 +3181,19 @@ impl Runtime {
             );
         }
         if !place.name.is_empty() {
-            status.push(
-                design::caption(place.name.clone())
+            status.push(bounded(
+                design::caption(Self::short_description(&place.name, FOOTER_LABEL))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .into(),
-            );
+                &place.name,
+                "Project",
+            ));
         }
         if let Some(branch) = &place.branch {
-            status.push(
+            status.push(bounded(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(crate::sidebar::worktree_icon(), 12),
-                    design::caption(branch.clone())
+                    design::caption(Self::short_description(branch, FOOTER_LABEL))
                         .class(cosmic::theme::Text::Custom(design::muted_text))
                         .wrapping(iced::widget::text::Wrapping::None)
                         .into(),
@@ -3040,11 +3201,47 @@ impl Runtime {
                 .spacing(step::GAP_XS)
                 .align_y(Alignment::Center)
                 .into(),
-            );
+                branch,
+                "Branch",
+            ));
         }
+        let mut engine = Vec::new();
         if !self.closed_elsewhere {
-            status.extend(self.session_controls(transitioning, accounts, offers, shortcuts));
+            let (context, controls) =
+                self.session_controls(transitioning, accounts, offers, shortcuts);
+            status.extend(context);
+            engine = controls;
         }
+        let compact_footer = content_width < 600.0;
+        let notice = permissions::notice(snapshot).map(|notice| {
+            widget::button::custom(
+                widget::row::with_children(
+                    std::iter::once(crate::ui_controls::passive_icon(
+                        Icon::Warning,
+                        design::COMPACT_ICON_SIZE,
+                    ))
+                    .chain((!compact_footer).then(|| {
+                        design::caption(notice)
+                            .class(cosmic::theme::Text::Custom(design::warning_text))
+                            .wrapping(iced::widget::text::Wrapping::None)
+                            .into()
+                    })),
+                )
+                .spacing(step::GAP_XS)
+                .align_y(Alignment::Center),
+            )
+            .name("Resolve blocked permissions")
+            .class(crate::ui_controls::control_style(
+                self.permission_picker,
+                None,
+            ))
+            .padding(CONTROL_PADDING)
+            .on_press(action(Action::PermissionPicker(
+                target,
+                !self.permission_picker,
+            )))
+            .into()
+        });
         // Keep budget and cost together when the footer wraps.
         let mut spend: Vec<Element<'_, Message>> = Vec::new();
         if usage.context_limit > 0 {
@@ -3053,7 +3250,7 @@ impl Runtime {
             // beside it. The linear capsule this replaces spent the width of a
             // whole caption saying what the percentage already said.
             let used = (usage.context_tokens as f32 / usage.context_limit as f32).clamp(0.0, 1.0);
-            spend.push(crate::interaction::tooltip(
+            spend.push(crate::interaction::tooltip_above(
                 widget::row::with_children(vec![
                     crate::ui_controls::budget_radial(used),
                     design::caption(format!("{:.0}%", used * 100.0))
@@ -3091,58 +3288,26 @@ impl Runtime {
             spend.push(design::caption(format!("${:.2}", cost as f64 / 1_000_000.0)).into());
         } else if let Some(estimate) = usage.cost_estimate {
             let (label, tooltip) = cost_estimate_label(estimate);
-            spend.push(crate::interaction::tooltip(design::caption(label), tooltip));
-        }
-        let compact_footer = content_width < 600.0;
-        let mut secondary = if compact_footer {
-            status.split_off(primary_status_count)
-        } else {
-            Vec::new()
-        };
-        let mut footer = status;
-        if let Some(notice) = permissions::notice(snapshot) {
-            footer.push(
-                widget::button::custom(
-                    widget::row::with_children(
-                        std::iter::once(crate::ui_controls::passive_icon(
-                            Icon::Warning,
-                            design::COMPACT_ICON_SIZE,
-                        ))
-                        .chain((!compact_footer).then(|| {
-                            design::caption(notice)
-                                .class(cosmic::theme::Text::Custom(design::warning_text))
-                                .wrapping(iced::widget::text::Wrapping::None)
-                                .into()
-                        })),
-                    )
-                    .spacing(step::GAP_XS)
-                    .align_y(Alignment::Center),
-                )
-                .name("Resolve blocked permissions")
-                .class(crate::ui_controls::control_style(
-                    self.permission_picker,
-                    None,
-                ))
-                .padding(CONTROL_PADDING)
-                .on_press(action(Action::PermissionPicker(
-                    target,
-                    !self.permission_picker,
-                )))
-                .into(),
-            );
+            spend.push(crate::interaction::tooltip_above(
+                design::caption(label),
+                tooltip,
+            ));
         }
         let spend = widget::row::with_children(spend)
             .spacing(step::GAP_S)
             .align_y(Alignment::Center)
             .into();
-        if compact_footer {
+        let footer_row: Element<'_, Message> = if compact_footer {
             // Model/reasoning/account popovers are anchored inside this
             // overflow. Keyboard shortcuts can open them while More is closed.
             let details_open = self.footer_picker
                 || self.model_picker.is_some()
                 || self.reasoning_picker
                 || self.account_picker;
+            let mut secondary = status;
+            secondary.extend(engine);
             secondary.push(spend);
+            let mut footer: Vec<Element<'_, Message>> = notice.into_iter().collect();
             footer.push(widget::Space::new().width(Length::Fill).into());
             footer.push(crate::ui_controls::popover(
                 crate::ui_controls::icon_button(Icon::More, "Conversation details and settings")
@@ -3161,20 +3326,36 @@ impl Runtime {
                 widget::popover::Position::Top,
                 action(Action::FooterPicker(target, false)),
             ));
-        } else {
-            footer.push(spend);
-        }
-        let footer_row: Element<'_, Message> = if compact_footer {
             widget::row::with_children(footer)
                 .spacing(step::GAP_S)
                 .align_y(Alignment::Center)
                 .width(Length::Fill)
                 .into()
         } else {
-            widget::flex_row(footer)
-                .spacing(step::GAP_S as u16)
-                .align_items(Alignment::Center)
-                .into()
+            let mut leading = status;
+            leading.extend(notice);
+            engine.push(spend);
+            // The leading group wraps when the place is long; the trailing
+            // one holds the footer's far edge. The flex row stays shrink-wide
+            // inside a filling container: a filling flex row hands its width
+            // to every item as a minimum, setting each on a line of its own.
+            widget::row::with_children(vec![
+                widget::container(
+                    widget::flex_row(leading)
+                        .spacing(step::GAP_S as u16)
+                        .align_items(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .into(),
+                widget::row::with_children(engine)
+                    .spacing(step::GAP_S)
+                    .align_y(Alignment::Center)
+                    .into(),
+            ])
+            .spacing(step::GAP_S)
+            .align_y(Alignment::Center)
+            .width(Length::Fill)
+            .into()
         };
         let footer = crate::ui_controls::popover(
             footer_row,
@@ -3548,8 +3729,12 @@ impl Runtime {
             .into()
     }
 
-    /// The model, reasoning effort, and permission mode, at the status line's
-    /// own scale.
+    /// The account, model, reasoning effort, and permission mode, at the
+    /// status line's own scale.
+    ///
+    /// They come back in two groups: who acts and under which permissions,
+    /// which belong with the conversation's place, and what the agent runs
+    /// on, which sits with its usage at the footer's trailing edge.
     ///
     /// These were three full-size dropdowns stacked above the composer, which
     /// gave settings a reader changes occasionally more room than the message
@@ -3562,12 +3747,13 @@ impl Runtime {
         accounts: Option<ChatAccounts>,
         offers: Vec<Offer<'a>>,
         shortcuts: &crate::settings::KeyboardShortcuts,
-    ) -> Vec<Element<'a, Message>> {
+    ) -> (Vec<Element<'a, Message>>, Vec<Element<'a, Message>>) {
         let target = self.target;
         let snapshot = &self.snapshot;
+        let mut context: Vec<Element<'a, Message>> = Vec::new();
         let mut controls: Vec<Element<'a, Message>> = Vec::new();
         if let Some(accounts) = accounts {
-            controls.push(self.account_picker(accounts, transitioning, shortcuts));
+            context.push(self.account_picker(accounts, transitioning, shortcuts));
         }
         let draft = self.is_draft();
         if (snapshot.capabilities.model_selection && !snapshot.models.is_empty()) || draft {
@@ -3590,7 +3776,11 @@ impl Runtime {
                 },
             };
             if transitioning {
-                controls.push(design::caption(label).into());
+                controls.push(bounded(
+                    design::caption(Self::short_description(&label, FOOTER_LABEL)).into(),
+                    &label,
+                    "Model",
+                ));
             } else {
                 controls.push(self.model_picker(label, offers, shortcuts));
             }
@@ -3667,7 +3857,7 @@ impl Runtime {
                 .iter()
                 .position(|mode| Some(mode) == snapshot.permission_mode.as_ref());
             if transitioning || (self.session.launch.provider == Provider::Codex && snapshot.busy) {
-                controls.push(
+                context.push(
                     design::caption(
                         selected
                             .map_or("Permissions", |index| permission_mode_label(&modes[index])),
@@ -3694,7 +3884,7 @@ impl Runtime {
                     .class(crate::ui_controls::control_style(open, None))
                     .padding(CONTROL_PADDING)
                     .on_press(action(Action::PermissionPicker(target, !open)));
-                controls.push(crate::interaction::tooltip(
+                context.push(crate::interaction::tooltip_above(
                     anchor,
                     crate::workspace_widget::shortcut_tooltip(
                         crate::workspace_widget::GlobalShortcut::ChatPermissions,
@@ -3703,7 +3893,7 @@ impl Runtime {
                 ));
             }
         }
-        controls
+        (context, controls)
     }
 
     /// A draft can explicitly pin its account. Started conversations display
@@ -3725,7 +3915,7 @@ impl Runtime {
         if transitioning || !self.choosing() {
             // Manual choices are made before the first message. Automatic
             // routing can hand off later at a safe idle boundary.
-            return crate::interaction::tooltip(
+            return crate::interaction::tooltip_above(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(icon, design::COMPACT_ICON_SIZE),
                     label.into(),
@@ -3765,7 +3955,7 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::AccountPicker(target, !open)));
-        let anchor = crate::interaction::tooltip(
+        let anchor = crate::interaction::tooltip_above(
             anchor,
             crate::workspace_widget::shortcut_tooltip(
                 crate::workspace_widget::GlobalShortcut::ChatAccount,
@@ -3877,6 +4067,19 @@ impl Runtime {
         } else {
             label
         };
+        // An unlisted model is named by its id, which has no bound. Cut, the
+        // trailing group stays narrow enough that the footer's leading group
+        // keeps a column, and the tooltip says the whole name.
+        let shortcut = crate::workspace_widget::shortcut_tooltip(
+            crate::workspace_widget::GlobalShortcut::ChatModel,
+            shortcuts,
+        );
+        let tooltip = if label.chars().count() > FOOTER_LABEL {
+            format!("Model: {label} · {shortcut}")
+        } else {
+            shortcut
+        };
+        let label = Self::short_description(&label, FOOTER_LABEL);
         let anchor = widget::button::custom(
             widget::row::with_children(vec![
                 widget::icon(crate::ui_controls::provider_icon(
@@ -3899,13 +4102,7 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding(CONTROL_PADDING)
         .on_press(action(Action::ModelPicker(target, !open)));
-        let anchor = crate::interaction::tooltip(
-            anchor,
-            crate::workspace_widget::shortcut_tooltip(
-                crate::workspace_widget::GlobalShortcut::ChatModel,
-                shortcuts,
-            ),
-        );
+        let anchor = crate::interaction::tooltip_above(anchor, tooltip);
         crate::ui_controls::popover(
             anchor,
             self.model_search(offers),
@@ -7033,6 +7230,155 @@ mod tests {
     }
 
     #[test]
+    fn timeline_activity_follows_real_work_and_settles_into_the_finished_stamp() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let activity = |runtime: &Runtime| runtime.timeline_activity(false, None);
+        // Nothing runs, so nothing is said.
+        assert_eq!(activity(&runtime), None);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.busy = true;
+        snapshot.detail = "Reviewing changes".into();
+        let items = runtime.snapshot.items.len();
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWorking, "Reviewing changes".into()))
+        );
+        // Subagents are counted beside the parent's own work, and the row is
+        // derived, never appended to the conversation.
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents = vec![native_child_fixture(), native_child_fixture()];
+        snapshot.subagents[1].id = "second-child".into();
+        assert_eq!(
+            activity(&runtime),
+            Some((
+                Icon::AgentWorking,
+                "Reviewing changes · 2 subagents working".into()
+            ))
+        );
+        assert_eq!(runtime.snapshot.items.len(), items);
+        Arc::make_mut(&mut runtime.snapshot).busy = false;
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWorking, "2 subagents working".into()))
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents[0].waiting = true;
+        snapshot.subagents[1].status = chat::ToolStatus::Succeeded;
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWaiting, "1 subagent waiting".into()))
+        );
+        Arc::make_mut(&mut runtime.snapshot).waiting = true;
+        assert_eq!(
+            activity(&runtime).map(|(glyph, _)| glyph),
+            Some(Icon::AgentWaiting)
+        );
+
+        // The selected subagent's own work closes its transcript.
+        let mut child = native_child_fixture();
+        child.detail = "Reading the parser".into();
+        assert_eq!(
+            runtime.timeline_activity(false, Some(&child)),
+            Some((Icon::AgentWorking, "Reading the parser".into()))
+        );
+        child.status = chat::ToolStatus::Succeeded;
+        assert_eq!(runtime.timeline_activity(false, Some(&child)), None);
+
+        // Where the transcript already says what is happening, or the end of
+        // the conversation is not shown, there is no row.
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.waiting = false;
+        snapshot.busy = true;
+        assert!(activity(&runtime).is_some());
+        assert_eq!(runtime.timeline_activity(true, None), None);
+        Arc::make_mut(&mut runtime.snapshot).has_later = true;
+        assert_eq!(activity(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).has_later = false;
+        runtime.disconnected = true;
+        assert_eq!(activity(&runtime), None);
+        runtime.disconnected = false;
+
+        // Once work ends the row goes, and the stamp says how the turn ended.
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.subagents.clear();
+        snapshot.finished_at = Some(42);
+        snapshot.detail = "Turn interrupted".into();
+        assert_eq!(activity(&runtime), None);
+        assert_eq!(runtime.finished_label(), "Interrupted");
+        Arc::make_mut(&mut runtime.snapshot).detail.clear();
+        assert_eq!(runtime.finished_label(), "Finished");
+        Arc::make_mut(&mut runtime.snapshot).error = Some("Provider failed".into());
+        assert_eq!(runtime.finished_label(), "Finished with error");
+        // Once stamped, how the turn ended stays put through later notices
+        // and errors that are not about it.
+        runtime.finished_stamp = Some(FinishedStamp {
+            at: 42,
+            clock: "12:00".into(),
+            full: "2026-11-05 12:00".into(),
+            outcome: "Interrupted",
+        });
+        Arc::make_mut(&mut runtime.snapshot).detail = "Reconnected".into();
+        runtime.error = Some("Could not change the model".into());
+        assert_eq!(runtime.finished_label(), "Interrupted");
+        // Choosing a model is not a message on its way: it neither reads as
+        // sending nor takes the stamp away. A message does.
+        runtime.error = None;
+        let pending = |sent: Option<&str>| PendingCommand {
+            followup: false,
+            take_back: None,
+            id: 1,
+            draft_revision: None,
+            request: None,
+            first_prompt: None,
+            model: sent.is_none().then(|| ("haiku".to_owned(), None)),
+            sent: sent.map(str::to_owned),
+            sent_attachments: Vec::new(),
+            page: None,
+            queued: None,
+        };
+        runtime.pending = Some(pending(None));
+        assert!(!runtime.sending());
+        assert_eq!(activity(&runtime), None);
+        runtime.pending = Some(pending(Some("next")));
+        assert!(runtime.sending());
+        assert_eq!(
+            activity(&runtime),
+            Some((Icon::AgentWorking, "Sending".into()))
+        );
+    }
+
+    #[test]
+    fn conversation_tab_marks_only_the_main_conversations_own_state() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let state = |runtime: &Runtime| runtime.parent_tab_state().map(|(glyph, _)| glyph);
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.ready = true;
+        snapshot.subagents = vec![native_child_fixture()];
+        // A subagent working or waiting is said on its own tab, not here.
+        assert_eq!(state(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).subagents[0].waiting = true;
+        assert_eq!(state(&runtime), None);
+        // The main conversation's own work, question and failure are.
+        Arc::make_mut(&mut runtime.snapshot).busy = true;
+        assert_eq!(state(&runtime), Some(Icon::AgentWorking));
+        Arc::make_mut(&mut runtime.snapshot).waiting = true;
+        assert_eq!(state(&runtime), Some(Icon::AgentWaiting));
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.waiting = false;
+        snapshot.subagents.clear();
+        snapshot.finished_at = Some(42);
+        // A turn that ended well needs no mark; one that failed does.
+        assert_eq!(state(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).detail = "Turn interrupted".into();
+        assert_eq!(state(&runtime), None);
+        Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
+        assert_eq!(runtime.parent_tab_state(), Some((Icon::Warning, "Failed")));
+    }
+
+    #[test]
     fn native_child_identity_uses_its_reported_model_and_waiting_state() {
         let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
         Arc::make_mut(&mut runtime.snapshot).selected_model = Some("parent-model".into());
@@ -7048,6 +7394,20 @@ mod tests {
         assert!(known.contains("child-model"));
         assert!(known.contains("Waiting for you"));
         assert!(known.contains("Waiting for your approval"));
+        // A provider's raw error payload is summarized, not quoted.
+        child.detail =
+            r#"{"message":"You've hit your limit · resets 1:30pm","type":"rate_limit_error"}"#
+                .into();
+        let limited = runtime.native_child_identity(&child);
+        assert!(limited.contains("Claude usage limit reached · resets 1:30pm"));
+        assert!(!limited.contains("rate_limit_error"));
+        // A finished child's own report is quoted, never read as a failure.
+        child.waiting = false;
+        child.status = chat::ToolStatus::Succeeded;
+        child.detail = "psql gave connection refused until postgres started".into();
+        let report = runtime.native_child_identity(&child);
+        assert!(report.contains("psql gave connection refused"));
+        assert!(!report.contains("connection was interrupted"));
         child.status = chat::ToolStatus::Succeeded;
         assert_eq!(Runtime::native_child_status(&child), "Finished");
     }
@@ -8208,8 +8568,8 @@ mod tests {
         assert!(
             labels
                 .iter()
-                .any(|label| label.starts_with("Choose subagent:")
-                    && label.contains("Inspect repository")),
+                .any(|label| label.starts_with("Scout · Waiting · ")
+                    && label.contains("Task: Inspect repository")),
             "{labels:?}"
         );
         assert!(
@@ -9793,12 +10153,14 @@ mod tests {
                 .find(|node| {
                     node.node().role() == iced_accessibility::accesskit::Role::Button
                         && node.node().label().is_some_and(|label| match step {
-                            0 => label.starts_with("Choose subagent:"),
+                            0 => label.starts_with("Search and filter subagents:"),
                             1 => {
                                 label.contains("Inspect repository")
                                     && label.ends_with(" · native-child")
                             }
-                            _ => label == "Main conversation",
+                            // The open subagent's transcript does not show the
+                            // main conversation's request, so its tab does.
+                            _ => label == "Main conversation: Waiting for you",
                         })
                 })
                 .and_then(|node| node.node().bounds())

@@ -480,6 +480,9 @@ struct Claude {
     retracted: std::collections::HashSet<String>,
     retracted_order: VecDeque<String>,
     tools: HashMap<ScopedId, Item>,
+    /// Agent calls that published their agent's name. A child's own frames
+    /// carry at most its type, which must not rename it. Bounded by `tools`.
+    named_agents: HashSet<String>,
     /// Synthetic task rows shown before their Agent tool is known. Bounded by
     /// the same cache as task tools, so late correlation can retract one row.
     visible_task_rows: HashSet<String>,
@@ -700,6 +703,7 @@ impl Claude {
     }
     fn forget_tool(&mut self, key: &ScopedId) {
         self.tools.remove(key);
+        self.named_agents.remove(&key.id);
         self.edit_tools.remove(key);
         self.tool_inputs.remove(key);
         self.tool_input_order.retain(|known| known != key);
@@ -1543,12 +1547,16 @@ impl Claude {
                                 if background == Some(true) {
                                     self.background_agents.insert(tool_id.clone());
                                 }
+                                let kind = agent_name(&block["input"]);
+                                if !kind.is_empty() {
+                                    self.named_agents.insert(tool_id.clone());
+                                }
                                 step.events.push(Event::Subagent {
                                     model: block["input"]["model"].as_str().map(str::to_owned),
                                     waiting: None,
                                     detail: None,
                                     id: tool_id.clone(),
-                                    kind: string(&block["input"], "subagent_type").into(),
+                                    kind: kind.into(),
                                     description: string(&block["input"], "description").into(),
                                     status: Some(ToolStatus::Running),
                                     background,
@@ -1790,7 +1798,13 @@ impl Claude {
                 waiting: None,
                 detail: None,
                 id: parent.into(),
-                kind: string(frame, "subagent_type").into(),
+                // The Agent call's name, once published, outranks the type a
+                // child's frame may carry; an empty kind leaves it in place.
+                kind: if self.named_agents.contains(parent) {
+                    String::new()
+                } else {
+                    string(frame, "subagent_type").into()
+                },
                 description: string(frame, "task_description").into(),
                 status: None,
                 background: None,
@@ -2614,10 +2628,16 @@ impl Adapter for Claude {
             if self.session_id.is_none() {
                 self.session_id = Some(id.into());
             }
-            step.events.push(Event::Session {
-                id: id.into(),
-                title: None,
-            });
+            // SessionStart hooks and other system frames name the session
+            // before the CLI answers initialize. Only frames after it announce
+            // the session: a resume is confirmed by that answer, and a fresh
+            // conversation, as without hooks, by its first turn.
+            if self.ready {
+                step.events.push(Event::Session {
+                    id: id.into(),
+                    title: None,
+                });
+            }
         }
         match required(&frame, "type")? {
             "control_request" => return self.permission(frame),
@@ -2637,6 +2657,7 @@ impl Adapter for Claude {
                 self.message_offsets.clear();
                 self.message_order.clear();
                 self.tools.clear();
+                self.named_agents.clear();
                 self.visible_task_rows.clear();
                 self.edit_tools.clear();
                 self.tool_inputs.clear();
@@ -3373,6 +3394,16 @@ fn choice(id: &str, label: &str) -> Choice {
 }
 fn string<'a>(value: &'a Value, key: &str) -> &'a str {
     value[key].as_str().unwrap_or("")
+}
+/// What an Agent call's agent is called: the name it was asked to go by,
+/// else its agent type. Several agents can share a type, and the reader
+/// tells them apart by name; the task description is never the name.
+fn agent_name(input: &Value) -> &str {
+    ["name", "subagent_type"]
+        .into_iter()
+        .map(|key| string(input, key).trim())
+        .find(|name| !name.is_empty())
+        .unwrap_or_default()
 }
 fn required<'a>(value: &'a Value, key: &str) -> Result<&'a str, String> {
     value[key]
@@ -5043,6 +5074,9 @@ struct History {
     /// The agent ID Claude Code gave each background agent, which names its
     /// sidecar files.
     agent_ids: HashMap<String, String>,
+    /// The name each Agent call asked its agent to go by. A sidecar records
+    /// only the agent's type, which must not rename it on resume.
+    agent_names: HashMap<String, String>,
     agent_status: HashMap<String, ToolStatus>,
     background_agent_tools: HashSet<String>,
     /// Result carriers' preceding call locations in the selected visible
@@ -5148,6 +5182,7 @@ impl History {
         let mut retracted = std::collections::HashSet::<String>::new();
         let mut agent_tools = HashMap::new();
         let mut agent_ids = HashMap::<String, String>::new();
+        let mut agent_names = HashMap::<String, String>::new();
         let mut agent_status = HashMap::new();
         let mut background_agent_tools = HashSet::new();
         // Ended agents whose delayed launch acknowledgement, or refused result
@@ -5187,6 +5222,10 @@ impl History {
                         {
                             let launched = agent_tools.len();
                             agent_tools.entry(tool_id.to_owned()).or_insert(launched);
+                            let name = string(&block["input"], "name").trim();
+                            if !name.is_empty() {
+                                agent_names.insert(tool_id.to_owned(), name.to_owned());
+                            }
                             if block["input"]["run_in_background"].as_bool() == Some(true) {
                                 background_agent_tools.insert(tool_id.to_owned());
                             }
@@ -5432,6 +5471,7 @@ impl History {
             subagent_dir: None,
             agent_tools,
             agent_ids,
+            agent_names,
             agent_status,
             background_agent_tools,
             result_calls,
@@ -5575,7 +5615,10 @@ impl History {
             }
             children.push((
                 parent.to_owned(),
-                string(&meta, "agentType").into(),
+                self.agent_names
+                    .get(parent)
+                    .map_or_else(|| string(&meta, "agentType"), String::as_str)
+                    .into(),
                 string(&meta, "description").into(),
                 frames.into_iter().map(|(frame, _)| frame).collect(),
             ));
@@ -10304,7 +10347,13 @@ mod tests {
             if let Some(replay) = replay {
                 frame["isReplay"] = json!(replay);
             }
-            let live = Claude::default().receive(frame.clone()).unwrap();
+            // A live summary arrives after initialize, so it names the session.
+            let live = Claude {
+                ready: true,
+                ..Default::default()
+            }
+            .receive(frame.clone())
+            .unwrap();
             let expected = context_item("summary:0".into(), body.into());
             assert!(
                 matches!(&live.events[..], [Event::Session { .. }, Event::Item(item)] if item == &expected),
@@ -11189,6 +11238,126 @@ mod tests {
         );
         let finished = adapter.receive(json!({"type":"user","uuid":"result-carrier","message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Done"}]}})).unwrap();
         assert!(finished.events.iter().any(|event| matches!(event, Event::Subagent { id, status:Some(ToolStatus::Succeeded), .. } if id == "tool-agent")));
+    }
+
+    #[test]
+    fn agent_calls_name_their_agent_before_its_type_and_never_by_task() {
+        for (input, expected) in [
+            (
+                json!({"name":" Scout ","subagent_type":"Explore","description":"Inspect parser"}),
+                "Scout",
+            ),
+            (
+                json!({"name":" \t","subagent_type":"Explore","description":"Inspect parser"}),
+                "Explore",
+            ),
+            (json!({"description":"Inspect parser"}), ""),
+        ] {
+            let mut adapter = Claude::default();
+            let started = adapter.receive(json!({"type":"assistant","uuid":"parent-carrier","message":{"id":"parent-message","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":input}]}})).unwrap();
+            assert!(
+                started.events.iter().any(|event| matches!(event,
+                    Event::Subagent { id, kind, description, .. }
+                        if id == "tool-agent" && kind == expected && description == "Inspect parser")),
+                "{input}: {:?}",
+                started.events
+            );
+        }
+    }
+
+    #[test]
+    fn child_frames_cannot_rename_a_named_agent_with_their_type() {
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"launch","message":{"id":"launch","content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"name":"Scout","subagent_type":"Explore","description":"Map"}}]}})).unwrap();
+        let child = adapter.receive(json!({"type":"assistant","uuid":"child","parent_tool_use_id":"tool-agent","subagent_type":"Explore","message":{"id":"child","content":[{"type":"text","text":"Reading"}]}})).unwrap();
+        assert!(
+            child
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Subagent { id, .. } if id == "tool-agent"))
+        );
+        assert!(
+            !child
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::Subagent { kind, .. } if !kind.is_empty()))
+        );
+        // An agent its call did not name still learns its type from them.
+        let unknown = adapter.receive(json!({"type":"assistant","uuid":"other","parent_tool_use_id":"tool-other","subagent_type":"Plan","message":{"id":"other","content":[{"type":"text","text":"Planning"}]}})).unwrap();
+        assert!(unknown.events.iter().any(|event| matches!(event, Event::Subagent { id, kind, .. } if id == "tool-other" && kind == "Plan")));
+    }
+
+    /// The frames `tests/fixtures/chat-composer-claude.sh` emits for its
+    /// opt-in subagent scene, which native tab checks rely on.
+    #[test]
+    fn fixture_subagent_scene_publishes_each_named_state() {
+        let mut adapter = Claude::default();
+        let mut events = Vec::new();
+        let agent = |id: &str, input: Value| json!({"type":"assistant","uuid":format!("fixture-{id}"),"message":{"id":format!("fixture-{id}"),"role":"assistant","content":[{"type":"tool_use","id":id,"name":"Agent","input":input}]}});
+        let settle = |id: &str, error: bool| json!({"type":"user","uuid":format!("fixture-{id}-result"),"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":id,"is_error":error,"content":"Report"}]}});
+        for frame in [
+            agent(
+                "explore-logs",
+                json!({"subagent_type":"Explore","description":"Read logs"}),
+            ),
+            settle("explore-logs", false),
+            agent(
+                "scout",
+                json!({"name":"Scout","subagent_type":"Explore","description":"Map","run_in_background":true}),
+            ),
+            json!({"type":"system","subtype":"task_started","uuid":"scout-start","task_id":"fixture-task-scout","tool_use_id":"scout","task_type":"local_agent","description":"Map"}),
+            agent(
+                "planner",
+                json!({"name":"Planner","subagent_type":"Plan","description":"Plan","run_in_background":true}),
+            ),
+            json!({"type":"system","subtype":"task_started","uuid":"planner-start","task_id":"fixture-task-planner","tool_use_id":"planner","task_type":"local_agent","description":"Plan"}),
+            json!({"type":"stream_event","parent_tool_use_id":"planner","event":{"type":"error","error":{"type":"rate_limit_error","message":"Waiting for the rate limit to reset"}}}),
+            agent(
+                "builder",
+                json!({"name":"Builder","subagent_type":"general-purpose","description":"Rebuild"}),
+            ),
+            settle("builder", true),
+        ] {
+            events.extend(adapter.receive(frame).unwrap().events);
+        }
+        let mut state =
+            std::collections::BTreeMap::<String, (String, Option<ToolStatus>, bool)>::new();
+        for event in events {
+            if let Event::Subagent {
+                id,
+                kind,
+                status,
+                waiting,
+                ..
+            } = event
+            {
+                let agent = state.entry(id).or_default();
+                if !kind.is_empty() {
+                    agent.0 = kind;
+                }
+                if status.is_some() {
+                    agent.1 = status;
+                }
+                if let Some(waiting) = waiting {
+                    agent.2 = waiting;
+                }
+            }
+        }
+        let expect = |id: &str, name: &str, status: ToolStatus, waiting: bool| {
+            assert_eq!(state[id], (name.to_owned(), Some(status), waiting), "{id}");
+        };
+        expect("explore-logs", "Explore", ToolStatus::Succeeded, false);
+        expect("scout", "Scout", ToolStatus::Running, false);
+        expect("planner", "Planner", ToolStatus::Running, true);
+        expect("builder", "Builder", ToolStatus::Failed, false);
+        // Stopping a background agent ends its task, as the fixture reports.
+        let stop = adapter
+            .command(Command::StopSubagent { id: "scout".into() })
+            .unwrap();
+        assert_eq!(stop.writes[0]["request"]["task_id"], "fixture-task-scout");
+        let stopped = adapter.receive(json!({"type":"system","subtype":"task_notification","uuid":"fixture-scout-stopped","task_id":"fixture-task-scout","tool_use_id":"scout","status":"stopped","summary":"Agent stopped"})).unwrap();
+        assert!(stopped.events.iter().any(|event| matches!(event,
+            Event::Subagent { id, status: Some(ToolStatus::Stopped), .. } if id == "scout")));
     }
 
     #[test]
@@ -12314,8 +12483,31 @@ mod tests {
         let loaded = history.subagent_frames().unwrap();
         assert_eq!(loaded.len(), 1);
         assert_eq!(loaded[0].0, "tool-one");
+        assert_eq!(loaded[0].1, "Explore");
         assert_eq!(loaded[0].3.len(), 1);
         assert_eq!(loaded[0].3[0]["uuid"], "child");
+    }
+
+    #[test]
+    fn resumed_child_keeps_the_name_its_agent_call_gave_over_its_sidecar_type() {
+        let directory = tempfile::tempdir().unwrap();
+        let session = "00000000-0000-4000-8000-000000000001";
+        let root = directory.path().join("root.jsonl");
+        std::fs::write(&root, format!("{}\n", json!({"type":"assistant","sessionId":session,"uuid":"root","message":{"id":"root-message","content":[{"type":"tool_use","id":"tool-one","name":"Agent","input":{"name":"Scout","subagent_type":"Explore"}}]}}))).unwrap();
+        let mut history = History::index(File::open(root).unwrap(), session).unwrap();
+        let children = directory.path().join("subagents");
+        std::fs::create_dir(&children).unwrap();
+        history.subagent_dir = Some(children.clone());
+        std::fs::write(
+            children.join("agent-one.meta.json"),
+            json!({"toolUseId":"tool-one","agentType":"Explore","description":"Inspect"})
+                .to_string(),
+        )
+        .unwrap();
+        std::fs::write(children.join("agent-one.jsonl"), format!("{}\n", json!({"type":"assistant","sessionId":session,"agentId":"one","isSidechain":true,"uuid":"child","message":{"content":"Valid"}}))).unwrap();
+        let loaded = history.subagent_frames().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].1, "Scout");
     }
 
     fn errors(events: &[Event]) -> Vec<&str> {
@@ -13143,6 +13335,54 @@ mod tests {
         // `--session-id` names a conversation that does not exist on disk
         // until its first prompt, so nothing could resume it yet.
         assert!(!confirmed(false));
+    }
+
+    /// A SessionStart hook makes the CLI report its session on system hook
+    /// frames before it answers initialize. Those frames must not confirm the
+    /// resume, or the daemon would treat a still-opening provider as ready.
+    #[test]
+    fn hook_frames_before_initialize_do_not_confirm_a_resume() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let announces = |step: Step| {
+            step.events
+                .iter()
+                .any(|event| matches!(event, Event::Session { id: session, .. } if session == id))
+        };
+        for resumed in [true, false] {
+            let mut adapter = Claude {
+                session_id: Some(id.into()),
+                resumed,
+                ..Default::default()
+            };
+            let initialize = adapter.initialize().unwrap();
+            let request = initialize.writes[0]["request_id"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            for subtype in ["hook_started", "hook_response"] {
+                let step = adapter
+                    .receive(json!({"type":"system","subtype":subtype,"uuid":subtype,"hook_name":"SessionStart","session_id":id}))
+                    .unwrap();
+                assert!(
+                    !announces(step),
+                    "{subtype} confirmed the session before initialize"
+                );
+            }
+            // A hook naming another conversation is still refused outright.
+            assert!(adapter
+                .receive(json!({"type":"system","subtype":"hook_started","uuid":"other","hook_name":"SessionStart","session_id":"00000000-0000-4000-8000-000000000002"}))
+                .is_err());
+            assert_eq!(
+                announces(adapter.receive(reply(&request, json!({}))).unwrap()),
+                resumed
+            );
+            // After initialize, frames name the session as before.
+            assert!(announces(
+                adapter
+                    .receive(json!({"type":"system","subtype":"hook_response","uuid":"late","hook_name":"SessionStart","session_id":id}))
+                    .unwrap()
+            ));
+        }
     }
 
     #[test]

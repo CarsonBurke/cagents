@@ -460,6 +460,16 @@ fn dispatch(
         .agent_request(accepted.run.id)
         .map_err(before)?;
     let (session, handle) = if let Some(HostedSession::Chat(session)) = &accepted.agent.session {
+        let ended = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_process_ended(accepted.agent.id)
+            .map_err(before)?;
+        if ended {
+            return Err(before(
+                "This agent's process has stopped; reopen its conversation to resume it. The prompt was not sent".into(),
+            ));
+        }
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state
             .chats
@@ -644,6 +654,7 @@ fn dispatch(
         // still requires its explicitly selected account to be registered.
         selected_account(&accepted.agent.spec).map_err(before)?;
     }
+    given_work(host, session.id);
     // Once command submission begins an absent acknowledgement is ambiguous.
     // Only the adapter's exact correlated result may declare success.
     handle
@@ -788,6 +799,14 @@ pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
 }
 
 pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle_adoptions
+        .remove(&session.id)
+    {
+        return stopped(host, session);
+    }
     // Normal interactive sessions still work without the optional registry.
     let Ok(registry) = registry(host) else {
         return Ok(());
@@ -800,6 +819,107 @@ pub(super) fn retired(host: &SharedHost, session: &chat::Session) -> Result<(), 
         announce(host, &registry);
     }
     Ok(())
+}
+
+/// Daemon shutdown stopped this exact provider after confirmed teardown. Its
+/// authority and unfinished runs end, but the agent keeps its pane, placement
+/// and channel so the conversation resumes in place after restart.
+pub(super) fn stopped(host: &SharedHost, session: &chat::Session) -> Result<(), String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(());
+    };
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .stop_agent_process(&HostedSession::Chat(session.clone()), now())?;
+    if changed {
+        announce(host, &registry);
+    }
+    Ok(())
+}
+
+/// The conversation `chat` is being given work, so it no longer only reopens
+/// its agent's conversation: ending it from now on retires that agent.
+pub(in crate::host) fn given_work(host: &SharedHost, chat: TerminalId) {
+    host.lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .idle_adoptions
+        .remove(&chat);
+}
+
+/// Bind the agent of a resumed conversation to `successor`, the process that
+/// just started under a new chat ID. The predecessor is found through the
+/// lineage the successor joined when its resume was prepared, so a retry after
+/// a failed start, or a daemon restart between preparation and start, still
+/// finds it. A successor that started its own lineage adopts nothing.
+pub(in crate::host) fn adopt_resumed(
+    host: &SharedHost,
+    successor: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let agents = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .lineage_agents(successor.id)?;
+    let mut predecessors = agents.into_iter().filter_map(|agent| match agent.session {
+        Some(HostedSession::Chat(session)) => Some(session),
+        _ => None,
+    });
+    let Some(predecessor) = predecessors.next() else {
+        return Ok(false);
+    };
+    if predecessors.next().is_some() {
+        return Err("More than one open agent claims the resumed conversation's lineage".into());
+    }
+    adopt_successor(host, &predecessor, successor)
+}
+
+/// Bind a stopped agent to the process that resumed its conversation under a
+/// new chat ID. `Registry::adopt_successor` states the exact contract; no
+/// execution authority is issued here. Takes the agent's dispatch gate, so
+/// call it without holding that gate or the host lock.
+pub(in crate::host) fn adopt_successor(
+    host: &SharedHost,
+    predecessor: &chat::Session,
+    successor: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let Some(agent) = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(predecessor.id)?
+    else {
+        return Ok(false);
+    };
+    // Close and dispatch decide under this gate whether the agent's process
+    // ended; adoption must not change that between their check and commit.
+    let gate = agent_gate(host, agent.id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state
+            .chats
+            .get(&predecessor.id)
+            .is_some_and(|record| !record.handle.is_completed())
+        {
+            return Err("The predecessor is still running in this daemon".into());
+        }
+        if successor.proof.as_ref() != Some(state.proof()) {
+            return Err("The successor was not started by this daemon".into());
+        }
+    }
+    let changed = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .adopt_successor(predecessor, successor)?;
+    if changed {
+        announce(host, &registry);
+    }
+    Ok(changed)
 }
 
 /// Reads only the managed presentation. No registry means ordinary interactive
@@ -861,11 +981,21 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         announce(host, &registry);
         return Ok(agent);
     }
-    let pending = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .pending_agent_launch(id)?;
-    if let Some(source) = agent.session.as_ref().or(pending.as_ref()) {
+    let (pending, ended) = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            store.pending_agent_launch(id)?,
+            store.agent_process_ended(id)?,
+        )
+    };
+    // A daemon stop already proved this agent's process ended and revoked its
+    // authority; only its saved conversation remains to retire.
+    if let Some(source) = agent
+        .session
+        .as_ref()
+        .or(pending.as_ref())
+        .filter(|_| !ended)
+    {
         match source {
             HostedSession::Chat(session) => {
                 let hosted = {
