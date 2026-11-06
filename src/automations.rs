@@ -10,6 +10,8 @@ use crate::{
 };
 
 #[cfg(any(feature = "host", feature = "ui"))]
+pub mod archive;
+#[cfg(any(feature = "host", feature = "ui"))]
 pub mod schedule;
 
 pub const MAX_NAME_BYTES: usize = 160;
@@ -226,6 +228,14 @@ pub struct LifecyclePage {
     /// Earlier events were never recorded or have left the bounded retention.
     /// Their actor and cause cannot be reconstructed from current state.
     pub earlier_events_unavailable: bool,
+}
+
+/// Bounded final presentation of an exact retired provider conversation.
+/// This payload is fetched only when its pane is visible; never in model watch.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArchivedConversation {
+    pub agent: agent_execution::Agent,
+    pub snapshot: crate::chat::Snapshot,
 }
 
 /// A saved execution configuration, separate from active scheduler records.
