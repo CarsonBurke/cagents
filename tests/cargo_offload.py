@@ -1374,16 +1374,16 @@ class RemoteRun(unittest.TestCase):
             lock = self.hold(base, 0, {"cost": 1, "pid": None, "build": "same", "key": "key"})
             waiter, waits = self.lease(base, slots=1, build="same")
             self.assertEqual(waits.next(10), "wait same")
-            # In line meanwhile, so first to the slot once it frees.
-            other, others = self.lease(base, slots=1, build="other")
-            self.assertEqual(others.next(10), "wait")
+            # The head of the line meanwhile, as another build would be.
+            line = open(Path(base, "queue"), "a")
+            self.addCleanup(line.close)
+            fcntl.flock(line, fcntl.LOCK_EX | fcntl.LOCK_NB)
             fcntl.flock(lock, fcntl.LOCK_UN)
-            self.assertEqual(json.loads(others.next(10).removeprefix("slot "))["index"], 0)
-            # It says so only if it got back in line before that build left it.
+            # The slot is free, and it still takes its turn.
+            self.assertEqual(waits.next(10), "wait")
             with self.assertRaises(TimeoutError):
-                while True:
-                    self.assertEqual(waits.next(1.5), "wait")
-            other.stdin.close()
+                waits.next(1.5)
+            line.close()
             self.assertEqual(json.loads(waits.next(10).removeprefix("slot "))["index"], 0)
 
     def test_a_build_beside_another_waits_until_the_host_has_room(self):
