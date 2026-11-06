@@ -5,7 +5,9 @@ import fcntl
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
+import threading
 import time
 import unittest
 
@@ -82,12 +84,13 @@ class PruneBuildDirs(unittest.TestCase):
 
     def test_a_copy_that_kept_its_sources_times_is_recent(self):
         path = self.target(self.roots / "lane/target")
-        self.settle()
+        time.sleep(7)
         # As `cp -p` leaves it: an old modification time, a new change time.
         copied = path / "debug/deps/libcopied.rlib"
         copied.write_bytes(b"x")
         os.utime(copied, (time.time() - 30 * 86400,) * 2)
-        self.prune()
+        # Older entries are idle at 6 seconds; the copy is not.
+        self.prune("--max-idle", str(6 / 86400))
         self.assertTrue(path.exists())
 
     def test_idle_days_are_configurable(self):
@@ -294,6 +297,107 @@ class PruneBuildDirs(unittest.TestCase):
         self.prune("--max-idle", str(60 / 86400))
         self.assertFalse(leftover.exists())
         self.assertTrue(live.exists())
+
+    def test_a_checkout_is_never_taken_for_build_output(self):
+        # As a target directory configured to be the checkout would leave it.
+        checkout = self.target(self.roots / "lane/checkout")
+        (checkout / "Cargo.toml").write_text("[workspace]\n")
+        (checkout / "notes.md").write_text("unsaved work")
+        self.settle()
+        self.prune()
+        self.assertTrue((checkout / "notes.md").exists())
+
+    def test_a_running_removals_renamed_copy_stays(self):
+        leftover = self.roots / f"lane/.target.cagents-pruned-{os.getpid()}"
+        (leftover / "debug").mkdir(parents=True)
+        self.settle()
+        self.prune()
+        self.assertTrue(leftover.exists())
+
+    def test_a_complete_run_stamps_and_one_cut_short_does_not(self):
+        stamp = self.root / "stamp"
+        self.prune("--stamp", str(stamp), "--budget", "0", status=75)
+        self.assertFalse(stamp.exists())
+        self.prune("--stamp", str(stamp))
+        self.assertTrue(stamp.exists())
+
+    def test_its_output_goes_to_a_file_keeping_the_last_runs(self):
+        output = self.root / "prune.log"
+        output.write_text("the last run\n")
+        self.assertEqual(self.prune("--output", str(output)), "")
+        self.assertEqual(Path(f"{output}.1").read_text(), "the last run\n")
+        self.assertIn("removed 0 build directories", output.read_text())
+
+    def test_it_can_wait_for_another_run_and_then_search_nothing(self):
+        path = self.target(self.roots / "lane/target")
+        self.settle()
+        lock = open(self.root / "lock", "a")
+        self.addCleanup(lock.close)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        threading.Timer(2, lambda: fcntl.flock(lock, fcntl.LOCK_UN)).start()
+        started = time.monotonic()
+        output = self.prune("--wait", "--budget", "30", status=75)
+        self.assertGreaterEqual(time.monotonic() - started, 1.5)
+        self.assertIn("the other run has finished", output)
+        self.assertTrue(path.exists())
+
+    # Runs the pruner with in_use and survey replaced, to reach the moments
+    # between its checks that a real build could only hit by chance.
+    DRIVER = """
+import importlib.machinery, importlib.util, os, sys
+from pathlib import Path
+loader = importlib.machinery.SourceFileLoader("pruner", sys.argv[1])
+pruner = importlib.util.module_from_spec(importlib.util.spec_from_loader("pruner", loader))
+loader.exec_module(pruner)
+in_use, survey, recreate = pruner.in_use, pruner.survey, sys.argv[2]
+def late_user(directory):
+    if ".cagents-pruned-" not in directory.name:
+        return in_use(directory)
+    if recreate == "recreate":
+        # As a build starting there would: a rename replaces only an empty one.
+        (directory.parent / "target/debug").mkdir(parents=True)
+    return 1
+def late_writer(directory, cutoff):
+    return None if ".cagents-pruned-" in directory.name else survey(directory, cutoff)
+if sys.argv[3] == "user":
+    pruner.in_use = late_user
+else:
+    pruner.survey = late_writer
+sys.argv = [sys.argv[1]] + sys.argv[4:]
+sys.exit(pruner.main())
+"""
+
+    def race(self, moment, recreate=""):
+        path = self.target(self.roots / "lane/target")
+        self.settle()
+        command = [sys.executable, "-I", "-B", "-c", self.DRIVER, str(PRUNER), recreate, moment,
+                   "--lock", str(self.root / "lock"), "--mirror", str(self.roots / "cargo-build"),
+                   "--verbose", "--apply", "--max-idle", str(IDLE / 86400)]
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return path, result
+
+    def test_a_process_that_opens_it_as_it_is_renamed_keeps_it(self):
+        path, result = self.race("user")
+        self.assertIn("used while it was being removed", result.stdout)
+        self.assertEqual(os.listdir(self.roots / "lane"), ["target"])
+        self.assertTrue((path / "debug/deps/libcrate.rlib").exists())
+
+    def test_a_write_as_it_is_renamed_keeps_it(self):
+        path, result = self.race("writer")
+        self.assertIn("written while it was being removed", result.stdout)
+        self.assertEqual(os.listdir(self.roots / "lane"), ["target"])
+        self.assertTrue((path / "debug/deps/libcrate.rlib").exists())
+
+    def test_a_copy_that_cannot_be_put_back_is_kept_aside(self):
+        path, result = self.race("user", recreate="recreate")
+        self.assertIn("cannot put it back", result.stderr)
+        # The build's new directory, and the copy that a later run removes.
+        names = sorted(os.listdir(self.roots / "lane"))
+        self.assertEqual(len(names), 2)
+        self.assertTrue(names[0].startswith(".target.cagents-pruned-"))
+        self.assertTrue((self.roots / "lane" / names[0] / "debug/deps/libcrate.rlib").exists())
+        self.assertEqual(os.listdir(path), ["debug"])
 
     def test_a_build_that_starts_after_removal_finds_no_directory(self):
         path = self.target(self.roots / "lane/target")

@@ -4,11 +4,13 @@
 # Every worktree and every agent's target directory grows as it builds, and
 # Cargo never removes any of it. At most every few hours this starts
 # prune-build-dirs in the background, which removes build output nothing has
-# used for a week. Below twice the floor it runs it at once, and also removes
-# removed workspaces' build directories without their usual grace period.
-# Below the floor itself it refuses, so a build fails with an explanation
-# instead of filling the disk that other builds, agents and their logs share.
-# A guard that cannot tell how much room there is lets the build run.
+# used for a week. Below twice the floor it starts it at once, still in the
+# background, and it also removes removed workspaces' build directories
+# without their usual grace period. Below the floor itself the build waits
+# for it, within a budget, then is refused if there is still too little
+# room, so it fails with an explanation instead of filling the disk that
+# other builds, agents and their logs share. A guard that cannot tell how
+# much room there is lets the build run.
 set -eu
 
 program=build-disk-guard
@@ -16,17 +18,18 @@ usage() {
     cat <<'EOF'
 Usage: scripts/build-disk-guard BUILD_DIR
 
-Exits 0 when the file system holding BUILD_DIR has room for builds, after
-reclaiming unused build directories with prune-build-dirs when it runs low.
-Exits 2, with an explanation, when it stays below the floor. Every
-CAGENTS_BUILD_PRUNE_INTERVAL_HOURS it also starts the pruner in the
-background, whatever the free space.
+Exits 0 when the file system holding BUILD_DIR has room for builds. Exits 2,
+with an explanation, when it is below the floor even after reclaiming
+unused build directories with prune-build-dirs. Every
+CAGENTS_BUILD_PRUNE_INTERVAL_HOURS, or every hour below twice the floor, it
+also starts the pruner in the background.
 
 Environment:
   CAGENTS_BUILD_FREE_FLOOR_GIB  Free space below which builds are refused;
                                 default: 5% of the file system, at most 64.
                                 0 disables the guard.
-  CAGENTS_BUILD_PRUNE           Command that reclaims build directories;
+  CAGENTS_BUILD_PRUNE           Command that reclaims build directories,
+                                run before the build below twice the floor;
                                 default: prune-build-dirs beside this guard,
                                 given this repository's main checkout.
   CAGENTS_BUILD_PRUNE_IDLE_DAYS Days unwritten after which the default
@@ -35,8 +38,8 @@ Environment:
                                 Hours between background runs (default 6);
                                 0 runs the pruner only when space is low.
   CAGENTS_BUILD_PRUNE_BUDGET_SECONDS
-                                Seconds after which the pruner run for low
-                                space starts nothing new (default 300).
+                                Seconds after which the pruner run below the
+                                floor starts nothing new (default 300).
   CAGENTS_BUILD_PRUNE_ROOTS     Directories the default pruner searches,
                                 colon-separated, besides the main checkout;
                                 default: ~/.cache, ~/.local/state, /var/tmp.
@@ -99,23 +102,58 @@ open7() {
     { command exec 7>>"$1"; } 2>/dev/null
 }
 prune=${CAGENTS_BUILD_PRUNE:-}
-pressed=$prune
+# The pruner beside this guard can also run detached; a command given as
+# CAGENTS_BUILD_PRUNE runs only before a build, below twice the floor.
+pruner=
 if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
-    prune="$(quote "$here/prune-build-dirs") --apply --max-idle $idle"
-    prune="$prune --lock $(quote "$pruner_state.lock") --log $(quote "$pruner_state.tsv")"
+    pruner="$(quote "$here/prune-build-dirs") --apply --max-idle $idle"
+    pruner="$pruner --lock $(quote "$pruner_state.lock") --log $(quote "$pruner_state.tsv")"
+    # A run that searched everything stamps the schedule.
+    pruner="$pruner --stamp $(quote "$pruner_state.scheduled")"
     # Never the build this guard runs for.
-    prune="$prune --keep $(quote "$build_dir")"
+    pruner="$pruner --keep $(quote "$build_dir")"
     # Worktrees' build output lives in the repository's main checkout, whose
     # own build seeds theirs and stays. A bare repository's parent holds
     # other repositories, so only a checkout's is searched.
     common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || common=
     case $common in
-        */.git) prune="$prune --root $(quote "${common%/.git}") --keep-checkout $(quote "${common%/.git}")" ;;
+        */.git) pruner="$pruner --root $(quote "${common%/.git}") --keep-checkout $(quote "${common%/.git}")" ;;
     esac
-    # Low on space, a removed workspace's build directory goes at once, and
-    # the build waits for the pruner only so long.
-    pressed="$prune --orphan-hours 0 --budget $budget"
+    # Out of room, a removed workspace's build directory goes at once, and
+    # the build waits for the pruner, or one already running, only so long.
+    prune="$pruner --orphan-hours 0 --budget $budget --wait"
 fi
+
+# This build may wait for a slot before it writes here; meanwhile another
+# build's pruner must not find its build directory idle.
+if [ -f "$build_dir/.rustc_info.json" ] || [ -f "$build_dir/CACHEDIR.TAG" ]; then
+    touch -- "$build_dir/.cagents-gate-used" 2>/dev/null || :
+fi
+
+# Starts the pruner, with the arguments after the first three, detached and
+# at a lower priority, unless a run is under way or one searched everything
+# within $1 minutes. $2 is its nice value and $3 its ionice options. Fails
+# when it starts none.
+detach() {
+    minutes=$1 niceness=$2 class=$3
+    shift 3
+    open7 "$pruner_state.lock" || return 1
+    if ! flock -n 7 ||
+        [ -n "$(find "$pruner_state.scheduled" -mmin -"$minutes" 2>/dev/null)" ]; then
+        exec 7>&-
+        return 1
+    fi
+    exec 7>&-
+    # In a session of its own and with no descriptor of the build's: it reads
+    # every build directory, which no build should wait for, and outlives
+    # the build. Its output replaces the last but one run's.
+    (
+        exec </dev/null >/dev/null 2>&1
+        command -v ionice >/dev/null 2>&1 && ionice="ionice $class" || ionice=
+        command -v setsid >/dev/null 2>&1 && setsid=setsid || setsid=
+        eval "exec $setsid nice -n $niceness $ionice $pruner --output $(quote "$pruner_state.log") $*"
+    ) &
+}
 
 read_space
 if [ -z "$floor" ]; then
@@ -124,27 +162,20 @@ if [ -z "$floor" ]; then
 fi
 
 if [ "$free" -ge $((floor * 2)) ]; then
-    # Every few hours, in the background at idle priority and in a session of
-    # its own: it reads every build directory, which a build should not wait
-    # for, and outlives the build.
-    # The run holds the schedule's lock until it ends, and stamps it only
-    # once it has searched everything: one cut short, killed or out of time,
-    # is started again by the next build.
-    if [ -n "$prune" ] && [ "$interval" -gt 0 ] && open7 "$pruner_state.scheduled"; then
-        if flock -n 7 &&
-            [ -z "$(find "$pruner_state.scheduled" -mmin -$((interval * 60)) -size +0c 2>/dev/null)" ]; then
-            log=$pruner_state.log
-            # Keep the last run's output and the one before.
-            [ ! -f "$log" ] || mv -f -- "$log" "$log.1" 2>/dev/null || :
-            run="$prune; status=\$?; [ \$status -eq 75 ] || [ \$status -gt 128 ] || date +%s >$(quote "$pruner_state.scheduled")"
-            (
-                exec 8>&- 9>&- </dev/null >"$log" 2>&1
-                command -v ionice >/dev/null 2>&1 && ionice='ionice -c3' || ionice=
-                command -v setsid >/dev/null 2>&1 && setsid=setsid || setsid=
-                exec $setsid nice -n 19 $ionice sh -c "$run"
-            ) 2>/dev/null &
-        fi
-        exec 7>&-
+    # Every few hours, at idle priority. One cut short or killed is started
+    # again by the next build.
+    if [ -n "$pruner" ] && [ "$interval" -gt 0 ]; then
+        detach $((interval * 60)) 19 -c3 || :
+    fi
+    exit 0
+fi
+
+if [ "$free" -ge "$floor" ] && [ -n "$pruner" ]; then
+    # Running low, but with room for this build: search everything at once,
+    # and again every hour, without making builds wait.
+    if detach 60 10 '-c2 -n7' --orphan-hours 0; then
+        printf '%s: %s GiB free on %s; reclaiming unused build directories in the background\n' \
+            "$program" "$free" "$directory" >&2
     fi
     exit 0
 fi
@@ -154,19 +185,16 @@ if [ -z "$prune" ]; then
         "$program" "$free" "$directory" "$here/prune-build-dirs" >&2
 fi
 # One reclaim at a time across the host, and at most every ten minutes: a
-# queue of builds would otherwise each scan every build directory.
+# queue of builds would otherwise each scan every build directory. The stamp
+# is a separate file, whose time a full disk can still update.
 if [ -n "$prune" ] && open7 "$state"; then
     if flock -n 7; then
-        if [ -z "$(find "$state" -mmin -10 -size +0c 2>/dev/null)" ]; then
+        if [ -z "$(find "$state.done" -mmin -10 2>/dev/null)" ]; then
             printf '%s: %s GiB free on %s; reclaiming unused build directories\n' \
                 "$program" "$free" "$directory" >&2
             # A failed reclaim leaves the decision to the free space below.
-            if sh -c "$pressed" >&2; then status=0; else status=$?; fi
-            { date +%s >"$state"; } 2>/dev/null || :
-            # One that searched everything was this period's scheduled run too.
-            if [ "$status" -ne 75 ]; then
-                { date +%s >"$pruner_state.scheduled"; } 2>/dev/null || :
-            fi
+            sh -c "$prune" >&2 || :
+            touch -- "$state.done" 2>/dev/null || :
         fi
         exec 7>&-
     else
@@ -176,6 +204,9 @@ if [ -n "$prune" ] && open7 "$state"; then
         flock -w 900 7 || :
         exec 7>&-
     fi
+    # Some file systems, such as btrfs, count freed space only once they
+    # commit.
+    sync -f -- "$directory" 2>/dev/null || :
     read_space
 fi
 [ "$free" -lt "$floor" ] || exit 0

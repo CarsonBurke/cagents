@@ -113,12 +113,22 @@ class BuildDiskGuard(unittest.TestCase):
         result = self.guard(1, guard=self.alone())
         self.assertEqual((result.returncode, result.stderr), (0, ""))
 
-    def stand_in_pruner(self, status=0):
-        """The guard beside a pruner that records how it was run."""
+    def stand_in_pruner(self, status=0, then=""):
+        """The guard beside a pruner that records how it was run, and as the
+        real one does, stamps the schedule unless it was cut short."""
         guard = self.alone()
         calls = self.root / "calls"
         pruner = guard.with_name("prune-build-dirs")
-        pruner.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {calls}\nexit {status}\n')
+        pruner.write_text(
+            "#!/bin/sh\n"
+            'arguments="$*"\n'
+            "while [ $# -gt 0 ]; do\n"
+            f'    [ "$1" != --stamp ] || [ {status} -eq 75 ] || touch "$2"\n'
+            "    shift\n"
+            "done\n"
+            f"{then}"
+            f'printf "%s\\n" "$arguments" >> {calls}\n'
+            f"exit {status}\n")
         pruner.chmod(0o755)
         del self.env["CAGENTS_BUILD_PRUNE"]
         return guard, calls
@@ -145,7 +155,8 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertIn("reclaiming unused build directories", result.stderr)
         (call,) = self.calls(calls, 1)
         self.assertIn("--apply --max-idle 7", call)
-        self.assertIn("--orphan-hours 0 --budget 300", call)
+        self.assertIn("--orphan-hours 0 --budget 300 --wait", call)
+        self.assertIn(f"--stamp {self.root}/pruner.scheduled", call)
         self.assertIn(f"--keep {self.root}", call)
         self.assertIn(f"--root {checkout.resolve()} --keep-checkout {checkout.resolve()}", call)
         self.assertIn(f"--log {self.root}/pruner.tsv", call)
@@ -177,21 +188,75 @@ class BuildDiskGuard(unittest.TestCase):
         self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         self.calls(calls, 1)
-        self.wait_unlocked(self.root / "pruner.scheduled")
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         self.assertEqual(len(self.calls(calls, 2)), 2)
 
-    def wait_unlocked(self, path, timeout=10):
-        """Until the background run that holds path's lock has ended."""
-        deadline = time.monotonic() + timeout
-        with open(path, "a") as lock:
-            while True:
-                try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    return
-                except BlockingIOError:
-                    self.assertLess(time.monotonic(), deadline)
-                    time.sleep(0.05)
+    def test_no_run_starts_while_one_is_pruning(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        with open(self.root / "pruner.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+            time.sleep(0.5)
+            self.assertEqual(self.calls(calls, 0, timeout=0), [])
+
+    def band(self):
+        """A floor that leaves free space between it and twice it."""
+        free = shutil.disk_usage(self.root).free // 2**30
+        if free < 4:
+            self.skipTest("too little free space to place a floor below it")
+        return free * 2 // 3
+
+    def test_running_low_the_pruner_runs_in_the_background(self):
+        guard, calls = self.stand_in_pruner(then="sleep 3\n")
+        started = time.monotonic()
+        result = self.guard(self.band(), guard=guard)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reclaiming unused build directories in the background", result.stderr)
+        (call,) = self.calls(calls, 1)
+        self.assertIn("--orphan-hours 0", call)
+        self.assertNotIn("--budget", call)
+        self.assertIn(f"--output {self.root}/pruner.log", call)
+        # Once it has searched everything, the next hour's builds start none.
+        result = self.guard(self.band(), guard=guard)
+        self.assertNotIn("reclaiming", result.stderr)
+        time.sleep(0.5)
+        self.assertEqual(len(self.calls(calls, 1)), 1)
+        long_ago = time.time() - 2 * 3600
+        os.utime(self.root / "pruner.scheduled", (long_ago, long_ago))
+        self.assertIn("in the background", self.guard(self.band(), guard=guard).stderr)
+
+    def test_the_background_run_keeps_none_of_the_builds_descriptors(self):
+        # As the real pruner closes what it inherited, and then runs on.
+        guard, calls = self.stand_in_pruner(
+            then="exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\nsleep 5\n")
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        # Like `flock FILE command`, which passes its lock to the command.
+        read, write = os.pipe()
+        started = time.monotonic()
+        with os.fdopen(read, "rb") as reader:
+            result = subprocess.run(
+                [str(guard), str(self.root / "absent/target")], pass_fds=(write,),
+                env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": "1"},
+                capture_output=True, timeout=20)
+            os.close(write)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(reader.read(), b"")
+        self.assertLess(time.monotonic() - started, 4)
+        self.calls(calls, 1)
+
+    def test_a_build_directory_in_use_is_marked_so(self):
+        build = self.root / "build/target"
+        build.mkdir(parents=True)
+        (build / ".rustc_info.json").write_text("{}")
+        self.assertEqual(self.guard(1, directory=build).returncode, 0)
+        self.assertTrue((build / ".cagents-gate-used").is_file())
+        # Never one Cargo has not made.
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.assertEqual(self.guard(1, directory=plain).returncode, 0)
+        self.assertEqual(list(plain.iterdir()), [])
 
     def test_the_build_directory_it_guards_is_kept(self):
         guard, calls = self.stand_in_pruner()
@@ -212,7 +277,6 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertNotIn("--orphan-hours", call)
         # Once it has finished, and within the interval, no build starts another.
         stamp = self.root / "pruner.scheduled"
-        self.wait_unlocked(stamp)
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)
         time.sleep(0.5)
         self.assertEqual(len(self.calls(calls, 1)), 1)

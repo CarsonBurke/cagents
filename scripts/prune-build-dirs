@@ -18,10 +18,11 @@ A target directory is removed only when, at the time of removal:
   mapping inside it.
 
 Under those locks it is renamed aside, so a build that starts later finds no
-directory rather than a partly removed one. The renamed copy is checked
-again, and put back if anything wrote to or opened it meanwhile; an
-interrupted removal leaves only the renamed copy, which the next run
-removes. A main checkout's own build, whose workspace has a `.git`
+directory rather than a partly removed one. Still under them, the renamed
+copy is put back if a process opened it meanwhile, such as a build waiting
+for those locks; after them, if anything wrote to it. An interrupted removal
+leaves only the renamed copy, which the next run removes. A directory that
+holds a `.git` or `Cargo.toml` is a checkout, never build output. A main checkout's own build, whose workspace has a `.git`
 directory, seeds new worktrees, so it waits four times as long. Never
 touched: the checkouts given with --keep-checkout, the directories given
 with --keep, ~/.local/share, the offload build slots
@@ -30,7 +31,8 @@ and anything a symlink leads to.
 
 One run at a time per user. The checkouts given with --root, and the mirror,
 are searched first. A run that stops on its --budget, or finds another run
-pruning, exits 75 so its caller can tell it did not search everything.
+pruning, exits 75 so its caller can tell it did not search everything; one
+that searched everything touches its --stamp.
 """
 from __future__ import annotations
 
@@ -68,7 +70,10 @@ def within(path: Path, parents: list[Path]) -> bool:
 def is_build_output(path: Path, names: set[str]) -> bool:
     """Cargo's own markers: `.rustc_info.json` at a target directory's root,
     or, beside the CACHEDIR.TAG Cargo writes, a profile's `.fingerprint` in a
-    separate build directory."""
+    separate build directory. Never a checkout, whatever it holds: a target
+    directory configured as one would take its sources with it."""
+    if {".git", "Cargo.toml"} & names:
+        return False
     if ".rustc_info.json" in names:
         return True
     return "CACHEDIR.TAG" in names and any(
@@ -228,6 +233,20 @@ def in_use(directory: Path) -> int | None:
     return None
 
 
+def put_back(aside: Path, directory: Path) -> bool:
+    """Undo a removal's rename, unless directory was meanwhile created again:
+    then a later run removes the copy once nothing uses it."""
+    if aside == directory:
+        return True
+    try:
+        os.rename(aside, directory)
+    except OSError as error:
+        print(f"kept {aside}, which was in use as it was removed, but cannot "
+              f"put it back as {directory}: {error}", file=sys.stderr, flush=True)
+        return False
+    return True
+
+
 def alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
@@ -322,6 +341,14 @@ def main() -> int:
     parser.add_argument("--budget", type=nonnegative, metavar="SECONDS",
                         help="start no search or removal after this long, finishing the "
                              "removal under way (default: no limit)")
+    parser.add_argument("--wait", action="store_true",
+                        help="when another run is pruning, wait for it within --budget "
+                             "instead of leaving at once; either way search nothing")
+    parser.add_argument("--stamp", type=Path, metavar="FILE",
+                        help="touch FILE once a run has searched everything")
+    parser.add_argument("--output", type=Path, metavar="FILE",
+                        help="once this run holds the lock, write its output to FILE, "
+                             "keeping the last run's as FILE.1")
     parser.add_argument("--verbose", action="store_true",
                         help="also say why each build directory in use stays")
     parser.add_argument("--lock", type=Path, default=Path(f"/var/tmp/cagents-prune-build-dirs-{os.getuid()}.lock"),
@@ -354,9 +381,25 @@ def main() -> int:
     try:
         fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
-        # It searches everything this run would; waiting frees nothing sooner.
+        # It searches everything this run would, so this one adds nothing;
+        # a caller that needs the space can wait for what it frees.
         print("another run is pruning; leaving the search to it", flush=True)
+        while arguments.wait and not deadline_passed():
+            time.sleep(min(1.0, max(0.0, DEADLINE[0] - time.monotonic())))
+            try:
+                fcntl.flock(runs, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            print("the other run has finished", flush=True)
+            break
         return INCOMPLETE
+    if arguments.output:
+        with contextlib.suppress(OSError):
+            os.replace(arguments.output, f"{arguments.output}.1")
+        output = os.open(arguments.output, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_CLOEXEC, 0o644)
+        os.dup2(output, 1)
+        os.dup2(output, 2)
+        os.close(output)
 
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400
@@ -420,20 +463,19 @@ def main() -> int:
                 print(f"failed to remove {directory}: {error}", file=sys.stderr, flush=True)
                 failed = True
                 continue
-        # Anything that wrote to or opened it since the first look keeps it.
-        user = in_use(aside)
-        if user is not None or survey(aside, cutoff) is None:
+            # A process that opened it between the first look and the rename,
+            # such as a build waiting for one of these locks, keeps it. While
+            # the locks are held, nothing it started can have got further.
+            if in_use(aside) is not None:
+                kept += 1
+                if put_back(aside, directory):
+                    note(f"keep {directory}: used while it was being removed")
+                continue
+        # Anything that wrote to it since the first look keeps it too.
+        if survey(aside, cutoff) is None:
             kept += 1
-            if aside != directory:
-                try:
-                    os.rename(aside, directory)
-                except OSError as error:
-                    # A build recreated it meanwhile; a later run removes this
-                    # copy once nothing uses it.
-                    print(f"kept {aside}, which was in use as it was removed, but cannot "
-                          f"put it back as {directory}: {error}", file=sys.stderr, flush=True)
-                    continue
-            note(f"keep {directory}: used while it was being removed")
+            if put_back(aside, directory):
+                note(f"keep {directory}: written while it was being removed")
             continue
         try:
             shutil.rmtree(aside)
@@ -453,6 +495,9 @@ def main() -> int:
     if not complete or deadline_passed():
         complete = False
         print("out of time; the rest waits for the next run", flush=True)
+    elif arguments.stamp:
+        with contextlib.suppress(OSError):
+            arguments.stamp.touch()
     verb = "removed" if arguments.apply else "would remove"
     print(f"{verb} {removed} build directories ({freed / 2**30:.1f} GiB); "
           f"kept {kept} in use or recently written", flush=True)
