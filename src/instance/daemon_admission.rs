@@ -740,13 +740,31 @@ mod tests {
         drop(daemon);
         drop(launcher);
         // The reviewed update coordinator holds the same fence for an update.
-        let _update = UiUpdateGuard::acquire().unwrap();
+        let update = UiUpdateGuard::acquire().unwrap();
         let error = WindowLease::acquire(true, None, &mut |_| {
             panic!("a window must not wait out an update")
         })
         .err()
         .unwrap();
         assert!(is_update_in_progress(&error), "{error}");
+        drop(update);
+
+        // Launches that wait together share one startup notice.
+        #[cfg(feature = "ui")]
+        {
+            let sleeper = || process::Command::new("sleep").arg("30").spawn();
+            show_startup_wait_notice(sleeper).unwrap();
+            show_startup_wait_notice(|| panic!("a second launch shows no second notice")).unwrap();
+            dismiss_startup_wait_notice();
+            let mut shown = false;
+            show_startup_wait_notice(|| {
+                shown = true;
+                sleeper()
+            })
+            .unwrap();
+            assert!(shown, "a dismissed notice lets the next launch show one");
+            dismiss_startup_wait_notice();
+        }
     }
 
     #[test]

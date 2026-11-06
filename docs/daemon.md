@@ -489,7 +489,8 @@ A daemon that takes the fence itself declares it as an admission until its
 listener is ready, and so does a worktree removal that briefly checks the
 running windows. A window opened meanwhile waits for that admission instead of
 reporting an update, then opens normally. If the wait passes two seconds it
-shows a **Starting cagents** notice, which closes when the workspace opens. A
+shows a **Starting cagents** notice, which closes when the workspace opens;
+launches that wait together share one notice. A
 daemon that dies during admission releases the waiting window at once, and
 that window starts a daemon itself. The wait is bounded by the daemon's own
 startup allowance plus ten seconds; past that, the window reports that the

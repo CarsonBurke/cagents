@@ -210,14 +210,21 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
 pub struct UpdateInProgress;
 
 pub fn is_update_in_progress(error: &(dyn std::error::Error + 'static)) -> bool {
+    caused_by::<UpdateInProgress>(error)
+}
+
+/// Whether a window gave up waiting for a daemon that is still starting.
+pub fn is_daemon_still_starting(error: &(dyn std::error::Error + 'static)) -> bool {
+    caused_by::<DaemonStillStarting>(error)
+}
+
+fn caused_by<T: std::error::Error + 'static>(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(error);
     while let Some(error) = current {
-        if error.is::<UpdateInProgress>()
-            || error.downcast_ref::<io::Error>().is_some_and(|error| {
-                error
-                    .get_ref()
-                    .is_some_and(|inner| inner.is::<UpdateInProgress>())
-            })
+        if error.is::<T>()
+            || error
+                .downcast_ref::<io::Error>()
+                .is_some_and(|error| error.get_ref().is_some_and(|inner| inner.is::<T>()))
         {
             return true;
         }
@@ -381,20 +388,38 @@ impl WindowLease {
     }
 }
 
-/// The detached notice a starting window shows while it waits for the daemon.
+/// The detached notice a starting window shows while it waits for the daemon,
+/// with the lock that makes it the only one on screen.
 #[cfg(feature = "ui")]
-static STARTUP_WAIT_NOTICE: std::sync::Mutex<Option<process::Child>> = std::sync::Mutex::new(None);
+static STARTUP_WAIT_NOTICE: std::sync::Mutex<Option<(process::Child, OwnedLock)>> =
+    std::sync::Mutex::new(None);
 
-/// Keep a starting window's wait notice until [`dismiss_startup_wait_notice`].
+/// Show a starting window's wait notice until [`dismiss_startup_wait_notice`].
+///
+/// Launches that wait together wait for the same daemon, so one notice speaks
+/// for all of them: while another starting window shows one, this does
+/// nothing. The lock outside the window slot namespace ends with its holder.
 #[cfg(feature = "ui")]
-pub fn hold_startup_wait_notice(notice: process::Child) {
+pub fn show_startup_wait_notice(
+    spawn: impl FnOnce() -> io::Result<process::Child>,
+) -> io::Result<()> {
+    let lock = match owned_lock(
+        &runtime_directory()?.join(format!("{APPLICATION_LOCK_FILE}-startup-notice")),
+        libc::LOCK_EX | libc::LOCK_NB,
+    ) {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let notice = spawn()?;
     let previous = STARTUP_WAIT_NOTICE
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .replace(notice);
-    if let Some(previous) = previous {
+        .replace((notice, lock));
+    if let Some((previous, _)) = previous {
         close_startup_wait_notice(previous);
     }
+    Ok(())
 }
 
 /// Close the wait notice, if one is showing: the window it stood in for has
@@ -405,7 +430,7 @@ pub fn dismiss_startup_wait_notice() {
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .take();
-    if let Some(notice) = notice {
+    if let Some((notice, _lock)) = notice {
         close_startup_wait_notice(notice);
     }
 }
@@ -3318,11 +3343,7 @@ mod startup_update_tests {
         .err()
         .unwrap();
         assert!(!is_update_in_progress(&error));
-        assert!(
-            error
-                .get_ref()
-                .is_some_and(|inner| inner.is::<DaemonStillStarting>())
-        );
+        assert!(is_daemon_still_starting(&error));
     }
 
     #[test]
