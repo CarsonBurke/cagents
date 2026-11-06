@@ -4,6 +4,7 @@ use serde_json::Value;
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub mod claude;
+pub(crate) mod claude_cached_context;
 mod claude_edits;
 mod claude_permissions;
 mod claude_titles;

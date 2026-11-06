@@ -4,6 +4,8 @@ pub(crate) use super::final_snapshot::{RetirementInspection, VerifiedRetirement}
 use super::journal::Journal;
 use super::journal::{ContinuityLoss, InputIdentity, InputReceipt, InputState};
 use super::{MAX_FRAME, deadline_io, final_snapshot, journal};
+#[path = "context.rs"]
+mod context;
 use crate::{
     chat::{
         self, Command, Snapshot,
@@ -228,6 +230,8 @@ struct Remote {
     state: Mutex<Arc<Resident>>,
     publication: Mutex<()>,
     final_snapshot: Mutex<Option<Arc<Snapshot>>>,
+    context: Mutex<context::ContextProjection>,
+    context_worker: Mutex<Option<thread::JoinHandle<()>>>,
     environment: Mutex<crate::terminal_ipc::ChatExecutionEnvironment>,
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
@@ -418,6 +422,8 @@ impl RemoteActor {
             state: Mutex::new(Arc::new(resident)),
             publication: Mutex::new(()),
             final_snapshot: Mutex::new(None),
+            context: Mutex::new(Default::default()),
+            context_worker: Mutex::new(None),
             environment: Mutex::new(crate::terminal_ipc::ChatExecutionEnvironment(
                 Default::default(),
             )),
@@ -1050,6 +1056,8 @@ impl RemoteActor {
             state: Mutex::new(Arc::new(attached.resident)),
             publication: Mutex::new(()),
             final_snapshot: Mutex::new(None),
+            context: Mutex::new(Default::default()),
+            context_worker: Mutex::new(None),
             environment: Mutex::new(attached.execution_environment),
             launch_account_scope: attached.launch_account_scope,
             recovery_environment: attached.recovery_environment,
@@ -1137,6 +1145,7 @@ impl RemoteActor {
             })
             .map_err(|error| error.to_string())?;
         *remote.0.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
+        remote.start_context_worker()?;
         Ok(remote)
     }
     fn publish_resident(&self, resident: Resident) -> bool {
@@ -1734,16 +1743,29 @@ impl RemoteActor {
     }
 
     pub fn snapshot(&self, after: Option<u64>) -> Option<Snapshot> {
-        if let Some(snapshot) = self
+        let final_snapshot = self
             .0
             .final_snapshot
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .as_ref()
-        {
-            return (after != Some(snapshot.generation)).then(|| snapshot.as_ref().clone());
+            .clone();
+        let after = if self.context_invalidates(after) {
+            None
+        } else {
+            after
+        };
+        if let Some(snapshot) = final_snapshot {
+            return (after != Some(snapshot.generation))
+                .then(|| self.project_snapshot(snapshot.as_ref().clone()));
         }
-        self.call("snapshot", json!([after])).ok().flatten()
+        let mut snapshot = self
+            .call::<Option<Snapshot>>("snapshot", json!([after]))
+            .ok()
+            .flatten();
+        if snapshot.is_none() && after.is_some() && self.context_invalidates(after) {
+            snapshot = self.call("snapshot", json!([null])).ok().flatten();
+        }
+        snapshot.map(|snapshot| self.project_snapshot(snapshot))
     }
     pub fn commit_installation(&self) -> Result<(), String> {
         self.call::<()>("commit", Value::Null)?;
@@ -1833,6 +1855,12 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        drop(
+            self.context_worker
+                .get_mut()
+                .unwrap_or_else(|p| p.into_inner())
+                .take(),
+        );
         if let Some(worker) = self
             .worker
             .get_mut()
@@ -4000,6 +4028,120 @@ while IFS= read -r frame; do :; done
         )
         .unwrap();
         assert_eq!(copied, before_page);
+    }
+    pub(super) fn legacy_context_fixture() -> (tempfile::TempDir, RemoteActor, Snapshot, PathBuf) {
+        let root = tempfile::tempdir().unwrap();
+        let config = root.path().join("claude");
+        let cwd = root.path().join("project");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir(&cwd).unwrap();
+        let session = "00000000-0000-4000-8000-000000000001";
+        let body = "Base directory for this skill: /skills/example\n\nKeep these exact bytes λ";
+        let project: String = cwd
+            .to_str()
+            .unwrap()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let directory = config.join("projects").join(project);
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join(format!("{session}.jsonl"));
+        let raw = [
+            json!({"type":"user","uuid":"internal","sessionId":session,"isMeta":true,"message":{"content":body}}),
+            json!({"type":"user","uuid":"quoted","parentUuid":"internal","sessionId":session,"message":{"content":body}}),
+        ].iter().map(|frame| format!("{frame}\n")).collect::<String>();
+        std::fs::write(&path, &raw).unwrap();
+        let mut remote = RemoteActor::fixture_at(root.path().join("proxy.sock"));
+        let inner = Arc::get_mut(&mut remote.0).unwrap();
+        inner.source.launch.session_id = Some(session.into());
+        inner.source.launch.recipe.working_directory = cwd;
+        Arc::make_mut(inner.state.get_mut().unwrap()).confirmed_session = Some(session.into());
+        let info = std::fs::metadata(&config).unwrap();
+        inner.launch_account_scope = Ok(crate::account::scope::LaunchAccountScope {
+            provider: crate::agent::Provider::Claude,
+            canonical_home: config,
+            device: info.dev(),
+            inode: info.ino(),
+            registered_id: None,
+            purge_ids: Vec::new(),
+        });
+        let mut snapshot = remote.attachment_snapshot();
+        snapshot.session_id = Some(session.into());
+        snapshot.items = ["internal:0", "quoted:0"]
+            .iter()
+            .map(|id| {
+                Arc::new(chat::Item {
+                    id: (*id).into(),
+                    role: chat::Role::User,
+                    content: chat::ItemContent::Text {
+                        text: body.into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    started_at: Some(7),
+                    at: Some(11),
+                })
+            })
+            .collect();
+        snapshot.text_copy_sources.conversation = snapshot
+            .items
+            .iter()
+            .enumerate()
+            .map(|(index, _)| {
+                Some(chat::TextCopySource {
+                    cache: uuid::Uuid::new_v4(),
+                    scope: chat::TextCopyScope::Conversation,
+                    token: index as u64 + 1,
+                    revision: 1,
+                    bytes: body.len() as u64,
+                })
+            })
+            .collect();
+        (root, remote, snapshot, path)
+    }
+    #[test]
+    fn retained_legacy_skill_text_is_reclassified_from_exact_provider_provenance() {
+        let (_root, remote, snapshot, path) = legacy_context_fixture();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let body = snapshot.items[0].logical_copy_body().unwrap().to_owned();
+        let original = snapshot.clone();
+        std::fs::remove_file(&path).unwrap();
+        Arc::make_mut(&mut remote.0.state.lock().unwrap()).confirmed_session =
+            Some("00000000-0000-4000-8000-000000000099".into());
+        remote.publish_closed(snapshot);
+        remote.start_context_worker().unwrap();
+        assert_eq!(
+            remote.snapshot(None).unwrap().items[0].role,
+            chat::Role::User
+        );
+        std::fs::write(&path, &raw).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let corrected = loop {
+            let snapshot = remote.snapshot(None).unwrap();
+            if snapshot.items[0].role == chat::Role::System {
+                break snapshot;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "final context scanner stopped before provenance arrived"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(corrected.items[0].role, chat::Role::System);
+        assert!(
+            matches!(&corrected.items[0].content, chat::ItemContent::Delivery { body: actual, summary, .. }
+            if actual == &body && summary == "Claude context")
+        );
+        assert_eq!(
+            corrected.items[1], original.items[1],
+            "identical user-pasted text stays visible"
+        );
+        assert_eq!(corrected.items[0].id, original.items[0].id);
+        assert_eq!(corrected.items[0].started_at, Some(7));
+        assert_eq!(corrected.items[0].at, Some(11));
+        assert_eq!(corrected.generation, original.generation);
+        assert_eq!(corrected.text_copy_sources, original.text_copy_sources);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
     }
     #[test]
     fn removed_or_replaced_home_can_only_adopt_the_exact_helper_for_close() {
