@@ -15,7 +15,7 @@ pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read},
@@ -1423,18 +1423,12 @@ pub enum MutationOutcome {
 /// request it applied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationScope {
-    /// The command works through its pathspecs and reports the ones it could
-    /// not handle at the end: `git add -A -- good ignored` exits 1 *having
-    /// staged* `good`, so a non-zero exit leaves the split between the two
-    /// halves unknown.
-    Incremental,
     /// The command assembles its whole result in memory and commits it with a
     /// single write, so a non-zero exit means nothing was written at all:
-    /// Path-limited `git reset --no-refresh` and `git update-index` each write
-    /// the index once, after the last selected path, under `index.lock`.
-    /// That single write says nothing about unmatched pathspecs — `reset`
-    /// ignores those and still exits 0 — so a caller that must refuse ghosts
-    /// validates the selection first (see `unstage`).
+    /// `git update-index` writes the index once, after the last selected
+    /// path, under `index.lock`. It does not refuse a path that matches
+    /// nothing, so a caller that must refuse ghosts validates the selection
+    /// first (see `unstage`).
     AllOrNothing,
     /// The command resolves every pathspec before it writes anything, and
     /// then writes entry by entry.
@@ -1463,7 +1457,6 @@ impl MutationScope {
     /// not tie this to the wording of a Git diagnostic.
     fn classify(self, exit_code: Option<i32>, failure: MutationFailure) -> MutationOutcome {
         match self {
-            Self::Incremental => MutationOutcome::OutcomeUnknown { failure },
             Self::AllOrNothing => MutationOutcome::NotApplied { failure },
             Self::AtomicRefusal if exit_code == Some(1) => MutationOutcome::NotApplied { failure },
             Self::AtomicRefusal => MutationOutcome::OutcomeUnknown { failure },
@@ -4615,7 +4608,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .stdin(pathspec_input(paths))
     }
 
-    /// The `git add` invocation for an already-resolved pathspec list.
+    /// Stages exactly these paths with one index write.
+    ///
+    /// `git add` matches every pathspec against every index entry, which
+    /// takes minutes for tens of thousands of selected files; `update-index`
+    /// looks each path up directly. `--remove` stages deletions and
+    /// `--replace` a file that became a directory or the reverse, as `add -A`
+    /// does. Entries outside a sparse checkout are absent by design, so they
+    /// are left alone rather than staged as deletions. A path it cannot stage,
+    /// such as a plain directory or one beyond a symlink, stops it before the
+    /// index is written.
     pub fn stage_command(
         &self,
         worktree: &Path,
@@ -4624,7 +4626,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if paths.is_empty() {
             return Err(ValidationError::EmptySelection);
         }
-        Ok(self.git_pathspec_mutation(worktree, ["add", "-A"], paths))
+        Ok(self
+            .git_literal_mutation(
+                worktree,
+                [
+                    "update-index",
+                    "--add",
+                    "--remove",
+                    "--replace",
+                    "--ignore-skip-worktree-entries",
+                    "-z",
+                    "--stdin",
+                ],
+            )
+            .stdin(pathspec_input(paths)))
     }
 
     /// Stages the selected paths, including the deletion half of a rename the
@@ -4640,16 +4655,64 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         let paths =
             self.matchable_pathspecs(&request.worktree, &request.selection, cancellation)?;
         let command = self.stage_command(&request.worktree, &paths)?;
-        Ok(self.run_mutation(&command, paths, MutationScope::Incremental, cancellation))
+        if let Some(ignored) = self.first_ignored_path(&request.worktree, &paths, cancellation)? {
+            return Ok(MutationOutcome::NotApplied {
+                failure: MutationFailure::Rejected {
+                    reason: format!("{ignored}: path is ignored"),
+                },
+            });
+        }
+        Ok(self.run_mutation(&command, paths, MutationScope::AllOrNothing, cancellation))
+    }
+
+    /// The first untracked path Git's ignore rules exclude. `update-index`
+    /// adds whatever it is given, unlike `git add`, and a file can become
+    /// ignored after status listed it.
+    fn first_ignored_path(
+        &self,
+        worktree: &Path,
+        paths: &[RepoPath],
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RepoPath>, RepositoryError> {
+        // check-ignore rejects --literal-pathspecs. Git reads magic only at
+        // the start of a pathspec, so a "./" prefix keeps ":(top)x" literal.
+        let mut input = Vec::new();
+        for path in paths {
+            input.extend_from_slice(b"./");
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        let command = self
+            .git_read(worktree, ["check-ignore", "-z", "--stdin"])
+            .stdin(input);
+        let output = self.run(&command, cancellation)?;
+        // Exit 1 means no path is ignored. Tracked paths are never reported.
+        if output.exit_code == Some(1) {
+            return Ok(None);
+        }
+        if !output.success {
+            return Err(git_failure(&command, output).into());
+        }
+        let first = output.stdout.split(|byte| *byte == 0).next();
+        let ignored = first
+            .and_then(|name| name.strip_prefix(b"./"))
+            .and_then(|name| RepoPath::from_bytes(name).ok());
+        match ignored {
+            Some(path) => Ok(Some(path)),
+            None => Err(RepositoryError::InvalidOutput {
+                field: "check_ignore",
+                reason: "an ignored path was not one this sent".into(),
+            }),
+        }
     }
 
     /// The pathspecs a worktree-side mutation can actually match.
     ///
-    /// `git add` and `git restore --worktree` resolve a pathspec against the
-    /// index and the working tree, never against HEAD. The source half of a
-    /// *staged* rename is in neither — only HEAD still has that name — so
-    /// listing it makes `add` exit 128 having staged nothing and `restore` exit
-    /// 1 having restored nothing, for the whole selection. Whether the source
+    /// `git restore --worktree` resolves a pathspec against the index and the
+    /// working tree, never against HEAD. The source half of a *staged* rename
+    /// is in neither — only HEAD still has that name — so listing it makes
+    /// `restore` exit 1 having restored nothing, for the whole selection, and
+    /// staging it would do nothing while reporting it staged. Whether the source
     /// is matchable is a property of the index at this moment rather than of
     /// the selection, which is why it is asked here and not at the point the
     /// selection was built: the same [`PathSelection`] names an unmatchable
@@ -4700,41 +4763,46 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
         if let Some(head) = self.resolve_head(&request.worktree, cancellation)? {
-            // `reset` silently ignores pathspecs that match nothing and still
-            // exits 0, so a stale selection would report ghosts as applied
-            // while unstaging the rest. Refuse the whole request up front
-            // when any selected path resolves to nothing git knows — the
-            // index, or the HEAD tree for renamed-away sources.
+            // Refuse the whole request up front when any selected path
+            // matches nothing git knows — the index, or the HEAD tree for
+            // renamed-away sources — rather than reporting a ghost as applied.
             let indexed: HashSet<_> = self
                 .indexed_paths(&request.worktree, &paths, cancellation)?
                 .into_iter()
                 .collect();
-            let unindexed: Vec<&RepoPath> = paths
-                .iter()
-                .filter(|path| !indexed.contains(*path))
+            let in_head: HashMap<_, _> = self
+                .head_tree_entries(&request.worktree, &head, &paths, cancellation)?
+                .into_iter()
+                .map(|entry| (entry.path.clone(), entry))
                 .collect();
-            if !unindexed.is_empty() {
-                let in_head: HashSet<_> = self
-                    .head_tree_paths(&request.worktree, &head, &unindexed, cancellation)?
-                    .into_iter()
-                    .collect();
-                if let Some(ghost) = unindexed.iter().find(|path| !in_head.contains(**path)) {
-                    return Ok(MutationOutcome::NotApplied {
-                        failure: MutationFailure::Rejected {
-                            reason: format!("{ghost}: path does not match anything known to git"),
-                        },
-                    });
-                }
+            if let Some(ghost) = paths
+                .iter()
+                .find(|path| !indexed.contains(*path) && !in_head.contains_key(*path))
+            {
+                return Ok(MutationOutcome::NotApplied {
+                    failure: MutationFailure::Rejected {
+                        reason: format!("{ghost}: path does not match anything known to git"),
+                    },
+                });
             }
-            // `restore --staged` preloads worktree stat information and runs
-            // post-checkout hooks. Neither belongs in an index-only operation.
-            // A path-limited reset never moves HEAD; --no-refresh also skips
-            // the otherwise repository-wide stat refresh after updating it.
-            let command = self.git_pathspec_mutation(
-                &request.worktree,
-                ["reset", "--no-refresh", "--quiet", head.as_str()],
-                &paths,
-            );
+            // Put back each path's HEAD entry, or drop one HEAD lacks, in one
+            // index write. Path-limited `reset` would match every pathspec
+            // against every index entry. Like `reset --no-refresh`, this
+            // leaves stat data for the next status to refresh.
+            let absent = "0".repeat(head.as_str().len());
+            let mut input = Vec::new();
+            for path in &paths {
+                let entry = match in_head.get(path) {
+                    Some(entry) => format!("{:o} {}\t", entry.mode, entry.oid.as_str()),
+                    None => format!("0 {absent}\t"),
+                };
+                input.extend_from_slice(entry.as_bytes());
+                input.extend_from_slice(path.as_bytes());
+                input.push(0);
+            }
+            let command = self
+                .git_literal_mutation(&request.worktree, ["update-index", "-z", "--index-info"])
+                .stdin(input);
             return Ok(self.run_mutation(
                 &command,
                 paths,
@@ -4771,7 +4839,9 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             // entry against the selection, once again for each argv batch.
             // A single bounded census avoids that quadratic matching cost.
             let command = self.git_literal_read(worktree, ["ls-files", "-z"]);
-            if let Some(listed) = self.membership_census(&command, "git ls-files", cancellation)? {
+            let parse = |output: &[u8]| parse_path_list(output, "git ls-files");
+            if let Some(listed) = self.membership_census(&command, parse, cancellation)? {
+                let listed: HashSet<_> = listed.into_iter().collect();
                 return Ok(paths
                     .iter()
                     .filter(|path| listed.contains(*path))
@@ -4802,51 +4872,45 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .collect())
     }
 
-    /// Filters paths down to the ones present in a commit's tree, preserving
-    /// the caller's order. Renamed-away sources live here even after leaving
-    /// the index, so this is the second half of "matches something git
-    /// knows" for selections that may name renames.
-    fn head_tree_paths(
+    /// The selected paths' entries in a commit's tree, in the caller's order.
+    /// Renamed-away sources live here even after leaving the index, so this
+    /// is the second half of "matches something git knows".
+    fn head_tree_entries(
         &self,
         worktree: &Path,
         revision: &Oid,
-        paths: &[&RepoPath],
+        paths: &[RepoPath],
         cancellation: &CancellationToken,
-    ) -> Result<Vec<RepoPath>, RepositoryError> {
-        let mut listed = HashSet::new();
-        let paths: Vec<RepoPath> = paths.iter().map(|path| (*path).clone()).collect();
-        if bounded_pathspec_batches(&paths).nth(1).is_some() {
-            let command = self.git_literal_read(
-                worktree,
-                ["ls-tree", "-r", "--name-only", "-z", revision.as_str()],
-            );
-            if let Some(listed) = self.membership_census(&command, "git ls-tree", cancellation)? {
-                return Ok(paths
-                    .iter()
-                    .filter(|path| listed.contains(*path))
-                    .cloned()
-                    .collect());
-            }
+    ) -> Result<Vec<TreeEntry>, RepositoryError> {
+        let mut listed = HashMap::new();
+        let mut census = None;
+        if bounded_pathspec_batches(paths).nth(1).is_some() {
+            let command =
+                self.git_literal_read(worktree, ["ls-tree", "-r", "-z", revision.as_str()]);
+            census = self.membership_census(&command, parse_tree_entries, cancellation)?;
         }
-        for batch in bounded_pathspec_batches(&paths) {
-            let mut arguments = vec![
-                OsString::from("ls-tree"),
-                OsString::from("-r"),
-                OsString::from("-z"),
-                OsString::from(revision.as_str()),
-                OsString::from("--"),
-            ];
-            arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
-            let command = self.git_literal_read(worktree, arguments);
-            let output = self.run_checked(&command, cancellation)?;
-            let parsed = parse_tree_entries(&output.stdout);
-            let entries = invalid_output(parsed, output)?;
-            listed.extend(entries.into_iter().map(|entry| entry.path));
+        if let Some(entries) = census {
+            listed.extend(entries.into_iter().map(|entry| (entry.path.clone(), entry)));
+        } else {
+            for batch in bounded_pathspec_batches(paths) {
+                let mut arguments = vec![
+                    OsString::from("ls-tree"),
+                    OsString::from("-r"),
+                    OsString::from("-z"),
+                    OsString::from(revision.as_str()),
+                    OsString::from("--"),
+                ];
+                arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
+                let command = self.git_literal_read(worktree, arguments);
+                let output = self.run_checked(&command, cancellation)?;
+                let parsed = parse_tree_entries(&output.stdout);
+                let entries = invalid_output(parsed, output)?;
+                listed.extend(entries.into_iter().map(|entry| (entry.path.clone(), entry)));
+            }
         }
         Ok(paths
             .iter()
-            .filter(|path| listed.contains(*path))
-            .cloned()
+            .filter_map(|path| listed.get(path).cloned())
             .collect())
     }
 
@@ -4855,12 +4919,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     /// an oversized repository falls back to selected-path queries instead.
     /// Small selections skip the census entirely, so selecting one file never
     /// enumerates a repository with hundreds of thousands of unrelated names.
-    fn membership_census(
+    fn membership_census<T>(
         &self,
         command: &CommandSpec,
-        format: &'static str,
+        parse: impl FnOnce(&[u8]) -> Result<Vec<T>, GitParseError>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<HashSet<RepoPath>>, RepositoryError> {
+    ) -> Result<Option<Vec<T>>, RepositoryError> {
         let output = match self.executor.execute(command, cancellation) {
             Ok(output) if output.success => output,
             Ok(output) => return Err(git_failure(command, output).into()),
@@ -4875,8 +4939,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(failure.into());
             }
         };
-        let parsed = parse_path_list(&output.stdout, format);
-        Ok(Some(invalid_output(parsed, output)?.into_iter().collect()))
+        let parsed = parse(&output.stdout);
+        Ok(Some(invalid_output(parsed, output)?))
     }
 
     /// Restores tracked paths from the index and deletes untracked files.
@@ -7206,9 +7270,11 @@ mod tests {
                     ));
                     let head = service.resolve_head(root, &cancel).unwrap().unwrap();
                     assert_eq!(
-                        service
-                            .head_tree_paths(root, &head, &[&path("selected.txt")], &cancel)
-                            .unwrap(),
+                        tree_paths(
+                            service
+                                .head_tree_entries(root, &head, &[path("selected.txt")], &cancel)
+                                .unwrap()
+                        ),
                         vec![path("selected.txt")]
                     );
                 },
@@ -7277,9 +7343,11 @@ mod tests {
                 indexed
             );
             assert_eq!(
-                service
-                    .head_tree_paths(root, &head, &paths.iter().collect::<Vec<_>>(), &cancel)
-                    .unwrap(),
+                tree_paths(
+                    service
+                        .head_tree_entries(root, &head, &paths, &cancel)
+                        .unwrap()
+                ),
                 expected
             );
         }
@@ -9053,11 +9121,18 @@ mod tests {
                 OsString::from("/repo"),
                 OsString::from("-c"),
                 OsString::from("core.fsmonitor=false"),
-                OsString::from("add"),
-                OsString::from("-A"),
-                OsString::from("--pathspec-from-file=-"),
-                OsString::from("--pathspec-file-nul"),
+                OsString::from("update-index"),
+                OsString::from("--add"),
+                OsString::from("--remove"),
+                OsString::from("--replace"),
+                OsString::from("--ignore-skip-worktree-entries"),
+                OsString::from("-z"),
+                OsString::from("--stdin"),
             ]
+        );
+        assert_eq!(
+            command.stdin.as_deref(),
+            Some(b":(top)old.txt\0new name.txt\0".as_slice())
         );
         // A mutation must not disable optional locks: it needs the index lock.
         assert!(
@@ -9072,6 +9147,10 @@ mod tests {
 
         let empty = service.stage_command(Path::new("/repo"), &[]);
         assert!(matches!(empty, Err(ValidationError::EmptySelection)));
+    }
+
+    fn tree_paths(entries: Vec<TreeEntry>) -> Vec<RepoPath> {
+        entries.into_iter().map(|entry| entry.path).collect()
     }
 
     fn large_membership_paths() -> Vec<RepoPath> {
@@ -9103,7 +9182,12 @@ mod tests {
         // An unmerged index lists one name per stage. Directory descendants
         // and unrelated names must never validate the directory itself.
         census.extend_from_slice(b"conflict\0conflict\0directory/child\0unselected\0");
-        let service = fake_service(vec![success(&census), success(&census)]);
+        let mut tree = Vec::new();
+        for name in census.split_inclusive(|byte| *byte == 0) {
+            tree.extend_from_slice(format!("100644 blob {}\t", oid(1)).as_bytes());
+            tree.extend_from_slice(name);
+        }
+        let service = fake_service(vec![success(&census), success(&tree)]);
         let cancel = CancellationToken::new();
         assert_eq!(
             service
@@ -9112,14 +9196,11 @@ mod tests {
             expected
         );
         assert_eq!(
-            service
-                .head_tree_paths(
-                    Path::new("/repo"),
-                    &oid(1),
-                    &paths.iter().collect::<Vec<_>>(),
-                    &cancel
-                )
-                .unwrap(),
+            tree_paths(
+                service
+                    .head_tree_entries(Path::new("/repo"), &oid(1), &paths, &cancel)
+                    .unwrap()
+            ),
             expected
         );
         let commands = service.executor.commands.lock().unwrap();
@@ -9153,12 +9234,9 @@ mod tests {
             let service = fake_service(outputs);
             let cancel = CancellationToken::new();
             let listed = if tree {
-                service.head_tree_paths(
-                    Path::new("/repo"),
-                    &oid(1),
-                    &paths.iter().collect::<Vec<_>>(),
-                    &cancel,
-                )
+                service
+                    .head_tree_entries(Path::new("/repo"), &oid(1), &paths, &cancel)
+                    .map(tree_paths)
             } else {
                 service.indexed_paths(Path::new("/repo"), &paths, &cancel)
             };
@@ -9255,7 +9333,7 @@ mod tests {
         }];
 
         // The index no longer has the source: only HEAD does.
-        let service = fake_service(vec![success(b""), success(b"")]);
+        let service = fake_service(vec![success(b""), exit(1, b""), success(b"")]);
         let outcome = service
             .stage(
                 &StageRequest {
@@ -9273,19 +9351,14 @@ mod tests {
         );
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(
-            commands[1].stdin.as_deref(),
+            commands[2].stdin.as_deref(),
             Some(b"new name.txt\0".as_slice())
-        );
-        assert!(
-            !commands[1]
-                .arguments
-                .contains(&OsString::from("old name.txt"))
         );
         drop(commands);
 
         // The index still has it, which is the unstaged rename this
         // application also has to stage as a pair.
-        let service = fake_service(vec![success(b"old name.txt\0"), success(b"")]);
+        let service = fake_service(vec![success(b"old name.txt\0"), exit(1, b""), success(b"")]);
         let outcome = service
             .stage(
                 &StageRequest {
@@ -9323,13 +9396,7 @@ mod tests {
                 })
                 .unwrap(),
             service.push_command(&publish_request()).unwrap(),
-            service.git_literal_mutation(
-                &worktree,
-                pathspec_arguments(
-                    ["reset", "--no-refresh", "--quiet", "HEAD"],
-                    &[path("new.txt")],
-                ),
-            ),
+            service.git_literal_mutation(&worktree, ["update-index", "-z", "--index-info"]),
             service.git_literal_mutation(
                 &worktree,
                 pathspec_arguments(["update-index", "--force-remove"], &[path("new.txt")]),
@@ -9444,7 +9511,7 @@ mod tests {
 
     #[test]
     fn stage_that_never_started_is_definitively_not_applied() {
-        let service = fake_service(vec![Err(unstarted_failure())]);
+        let service = fake_service(vec![exit(1, b""), Err(unstarted_failure())]);
         let outcome = service
             .stage(
                 &StageRequest {
@@ -9456,7 +9523,7 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
 
-        let service = fake_service(vec![Err(launched_failure(b""))]);
+        let service = fake_service(vec![exit(1, b""), Err(launched_failure(b""))]);
         let outcome = service
             .stage(
                 &StageRequest {

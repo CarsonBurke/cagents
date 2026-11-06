@@ -224,6 +224,11 @@ impl Fixture {
         self.head()
     }
 
+    fn commit_all(&self, message: &str) -> Oid {
+        self.git_in_work(&["add", "-A"]);
+        self.commit(message)
+    }
+
     fn head(&self) -> Oid {
         Oid::parse(self.text(&["rev-parse", "HEAD"])).expect("full object id")
     }
@@ -1023,6 +1028,224 @@ fn an_untracked_nested_repository_is_listed_as_its_directory() {
     assert!(snapshot.files.paths.contains(&path("subclone")));
 }
 
+fn index_entries(fixture: &Fixture) -> String {
+    fixture.text(&["ls-files", "--stage", "-t"])
+}
+
+fn stage(fixture: &Fixture, paths: &[&str]) -> MutationOutcome {
+    fixture
+        .service()
+        .stage(
+            &StageRequest {
+                worktree: fixture.work(),
+                selection: paths
+                    .iter()
+                    .map(|name| PathSelection::new(path(name)))
+                    .collect(),
+            },
+            &CancellationToken::new(),
+        )
+        .expect("stage")
+}
+
+fn unstage(fixture: &Fixture, paths: &[&str]) -> MutationOutcome {
+    fixture
+        .service()
+        .unstage(
+            &UnstageRequest {
+                worktree: fixture.work(),
+                selection: paths
+                    .iter()
+                    .map(|name| PathSelection::new(path(name)))
+                    .collect(),
+            },
+            &CancellationToken::new(),
+        )
+        .expect("unstage")
+}
+
+/// Staging looks paths up directly rather than through `git add` pathspecs,
+/// so each case below pins the index `git add -A` would have produced.
+#[test]
+fn staging_replaces_files_and_directories_in_either_direction() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("file/x", b"x\n");
+    fixture.write("dir", b"file\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    let committed = index_entries(&fixture);
+    fs::remove_dir_all(fixture.work().join("file")).expect("remove directory");
+    fixture.write("file", b"now a file\n");
+    fs::remove_file(fixture.work().join("dir")).expect("remove file");
+    fixture.write("dir/y", b"now a directory\n");
+
+    // Each row alone, in the order a status listing gives them.
+    for name in ["dir", "dir/y", "file", "file/x"] {
+        assert!(matches!(
+            stage(&fixture, &[name]),
+            MutationOutcome::Applied { .. }
+        ));
+    }
+    assert_eq!(fixture.text(&["ls-files"]), "dir/y\nfile");
+    assert_eq!(
+        fixture.text(&["status", "--porcelain", "--untracked-files=all"]),
+        "D  dir\nA  dir/y\nA  file\nD  file/x"
+    );
+
+    assert!(matches!(
+        unstage(&fixture, &["dir", "dir/y", "file", "file/x"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(index_entries(&fixture), committed);
+    assert_eq!(
+        fs::read(fixture.work().join("file")).unwrap(),
+        b"now a file\n"
+    );
+}
+
+#[test]
+fn staging_leaves_entries_outside_a_sparse_checkout_alone() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("sparse.txt", b"one\n");
+    fixture.write("dense.txt", b"one\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    fixture.git_in_work(&["update-index", "--skip-worktree", "sparse.txt"]);
+    let sparse = fixture.text(&["ls-files", "--stage", "-t", "sparse.txt"]);
+    fs::remove_file(fixture.work().join("sparse.txt")).expect("remove sparse file");
+    fixture.write("dense.txt", b"two\n");
+
+    assert!(matches!(
+        stage(&fixture, &["sparse.txt", "dense.txt"]),
+        MutationOutcome::Applied { .. }
+    ));
+    // Absent by design, not deleted.
+    assert_eq!(
+        fixture.text(&["ls-files", "--stage", "-t", "sparse.txt"]),
+        sparse
+    );
+    assert_eq!(
+        fixture.text(&["diff", "--cached", "--name-only"]),
+        "dense.txt"
+    );
+}
+
+#[test]
+fn staging_applies_attributes_resolves_conflicts_and_records_gitlinks() {
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write(".gitattributes", b"*.txt text\n");
+    fixture.write("c.txt", b"base\n");
+    fixture.write(".gitignore", b"*.log\n");
+    fixture.write("tracked.log", b"one\n");
+    fixture.git_in_work(&["add", "-A", "--force"]);
+    fixture.commit("initial");
+    fixture.git_in_work(&["checkout", "--quiet", "-b", "side"]);
+    fixture.write("c.txt", b"theirs\n");
+    fixture.commit_all("theirs");
+    fixture.git_in_work(&["checkout", "--quiet", "main"]);
+    fixture.write("c.txt", b"ours\n");
+    fixture.commit_all("ours");
+    fixture.run_failing(&fixture.work(), &["merge", "--no-edit", "side"]);
+    fixture.write("c.txt", b"resolved\r\n");
+    // An ignored file that is already tracked is staged like any other.
+    fixture.write("tracked.log", b"two\n");
+    fs::create_dir(fixture.work().join("nested")).expect("nested directory");
+    fixture.run(&fixture.work().join("nested"), &["init", "-b", "main", "."]);
+    fixture.run(
+        &fixture.work().join("nested"),
+        &["commit", "--quiet", "--allow-empty", "-m", "nested"],
+    );
+    let nested = fixture.run(&fixture.work().join("nested"), &["rev-parse", "HEAD"]);
+
+    assert!(matches!(
+        stage(&fixture, &["c.txt", "tracked.log", "nested"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(fixture.text(&["ls-files", "--unmerged"]), "");
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", ":c.txt"]),
+        b"resolved\n"
+    );
+    assert_eq!(
+        fixture.git_in_work(&["cat-file", "blob", ":tracked.log"]),
+        b"two\n"
+    );
+    let gitlink = fixture.text(&["ls-files", "--stage", "nested"]);
+    assert_eq!(
+        gitlink,
+        format!(
+            "160000 {} 0\tnested",
+            String::from_utf8_lossy(&nested).trim()
+        )
+    );
+
+    assert!(matches!(
+        unstage(&fixture, &["nested"]),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(fixture.text(&["ls-files", "nested"]), "");
+}
+
+#[cfg(unix)]
+#[test]
+fn staging_and_unstaging_keep_newline_and_non_utf8_names_exact() {
+    use std::os::unix::ffi::OsStrExt;
+    let Some(fixture) = Fixture::new() else {
+        return;
+    };
+    fixture.write("base.txt", b"base\n");
+    fixture.git_in_work(&["add", "-A"]);
+    fixture.commit("initial");
+    let names = [
+        b"line\nbreak".as_slice(),
+        b"non-utf8-\xff",
+        b"-leading space",
+    ];
+    for name in names {
+        fs::write(fixture.work().join(OsStr::from_bytes(name)), b"new\n").expect("write");
+    }
+    let selection: Vec<_> = names
+        .iter()
+        .map(|name| PathSelection::new(RepoPath::from_bytes(name).expect("path")))
+        .collect();
+    let service = fixture.service();
+    assert!(matches!(
+        service
+            .stage(
+                &StageRequest {
+                    worktree: fixture.work(),
+                    selection: selection.clone(),
+                },
+                &CancellationToken::new(),
+            )
+            .expect("stage"),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(
+        fixture.git_in_work(&["diff", "--cached", "--name-only", "-z"]),
+        b"-leading space\0line\nbreak\0non-utf8-\xff\0"
+    );
+    assert!(matches!(
+        service
+            .unstage(
+                &UnstageRequest {
+                    worktree: fixture.work(),
+                    selection,
+                },
+                &CancellationToken::new(),
+            )
+            .expect("unstage"),
+        MutationOutcome::Applied { .. }
+    ));
+    assert_eq!(fixture.text(&["ls-files"]), "base.txt");
+}
+
 #[test]
 fn literal_pathspecs_stage_only_the_named_file() {
     let Some(fixture) = Fixture::new() else {
@@ -1442,10 +1665,9 @@ fn a_commit_date_git_cannot_normalise_costs_only_its_own_row() {
 ///
 /// This is a claim about a refusal and not about `restore` as a whole:
 /// `a_restore_that_failed_inside_its_write_loop_never_says_nothing_happened`
-/// covers the other side, where Git exits 255 having destroyed work. `git add`
-/// is different again and genuinely applies what it could.
+/// covers the other side, where Git exits 255 having destroyed work.
 #[test]
-fn a_refused_restore_changed_nothing_and_a_refused_add_may_have() {
+fn a_refused_restore_or_stage_changed_nothing() {
     let Some(fixture) = Fixture::new() else {
         return;
     };
@@ -1531,23 +1753,10 @@ fn a_refused_restore_changed_nothing_and_a_refused_add_may_have() {
     );
     fixture.git_in_work(&["merge", "--abort"]);
 
-    // `git add` really is partial: it stages what it could before failing.
+    // `git add` refuses an untracked ignored file, as must staging one that
+    // became ignored after status listed it; this refuses the whole request.
     fixture.write("ignored.txt", b"ignored\n");
     fixture.write("good.txt", b"good\n");
-    let stderr = fixture.run_failing(
-        &fixture.work(),
-        &["add", "-A", "--", "good.txt", "ignored.txt"],
-    );
-    assert!(
-        stderr.contains("ignored by one of your .gitignore files"),
-        "git's reason changed: {stderr}"
-    );
-    assert_eq!(
-        fixture.text(&["diff", "--cached", "--name-only"]),
-        "good.txt"
-    );
-    fixture.git_in_work(&["restore", "--staged", "good.txt"]);
-
     let outcome = service
         .stage(
             &StageRequest {
@@ -1560,15 +1769,14 @@ fn a_refused_restore_changed_nothing_and_a_refused_add_may_have() {
             &CancellationToken::new(),
         )
         .expect("stage");
-    assert!(
-        matches!(outcome, MutationOutcome::OutcomeUnknown { .. }),
-        "an add that staged one of two paths is exactly an unknown outcome: {outcome:?}"
-    );
-    assert_eq!(
-        fixture.text(&["diff", "--cached", "--name-only"]),
-        "good.txt",
-        "and the outcome is unknown because this really did happen"
-    );
+    let MutationOutcome::NotApplied {
+        failure: MutationFailure::Rejected { reason },
+    } = outcome
+    else {
+        panic!("an ignored path refuses the stage: {outcome:?}");
+    };
+    assert!(reason.starts_with("ignored.txt:"), "{reason}");
+    assert_eq!(fixture.text(&["diff", "--cached", "--name-only"]), "");
 }
 
 /// Git reports an untracked nested repository as its directory even under
@@ -2401,7 +2609,7 @@ fn bare_refs(fixture: &Fixture) -> Vec<String> {
 /// Pathspec magic, whitespace, newlines and leading dashes remain literal
 /// paths in the NUL-delimited stdin protocol rather than becoming arguments.
 #[test]
-fn staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin() {
+fn staging_command_keeps_literal_paths_in_nul_delimited_stdin() {
     let service: RepositoryService<IsolatedExecutor> =
         RepositoryService::new("git", Arc::new(IsolatedExecutor(SystemProcessExecutor)));
     let command = service
@@ -2415,11 +2623,7 @@ fn staging_command_keeps_literal_pathspecs_in_nul_delimited_stdin() {
             ],
         )
         .expect("stage command");
-    assert_eq!(command.arguments[0], OsString::from("--literal-pathspecs"));
-    assert_eq!(
-        &command.arguments[command.arguments.len() - 4..],
-        ["add", "-A", "--pathspec-from-file=-", "--pathspec-file-nul"].map(OsString::from)
-    );
+    assert_eq!(command.arguments.last(), Some(&OsString::from("--stdin")));
     assert_eq!(
         command.stdin.as_deref(),
         Some(b":(top)magic.txt\0space name.txt\0line\nbreak.txt\0-leading.txt\0".as_slice())
