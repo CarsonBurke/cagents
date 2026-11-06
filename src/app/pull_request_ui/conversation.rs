@@ -37,6 +37,9 @@ pub struct State {
     pub(super) conversation: Option<TerminalId>,
     revision: u64,
     list: Option<Arc<ConversationPullRequests>>,
+    /// The previous conversation listed pull requests, so the tab stays
+    /// while this one's list is on its way rather than flickering away.
+    listed_before: bool,
     pub(super) all_mentions: bool,
 }
 
@@ -61,7 +64,12 @@ impl State {
             Watch::Lost {
                 conversation,
                 error,
-            } => tracing::debug!(%conversation, %error, "conversation pull requests unavailable"),
+            } => {
+                if self.conversation == Some(conversation) {
+                    self.listed_before = false;
+                }
+                tracing::debug!(%conversation, %error, "conversation pull requests unavailable")
+            }
         }
     }
 
@@ -76,6 +84,7 @@ impl State {
         *self = Self {
             card,
             conversation,
+            listed_before: conversation.is_some() && self.lists_any(),
             ..Self::default()
         };
         true
@@ -88,10 +97,26 @@ impl State {
     }
 
     pub(super) fn lists(&self, key: &PullRequestKey) -> bool {
-        self.rows()
-            .iter()
-            .any(|row| row_key(row).as_ref() == Some(key))
+        self.rows().iter().any(|row| names(row, key))
     }
+
+    /// Whether the conversation lists pull requests, or listed some before
+    /// it changed and its new list has not arrived yet.
+    pub(super) fn lists_any(&self) -> bool {
+        match &self.list {
+            Some(list) => !list.pull_requests.is_empty(),
+            None => self.listed_before,
+        }
+    }
+}
+
+/// GitHub names repositories case-insensitively.
+pub(super) fn same_pull_request(a: &PullRequestKey, b: &PullRequestKey) -> bool {
+    a.number == b.number && a.repository.same_repository(&b.repository)
+}
+
+fn names(row: &ConversationPullRequest, key: &PullRequestKey) -> bool {
+    row.number == key.number && row.repository.same_repository(&key.repository)
 }
 
 pub(super) fn row_key(row: &ConversationPullRequest) -> Option<PullRequestKey> {
@@ -233,7 +258,7 @@ pub(super) fn view<'a>(
         ];
         if let Some(title) = title.filter(|_| label == "Worked on" || worked_on_empty(list)) {
             parts.push(
-                design::caption(format!("in {title}"))
+                design::caption(format!("· {title}"))
                     .wrapping(iced::widget::text::Wrapping::None)
                     .ellipsize(iced::widget::text::Ellipsize::End(
                         iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -333,7 +358,11 @@ fn note<'a>(list: &ConversationPullRequests) -> Option<Element<'a, Action>> {
 /// What the row's pull request is called: its title, after its repository
 /// when that is not the conversation's.
 fn name(list: &ConversationPullRequests, row: &ConversationPullRequest) -> String {
-    let number = if list.repository.as_ref() == Some(&row.repository) {
+    let number = if list
+        .repository
+        .as_ref()
+        .is_some_and(|own| own.same_repository(&row.repository))
+    {
         format!("#{}", row.number)
     } else {
         format!("{}#{}", repository_label(&row.repository), row.number)
@@ -446,7 +475,7 @@ fn worked_on_row<'a>(
         .into(),
     ])
     .spacing(space::XXS);
-    let current = selected.is_some_and(|key| row_key(row).as_ref() == Some(key));
+    let current = selected.is_some_and(|key| names(row, key));
     crate::interaction::hover(
         widget::button::custom(lines)
             .name(format!("Show {name}"))
@@ -485,7 +514,7 @@ fn mentioned_row<'a>(
         parts.push(design::caption("by a subagent").into());
     }
     parts.push(link_out(row));
-    let current = selected.is_some_and(|key| row_key(row).as_ref() == Some(key));
+    let current = selected.is_some_and(|key| names(row, key));
     crate::interaction::hover(
         widget::button::custom(
             widget::row::with_children(parts)

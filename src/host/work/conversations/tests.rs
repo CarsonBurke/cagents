@@ -70,6 +70,7 @@ fn facts(directory: &str) -> Facts {
             })),
             local: Some(Arc::new(local)),
             forge_error: None,
+            synced_at_unix_ms: Some(1_000),
         }),
     }
 }
@@ -243,6 +244,42 @@ fn the_list_ranks_worked_on_first_and_marks_the_current_branch() {
 }
 
 #[test]
+fn rows_use_the_repository_s_own_spelling_and_the_board_s_sync_time() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut snapshot = (**project.snapshot.as_ref().unwrap()).clone();
+    snapshot.repository = GitHubRepoKey::new("github.com", None, "Me", "Repo").unwrap();
+    project.snapshot = Some(Arc::new(snapshot));
+    let watched = watched(&[(
+        Reference::PullRequest(key("me", 1)),
+        Relation::Mentioned,
+        false,
+    )]);
+    let first = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    let row = &first.pull_requests[0];
+    // The key is kept in one case, but the row names the repository as the
+    // board does, so the panel knows it is the conversation's own.
+    assert_eq!(Some(&row.repository), first.repository.as_ref());
+    // A listed row is as old as the board's sync, so a later pass with
+    // nothing new sends the same list.
+    assert_eq!(row.observed_at_unix_ms, Some(1_000));
+    let second = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(first.pull_requests, second.pull_requests);
+}
+
+#[test]
 fn the_current_branch_s_pull_request_is_listed_before_anything_touches_it() {
     let facts = facts("/w/app/.worktrees/feat/src");
     let list = assemble(
@@ -262,6 +299,36 @@ fn the_current_branch_s_pull_request_is_listed_before_anything_touches_it() {
         None,
     );
     assert!(list.pull_requests.is_empty());
+}
+
+#[test]
+fn an_old_merged_pull_request_of_the_branch_is_listed_only_once_touched() {
+    let mut facts = facts("/w/app");
+    let project = facts.project.as_mut().unwrap();
+    let mut local = (**project.local.as_ref().unwrap()).clone();
+    local.worktrees[0].branch = Some("old".into());
+    project.local = Some(Arc::new(local));
+    let list = assemble(
+        &Watched::new(),
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert!(list.pull_requests.is_empty());
+    let watched = watched(&[(
+        Reference::CurrentBranch { directory: None },
+        Relation::Pushed,
+        false,
+    )]);
+    let list = assemble(
+        &watched,
+        Some(&facts),
+        &BTreeMap::new(),
+        &BTreeMap::new(),
+        None,
+    );
+    assert_eq!(rows(&list), vec![(2, Relation::Pushed, true, false)]);
 }
 
 #[test]
@@ -557,4 +624,29 @@ fn a_long_transcript_is_read_from_its_newest_part_and_says_so() {
     // The cut-off line is skipped rather than read from its middle.
     assert_eq!(numbers(&watched), vec![7]);
     assert_eq!(watched.coverage, TranscriptCoverage::Partial);
+}
+
+#[test]
+fn work_on_the_current_branch_stays_with_that_branch_after_a_switch() {
+    let mut watched = Watched::new();
+    let push = |directory: Option<&str>| transcript::Found {
+        signal: Signal {
+            reference: Reference::CurrentBranch {
+                directory: directory.map(str::to_owned),
+            },
+            relation: Relation::Pushed,
+        },
+        by_subagent: false,
+    };
+    watched.apply(
+        Scanned {
+            found: vec![push(None), push(Some(".worktrees/feat"))],
+            coverage: TranscriptCoverage::Complete,
+        },
+        Some(&facts("/w/app")),
+    );
+    assert_eq!(
+        watched.references.keys().cloned().collect::<Vec<_>>(),
+        vec![branch(None, "feat"), branch(None, "main")]
+    );
 }

@@ -50,6 +50,41 @@ fn gh_pr_create_output_names_the_created_pull_request() {
 }
 
 #[test]
+fn only_the_url_create_prints_last_is_created_and_a_failed_create_creates_nothing() {
+    // The script's output is shared: #5 is what `gh pr view` printed.
+    let signals = command(
+        "gh pr view 5 --json url && gh pr create --fill",
+        "{\"url\":\"https://github.com/o/r/pull/5\"}\nhttps://github.com/o/r/pull/6\n",
+        Some(true),
+    );
+    assert_eq!(
+        of(&signals),
+        vec![
+            (key("o", "r", 6), Relation::Created),
+            (Reference::Number(5), Relation::Mentioned),
+        ]
+    );
+    let signals = command(
+        "gh pr create --fill",
+        "could not create: https://github.com/o/r/pull/7 is not reachable",
+        Some(false),
+    );
+    assert!(of(&signals).is_empty());
+}
+
+#[test]
+fn gh_flags_with_and_without_values_keep_the_selector() {
+    assert_eq!(
+        of(&command("gh pr checks --fail-fast 12", "", Some(true))),
+        vec![(Reference::Number(12), Relation::Mentioned)]
+    );
+    assert_eq!(
+        of(&command("gh pr view --color never 13", "", Some(true))),
+        vec![(Reference::Number(13), Relation::Mentioned)]
+    );
+}
+
+#[test]
 fn an_existing_pull_request_reported_by_create_is_the_branch_s_not_a_new_one() {
     let signals = command(
         "gh pr create --fill",

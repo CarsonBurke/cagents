@@ -640,7 +640,7 @@ fn gh(
                     | "--branch"
                     | "--remote-name"
                     | "--interval"
-                    | "--fail-fast"
+                    | "--color"
             ) && !arg.contains('=')
             {
                 iter.next();
@@ -658,8 +658,13 @@ fn gh(
     let selector = positionals.get(2).copied();
     let relation = match subcommand {
         "create" | "new" => {
+            if succeeded == Some(false) && !output.contains("already exists") {
+                return;
+            }
             let existing = output.contains("already exists");
-            for key in pull_request_urls(output) {
+            // gh prints the pull request last; the rest of the output may be
+            // another command's, sharing this one's in a script.
+            if let Some(key) = pull_request_urls(output).pop() {
                 let relation = if existing {
                     Relation::Pushed
                 } else {

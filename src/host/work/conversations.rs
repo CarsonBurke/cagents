@@ -41,6 +41,9 @@ mod tests;
 /// How often a watched conversation's transcript is read again.
 const TICK: Duration = Duration::from_secs(2);
 const UNWATCHED: Duration = Duration::from_secs(60 * 60);
+/// How long what was read of an unwatched conversation is kept, so coming
+/// back to it, or showing the inspector again, does not read it all again.
+const KEPT_UNWATCHED: Duration = Duration::from_secs(10 * 60);
 /// The most of one file read in a pass; a larger backlog continues next pass.
 const READ_PER_PASS: u64 = 8 * 1024 * 1024;
 /// The newest part of a transcript read when it is first watched.
@@ -153,6 +156,10 @@ struct Watched {
     coverage: TranscriptCoverage,
     revision: u64,
     sent: Option<ConversationPullRequests>,
+    unwatched_since: Option<Instant>,
+    /// The provider's conversation ID `source` was located for, so finding
+    /// the transcript, a search for Codex, happens once per conversation ID.
+    located_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -202,7 +209,34 @@ impl Watched {
             coverage: TranscriptCoverage::Pending,
             revision: 0,
             sent: None,
+            unwatched_since: None,
+            located_id: None,
         }
+    }
+
+    /// Records what a read found. A command run on "the current branch" is
+    /// pinned to the branch checked out now, so a later switch does not move
+    /// it to another branch's pull request.
+    fn apply(&mut self, scanned: Scanned, facts: Option<&Facts>) {
+        for mut found in scanned.found {
+            if let (Reference::CurrentBranch { directory }, Some(facts)) =
+                (&found.signal.reference, facts)
+                && let Some(branch) = facts.project.as_ref().and_then(|project| {
+                    let directory = match directory {
+                        Some(directory) => normalize(&facts.directory.join(directory)),
+                        None => facts.directory.clone(),
+                    };
+                    project.worktree(&directory)?.branch.clone()
+                })
+            {
+                found.signal.reference = Reference::Branch {
+                    repository: None,
+                    name: branch,
+                };
+            }
+            self.record(found);
+        }
+        self.coverage = scanned.coverage;
     }
 
     fn record(&mut self, found: transcript::Found) {
@@ -245,6 +279,8 @@ struct ProjectFacts {
     snapshot: Option<Arc<forge::Snapshot>>,
     local: Option<Arc<super::scan::Local>>,
     forge_error: Option<String>,
+    /// When the board last listed the project's pull requests.
+    synced_at_unix_ms: Option<u64>,
 }
 
 impl ProjectFacts {
@@ -252,6 +288,16 @@ impl ProjectFacts {
         self.snapshot
             .as_deref()
             .map(|snapshot| &snapshot.repository)
+    }
+
+    /// Whether one of the project's worktrees has `branch` checked out.
+    fn has_branch(&self, branch: &str) -> bool {
+        self.local.as_deref().is_some_and(|local| {
+            local
+                .worktrees
+                .iter()
+                .any(|worktree| worktree.branch.as_deref() == Some(branch))
+        })
     }
 
     /// The worktree containing `directory`, the deepest when they nest.
@@ -329,6 +375,7 @@ impl Handle {
             .entry(conversation)
             .or_insert_with(Watched::new);
         watched.watchers.insert(client, delivery);
+        watched.unwatched_since = None;
         let list = assemble(watched, facts.as_ref(), &observed, &branches, forge_error);
         let mut comparable = list.clone();
         comparable.generated_at_unix_ms = 0;
@@ -378,31 +425,60 @@ impl Handle {
                 watched
                     .watchers
                     .retain(|_, delivery| delivery.strong_count() > 0);
-                !watched.watchers.is_empty()
+                if watched.watchers.is_empty() {
+                    let since = *watched.unwatched_since.get_or_insert_with(Instant::now);
+                    since.elapsed() < KEPT_UNWATCHED
+                } else {
+                    watched.unwatched_since = None;
+                    true
+                }
             });
-            state.watched.keys().copied().collect::<Vec<_>>()
+            state
+                .watched
+                .iter()
+                .filter(|(_, watched)| !watched.watchers.is_empty())
+                .map(|(conversation, _)| *conversation)
+                .collect::<Vec<_>>()
         };
         if conversations.is_empty() {
             return false;
         }
         let mut facts = BTreeMap::new();
         for conversation in &conversations {
-            let located = locate(host, *conversation);
+            let known = self
+                .conversations()
+                .watched
+                .get(conversation)
+                .and_then(|watched| watched.located_id.clone());
+            let located = locate(host, *conversation, known.as_deref());
             facts.insert(*conversation, self.facts(host, *conversation));
-            let mut state = self.conversations();
-            let Some(watched) = state.watched.get_mut(conversation) else {
-                continue;
+            let (source, mut cursors) = {
+                let mut state = self.conversations();
+                let Some(watched) = state.watched.get_mut(conversation) else {
+                    continue;
+                };
+                if let Some((id, source)) = located {
+                    watched.located_id = Some(id);
+                    if watched.source != source {
+                        // A new conversation ID, after `/clear` or a resume,
+                        // is a new transcript.
+                        watched.source = source;
+                        watched.files.clear();
+                        watched.references.clear();
+                    }
+                }
+                (watched.source.clone(), std::mem::take(&mut watched.files))
             };
-            if let Some(source) = located
-                && watched.source != source
+            // Watching and unwatching take the same lock, so the files are
+            // read without it. Only this thread moves the cursors.
+            let scanned = scan(&source, &mut cursors);
+            let mut state = self.conversations();
+            if let Some(watched) = state.watched.get_mut(conversation)
+                && watched.source == source
             {
-                // A new conversation ID, after `/clear` or a resume, is a new
-                // transcript.
-                watched.source = source;
-                watched.files.clear();
-                watched.references.clear();
+                watched.files = cursors;
+                watched.apply(scanned, facts.get(conversation).and_then(Option::as_ref));
             }
-            read(watched);
         }
         self.look_up(&conversations, &facts);
         let mut state = self.conversations();
@@ -480,6 +556,10 @@ impl Handle {
                     crate::work::Forge::Synced { error, .. } => error.clone(),
                     crate::work::Forge::Pending | crate::work::Forge::NotGitHub => None,
                 },
+                synced_at_unix_ms: match &tracked.forge {
+                    crate::work::Forge::Synced { at_unix_ms, .. } => Some(*at_unix_ms),
+                    _ => None,
+                },
             };
             if new {
                 self.0.scanner.notify();
@@ -526,6 +606,16 @@ impl Handle {
                                 keys.push(key);
                             }
                         }
+                        // A name merely checked out may be a path or a branch
+                        // never pushed; GitHub is asked about it only while a
+                        // worktree has it.
+                        Resolved::Branch { branch, .. }
+                            if aggregate.relation == Relation::CheckedOut
+                                && matches!(reference, Reference::Branch { .. })
+                                && !facts
+                                    .project
+                                    .as_ref()
+                                    .is_some_and(|project| project.has_branch(&branch)) => {}
                         Resolved::Branch { base, head, branch } => {
                             let lookup = (RepoKeyOrd::from(&base), RepoKeyOrd::from(&head), branch);
                             if !branches.contains(&lookup) {
@@ -571,6 +661,17 @@ impl Handle {
                     );
                     state.succeeded();
                 }
+                // GitHub answered, about this branch only: it has no single
+                // pull request here. That is not GitHub being unreachable.
+                Err(error) if answered(&error) => {
+                    state.branches.insert(
+                        (base_key, branch),
+                        BranchLookup {
+                            number: None,
+                            checked: Instant::now(),
+                        },
+                    );
+                }
                 Err(error) => {
                     state.failed(&error);
                     return;
@@ -592,7 +693,7 @@ impl Handle {
                     *entry = observed_now(board::convert(&found, false));
                     state.succeeded();
                 }
-                Err(error) if not_a_pull_request(&error) => {
+                Err(error) if answered(&error) => {
                     entry.missing = true;
                     entry.failures = 0;
                 }
@@ -618,13 +719,19 @@ fn observed_now(pull_request: PullRequest) -> Observed {
 
 /// GitHub answered that this number names no pull request: an issue, or
 /// nothing at all. Neither changes soon.
-fn not_a_pull_request(error: &GitHubError) -> bool {
+/// GitHub answered about this one pull request or branch: it is not one,
+/// its repository does not exist or is hidden, or several match. Unlike a
+/// failure to reach GitHub, this says nothing about any other lookup.
+fn answered(error: &GitHubError) -> bool {
     let text = match error {
         GitHubError::Process(failure) => String::from_utf8_lossy(&failure.stderr).into_owned(),
-        GitHubError::InvalidResponse { source, .. } => return not_a_pull_request(source),
+        GitHubError::InvalidResponse { source, .. } => return answered(source),
+        GitHubError::Inspection(_) | GitHubError::Validation(_) => return true,
         error => error.to_string(),
     };
-    text.contains("Could not resolve to a PullRequest") || text.contains("no pull requests found")
+    text.contains("Could not resolve to a PullRequest")
+        || text.contains("Could not resolve to a Repository")
+        || text.contains("no pull requests found")
 }
 
 /// A conversation's references, worked-on first, strongest first, then most
@@ -817,19 +924,47 @@ fn assemble(
             if pull_request.is_none() && named_by_number && !current_branch {
                 return None;
             }
+            // Nothing in the conversation touched the branch's pull request,
+            // so it is listed only while it is still the branch's: open, or
+            // at the checkout's commit. An old merged one is not.
+            if current_branch && aggregate.seen == 0 {
+                let head = facts
+                    .zip(project)
+                    .and_then(|(facts, project)| project.worktree(&facts.directory))
+                    .and_then(|worktree| worktree.head.as_ref())
+                    .map(|head| head.oid.as_str());
+                let still_the_branch_s = pull_request.as_ref().is_some_and(|found| {
+                    found.state == crate::work::PullRequestState::Open
+                        || head.is_some_and(|head| found.head_oid == head)
+                });
+                if !still_the_branch_s {
+                    return None;
+                }
+            }
             let observed_at_unix_ms = match (&pull_request, observation) {
                 (Some(_), Some(observation)) if observation.pull_request.is_some() => {
                     observation.observed_at_unix_ms
                 }
-                (Some(_), _) => project
-                    .and_then(|project| project.snapshot.as_ref())
-                    .map(|_| now_unix_ms()),
+                // The board's listing is as old as its last sync, which a
+                // later pass does not change.
+                (Some(_), _) => project.and_then(|project| project.synced_at_unix_ms),
                 (None, _) => None,
+            };
+            // The key is kept in one case; show the spelling GitHub uses.
+            let spelled = GitHubRepoKey::from(&key.repository);
+            let canonical = match (&repository, &pull_request) {
+                (Some(own), _) if own.same_repository(&spelled) => own.clone(),
+                (_, Some(pull_request)) => PullRequestKey::from_url(&pull_request.url)
+                    .ok()
+                    .map(|found| found.repository)
+                    .filter(|found| found.same_repository(&spelled))
+                    .unwrap_or(spelled),
+                _ => spelled,
             };
             Some((
                 aggregate.seen,
                 ConversationPullRequest {
-                    repository: GitHubRepoKey::from(&key.repository),
+                    repository: canonical,
                     number: key.number,
                     relation: aggregate.relation,
                     by_subagent: aggregate.by_subagent,
@@ -860,7 +995,13 @@ fn assemble(
 
 /// Where a conversation's provider keeps its transcript, once it has
 /// reported which conversation it is.
-fn locate(host: &SharedHost, conversation: TerminalId) -> Option<Source> {
+///
+/// Returns nothing new while the conversation ID is still `known`.
+fn locate(
+    host: &SharedHost,
+    conversation: TerminalId,
+    known: Option<&str>,
+) -> Option<(String, Source)> {
     let (provider, recipe, session_id) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let record = state.chats.get(&conversation)?;
@@ -874,29 +1015,38 @@ fn locate(host: &SharedHost, conversation: TerminalId) -> Option<Source> {
         )
     };
     let id = session_id?;
+    if known == Some(id.as_str()) {
+        return None;
+    }
     let root = provider.session_root(&recipe)?;
     let directory = std::fs::canonicalize(&recipe.working_directory)
         .unwrap_or_else(|_| recipe.working_directory.clone());
     match provider {
         Provider::Claude => {
             let transcript = crate::agent::claude_transcript(&root, &directory, &id).ok()?;
-            Some(Source::Located(Located {
-                format: Format::Claude,
-                directory,
-                subagents: Some(transcript.with_extension("").join("subagents")),
-                transcript,
-            }))
+            Some((
+                id,
+                Source::Located(Located {
+                    format: Format::Claude,
+                    directory,
+                    subagents: Some(transcript.with_extension("").join("subagents")),
+                    transcript,
+                }),
+            ))
         }
         Provider::Codex => {
             let transcript = codex_rollout(&root.join("sessions"), &id)?;
-            Some(Source::Located(Located {
-                format: Format::Codex,
-                directory,
-                transcript,
-                subagents: None,
-            }))
+            Some((
+                id,
+                Source::Located(Located {
+                    format: Format::Codex,
+                    directory,
+                    transcript,
+                    subagents: None,
+                }),
+            ))
         }
-        Provider::Omp => Some(Source::Unsupported),
+        Provider::Omp => Some((id, Source::Unsupported)),
     }
 }
 
@@ -939,19 +1089,38 @@ fn codex_rollout(sessions: &Path, id: &str) -> Option<PathBuf> {
 
 /// Reads what each of the conversation's transcript files gained since the
 /// last pass.
+#[cfg(test)]
 fn read(watched: &mut Watched) {
-    let located = match &watched.source {
+    let scanned = scan(&watched.source, &mut watched.files);
+    watched.apply(scanned, None);
+}
+
+/// What one read of a conversation's transcripts found.
+struct Scanned {
+    found: Vec<transcript::Found>,
+    coverage: TranscriptCoverage,
+}
+
+/// Reads the new part of a conversation's transcripts. It needs only the
+/// cursors, so no lock is held while it reads.
+fn scan(source: &Source, cursors: &mut BTreeMap<PathBuf, Cursor>) -> Scanned {
+    let located = match source {
         Source::Pending => {
-            watched.coverage = TranscriptCoverage::Pending;
-            return;
+            return Scanned {
+                found: Vec::new(),
+                coverage: TranscriptCoverage::Pending,
+            };
         }
         Source::Unsupported => {
-            watched.coverage = TranscriptCoverage::Unsupported;
-            return;
+            return Scanned {
+                found: Vec::new(),
+                coverage: TranscriptCoverage::Unsupported,
+            };
         }
         Source::Located(located) => located.clone(),
     };
     let mut files = vec![(located.transcript.clone(), false)];
+    let mut capped = false;
     if let Some(subagents) = &located.subagents {
         let mut children = std::fs::read_dir(subagents)
             .into_iter()
@@ -967,7 +1136,15 @@ fn read(watched: &mut Watched) {
                         .is_some_and(|name| name.starts_with("agent-"))
             })
             .collect::<Vec<_>>();
-        children.sort();
+        // The newest subagents are read when there are too many to read.
+        capped = children.len() > SUBAGENTS;
+        children.sort_by_cached_key(|path| {
+            std::cmp::Reverse(
+                std::fs::metadata(path)
+                    .and_then(|metadata| metadata.modified())
+                    .ok(),
+            )
+        });
         files.extend(
             children
                 .into_iter()
@@ -979,7 +1156,7 @@ fn read(watched: &mut Watched) {
     let mut unavailable = None;
     let mut found = Vec::new();
     for (path, subagent) in files {
-        match read_file(watched, &path, located.format, subagent, &mut found) {
+        match read_file(cursors, &path, located.format, subagent, &mut found) {
             Ok(caught_up) => complete &= caught_up,
             Err(error) if error.kind() == io::ErrorKind::NotFound && subagent => {}
             Err(error) => {
@@ -989,21 +1166,19 @@ fn read(watched: &mut Watched) {
             }
         }
     }
-    for found in found {
-        watched.record(found);
-    }
-    let truncated = watched.files.values().any(|cursor| cursor.truncated);
-    watched.coverage = match unavailable {
-        Some(reason) if watched.files.is_empty() => TranscriptCoverage::Unavailable { reason },
+    let truncated = cursors.values().any(|cursor| cursor.truncated);
+    let coverage = match unavailable {
+        Some(reason) if cursors.is_empty() => TranscriptCoverage::Unavailable { reason },
         _ if !complete => TranscriptCoverage::Pending,
-        _ if truncated => TranscriptCoverage::Partial,
+        _ if truncated || capped => TranscriptCoverage::Partial,
         _ => TranscriptCoverage::Complete,
     };
+    Scanned { found, coverage }
 }
 
 /// Reads the new part of one file, and reports whether it reached the end.
 fn read_file(
-    watched: &mut Watched,
+    cursors: &mut BTreeMap<PathBuf, Cursor>,
     path: &Path,
     format: Format,
     subagent: bool,
@@ -1019,7 +1194,7 @@ fn read_file(
     }
     let identity = (metadata.dev(), metadata.ino());
     let size = metadata.len();
-    let cursor = watched.files.entry(path.to_owned()).or_insert_with(|| {
+    let cursor = cursors.entry(path.to_owned()).or_insert_with(|| {
         let start = size.saturating_sub(FIRST_READ);
         // Starting mid-file, the first line is whole only when the byte
         // before it ends a line.

@@ -1229,8 +1229,11 @@ impl Cagents {
             Action::Choose(key) => {
                 // The active branch's own pull request is shown as the
                 // branch's, which also compares it with the local head.
-                self.pull_request_inspector.chosen =
-                    key.filter(|key| self.active_branch_pull_request().as_ref() != Some(key));
+                self.pull_request_inspector.chosen = key.filter(|key| {
+                    !self
+                        .active_branch_pull_request()
+                        .is_some_and(|active| conversation::same_pull_request(&active, key))
+                });
                 return self.sync_pull_request_inspector();
             }
             Action::Conversation(watch) => {
@@ -1390,7 +1393,7 @@ impl Cagents {
     /// Whether the inspected conversation names any pull request, which
     /// opens the pull request tab even where no worktree branch would.
     pub(super) fn conversation_lists_pull_requests(&self) -> bool {
-        !self.pull_request_inspector.conversation.rows().is_empty()
+        self.pull_request_inspector.conversation.lists_any()
     }
 
     /// The inspected conversation's pull requests, watched while the
@@ -1611,10 +1614,26 @@ impl Cagents {
             .map(|card| card.title.as_str())
             .filter(|title| !title.is_empty());
         let list = conversation::view(&state.conversation, title, selected.as_ref());
-        let detail: Element<'_, Action> = match list {
-            // Without a branch or a choice, the list is the panel's content.
-            Some(_) if state.target.is_none() => widget::container(
-                design::caption("Choose a pull request to see its checks and discussion.")
+        // Without a branch or a choice, or on a branch with no pull request,
+        // the list is the panel's content.
+        let prompt = match &state.target {
+            None => Some("Choose a pull request to see its checks and discussion.".to_owned()),
+            Some(Target::Branch(target))
+                if state.loaded
+                    && state.error.is_none()
+                    && state.inspection.is_none()
+                    && state.pull_request.is_none() =>
+            {
+                Some(format!(
+                    "{} has no pull request. Choose one above to see its checks and discussion.",
+                    target.branch
+                ))
+            }
+            Some(_) => None,
+        };
+        let detail: Element<'_, Action> = match (&list, prompt) {
+            (Some(_), Some(prompt)) => widget::container(
+                design::caption(prompt)
                     .wrapping(iced::widget::text::Wrapping::Word)
                     .width(Length::Fill),
             )
