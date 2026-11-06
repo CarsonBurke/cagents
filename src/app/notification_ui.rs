@@ -138,6 +138,12 @@ pub(super) struct Preview {
     seen: u64,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct VisiblePane {
+    card: CardId,
+    session: Option<TerminalId>,
+}
+
 pub(super) struct State {
     pub snapshot: Snapshot,
     /// Derived once per broker snapshot, never searched during row rendering.
@@ -152,7 +158,7 @@ pub(super) struct State {
     /// workspace: the focused card, window focus, whether the card's pane is
     /// active, and which review a focused pull request pane has open.
     last_focus: Option<(Option<CardId>, bool, bool, Option<u64>)>,
-    visible_focus: Option<CardId>,
+    visible_pane: Option<VisiblePane>,
     visible_notices: BTreeSet<uuid::Uuid>,
     visible_acknowledged: bool,
     acknowledged: BTreeSet<uuid::Uuid>,
@@ -185,7 +191,7 @@ impl Default for State {
             receiver: async_channel::bounded(32).1,
             last_workspace: Weak::new(),
             last_focus: None,
-            visible_focus: None,
+            visible_pane: None,
             visible_notices: BTreeSet::new(),
             visible_acknowledged: false,
             acknowledged: BTreeSet::new(),
@@ -438,19 +444,24 @@ impl Cagents {
         }
     }
 
-    pub(super) fn sync_visible_attention(&mut self) -> Task<Message> {
-        let visible = self
-            .workspace
+    fn visible_attention_owner(&self) -> Option<VisiblePane> {
+        self.workspace
             .focused()
-            .filter(|card| self.pane_is_active(*card));
-        if self.notification_ui.visible_focus == visible {
+            .filter(|card| self.pane_is_active(*card))
+            .map(|card| VisiblePane {
+                card,
+                session: self.card_state(card).and_then(card_session),
+            })
+    }
+
+    pub(super) fn sync_visible_attention(&mut self) -> Task<Message> {
+        let visible = self.visible_attention_owner();
+        if self.notification_ui.visible_pane == visible {
             return Task::none();
         }
-        self.notification_ui.visible_focus = visible;
+        self.notification_ui.visible_pane = visible;
         self.notification_ui.visible_acknowledged = false;
-        let session = visible
-            .and_then(|card| self.card_state(card))
-            .and_then(card_session);
+        let session = visible.and_then(|pane| pane.session);
         self.notification_ui.visible_notices = self
             .notification_ui
             .snapshot
@@ -466,15 +477,25 @@ impl Cagents {
             .collect();
         self.attention_focus_epoch = self.attention_focus_epoch.wrapping_add(1);
         let epoch = self.attention_focus_epoch;
-        visible.map_or_else(Task::none, |card| {
+        visible.map_or_else(Task::none, |pane| {
             cosmic::task::future(async move {
                 tokio::time::sleep(Duration::from_millis(400)).await;
-                Message::AcknowledgeVisiblePane { card, epoch }
+                Message::AcknowledgeVisiblePane {
+                    card: pane.card,
+                    epoch,
+                }
             })
         })
     }
 
     pub(super) fn acknowledge_visible_pane(&mut self) -> Task<Message> {
+        // A conversation can be replaced inside the same focused card. Check
+        // its owner again before consuming a timer's captured journal IDs,
+        // including when replacement precedes the next update-tail sync.
+        let visible = self.visible_attention_owner();
+        if visible.is_none() || self.notification_ui.visible_pane != visible {
+            return self.sync_visible_attention();
+        }
         // The timer owns the notices present at its visibility boundary. A
         // newer opted-in alert must survive an older parent's pending dwell.
         self.notification_ui.visible_acknowledged = true;
@@ -562,7 +583,7 @@ impl Cagents {
         // Delivery presence changes immediately, but implicit Session reads on
         // a visibility return share the sidebar's qualified dwell. Preserve
         // the existing policy for fresh alerts while the parent stays visible.
-        if focused_card == self.notification_ui.visible_focus {
+        if self.notification_ui.visible_pane == self.visible_attention_owner() {
             read.extend(session_read.into_iter().filter(|id| {
                 self.notification_ui.visible_acknowledged
                     || (!focus_changed && !self.notification_ui.visible_notices.contains(id))
@@ -1804,6 +1825,169 @@ mod tests {
         assert_eq!(
             app.notification_ui.pending.lock().unwrap().acknowledged,
             BTreeSet::from([id])
+        );
+    }
+
+    #[test]
+    fn attention_same_card_conversation_replacement_owns_a_new_visibility_dwell() {
+        for previous_dwell_completed in [false, true] {
+            for sync_before_old_timer in [false, true] {
+                let mut app = super::super::tests::context_inspector_test_app(false);
+                drop(app.new_native_chat(Provider::Claude, Some("/tmp".into())));
+                let card = app.workspace.focused().unwrap();
+                let CardKind::Chat(previous) = &app.card_state(card).unwrap().kind else {
+                    panic!("the fixture opens a native chat draft");
+                };
+                let previous = previous.clone();
+                let mut replacement = previous.clone();
+                replacement.id = TerminalId::new();
+                let mut snapshot = attention_snapshot(previous.id);
+                let previous_notice = snapshot.notices[0].id;
+                let replacement_snapshot = attention_snapshot(replacement.id);
+                let replacement_notice = replacement_snapshot.notices[0].id;
+                // The broker journal is global, including sessions this card
+                // does not currently show. Each dwell must capture its owner.
+                snapshot.notices.extend(replacement_snapshot.notices);
+                drop(app.update_notifications(Action::Snapshot(snapshot)));
+                app.core.set_main_window_id(Some(window::Id::RESERVED));
+                app.context_inspector_open = false;
+                app.refresh_ui.focused = true;
+                drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+                let previous_epoch = app.attention_focus_epoch;
+                assert_eq!(
+                    app.notification_ui.focused_session_for_test(),
+                    Some(previous.id)
+                );
+                assert!(!app.notification_ui.acknowledged_for_test(previous_notice));
+                if previous_dwell_completed {
+                    drop(app.update(Message::AcknowledgeVisiblePane {
+                        card,
+                        epoch: previous_epoch,
+                    }));
+                    assert!(app.notification_ui.acknowledged_for_test(previous_notice));
+                }
+
+                // The same accepted producer is used when a first send gets a
+                // fresh identity or a failed first send returns to its draft.
+                app.replace_chat_conversation(card, replacement.clone());
+                drop(app.open_chat(card, replacement.clone(), crate::chat::Intent::Start));
+                assert_eq!(app.workspace.focused(), Some(card));
+                if sync_before_old_timer {
+                    drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+                }
+                drop(app.update(Message::AcknowledgeVisiblePane {
+                    card,
+                    epoch: previous_epoch,
+                }));
+                let replacement_epoch = app.attention_focus_epoch;
+                assert_ne!(replacement_epoch, previous_epoch);
+                assert_eq!(
+                    app.notification_ui.focused_session_for_test(),
+                    Some(replacement.id)
+                );
+                assert_eq!(
+                    app.notification_ui.acknowledged_for_test(previous_notice),
+                    previous_dwell_completed,
+                    "replacement cannot read its predecessor's journal notice"
+                );
+                assert!(
+                    !app.notification_ui
+                        .acknowledged_for_test(replacement_notice),
+                    "neither a stale timer nor an already completed dwell transfers"
+                );
+
+                drop(app.update(Message::AcknowledgeVisiblePane {
+                    card,
+                    epoch: replacement_epoch,
+                }));
+                assert!(
+                    app.notification_ui
+                        .acknowledged_for_test(replacement_notice)
+                );
+                assert_eq!(
+                    app.notification_ui.pending.lock().unwrap().acknowledged,
+                    if previous_dwell_completed {
+                        BTreeSet::from([previous_notice, replacement_notice])
+                    } else {
+                        BTreeSet::from([replacement_notice])
+                    },
+                    "the new dwell queues only notices actually owned by its session"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn attention_terminal_relaunch_does_not_read_its_predecessors_captured_notice() {
+        let mut app = super::super::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        let previous = card_session(app.card_state(card).unwrap()).unwrap();
+        let snapshot = attention_snapshot(previous);
+        let notice = snapshot.notices[0].id;
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        let previous_epoch = app.attention_focus_epoch;
+
+        // Drop the launch task: exercise the real accepted relaunch and its
+        // update tail without starting a terminal or contacting the daemon.
+        drop(app.update(Message::RetryCard(card)));
+        let CardKind::Terminal(replacement) = &app.card_state(card).unwrap().kind else {
+            panic!("relaunch keeps the terminal card");
+        };
+        assert_ne!(replacement.id, previous);
+        assert_eq!(replacement.predecessor, Some(previous));
+        assert_eq!(app.workspace.focused(), Some(card));
+        let replacement_epoch = app.attention_focus_epoch;
+        assert_ne!(replacement_epoch, previous_epoch);
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: previous_epoch,
+        }));
+        drop(app.update(Message::AcknowledgeVisiblePane {
+            card,
+            epoch: replacement_epoch,
+        }));
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        assert!(
+            app.notification_ui
+                .pending
+                .lock()
+                .unwrap()
+                .acknowledged
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn attention_same_conversation_descriptor_enrichment_preserves_its_pending_dwell() {
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        drop(app.new_native_chat(Provider::Claude, Some("/tmp".into())));
+        let card = app.workspace.focused().unwrap();
+        let CardKind::Chat(session) = &app.card_state(card).unwrap().kind else {
+            panic!("the fixture opens a native chat draft");
+        };
+        let mut enriched = session.clone();
+        let snapshot = attention_snapshot(session.id);
+        let notice = snapshot.notices[0].id;
+        drop(app.update_notifications(Action::Snapshot(snapshot)));
+        app.core.set_main_window_id(Some(window::Id::RESERVED));
+        app.context_inspector_open = false;
+        app.refresh_ui.focused = true;
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        let epoch = app.attention_focus_epoch;
+
+        enriched.launch.session_id = Some("provider-enriched-thread".into());
+        app.commit_chat_session(card, enriched);
+        drop(app.update(Message::RefreshUi(refresh_ui::Action::Tick)));
+        assert_eq!(app.attention_focus_epoch, epoch);
+        assert!(!app.notification_ui.acknowledged_for_test(notice));
+        drop(app.update(Message::AcknowledgeVisiblePane { card, epoch }));
+        assert_eq!(
+            app.notification_ui.pending.lock().unwrap().acknowledged,
+            BTreeSet::from([notice])
         );
     }
 
