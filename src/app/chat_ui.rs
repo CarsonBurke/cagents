@@ -9052,7 +9052,7 @@ impl Cagents {
             } else if !snapshot.models.is_empty() || waited >= MODEL_PATIENCE {
                 queued.model = None;
                 runtime.note(format!(
-                    "This conversation does not offer {model}, so the message went to its default model."
+                    "This conversation does not offer {model}, so this message will use its default model."
                 ));
                 self.forget_chat_model(provider, &model);
             } else {
@@ -9113,12 +9113,27 @@ impl Cagents {
             }
             (QueuedStep::Model, Err(error)) => {
                 let model = queued.model.take().map(|(model, _)| model);
-                runtime.note(format!(
-                    "{} could not be chosen ({error}), so the message went to the default model.",
-                    model.as_deref().unwrap_or("The model")
-                ));
-                if let Some(model) = model {
-                    self.forget_chat_model(provider, &model);
+                let name = model.as_deref().unwrap_or("the model");
+                match chat::failure::DeliveryOutcome::parse(&error) {
+                    // Claude did not take the request; the model itself may
+                    // be fine, so it stays on offer.
+                    // Whether the message itself is sent is reported apart.
+                    Some(outcome) if outcome.unknown => runtime.note(format!(
+                        "Claude hasn't confirmed the switch to {name} yet, so this message might not use it."
+                    )),
+                    Some(_) => runtime.note(format!(
+                        "Claude didn't take the switch to {name}, so this message won't use it."
+                    )),
+                    None => {
+                        tracing::warn!(%error, "a queued model choice was refused");
+                        runtime.note(format!(
+                            "{} couldn't be chosen, so this message won't use it.",
+                            model.as_deref().unwrap_or("The model")
+                        ));
+                        if let Some(model) = model {
+                            self.forget_chat_model(provider, &model);
+                        }
+                    }
                 }
                 None
             }
@@ -9146,7 +9161,11 @@ impl Cagents {
             .take()
             .map(|queued| (queued.source.text().to_owned(), queued.attachments));
         let _ = runtime.present();
-        if let Some(error) = error {
+        // A delivery report about a message that arrived anyway says
+        // nothing more the reader can act on.
+        if let Some(error) = error
+            && chat::failure::DeliveryOutcome::parse(&error).is_none()
+        {
             runtime.note(format!(
                 "The first message arrived, but its sending reported: {error}"
             ));
@@ -24295,10 +24314,73 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|note| note.text.contains("does not offer gpt-b")),
+                .any(|note| note.text
+                    == "This conversation does not offer gpt-b, so this message will use its default model."),
             "{:?}",
             runtime.failures
         );
+    }
+
+    /// A model switch that Claude did not take, or has not confirmed, says
+    /// so, and the model stays remembered: delivery failed, not the model.
+    #[test]
+    fn an_undelivered_model_switch_is_reported_and_the_model_kept() {
+        for (outcome, said) in [
+            (
+                chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+                "hasn't confirmed the switch to gpt-b yet, so this message might not use it",
+            ),
+            (
+                chat::failure::delivery::UNCONFIRMED_INPUT,
+                "didn't take the switch to gpt-b, so this message won't use it",
+            ),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let listed = vec![fixture_model("gpt-a", &[]), fixture_model("gpt-b", &[])];
+            let card = queued_on(&mut app, "gpt-b", listed);
+            assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+            let remembered = app.chat_ui.last_models.get(&Provider::Codex).cloned();
+            assert!(remembered.is_some());
+            settle(&mut app, card, Err(outcome.into()));
+            assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+            let notes = &chat_runtime(&app, card).failures;
+            assert!(
+                notes.iter().any(|note| note.text.contains(said)),
+                "{notes:?}"
+            );
+            assert!(
+                notes.iter().all(|note| !note.text.contains(outcome)),
+                "{notes:?}"
+            );
+            assert_eq!(
+                app.chat_ui.last_models.get(&Provider::Codex).cloned(),
+                remembered
+            );
+        }
+        // Any other refusal gives the model up, and its reason goes to the
+        // log rather than the transcript.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let listed = vec![fixture_model("gpt-a", &[]), fixture_model("gpt-b", &[])];
+        let card = queued_on(&mut app, "gpt-b", listed);
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+        settle(
+            &mut app,
+            card,
+            Err("model gpt-b requires another plan".into()),
+        );
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        let notes = &chat_runtime(&app, card).failures;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.text == "gpt-b couldn't be chosen, so this message won't use it."),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.text.contains("another plan")),
+            "{notes:?}"
+        );
+        assert!(!app.chat_ui.last_models.contains_key(&Provider::Codex));
     }
 
     /// A conversation that has not listed its models yet is given time to,

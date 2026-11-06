@@ -420,20 +420,21 @@ impl ControlClient {
             ))
             .into());
         }
-        let closing = matches!(&operation, Operation::Close(_));
+        // Requests that wait on teardown or a durable commit get a longer
+        // budget than an ordinary reply; a caller's own deadline still bounds it.
+        let budget = match &operation {
+            Operation::Close(_) => Some(CHAT_CLOSE_TIMEOUT + Duration::from_secs(35)),
+            Operation::Submit(_) => Some(AGENT_SUBMIT_TIMEOUT),
+            _ => None,
+        }
+        .map(|budget| Instant::now() + budget);
         let request = ClientRequest::Agent {
             authority,
             operation,
         };
-        let response = if closing {
-            self.request_with_deadline(
-                request,
-                Instant::now() + CHAT_CLOSE_TIMEOUT + Duration::from_secs(35),
-            )?
-        } else if let Some(deadline) = deadline {
-            self.request_with_deadline(request, deadline)?
-        } else {
-            self.request_strict(request)?
+        let response = match budget.into_iter().chain(deadline).min() {
+            Some(deadline) => self.request_with_deadline(request, deadline)?,
+            None => self.request_strict(request)?,
         };
         match response {
             ServerResponse::Agent(reply) => Ok(reply),
@@ -1907,6 +1908,63 @@ mod tests {
             drop(client);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn a_submission_answered_after_a_slow_durable_commit_is_still_accepted() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let (_, reply) = running();
+        let (agent, run) = status_reply(reply).unwrap();
+        let accepted = Accepted {
+            agent,
+            run,
+            created: true,
+        };
+        let answered = accepted.clone();
+        let server = thread::spawn(move || {
+            answer(&mut server_stream, |_| true, connected());
+            let request: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            assert!(
+                matches!(
+                    request.request,
+                    ClientRequest::Agent {
+                        operation: Operation::Submit(_),
+                        ..
+                    }
+                ),
+                "{:?}",
+                request.request
+            );
+            // The acceptance's commit waits on a loaded disk for longer than
+            // an ordinary reply may take.
+            thread::sleep(IO_TIMEOUT + Duration::from_millis(500));
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(request.request_id),
+                    proof: proof(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Agent(Reply::Accepted(answered)),
+                    },
+                },
+            )
+            .unwrap();
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        let request = Submit {
+            name: None,
+            destination: Destination::New(accepted.agent.spec.clone()),
+            prompt: "durable work".into(),
+            idempotency_key: "slow-commit".into(),
+        };
+        let reply = client
+            .agent(Authority::default(), Operation::Submit(request))
+            .unwrap();
+        assert_eq!(reply, Reply::Accepted(accepted));
+        assert_eq!(client.stream.read_timeout().unwrap(), Some(IO_TIMEOUT));
+        drop(client);
+        server.join().unwrap();
     }
 
     #[test]

@@ -82,6 +82,10 @@ const TERMINAL_CLOSE_TIMEOUT: Duration = Duration::from_secs(20);
 // registry. It retries in the background, so that wait is not an unresponsive
 // daemon either.
 const NOTIFICATION_PRESENCE_TIMEOUT: Duration = Duration::from_secs(20);
+// An agent submission is answered only after its acceptance and its dispatch
+// claim are durable. Each waits on an fsync, which a heavily loaded disk can
+// hold for several seconds; that wait is not an unresponsive daemon.
+const AGENT_SUBMIT_TIMEOUT: Duration = Duration::from_secs(30);
 // Close is acknowledged only after interruption and process teardown. Allow
 // those grace periods plus time to schedule the worker and deliver its reply.
 const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
@@ -549,6 +553,9 @@ impl Hangup {
 pub struct ControlClient {
     stream: UnixStream,
     proof: HostSessionProof,
+    /// The envelope version this connection speaks: `PROTOCOL_VERSION`,
+    /// except for an update source admitted by `from_stream_at_source_protocol`.
+    protocol: u16,
     next_request_id: u64,
     /// Inventory edges that arrived while a correlated response was pending.
     ///
@@ -683,10 +690,30 @@ impl ControlClient {
         Self::from_stream_inner(stream, deadline, deadline)
     }
 
+    /// Handshake with an update source at its own protocol number. Only the
+    /// update source client calls this, for a number whose wire is this
+    /// release's except for appended requests the update never sends.
+    pub(crate) fn from_stream_at_source_protocol(
+        stream: UnixStream,
+        deadline: Instant,
+        protocol: u16,
+    ) -> Result<Self, ControlError> {
+        Self::from_stream_at(stream, deadline, deadline, protocol)
+    }
+
     fn from_stream_inner(
         stream: UnixStream,
         deadline: Instant,
         write_deadline: Instant,
+    ) -> Result<Self, ControlError> {
+        Self::from_stream_at(stream, deadline, write_deadline, PROTOCOL_VERSION)
+    }
+
+    fn from_stream_at(
+        stream: UnixStream,
+        deadline: Instant,
+        write_deadline: Instant,
+        protocol: u16,
     ) -> Result<Self, ControlError> {
         stream
             .set_read_timeout(Some(Self::handshake_timeout()))
@@ -697,6 +724,7 @@ impl ControlClient {
         let mut client = HandshakeClient {
             stream,
             next_request_id: 1,
+            protocol,
         };
         let proof = client.handshake(deadline, write_deadline)?;
         client
@@ -710,6 +738,7 @@ impl ControlClient {
         Ok(Self {
             stream: client.stream,
             proof,
+            protocol,
             next_request_id: client.next_request_id,
             observed: VecDeque::new(),
             observed_model: VecDeque::new(),
@@ -722,6 +751,10 @@ impl ControlClient {
 
     pub fn proof(&self) -> &HostSessionProof {
         &self.proof
+    }
+
+    pub(crate) fn protocol(&self) -> u16 {
+        self.protocol
     }
 
     /// Release a native-to-terminal replay receipt after its replacement is durable.
@@ -1333,6 +1366,14 @@ impl ControlClient {
         }
     }
 
+    /// Answered during startup recovery, when other requests are refused.
+    pub fn startup_state(&mut self) -> Result<terminal::ipc::StartupState, ControlError> {
+        match self.request_strict(ClientRequest::StartupState)? {
+            ServerResponse::StartupState(state) => Ok(state),
+            response => Err(unexpected_response("daemon startup state", &response)),
+        }
+    }
+
     pub fn shutdown_with_policy(
         &mut self,
         require_empty: bool,
@@ -1712,7 +1753,7 @@ impl ControlClient {
             self.next_request_id = 1;
         }
         let envelope = ClientEnvelope {
-            version: PROTOCOL_VERSION,
+            version: self.protocol,
             request_id,
             proof: Some(self.proof.clone()),
             request,
@@ -1831,7 +1872,7 @@ impl ControlClient {
     }
 
     fn validate_pinned_envelope(&self, envelope: &ServerEnvelope) -> Result<(), ControlError> {
-        if envelope.version != PROTOCOL_VERSION {
+        if envelope.version != self.protocol {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
             });
@@ -1909,6 +1950,7 @@ impl Write for DeadlineWriter<'_> {
 struct HandshakeClient {
     stream: UnixStream,
     next_request_id: u64,
+    protocol: u16,
 }
 
 impl HandshakeClient {
@@ -1920,7 +1962,7 @@ impl HandshakeClient {
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         let request = ClientEnvelope {
-            version: PROTOCOL_VERSION,
+            version: self.protocol,
             request_id,
             proof: None,
             request: ClientRequest::Connect {
@@ -1945,7 +1987,7 @@ impl HandshakeClient {
         })
         .map_err(|error| reply_error(error, Some(timeout)))?
         .ok_or(ControlError::ConnectionClosed)?;
-        if envelope.version != PROTOCOL_VERSION {
+        if envelope.version != self.protocol {
             return Err(ControlError::UnsupportedVersion {
                 actual: envelope.version,
             });
@@ -2098,6 +2140,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatTextCopy { .. } => "chat_text_copy",
         ServerResponse::Work(_) => "work",
         ServerResponse::ChannelWork(_) => "channel_work",
+        ServerResponse::StartupState(_) => "startup_state",
         ServerResponse::DeviceOperation { .. } => "device_operation",
     }
 }
@@ -5961,6 +6004,69 @@ mod tests {
         assert_eq!(client.proof(), &expected);
         assert!(client.list().unwrap().is_empty());
         server.join().unwrap();
+    }
+
+    #[test]
+    fn update_source_client_speaks_and_requires_the_sources_own_protocol() {
+        let source = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
+        for answered in [source, PROTOCOL_VERSION] {
+            let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+            let expected = proof("session", "boot", "incarnation");
+            let server_proof = expected.clone();
+            let server = thread::spawn(move || {
+                let connect: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(connect.version, source);
+                let mut connected =
+                    connected_envelope(1, server_proof.clone(), server_proof.clone());
+                connected.version = answered;
+                write_frame(&mut server_stream, &connected).unwrap();
+                if answered != source {
+                    return;
+                }
+                let list: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(list.version, source);
+                for version in [source, PROTOCOL_VERSION] {
+                    write_frame(
+                        &mut server_stream,
+                        &ServerEnvelope {
+                            version,
+                            request_id: Some(list.request_id),
+                            proof: server_proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Listed {
+                                    terminals: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                    if version == source {
+                        let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                    }
+                }
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let client =
+                ControlClient::from_stream_at_source_protocol(client_stream, deadline, source);
+            if answered != source {
+                // A source that answers in another number is not the source
+                // the update authenticated.
+                assert!(matches!(
+                    client,
+                    Err(ControlError::UnsupportedVersion { actual }) if actual == answered
+                ));
+            } else {
+                let mut client = client.unwrap();
+                assert_eq!(client.protocol(), source);
+                assert_eq!(client.proof(), &expected);
+                assert!(client.list().unwrap().is_empty());
+                assert!(matches!(
+                    client.list(),
+                    Err(ControlError::UnsupportedVersion { actual }) if actual == PROTOCOL_VERSION
+                ));
+            }
+            server.join().unwrap();
+        }
     }
 
     #[test]

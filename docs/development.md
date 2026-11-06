@@ -355,8 +355,10 @@ GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
 script such as the development runner; a slot held by a plain `flock` counts as
 9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
-beyond what they already hold, covers its own. A lone build always starts,
-whatever the memory or pressure, so no build waits forever. Each build gets a
+beyond what they already hold, covers its own, and while the kernel's memory
+pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
+stalled on reclaim) is below 10% (`CAGENTS_BUILD_MEMORY_PRESSURE`; `0` disables
+it). A lone build always starts, whatever the memory or pressure. Each build gets a
 share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
@@ -367,6 +369,34 @@ throughout; a plain `cargo test` compiles its doctests after the slot is
 released. The development runner builds its matched set through the gate
 itself, and skips the gate when the set is [already
 current](#up-to-date-launches).
+
+The running builds are those of the whole host, not only of one family of
+slots. Builds in the shared families, whose first lock is named
+`/var/tmp/cagents-*.lock` (such as `/var/tmp/cagents-cargo.lock` and
+`/var/tmp/cagents-fw16-cargo.lock`), and builds in the slots offloaded to the
+build host each record themselves in `/var/tmp/cagents-builds-UID`
+(`CAGENTS_BUILD_REGISTRY`; empty disables it), naming the lock they hold. Every
+family prices the others' running builds beside its own, and a build is lone
+only when nothing on the host builds. Without this each family filled the same
+memory: on fw16, three families admitted builds independently and the host
+swapped about 20 GiB each way every six minutes. A private family, such as a
+test's or a native session's own lock elsewhere (including one in a directory
+under `/var/tmp` named like a shared lock), stays out of the registry unless
+the variable names one. A record whose lock is free is stale and ignored, and
+one whose holder has exited is priced at the largest cost. Families decide one
+at a time, under the registry's `.decision` lock. A slot held by a plain
+`flock`, by a gate from before the registry or by an offload agent sent from
+such a checkout writes no record, so only its own family prices it.
+
+So that no build waits forever behind smaller ones from other families that
+keep fitting, a build refused room while it holds a free slot records itself
+as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
+read on the host that admits the build; `0` disables it), the build refused
+longest on the host starts beside the running builds whatever the memory or
+pressure. Only one such build ramps up at a time: while one admitted that way
+started less than 10 minutes ago and its holder lives, the next waits. Time
+spent queued behind its own family, or waiting for one of its slots, does not
+count, and a build no longer refused for 10 seconds loses its place.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly
@@ -392,6 +422,11 @@ host](#building-on-another-host), each Cargo command in it goes there on its
 own. Building here, it holds one slot until the command exits, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
+
+Queue and slot lock requests die with their gate, including when it is killed
+without a chance to handle a signal. Waiters retain only their lock descriptor
+and standard streams; inherited pipes and locks remain with the gate for the
+admitted command.
 
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
@@ -433,6 +468,9 @@ admission budget. A Cargo reached any other way inside COMMAND, by path,
 through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+Programs launched by `cargo run` inside that `exec` inherit the same Cargo
+shim and guard. Their named `cargo` reenters the gate after the program's
+build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
@@ -467,7 +505,10 @@ running builds, only when the host's available memory, less what those builds
 are expected to take beyond what they already hold, covers this build's
 expected peak (at least 2 GiB), while the host's memory pressure (`some
 avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
-(`/proc/pressure/cpu`) is below 40%; a lone build always starts. A plain
+(`/proc/pressure/cpu`) is below 40%; a lone build always starts. The running
+builds counted include those the host's own gate admits in its shared
+families, through the registry described [above](#sharing-a-host-between-several-checkouts),
+where these slots record their builds in turn. A plain
 `cargo test` runs its tests there, in the slot, which stays leased until they
 end. One build's
 steps share one ssh connection, which ends with it. Output streams back and
@@ -544,8 +585,9 @@ there; its build settings, such as `jobs` and `build-dir`, describe this host
 and are not. Each slot's commands get a private `TMPDIR`,
 `$XDG_RUNTIME_DIR/cof/<repository>-<N>` (mode 0700) on the host, short enough
 for the Unix sockets tests bind under it and emptied before the next command
-there; a HOST test lane leaves about 12 MB. It follows the HOST recipe below
-rather than `/tmp`, `/var/tmp`, `~/.cache` or the home directory: agent
+there; a HOST test lane leaves about 12 MB. It follows the ancestry, home and
+socket constraints in the HOST recipe below rather than selecting `/tmp`,
+`/var/tmp`, `~/.cache` or the home directory: agent
 sandboxes create `.git` placeholders in the first three, recovery placement
 deliberately refuses any enclosing `.git`, and fixtures refuse roots inside
 the home directory. The runtime directory exists while the host has a login
@@ -554,8 +596,8 @@ temporary files fall back to the slot, and `test` stops with status 78 if a
 marker is above it. While a
 `.git` sits in any of its ancestors on the host, `test` stops with status 78
 and names it, since fixtures that check Git ancestry fail under one and
-building here instead would hide the leak; remove the marker, or set
-`CAGENTS_BUILD_REMOTE=local`. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
+building here instead would hide the leak. Stop and investigate its ownership;
+do not remove a shared marker to make tests pass. Other commands still run there. Cargo's registry and Git caches and the toolchain on the
 host are shared with anything else built there; Cargo locks its caches itself.
 
 ### Compilation jobs and shared build directories
@@ -765,18 +807,29 @@ The existing artifact helper reads Cargo's exact executable path, including
 configured target directories/triples. A matching version alone does not prove
 that two dirty source trees match.
 
-Use a fresh private temporary directory with a short, physical absolute path
-outside Git ancestry: neither it nor any ancestor may contain a `.git` file,
-directory or symlink. For this Linux example, verify that `XDG_RUNTIME_DIR`
-meets those conditions before creating the root. The **final** nested Unix
+For a local HOST run, select an existing private **disk-backed** base with a
+short, physical absolute path. Verify its filesystem with `findmnt -T PATH`;
+`/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can be RAM-backed. Neither the base nor
+any ancestor may contain a `.git` file, directory or symlink. The base must also
+be outside the account home reported by `getent passwd "$(id -u)"`, even when
+`HOME` points elsewhere: bundled-skill tests deliberately refuse installation
+beneath the passwd home. A private `~/.cot` therefore does not qualify.
+
+Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
+with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
+host. Do not borrow another application's tree, and do not change shared
+directories or Git markers. The **final** nested Unix
 socket path must be shorter than 108 bytes, including fixture suffixes. For
 example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
 bytes, so that layout requires a temporary base of at most 28 bytes. Longer
 fixture layouts need more room; a short base alone is not proof.
 
 ```sh
+# Set this only after verifying the base above.
+mkdir -p -m 700 /var/tmp/ct
+export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
-    TMPDIR=$(mktemp -d "${XDG_RUNTIME_DIR:?}/tXXXXXX") || exit
+    TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
@@ -792,8 +845,18 @@ A helper build failure prevents the test command. Use the same preparation for
 narrow HOST targets that need retained actors. Keep the temporary root and any
 separately retained fixture evidence until their original children have settled;
 this recipe deliberately installs no automatic deletion trap. Do not change
-socket limits, remove enclosing Git markers or silently select another runtime
+socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
+
+Tests that spawn the retained helper call `retained_fixture::run_isolated()`
+first. The helper calls `setsid` and enters its own systemd scope, so killing a
+process group or cgroup misses it. `run_isolated()` reruns the exact test as a
+worker beneath a private subreaper. When the worker exits, for any reason, the
+subreaper kills and reaps every remaining descendant. Only killing the
+subreaper itself, for example by the OOM killer, leaves them behind. After a
+passing worker it prints how many it killed: a nonzero count means the product
+left processes behind. Same-test reexecs that call `env_clear()` must pass
+`retained_fixture::owner_env()` through.
 
 Prefer the narrow target that covers the changed contract, for example:
 
@@ -946,7 +1009,7 @@ Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
 
-Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. `build` takes one `scripts/cargo-gate` slot. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` takes one `scripts/cargo-gate` slot. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
 export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-task

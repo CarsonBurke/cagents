@@ -27,6 +27,8 @@ use super::{
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
+#[cfg(test)]
+mod workspace_progress_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
@@ -453,6 +455,7 @@ fn ensure_request_open(host: &SharedHost, request: &ClientRequest) -> Result<(),
     if matches!(
         request,
         ClientRequest::BuildInfo
+            | ClientRequest::StartupState
             | ClientRequest::List
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
@@ -525,7 +528,8 @@ fn ensure_startup_recovery_request(
     };
     let inspection = matches!(
         request,
-        ClientRequest::List
+        ClientRequest::StartupState
+            | ClientRequest::List
             | ClientRequest::ChatList
             | ClientRequest::Attach { .. }
             | ClientRequest::Detach { .. }
@@ -1402,6 +1406,15 @@ pub(super) fn process_request(
             Vec::new(),
             false,
         )),
+        ClientRequest::StartupState => Ok((
+            ServerResponse::StartupState(
+                host.lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .startup_state(),
+            ),
+            Vec::new(),
+            false,
+        )),
         ClientRequest::PrepareUpgrade {
             capability,
             relaunch_agents,
@@ -1514,24 +1527,15 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .watch_model(client_id)?;
+            let model = super::workspace::snapshot(host, Some(client_id))?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::ReadWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .read_model()?;
+            let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .edit_model(client_id, edit)?;
+            let model = super::workspace::edit(host, client_id, edit)?;
             crate::daemon::wake();
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
