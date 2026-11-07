@@ -1573,6 +1573,15 @@ class TestsUnderAMemoryLimit(TwoSlots):
         self.assertEqual(result.returncode, 0, result.stderr)
         return [line.replace(str(self.root) + "/", "") for line in self.ran.read_text().splitlines()]
 
+    def test_tests_under_it_keep_the_runner_that_unstamps_them(self):
+        offload = self.root / "cargo-offload"
+        offload.write_text('#!/bin/sh\n[ "$1" = --stamp ] || exit 75\necho 1.2.3+stamp\n')
+        offload.chmod(0o755)
+        self.env["CARGO_HOME"] = str(self.root / "cargo-home")
+        limited = [line for line in self.gate_run("test", "--lib", "filter") if line.startswith("limited ")]
+        self.assertEqual(len(limited), 1)
+        self.assertIn("cargo test --config target.'cfg(all())'.runner=", limited[0])
+
     def test_tests_and_benchmarks_run_under_it_after_their_build_without_it(self):
         for subcommand in ("test", "bench"):
             with self.subTest(subcommand):

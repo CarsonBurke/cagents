@@ -484,7 +484,7 @@ run_session() {
     # and desktop settings must not feed into the evidence. Each stage dies with
     # its parent, so a killed supervisor does not leave a compositor behind.
     # Its memory limit is made here, with the user manager still reachable.
-    "$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u NIRI_HARNESS_STATE \
+    setpriv --pdeathsig TERM "$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u NIRI_HARNESS_STATE \
         -u XDG_SESSION_TYPE -u XDG_CURRENT_DESKTOP -u XCURSOR_THEME -u XCURSOR_SIZE \
         HOME="$compositor_home/home" XDG_RUNTIME_DIR="$runtime" \
         XDG_CONFIG_HOME="$compositor_home/config" XDG_DATA_HOME="$compositor_home/data" \

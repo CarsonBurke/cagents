@@ -267,7 +267,7 @@ class Evidence(unittest.TestCase):
     def test_a_session_has_a_memory_limit_made_before_its_private_environment(self):
         source = (REPOSITORY / "scripts/native-evidence").read_text()
         self.assertIn(
-            """"$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY""",
+            """setpriv --pdeathsig TERM "$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY""",
             source)
 
     def test_a_session_over_its_limit_at_start_says_so(self):
@@ -832,6 +832,15 @@ class Evidence(unittest.TestCase):
         self.killed_supervisor_processes(15)
         self.assertEqual(self.fixture_process_count(), 0)
         self.assertIn("none", self.run_tool("status").stdout)
+
+    def test_a_killed_supervisor_takes_the_session_with_it_without_stop(self) -> None:
+        # Nothing else enforces --limit once the supervisor is gone.
+        self.killed_supervisor_processes(9)
+        for _ in range(100):
+            if self.fixture_process_count() == 0:
+                break
+            time.sleep(0.2)
+        self.assertEqual(self.fixture_process_count(), 0)
 
     def test_stop_ends_what_a_killed_supervisor_left(self) -> None:
         self.killed_supervisor_processes(9)

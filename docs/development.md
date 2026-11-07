@@ -905,10 +905,16 @@ the limit. The notice names the app and how to raise it.
 
 `scripts/cargo-gate test` and `bench` run under it, inside a held slot too, as do
 `scripts/test-lib`, the app in `scripts/run-development`, `--instance` included,
-and a `scripts/native-evidence` session. A command that already has a memory limit
-keeps it. It doesn't cover outer `cargo-gate test --doc`, `cargo-gate run`, `--hot`,
-tests run on a build host through `cargo-offload`, Cargo run by a script under
-`cargo-gate exec`, or a harness that runs Cargo or a test binary itself.
+and a `scripts/native-evidence` session. A command already under any memory limit
+keeps that one, even a looser one, and `CAGENTS_MEMORY_MAX` then has no effect. A
+capped command leaves the caller's cgroup, so a caller's CPU quota stops applying
+to it. It doesn't cover outer `cargo-gate test --doc`, `cargo-gate run`, `--hot`,
+tests run on a build host through `cargo-offload`, or a harness that runs Cargo or a
+test binary itself.
+
+A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
+covered, and so is its compile, which runs inside the limit there. A UI test rebuild
+peaked at about 11 GiB with page cache, so it fits, but a cold one is unmeasured.
 
 **Writing a mutation harness:** a mutant can turn a bounded loop into an endless
 one that allocates, so run each mutant through `scripts/cargo-gate test` or

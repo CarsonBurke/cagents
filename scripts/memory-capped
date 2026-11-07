@@ -186,7 +186,8 @@ def main():
     # The command runs as this child: systemd-run execs it after making the scope.
     child = subprocess.Popen([*scope_command([f"--unit={unit}"], limit, swap),
                               *with_own_environment(command)],
-                             env=manager_environment(), preexec_fn=lambda: follow_parent(parent))
+                             env=manager_environment(), close_fds=False,
+                             preexec_fn=lambda: follow_parent(parent))
     interrupted = []
 
     def forward(sent, _frame):

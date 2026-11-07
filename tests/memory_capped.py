@@ -249,6 +249,15 @@ class InARealScope(unittest.TestCase):
         result = self.run_tool(str(self.root / "absent"))
         self.assertNotEqual(result.returncode, 0)
 
+    def test_the_command_keeps_descriptors_it_inherits(self):
+        # A held build slot arrives as one, as it would without this wrapper.
+        with open(self.root / "held", "w") as held:
+            descriptor = held.fileno()
+            result = subprocess.run([str(TOOL), "sh", "-c", f'[ -e /proc/self/fd/{descriptor} ]'],
+                                    env=self.env, pass_fds=[descriptor], capture_output=True, text=True,
+                                    timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_every_way_of_ending_the_wrapper_ends_the_command(self):
         for name, number in (("terminate", signal.SIGTERM), ("interrupt", signal.SIGINT),
                              ("hang up", signal.SIGHUP), ("kill", signal.SIGKILL)):
