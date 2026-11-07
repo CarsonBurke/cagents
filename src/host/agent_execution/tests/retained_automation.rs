@@ -15,6 +15,9 @@ fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
 
 #[test]
 fn completed_retained_automation_retires_only_after_exact_idle_close() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     if std::env::var(MODE).as_deref() != Ok("fixture") {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = directory.path();
@@ -48,6 +51,7 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
         }
         let output = command
             .args(["--exact", TEST, "--nocapture"])
+            .envs(crate::retained_fixture::owner_env())
             .env(MODE, "fixture")
             .env(
                 SCOPE,
@@ -257,7 +261,7 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
     );
     assert!(handle.is_completed());
     assert!(!identity.record.root.is_current());
-    assert!(!identity.record.holder.is_current());
+    assert!(identity.record.holder.reaped());
     let registry = registry(&host).unwrap();
     let registry = registry.lock().unwrap();
     assert!(registry.agent(accepted.agent.id).unwrap().closed);

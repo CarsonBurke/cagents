@@ -12,15 +12,15 @@ case "${1:-}" in
     --review-alerts) alerts=1; shift; [ "${1:-}" != -- ] || shift ;;
     --) shift ;;
 esac
-command -v python3 >/dev/null 2>&1 || {
-    printf '%s\n' 'required command not found: python3 (reads Cargo executable artifacts)' >&2
+[ -x /usr/bin/python3 ] || {
+    printf '%s\n' 'required command not found: /usr/bin/python3 (reads Cargo executable artifacts)' >&2
     exit 1
 }
 if [ "$alerts" = 1 ]; then
-    python3 "$root/scripts/build-ceditor-product" cagents --locked --profile dev-runtime --no-default-features --features development --bin cagents >/dev/null
-    python3 "$root/scripts/build-ceditor-product" cagentsd --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd >/dev/null
+    /usr/bin/python3 "$root/scripts/build-ceditor-product" cagents --locked --profile dev-runtime --no-default-features --features development --bin cagents >/dev/null
+    /usr/bin/python3 "$root/scripts/build-ceditor-product" cagentsd --locked --profile dev-runtime --no-default-features --features development,host --bin cagentsd >/dev/null
 fi
-editor=$(python3 "$root/scripts/build-ceditor-product" ceditor --locked --profile dev-runtime --package ceditor --features development)
+editor=$(/usr/bin/python3 "$root/scripts/build-ceditor-product" ceditor --locked --profile dev-runtime --package ceditor --features development)
 # Cargo's artifact path honors configured targets and directories, including
 # build.target without CARGO_BUILD_TARGET. Never guess a path to an older build.
 # Companions are started lazily only when a review alert is observed.

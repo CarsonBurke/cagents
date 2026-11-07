@@ -575,6 +575,7 @@ pub struct ControlClient {
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
     observed_work: Option<(u64, Box<crate::work::Board>)>,
+    observed_conversation: Option<(u64, Box<crate::work::ConversationPullRequests>)>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
     ///
@@ -749,6 +750,7 @@ impl ControlClient {
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
             observed_work: None,
+            observed_conversation: None,
             attached_chats: BTreeSet::new(),
             terminal_streams: BTreeSet::new(),
         })
@@ -1854,6 +1856,19 @@ impl ControlClient {
                     self.observed_work = Some((revision, board));
                 }
             }
+            ServerMessage::ConversationPullRequests {
+                revision,
+                pull_requests,
+                ..
+            } => {
+                if self
+                    .observed_conversation
+                    .as_ref()
+                    .is_none_or(|(observed, _)| *observed < revision)
+                {
+                    self.observed_conversation = Some((revision, pull_requests));
+                }
+            }
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
@@ -2079,6 +2094,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::NotificationsChanged
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
+        | ServerMessage::ConversationPullRequests { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -2102,6 +2118,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
+        ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
     }
 }
 

@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Check the selected IPC source contract; this is not a wire fingerprint."""
 
 import argparse

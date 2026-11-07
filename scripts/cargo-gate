@@ -10,11 +10,31 @@
 # further build only slows the running ones and every other workload.
 set -eu
 
+# A mise shim finds its target on PATH, passing over its own directory only if
+# that is the shims directory of mise's data directory. With HOME or XDG_DATA_HOME
+# moved, as in a fixture, the shim finds itself and re-executes without end. Naming
+# the directory here covers this gate's helpers and whatever moves HOME below it.
+# mise treats an empty value as unset.
+if [ -z "${MISE_DATA_DIR-}" ]; then
+    rest=$PATH:
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        case $entry in
+        /*/mise/shims)
+            MISE_DATA_DIR=${entry%/shims}
+            export MISE_DATA_DIR
+            break
+            ;;
+        esac
+    done
+fi
+
 # Raise this whenever the gate or a helper beside it changes what it does. A
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=9
+gate_version=15
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -33,7 +53,7 @@ if [ -z "$synced" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] &&
     main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) &&
     [ "$(cat -- "$installed.checked" 2>/dev/null)" != "$main" ]; then
     was=$(readlink -f -- "$installed" 2>/dev/null) || was=
-    if python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
+    if /usr/bin/python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
         # This gate was the installed one, so main's runs in its place.
         case $here/ in
             "$(readlink -f -- "$(dirname -- "$installed")")/cagents-cargo-gate.d/"*)
@@ -62,7 +82,7 @@ fail() {
 usage() {
     cat <<'EOF'
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
-       scripts/cargo-gate exec COMMAND [ARGS...]
+       scripts/cargo-gate exec [--hold] COMMAND [ARGS...]
 
 Rust compiles only on the build host in CAGENTS_BUILD_REMOTE, through
 scripts/cargo-offload: in one of its build slots, with this checkout's
@@ -77,12 +97,16 @@ with the reason.
 
 `exec` runs any command, such as a script of several Cargo builds, with a
 `cargo` first on PATH that leads back to this gate, so every Cargo command in
-it builds on that host.
+it builds on that host, each admitted there on its own. With --hold, for a
+script that only builds, one slot there is leased first, priced as a UI
+build, and held until COMMAND exits: its Cargo commands build in that slot one
+at a time, with no wait for admission of their own.
 
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here, each once a build slot is free. For `test`, `bench` and `run`, only the
 build (`--no-run`, or `build`) holds the slot; the tests or program run
-afterwards without it. `exec` holds one slot until COMMAND exits: a drop-in
+afterwards without it. `exec`, with or without --hold, holds one slot
+until COMMAND exits: a drop-in
 for `flock /var/tmp/cagents-cargo.lock COMMAND`, whose gated commands run in
 that slot without waiting.
 
@@ -91,9 +115,10 @@ when that is newer. Run inside a checkout whose origin/main has changed the
 gate since the installed one's commit, the gate first installs main's.
 
 A checkout whose Cargo build directory has never been built is first seeded
-from the main checkout's with scripts/seed-build-dir. When the file system
-holding build directories runs low, scripts/build-disk-guard first reclaims
-removed worktrees' build directories, and refuses the build below a floor.
+from the main checkout's with scripts/seed-build-dir. Every few hours, and
+at once when the file system holding build directories runs low,
+scripts/build-disk-guard runs scripts/prune-build-dirs, which removes Cargo
+build output nothing has used for a week; below a floor it refuses the build.
 
 Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
@@ -132,6 +157,23 @@ Environment:
                          Seconds after a build starts before the pressure,
                          a 10 s average, can show it; no further build
                          starts until then; default 10
+  CAGENTS_BUILD_MEMORY_PRESSURE
+                         Percentage of time some task stalled on memory over
+                         the last 10 s (`some avg10` in /proc/pressure/memory)
+                         at or above which no further build starts beside a
+                         running one; default 10; 0 disables
+  CAGENTS_BUILD_REGISTRY Directory where builds in every shared slot family
+                         and the build host's offloaded slots record
+                         themselves, so each family counts the others' builds;
+                         default /var/tmp/cagents-builds-UID for a lock named
+                         /var/tmp/cagents-*.lock, otherwise none; empty
+                         disables
+  CAGENTS_BUILD_WAIT_PRIORITY_SECS
+                         Seconds refused room with a free slot after which
+                         the build refused longest on the host starts beside
+                         the running builds whatever their memory, while no
+                         other build admitted so is ramping up; default 120;
+                         0 disables
   CAGENTS_BUILD_COST_GIB Memory this build is expected to need at its peak;
                          default by kind, from 3 GiB for the CLI lane to
                          9 GiB for a UI build
@@ -186,8 +228,13 @@ case $1 in
     cargo) shift; named=true ;;
 esac
 [ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
+hold=false
 if [ "$1" = exec ] && [ "$named" = false ]; then
     shift
+    if [ "${1-}" = --hold ]; then
+        hold=true
+        shift
+    fi
     [ "$#" -gt 0 ] || fail 'missing command for exec'
     mode=exec
 else
@@ -230,19 +277,63 @@ case $settle in
     ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_CPU_SETTLE_SECS must be a whole number of seconds' ;;
 esac
 pressure_file=${CAGENTS_BUILD_CPU_PRESSURE_FILE:-/proc/pressure/cpu}
+memory_limit=${CAGENTS_BUILD_MEMORY_PRESSURE-10}
+case $memory_limit in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_MEMORY_PRESSURE must be a percentage' ;;
+    *) [ "$memory_limit" -le 100 ] || fail 'CAGENTS_BUILD_MEMORY_PRESSURE must be a percentage' ;;
+esac
+memory_pressure_file=${CAGENTS_BUILD_MEMORY_PRESSURE_FILE:-/proc/pressure/memory}
 lock=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-cargo.lock}
+# Every shared slot family on this host, and the build host's offloaded
+# slots, record their running builds in one registry, so each prices the
+# others' builds beside its own: separate families would otherwise each fill
+# the same memory. A private family, such as a test's or a native session's,
+# stays out of it unless CAGENTS_BUILD_REGISTRY names one; empty disables it.
+if [ -n "${CAGENTS_BUILD_REGISTRY+set}" ]; then
+    registry=$CAGENTS_BUILD_REGISTRY
+else
+    # Only locks directly in /var/tmp: a pattern's `*` matches `/` too, and a
+    # private family's lock may lie in a directory named like a shared one.
+    case $lock in
+        /var/tmp/cagents-*.lock)
+            case ${lock#/var/tmp/cagents-} in
+                */*) registry= ;;
+                *) registry=/var/tmp/cagents-builds-$(id -u) ;;
+            esac
+            ;;
+        *) registry= ;;
+    esac
+fi
+priority_secs=${CAGENTS_BUILD_WAIT_PRIORITY_SECS-120}
+case $priority_secs in
+    0) ;;
+    ''|*[!0-9]*|0*) fail 'CAGENTS_BUILD_WAIT_PRIORITY_SECS must be a whole number of seconds' ;;
+esac
+# How recently a waiting build must have been refused room to keep its place,
+# and how long a build admitted as overdue keeps the next one waiting.
+wait_fresh=10
+overdue_ramp=600
 
 # The memory a build is expected to need at its peak, in KiB: the whole
 # process tree's resident memory, measured on this repository's builds with 8
 # jobs (p90 rounded up). A UI build links the libcosmic, Servo and iced
-# graphs; a host build, Ghostty; a check generates no code. A script of
-# builds, such as the development runner, is costed as its largest.
+# graphs; a host build, Ghostty; a check generates no code. A held script
+# of builds, such as the development runner's, may build any lane in its
+# slot, so it is costed as the largest, a UI build.
 expected_cost() {
     if [ -n "${CAGENTS_BUILD_COST_GIB:-}" ]; then
         printf '%s' $((CAGENTS_BUILD_COST_GIB * gib))
         return
     fi
-    [ "$mode" = cargo ] || { printf '%s' $((8 * gib)); return; }
+    if [ "$mode" != cargo ]; then
+        if [ "$hold" = true ]; then
+            printf '%s' $((9 * gib))
+        else
+            printf '%s' $((8 * gib))
+        fi
+        return
+    fi
     # The lane is in the selected features and executables.
     lane=cli
     selection=false
@@ -320,6 +411,205 @@ cpu_allows() {
     return 1
 }
 
+# Whether memory has room for one more build beside running ones: tasks are
+# not already stalling on reclaim (`some avg10` in /proc/pressure/memory below
+# the limit). A host that does not report pressure has room.
+memory_allows() {
+    [ "$memory_limit" -gt 0 ] || return 0
+    some=$(sed -n 's/^some avg10=\([0-9]*\)[.[:space:]].*/\1/p' "$memory_pressure_file" 2>/dev/null) || some=
+    [ -n "$some" ] || return 0
+    [ "$some" -ge "$memory_limit" ] || return 0
+    if [ "$memory_announced" = false ]; then
+        printf '%s: memory under pressure (%s%%, limit %s%%); waiting to start beside the running builds\n' \
+            "$program" "$some" "$memory_limit" >&2
+        memory_announced=true
+    fi
+    return 1
+}
+
+# Counts a running build whose record, read from standard input, is its
+# holder's PID and expected cost, then its start in seconds since boot. A
+# record whose holder has exited is priced as unknown: the largest cost. PID
+# 0 is an offloaded build whose command has not started: its cost, with
+# nothing held yet.
+count_running() {
+    running=$((running + 1))
+    claim= holder= claimed= since=
+    { read -r holder claimed; read -r since; } 2>/dev/null || :
+    case $holder:$claimed in
+        *[!0-9:]*|:*|*:) ;;
+        *)
+            if [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ]; then
+                claim="$holder:$claimed"
+            fi
+            [ -n "$claim" ] || since=
+            case $since in
+                ''|*[!0-9]*) ;;
+                *)
+                    # Discard pre-reboot dates before choosing
+                    # the newest, so they cannot hide a fresh start.
+                    if [ "$since" -le "$(uptime_seconds)" ]; then
+                        [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since
+                    fi
+                    ;;
+            esac
+            ;;
+    esac
+    claims="$claims ${claim:-0:$((9 * gib))}"
+}
+
+# Whether `$1` is one of this family's slot locks.
+own_slot() {
+    case $1 in
+        "$lock") return 0 ;;
+        "$lock".*) case ${1#"$lock".} in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac ;;
+    esac
+    return 1
+}
+
+# Whether something holds the lock file `$1`. A child probes it, as the
+# admission decision holds descriptor 7.
+locked() {
+    if flock -n -E 75 "$1" true 2>/dev/null; then
+        return 1
+    else
+        [ "$?" -eq 75 ]
+    fi
+}
+
+# The lock named by the registry record `$1` while a build holds it: a record
+# of a free lock is stale. Only regular files are probed, as opening anything
+# else could fail or block.
+running_lock() {
+    case $1 in *.new) return 1 ;; esac
+    [ -f "$1" ] || return 1
+    held_lock=$(sed -n 3p "$1" 2>/dev/null) || return 1
+    [ -n "$held_lock" ] && [ -f "$held_lock" ] && locked "$held_lock"
+}
+
+# Counts the registry's builds in other families: each record names its slot's
+# lock, which its build holds while it runs.
+count_registered() {
+    [ -n "$registry" ] || return 0
+    for entry in "$registry"/gate-* "$registry"/offload-*; do
+        running_lock "$entry" || continue
+        own_slot "$held_lock" || count_running <"$entry"
+    done
+}
+
+# Families decide one at a time: from pricing the running builds until this
+# one's record is written, on descriptor 7, so two families cannot each admit
+# a build into the same free memory. A registry this gate cannot write leaves
+# it pricing its own family alone, as a failed redirection on `exec` would end
+# the shell.
+decide() {
+    deciding=
+    [ -n "$registry" ] || return 0
+    mkdir -p -m 0700 "$registry" 2>/dev/null || :
+    if [ -d "$registry" ] && [ -w "$registry" ] && {
+        [ ! -e "$registry/.decision" ] || { [ -f "$registry/.decision" ] && [ -w "$registry/.decision" ]; }
+    }; then
+        exec 7>>"$registry/.decision"
+        flock 7
+        deciding=yes
+    else
+        printf '%s: cannot use the build registry %s; pricing this slot family alone\n' \
+            "$program" "$registry" >&2
+        registry=
+    fi
+}
+
+decided() {
+    [ -z "$deciding" ] || exec 7>&-
+    deciding=
+}
+
+# The registry record of this family's slot `$1`.
+registry_entry() {
+    printf '%s/gate-%s' "$registry" "$(printf '%s' "$1" | cksum | cut -d ' ' -f 1)"
+}
+
+# This family's record of the build waiting at the head of its queue.
+wait_entry() {
+    printf '%s/wait-gate-%s' "$registry" "$(printf '%s' "$lock" | cksum | cut -d ' ' -f 1)"
+}
+
+# When process `$1` started, in clock ticks since boot, to tell it from a
+# later process given its PID.
+start_time() {
+    sed 's/^.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
+}
+
+# Records this build as refused room while it holds a free slot, refreshed
+# every couple of seconds while that lasts, so another family's build can tell
+# which of them has been refused longest. A build refused again within
+# `wait_fresh` seconds keeps its place; one waiting for a slot of its own
+# family is not refused room, and its record goes stale. Times are seconds
+# since boot, which the wall clock's steps cannot reorder.
+record_refusal() {
+    [ -n "$registry" ] || return 0
+    now=$(uptime_seconds)
+    if [ -z "$refused_since" ] || [ $((now - refused_last)) -gt "$wait_fresh" ]; then
+        refused_since=$now
+    fi
+    refused_last=$now
+    [ -z "$refused_written" ] || [ $((now - refused_written)) -ge 2 ] || return 0
+    refused_written=$now
+    entry=$(wait_entry)
+    if { printf '%s %s %s %s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" >"$entry.new" &&
+        mv -f -- "$entry.new" "$entry"; } 2>/dev/null; then
+        wait_recorded=yes
+    fi
+}
+
+forget_wait() {
+    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" 2>/dev/null || :
+    wait_recorded=
+}
+
+# Whether the registry record `$1` is of a build admitted as overdue that may
+# still be ramping up at second `$2` since boot: its holder lives, it started
+# less than `overdue_ramp` seconds before, and it holds its lock. After that,
+# what it has yet to take is priced as any running build's is.
+ramping() {
+    [ "$(sed -n 4p "$1" 2>/dev/null)" = overdue ] || return 1
+    holder= claimed= started=
+    { read -r holder claimed; read -r started; } 2>/dev/null <"$1" || return 1
+    case $holder:$started in *[!0-9:]*|:*|*:) return 1 ;; esac
+    [ $(($2 - started)) -lt "$overdue_ramp" ] || return 1
+    [ "$holder" -eq 0 ] || [ -d "/proc/$holder" ] || return 1
+    running_lock "$1"
+}
+
+# Whether this build, refused room, is overdue: it has been refused for the
+# priority time, longer than every other build refused on the host now, and
+# no build admitted that way is still ramping up. It then starts whatever the
+# memory, so a large build cannot wait forever behind smaller ones that keep
+# fitting, nor several such builds fill memory at once.
+overdue() {
+    [ -n "$registry" ] && [ "$priority_secs" -gt 0 ] && [ -n "$refused_since" ] || return 1
+    now=$(uptime_seconds)
+    # Refusals that stopped, while it waited for a slot, start again.
+    [ $((now - refused_last)) -le "$wait_fresh" ] || return 1
+    [ $((now - refused_since)) -ge "$priority_secs" ] || return 1
+    mine=$(wait_entry)
+    for entry in "$registry"/wait-*; do
+        case $entry in "$mine"|*.new) continue ;; esac
+        [ -f "$entry" ] || continue
+        pid= started= since= last=
+        read -r pid started since last <"$entry" 2>/dev/null || continue
+        case $pid:$started:$since:$last in *[!0-9:]*|*::*|:*|*:) continue ;; esac
+        [ $((now - last)) -le "$wait_fresh" ] || continue
+        [ "$since" -lt "$refused_since" ] ||
+            { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        [ "$(start_time "$pid")" = "$started" ] || continue
+        return 1
+    done
+    for entry in "$registry"/gate-* "$registry"/offload-*; do
+        ! ramping "$entry" "$now" || return 1
+    done
+}
+
 # Whether this build fits beside the builds in the slots other than $1: the
 # CPUs have room for it, and the memory free now, less what those builds are expected to take beyond what
 # they already hold, covers this build's expected cost. A lone build always
@@ -331,41 +621,33 @@ fits() {
     running=0
     claims=
     newest=
+    late=
     other=0
     while [ "$other" -lt "$slots" ]; do
         if [ "$other" -ne "$1" ]; then
             path=$(slot_path "$other")
-            exec 7>>"$path"
-            if ! flock -n 7; then
-                running=$((running + 1))
-                claim= holder= claimed= since=
-                { read -r holder claimed; read -r since; } 2>/dev/null <"$path.cost" || :
-                case $holder:$claimed in
-                    *[!0-9:]*|:*|*:) ;;
-                    *)
-                        if [ -d "/proc/$holder" ]; then
-                            claim="$holder:$claimed"
-                            case $since in
-                                ''|*[!0-9]*) ;;
-                                *)
-                                    # Discard pre-reboot dates before choosing
-                                    # the newest, so they cannot hide a fresh start.
-                                    if [ "$since" -le "$(uptime_seconds)" ]; then
-                                        [ -n "$newest" ] && [ "$since" -le "$newest" ] || newest=$since
-                                    fi
-                                    ;;
-                            esac
-                        fi
-                        ;;
-                esac
-                claims="$claims ${claim:-0:$((9 * gib))}"
+            if locked "$path"; then
+                if [ -r "$path.cost" ]; then
+                    count_running <"$path.cost"
+                else
+                    count_running </dev/null
+                fi
             fi
-            exec 7>&-
         fi
         other=$((other + 1))
     done
+    count_registered
     [ "$running" -gt 0 ] || return 0
-    cpu_allows || return 1
+    if cpu_allows && memory_allows && memory_fits; then
+        return 0
+    fi
+    overdue || return 1
+    late=yes
+}
+
+# Whether the memory free now, less what the running builds in `claims` are
+# expected to take beyond what they already hold, covers this build's cost.
+memory_fits() {
     # One process listing prices every running build: its expected cost less
     # the resident memory of its process tree so far.
     outstanding=$(ps -e -o pid= -o ppid= -o rss= 2>/dev/null | awk -v claims="$claims" '
@@ -389,19 +671,6 @@ fits() {
     [ $(($(available_kib) - outstanding)) -ge "$cost" ]
 }
 
-# Whether every slot other than $1 is free.
-others_idle() {
-    other=0
-    while [ "$other" -lt "$slots" ]; do
-        if [ "$other" -ne "$1" ]; then
-            exec 7>>"$(slot_path "$other")"
-            flock -n 7 || { exec 7>&-; return 1; }
-            exec 7>&-
-        fi
-        other=$((other + 1))
-    done
-}
-
 # Holds a slot on descriptor 9 until release. Gated waiters line up on a
 # queue lock, and the one at its head takes the first slot that frees. Plain
 # `flock` callers take only slot 0 and wait for it in the kernel, which
@@ -412,8 +681,13 @@ others_idle() {
 acquire() {
     announced=false
     pressure_announced=false
+    memory_announced=false
     waited_since=$(date +%s)
     waiter=
+    wait_recorded=
+    refused_since=
+    refused_last=
+    refused_written=
     # Both queue and slot requests are private lock waiters, bound to this
     # gate's lifetime. The admitted command alone inherits caller descriptors.
     trap 'withdraw; exit 130' INT
@@ -423,7 +697,7 @@ acquire() {
     exec 6>>"$lock.queue"
     if ! flock -n 6; then
         announce
-        python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
+        /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
             8>&- 9>&- </dev/null >/dev/null &
         waiter=$!
         status=0
@@ -439,7 +713,7 @@ acquire() {
             # A killed gate must leave neither an abandoned slot request nor
             # any helper holding its caller's pipes, locks or queue descriptor.
             # This loop enforces the deadline itself, so the waiter needs none.
-            python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
+            /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
                 8>&- 9>&- </dev/null >/dev/null &
             waiter=$!
         fi
@@ -451,11 +725,14 @@ acquire() {
             wait "$waiter" 2>/dev/null || :
             waiter=
             exec 9>&6 6>&-
+            decide
             if fits 0; then
                 index=0
                 admitted
                 return
             fi
+            record_refusal
+            decided
             flock -u 9
             exec 9>&-
             sleep 0.5
@@ -475,6 +752,7 @@ acquire() {
         fi
         # Every free slot sees the same other builds, so price them once.
         fit=
+        decide
         index=$slots
         while [ "$index" -gt 1 ]; do
             index=$((index - 1))
@@ -494,6 +772,8 @@ acquire() {
             fi
             exec 9>&-
         done
+        [ "$fit" != no ] || record_refusal
+        decided
         announce
         sleep 0.2
     done
@@ -502,7 +782,7 @@ acquire() {
 check_admission() {
     [ -n "$admission_deadline" ] || return 0
     admission_status=0
-    python3 "$here/cargo-gate-command.py" \
+    /usr/bin/python3 "$here/cargo-gate-command.py" \
         --admission-check "$admission_deadline" 6>&- 8>&- 9>&- || admission_status=$?
     if [ "$admission_status" -ne 0 ]; then
         withdraw
@@ -521,6 +801,7 @@ withdraw() {
     fi
     exec 6>&-
     waiter=
+    forget_wait
 }
 
 # Whether the queued request has exited; an unreaped one is a zombie.
@@ -538,7 +819,18 @@ admitted() {
     # Prices this build for the builds that start after it, and dates its
     # start in seconds since boot, before the next waiter can look. The date
     # is a line of its own, which gates that only price builds do not read.
-    printf '%s %s\n%s\n' "$$" "$cost" "$(uptime_seconds)" >"$(slot_path "$index").cost" 2>/dev/null || :
+    since=$(uptime_seconds)
+    printf '%s %s\n%s\n' "$$" "$cost" "$since" >"$(slot_path "$index").cost" 2>/dev/null || :
+    if [ -n "$registry" ]; then
+        # The fourth line marks a build admitted as overdue.
+        printf '%s %s\n%s\n%s\n%s\n' "$$" "$cost" "$since" "$(slot_path "$index")" "${late:+overdue}" \
+            >"$(registry_entry "$(slot_path "$index")")" 2>/dev/null || :
+        forget_wait
+    fi
+    decided
+    if [ -n "$late" ]; then
+        printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
+    fi
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it
     # starts, replacing the repository's two-job default and capping a larger
@@ -565,6 +857,7 @@ admitted() {
 release() {
     # While the slot is still held, so no later holder is priced as this one.
     rm -f -- "$(slot_path "$index").cost"
+    [ -z "$registry" ] || rm -f -- "$(registry_entry "$(slot_path "$index")")"
     exec 9>&-
 }
 
@@ -591,7 +884,7 @@ supervised() {
     if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
         set -- --admission-until "$admission_deadline" "$@"
     fi
-    CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$here/cargo-gate-command.py" \
+    CAGENTS_BUILD_SLOT_HELD=$slot_marker /usr/bin/python3 "$here/cargo-gate-command.py" \
         "$@" 0<&8 8>&- 9>&- &
     child=$!
     exec 8<&-
@@ -744,7 +1037,7 @@ esac
 if [ "$where" -eq 0 ]; then
     deadline=
     if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-        deadline=$(python3 "$here/cargo-gate-command.py" \
+        deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
             --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
     fi
     admission_deadline=
@@ -761,6 +1054,7 @@ if [ "$where" -eq 0 ]; then
     fi
     # Each Cargo command in COMMAND goes through this gate, with its own
     # admission budget: nothing here holds a slot while they build there.
+    # With --hold, the offload holds one slot there for all of them.
     # The shim reaches this gate by its own path, naming Cargo so that
     # `cargo --help` is Cargo's; the gate takes the shim off PATH again, so
     # it reaches this host's Cargo.
@@ -776,7 +1070,13 @@ if [ "$where" -eq 0 ]; then
     RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
     export CAGENTS_BUILD_EXEC_SHIMS CAGENTS_BUILD_EXEC_RUSTC_WRAPPER PATH RUSTC_WRAPPER
     status=0
-    supervised '' "$@" || status=$?
+    if [ "$hold" = true ]; then
+        supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
+            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" \
+            CAGENTS_BUILD_OFFLOAD_HOST="$build_host" "$offload" --hold "$@" || status=$?
+    else
+        supervised '' "$@" || status=$?
+    fi
     rm -rf -- "$shims"
     exit "$status"
 fi
@@ -790,15 +1090,16 @@ fi
 
 admission_deadline=
 if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-    admission_deadline=$(python3 "$here/cargo-gate-command.py" \
+    admission_deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
         --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
 fi
 
 # A new worktree's build directory starts from the main checkout's compiled
 # dependencies instead of empty, so it neither builds them all again nor
 # shares a build directory with another worktree. Copying needs no slot.
-# Before either, a file system running out of room for build directories
-# reclaims removed worktrees' or refuses the build.
+# Before either, the disk guard prunes unused build output on its schedule,
+# and a file system running out of room for build directories prunes at once
+# or refuses the build.
 guard=$here/build-disk-guard
 seed=$here/seed-build-dir
 if [ -x "$guard" ] || [ -x "$seed" ]; then

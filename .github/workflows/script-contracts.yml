@@ -24,7 +24,7 @@ jobs:
   contracts:
     name: Script contracts
     runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    timeout-minutes: 20
     defaults:
       run:
         shell: bash
@@ -219,9 +219,11 @@ jobs:
               ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
               ("build directory seeding", "scripts/seed-build-dir", "tests/seed_build_dir.py"),
               ("build disk guard and gate install", "scripts/build-disk-guard", "tests/build_disk_guard.py"),
+              ("build directory pruning", "scripts/prune-build-dirs", "tests/prune_build_dirs.py"),
               ("build offload", "scripts/cargo-offload", "tests/cargo_offload.py"),
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
               ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
+              ("local install head check", "scripts/install-local", "tests/install_local.py"),
           ):
               source_present = present(Path(source))
               fixture_present = present(Path(fixture))
@@ -237,7 +239,7 @@ jobs:
                   result = subprocess.run(["sh", "-n", *shell])
                   if result.returncode:
                       raise SystemExit(result.returncode)
-              if source == "scripts/native-evidence":
+              if source in ("scripts/native-evidence", "scripts/install-local"):
                   result = subprocess.run(["bash", "-n", source])
                   if result.returncode:
                       raise SystemExit(result.returncode)

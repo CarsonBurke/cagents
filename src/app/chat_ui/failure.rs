@@ -1,6 +1,6 @@
 //! Presentation-only incidents. Sources remain in the original snapshot/history.
 use super::*;
-use chat::failure::{Failure, FailureKind};
+use chat::failure::{DeliveryOutcome, Failure, FailureKind};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Source {
@@ -420,23 +420,30 @@ impl State {
         if text.trim().is_empty() {
             return None;
         }
-        let parsed = Failure::parse(provider, text);
-        if known_only && parsed.is_none() {
-            return None;
-        }
-        let (key, summary, guidance, kind) = match parsed {
-            Some(failure) => (
+        let (key, summary, guidance, kind) = if let Some(failure) = Failure::parse(provider, text) {
+            (
                 diagnostic_key(failure.key.as_ref()),
                 failure.summary,
                 failure.action,
                 Some(failure.kind),
-            ),
-            None => (
+            )
+        } else if let Some(outcome) = DeliveryOutcome::parse(text) {
+            // The daemon's report already says what to do next.
+            (
+                diagnostic_key(text),
+                outcome.summary.to_owned(),
+                outcome.action,
+                None,
+            )
+        } else if known_only {
+            return None;
+        } else {
+            (
                 diagnostic_key(text),
                 fallback_summary(text),
                 "Review the details before trying again.",
                 None,
-            ),
+            )
         };
         let meta = Metadata {
             key: diagnostic_key(&format!("{context}\0{key}")),
@@ -1393,6 +1400,27 @@ mod tests {
         let mut item = text(id, chat::Role::System, body);
         assert!(chat::failure::mark_provider_error(provider, &mut item));
         item
+    }
+
+    #[test]
+    fn a_delivery_outcome_notice_shows_its_own_next_step_once() {
+        let outcome = State::metadata(
+            Provider::Claude,
+            chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+            false,
+            "",
+        )
+        .unwrap();
+        assert_eq!(outcome.summary, "Claude hasn't confirmed this yet.");
+        assert_eq!(
+            outcome.guidance,
+            "It may still go through, so check the conversation before trying again."
+        );
+        // Other unrecognised failures keep the general guidance, and a
+        // filter for known failures still drops them.
+        let other = State::metadata(Provider::Claude, "Something else broke", false, "").unwrap();
+        assert_eq!(other.guidance, "Review the details before trying again.");
+        assert!(State::metadata(Provider::Claude, "Something else broke", true, "").is_none());
     }
 
     /// The content-part ID a provider's decoder assigns to one message.

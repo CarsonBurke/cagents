@@ -27,6 +27,8 @@ use super::{
 mod device_request_tests;
 #[cfg(all(test, target_os = "linux"))]
 mod explicit_authority_server_tests;
+#[cfg(test)]
+mod workspace_progress_tests;
 
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 struct HandshakeReader<'a> {
@@ -508,6 +510,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
     if let Some(work) = work {
         work.unwatch(client_id);
+        work.unwatch_conversation(client_id);
     }
 }
 
@@ -1204,6 +1207,33 @@ pub(super) fn process_request(
                 false,
             ))
         }
+        ClientRequest::WatchConversationPullRequests { conversation } => {
+            drop(_shared);
+            let (work, delivery) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.work.clone(),
+                    state.clients.get(&client_id).map(Arc::downgrade),
+                )
+            };
+            let unavailable = |message: &str| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            };
+            let work = work.ok_or_else(|| unavailable("The Work board is unavailable"))?;
+            let delivery =
+                delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
+            let (revision, pull_requests) = work
+                .watch_conversation(host, client_id, conversation, delivery)
+                .map_err(|message| unavailable(&message))?;
+            Ok((
+                ServerResponse::Work(crate::work::Response::WatchingConversation {
+                    revision,
+                    pull_requests: Box::new(pull_requests),
+                }),
+                Vec::new(),
+                false,
+            ))
+        }
         ClientRequest::Automation {
             authority,
             operation,
@@ -1477,7 +1507,7 @@ pub(super) fn process_request(
             ))
         }
         ClientRequest::ChatCloseRetained { session } => {
-            super::chat::close_retained_native(host, &session).map_err(|message| {
+            super::chat::close_retained_from_pane(host, &session).map_err(|message| {
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
@@ -1525,24 +1555,15 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         ClientRequest::WatchWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .watch_model(client_id)?;
+            let model = super::workspace::snapshot(host, Some(client_id))?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::ReadWorkspaceModel => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .read_model()?;
+            let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
-            let model = host
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .edit_model(client_id, edit)?;
+            let model = super::workspace::edit(host, client_id, edit)?;
             crate::daemon::wake();
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
         }

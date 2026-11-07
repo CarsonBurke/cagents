@@ -1912,6 +1912,12 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     assert!(runtime.failure_ui.incidents.is_empty());
     assert!(runtime.failure_preview(&key).is_none());
     assert!(runtime.failure_ui.expanded.contains(&key));
+    // The client's publication retires the item on its own worker, which the
+    // presentation barrier does not cover.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert!(
         weak.upgrade().is_none(),
         "diagnostic metadata must not retain the hidden original item"

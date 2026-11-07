@@ -202,9 +202,12 @@ use crate::{
 /// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
 /// daemons are update sources this release inspects and replaces, not peers.
 /// Version 129 is this release's matched set with the same extension.
+/// Version 151 appends a conversation's inferred pull requests: the
+/// `WatchConversationPullRequests` request, its `work::Response` and the
+/// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
+/// and are not adopted here.
 /// Version 152 appends the transcript read and its reply, a channel directory
 /// scope, and a directory entry's exited state, failure and last activity.
-/// Versions 145 to 151 are claimed by parallel branches and are not adopted.
 pub const PROTOCOL_VERSION: u16 = 152;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
@@ -570,6 +573,13 @@ pub enum ClientRequest {
     /// or kept them after a failure. Answered during recovery, unlike every
     /// request that recovery refuses with the same `TerminalUnavailable`.
     StartupState,
+    /// Subscribes this connection to the pull requests one conversation
+    /// worked on or mentioned and returns them, as
+    /// [`crate::work::Response::WatchingConversation`]. Each later change
+    /// arrives as [`ServerMessage::ConversationPullRequests`].
+    WatchConversationPullRequests {
+        conversation: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -784,6 +794,14 @@ pub enum ServerMessage {
     WorkBoard {
         revision: u64,
         board: Box<crate::work::Board>,
+    },
+    /// A conversation's pull requests after a change, delivered only to a
+    /// connection that subscribed with
+    /// [`ClientRequest::WatchConversationPullRequests`].
+    ConversationPullRequests {
+        conversation: TerminalId,
+        revision: u64,
+        pull_requests: Box<crate::work::ConversationPullRequests>,
     },
 }
 
