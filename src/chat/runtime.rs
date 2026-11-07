@@ -1947,6 +1947,12 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        // Commands in process groups of their own outlive that signal.
+        if let Some(scope) = self.scope.as_mut()
+            && let Err(error) = scope.end()
+        {
+            tracing::warn!(%error, "commands the provider left could not be ended");
+        }
         self.child.wait()?;
         self.terminated = true;
         Ok(())
@@ -8973,10 +8979,11 @@ for line in sys.stdin:
             transport: TransportSpec::JsonLines,
             program: "/bin/sh".into(),
             // A one-process command, and a shell running a command of its
-            // own, as an agent's Bash tool does.
+            // own, as an agent's Bash tool does. That one leaves the
+            // provider's process group, as a tool may start its commands.
             arguments: vec![
                 "-c".into(),
-                "read go; sleep 300 & echo $!; sh -c 'sleep 300 & echo $!; wait' & echo $!; read done"
+                "read go; sleep 300 & echo $!; sh -c 'setsid sleep 300 & echo $!; wait' & echo $!; read done"
                     .into(),
             ],
             working_directory: std::env::current_dir().unwrap(),
@@ -9152,8 +9159,24 @@ for line in sys.stdin:
             report.ends_with("Provider exited with signal: 9 (SIGKILL)"),
             "{report}"
         );
-        // The remaining command is in the provider's process group still.
+        // The command in a session of its own outlived the provider's kill.
+        assert_eq!(cgroup(inner), shell_leaf);
+        let ended = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ").unwrap().1.starts_with('Z')
+            })
+        };
+        assert!(!ended(inner));
+        // Ending the provider ends what it left, as nothing else would.
         provider.terminate().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ended(inner) {
+            assert!(
+                Instant::now() < deadline,
+                "a command outlived the provider that started it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]

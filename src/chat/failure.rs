@@ -273,7 +273,7 @@ impl<'a> Failure<'a> {
                 // Its step reads "failed", as the agent reported it: this
                 // says why, in the same word.
                 "A command failed because the system ran out of memory".to_owned(),
-                "The system stopped the command that was using the most memory. The agent is still running and sees the failure.",
+                "The system stopped the command to free memory. The agent is still running and sees the failure.",
             ),
             FailureKind::Exited => (
                 exit_summary(program, &signal),

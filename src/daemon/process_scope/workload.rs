@@ -87,6 +87,8 @@ pub(crate) struct ProviderScope {
 
 struct Layout {
     scope: PathBuf,
+    /// The scope's cgroup, which ends the provider's commands with it.
+    directory: fs::File,
     scope_membership: String,
     provider_membership: String,
 }
@@ -130,6 +132,7 @@ impl ProviderScope {
                     provider,
                     layout: Some(Layout {
                         scope: path,
+                        directory,
                         scope_membership: scope.to_owned(),
                         provider_membership,
                     }),
@@ -210,6 +213,30 @@ impl ProviderScope {
     /// Whether the provider's commands are kept in cgroups of their own.
     pub(crate) fn keeps_commands_apart(&self) -> bool {
         self.sweeper.is_some()
+    }
+
+    /// End the commands a divided scope's provider left: call once the
+    /// provider is gone. A memory kill of the provider's leaf spares its
+    /// command leaves, and a command in a process group of its own outlives
+    /// the provider's group signal, so it would run on, holding its memory,
+    /// while the chat reads it as stopped. An undivided scope is left to
+    /// systemd, as before.
+    pub(crate) fn end(&mut self) -> io::Result<()> {
+        // Stop moving processes before the scope ends under the sweeper.
+        self.sweeper = None;
+        let Some(layout) = &self.layout else {
+            return Ok(());
+        };
+        match write_at(&layout.directory, "cgroup.kill", "1") {
+            // systemd removed the scope once it emptied.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ENODEV) =>
+            {
+                Ok(())
+            }
+            result => result,
+        }
     }
 }
 

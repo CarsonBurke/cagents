@@ -658,6 +658,25 @@ impl Claude {
         }
     }
 
+    /// Replayed history comes from before this process started, so a step
+    /// it leaves running ended with an earlier process, such as one the
+    /// system stopped. A background agent stays running: another process on
+    /// this conversation may still be running it. A read-only view shows the
+    /// history as it is.
+    fn stop_earlier_steps(&self, items: &mut [Item]) {
+        if self.history_only {
+            return;
+        }
+        for item in items {
+            if !self.background_agents.contains(&item.id)
+                && let Some(status) = item.content.status_mut()
+                && *status == ToolStatus::Running
+            {
+                *status = ToolStatus::Stopped;
+            }
+        }
+    }
+
     fn remember_failure_receipt(&mut self, receipt: Option<[u8; 32]>) {
         if let Some(receipt) = receipt {
             self.failure_receipts.push_back(receipt);
@@ -2578,19 +2597,7 @@ impl Adapter for Claude {
                 }
             }
             let mut items = settled(items);
-            if !self.history_only {
-                // This process has not started, so a step its history leaves
-                // running ended with an earlier one, such as one the system
-                // stopped. A background agent can outlive it, and stays.
-                for item in &mut items {
-                    if !self.background_agents.contains(&item.id)
-                        && let Some(status) = item.content.status_mut()
-                        && *status == ToolStatus::Running
-                    {
-                        *status = ToolStatus::Stopped;
-                    }
-                }
-            }
+            self.stop_earlier_steps(&mut items);
             step.events.push(Event::History {
                 items,
                 has_earlier: history.offset > 0,
@@ -2827,11 +2834,10 @@ impl Adapter for Claude {
                         }
                     })
                     .collect();
+                let mut items = settled(items);
+                self.stop_earlier_steps(&mut items);
                 Ok(Step {
-                    events: vec![Event::History {
-                        items: settled(items),
-                        has_earlier,
-                    }],
+                    events: vec![Event::History { items, has_earlier }],
                     ..Step::default()
                 })
             }
@@ -15687,10 +15693,12 @@ mod tests {
         assert!(
             matches!(&items["edit-145"].content,ItemContent::Tool{name,status:ToolStatus::Failed,output,..} if name=="Edit"&&output=="permission denied")
         );
+        // Left without a result by a process before this one, which this
+        // one never runs.
         assert!(matches!(
             &items["edit-146"].content,
             ItemContent::Changes {
-                status: ToolStatus::Running,
+                status: ToolStatus::Stopped,
                 ..
             }
         ));
