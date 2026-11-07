@@ -48,7 +48,8 @@ impl Editor {
                 Target::Session(_)
                 | Target::SessionInbox(_)
                 | Target::AgentRun(_)
-                | Target::Automation { .. },
+                | Target::Automation { .. }
+                | Target::AutomationProposal { .. },
             )) => Task::none(),
             Action::Observed(notifications::ui::Action::ActivateWindow(token)) => iced::Task::done(
                 cosmic::Action::Cosmic(cosmic::app::Action::Activate(token.unwrap_or_default())),

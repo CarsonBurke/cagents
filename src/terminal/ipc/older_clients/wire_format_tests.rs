@@ -22,6 +22,8 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 const WORK_RESPONSE: &str = "cagents::work::Response";
 const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
+const NOTIFICATION_TARGET: &str = "cagents::notifications::Target";
+const NOTIFICATION_KIND: &str = "cagents::notifications::Kind";
 
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -287,7 +289,10 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 client.server_messages,
                 client.server_responses,
                 client.work_responses,
-                client.agent_replies
+                client.agent_replies,
+                client.automation_responses,
+                client.notification_targets,
+                client.notification_kinds,
             ),
             (
                 variant_count(&older, "ClientRequest"),
@@ -295,6 +300,9 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 variant_count(&older, "ServerResponse"),
                 variant_count(&older, WORK_RESPONSE),
                 variant_count(&older, AGENT_REPLY),
+                variant_count(&older, AUTOMATION_RESPONSE),
+                variant_count(&older, NOTIFICATION_TARGET),
+                variant_count(&older, NOTIFICATION_KIND),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -307,6 +315,9 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 ("ServerResponse", client.server_responses as usize),
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
+                (AUTOMATION_RESPONSE, client.automation_responses as usize),
+                (NOTIFICATION_TARGET, client.notification_targets as usize),
+                (NOTIFICATION_KIND, client.notification_kinds as usize),
             ],
             if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
                 vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]

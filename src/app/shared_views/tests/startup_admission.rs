@@ -261,6 +261,14 @@ impl ScriptedDaemon {
                                     response: ServerResponse::Accepted,
                                 }
                             }
+                            // Every window also reads pending approval requests.
+                            ClientRequest::Automation { .. } => {
+                                ServerMessage::Error(ProtocolError::new(
+                                    ProtocolErrorCode::TerminalUnavailable,
+                                    "No approval requests in this fixture",
+                                    false,
+                                ))
+                            }
                             other => panic!("unexpected startup request: {other:?}"),
                         };
                         if let Err(error) = write_frame(
