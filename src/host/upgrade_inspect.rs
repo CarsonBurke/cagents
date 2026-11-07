@@ -516,7 +516,9 @@ impl ExecutionEvidence {
     /// including one a discovery record names, has a recorded retirement and
     /// none of this boot's remains with its provider or anything in their
     /// process group or session. Without any census owner nothing proves
-    /// what ran it.
+    /// what ran it. Its continuity need not still say retained: any later
+    /// hosted provider would have issued the pane a proof, so a proofless
+    /// pane's only execution is the actors the census registered for it.
     fn classify_proofless(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
         if source.launch.provider != crate::agent::Provider::Claude

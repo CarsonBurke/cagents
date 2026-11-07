@@ -556,7 +556,8 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 }
 
 /// CLI entry point for the same leased worker, exact preview and window fence
-/// used by the application. The running daemon's matched CLI owns the worker.
+/// used by the application. This installed coordinator chooses the worker
+/// (`installed_update_worker`); it is never delegated to an older owner's CLI.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     use std::io::IsTerminal;
     if !yes && !io::stdin().is_terminal() {
