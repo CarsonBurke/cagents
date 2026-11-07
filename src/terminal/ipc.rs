@@ -202,16 +202,27 @@ use crate::{
 /// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
 /// daemons are update sources this release inspects and replaces, not peers.
 /// Version 129 is this release's matched set with the same extension.
-/// Version 130 appends the exact skipped-occurrence count and range to Firing,
-/// so all executables must match. An update never exchanges a Firing.
-pub const PROTOCOL_VERSION: u16 = 130;
+/// Version 151 appends a conversation's inferred pull requests: the
+/// `WatchConversationPullRequests` request, its `work::Response` and the
+/// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
+/// and are not adopted here.
+/// Version 153 appends the exact skipped-occurrence count and range to Firing,
+/// so all executables must match. An update never exchanges a Firing. 152 is
+/// taken by an unmerged branch and is not adopted here.
+pub const PROTOCOL_VERSION: u16 = 153;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
 /// encoding, so an update may speak it as a source with this release's
-/// client. Other parts differ, such as device account operations, so it is
-/// never an ordinary peer.
+/// client. Its daemons and windows are never peers. Its CLI, which chats
+/// carried across an update keep running, is served as an [`OlderClient`]:
+/// the one wire difference, the device account `Restore` operation this
+/// release appended, is a request that CLI cannot send.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+
+mod older_clients;
+pub use older_clients::{OlderClient, is_cli_peer, older_client};
+
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -569,6 +580,13 @@ pub enum ClientRequest {
     /// or kept them after a failure. Answered during recovery, unlike every
     /// request that recovery refuses with the same `TerminalUnavailable`.
     StartupState,
+    /// Subscribes this connection to the pull requests one conversation
+    /// worked on or mentioned and returns them, as
+    /// [`crate::work::Response::WatchingConversation`]. Each later change
+    /// arrives as [`ServerMessage::ConversationPullRequests`].
+    WatchConversationPullRequests {
+        conversation: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,6 +801,14 @@ pub enum ServerMessage {
     WorkBoard {
         revision: u64,
         board: Box<crate::work::Board>,
+    },
+    /// A conversation's pull requests after a change, delivered only to a
+    /// connection that subscribed with
+    /// [`ClientRequest::WatchConversationPullRequests`].
+    ConversationPullRequests {
+        conversation: TerminalId,
+        revision: u64,
+        pull_requests: Box<crate::work::ConversationPullRequests>,
     },
 }
 

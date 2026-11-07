@@ -9036,6 +9036,7 @@ mod tests {
             email: Some("expected@example.test".into()),
             organization: None,
             plan: None,
+            disputed_by: None,
         };
         let request = adapter
             .command(Command::ResumeAfterLogin {

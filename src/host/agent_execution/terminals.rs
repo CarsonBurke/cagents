@@ -106,6 +106,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
         | R::ChatPrepareResume { .. }
+        | R::WatchConversationPullRequests { .. }
         | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
             Access::Refused
         }

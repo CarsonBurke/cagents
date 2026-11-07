@@ -245,6 +245,14 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
+    // Before anything is launched or adopted: sessions launched through this
+    // entry by an earlier daemon now run the CLI that speaks this protocol.
+    if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
+        tracing::warn!(
+            %error,
+            "sessions will name this version's CLI directory, which a later update does not follow"
+        );
+    }
     let mut initial = HostState::new(proof);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));

@@ -592,9 +592,16 @@ impl Runtime {
                     ));
                 }
             }
-            ItemContent::Changes { changes, .. } => {
+            ItemContent::Changes { changes, status } => {
                 if changes.is_empty() {
-                    rows.push(design::caption("No file changes were reported.").into());
+                    rows.push(
+                        design::caption(if *status == ToolStatus::Running {
+                            "The edit is still being written."
+                        } else {
+                            "No file changes were reported."
+                        })
+                        .into(),
+                    );
                 }
                 for (index, change) in changes.iter().enumerate() {
                     rows.push(change_view(change));

@@ -62,6 +62,14 @@ scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
+Each of these commands waits in the build host's queue on its own, and on a
+busy host the wait is most of its time: on fw16 under a full queue, the CLI
+check above took 26 s to compile and 19 minutes in all. The CLI, host and
+browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
+[below](#testing)) type-check everything the lane's check does, so when you are
+about to run them, skip that check. The integrated UI has no test lane; keep
+its check.
+
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
 `default-members = ["."]` selects only cagents: root UI checks and root
@@ -158,8 +166,10 @@ How the runner works:
 - A launch with nothing to build skips the gate and starts at once, printing
   `The matched set is already built for this checkout; skipping the build.`
   See [Up-to-date launches](#up-to-date-launches).
-- The normal runner enables `integrated-browser` only for the UI; the matched
-  CLI and daemon keep the same full-product identity without resolving Servo.
+- The normal runner enables `integrated-browser` only for the UI. Both lanes
+  build the same CLI and daemon, without `full`: that feature selects the
+  shipped product's application ID, peer package and self-update, none of which
+  a development build uses, so switching lanes rebuilds only the UI.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
   usable performance while the ordinary `dev` profile stays cheap for checks.
 - The development instance has its own application ID, configuration, session
@@ -353,9 +363,10 @@ within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
 host that does not report pressure is treated as having room. Each build has an
 expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
-GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
-script such as the development runner; a slot held by a plain `flock` counts as
-9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
+GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
+script and 9 GiB for an `exec --hold` one such as the development runner's; a
+slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
+overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
 beyond what they already hold, covers its own, and while the kernel's memory
 pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
@@ -421,7 +432,8 @@ To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
 `scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
 host](#building-on-another-host), each Cargo command in it goes there on its
-own. Building here, it holds one slot until the command exits, and gated
+own, unless `exec --hold` holds one slot there for all of them. Building here,
+it holds one slot until the command exits, with or without `--hold`, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
@@ -464,12 +476,21 @@ command that compiles there through `scripts/cargo-offload`, without taking a
 slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
-script of builds, such as the development runner or
-`scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. A Cargo reached any other way inside COMMAND, by path,
-through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
-also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
-compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+script of builds, such as `scripts/build-ceditor-product`, builds there too,
+each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
+leases one slot there first, at the cost of a UI build, and holds it until
+COMMAND exits: each gated Cargo command in it builds in that slot, one at a
+time, with no admission of its own. It is for a script that only builds, such
+as the development runner's three: a launch waits in the host's queue once
+rather than three times. Tests run in that slot too, priced by what they hold
+while they run and as a UI build again once they end. A Cargo command run from
+another checkout, or after the hold's lease has ended, leases a slot of its
+own. Anything slow between its builds would keep the slot leased and its memory
+reserved while it ran, so leave `--hold` off for such a script. A Cargo
+reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
+or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
+`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
+why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
 Programs launched by `cargo run` inside that `exec` inherit the same Cargo
 shim and guard. Their named `cargo` reenters the gate after the program's
 build releases its slot; their absolute `$CARGO` cannot compile here.

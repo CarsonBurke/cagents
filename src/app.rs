@@ -6309,13 +6309,8 @@ impl Cagents {
                     .iter()
                     .map(|name| (*name).to_owned()),
             );
-            if let (Some(variable), Some(home)) =
-                (account::home_variable(provider), account.resolved_home())
-            {
-                launch
-                    .environment
-                    .insert(variable.to_owned(), home.display().to_string());
-            }
+            // A home that is not a path the recipe can record stays unbound.
+            let _ = account.bind_home(&mut launch);
         }
         self.add_terminal_recipe(launch)
     }
@@ -11139,10 +11134,9 @@ impl Cagents {
             return Task::none();
         };
         if self.folder_scope(&key)
-            && matches!(
-                self.context_tab,
-                ContextTab::Changes | ContextTab::PullRequest
-            )
+            && (self.context_tab == ContextTab::Changes
+                || (self.context_tab == ContextTab::PullRequest
+                    && !self.conversation_lists_pull_requests()))
         {
             self.context_tab = ContextTab::Files;
         }
@@ -17863,7 +17857,9 @@ impl Application for Cagents {
             }
             Message::SelectContextTab(tab) => {
                 if self.active_folder_scope()
-                    && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                    && (tab == ContextTab::Changes
+                        || (tab == ContextTab::PullRequest
+                            && !self.conversation_lists_pull_requests()))
                 {
                     return Task::none();
                 }
@@ -18405,6 +18401,7 @@ impl Application for Cagents {
             self.account_subscription(),
             self.automation_subscription(),
             self.work_subscription(),
+            self.conversation_pull_request_subscription(),
             self.channel_work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
