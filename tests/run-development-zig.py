@@ -573,6 +573,41 @@ exit 83
         self.assert_skipped("--browserless")
         self.assert_skipped("--browserless")
 
+    def test_the_app_runs_under_a_memory_limit(self):
+        ran = self.root / "limited"
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text(f'#!/bin/sh\necho "$2" >"{ran}"\nshift 2\necho "$1" >>"{ran}"\nexec "$@"\n')
+        limit.chmod(0o755)
+        self.assert_built("--browserless")
+        name, program = ran.read_text().splitlines()
+        self.assertEqual(name, "cagents-ui")
+        self.assertTrue(program.endswith("/cagents-ui"))
+
+    def test_an_instance_runs_under_a_memory_limit(self):
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+        limit.chmod(0o755)
+        started = self.root / "started"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(f'#!/bin/sh\ncase " $* " in *" start "*) printf "%s\\n" "$@" >"{started}" ;; *) exit 1 ;; esac\n')
+        harness.chmod(0o755)
+        self.launch("--browserless", "--instance", "capped")
+        words = started.read_text().splitlines()
+        program = words.index(str(limit))
+        self.assertEqual(words[program + 1:program + 3], ["--name", "cagents-ui"])
+        self.assertTrue(words[program + 3].endswith("/cagents-ui"), words)
+
+    def test_the_memory_limit_speaks_to_the_terminal_and_the_app_to_the_log(self):
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text('#!/bin/sh\nshift 2\n"$@"\necho limit-message >&2\n')
+        limit.chmod(0o755)
+        log = self.root / "ui.log"
+        result, _ = self.launch("--browserless", "--log-file", str(log))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("limit-message", result.stderr)
+        self.assertTrue(log.exists())
+        self.assertNotIn("limit-message", log.read_text())
+
     def test_a_launch_building_on_the_build_host_always_asks_it(self):
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.

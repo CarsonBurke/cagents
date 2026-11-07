@@ -33,7 +33,7 @@ INSTALLER = "scripts/install-cargo-gate"
 GATE_FILES = ["scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo-gate-sync.py",
               "scripts/cargo-gate-rustc-guard",
               "scripts/cargo-offload", "scripts/seed-build-dir", "scripts/build-disk-guard",
-              "scripts/prune-build-dirs", INSTALLER]
+              "scripts/memory-capped", "scripts/prune-build-dirs", INSTALLER]
 
 
 def git(*arguments):
