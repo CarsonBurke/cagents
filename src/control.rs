@@ -545,6 +545,16 @@ pub enum ControlError {
     ShutdownRejected(ShutdownOutcome),
 }
 
+impl ControlError {
+    /// The daemon's own sentence for a person; every other failure as it stands.
+    pub fn reason(self) -> String {
+        match self {
+            Self::Remote { message, .. } => message,
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Ends a [`ControlClient`]'s connection from another thread.
 pub struct Hangup(UnixStream);
 
@@ -4541,6 +4551,23 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    use super::ControlError;
+
+    #[test]
+    fn a_daemon_refusal_reaches_a_person_as_its_own_sentence() {
+        let refusal = ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+            message: "This run's details are no longer available.".into(),
+            retryable: false,
+        };
+        assert_eq!(
+            refusal.reason(),
+            "This run's details are no longer available."
+        );
+        let other = ControlError::Connect(std::io::Error::other("refused"));
+        assert_eq!(other.reason(), "could not connect to the daemon: refused");
+    }
+
     #[test]
     fn hosted_daemon_lifecycle_refuses_before_routing_and_user_framing_stays_usable() {
         use std::os::unix::{
