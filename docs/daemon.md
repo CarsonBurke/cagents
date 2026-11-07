@@ -31,10 +31,11 @@ together.
 A session carried across an update keeps running the `cagents` CLI it was
 launched with. The daemon still serves that CLI when its protocol is listed as
 an older client: currently protocol 128, the 0.1.3+local.c68275e94 line. Only
-a peer running the `cagents` executable is served this way. An older window or
-daemon is still refused at its handshake, which is how a stale window learns
+a peer running the `cagents` executable is served this way, and not one
+running `cagents daemon bridge`, which relays a remote device's window. An
+older window or daemon is still refused at its handshake, which is how a stale window learns
 that an update superseded it. The daemon answers that CLI in its protocol's
-version. It refuses requests to stop or update the daemon, and requests whose
+version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read. It withholds notifications the CLI couldn't read.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol

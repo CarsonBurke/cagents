@@ -214,7 +214,7 @@ pub const PROTOCOL_VERSION: u16 = 129;
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
-pub use older_clients::{OlderClient, is_cli_executable, older_client};
+pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after

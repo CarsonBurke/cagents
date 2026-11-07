@@ -134,14 +134,22 @@ fn changes_the_daemon(request: &ClientRequest) -> bool {
     )
 }
 
-/// Whether `executable`, a peer's `/proc/<pid>/exe`, is the `cagents` CLI:
-/// the only older client this daemon serves. A pruned version directory
-/// leaves the link marked deleted.
-pub fn is_cli_executable(executable: &Path) -> bool {
-    executable
+/// Whether a peer, by its `/proc/<pid>/exe` and NUL-separated
+/// `/proc/<pid>/cmdline`, is the `cagents` CLI: the only older client this
+/// daemon serves. A pruned version directory leaves the link marked deleted.
+///
+/// `cagents daemon bridge` is excluded: it relays a remote device's window,
+/// or any other client, which must meet this protocol as it did before.
+pub fn is_cli_peer(executable: &Path, command_line: &[u8]) -> bool {
+    let cli = executable
         .file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name.strip_suffix(" (deleted)").unwrap_or(name) == "cagents")
+        .is_some_and(|name| name.strip_suffix(" (deleted)").unwrap_or(name) == "cagents");
+    let arguments: Vec<&[u8]> = command_line.split(|byte| *byte == 0).skip(1).collect();
+    let bridge = arguments
+        .windows(2)
+        .any(|pair| pair == [&b"daemon"[..], &b"bridge"[..]]);
+    cli && !bridge
 }
 
 /// The postcard variant index of an enum value: its position in the
@@ -323,12 +331,13 @@ mod tests {
 
     #[test]
     fn only_the_cli_executable_is_served_as_an_older_client() {
+        let command = b"cagents\0agent\0list\0";
         for cli in [
             "/home/user/.local/share/cagents/versions/0.1.3/bin/cagents",
             "/usr/bin/cagents",
             "/home/user/.local/share/cagents/versions/0.1.3/bin/cagents (deleted)",
         ] {
-            assert!(is_cli_executable(Path::new(cli)), "{cli}");
+            assert!(is_cli_peer(Path::new(cli), command), "{cli}");
         }
         for other in [
             "/usr/bin/cagents-ui",
@@ -337,8 +346,15 @@ mod tests {
             "/usr/bin/python3",
             "/",
         ] {
-            assert!(!is_cli_executable(Path::new(other)), "{other}");
+            assert!(!is_cli_peer(Path::new(other), command), "{other}");
         }
+        // A bridge relays a remote window, whatever protocol it speaks.
+        let cli = Path::new("/usr/bin/cagents");
+        assert!(!is_cli_peer(cli, b"cagents\0daemon\0bridge\0"));
+        assert!(!is_cli_peer(cli, b"/usr/bin/cagents\0daemon\0bridge"));
+        // A message that merely mentions it is still the CLI.
+        assert!(is_cli_peer(cli, b"cagents\0send\0abcd\0daemon bridge\0"));
+        assert!(is_cli_peer(cli, b""));
     }
 
     #[test]

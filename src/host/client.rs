@@ -14,8 +14,8 @@ use crate::{
         MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
         ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
         ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, is_cli_executable, older_client,
-        read_frame_with_limit, validate_proof,
+        TerminalVisibility, WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit,
+        validate_proof,
     },
 };
 
@@ -186,7 +186,13 @@ fn may_release_retention(request: &ClientRequest) -> bool {
 /// Whether the peer process runs the `cagents` CLI, the only client this
 /// daemon serves at an older protocol.
 fn peer_runs_cli(pid: u32) -> bool {
-    std::fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|exe| is_cli_executable(&exe))
+    let (Ok(executable), Ok(command_line)) = (
+        std::fs::read_link(format!("/proc/{pid}/exe")),
+        std::fs::read(format!("/proc/{pid}/cmdline")),
+    ) else {
+        return false;
+    };
+    is_cli_peer(&executable, &command_line)
 }
 
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
