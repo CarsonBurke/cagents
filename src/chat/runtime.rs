@@ -504,6 +504,7 @@ impl LocalHandle {
                     child: None,
                     native_holder,
                     reconnect_only_reported: false,
+                    command_stops: 0,
                     expected_native_peer,
                     native_peer: None,
                     preserve_native: preserve_native.clone(),
@@ -659,13 +660,17 @@ impl LocalHandle {
                     true
                 };
                 // Nothing reports the end of a step the provider left running.
-                if let Err(error) = actor
-                    .store
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .stop_running_steps()
-                {
-                    tracing::warn!(%error, "steps left running could not be marked stopped");
+                // A preserved holder's provider is still running its steps.
+                if !preserve_holder {
+                    if let Err(error) = actor
+                        .store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .stop_running_steps()
+                    {
+                        tracing::warn!(%error, "steps left running could not be marked stopped");
+                    }
+                    stop_snapshot_steps(&mut actor.state.lock().unwrap_or_else(|p| p.into_inner()));
                 }
                 actor.apply(Event::Exited { code });
                 let usage = actor
@@ -1979,6 +1984,8 @@ struct Actor {
     native_holder: Option<super::native_holder::Holder>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
+    /// Commands memory exhaustion stopped while this actor ran.
+    command_stops: usize,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
     preserve_native: Arc<AtomicBool>,
@@ -2055,21 +2062,50 @@ fn exit_report(child: &ChildGuard, status: std::process::ExitStatus) -> String {
     }
 }
 
-fn command_stop_report(stop: &crate::daemon::process_scope::CommandStop) -> String {
+/// One notice for the commands memory exhaustion stopped since the last
+/// check. `earlier` were stopped before them since the agent started: a retried
+/// command stopped again still gets a notice of its own.
+fn command_stop_report(
+    stops: &[crate::daemon::process_scope::CommandStop],
+    earlier: usize,
+) -> String {
     use crate::daemon::process_scope::Killer;
-    let by = match stop.killer {
-        Killer::Oomd => "systemd-oomd",
-        Killer::Kernel => "The kernel's out-of-memory killer",
+    let mut killers = Vec::new();
+    for stop in stops {
+        let by = match stop.killer {
+            Killer::Oomd => "systemd-oomd",
+            Killer::Kernel => "the kernel's out-of-memory killer",
+        };
+        if !killers.contains(&by) {
+            killers.push(by);
+        }
+    }
+    // It opens a sentence; systemd-oomd keeps its own lower case.
+    let by = killers.join(" and ");
+    let by = match by.strip_prefix("the ") {
+        Some(rest) => format!("The {rest}"),
+        None => by,
     };
-    let processes = match stop.processes {
+    let what = match stops.len() {
+        1 => "it".to_owned(),
+        count => format!("{count} commands"),
+    };
+    let processes = match stops.iter().map(|stop| stop.processes).sum::<Option<u64>>() {
         Some(1) => " (1 process)".to_owned(),
         Some(count) => format!(" ({count} processes)"),
         None => String::new(),
     };
-    format!(
-        "{} {by} ended it{processes}; the agent is still running.",
+    let mut report = format!(
+        "{} {by} ended {what}{processes}; the agent is still running.",
         super::failure::COMMAND_OUT_OF_MEMORY
-    )
+    );
+    if earlier > 0 {
+        report.push_str(&format!(
+            " Commands stopped for memory since the agent started: {}.",
+            earlier + stops.len()
+        ));
+    }
+    report
 }
 
 /// Append the most recent skipped stdout line, which often names the real cause.
@@ -2530,12 +2566,15 @@ impl Actor {
             Some(scope) => scope.take_command_stops(),
             None => return,
         };
-        for stop in stops {
-            self.apply(Event::Error {
-                message: command_stop_report(&stop),
-                fatal: false,
-            });
+        if stops.is_empty() {
+            return;
         }
+        let message = command_stop_report(&stops, self.command_stops);
+        self.command_stops += stops.len();
+        self.apply(Event::Error {
+            message,
+            fatal: false,
+        });
     }
 
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
@@ -3856,16 +3895,6 @@ fn apply_projected_event(
             state.busy = false;
             state.ready = false;
             state.history_loading = false;
-            // Nothing the provider was doing outlives it; a step it left
-            // running would otherwise read as still working.
-            stop_running_steps(&mut state.items);
-            for agent in &mut state.subagents {
-                if agent.status == ToolStatus::Running {
-                    agent.status = ToolStatus::Stopped;
-                    agent.waiting = false;
-                }
-                stop_running_steps(&mut agent.items);
-            }
         }
         Event::ReadOnlyHistory { reason } => state.read_only_reason = Some(reason),
         Event::Ready(ready) => {
@@ -3882,6 +3911,19 @@ fn apply_projected_event(
 }
 
 /// Marks the steps still running as stopped, copying only those items.
+/// Nothing a provider that ended was doing outlives it; a step it left
+/// running would otherwise read as still working.
+fn stop_snapshot_steps(state: &mut Snapshot) {
+    stop_running_steps(&mut state.items);
+    for agent in &mut state.subagents {
+        if agent.status == ToolStatus::Running {
+            agent.status = ToolStatus::Stopped;
+            agent.waiting = false;
+        }
+        stop_running_steps(&mut agent.items);
+    }
+}
+
 fn stop_running_steps(items: &mut [Arc<Item>]) {
     let now = observed_at();
     for item in items {
@@ -5065,7 +5107,48 @@ mod tests {
     }
 
     #[test]
-    fn steps_left_running_when_the_provider_exits_read_as_stopped() {
+    fn each_check_that_finds_stopped_commands_gives_a_new_notice() {
+        use crate::daemon::process_scope::{CommandStop, Killer};
+        let oomd = |processes| CommandStop {
+            killer: Killer::Oomd,
+            processes,
+        };
+        let first = command_stop_report(&[oomd(Some(3))], 0);
+        assert_eq!(
+            first,
+            format!(
+                "{} systemd-oomd ended it (3 processes); the agent is still running.",
+                super::super::failure::COMMAND_OUT_OF_MEMORY
+            )
+        );
+        // The agent retries the command and it is stopped the same way.
+        let again = command_stop_report(&[oomd(Some(3))], 1);
+        assert_ne!(again, first, "the card for a repeat must be a new one");
+        assert!(again.ends_with("since the agent started: 2."), "{again}");
+
+        let both = command_stop_report(
+            &[
+                oomd(Some(1)),
+                CommandStop {
+                    killer: Killer::Kernel,
+                    processes: None,
+                },
+            ],
+            0,
+        );
+        assert!(
+            both.contains(
+                "systemd-oomd and the kernel's out-of-memory killer ended 2 commands; the agent"
+            ),
+            "{both}"
+        );
+        for report in [first, again, both] {
+            assert!(super::super::failure::is_notice(&report), "{report}");
+        }
+    }
+
+    #[test]
+    fn steps_left_running_by_an_ended_provider_read_as_stopped() {
         let mut state = Snapshot::default();
         let mut indices = BTreeMap::new();
         let tool = |id: &str, status| Item {
@@ -5097,6 +5180,7 @@ mod tests {
             .items
             .push(Arc::new(tool("child", ToolStatus::Running)));
         subagent(&mut state, "builder").status = ToolStatus::Failed;
+        stop_snapshot_steps(&mut state);
         apply_event(&mut state, &mut indices, Event::Exited { code: None });
         let statuses: Vec<_> = state
             .items
@@ -8996,7 +9080,7 @@ for line in sys.stdin:
             .set_read_timeout(Some(Duration::from_secs(5)))
             .unwrap();
         woken.read_exact(&mut byte).unwrap();
-        let report = command_stop_report(&stops[0]);
+        let report = command_stop_report(&stops, 0);
         assert!(
             report.starts_with(super::super::failure::COMMAND_OUT_OF_MEMORY),
             "{report}"
