@@ -1725,6 +1725,14 @@ fn start_with_execution(
                     .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
             }
         }
+        // Equally transient: the provider's own `cagents` must reach this
+        // development instance's daemon.
+        if let Some(instance) = crate::instance::development_instance() {
+            spec.environment.insert(
+                crate::instance::DEVELOPMENT_INSTANCE_ENV.into(),
+                instance.into(),
+            );
+        }
         // Like the capability, transient: a cagents process the provider
         // starts must not take this conversation's account for the system
         // account.

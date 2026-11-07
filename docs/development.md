@@ -221,8 +221,10 @@ the matched set as usual, then starts the UI in a headless
 
 `CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
 ignores it. The runner sets it for `--instance` and clears it otherwise, so an
-inherited value never selects an instance. Provider accounts and tools keep
-the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+inherited value never selects an instance. The instance's daemon gives it to
+every agent and terminal it starts, so a `cagents` they run reaches that
+daemon. Provider accounts and tools keep the caller's `HOME`, so an
+instance's agents use the same provider sign-ins.
 
 The runner starts the session without the caller's `WAYLAND_DISPLAY`,
 `WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
