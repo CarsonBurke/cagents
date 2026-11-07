@@ -272,7 +272,9 @@ impl<'a> Failure<'a> {
             ),
             FailureKind::Exited => (
                 exit_summary(program, &signal),
-                "Resume to continue the same conversation. Details show what the agent reported before it stopped.",
+                // The stopped chat's bar offers what fits, Resume or Try
+                // again; this only says where the cause is.
+                "Details show what the agent reported before it stopped.",
             ),
         };
         if let Some(reset) = &reset {
@@ -917,7 +919,7 @@ mod tests {
             let failure = Failure::parse(Provider::Claude, raw).unwrap();
             assert_eq!(failure.kind, FailureKind::Exited, "{raw}");
             assert_eq!(failure.summary, summary, "{raw}");
-            assert!(failure.action.starts_with("Resume"), "{raw}");
+            assert!(!failure.action.contains("Resume"), "{raw}");
             assert_eq!(failure.details, raw);
         }
     }
