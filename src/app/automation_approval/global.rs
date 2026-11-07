@@ -308,7 +308,7 @@ impl Cagents {
                     .map_err(|error| error.to_string())?;
                 client
                     .automation(authority, request)
-                    .map_err(|error| error.to_string())
+                    .map_err(crate::control::ControlError::reason)
             })
             .await
             .map_err(|error| error.to_string())

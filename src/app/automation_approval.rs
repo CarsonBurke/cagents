@@ -234,7 +234,7 @@ impl Cagents {
                             .map_err(|error| error.to_string())?;
                         match client
                             .automation(authority, request)
-                            .map_err(|error| error.to_string())?
+                            .map_err(crate::control::ControlError::reason)?
                         {
                             Response::ProposalReview(review) if review.identity == identity => {
                                 Ok(*review.proposal)
