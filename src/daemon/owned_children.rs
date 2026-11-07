@@ -102,24 +102,24 @@ impl OwnedChildren {
     /// the children this process had adopted from the provider: work the
     /// provider detached. Sparing pins them as they are now, so children
     /// adopted once the provider is stopping, such as its running commands,
-    /// are still stopped. A later decision cannot spare more than the first.
-    /// `provider` names more of the provider's own processes, such as a
-    /// server its launcher started, which are never spared.
+    /// are still stopped; a caller pins as its close begins, before it
+    /// interrupts the provider. A later decision cannot spare more than the
+    /// first. `provider` names more of the provider's own processes, such as
+    /// a server its launcher started, which are never spared.
     ///
     /// A provider something outside this process killed, such as the system
-    /// for memory, spares nothing: what it left would hold the memory it
-    /// needed, with no agent left to use it.
+    /// for memory, spares nothing, even after its work was pinned: what it
+    /// left would hold the memory it needed, with no agent left to use it.
     pub(crate) fn decide_detached(
         &mut self,
         detached: DetachedWork,
         provider: &[i32],
     ) -> io::Result<()> {
         match detached {
-            DetachedWork::Spare if self.spared.is_none() && !self.group_signalled => {
-                if self.killed() {
-                    self.spared = None;
-                    return Ok(());
-                }
+            DetachedWork::Stop => self.spared = None,
+            DetachedWork::Spare if self.group_signalled => {}
+            DetachedWork::Spare if self.killed(provider) => self.spared = None,
+            DetachedWork::Spare if self.spared.is_none() => {
                 let root = self.child.as_ref().map(|child| child.id() as i32);
                 self.spared =
                     Some(Spared::pin(direct_children()?.into_iter().filter(|pid| {
@@ -127,31 +127,36 @@ impl OwnedChildren {
                     }))?);
             }
             DetachedWork::Spare => {}
-            DetachedWork::Stop => self.spared = None,
         }
         Ok(())
     }
 
-    /// Whether the provider has exited by `SIGKILL`. Before teardown has
-    /// signalled it, that came from outside this process.
-    fn killed(&self) -> bool {
+    /// Whether the provider, or one of its `provider` processes this process
+    /// adopted, has exited by `SIGKILL`. Before teardown has signalled it,
+    /// that came from outside this process.
+    fn killed(&self, provider: &[i32]) -> bool {
         let Some(child) = &self.child else {
             return false;
         };
-        let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-        // SAFETY: the buffer is live and writable; WNOWAIT leaves the status
-        // for teardown's own reap.
-        unsafe {
-            libc::waitid(
-                libc::P_PID,
-                child.id(),
-                &mut status,
-                libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-            ) == 0
-                && status.si_pid() != 0
-                && status.si_code == libc::CLD_KILLED
-                && status.si_status() == libc::SIGKILL
-        }
+        std::iter::once(child.id() as i32)
+            .chain(provider.iter().copied())
+            .any(|pid| {
+                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+                // SAFETY: the buffer is live and writable; WNOWAIT leaves the
+                // status for teardown's own reap. A process that isn't this
+                // one's child fails with ECHILD.
+                unsafe {
+                    libc::waitid(
+                        libc::P_PID,
+                        pid as libc::id_t,
+                        &mut status,
+                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+                    ) == 0
+                        && status.si_pid() != 0
+                        && status.si_code == libc::CLD_KILLED
+                        && status.si_status() == libc::SIGKILL
+                }
+            })
     }
 
     pub(crate) fn id(&self) -> i32 {
@@ -343,6 +348,38 @@ exec /bin/sleep 602"#,
         Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    /// A process orphaned to this subreaper, as interrupting a turn can
+    /// orphan a command's descendants, once it has been adopted here.
+    fn orphan(root: &Path, name: &str) -> i32 {
+        let file = root.join(name);
+        let status = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"setsid /bin/sleep 603 & echo $! > "$1.tmp"; mv "$1.tmp" "$1""#)
+            .args(["orphan", file.to_str().unwrap()])
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let pid = std::fs::read_to_string(&file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while parent(pid) != Some(std::process::id() as i32) {
+            assert!(Instant::now() < deadline, "the orphan was not adopted");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        pid
+    }
+
+    fn wait_exited(children: &OwnedChildren) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !children.exited() {
+            assert!(Instant::now() < deadline, "the provider outlived its kill");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     #[test]
     fn an_ordinary_teardown_spares_only_work_detached_before_it() {
         if crate::retained_fixture::run_isolated() {
@@ -395,6 +432,83 @@ exec /bin/sleep 602"#,
         children.decide_detached(DetachedWork::Spare, &[]).unwrap();
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
         assert!(!exists(detached) && !exists(running));
+    }
+
+    #[test]
+    fn what_a_close_orphans_after_pinning_still_stops() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let provider = provider_with_detached_work(root.path()).spawn().unwrap();
+        let (detached, running) = detached_work(root.path());
+        let mut children = OwnedChildren::new(provider);
+        // Pinned as the close begins, before the turn is interrupted.
+        children.decide_detached(DetachedWork::Spare, &[]).unwrap();
+        let interrupted = orphan(root.path(), "interrupted");
+        children.decide_detached(DetachedWork::Spare, &[]).unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(
+            exists(detached),
+            "work detached before the close keeps running"
+        );
+        assert!(
+            !exists(interrupted) && !exists(running),
+            "what the close orphaned is stopped"
+        );
+        children.decide_detached(DetachedWork::Stop, &[]).unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(!exists(detached));
+    }
+
+    #[test]
+    fn a_provider_killed_after_its_work_was_pinned_spares_nothing() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let provider = provider_with_detached_work(root.path()).spawn().unwrap();
+        let (detached, running) = detached_work(root.path());
+        let mut children = OwnedChildren::new(provider);
+        children.decide_detached(DetachedWork::Spare, &[]).unwrap();
+        // The system kills it for memory while the close waits on its turn.
+        unsafe { libc::kill(children.id(), libc::SIGKILL) };
+        wait_exited(&children);
+        children.decide_detached(DetachedWork::Spare, &[]).unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(!exists(detached) && !exists(running));
+    }
+
+    #[test]
+    fn a_killed_server_its_launcher_left_here_spares_nothing() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let provider = provider_with_detached_work(root.path()).spawn().unwrap();
+        // The provider's detached process stands in for the server its
+        // launcher started and left to this subreaper.
+        let (server, running) = detached_work(root.path());
+        let detached = orphan(root.path(), "detached-work");
+        let mut children = OwnedChildren::new(provider);
+        unsafe { libc::kill(server, libc::SIGKILL) };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let stat = std::fs::read_to_string(format!("/proc/{server}/stat")).unwrap();
+            if stat[stat.rfind(')').unwrap() + 2..].starts_with('Z') {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the server outlived its kill");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        children
+            .decide_detached(DetachedWork::Spare, &[server])
+            .unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(!exists(detached) && !exists(running) && !exists(server));
     }
 
     #[test]

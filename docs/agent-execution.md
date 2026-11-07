@@ -47,6 +47,16 @@ explicitly permits stopping the background work. Stopped background tasks do not
 resume automatically. Closing an agent stops the entire owned conversation and
 its background tasks.
 
+Closing a chat, or an agent you started, leaves running what its provider had
+already detached from itself before the close, such as a server started with
+`nohup ... &` or `setsid`; so does stopping the daemon. Everything still running
+under the provider stops with it, including commands it was running and Claude's
+`run_in_background` shells. An agent an automation or another session started
+stops everything, unless you have taken part in it. If something outside cagents
+killed the provider, for example the system for memory, nothing is left running.
+Returning a chat to its terminal, and switching accounts, still stop detached
+work.
+
 Daemon Stop confirmation counts running background subagents as well as hosted
 sessions. If those tasks change before confirmation is accepted, refresh the
 preview and confirm again. An update with **When idle** waits for background work
