@@ -486,9 +486,10 @@ rather than three times. A Cargo command that runs tests, one run from another
 checkout, and one run after the hold's lease has ended each lease a slot of
 their own. Anything slow between its builds would keep the slot leased and its
 memory reserved while it ran, so leave `--hold` off for such a script. A Cargo
-reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
-also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
-compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
+or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
+`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
+why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
 Programs launched by `cargo run` inside that `exec` inherit the same Cargo
 shim and guard. Their named `cargo` reenters the gate after the program's
 build releases its slot; their absolute `$CARGO` cannot compile here.
