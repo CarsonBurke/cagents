@@ -341,6 +341,11 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("replacement daemon startup failed", result.stderr)
         self.assertIn(f"{copy} was an unchanged copy", result.stderr, "the copy was never replaced")
+        self.assertIn(
+            f"rolled back; restored the original file at {copy}",
+            result.stderr,
+            "the user was not told the earlier replacement was undone",
+        )
         self.assertFalse(copy.is_symlink())
         self.assertEqual(copy.read_bytes(), (previous / member).read_bytes())
         self.assertEqual(copy.stat().st_ino, before.st_ino, "the original file was not the one restored")

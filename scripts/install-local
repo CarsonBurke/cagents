@@ -66,10 +66,11 @@ COMMIT=$(git rev-parse --verify HEAD)
 SHORT=$(git rev-parse --short=9 HEAD)
 
 # Updates the remote-tracking ref for REF on REMOTE so the comparison below
-# sees what has been published since the last fetch. A failure is reported
-# and leaves the last fetched state to compare with.
+# sees what has been published since the last fetch. It never prompts (HTTPS
+# or SSH); a failure is reported and leaves the last fetched state to compare
+# with.
 refresh_remote_ref() {
-    GIT_TERMINAL_PROMPT=0 git fetch --quiet --no-tags -- "$1" "$2" </dev/null 2>/dev/null \
+    GIT_TERMINAL_PROMPT=0 GIT_SSH_COMMAND="${GIT_SSH_COMMAND:-ssh} -o BatchMode=yes" git fetch --quiet --no-tags -- "$1" "$2" </dev/null 2>/dev/null \
         || printf '%s: could not fetch %s from %s; comparing with the last fetched state\n' \
             "$PROGRAM" "$2" "$1" >&2
 }

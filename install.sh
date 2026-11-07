@@ -471,9 +471,13 @@ settle_adopted_link() {
         rm -f "$settle_backup" || :
     elif { [ -L "$settle_link" ] && [ "$(readlink "$settle_link" 2>/dev/null || :)" = "$settle_target" ]; } \
         || { [ ! -e "$settle_link" ] && [ ! -L "$settle_link" ]; }; then
-        mv -fT "$settle_backup" "$settle_link" \
-            || printf '%s: could not restore %s; the original file is at %s\n' \
+        if mv -fT "$settle_backup" "$settle_link"; then
+            printf '%s: installation rolled back; restored the original file at %s\n' \
+                "$PROGRAM" "$settle_link" >&2
+        else
+            printf '%s: could not restore %s; the original file is at %s\n' \
                 "$PROGRAM" "$settle_link" "$settle_backup" >&2
+        fi
     else
         printf '%s: %s changed during installation; the original file is at %s\n' \
             "$PROGRAM" "$settle_link" "$settle_backup" >&2
@@ -965,7 +969,8 @@ INSTALL_STAGE=
 
 # Replaces a managed copy at LINK with the link. The copy moves aside before
 # it is compared, so the bytes compared are the bytes replaced, and a file that
-# appears at LINK meanwhile makes ln fail instead of being overwritten.
+# appears at LINK meanwhile (even a directory, hence -T) makes ln fail instead
+# of being overwritten.
 adopt_managed_copy() {
     adopt_member=$1
     adopt_link=$2
@@ -985,7 +990,7 @@ adopt_managed_copy() {
     mv -T "$adopt_link" "$adopt_backup" || fail "cannot move $adopt_link aside to replace it"
     is_managed_copy "$adopt_backup" "$adopt_member" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR" \
         || fail "refusing to replace existing file $adopt_link"
-    ln -s "$PREFIX/current/$adopt_member" "$adopt_link" || fail "cannot create link $adopt_link"
+    ln -sT "$PREFIX/current/$adopt_member" "$adopt_link" || fail "cannot create link $adopt_link"
     printf '%s: %s was an unchanged copy of the installed file; replaced it with a link so updates reach it\n' \
         "$PROGRAM" "$adopt_link" >&2
 }
@@ -1018,7 +1023,7 @@ ensure_link() {
         autostart) AUTOSTART_LINK_CREATED=1 ;;
         *) fail 'internal error: unknown link kind' ;;
     esac
-    ln -s "$link_target" "$link_path" || fail "cannot create link $link_path"
+    ln -sT "$link_target" "$link_path" || fail "cannot create link $link_path"
 }
 
 
