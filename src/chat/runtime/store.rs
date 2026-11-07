@@ -1224,6 +1224,9 @@ impl Store {
                 && *status == crate::chat::ToolStatus::Running
             {
                 *status = crate::chat::ToolStatus::Stopped;
+                // It ended now, so its duration runs to the provider's exit.
+                item.started_at = item.started_at.or(item.at);
+                item.at = observed_at();
                 let id: String = row.get(0).map_err(|e| e.to_string())?;
                 stopped.push((id, postcard::to_stdvec(&item).map_err(|e| e.to_string())?));
             }
@@ -3412,8 +3415,12 @@ mod tests {
         // The actor reuses its last window, so the stop must reach it as a
         // change, not only in a fresh read.
         let mut presented = store.window().unwrap().items;
+        let (started, streamed) = (presented[0].started_at, presented[0].at);
         store.stop_running_steps().unwrap();
         let items = store.window_reusing(&mut presented).unwrap().items;
+        // The step ended when its provider did, not at its last output.
+        assert_eq!(items[0].started_at, started);
+        assert!(items[0].at >= streamed && items[0].at.is_some());
         let steps: Vec<_> = items
             .iter()
             .map(|item| match &item.content {

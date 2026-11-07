@@ -3883,11 +3883,16 @@ fn apply_projected_event(
 
 /// Marks the steps still running as stopped, copying only those items.
 fn stop_running_steps(items: &mut [Arc<Item>]) {
+    let now = observed_at();
     for item in items {
-        if item.content.status() == Some(ToolStatus::Running)
-            && let Some(status) = Arc::make_mut(item).content.status_mut()
-        {
-            *status = ToolStatus::Stopped;
+        if item.content.status() == Some(ToolStatus::Running) {
+            let item = Arc::make_mut(item);
+            if let Some(status) = item.content.status_mut() {
+                *status = ToolStatus::Stopped;
+                // It ended now, so its duration runs to the provider's exit.
+                item.started_at = item.started_at.or(item.at);
+                item.at = now;
+            }
         }
     }
 }
