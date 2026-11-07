@@ -2638,7 +2638,7 @@ impl State {
                     }
                     if !self.history.is_empty() {
                         content = content.push(crate::design::caption(format!(
-                            "Keeps up to {} finished entries per automation, and a removed automation's finished entries for {} days. Runs still waiting or in progress stay until they finish. Details of older runs may be unavailable.",
+                            "Keeps up to {} finished entries per automation, and a removed automation's finished entries for {} days. Runs still in progress or needing your attention stay.",
                             crate::automations::HISTORY_RETAINED_ROWS,
                             crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
                         )));
@@ -3832,7 +3832,7 @@ mod tests {
                 let history = Outline::of(&state, width, 700.0);
                 history.text(&row);
                 history.text(&format!(
-                    "Keeps up to {} finished entries per automation, and a removed automation's finished entries for {} days. Runs still waiting or in progress stay until they finish. Details of older runs may be unavailable.",
+                    "Keeps up to {} finished entries per automation, and a removed automation's finished entries for {} days. Runs still in progress or needing your attention stay.",
                     crate::automations::HISTORY_RETAINED_ROWS,
                     crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
                 ));

@@ -627,19 +627,22 @@ target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
 **Run history** pages through original names, times, outcomes, and bounded
-results. Consecutive scheduled skips with the same reason and execution revision
-share one entry showing the actual occurrence count and first/last times. A
-manual request, successful run or different reason starts another entry. A
-name-only edit keeps a group's original name. Downtime summaries do not invent
-a count of occurrences that were never individually recorded.
+results. Consecutive scheduled skips with the same reason share one entry
+showing how many times the schedule was skipped and the first and last times, so
+a run waiting for you stays near the top instead of behind pages of skips. A
+manual request, a successful run, a different reason, or a change to what the
+automation runs starts another entry. A name-only edit keeps a group's original
+name. Time the daemon was not running is summarized without a count, because
+those times were never individually recorded.
 
-Each automation retains up to 500 settled history entries; active or unresolved
-ownership and cleanup evidence remain until resolved. Removed automations keep
-eligible history for 30 days, after which its history entries and unreferenced
-execution revisions are removed. The automation's saved definition and its agent
-sessions stay, so this bounds history, not total storage. An old manual request ID still cannot run again when its
-details expire: retries report that the original request was recorded. Use a new
-request ID only for an intentional new run.
+Each automation keeps up to 500 finished entries. Runs still in progress or
+needing your attention stay however old they are. A removed automation's
+finished entries are kept for 30 days and then deleted; its saved definition and
+agent sessions stay, so this limits history, not total storage. Opening an alert
+or entry whose details were already removed says they are no longer available.
+An old manual request ID still cannot run again when its details expire: retries
+report that the original request was recorded. Use a new request ID only for an
+intentional new run.
 
 Opening history does not start or attach a provider. **Open agent** explicitly
 opens a still-live session; retained completed sessions remain readable in

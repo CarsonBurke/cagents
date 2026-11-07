@@ -669,6 +669,7 @@ mod tests {
                 "DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;
+                 DROP INDEX automation_firing_successors;
                  ALTER TABLE automation_firings DROP COLUMN previous_firing;
                  DROP TABLE channel_work_operations;
                 DROP TABLE channel_work_entries;
@@ -909,6 +910,7 @@ mod tests {
                 "DROP TABLE automation_precheck_history_cleanup;
                  DROP TABLE automation_retired_manual_requests;
                  DROP INDEX automation_removed_history;
+                 DROP INDEX automation_firing_successors;
                  ALTER TABLE automation_firings DROP COLUMN previous_firing;
                  DROP TABLE channel_work_operations;
                 DROP TABLE channel_work_entries;

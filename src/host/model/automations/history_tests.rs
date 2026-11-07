@@ -455,9 +455,32 @@ fn skips_from_before_groups_collapse_so_the_waiting_run_stays_on_the_first_page(
 }
 
 #[test]
+fn relinking_a_merged_skip_finds_its_successor_through_an_index() {
+    // A month of every-minute skips merges one row at a time in one startup
+    // transaction, so a table scan per merge would hold the registry for minutes.
+    let (registry, _directory, _definition) = fixture();
+    let plan: Vec<String> = registry
+        .db
+        .prepare(
+            "EXPLAIN QUERY PLAN UPDATE automation_firings SET previous_firing=?1
+             WHERE automation=?2 AND previous_firing=?3",
+        )
+        .unwrap()
+        .query_map(params!["a", "b", "c"], |row| row.get(3))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(
+        plan.iter()
+            .any(|step| step.contains("automation_firing_successors")),
+        "{plan:?}"
+    );
+}
+
+#[test]
 fn a_run_that_left_history_explains_itself_instead_of_a_query_error() {
     let (registry, _directory, _definition) = fixture();
-    let expected = "This run's details are no longer available. Run history keeps only the most recent entries.";
+    let expected = "This run's details are no longer available. Older run history is removed over time.";
     assert_eq!(
         registry.automation_run_detail(Uuid::new_v4()).err().unwrap(),
         expected
