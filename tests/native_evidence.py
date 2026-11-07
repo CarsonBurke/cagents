@@ -834,7 +834,14 @@ class Evidence(unittest.TestCase):
         self.assertIn("none", self.run_tool("status").stdout)
 
     def test_a_killed_supervisor_takes_the_session_with_it_without_stop(self) -> None:
-        # Nothing else enforces --limit once the supervisor is gone.
+        # Nothing else enforces --limit once the supervisor is gone. This needs
+        # the session's own scope, which an outer memory limit or no user manager
+        # rules out.
+        own_group = subprocess.run(
+            [str(REPOSITORY / "scripts/memory-capped"), "cat", "/proc/self/cgroup"],
+            env=self.env, capture_output=True, text=True, timeout=60).stdout
+        if "cagents-capped-" not in own_group:
+            self.skipTest("a session can't have a scope of its own here")
         self.killed_supervisor_processes(9)
         for _ in range(100):
             if self.fixture_process_count() == 0:

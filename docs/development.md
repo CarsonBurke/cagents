@@ -914,7 +914,8 @@ test binary itself.
 
 A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
 covered, and so is its compile, which runs inside the limit there. A UI test rebuild
-peaked at about 11 GiB with page cache, so it fits, but a cold one is unmeasured.
+peaked at about 11 GiB with page cache, so it fits, but a cold build and an
+integrated one are unmeasured.
 
 **Writing a mutation harness:** a mutant can turn a bounded loop into an endless
 one that allocates, so run each mutant through `scripts/cargo-gate test` or

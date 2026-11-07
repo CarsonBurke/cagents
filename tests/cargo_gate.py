@@ -1578,9 +1578,12 @@ class TestsUnderAMemoryLimit(TwoSlots):
         offload.write_text('#!/bin/sh\n[ "$1" = --stamp ] || exit 75\necho 1.2.3+stamp\n')
         offload.chmod(0o755)
         self.env["CARGO_HOME"] = str(self.root / "cargo-home")
-        limited = [line for line in self.gate_run("test", "--lib", "filter") if line.startswith("limited ")]
-        self.assertEqual(len(limited), 1)
-        self.assertIn("cargo test --config target.'cfg(all())'.runner=", limited[0])
+        for route in (("test", "--lib"), ("exec", str(self.gate), "test", "--lib")):
+            with self.subTest(route[0]):
+                self.ran.unlink(missing_ok=True)
+                limited = [line for line in self.gate_run(*route) if line.startswith("limited ")]
+                self.assertEqual(len(limited), 1)
+                self.assertIn("cargo test --config target.'cfg(all())'.runner=", limited[0])
 
     def test_tests_and_benchmarks_run_under_it_after_their_build_without_it(self):
         for subcommand in ("test", "bench"):
