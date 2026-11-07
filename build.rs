@@ -1,4 +1,4 @@
-//! Stamps the executables with the version they can report about themselves.
+//! Finds the build metadata the checkout gives the executables.
 //!
 //! `CARGO_PKG_VERSION` is the product version and nothing more: every local
 //! build of `0.1.3` and every packaged `0.1.3` carry the same string, so a bug
@@ -6,15 +6,28 @@
 //! local archive after the commit it was built from (`0.1.3+local.3d80e6d`),
 //! and that metadata has to reach the binary inside it as well.
 //!
-//! The version is resolved once here, in this order:
+//! An executable states its version with `cagents::stamp_version!()`, which
+//! reads, in this order:
 //!
-//! 1. `CAGENTS_BUILD_METADATA`, when the packaging script sets it, which is
-//!    the metadata it also uses for the archive name.
-//! 2. The Git checkout the build runs from, when there is one: no metadata at
-//!    all when `HEAD` is exactly the release tag for the manifest version and
-//!    the tree is clean, otherwise `local.<short sha>` with `.dirty` appended
-//!    for uncommitted changes.
+//! 1. `CAGENTS_BUILD_METADATA`, when the packaging script or the build gate
+//!    sets it, which is the metadata the packaging step also uses for the
+//!    archive name.
+//! 2. `CAGENTS_CHECKOUT_METADATA`, which this script sets from the Git
+//!    checkout the build runs from, when there is one: nothing when `HEAD` is
+//!    exactly the release tag for the manifest version and the tree is clean,
+//!    otherwise `local.<short sha>` with `.dirty` appended for uncommitted
+//!    changes.
 //! 3. Nothing, for a source export with no `.git` - a release build.
+//!
+//! Only the executables read either variable. A build script's rerun, or a
+//! change to a variable it watches, recompiles every target of the package,
+//! including the whole library, so this script never reads
+//! `CAGENTS_BUILD_METADATA`: Cargo tracks it in the dep-info of each executable
+//! that reads it, and a new value relinks only those. A driver that supplies
+//! the metadata for every build also sets `CAGENTS_BUILD_METADATA_SUPPLIED=1`,
+//! whose value does not change between commits, and then this script does not
+//! consult the checkout at all. Otherwise its watches below rerun it, and
+//! recompile the library, when the checkout's stamp could change.
 //!
 //! The self-updater verifies the complete installed version against this
 //! stamp, then ignores build metadata when comparing it with stable releases.
@@ -46,30 +59,14 @@ fn main() {
         println!("cargo:rustc-link-arg-bin=cagents-ui={}", map.display());
     }
     println!("cargo:rerun-if-env-changed=CAGENTS_CHECKOUT_ROOT");
-    println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA");
+    println!("cargo:rerun-if-env-changed=CAGENTS_BUILD_METADATA_SUPPLIED");
+    if std::env::var_os("CAGENTS_BUILD_METADATA_SUPPLIED").is_some_and(|value| value == "1") {
+        return;
+    }
     let base = std::env::var("CARGO_PKG_VERSION").expect("cargo sets CARGO_PKG_VERSION");
-    let metadata = match std::env::var("CAGENTS_BUILD_METADATA") {
-        Ok(metadata) if !metadata.trim().is_empty() => Some(metadata.trim().to_owned()),
-        _ => git_metadata(&base),
-    };
-    let version = match metadata.filter(|metadata| valid_metadata(metadata)) {
-        Some(metadata) => format!("{base}+{metadata}"),
-        None => base,
-    };
-    println!("cargo:rustc-env=CAGENTS_VERSION={version}");
-}
-
-/// Semantic-versioning build metadata: dot-separated ASCII alphanumerics and
-/// hyphens. Anything else would make `--version` print something the
-/// packaging step's own version check rejects.
-fn valid_metadata(metadata: &str) -> bool {
-    !metadata.is_empty()
-        && metadata.split('.').all(|part| {
-            !part.is_empty()
-                && part
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
+    if let Some(metadata) = git_metadata(&base) {
+        println!("cargo:rustc-env=CAGENTS_CHECKOUT_METADATA={metadata}");
+    }
 }
 
 fn git(manifest: &Path, arguments: &[&str]) -> Option<String> {

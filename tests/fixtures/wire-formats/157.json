@@ -1198,6 +1198,22 @@
               "Container": "cagents::agent_execution::mailbox::Receipt"
             }
           }
+        ],
+        [
+          "Transcript",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::transcript::Query"
+            }
+          }
+        ],
+        [
+          "Members",
+          {
+            "Newtype": {
+              "Option": "Bytes"
+            }
+          }
         ]
       ]
     },
@@ -1335,6 +1351,22 @@
         [
           "InboxAcknowledged",
           "Unit"
+        ],
+        [
+          "Transcript",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::transcript::Page"
+            }
+          }
+        ],
+        [
+          "Members",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::directory::Members"
+            }
+          }
         ]
       ]
     },
@@ -1718,6 +1750,56 @@
         ]
       ]
     },
+    "cagents::agent_execution::directory::Member": {
+      "Struct": [
+        [
+          "session",
+          {
+            "Container": "cagents::agent_execution::directory::Entry"
+          }
+        ],
+        [
+          "exited",
+          "Bool"
+        ],
+        [
+          "failure",
+          {
+            "Option": "Str"
+          }
+        ],
+        [
+          "active_at",
+          {
+            "Option": "U64"
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::directory::Members": {
+      "Struct": [
+        [
+          "channel",
+          "Bytes"
+        ],
+        [
+          "caller",
+          {
+            "Option": {
+              "Container": "cagents::agent_execution::directory::Member"
+            }
+          }
+        ],
+        [
+          "sessions",
+          {
+            "Seq": {
+              "Container": "cagents::agent_execution::directory::Member"
+            }
+          }
+        ]
+      ]
+    },
     "cagents::agent_execution::directory::Owner": {
       "Enum": [
         [
@@ -1967,6 +2049,224 @@
           {
             "Newtype": "Str"
           }
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::Content": {
+      "Enum": [
+        [
+          "User",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::transcript::Text"
+            }
+          }
+        ],
+        [
+          "Assistant",
+          {
+            "Struct": [
+              [
+                "text",
+                {
+                  "Container": "cagents::agent_execution::transcript::Text"
+                }
+              ],
+              [
+                "commentary",
+                "Bool"
+              ]
+            ]
+          }
+        ],
+        [
+          "Delivery",
+          {
+            "Struct": [
+              [
+                "kind",
+                {
+                  "Container": "cagents::chat::DeliveryKind"
+                }
+              ],
+              [
+                "from",
+                "Str"
+              ],
+              [
+                "summary",
+                "Str"
+              ],
+              [
+                "body",
+                {
+                  "Container": "cagents::agent_execution::transcript::Text"
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "Tool",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::transcript::Tool"
+            }
+          }
+        ],
+        [
+          "Tools",
+          {
+            "Newtype": {
+              "Container": "cagents::agent_execution::transcript::ToolRun"
+            }
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::Entry": {
+      "Struct": [
+        [
+          "id",
+          "Str"
+        ],
+        [
+          "at",
+          {
+            "Option": "U64"
+          }
+        ],
+        [
+          "content",
+          {
+            "Container": "cagents::agent_execution::transcript::Content"
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::Page": {
+      "Struct": [
+        [
+          "session",
+          {
+            "Container": "cagents::agent_execution::directory::Member"
+          }
+        ],
+        [
+          "entries",
+          {
+            "Seq": {
+              "Container": "cagents::agent_execution::transcript::Entry"
+            }
+          }
+        ],
+        [
+          "earlier",
+          {
+            "Option": "Str"
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::Query": {
+      "Struct": [
+        [
+          "session",
+          "Str"
+        ],
+        [
+          "before",
+          {
+            "Option": "Str"
+          }
+        ],
+        [
+          "limit",
+          "U16"
+        ],
+        [
+          "tools",
+          "Bool"
+        ],
+        [
+          "full",
+          "Bool"
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::Text": {
+      "Struct": [
+        [
+          "text",
+          "Str"
+        ],
+        [
+          "omitted",
+          "U64"
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::Tool": {
+      "Struct": [
+        [
+          "name",
+          "Str"
+        ],
+        [
+          "summary",
+          "Str"
+        ],
+        [
+          "status",
+          {
+            "Container": "cagents::chat::ToolStatus"
+          }
+        ],
+        [
+          "output",
+          {
+            "Option": {
+              "Container": "cagents::agent_execution::transcript::Text"
+            }
+          }
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::ToolCount": {
+      "Struct": [
+        [
+          "name",
+          "Str"
+        ],
+        [
+          "count",
+          "U32"
+        ]
+      ]
+    },
+    "cagents::agent_execution::transcript::ToolRun": {
+      "Struct": [
+        [
+          "calls",
+          {
+            "Seq": {
+              "Container": "cagents::agent_execution::transcript::ToolCount"
+            }
+          }
+        ],
+        [
+          "failed",
+          "U32"
+        ],
+        [
+          "edited",
+          {
+            "Seq": "Str"
+          }
+        ],
+        [
+          "more_edited",
+          "U32"
         ]
       ]
     },
