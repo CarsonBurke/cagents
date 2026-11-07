@@ -691,9 +691,24 @@ fn threads(process: &Path) -> Result<Threads, String> {
     if unsettled {
         return Ok(Threads::Unsettled);
     }
-    Ok(match list()? {
-        Some(listed) if listed.iter().any(|thread| !read.contains(thread)) => Threads::Unsettled,
-        _ => Threads::Ended,
+    match list()? {
+        None => return Ok(Threads::Ended),
+        Some(listed) if listed.iter().any(|thread| !read.contains(thread)) => {
+            return Ok(Threads::Unsettled);
+        }
+        Some(_) => {}
+    }
+    // A thread created after the first listing can still have taken the
+    // leader's id by `execve` before the second; only the leader's id can
+    // change hands, so reading it once more settles that.
+    let leader = match leader {
+        Some(leader) => process.join("task").join(leader),
+        None => return Ok(Threads::Unsettled),
+    };
+    Ok(if thread_ended(&leader)? {
+        Threads::Ended
+    } else {
+        Threads::Unsettled
     })
 }
 
