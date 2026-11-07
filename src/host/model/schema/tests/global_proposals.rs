@@ -30,12 +30,22 @@ fn count(db: &Connection, table: &str) -> u64 {
     .unwrap()
 }
 
+/// The predecessor fixture closes one project; a request needs an open one.
+fn open_project_definition(registry: &Registry) -> crate::automations::Definition {
+    let open = registry
+        .automations(None, 100)
+        .unwrap()
+        .into_iter()
+        .find(|summary| summary.directory == std::path::Path::new("/kept"))
+        .unwrap();
+    registry.automation(open.id).unwrap().definition
+}
+
 fn real_twenty_two() -> (tempfile::TempDir, std::path::PathBuf, Vec<Proposal>) {
     // Reuse the existing real API fixture: pins, lifecycle/run outboxes,
     // accepted work, CoreHome, placement, history22 lineage and cleanup rows.
     let (mut source, directory, scope) = history_predecessor_source();
-    let id = source.automations(None, 100).unwrap()[0].id;
-    let definition = source.automation(id).unwrap().definition;
+    let definition = open_project_definition(&source);
     let mut proposals = Vec::new();
     for number in 0..4 {
         let proposal = source
@@ -257,8 +267,7 @@ fn damaged_twenty_three_layout_refuses_before_writable_admission_or_counter_repa
 fn future_header_refuses_retained_delivery_review_decision_and_notice_without_mutation() {
     let _clear = Clear;
     let (mut registry, _directory, _) = history_predecessor_source();
-    let id = registry.automations(None, 100).unwrap()[0].id;
-    let definition = registry.automation(id).unwrap().definition;
+    let definition = open_project_definition(&registry);
     let proposal = registry
         .propose_automation(
             Uuid::new_v4(),

@@ -213,6 +213,12 @@ fn message(action: Action) -> Message {
     Message::AutomationApproval(super::Action::Global(action))
 }
 
+// Presentation key only. Commands retain and validate the exact request.
+pub(super) fn presentation_key(parts: &impl std::fmt::Debug) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(format!("{parts:?}").as_bytes()).into()
+}
+
 fn resolved_proposal_notice(state: &ProposalState) -> Option<TransientNotice> {
     match state {
         ProposalState::Pending => None,
@@ -803,12 +809,15 @@ impl Cagents {
                 .spacing(space::S)
                 .align_y(Alignment::Center)
                 .into();
-                ((proposal.id, proposal.revision), row)
+                let row = widget::container(row)
+                    .padding([0.0, 0.0, space::S, 0.0])
+                    .into();
+                (presentation_key(&(proposal.id, proposal.revision)), row)
             });
             body = body.push(
-                widget::container(widget::scrollable(
-                    iced::widget::keyed::Column::with_children(rows).spacing(space::S),
-                ))
+                widget::container(widget::scrollable(crate::interaction::keyed_list_rows(
+                    rows.collect(),
+                )))
                 .max_height(160),
             );
             let next = state.pending.last().map(|row| row.id);
@@ -843,8 +852,8 @@ impl Cagents {
             ])
             .spacing(space::S)
             .into();
-            body = body.push(iced::widget::keyed::Column::with_children([(
-                (state.key, state.after, next),
+            body = body.push(crate::interaction::keyed_list_rows(vec![(
+                presentation_key(&(state.key, state.after, next)),
                 controls,
             )]));
         }
@@ -852,14 +861,10 @@ impl Cagents {
             .padding(space::M)
             .width(Length::Fill)
             .into();
-        Some(
-            iced::widget::keyed::Column::with_children([(
-                state.key.map(|key| (key.identity, key.epoch)),
-                content,
-            )])
-            .width(Length::Fill)
-            .into(),
-        )
+        Some(crate::interaction::keyed_list_rows(vec![(
+            presentation_key(&state.key.map(|key| (key.identity, key.epoch))),
+            content,
+        )]))
     }
 }
 

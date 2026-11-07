@@ -835,7 +835,7 @@ fn an_exact_already_resolved_notice_reports_its_terminal_state_without_a_modal_o
         assert!(app.automation_approval.global.pending.is_empty());
         assert!(app.automation_approval.global.latest_open.is_none());
         assert!(matches!(flight(&app).2, Read::Delivery));
-        assert!(app.status.is_some());
+        assert!(!app.notices.entries.is_empty());
     }
 
     // A request resolved elsewhere, or an uncertain earlier decision, must
@@ -911,7 +911,12 @@ fn an_exact_already_resolved_notice_reports_its_terminal_state_without_a_modal_o
             assert!(app.automation_approval.generation > generation);
             assert!(matches!(flight(&app).2, Read::Delivery));
             assert!(app.core.keyboard_nav());
-            let notice = app.status.as_ref().expect("confirmed decision outcome");
+            let notice = &app
+                .notices
+                .entries
+                .back()
+                .expect("confirmed decision outcome")
+                .notice;
             assert_eq!(
                 notice.message,
                 if approved {
@@ -1127,7 +1132,7 @@ fn proposal_discovery_has_no_time_based_subscription_even_when_focused_with_a_pr
         }
     }
     assert!(
-        !app.sidebar_model.projects.is_empty(),
+        !app.workspace_model.projects.is_empty(),
         "the original focused/project timer condition is actually present"
     );
 }

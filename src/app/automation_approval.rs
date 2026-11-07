@@ -661,12 +661,10 @@ impl Cagents {
         );
         // Reset unnamed pointer state for each review. Named button state is
         // restored outside keyed diff, so those IDs also carry this generation.
-        Some(
-            iced::widget::keyed::Column::with_children([(state.generation, overlay)])
-                .width(Length::Fill)
-                .height(Length::Fill)
-                .into(),
-        )
+        Some(crate::interaction::keyed_list_rows(vec![(
+            global::presentation_key(&state.generation),
+            overlay,
+        )]))
     }
 }
 

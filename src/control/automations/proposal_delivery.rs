@@ -6,36 +6,49 @@ pub enum Command {
     /// List pending metadata; continue with the returned registry and clock.
     Proposals {
         #[arg(long, requires_all = ["registry", "sequence"])]
+        #[arg(help = "Continue after this proposal, as returned by the previous page.")]
         after: Option<Uuid>,
         #[arg(long, requires = "sequence")]
+        #[arg(help = "Registry identity returned by the previous page.")]
         registry: Option<Uuid>,
         #[arg(long, requires = "registry", value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(help = "Delivery clock returned by the previous page.")]
         sequence: Option<u64>,
         #[arg(long, default_value_t = 50, value_parser = page_limit)]
+        #[arg(help = "Requests per page (1 through 64).")]
         limit: usize,
     },
     /// Read full immutable consent from the exact registry shown by proposals.
     ReviewProposal {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Registry identity shown by automation proposals.")]
         registry: Uuid,
     },
     /// Approve the exact reviewed proposal (user only).
     Approve {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Registry identity shown by automation proposals.")]
         registry: Uuid,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(help = "Revision shown by automation review-proposal.")]
         revision: u64,
         #[arg(long)]
+        #[arg(help = "Confirm approving and enabling this exact request.")]
         confirm: bool,
     },
     /// Explicitly decline the exact reviewed revision (user only).
     Decline {
+        #[arg(help = "The stable resource ID.")]
         id: Uuid,
         #[arg(long)]
+        #[arg(help = "Registry identity shown by automation proposals.")]
         registry: Uuid,
         #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        #[arg(help = "Revision shown by automation review-proposal.")]
         revision: u64,
     },
 }
