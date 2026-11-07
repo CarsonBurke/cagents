@@ -411,7 +411,7 @@ impl Cagents {
             return "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available. The update has not been verified.".to_owned();
         }
         format!(
-            "recovery-incomplete: {} did not reconnect in time: {}. {} in this window, which remains available. The update has not been verified.",
+            "recovery-incomplete: {} did not reconnect in time: {}. {}. The update has not been verified.",
             saved_panes(pending.panes.len()),
             self.startup_pane_names(&pending.panes),
             they_stay(pending.panes.len()),
@@ -426,7 +426,7 @@ impl Cagents {
             );
         }
         format!(
-            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. {} in this window, which remains available. The update has not been verified.",
+            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. {}. The update has not been verified.",
             saved_panes(pending.panes.len()),
             NO_PROGRESS.as_secs(),
             self.startup_pane_names(&pending.panes),
@@ -701,7 +701,7 @@ fn inspect_existing_daemon(
 
 /// What the window says when the daemon kept its original owners after a
 /// failed restore; the daemon's own reason goes beneath it as details.
-const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted. Until the terminal service restarts, it cannot start new terminals or chats or accept input in existing ones. The update has not been verified.";
+const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted. Until the terminal service restarts, it cannot start new terminals or chats or accept input in existing ones. To start new work, let these sessions finish or close them, then run `cagents daemon stop` and reopen cagents. The update has not been verified.";
 
 /// The handshake's prefix tells the launcher to keep the window open; the
 /// person reading the notice needs only the sentence after it.
@@ -766,10 +766,11 @@ fn unconfirmed_reason() -> String {
     "recovery-incomplete: this window's saved panes reconnected, but the terminal service did not confirm that it had finished restoring saved sessions. The window remains available. The update has not been verified.".to_owned()
 }
 
+/// Where waiting panes are, and how to check on them.
 fn they_stay(count: usize) -> &'static str {
     match count {
-        1 => "It stays",
-        _ => "They stay",
+        1 => "It stays in this window, which remains available; open it to see its status",
+        _ => "They stay in this window, which remains available; open them to see their status",
     }
 }
 

@@ -1233,7 +1233,12 @@ fn a_single_waiting_pane_is_named_in_the_singular() {
         app.reconnecting_reason(&pending),
     ] {
         assert!(reason.contains("1 saved pane "), "{reason}");
-        assert!(reason.contains(". It stays in this window"), "{reason}");
+        assert!(
+            reason.contains(
+                ". It stays in this window, which remains available; open it to see its status."
+            ),
+            "{reason}"
+        );
     }
 }
 
@@ -1282,6 +1287,7 @@ fn a_saved_chat_that_never_gets_a_runtime_is_named_once_the_daemon_is_ready() {
             .checked_sub(NO_PROGRESS + Duration::from_secs(1))
             .unwrap(),
     );
+    assert!(!app.startup_budget_spent(Instant::now()));
     drop(app.verify_startup_gate());
     let reason = reported(&app).expect("a stalled chat answers the launcher");
     assert_readable(reason);
