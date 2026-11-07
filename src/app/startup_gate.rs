@@ -239,9 +239,30 @@ impl Cagents {
             count => (format!("{count} panes"), "them"),
         };
         let detail = startup_details(reason);
+        if failures.iter().all(|card| self.startup_pane_held(*card)) {
+            return format!(
+                "recovery-incomplete: {count} did not reconnect: {names}. Nothing was closed or restarted, and this window stays available.{detail}"
+            );
+        }
         format!(
             "recovery-incomplete: {count} did not reconnect: {names}. Open {verb} to reconnect or recover {verb}; drafts and recovery evidence are kept, and this window stays available.{detail}"
         )
+    }
+
+    /// Whether `card` has no surface because something holds it back, so
+    /// opening it would only show why rather than reconnect it.
+    fn startup_pane_held(&self, card: CardId) -> bool {
+        if !matches!(self.cards.get(&card), Some(CardRuntime::Loading) | None) {
+            return false;
+        }
+        self.shared_views_startup_hold()
+            .filter(|_| !self.shared_views.registry_unavailable)
+            .is_some()
+            || matches!(
+                self.card_state(card).map(|state| &state.kind),
+                Some(CardKind::Terminal(session))
+                    if self.shared_terminal_attach_hold(card, session).is_some()
+            )
     }
 
     /// The report when `out_of_step` panes are attached and working, so

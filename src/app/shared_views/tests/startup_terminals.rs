@@ -1404,6 +1404,11 @@ fn a_held_restored_pane_is_reported_with_its_hold() {
         report.contains("the shared workspace is still starting its terminal"),
         "{report}"
     );
+    // Opening it would show the same hold, as its pane does, not reconnect it.
+    assert!(
+        report.contains("Nothing was closed or restarted") && !report.contains("Open it"),
+        "{report}"
+    );
 }
 
 /// A view the registry never admits holds every pane in it. Past its window
