@@ -163,6 +163,72 @@ pub(crate) fn ensure_no_surviving_process(
     owner: u32,
     proc_root: &Path,
 ) -> Result<(), String> {
+    match surviving_process(session, owner, proc_root)? {
+        Some(survivor) => Err(survivor.reason),
+        None => Ok(()),
+    }
+}
+
+/// A process that ties a saved terminal to something still running.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SurvivingProcess {
+    pub(crate) pid: u32,
+    /// The kernel's short name for it, unless it exited during the scan.
+    pub(crate) name: Option<String>,
+    pub(crate) link: SurvivorLink,
+    reason: String,
+}
+
+/// What ties the process to the terminal, which decides how sure a person can be
+/// that stopping it is theirs to do.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SurvivorLink {
+    Conversation,
+    /// The saved launch named this unit. Another launch can reuse a unit name.
+    Unit(String),
+    Lineage,
+}
+
+/// `Err` means the scan could not finish, not that anything is running: a
+/// process can be mid-exec or vanish while it is read.
+#[cfg(any(feature = "host", feature = "ui"))]
+pub(crate) fn surviving_process(
+    session: &TerminalSession,
+    owner: u32,
+    proc_root: &Path,
+) -> Result<Option<SurvivingProcess>, String> {
+    finish_process_scan(|| scan_for_survivor(session, owner, proc_root))
+}
+
+/// A process shows no arguments for a moment while it execs or exits, which on a
+/// machine that's building happens often enough that one scan alone would turn
+/// people away. Each attempt scans everything again, so a process that keeps
+/// re-execing or stays unreadable can still fail the scan: unknown is not absent.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn finish_process_scan<T>(mut scan: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+    const ATTEMPTS: usize = 4;
+    const WAIT: std::time::Duration = if cfg!(test) {
+        std::time::Duration::from_millis(1)
+    } else {
+        std::time::Duration::from_millis(100)
+    };
+    for _ in 1..ATTEMPTS {
+        match scan() {
+            Err(_) => std::thread::sleep(WAIT),
+            finished => return finished,
+        }
+    }
+    scan()
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn scan_for_survivor(
+    session: &TerminalSession,
+    owner: u32,
+    proc_root: &Path,
+) -> Result<Option<SurvivingProcess>, String> {
     use std::collections::HashMap;
     let mut processes = HashMap::new();
     let mut starts = HashMap::new();
@@ -213,6 +279,12 @@ pub(crate) fn ensure_no_surviving_process(
         "CAGENTS_RECOVERY_ORIGIN={}",
         session.recovery_origin.unwrap_or(session.id)
     );
+    let carries_marker = |environment: &[u8]| {
+        environment
+            .split(|byte| *byte == 0)
+            .any(|entry| entry == terminal_marker.as_bytes() || entry == origin_marker.as_bytes())
+    };
+    let unit = systemd_unit(&session.launch);
     for &pid in processes.keys() {
         if pid == std::process::id() || belongs_to_owner(pid, owner, &processes) {
             continue;
@@ -264,9 +336,45 @@ pub(crate) fn ensure_no_surviving_process(
                 })
             })
         }) {
-            return Err(format!(
-                "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
-            ));
+            return Ok(Some(survivor(
+                &path,
+                pid,
+                SurvivorLink::Conversation,
+                format!(
+                    "agent session still has a live process ({pid}); automatic recovery would duplicate its writer"
+                ),
+            )));
+        }
+        if let Some(unit) = unit {
+            let cgroup = match fs::read_to_string(path.join("cgroup")) {
+                Ok(cgroup) => cgroup,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            if in_systemd_unit(&cgroup, unit) && !detached_browser_helper(&path) {
+                let marked = fs::read(path.join("environ"))
+                    .is_ok_and(|environment| carries_marker(&environment));
+                return Ok(Some(survivor(
+                    &path,
+                    pid,
+                    if marked {
+                        SurvivorLink::Lineage
+                    } else {
+                        SurvivorLink::Unit(unit.to_owned())
+                    },
+                    if marked {
+                        format!(
+                            "terminal {} still has a live process ({pid}); preserving it",
+                            session.id
+                        )
+                    } else {
+                        format!(
+                            "terminal {} may still have a live process ({pid}) in {unit}, the systemd unit it was launched in; preserving it",
+                            session.id
+                        )
+                    },
+                )));
+            }
         }
         let environment = match fs::read(path.join("environ")) {
             Ok(environment) => environment,
@@ -300,22 +408,83 @@ pub(crate) fn ensure_no_surviving_process(
                 return Err(format!("cannot inspect process environment ({pid})"));
             }
         }
-        for entry in environment.split(|byte| *byte == 0) {
-            if entry == terminal_marker.as_bytes() || entry == origin_marker.as_bytes() {
-                if detached_browser_helper(&path) {
-                    break;
-                }
-                return Err(format!(
+        if carries_marker(&environment) && !detached_browser_helper(&path) {
+            return Ok(Some(survivor(
+                &path,
+                pid,
+                SurvivorLink::Lineage,
+                format!(
                     "terminal {} still has a live process ({pid}); preserving it",
                     session.id
-                ));
-            }
+                ),
+            )));
         }
         // Terminal branding and another terminal's marker can be inherited by
         // detached browsers and services. Neither proves ownership of this
         // session. Recovery lineage and exact agent identities do.
     }
-    Ok(())
+    Ok(None)
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn survivor(process: &Path, pid: u32, link: SurvivorLink, reason: String) -> SurvivingProcess {
+    SurvivingProcess {
+        pid,
+        name: fs::read_to_string(process.join("comm"))
+            .ok()
+            .map(|name| name.trim_end().to_owned())
+            .filter(|name| !name.is_empty()),
+        link,
+        reason,
+    }
+}
+
+/// The unit a `systemd-run` launch names for itself. Its cgroup still finds a
+/// process that cleared the inherited markers. A spelling this misses (a bundled
+/// `-qu`, an abbreviated `--un=`, a wrapper before `systemd-run`) leaves only the
+/// marker check. Arguments after the command can look like this option too. Both
+/// outcomes can only change whether a refusal happens on top of the marker check,
+/// never remove a check.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn systemd_unit(launch: &LaunchRecipe) -> Option<&str> {
+    if Path::new(&launch.program).file_name()? != "systemd-run" {
+        return None;
+    }
+    let mut arguments = launch
+        .arguments
+        .iter()
+        .map(String::as_str)
+        .take_while(|argument| *argument != "--");
+    while let Some(argument) = arguments.next() {
+        if let Some(unit) = argument.strip_prefix("--unit=").or_else(|| {
+            argument
+                .strip_prefix("-u")
+                .filter(|attached| !attached.is_empty())
+        }) {
+            return Some(unit);
+        }
+        if argument == "--unit" || argument == "-u" {
+            return arguments.next();
+        }
+    }
+    None
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn in_systemd_unit(cgroup: &str, unit: &str) -> bool {
+    let stem = unit
+        .strip_suffix(".scope")
+        .or_else(|| unit.strip_suffix(".service"))
+        .unwrap_or(unit);
+    cgroup
+        .lines()
+        .filter_map(|line| line.strip_prefix("0::"))
+        .flat_map(|path| path.split('/'))
+        .any(|part| {
+            part.strip_suffix(".scope")
+                .or_else(|| part.strip_suffix(".service"))
+                == Some(stem)
+        })
 }
 
 /// Browser tooling starts long-lived services which inherit the launching
@@ -2285,6 +2454,121 @@ mod tests {
         fs::write(process.join("cmdline"), format!("browser-helper\0{id}\0")).unwrap();
         let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
         assert!(error.contains("agent session still has a live process"));
+    }
+
+    /// A zombie shows no arguments for as long as its parent leaves it, and it
+    /// has stopped running, so it mustn't block every Close and Retry.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_zombie_does_not_fail_a_process_scan_but_a_lasting_blank_process_does() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("cmdline"), b"").unwrap();
+
+        fs::write(process.join("stat"), "42 (sleep) Z 1 41 41 0").unwrap();
+        assert_eq!(
+            ensure_no_surviving_process(&source, u32::MAX, directory.path()),
+            Ok(())
+        );
+
+        fs::write(process.join("stat"), "42 (sleep) R 1 41 41 0").unwrap();
+        let error = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+        assert!(
+            error.contains("cannot inspect process invocation (42)"),
+            "{error}"
+        );
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_process_scan_gets_past_a_moment_of_exec_but_not_a_lasting_unknown() {
+        let mut scans = 0;
+        let finished = finish_process_scan(|| {
+            scans += 1;
+            if scans < 3 {
+                Err("cannot inspect process invocation (42)".to_owned())
+            } else {
+                Ok(None::<u32>)
+            }
+        });
+        assert_eq!(finished, Ok(None));
+        assert_eq!(scans, 3);
+
+        let mut scans = 0;
+        let unknown = finish_process_scan::<()>(|| {
+            scans += 1;
+            Err("cannot inspect process invocation (42)".to_owned())
+        });
+        assert!(unknown.is_err(), "unknown is not absent");
+        assert_eq!(scans, 4);
+
+        let mut scans = 0;
+        let found = finish_process_scan(|| {
+            scans += 1;
+            Ok::<_, String>(Some(42))
+        });
+        assert_eq!(found, Ok(Some(42)));
+        assert_eq!(scans, 1, "a finished scan isn't repeated");
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn systemd_unit_finds_each_spelling_of_the_named_unit() {
+        let launch = |arguments: &[&str]| {
+            let mut launch = LaunchRecipe::shell("/tmp".into()).unwrap();
+            launch.program = "/usr/bin/systemd-run".into();
+            launch.arguments = arguments
+                .iter()
+                .map(|argument| (*argument).into())
+                .collect();
+            launch
+        };
+        for arguments in [
+            &["--user", "--scope", "--unit=named", "claude"][..],
+            &["--user", "--scope", "--unit", "named", "claude"],
+            &["--user", "--scope", "-u", "named", "claude"],
+            &["--user", "--scope", "-unamed", "claude"],
+        ] {
+            assert_eq!(
+                systemd_unit(&launch(arguments)),
+                Some("named"),
+                "{arguments:?}"
+            );
+        }
+        // `--user` is not `-u`, and nothing after `--` is an option.
+        assert_eq!(
+            systemd_unit(&launch(&["--user", "--scope", "claude"])),
+            None
+        );
+        assert_eq!(
+            systemd_unit(&launch(&["--user", "--", "-u", "named"])),
+            None
+        );
+        let mut other = launch(&["--unit=named"]);
+        other.program = "env".into();
+        assert_eq!(systemd_unit(&other), None);
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn in_systemd_unit_matches_a_whole_unit_at_any_depth() {
+        let base = "0::/user.slice/user-1000.slice/user@1000.service/app.slice";
+        for (cgroup, unit, expected) in [
+            (format!("{base}/named.scope\n"), "named", true),
+            (format!("{base}/named.scope\n"), "named.scope", true),
+            (format!("{base}/named.service\n"), "named.service", true),
+            (format!("{base}/named.scope/inner\n"), "named", true),
+            (format!("{base}/named-2.scope\n"), "named", false),
+            (format!("{base}/other.scope\n"), "named", false),
+            // A slice is not the unit the launch named.
+            (format!("{base}\n"), "app", false),
+            // Only the unified hierarchy is read.
+            ("1:name=systemd:/named.scope\n".to_owned(), "named", false),
+        ] {
+            assert_eq!(in_systemd_unit(&cgroup, unit), expected, "{cgroup} {unit}");
+        }
     }
 
     #[cfg(any(feature = "host", feature = "ui"))]

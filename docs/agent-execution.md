@@ -208,7 +208,7 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 
 ## Console surface
 
-`--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console streams a bounded transcript, structured usage, run outcomes, approvals, and questions.
+`--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console prints what the agent said and one line per finished step, plus a line for any step still running after a few seconds; command output, tool payloads and delivered reports are left out. It also prints run outcomes with their token usage, approvals, and questions. A line appears once it is complete, and a step that finishes after later text was printed appears as one new line, so the transcript is not reprinted.
 
 - Ordinary input submits a new durable run.
 - `/interrupt` requests interruption through the native adapter. It refuses an interruption that would stop running background subagents; `/interrupt --including-subagents` permits that wider impact. A successful interrupt takes the agent over; a refusal leaves its owner in control.

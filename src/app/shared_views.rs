@@ -907,6 +907,13 @@ impl Cagents {
             .any(|pending| *pending == card)
     }
 
+    #[cfg(test)]
+    pub(super) fn mark_pane_moving(&mut self, card: CardId) {
+        self.shared_views
+            .requested_transfers
+            .insert(uuid::Uuid::new_v4(), card);
+    }
+
     pub(super) fn can_move_pane_to_channel(
         &self,
         card: CardId,
