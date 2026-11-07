@@ -146,6 +146,7 @@ pub fn accounts(rows: impl IntoIterator<Item = Row>, now: u64) -> Vec<Brokered> 
                     email,
                     organization: None,
                     plan: None,
+                    disputed_by: None,
                 },
                 snapshot: snapshot(&reading, newest),
             })

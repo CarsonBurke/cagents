@@ -306,6 +306,20 @@ impl Serializer for VariantIndex {
     }
 }
 
+/// The protocols with a recorded wire format, which are kept across bumps.
+#[cfg(test)]
+pub(crate) fn recorded_protocols() -> Vec<u16> {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wire-formats");
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_stem().unwrap().to_str().unwrap().parse().unwrap()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod wire_format_tests;
 #[cfg(test)]

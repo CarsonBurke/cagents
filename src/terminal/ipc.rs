@@ -228,6 +228,8 @@ pub const STARTUP_STATE_PROTOCOL: u16 = 129;
 pub const INFERRED_PULL_REQUESTS_PROTOCOL: u16 = 151;
 
 mod older_clients;
+#[cfg(test)]
+pub(crate) use older_clients::recorded_protocols;
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row

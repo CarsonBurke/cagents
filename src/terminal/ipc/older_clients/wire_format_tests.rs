@@ -59,7 +59,8 @@ struct Comparison<'a> {
     older: &'a Shapes,
     current: &'a Shapes,
     /// Enums whose later variants the connection withholds, by short name
-    /// (`ServerMessage`), with the older client's variant count.
+    /// (`ServerMessage`) or full path (`cagents::work::Response`), with the
+    /// older client's variant count.
     gated: Vec<(&'static str, usize)>,
     appended_at_frame_end: &'a [&'a str],
     visited: BTreeSet<(Direction, bool, String, String)>,
@@ -366,6 +367,28 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             "protocol {} clients would misread this daemon. Adapt or refuse what changed for \
              them, or remove them from OLDER_CLIENTS:\n{}",
             client.protocol,
+            differences.join("\n")
+        );
+    }
+}
+
+/// An update speaks these sources' protocols with this release's types. The one
+/// field allowed to differ ends the directory reply, which no update exchanges.
+#[test]
+fn matched_sets_an_update_replaces_keep_their_messages() {
+    let current = traced();
+    for protocol in [
+        crate::terminal_ipc::STARTUP_STATE_PROTOCOL,
+        crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
+    ] {
+        let older = recorded(protocol);
+        let gated = ["ServerMessage", "ServerResponse", WORK_RESPONSE]
+            .map(|name| (name, variant_count(&older, name) as usize))
+            .to_vec();
+        let differences = differences(&older, &current, gated, APPENDED_AT_FRAME_END);
+        assert!(
+            differences.is_empty(),
+            "protocol {protocol} would misread an update:\n{}",
             differences.join("\n")
         );
     }

@@ -183,9 +183,8 @@ fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
     a.launch.provider == b.launch.provider
         && a.launch.session_id == b.launch.session_id
         && a.launch.recipe.working_directory == b.launch.recipe.working_directory
-        && crate::account::home_variable(a.launch.provider).is_none_or(|variable| {
-            a.launch.recipe.environment.get(variable) == b.launch.recipe.environment.get(variable)
-        })
+        && conversation_home(a.launch.provider, &a.launch.recipe)
+            == conversation_home(b.launch.provider, &b.launch.recipe)
 }
 
 /// What makes two listings the same conversation: its provider, its ID, and
@@ -196,13 +195,23 @@ fn identity(provider: Provider, id: Option<&str>, recipe: &LaunchRecipe) -> Iden
     (
         provider,
         id.map(str::to_owned),
-        crate::account::home_variable(provider)
-            .and_then(|variable| recipe.environment.get(variable))
-            .map(|home| {
-                let path = PathBuf::from(home);
-                path.canonicalize().unwrap_or(path)
-            }),
+        conversation_home(provider, recipe),
     )
+}
+
+/// The directory a launch keeps its provider's history in, however the
+/// launch names it: a recipe that exports the provider's default home and one
+/// that leaves the CLI to resolve that default keep the same history.
+fn conversation_home(provider: Provider, recipe: &LaunchRecipe) -> Option<PathBuf> {
+    let root = provider.session_root(recipe).or_else(|| {
+        let variable = crate::account::home_variable(provider)?;
+        recipe
+            .environment
+            .get(variable)
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+    })?;
+    Some(root.canonicalize().unwrap_or(root))
 }
 
 /// Lists saved conversations, then every conversation the seeds' providers
@@ -1193,6 +1202,32 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A conversation saved while cagents exported Claude's default home and
+    /// the same conversation found under a launch that leaves the CLI to
+    /// resolve it are one listing, kept in one history.
+    #[test]
+    fn exporting_the_default_home_or_not_lists_one_conversation() {
+        let mut exported = LaunchRecipe::shell("/w".into()).unwrap();
+        exported.environment.insert("HOME".into(), "/home/a".into());
+        let mut resolved = exported.clone();
+        exported
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into());
+        resolved.environment.remove("CLAUDE_CONFIG_DIR");
+        assert_eq!(
+            identity(Provider::Claude, Some("id"), &exported),
+            identity(Provider::Claude, Some("id"), &resolved)
+        );
+        let mut other = exported.clone();
+        other
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/home/a/work".into());
+        assert_ne!(
+            identity(Provider::Claude, Some("id"), &other),
+            identity(Provider::Claude, Some("id"), &resolved)
+        );
+    }
 
     fn saved(directory: &Path) -> SavedConversation {
         let mut session = chat::fresh_session(

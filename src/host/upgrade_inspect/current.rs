@@ -1228,4 +1228,14 @@ mod tests {
         assert!(refused);
         assert_eq!(observed, io::ErrorKind::WouldBlock);
     }
+
+    #[test]
+    fn a_protocol_bump_keeps_every_recorded_protocol_inspectable() {
+        for protocol in ipc::recorded_protocols() {
+            assert!(
+                supports_protocol(protocol),
+                "an update from protocol {protocol} couldn't inspect its source"
+            );
+        }
+    }
 }

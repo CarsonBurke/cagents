@@ -1131,12 +1131,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                                 return Err("Startup teardown remains unconfirmed; its exact cleanup owner was retained".into());
                             }
                         }
-                    } else if session.owned_codex_listener.is_some()
-                        || matches!(
-                            session.native_continuity,
-                            chat::NativeContinuity::Durable { .. }
-                        )
-                    {
+                    } else if session.closes_without_hosted_actor() {
                         // Missing history can prevent actor restoration while
                         // its authenticated provider holder is still alive.
                         // Only the holder's exact receipt releases ownership.
@@ -1725,60 +1720,12 @@ fn console(
             let Some(snapshot) = handle.snapshot(cursor) else {
                 return Ok(Reply::Console(None));
             };
-            let mut chunks = Vec::new();
-            let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
-            let mut truncated = false;
-            for item in snapshot.items.iter().rev() {
-                let mut text = match &item.content {
-                    chat::ItemContent::Text {
-                        text,
-                        thinking: false,
-                        ..
-                    } => format!("{:?}: {text}\n", item.role),
-                    chat::ItemContent::Command {
-                        command,
-                        status,
-                        output,
-                        ..
-                    } => format!("Command ({status:?}): {command}\n{output}\n"),
-                    chat::ItemContent::Tool {
-                        name,
-                        status,
-                        output,
-                        ..
-                    } => format!("Tool {name} ({status:?}): {output}\n"),
-                    chat::ItemContent::Delivery {
-                        kind,
-                        from,
-                        sender,
-                        summary,
-                        body,
-                    } => {
-                        let heading = chat::delivery_heading(*kind, from, sender, summary);
-                        if body.is_empty() {
-                            format!("{heading}\n")
-                        } else {
-                            format!("{heading}:\n{body}\n")
-                        }
-                    }
-                    _ => continue,
-                };
-                if text.len() > remaining {
-                    crate::agent_execution::truncate(&mut text, remaining);
-                    truncated = true;
-                }
-                remaining -= text.len();
-                chunks.push(text);
-                if remaining == 0 {
-                    break;
-                }
-            }
-            chunks.reverse();
+            let (text, truncated) = console_text(&snapshot, chat::now_ms().unwrap_or(0));
             let mut requests = snapshot.requests;
             hide_secrets(&mut requests);
             Ok(Reply::Console(Some(ConsoleView {
                 generation: snapshot.generation,
-                text: chunks.concat(),
+                text,
                 truncated,
                 requests,
                 ready: snapshot.ready,
@@ -1786,6 +1733,255 @@ fn console(
             })))
         }
     }
+}
+
+/// How long a step runs before the console says so. Most finish sooner, and
+/// their one line is enough; a long one would otherwise look like a hang.
+const CONSOLE_RUNNING_AFTER_MILLIS: u64 = 5_000;
+/// The longest line a provider notice prints in the console.
+const CONSOLE_NOTICE_BYTES: usize = 200;
+
+/// The newest console lines that fit the reply, and whether any were left out.
+/// Items are kept or dropped whole, so a line the client printed never comes
+/// back shorter. Only an item too long to fit at all is cut.
+///
+/// Every line ends in a newline except the one the provider is still writing:
+/// the client holds that back until it is complete.
+fn console_text(snapshot: &chat::Snapshot, now: u64) -> (String, bool) {
+    let mut chunks = Vec::new();
+    let mut remaining = crate::agent_execution::MAX_RESULT_BYTES;
+    let mut truncated = snapshot.has_earlier;
+    let paged_files = console_paged_files(snapshot);
+    for item in snapshot.items.iter().rev() {
+        let line = match paged_files.get(item.id.as_str()) {
+            Some(0) => None,
+            Some(1) => Some("Edited 1 more file\n".to_owned()),
+            Some(files) => Some(format!("Edited {files} more files\n")),
+            None => console_line(item, now),
+        };
+        let Some(mut text) = line else {
+            continue;
+        };
+        if text.len() > remaining {
+            truncated = true;
+            if chunks.is_empty() {
+                crate::agent_execution::truncate(&mut text, remaining);
+                text.pop();
+                text.push('\n');
+                chunks.push(text);
+            }
+            break;
+        }
+        remaining -= text.len();
+        chunks.push(text);
+    }
+    chunks.reverse();
+    let mut text = chunks.concat();
+    // A provider opens its next text block empty, which has no line to hold.
+    let writing = snapshot.busy
+        && snapshot.items.last().is_some_and(|item| {
+            matches!(
+                item.content,
+                chat::ItemContent::Text {
+                    thinking: false,
+                    ..
+                }
+            ) && console_line(item, now).is_some()
+        });
+    if writing {
+        text.pop();
+    }
+    (text, truncated)
+}
+
+/// How many files each later part of a paged edit adds to those its earlier
+/// parts named. A part names the files it has lines of, so a file can span parts.
+fn console_paged_files(snapshot: &chat::Snapshot) -> std::collections::HashMap<&str, usize> {
+    let mut named = std::collections::HashSet::new();
+    let mut files = std::collections::HashMap::new();
+    for item in &snapshot.items {
+        let chat::ItemContent::Changes { changes, status } = &item.content else {
+            continue;
+        };
+        let edit = chat::TranscriptPart::parse(&item.id).map_or(item.id.as_str(), |part| part.item);
+        let added = changes
+            .iter()
+            .filter(|change| named.insert((edit, change.path.as_str())))
+            .count();
+        if item.continues_paged_item() && *status != chat::ToolStatus::Running {
+            files.insert(item.id.as_str(), added);
+        }
+    }
+    files
+}
+
+/// What the provider's harness said about the session, as one unlabelled line,
+/// the way the native chat recesses it. Adapters file command output and whole
+/// protocol frames under this role, so only the start of plain text is shown.
+fn console_notice(text: &str) -> Option<String> {
+    let text = text.trim();
+    if serde_json::from_str::<serde_json::Value>(text)
+        .is_ok_and(|value| value.is_object() || value.is_array())
+    {
+        return None;
+    }
+    let mut line = text.lines().next()?.trim_end().to_owned();
+    if line.len() > CONSOLE_NOTICE_BYTES {
+        crate::agent_execution::truncate(&mut line, CONSOLE_NOTICE_BYTES);
+    }
+    line.push('\n');
+    Some(line)
+}
+
+/// One console line per transcript item. The console is a plain-text view a
+/// person reads, so it shows what the agent said, what it was sent, and a
+/// one-line account of each step, named as the native chat view names it.
+/// Command output, tool payloads and delivered reports are left to that view,
+/// which discloses them on demand.
+///
+/// A step appears once it settles, or as running once it has taken a while, so
+/// finishing it adds a line instead of rewriting one the client already printed.
+/// A step that settles after later text still lands before that text; the client
+/// then prints only the lines it has not shown (`ConsoleTranscript` in the CLI).
+fn console_line(item: &chat::Item, now: u64) -> Option<String> {
+    use chat::{ChangeKind, CommandAction, DeliveryKind, ItemContent, ToolStatus};
+    let running = item.content.status() == Some(ToolStatus::Running);
+    if running
+        && !item
+            .started_at
+            .is_some_and(|started| now.saturating_sub(started) >= CONSOLE_RUNNING_AFTER_MILLIS)
+    {
+        return None;
+    }
+    if item.continues_paged_item() {
+        // A notice prints one line, which its first part already gave.
+        if item.role == chat::Role::System {
+            return None;
+        }
+        return match &item.content {
+            ItemContent::Text {
+                text,
+                thinking: false,
+                ..
+            }
+            | ItemContent::Delivery {
+                kind: DeliveryKind::Message,
+                body: text,
+                ..
+            } if !text.trim().is_empty() => Some(format!("{}\n", text.trim_end())),
+            _ => None,
+        };
+    }
+    let outcome = |status: &ToolStatus| match status {
+        ToolStatus::Succeeded | ToolStatus::Running => "",
+        ToolStatus::Failed => " (failed)",
+        ToolStatus::Denied => " (denied)",
+        ToolStatus::Stopped => " (stopped)",
+    };
+    let first_line = |text: &str| text.trim().lines().next().unwrap_or_default().to_owned();
+    let line = match &item.content {
+        ItemContent::Text {
+            text,
+            thinking: false,
+            ..
+        } if !text.trim().is_empty() => {
+            let text = text.trim_end();
+            return match item.role {
+                chat::Role::User => Some(format!("User: {text}\n")),
+                chat::Role::Assistant => Some(format!("Assistant: {text}\n")),
+                chat::Role::System => console_notice(text),
+            };
+        }
+        ItemContent::Text { .. } => return None,
+        ItemContent::Command {
+            label,
+            command,
+            action,
+            status,
+            exit_code,
+            ..
+        } => {
+            let (verb, doing, stored) = match action {
+                CommandAction::Run => ("Ran", "Running", None),
+                CommandAction::Read => ("Read", "Reading", Some("Read ")),
+                CommandAction::Search => ("Searched", "Searching", Some("Search ")),
+                CommandAction::List => ("Listed", "Listing", Some("List ")),
+            };
+            let verb = if running { doing } else { verb };
+            let label = chat::without_page_mark(label.trim());
+            // Transcripts stored before adapters dropped the verb from the
+            // label still carry it, as the native view also allows for.
+            let label = stored
+                .and_then(|verb| label.strip_prefix(verb))
+                .filter(|target| !target.is_empty())
+                .unwrap_or(label);
+            let target = first_line(if label.is_empty() { command } else { label });
+            let exit = match (status, exit_code) {
+                (ToolStatus::Failed, Some(code)) => format!(" (failed, exit {code})"),
+                _ => outcome(status).to_owned(),
+            };
+            format!("{verb} {target}").trim_end().to_owned() + &exit
+        }
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
+            [] => return None,
+            [single] => {
+                let verb = match (&single.kind, running) {
+                    (ChangeKind::Added, false) => "Added",
+                    (ChangeKind::Deleted, false) => "Deleted",
+                    (ChangeKind::Updated, false) => "Edited",
+                    (ChangeKind::Renamed { .. }, false) => "Renamed",
+                    (ChangeKind::Added, true) => "Adding",
+                    (ChangeKind::Deleted, true) => "Deleting",
+                    (ChangeKind::Updated, true) => "Editing",
+                    (ChangeKind::Renamed { .. }, true) => "Renaming",
+                };
+                format!("{verb} {}{}", single.path, outcome(status))
+            }
+            many if running => format!("Editing {} files", many.len()),
+            many => format!("Edited {} files{}", many.len(), outcome(status)),
+        },
+        ItemContent::WebSearch { query, .. } if query.trim().is_empty() => return None,
+        ItemContent::WebSearch { query, .. } if running => {
+            format!("Searching the web for {}", first_line(query))
+        }
+        ItemContent::WebSearch { query, .. } => {
+            format!("Searched the web for {}", first_line(query))
+        }
+        ItemContent::Tool { name, .. } if running => {
+            format!("Calling {}", chat::without_page_mark(name))
+        }
+        ItemContent::Tool { name, status, .. } => {
+            format!(
+                "Called {}{}",
+                chat::without_page_mark(name),
+                outcome(status)
+            )
+        }
+        ItemContent::Image { description, .. } if description.trim().is_empty() => {
+            "Viewed an image".to_owned()
+        }
+        ItemContent::Image { description, .. } => {
+            format!("Viewed {}", first_line(description))
+        }
+        ItemContent::Delivery {
+            kind,
+            from,
+            sender,
+            summary,
+            body,
+        } => {
+            let heading = chat::delivery_heading(*kind, from, sender, summary);
+            // A message from another session is what the agent is asked to
+            // act on, so it stays readable. Reports and notices are payload.
+            match kind {
+                DeliveryKind::Message if !body.trim().is_empty() => {
+                    format!("{heading}:\n{}", body.trim_end())
+                }
+                _ => heading,
+            }
+        }
+    };
+    Some(line + "\n")
 }
 
 #[cfg(test)]

@@ -47,6 +47,7 @@ pub fn parse_account(result: &Value) -> Result<Identity, UsageStatus> {
         email: text("email"),
         organization: None,
         plan: text("planType").filter(|plan| plan != "unknown"),
+        disputed_by: None,
     })
 }
 

@@ -3016,6 +3016,13 @@ finally:
         assert!(is_bootstrapped_source(
             crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL
         ));
+        for protocol in crate::terminal_ipc::recorded_protocols() {
+            assert_eq!(
+                is_bootstrapped_source(protocol),
+                protocol != crate::terminal_ipc::PROTOCOL_VERSION,
+                "protocol {protocol}"
+            );
+        }
         assert!(!is_bootstrapped_source(candidate_line - 1));
         assert!(!is_bootstrapped_source(
             crate::terminal_ipc::PROTOCOL_VERSION

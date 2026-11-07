@@ -750,6 +750,16 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[test]
+    fn a_protocol_bump_keeps_every_recorded_protocol_an_update_source() {
+        for protocol in crate::terminal_ipc::recorded_protocols() {
+            assert!(
+                super::super::is_qualified_source(protocol),
+                "protocol {protocol} would be stranded on this release"
+            );
+        }
+    }
+
     /// The candidate line (128) is spoken with this release's types, so the
     /// messages an update exchanges with it must keep the variant positions
     /// that line published. Moving one would silently mis-decode its replies.

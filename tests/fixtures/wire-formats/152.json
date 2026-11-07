@@ -129,7 +129,7 @@
         ]
       ]
     },
-    "cagents::account::Identity": {
+    "cagents::account::IdentityWire": {
       "Struct": [
         [
           "email",
@@ -385,7 +385,7 @@
           "registered_identity",
           {
             "Option": {
-              "Container": "cagents::account::Identity"
+              "Container": "cagents::account::IdentityWire"
             }
           }
         ],
@@ -393,7 +393,7 @@
           "observed_identity",
           {
             "Option": {
-              "Container": "cagents::account::Identity"
+              "Container": "cagents::account::IdentityWire"
             }
           }
         ],
@@ -4133,7 +4133,7 @@
                 "expected",
                 {
                   "Option": {
-                    "Container": "cagents::account::Identity"
+                    "Container": "cagents::account::IdentityWire"
                   }
                 }
               ]
