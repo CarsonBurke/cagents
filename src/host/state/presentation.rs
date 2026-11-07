@@ -495,14 +495,28 @@ mod tests {
             state.detach(2, id).unwrap();
             state.register_client(3);
         }
-        let before = handle.activity().map(|fact| fact.sequence);
+        let shows_reply = |snapshot: &RenderSnapshot| {
+            snapshot.lines.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("GOT-FRESH")
+            })
+        };
         handle.input(b"FRESH\n".to_vec()).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.activity().map(|fact| fact.sequence) == before && Instant::now() < deadline {
+        // A hidden terminal's parser can still be read with a viewport other
+        // than the published one. Wait until it holds the reply.
+        let rows = handle.snapshot().rows - 1;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !shows_reply(&handle.viewport_snapshot(None, Some(rows), false).unwrap()) {
+            assert!(Instant::now() < deadline, "the shell never replied");
             thread::sleep(Duration::from_millis(10));
         }
-        // The echo and the reply can arrive as separate reads.
-        thread::sleep(Duration::from_millis(300));
+        assert!(
+            !shows_reply(&handle.snapshot()),
+            "a hidden terminal published a screen"
+        );
         {
             let mut state = host.lock().unwrap();
             state.attach(3, id).unwrap();
