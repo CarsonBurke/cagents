@@ -1725,17 +1725,36 @@ fn start_with_execution(
                     .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
             }
         }
+        // Equally transient: the provider's own `cagents` must reach this
+        // development instance's daemon.
+        if let Some(instance) = crate::instance::development_instance() {
+            spec.environment.insert(
+                crate::instance::DEVELOPMENT_INSTANCE_ENV.into(),
+                instance.into(),
+            );
+        }
         // Like the capability, transient: a cagents process the provider
         // starts must not take this conversation's account for the system
         // account.
-        match crate::account::registry::selection_marker(|name| spec.environment.get(name).cloned())
-        {
-            Some(marker) => {
-                spec.environment
-                    .insert(crate::account::SELECTION_MARKER.into(), marker);
-            }
-            None => {
-                spec.environment.remove(crate::account::SELECTION_MARKER);
+        let home_of = |name: &str| spec.environment.get(name).cloned();
+        let selection = crate::account::registry::selection_marker(home_of);
+        // It must keep the Claude home the reader started cagents with,
+        // though, rather than take it for the default earlier cagents
+        // exported to every launch.
+        let system = crate::account::system_home_marker(home_of, selection.as_deref(), |name| {
+            std::env::var(name).ok()
+        });
+        for (marker, value) in [
+            (crate::account::SELECTION_MARKER, selection),
+            (crate::account::SYSTEM_HOME_MARKER, system),
+        ] {
+            match value {
+                Some(value) => {
+                    spec.environment.insert(marker.into(), value);
+                }
+                None => {
+                    spec.environment.remove(marker);
+                }
             }
         }
         let execution_instance = uuid::Uuid::new_v4();
@@ -2736,6 +2755,11 @@ fn process_inner(
             if let Some(session) = capacity::prepare_saved_history(host, &source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
+            // A card still attached to an actor whose provider exited under
+            // this daemon resumes the same way as one a daemon stop ended:
+            // the exited actor is retired as a stop first, so the checks
+            // below find its verified retirement rather than a present owner.
+            retained_actor::finish_exited_attachment(host, &source).map_err(unavailable)?;
             // An unnamed pane resumes the conversation its ended actors
             // confirmed, through the same checks as a named one; when they
             // confirmed none, every actor's end is already proved and the
@@ -4706,9 +4730,8 @@ IFS= read -r finish < finish
         assert_eq!(retired.source().id, source.id);
         // The retirement receipt can precede the startup reaper consuming the
         // original helper's zombie. Observe that exact incarnation disappearing.
-        completion_wait_until(|| !identity.record.holder.is_current());
         assert!(
-            !identity.record.holder.is_current(),
+            identity.record.holder.reaped(),
             "real helper was not retired"
         );
         host.lock().unwrap().chats.clear();
@@ -5240,6 +5263,62 @@ IFS= read -r finish < finish
             !upgrade_environment(&launch, true, BTreeMap::new())
                 .unwrap()
                 .contains_key("ANTHROPIC_API_KEY")
+        );
+    }
+
+    /// A conversation on the system Claude login resolves the CLI's default
+    /// home, as the window's probe does, even under a daemon started with
+    /// its own `CLAUDE_CONFIG_DIR`, and after an upgrade.
+    #[test]
+    fn a_system_claude_launch_does_not_take_the_daemon_home() {
+        let mut recipe = LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: "/project".into(),
+            environment: BTreeMap::from([("HOME".into(), "/home/a".into())]),
+            unset_environment: Default::default(),
+        };
+        crate::account::Account::system(Provider::Claude)
+            .bind_home_in(&mut recipe, &|name| {
+                (name == "HOME").then(|| "/home/a".to_owned())
+            })
+            .unwrap();
+        let launch = chat::Launch {
+            provider: Provider::Claude,
+            recipe,
+            session_id: None,
+        };
+        let daemon = BTreeMap::from([
+            ("CLAUDE_CONFIG_DIR".into(), "/daemon/claude".into()),
+            ("HTTPS_PROXY".into(), "http://fixture".into()),
+        ]);
+        let prepared =
+            prepare_native_process_launch(&launch, Some(daemon.clone()), &BTreeMap::new(), None)
+                .unwrap();
+        assert!(
+            !prepared
+                .recipe
+                .environment
+                .contains_key("CLAUDE_CONFIG_DIR")
+        );
+        assert!(
+            prepared
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR")
+        );
+        assert_eq!(
+            prepared
+                .recipe
+                .environment
+                .get("HTTPS_PROXY")
+                .map(String::as_str),
+            Some("http://fixture")
+        );
+        assert!(
+            !upgrade_environment(&launch, false, daemon)
+                .unwrap()
+                .contains_key("CLAUDE_CONFIG_DIR")
         );
     }
 

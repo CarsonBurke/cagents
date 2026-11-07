@@ -424,18 +424,65 @@ ICON_LINK=$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
 RASTER_ICON_LINK=$DATA_HOME/icons/hicolor/128x128/apps/dev.cagents.Cagents.png
 METAINFO_LINK=$DATA_HOME/metainfo/dev.cagents.Cagents.metainfo.xml
 AUTOSTART_LINK=$CONFIG_HOME/autostart/dev.cagents.Cagents.Daemon.desktop
-BIN_TARGET=$PREFIX/current/bin/cagents
-DESKTOP_TARGET=$PREFIX/current/share/applications/dev.cagents.Cagents.desktop
-ICON_TARGET=$PREFIX/current/share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
-RASTER_ICON_TARGET=$PREFIX/current/share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png
-METAINFO_TARGET=$PREFIX/current/share/metainfo/dev.cagents.Cagents.metainfo.xml
-AUTOSTART_TARGET=$PREFIX/current/share/autostart/dev.cagents.Cagents.Daemon.desktop
+# Each link points at the same path, relative to a version root, through current.
+BIN_MEMBER=bin/cagents
+DESKTOP_MEMBER=share/applications/dev.cagents.Cagents.desktop
+ICON_MEMBER=share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
+RASTER_ICON_MEMBER=share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png
+METAINFO_MEMBER=share/metainfo/dev.cagents.Cagents.metainfo.xml
+AUTOSTART_MEMBER=share/autostart/dev.cagents.Cagents.Daemon.desktop
+BIN_TARGET=$PREFIX/current/$BIN_MEMBER
+DESKTOP_TARGET=$PREFIX/current/$DESKTOP_MEMBER
+ICON_TARGET=$PREFIX/current/$ICON_MEMBER
+RASTER_ICON_TARGET=$PREFIX/current/$RASTER_ICON_MEMBER
+METAINFO_TARGET=$PREFIX/current/$METAINFO_MEMBER
+AUTOSTART_TARGET=$PREFIX/current/$AUTOSTART_MEMBER
 BIN_LINK_CREATED=0
 DESKTOP_LINK_CREATED=0
 ICON_LINK_CREATED=0
 RASTER_ICON_LINK_CREATED=0
 METAINFO_LINK_CREATED=0
 AUTOSTART_LINK_CREATED=0
+# Set just before an identical copy at a link path moves aside to its backup.
+BIN_LINK_ADOPTED=0
+DESKTOP_LINK_ADOPTED=0
+ICON_LINK_ADOPTED=0
+RASTER_ICON_LINK_ADOPTED=0
+METAINFO_LINK_ADOPTED=0
+AUTOSTART_LINK_ADOPTED=0
+PREVIOUS_VERSION_DIR=
+
+# An identical copy found at a link path is moved here, beside it, until the
+# transaction commits, so a rollback can put the original file back.
+link_backup_path() {
+    printf '%s/.%s.cagents-install.%s\n' "${1%/*}" "${1##*/}" "$$"
+}
+
+# Restores or discards one adopted copy. The original returns only over this
+# installer's own link or an empty path; anything else there is left alone.
+settle_adopted_link() {
+    settle_adopted=$1
+    settle_link=$2
+    settle_target=$3
+    [ "$settle_adopted" -eq 1 ] || return 0
+    settle_backup=$(link_backup_path "$settle_link")
+    [ -e "$settle_backup" ] || [ -L "$settle_backup" ] || return 0
+    if [ "$TRANSACTION_COMMITTED" -eq 1 ]; then
+        rm -f "$settle_backup" || :
+    elif { [ -L "$settle_link" ] && [ "$(readlink "$settle_link" 2>/dev/null || :)" = "$settle_target" ]; } \
+        || { [ ! -e "$settle_link" ] && [ ! -L "$settle_link" ]; }; then
+        if mv -fT "$settle_backup" "$settle_link"; then
+            printf '%s: installation rolled back; restored the original file at %s\n' \
+                "$PROGRAM" "$settle_link" >&2
+        else
+            printf '%s: could not restore %s; the original file is at %s\n' \
+                "$PROGRAM" "$settle_link" "$settle_backup" >&2
+        fi
+    else
+        printf '%s: %s changed during installation; the original file is at %s\n' \
+            "$PROGRAM" "$settle_link" "$settle_backup" >&2
+    fi
+}
 cleanup() {
     cleanup_status=$?
     rm -rf "$DOWNLOAD_DIR" || :
@@ -525,6 +572,12 @@ cleanup() {
         && [ "$(readlink "$AUTOSTART_LINK" 2>/dev/null || :)" = "$AUTOSTART_TARGET" ]; then
         rm -f "$AUTOSTART_LINK" || :
     fi
+    settle_adopted_link "$BIN_LINK_ADOPTED" "$BIN_LINK" "$BIN_TARGET"
+    settle_adopted_link "$DESKTOP_LINK_ADOPTED" "$DESKTOP_LINK" "$DESKTOP_TARGET"
+    settle_adopted_link "$ICON_LINK_ADOPTED" "$ICON_LINK" "$ICON_TARGET"
+    settle_adopted_link "$RASTER_ICON_LINK_ADOPTED" "$RASTER_ICON_LINK" "$RASTER_ICON_TARGET"
+    settle_adopted_link "$METAINFO_LINK_ADOPTED" "$METAINFO_LINK" "$METAINFO_TARGET"
+    settle_adopted_link "$AUTOSTART_LINK_ADOPTED" "$AUTOSTART_LINK" "$AUTOSTART_TARGET"
 
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] \
         && [ -n "$NEW_VERSION_DIR" ] && [ "$ROLLBACK_OK" -eq 1 ]; then
@@ -576,13 +629,16 @@ if ! EXPECTED_HASH=$(awk -v target="$ARCHIVE_NAME" '
     fail 'SHA256SUMS is malformed or does not contain exactly one archive checksum'
 fi
 
-if command -v sha256sum >/dev/null 2>&1; then
-    ACTUAL_HASH=$(sha256sum "$ARCHIVE_PATH" | awk '{ print tolower($1) }')
-elif command -v shasum >/dev/null 2>&1; then
-    ACTUAL_HASH=$(shasum -a 256 "$ARCHIVE_PATH" | awk '{ print tolower($1) }')
-else
-    fail 'sha256sum or shasum is required'
-fi
+command -v sha256sum >/dev/null 2>&1 || command -v shasum >/dev/null 2>&1 \
+    || fail 'sha256sum or shasum is required'
+file_sha256() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{ print tolower($1) }'
+    else
+        shasum -a 256 "$1" | awk '{ print tolower($1) }'
+    fi
+}
+ACTUAL_HASH=$(file_sha256 "$ARCHIVE_PATH")
 [ "$ACTUAL_HASH" = "$EXPECTED_HASH" ] || fail 'archive SHA-256 verification failed'
 
 ARCHIVE_LIST=$DOWNLOAD_DIR/archive.list
@@ -707,11 +763,7 @@ else
             $2 == "install.sh" { count++; hash = tolower($1) }
             END { if (count != 1) exit 1; print hash }
         ' "$CHECKSUMS_PATH") || fail 'SHA256SUMS does not identify this release installer'
-        if command -v sha256sum >/dev/null 2>&1; then
-            INSTALLER_ACTUAL=$(sha256sum "$INSTALLER_SOURCE" | awk '{ print tolower($1) }')
-        else
-            INSTALLER_ACTUAL=$(shasum -a 256 "$INSTALLER_SOURCE" | awk '{ print tolower($1) }')
-        fi
+        INSTALLER_ACTUAL=$(file_sha256 "$INSTALLER_SOURCE")
         [ "$INSTALLER_ACTUAL" = "$INSTALLER_HASH" ] || fail 'installer SHA-256 verification failed'
     fi
     set -- --version "$VERSION" --prefix "$PREFIX"
@@ -782,16 +834,42 @@ if [ -L "$PREFIX/current" ]; then
     PREVIOUS_CURRENT_TARGET=$(readlink "$PREFIX/current") \
         || fail "cannot inspect $PREFIX/current"
     HAD_CURRENT=1
+    case $PREVIOUS_CURRENT_TARGET in
+        /*) PREVIOUS_VERSION_DIR=$PREVIOUS_CURRENT_TARGET ;;
+        *) PREVIOUS_VERSION_DIR=$PREFIX/$PREVIOUS_CURRENT_TARGET ;;
+    esac
 fi
 
+# Succeeds when COPY is a regular file with the same bytes as MEMBER in any of
+# the given version roots. Desktop tools can replace a link with a copy of its
+# target; such a copy carries no change of its own.
+is_managed_copy() {
+    managed_copy=$1
+    managed_member=$2
+    shift 2
+    [ -f "$managed_copy" ] && [ ! -L "$managed_copy" ] || return 1
+    managed_copy_hash=$(file_sha256 "$managed_copy")
+    [ -n "$managed_copy_hash" ] || return 1
+    for managed_root do
+        [ -n "$managed_root" ] && [ -f "$managed_root/$managed_member" ] || continue
+        [ "$(file_sha256 "$managed_root/$managed_member")" = "$managed_copy_hash" ] && return 0
+    done
+    return 1
+}
+
+# Refuses LINK unless it is absent, this installer's own symlink to MEMBER
+# through current, or a managed copy of MEMBER from one of the version roots.
 check_link_destination() {
     link=$1
-    expected_target=$2
-    if [ -e "$link" ] || [ -L "$link" ]; then
-        [ -L "$link" ] || fail "refusing to replace existing file $link"
+    link_member=$2
+    shift 2
+    if [ -L "$link" ]; then
         target=$(readlink "$link") || fail "cannot inspect $link"
-        [ "$target" = "$expected_target" ] \
+        [ "$target" = "$PREFIX/current/$link_member" ] \
             || fail "refusing to replace unowned symlink $link"
+    elif [ -e "$link" ]; then
+        is_managed_copy "$link" "$link_member" "$@" \
+            || fail "refusing to replace existing file $link"
     fi
 }
 
@@ -820,19 +898,6 @@ desktop_string_escape() {
         -e 's/\r/\\r/g' \
         -e 's/\n/\\n/g'
 }
-
-check_link_destination "$BIN_LINK" "$BIN_TARGET"
-check_link_destination "$DESKTOP_LINK" "$DESKTOP_TARGET"
-check_link_destination "$ICON_LINK" "$ICON_TARGET"
-check_link_destination "$RASTER_ICON_LINK" "$RASTER_ICON_TARGET"
-check_link_destination "$METAINFO_LINK" "$METAINFO_TARGET"
-check_link_destination "$AUTOSTART_LINK" "$AUTOSTART_TARGET"
-prepare_link_parent "$BIN_LINK"
-prepare_link_parent "$DESKTOP_LINK"
-prepare_link_parent "$ICON_LINK"
-prepare_link_parent "$RASTER_ICON_LINK"
-prepare_link_parent "$METAINFO_LINK"
-prepare_link_parent "$AUTOSTART_LINK"
 
 INSTALL_STAGE=$PREFIX/.staging.$$
 (umask 077 && mkdir "$INSTALL_STAGE") || fail 'could not create installation staging directory'
@@ -883,21 +948,69 @@ chmod 0755 \
     "$INSTALL_STAGE/$TOP_LEVEL/bin/cagents-uninstall"
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type d -exec chmod 0755 {} +
 find "$INSTALL_STAGE/$TOP_LEVEL/share" -type f -exec chmod 0644 {} +
+# A copy at a link path is compared with the finished candidate files, so the
+# rewritten desktop and autostart entries count, and with the current version.
+check_link_destination "$BIN_LINK" "$BIN_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$DESKTOP_LINK" "$DESKTOP_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$ICON_LINK" "$ICON_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$RASTER_ICON_LINK" "$RASTER_ICON_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$METAINFO_LINK" "$METAINFO_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+check_link_destination "$AUTOSTART_LINK" "$AUTOSTART_MEMBER" "$INSTALL_STAGE/$TOP_LEVEL" "$PREVIOUS_VERSION_DIR"
+prepare_link_parent "$BIN_LINK"
+prepare_link_parent "$DESKTOP_LINK"
+prepare_link_parent "$ICON_LINK"
+prepare_link_parent "$RASTER_ICON_LINK"
+prepare_link_parent "$METAINFO_LINK"
+prepare_link_parent "$AUTOSTART_LINK"
 NEW_VERSION_DIR=$PREFIX/versions/$VERSION
 mv "$INSTALL_STAGE/$TOP_LEVEL" "$NEW_VERSION_DIR"
 rmdir "$INSTALL_STAGE"
 INSTALL_STAGE=
 
+# Replaces a managed copy at LINK with the link. The copy moves aside before
+# it is compared, so the bytes compared are the bytes replaced, and a file that
+# appears at LINK meanwhile (even a directory, hence -T) makes ln fail instead
+# of being overwritten.
+adopt_managed_copy() {
+    adopt_member=$1
+    adopt_link=$2
+    adopt_kind=$3
+    adopt_backup=$(link_backup_path "$adopt_link")
+    [ ! -e "$adopt_backup" ] && [ ! -L "$adopt_backup" ] \
+        || fail "refusing to replace existing file $adopt_link while $adopt_backup exists"
+    case $adopt_kind in
+        bin) BIN_LINK_ADOPTED=1 ;;
+        desktop) DESKTOP_LINK_ADOPTED=1 ;;
+        icon) ICON_LINK_ADOPTED=1 ;;
+        raster_icon) RASTER_ICON_LINK_ADOPTED=1 ;;
+        metainfo) METAINFO_LINK_ADOPTED=1 ;;
+        autostart) AUTOSTART_LINK_ADOPTED=1 ;;
+        *) fail 'internal error: unknown link kind' ;;
+    esac
+    mv -T "$adopt_link" "$adopt_backup" || fail "cannot move $adopt_link aside to replace it"
+    is_managed_copy "$adopt_backup" "$adopt_member" "$NEW_VERSION_DIR" "$PREVIOUS_VERSION_DIR" \
+        || fail "refusing to replace existing file $adopt_link"
+    ln -sT "$PREFIX/current/$adopt_member" "$adopt_link" || fail "cannot create link $adopt_link"
+    printf '%s: %s was an unchanged copy of the installed file; replaced it with a link so updates reach it\n' \
+        "$PROGRAM" "$adopt_link" >&2
+}
+
 ensure_link() {
-    link_target=$1
+    link_member=$1
     link_path=$2
     link_kind=$3
-    if [ -e "$link_path" ] || [ -L "$link_path" ]; then
-        check_link_destination "$link_path" "$link_target"
+    link_target=$PREFIX/current/$link_member
+    if [ -L "$link_path" ]; then
+        check_link_destination "$link_path" "$link_member"
         if [ "$link_kind" = desktop ]; then
             # Refresh directory watchers after switching the version target.
             ln -snf "$link_target" "$link_path" || fail "cannot refresh link $link_path"
         fi
+        return
+    fi
+    if [ -e "$link_path" ]; then
+        [ -f "$link_path" ] || fail "refusing to replace existing file $link_path"
+        adopt_managed_copy "$link_member" "$link_path" "$link_kind"
         return
     fi
 
@@ -910,7 +1023,7 @@ ensure_link() {
         autostart) AUTOSTART_LINK_CREATED=1 ;;
         *) fail 'internal error: unknown link kind' ;;
     esac
-    ln -s "$link_target" "$link_path" || fail "cannot create link $link_path"
+    ln -sT "$link_target" "$link_path" || fail "cannot create link $link_path"
 }
 
 
@@ -993,12 +1106,12 @@ mv -Tf "$CURRENT_TEMP" "$PREFIX/current"
 
 # Publish launchers only after their executable and icon targets exist. Menus
 # can cache a dangling desktop link as missing until their next full rescan.
-ensure_link "$BIN_TARGET" "$BIN_LINK" bin
-ensure_link "$DESKTOP_TARGET" "$DESKTOP_LINK" desktop
-ensure_link "$ICON_TARGET" "$ICON_LINK" icon
-ensure_link "$RASTER_ICON_TARGET" "$RASTER_ICON_LINK" raster_icon
-ensure_link "$METAINFO_TARGET" "$METAINFO_LINK" metainfo
-ensure_link "$AUTOSTART_TARGET" "$AUTOSTART_LINK" autostart
+ensure_link "$BIN_MEMBER" "$BIN_LINK" bin
+ensure_link "$DESKTOP_MEMBER" "$DESKTOP_LINK" desktop
+ensure_link "$ICON_MEMBER" "$ICON_LINK" icon
+ensure_link "$RASTER_ICON_MEMBER" "$RASTER_ICON_LINK" raster_icon
+ensure_link "$METAINFO_MEMBER" "$METAINFO_LINK" metainfo
+ensure_link "$AUTOSTART_MEMBER" "$AUTOSTART_LINK" autostart
 # A requested daemon update commits only after the replacement starts. Ordinary
 # installs retain their existing login-autostart behavior on startup failure.
 [ "$RESTART_DAEMON" -eq 1 ] || TRANSACTION_COMMITTED=1

@@ -105,6 +105,18 @@ To check where a failure is drawn after delivered work, write a diagnostic to
 command's completion notice, a follow-up, and that error. The notice must
 appear once, after the follow-up.
 
+To check recovery after the provider dies mid-turn, as when the system runs
+out of memory, create `fixture-stop-on-prompt`. The next prompt gets the start
+of an answer, then the provider kills itself with SIGKILL; the file is removed
+first, so a resumed provider answers normally. Create an empty
+`fixture-launches` as well to record each provider start: a line holds the
+conversation ID it resumed, or `new`. After pressing **Resume conversation**
+on the stopped card, the file ends with exactly one line naming the
+conversation that stopped, and no prompt is sent until you send one.
+To see a resume that fails, create `fixture-fail-resume` too: the next
+resumed start exits before it answers, and the card offers **Try again**. The
+file is removed first, so pressing it resumes normally.
+
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
@@ -143,6 +155,16 @@ line, as `{"name":"Bash","input":{"command":"cargo test","description":"Run
 the tests"},"result":"error[E0308]: mismatched types","is_error":true}`.
 Every turn emits each call and its result in order, before its answer, and
 records them in the synthetic history like the other behaviors.
+
+To replay a provider stream exactly, write `fixture-frames.jsonl`: one
+stream-json frame per line, emitted in order on every turn before its answer.
+`@TURN@` in any string becomes the turn number, so IDs stay unique across
+turns. Assistant and user frames are recorded in the synthetic history; system
+frames, such as a background task's `task_started` and `task_notification`,
+are live only, as they are from Claude Code. A frame with `"_history": true` is
+only recorded, the way Claude Code records a queued notification as a
+`queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
+state can be captured.
 
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native

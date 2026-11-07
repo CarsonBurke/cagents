@@ -11,11 +11,13 @@
 //! that watch the board each changed board as soon as a scan, poll, pin or
 //! session changes it.
 mod board;
+mod conversations;
 mod forge;
 mod removal;
 mod scan;
 mod store;
 mod tickets;
+mod transcript;
 
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap, VecDeque},
@@ -455,6 +457,8 @@ struct Inner {
     /// `None` when the store could not be opened: the board still works, but
     /// pins and session history last only as long as the daemon.
     store: Mutex<Option<store::Store>>,
+    /// The pull requests of conversations a window is watching.
+    conversations: conversations::Conversations,
     cancellation: CancellationToken,
 }
 
@@ -518,6 +522,7 @@ impl Service {
             publication: Mutex::new(Publication::default()),
             jobs: Jobs::default(),
             store: Mutex::new(store),
+            conversations: conversations::Conversations::default(),
             cancellation: CancellationToken::new(),
         }));
         let mut service = Self {
@@ -536,6 +541,13 @@ impl Service {
             std::thread::Builder::new()
                 .name("work-forge".into())
                 .spawn(move || forge.forge_loop())
+                .map_err(|error| error.to_string())?,
+        );
+        let conversations = handle.clone();
+        service.threads.push(
+            std::thread::Builder::new()
+                .name("work-conversations".into())
+                .spawn(move || conversations.conversation_loop())
                 .map_err(|error| error.to_string())?,
         );
         let publisher = handle.clone();
@@ -568,6 +580,7 @@ impl Drop for Service {
         self.handle.0.scanner.stop();
         self.handle.0.forge.stop();
         self.handle.0.publisher.stop();
+        self.handle.0.conversations.signal.stop();
         self.handle.0.jobs.stop();
         for thread in self.threads.drain(..) {
             let _ = thread.join();

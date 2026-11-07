@@ -28,6 +28,28 @@ handshake rejects incompatible clients without terminating their PTYs.
 Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
 together.
 
+A session carried across an update keeps running the `cagents` CLI it was
+launched with. The daemon still serves that CLI when its protocol is listed as
+an older client: currently protocol 128, the 0.1.3+local.c68275e94 line. Only
+a peer running the `cagents` executable is served this way, and not one
+running `cagents daemon bridge`, which relays a remote device's window. An
+older window or daemon is still refused at its handshake, which is how a stale window learns
+that an update superseded it. The daemon answers that CLI in its protocol's
+version. It refuses requests to stop, update or hand off the daemon, and requests whose
+reply the CLI couldn't read, such as `automation history`, `automation run` and
+`automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+Each protocol's postcard wire format is recorded under
+`tests/fixtures/wire-formats/`. A test checks that every listed older protocol
+encodes the same way, except for what is refused or withheld. It checks
+encoding, not meaning, and not JSON carried as text inside a message.
+
+When a daemon takes the runtime lease, it points `bin` in its runtime
+directory at its own matched CLI. That runtime directory is
+`$XDG_RUNTIME_DIR/cagents` in production, or the development instance's
+directory. The sessions it launches find `cagents` there first, so a later
+update gives them the new daemon's CLI. A daemon without a matched CLI removes
+the link instead.
+
 Each window holds an exclusive slot lease and its own session database, and a
 shared compatibility fence excludes older single-window UIs. Startup rejects an
 older running UI or Debian peer package that predates the lease marker; upgrade
@@ -75,7 +97,8 @@ cagents daemon stop --confirm
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
 | `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement |
-| `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `sessions [--project PATH \| --all \| --channel [CHANNEL]]` (alias `ls`), `whoami` | List live agent sessions in this project or everyone in a channel, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `transcript SESSION [-n N] [--before ID] [--tools] [--full]` (alias `history`) | Read one page of a session's conversation from its provider's saved history; see [Reading your channel](agent-execution.md#reading-your-channel) |
 | `work ls [--project PATH] [--column COLUMN] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show every worktree and branch in progress across open projects, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |
 | `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 

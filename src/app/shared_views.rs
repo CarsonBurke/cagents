@@ -907,6 +907,13 @@ impl Cagents {
             .any(|pending| *pending == card)
     }
 
+    #[cfg(test)]
+    pub(super) fn mark_pane_moving(&mut self, card: CardId) {
+        self.shared_views
+            .requested_transfers
+            .insert(uuid::Uuid::new_v4(), card);
+    }
+
     pub(super) fn can_move_pane_to_channel(
         &self,
         card: CardId,
@@ -1964,6 +1971,11 @@ impl Cagents {
             }
             match existing {
                 Some(card) if card.existence.is_open() => {
+                    // The daemon can publish the conversation a resume in this
+                    // window started before that start replies. The start owns
+                    // the card's runtime, with its transcript and draft, and
+                    // puts the conversation in the card itself once it is saved.
+                    let resuming = matches!(&pane.kind, CardKind::Chat(session) if self.chat_resume_in_flight(pane.id, session));
                     if card.kind != pane.kind
                         && matches!(self.cards.get(&pane.id), Some(CardRuntime::Repository(runtime)) if runtime.is_dirty() || runtime.is_saving())
                     {
@@ -1972,7 +1984,7 @@ impl Cagents {
                         ));
                         continue;
                     }
-                    if card.kind != pane.kind {
+                    if card.kind != pane.kind && !resuming {
                         // Runtime metadata can change, but an exact live actor
                         // remains attached unless the session identity changes.
                         let same_session = match (&card.kind, &pane.kind) {
@@ -2016,7 +2028,9 @@ impl Cagents {
                             current.title = pane.title.clone();
                         }
                         current.width_fraction = pane.width_fraction;
-                        current.kind = kind;
+                        if !resuming {
+                            current.kind = kind;
+                        }
                     }
                     // Publishing a locally opened chat can echo its pane
                     // before the provider handshake creates a runtime. Its
@@ -2024,7 +2038,9 @@ impl Cagents {
                     // replacing it would discard the first start's reply.
                     // A different canonical descriptor still needs attachment.
                     let starting = matches!(&pane.kind, CardKind::Chat(session) if self.chat_start_matches(pane.id, session));
-                    if !self.cards.contains_key(&pane.id) && !starting {
+                    if resuming {
+                        // Its start attaches the card.
+                    } else if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
                     } else if let CardKind::Chat(session) = &pane.kind {
                         tasks.push(self.adopt_shared_draft_session(pane.id, session));

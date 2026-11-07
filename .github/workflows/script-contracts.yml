@@ -224,6 +224,7 @@ jobs:
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
               ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
               ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
+              ("local install head check", "scripts/install-local", "tests/install_local.py"),
           ):
               source_present = present(Path(source))
               fixture_present = present(Path(fixture))
@@ -239,7 +240,7 @@ jobs:
                   result = subprocess.run(["sh", "-n", *shell])
                   if result.returncode:
                       raise SystemExit(result.returncode)
-              if source == "scripts/native-evidence":
+              if source in ("scripts/native-evidence", "scripts/install-local"):
                   result = subprocess.run(["bash", "-n", source])
                   if result.returncode:
                       raise SystemExit(result.returncode)
@@ -267,3 +268,26 @@ jobs:
           test "$(git rev-parse HEAD)" = "$EXPECTED_SOURCE_SHA"
           git diff --exit-code
           git diff --cached --exit-code
+
+  older-clients:
+    # The claim that older CLIs are proven must hold for the merge, not only
+    # for this head: a protocol bump merging beside it leaves them unproven.
+    # The default checkout of a pull request is its merge result as of the
+    # latest pull request event.
+    name: Older clients proven at the merged protocol
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the merge result
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Check older client proofs
+        run: |
+          git rev-parse HEAD
+          python3 -I -B tests/check_older_clients.py -v
+          python3 -I -B scripts/check-older-clients

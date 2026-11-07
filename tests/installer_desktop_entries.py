@@ -34,7 +34,7 @@ class InstallerDesktopEntries(unittest.TestCase):
         self.directory = Path(temporary.name)
         installer = (ROOT / "install.sh").read_text()
         helper_start = installer.index("desktop_exec_escape() {\n")
-        helper_end = installer.index('\ncheck_link_destination "$BIN_LINK" "$BIN_TARGET"',
+        helper_end = installer.index('\nINSTALL_STAGE=$PREFIX/.staging.$$',
                                      helper_start)
         emitter_start = installer.index('\nAUTOSTART_EXEC=$(desktop_exec_escape "$BIN_TARGET")',
                                         helper_end) + 1

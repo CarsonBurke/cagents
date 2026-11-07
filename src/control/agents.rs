@@ -8,6 +8,7 @@ use crate::{
     },
     model::{AgentId, RunId},
 };
+use imara_diff::{Algorithm, Diff, InternedInput};
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
@@ -2165,6 +2166,260 @@ mod tests {
         assert!(printed.contains("  Use the staging database"), "{printed}");
     }
 
+    /// Feeds the transcript through `frames` and returns what each one prints.
+    fn console_output(frames: &[&str]) -> Vec<String> {
+        let mut transcript = ConsoleTranscript::default();
+        frames.iter().map(|text| transcript.advance(text)).collect()
+    }
+
+    #[test]
+    fn console_prints_a_growing_line_once_it_is_complete() {
+        assert_eq!(
+            console_output(&[
+                "User: Build it\nAssistant: Star",
+                "User: Build it\nAssistant: Starting the build.",
+                "User: Build it\nAssistant: Starting the build.\nSecond li",
+                "User: Build it\nAssistant: Starting the build.\nSecond line.\n",
+            ]),
+            [
+                "User: Build it\n",
+                "",
+                "Assistant: Starting the build.\n",
+                "Second line.\n",
+            ]
+        );
+    }
+
+    #[test]
+    fn console_prints_late_settled_steps_without_replaying_the_transcript() {
+        let built = "User: Build it\nAssistant: Started the build.\n";
+        assert_eq!(
+            console_output(&[
+                built,
+                // A background tool settles before text already printed.
+                "User: Build it\nCalled Agent\nAssistant: Started the build.\n",
+                // Growth at the end still streams as a plain suffix.
+                "User: Build it\nCalled Agent\nAssistant: Started the build.\nAssistant: Done\n",
+                // A second step with the same name is a new line.
+                "User: Build it\nCalled Agent\nCalled Agent\nAssistant: Started the build.\nAssistant: Done\n",
+            ]),
+            [
+                built,
+                "Called Agent\n",
+                "Assistant: Done\n",
+                "Called Agent\n"
+            ]
+        );
+    }
+
+    /// Lines leaving the front of a bounded transcript print nothing, and a
+    /// recurring line arriving at its end is still new. Counting occurrences
+    /// without their position would take one for the other.
+    #[test]
+    fn console_keeps_new_lines_when_the_front_of_the_transcript_drops() {
+        assert_eq!(
+            console_output(&["Ran tests\nEdited a.rs\n", "Edited a.rs\nRan tests\n"]),
+            ["Ran tests\nEdited a.rs\n", "Ran tests\n"]
+        );
+        assert_eq!(
+            console_output(&["Ran tests\nEdited a.rs\nRead b.rs\n", "Read b.rs\n"]),
+            ["Ran tests\nEdited a.rs\nRead b.rs\n", ""]
+        );
+    }
+
+    /// Recurring steps must not make a sliding transcript print out of order.
+    #[test]
+    fn console_keeps_order_while_a_long_transcript_slides() {
+        let round = |n: u32| format!("Assistant: Round {n}\nRan test {n}\nCalled Agent\n");
+        let window = |rounds: std::ops::Range<u32>| rounds.map(round).collect::<String>();
+        let mut transcript = ConsoleTranscript::default();
+        let mut printed = transcript.advance(&window(0..40));
+        for end in 41..=80 {
+            printed.push_str(&transcript.advance(&window(end - 40..end)));
+        }
+        assert_eq!(printed, window(0..80));
+    }
+
+    /// A window that slides by a part of a round can start on any of its lines.
+    #[test]
+    fn console_keeps_order_when_the_window_slides_by_single_lines() {
+        let lines = (0..300)
+            .flat_map(|n| {
+                [
+                    format!("Assistant: Round {n}\n"),
+                    "Called Agent\n".to_owned(),
+                    "Called Agent\n".to_owned(),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut transcript = ConsoleTranscript::default();
+        let mut printed = String::new();
+        for end in 1..=lines.len() {
+            printed.push_str(&transcript.advance(&lines[end.saturating_sub(128)..end].concat()));
+        }
+        assert_eq!(printed, lines.concat());
+    }
+
+    #[test]
+    fn console_rereads_periodically_only_while_a_run_is_working() {
+        let unchanged = |working| {
+            (1..=16)
+                .filter(|reads| console_read_cursor(Some(7), working, *reads).is_none())
+                .count()
+        };
+        assert_eq!(unchanged(false), 0);
+        assert_eq!(unchanged(true), 2);
+        assert_eq!(console_read_cursor(None, false, 1), None);
+    }
+
+    /// A question's context prints before it; a line that goes on being written
+    /// afterwards prints complete, once.
+    #[test]
+    fn console_prints_the_held_line_before_a_question() {
+        let mut transcript = ConsoleTranscript::default();
+        assert_eq!(transcript.advance("Ran x\nAssistant: Which"), "Ran x\n");
+        assert_eq!(
+            transcript.advance_to_question("Ran x\nAssistant: Which"),
+            "Assistant: Which\n"
+        );
+        assert_eq!(transcript.advance("Ran x\nAssistant: Which"), "");
+        assert_eq!(
+            transcript.advance("Ran x\nAssistant: Which one?\n"),
+            "Assistant: Which one?\n"
+        );
+        assert_eq!(transcript.advance_to_question("Ran x\n"), "");
+    }
+
+    /// A line it has shown going back to being held open prints nothing new,
+    /// and nothing twice when it completes.
+    #[test]
+    fn console_does_not_reprint_a_line_held_open_again() {
+        assert_eq!(
+            console_output(&[
+                "Ran x\n",
+                "Ran x",
+                "Ran x\nAssistant: Lo",
+                "Ran x\nAssistant: Long\n"
+            ]),
+            ["Ran x\n", "", "", "Assistant: Long\n"]
+        );
+    }
+
+    /// A step settling while the front drops prints only that step and what
+    /// was appended.
+    #[test]
+    fn console_prints_a_late_step_while_the_window_slides() {
+        let round = |n: u32| format!("Assistant: Round {n}\nCalled Agent\n");
+        let window = |rounds: std::ops::Range<u32>| rounds.map(round).collect::<String>();
+        let mut transcript = ConsoleTranscript::default();
+        transcript.advance(&window(0..40));
+        let settled = format!("{}Ran late step\n{}", window(1..39), window(39..41),);
+        assert_eq!(
+            transcript.advance(&settled),
+            format!("Ran late step\n{}", round(40)),
+        );
+    }
+
+    #[test]
+    fn console_run_outcomes_name_no_transport_identifier() {
+        use crate::agent_execution::{ResultSummary, Run, State};
+        let mut run = Run {
+            id: crate::model::RunId::new(),
+            agent: AgentId::new(),
+            state: State::Running,
+            revision: 1,
+            accepted_ms: 0,
+            started_ms: None,
+            finished_ms: None,
+            provider_key: None,
+            result: ResultSummary::default(),
+        };
+        assert_eq!(console_run_outcome(&run), None);
+        run.state = State::Succeeded;
+        assert_eq!(console_run_outcome(&run).unwrap(), "Finished");
+        run.result.usage.input_tokens = 12;
+        run.result.usage.output_tokens = 3;
+        assert_eq!(
+            console_run_outcome(&run).unwrap(),
+            "Finished (12 input, 3 output tokens)"
+        );
+    }
+
+    #[test]
+    fn console_requests_read_as_questions_with_the_ids_to_answer_them() {
+        use crate::chat::{Choice, Field, Request, RequestKind};
+        let choice = |id: &str, label: &str| Choice {
+            id: id.into(),
+            label: label.into(),
+            description: String::new(),
+        };
+        let mut request = Request {
+            kind: RequestKind::Question,
+            id: "request-1".into(),
+            title: "Which branch?".into(),
+            description: "Pick the base.".into(),
+            fields: vec![Field {
+                id: "base".into(),
+                label: "Base".into(),
+                description: "Where it lands".into(),
+                choices: vec![choice("main", "Main branch")],
+                multiple: true,
+                secret: false,
+                initial: String::new(),
+            }],
+            actions: vec![choice("submit", "Submit"), choice("deny", "deny")],
+        };
+        assert_eq!(
+            console_request(&request),
+            "Input requested: Which branch?\n\
+             Pick the base.\n\
+             Field base (Base): Where it lands\n\
+             Choices: main (Main branch).\n\
+             Several values allowed.\n\
+             Actions: submit (Submit); deny\n\
+             Use /answer request-1 ACTION [{\"field\":\"base\",\"values\":[\"VALUE\"]}]"
+        );
+        let mut second = request.fields[0].clone();
+        second.id = "head".into();
+        request.fields.push(second);
+        assert!(
+            console_request(&request).ends_with(
+                r#"[{"field":"base","values":["VALUE"]},{"field":"head","values":["VALUE"]}]"#
+            ),
+            "every field has to be answered"
+        );
+        request.fields.pop();
+        request.actions[1].description = "Stop here".into();
+        request.fields[0].label = String::new();
+        request.fields[0].initial = "main".into();
+        let text = console_request(&request);
+        assert!(
+            text.contains("Actions: submit (Submit); deny: Stop here\n"),
+            "{text}"
+        );
+        assert!(text.contains("Field base: Where it lands"), "{text}");
+        assert!(text.contains("\nCurrently: main."), "{text}");
+        request.fields[0].secret = true;
+        let text = console_request(&request);
+        assert!(text.contains("this console shows what you type"), "{text}");
+        assert!(
+            !text.contains("Currently"),
+            "a secret's value stays hidden: {text}"
+        );
+        request.fields.clear();
+        assert!(console_request(&request).ends_with("Use /answer request-1 ACTION"));
+    }
+
+    #[test]
+    fn console_refusal_names_no_protocol_code() {
+        let refusal = console_refusal(&ControlError::Remote {
+            code: crate::terminal::ipc::ProtocolErrorCode::InvalidRequest,
+            message: "The agent is busy".into(),
+            retryable: false,
+        });
+        assert_eq!(refusal, "The agent is busy");
+    }
+
     #[test]
     fn console_answers_require_explicit_request_action_and_structured_fields() {
         use crate::agent_execution::ConsoleCommand;
@@ -2747,59 +3002,61 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         })
         .map_err(|e| AppError::new("console_input", e))?;
     println!(
-        "cagents provider console — agent {agent}\nPrompts create durable runs. /interrupt [--including-subagents], /answer REQUEST ACTION [ANSWERS_JSON], /quit\nThis is a console over the hosted provider, not its stock TUI.\n"
+        "Agent console: type a prompt to send it.\n/interrupt [--including-subagents] stops the current work. /quit leaves the console; the agent keeps running.\nThis shows one line per step, without command output or tool details.\n"
     );
     let startup = Instant::now() + Duration::from_secs(10);
     let mut generation = None;
-    let mut previous = String::new();
+    let mut transcript = ConsoleTranscript::default();
     let mut last_run = None;
     let mut last_requests = Vec::new();
+    let mut working = false;
+    let mut reads = 0u32;
+    let mut noted_earlier = false;
     loop {
+        reads = reads.wrapping_add(1);
         match client.agent(
             authority.clone(),
             Operation::Console {
                 agent,
                 command: ConsoleCommand::Read {
-                    after_generation: generation,
+                    after_generation: console_read_cursor(generation, working, reads),
                     after_run: last_run,
                 },
             },
         ) {
             Ok(Reply::Console(Some(view))) => {
                 generation = Some(view.generation);
+                working = console_run_outcome(&view.run).is_none();
                 let text: String = view
                     .text
                     .chars()
                     .filter(|ch| !ch.is_control() || matches!(ch, '\n' | '\t'))
                     .collect();
-                if let Some(delta) = text.strip_prefix(&previous) {
-                    print!("{delta}");
-                } else if text != previous {
-                    print!(
-                        "\n--- Current transcript{} ---\n{text}",
-                        if view.truncated { " (bounded)" } else { "" }
-                    );
+                if view.truncated && transcript.is_empty() && !noted_earlier {
+                    noted_earlier = true;
+                    println!("Earlier activity is not shown here.");
                 }
-                previous = text;
+                print!("{}", transcript.advance(&text));
                 if last_run != Some((view.run.id, view.run.revision)) {
-                    println!(
-                        "\nRun {}: {:?}; usage: {}",
-                        view.run.id,
-                        view.run.state,
-                        serde_json::to_string(&view.run.result.usage).unwrap_or_default()
-                    );
-                    if let Some(diagnostic) = &view.run.result.diagnostic {
-                        println!("{diagnostic}");
+                    if let Some(outcome) = console_run_outcome(&view.run) {
+                        println!("\n{outcome}");
+                        if let Some(diagnostic) = &view.run.result.diagnostic {
+                            println!("{diagnostic}");
+                        }
                     }
                     last_run = Some((view.run.id, view.run.revision));
                 }
                 if view.requests != last_requests {
-                    for request in &view.requests {
-                        println!(
-                            "\nInput requested:\n{}\nUse /answer {} ACTION [ANSWERS_JSON] with an action and field IDs shown above.",
-                            serde_json::to_string_pretty(request).unwrap_or_default(),
-                            request.id
-                        );
+                    let mut asked = view
+                        .requests
+                        .iter()
+                        .filter(|request| !last_requests.contains(*request))
+                        .peekable();
+                    if asked.peek().is_some() {
+                        print!("{}", transcript.advance_to_question(&text));
+                    }
+                    for request in asked {
+                        println!("\n{}", console_request(request));
                     }
                     last_requests = view.requests;
                 }
@@ -2839,9 +3096,9 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                     }
                 };
                 match client.agent(authority.clone(), Operation::Console { agent, command }) {
-                    Ok(Reply::Accepted(accepted)) => println!("Accepted run {}", accepted.run.id),
+                    Ok(Reply::Accepted(_)) => println!("Prompt accepted."),
                     Ok(_) => {}
-                    Err(error) => eprintln!("{error}"),
+                    Err(error) => eprintln!("{}", console_refusal(&error)),
                 }
                 generation = None;
             }
@@ -2852,6 +3109,159 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
         data: json!({ "agent": agent, "detached": true }),
         human: "Console detached; the provider remains hosted until explicitly closed.".into(),
     })
+}
+
+/// What the terminal has shown of the agent's transcript, which it cannot take
+/// back. Only complete lines are printed, so output never leaves the cursor in
+/// the middle of a line someone may be typing on, and a line still being
+/// written is shown once rather than again each time it grows.
+#[derive(Default)]
+struct ConsoleTranscript {
+    shown: String,
+}
+
+impl ConsoleTranscript {
+    fn is_empty(&self) -> bool {
+        self.shown.is_empty()
+    }
+
+    /// What to print before a question: the line still being written too, which
+    /// is usually what the question is about. If it does go on being written,
+    /// it prints once more when it's complete.
+    fn advance_to_question(&mut self, text: &str) -> String {
+        if text.is_empty() || text.ends_with('\n') {
+            return self.advance(text);
+        }
+        self.advance(&format!("{text}\n"))
+    }
+
+    /// What to print for the transcript now reading `text`. It usually only
+    /// grew, but a step can settle after later text and the front drops once it
+    /// is long. Steps recur, so a line diff may match a repeated line to any of
+    /// its occurrences; sliding each change as far down as it goes makes what
+    /// prints continue from what was shown, in order.
+    fn advance(&mut self, text: &str) -> String {
+        let complete = text.rfind('\n').map_or("", |end| &text[..=end]);
+        // A line it has shown can go back to being held open; that's nothing new.
+        if self.shown.starts_with(complete) {
+            return String::new();
+        }
+        let delta = match complete.strip_prefix(self.shown.as_str()) {
+            Some(grown) => grown.to_owned(),
+            None => {
+                let input = InternedInput::new(self.shown.as_str(), complete);
+                let mut diff = Diff::compute(Algorithm::Myers, &input);
+                diff.postprocess_no_heuristic(&input);
+                diff.hunks()
+                    .flat_map(|hunk| {
+                        &input.after[hunk.after.start as usize..hunk.after.end as usize]
+                    })
+                    .map(|line| input.interner[*line])
+                    .collect()
+            }
+        };
+        self.shown.clear();
+        self.shown.push_str(complete);
+        delta
+    }
+}
+
+/// A finished run's outcome. Runs in progress say nothing here: the transcript
+/// already shows what they are doing.
+fn console_run_outcome(run: &crate::agent_execution::Run) -> Option<String> {
+    use crate::agent_execution::State;
+    let outcome = match run.state {
+        State::Accepted | State::Running | State::Waiting => return None,
+        State::Succeeded => "Finished",
+        State::Failed => "Failed",
+        State::Cancelled => "Stopped",
+        State::Interrupted => "Interrupted, and it may have done some of its work",
+    };
+    let usage = &run.result.usage;
+    Some(if usage.input_tokens + usage.output_tokens == 0 {
+        outcome.to_owned()
+    } else {
+        format!(
+            "{outcome} ({} input, {} output tokens)",
+            usage.input_tokens, usage.output_tokens
+        )
+    })
+}
+
+/// Reads ask only for what changed, but a step that keeps running changes
+/// nothing, and the console says so once it has taken a while. So while a run is
+/// working, every eighth read (two seconds) asks for the transcript regardless.
+fn console_read_cursor(generation: Option<u64>, working: bool, reads: u32) -> Option<u64> {
+    generation.filter(|_| !working || !reads.is_multiple_of(8))
+}
+
+/// A request as someone answers it: what is being asked, then the exact IDs
+/// `/answer` takes, which no other view of the console provides.
+fn console_request(request: &crate::chat::Request) -> String {
+    use crate::chat::Choice;
+    use std::fmt::Write;
+    let named = |id: &str, label: &str| {
+        if label.is_empty() || label == id {
+            id.to_owned()
+        } else {
+            format!("{id} ({label})")
+        }
+    };
+    let choices = |choices: &[Choice]| {
+        choices
+            .iter()
+            .map(|choice| {
+                let name = named(&choice.id, &choice.label);
+                if choice.description.is_empty() {
+                    name
+                } else {
+                    format!("{name}: {}", choice.description)
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let mut text = format!("Input requested: {}\n", request.title);
+    if !request.description.is_empty() {
+        let _ = writeln!(text, "{}", request.description);
+    }
+    for field in &request.fields {
+        let _ = write!(text, "Field {}", named(&field.id, &field.label));
+        if !field.description.is_empty() {
+            let _ = write!(text, ": {}", field.description);
+        }
+        if !field.choices.is_empty() {
+            let _ = write!(text, "\nChoices: {}.", choices(&field.choices));
+        }
+        if field.multiple {
+            text.push_str("\nSeveral values allowed.");
+        }
+        if field.secret {
+            text.push_str("\nThis is secret, and this console shows what you type.");
+        } else if !field.initial.is_empty() {
+            let _ = write!(text, "\nCurrently: {}.", field.initial);
+        }
+        text.push('\n');
+    }
+    let _ = writeln!(text, "Actions: {}", choices(&request.actions));
+    let _ = write!(text, "Use /answer {} ACTION", request.id);
+    if !request.fields.is_empty() {
+        let example = request
+            .fields
+            .iter()
+            .map(|field| serde_json::json!({"field": field.id, "values": ["VALUE"]}))
+            .collect::<Vec<_>>();
+        let _ = write!(text, " {}", serde_json::Value::Array(example));
+    }
+    text
+}
+
+/// Why the daemon refused what was typed, without the protocol's framing.
+fn console_refusal(error: &ControlError) -> String {
+    match error {
+        ControlError::Remote { message, .. } => message.clone(),
+        error => error.to_string(),
+    }
 }
 
 fn console_input(line: &str) -> Result<crate::agent_execution::ConsoleCommand, String> {

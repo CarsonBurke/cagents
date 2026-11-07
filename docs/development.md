@@ -62,6 +62,14 @@ scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
+Each of these commands waits in the build host's queue on its own, and on a
+busy host the wait is most of its time: on fw16 under a full queue, the CLI
+check above took 26 s to compile and 19 minutes in all. The CLI, host and
+browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
+[below](#testing)) type-check everything the lane's check does, so when you are
+about to run them, skip that check. The integrated UI has no test lane; keep
+its check.
+
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
 `default-members = ["."]` selects only cagents: root UI checks and root
@@ -158,8 +166,10 @@ How the runner works:
 - A launch with nothing to build skips the gate and starts at once, printing
   `The matched set is already built for this checkout; skipping the build.`
   See [Up-to-date launches](#up-to-date-launches).
-- The normal runner enables `integrated-browser` only for the UI; the matched
-  CLI and daemon keep the same full-product identity without resolving Servo.
+- The normal runner enables `integrated-browser` only for the UI. Both lanes
+  build the same CLI and daemon, without `full`: that feature selects the
+  shipped product's application ID, peer package and self-update, none of which
+  a development build uses, so switching lanes rebuilds only the UI.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
   usable performance while the ordinary `dev` profile stays cheap for checks.
 - The development instance has its own application ID, configuration, session
@@ -221,8 +231,10 @@ the matched set as usual, then starts the UI in a headless
 
 `CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
 ignores it. The runner sets it for `--instance` and clears it otherwise, so an
-inherited value never selects an instance. Provider accounts and tools keep
-the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+inherited value never selects an instance. The instance's daemon gives it to
+every agent and terminal it starts, so a `cagents` they run reaches that
+daemon. Provider accounts and tools keep the caller's `HOME`, so an
+instance's agents use the same provider sign-ins.
 
 The runner starts the session without the caller's `WAYLAND_DISPLAY`,
 `WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
@@ -351,9 +363,10 @@ within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
 host that does not report pressure is treated as having room. Each build has an
 expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
-GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
-script such as the development runner; a slot held by a plain `flock` counts as
-9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
+GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
+script and 9 GiB for an `exec --hold` one such as the development runner's; a
+slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
+overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
 beyond what they already hold, covers its own, and while the kernel's memory
 pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
@@ -420,7 +433,8 @@ To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
 `scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
 host](#building-on-another-host), each Cargo command in it goes there on its
-own. Building here, it holds one slot until the command exits, and gated
+own, unless `exec --hold` holds one slot there for all of them. Building here,
+it holds one slot until the command exits, with or without `--hold`, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
@@ -463,12 +477,21 @@ command that compiles there through `scripts/cargo-offload`, without taking a
 slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
-script of builds, such as the development runner or
-`scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. A Cargo reached any other way inside COMMAND, by path,
-through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
-also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
-compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+script of builds, such as `scripts/build-ceditor-product`, builds there too,
+each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
+leases one slot there first, at the cost of a UI build, and holds it until
+COMMAND exits: each gated Cargo command in it builds in that slot, one at a
+time, with no admission of its own. It is for a script that only builds, such
+as the development runner's three: a launch waits in the host's queue once
+rather than three times. Tests run in that slot too, priced by what they hold
+while they run and as a UI build again once they end. A Cargo command run from
+another checkout, or after the hold's lease has ended, leases a slot of its
+own. Anything slow between its builds would keep the slot leased and its memory
+reserved while it ran, so leave `--hold` off for such a script. A Cargo
+reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
+or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
+`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
+why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
 Programs launched by `cargo run` inside that `exec` inherit the same Cargo
 shim and guard. Their named `cargo` reenters the gate after the program's
 build releases its slot; their absolute `$CARGO` cannot compile here.
@@ -685,16 +708,34 @@ It never touches:
 
 What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
-The build script that stamps `--version` reruns only when the stamp could
-change, because each rerun recompiles `cagents`. It watches this checkout's
-`HEAD` and `HEAD` reflog. While the checkout is clean it also watches the
-compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`,
-`fixtures`, `tests/fixtures`, the manifest, lockfile, toolchain, Cargo
-configuration and build script), and while it is dirty, the index, which
-restoring or stashing rewrites. It reads `git status` without refreshing the
-index, and it does not watch the shared `packed-refs`, which pruning or
-deleting any branch rewrites. An edit outside those sources, or undoing an edit
-by hand, updates the `.dirty` suffix at the next rerun.
+Each executable states its version with `cagents::stamp_version!()`, invoked
+once as an item at its root; the library answers `cagents::version()` from
+that. The macro stamps from a constructor that runs before `main` and before
+the holders' own constructors, which serve in place of `main`.
+The stamp is read where the macro expands, so a new commit or a move to another
+build slot relinks the executables and leaves the library compiled. Never read
+`CAGENTS_BUILD_METADATA` or `CAGENTS_CHECKOUT_METADATA` in the library or in
+`build.rs`: Cargo would recompile the whole library for each new stamp. A
+process that never stamps, such as a unit test, reports
+`<version>+unstamped`.
+
+The gate works out the stamp for each Cargo command once it has a slot, here
+or for the build host, and passes it with `CAGENTS_BUILD_METADATA_SUPPLIED=1`,
+so `build.rs` leaves the checkout alone. A program a local `run` or `test`
+starts gets the caller's stamp back through a Cargo runner, unless Cargo
+already has a runner configured, so a bare Cargo it starts reads its own
+checkout. Gated and bare Cargo commands sharing one build directory, such as
+an editor's `cargo check` beside gated builds on the same host, rerun
+`build.rs` and recompile `cagents` each time they alternate. Without the gate, `build.rs` reads the checkout's
+Git state and reruns, recompiling `cagents`, only when the stamp could change.
+It watches this checkout's `HEAD` and `HEAD` reflog. While the checkout is
+clean it also watches the compiled sources (`src`, `crates`, `vendor`,
+`assets`, `packaging`, `fixtures`, `tests/fixtures`, the manifest, lockfile,
+toolchain, Cargo configuration and build script), and while it is dirty, the
+index, which restoring or stashing rewrites. It reads `git status` without
+refreshing the index, and it does not watch the shared `packed-refs`, which
+pruning or deleting any branch rewrites. An edit outside those sources, or
+undoing an edit by hand, updates the `.dirty` suffix at the next rerun.
 
 Worktrees that do share a build directory stay correct. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
@@ -1184,6 +1225,14 @@ needs a newer glibc than this machine has. Uncommitted tracked changes are
 refused so that the version names its exact source. If that version is already
 current, the build is skipped. After staging, older `+local` builds are removed,
 except the two most recent and any that a running process still uses.
+
+The script first fetches and checks what `HEAD` is, because a checkout nobody
+updated would install old code. It refuses a detached `HEAD` that is not the
+tip of `origin/main`, and a branch that is behind its upstream, and prints the
+command that updates the checkout, such as
+`git checkout main && git pull --ff-only`. Pass `--this-commit` to build that
+exact commit anyway, for example to install a known-good build again. Any other
+branch is built, and the script names it.
 
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).

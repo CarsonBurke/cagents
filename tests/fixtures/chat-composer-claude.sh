@@ -14,10 +14,17 @@ if [ "${1:-}" = auth ]; then
 fi
 
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
+resumed=
+# The app's account check starts the provider without keeping a session. It
+# is not a conversation, so the launch and stop switches leave it alone.
+probe=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --session-id|--resume) shift; session=$1 ;;
-        --session-id=*|--resume=*) session=${1#*=} ;;
+        --no-session-persistence) probe=true ;;
+        --session-id) shift; session=$1 ;;
+        --session-id=*) session=${1#*=} ;;
+        --resume) shift; session=$1; resumed=$1 ;;
+        --resume=*) session=${1#*=}; resumed=$session ;;
     esac
     shift
 done
@@ -38,6 +45,20 @@ if [ -e "$task_scene_file" ] || [ -L "$task_scene_file" ]; then
         printf '%s\n' 'Invalid fixture-agent-task-receipt.json' >&2
         exit 2
     fi
+fi
+# Optional launch record: while fixture-launches exists, each provider start
+# appends the conversation it resumed, or `new`, so a check can tell a
+# resume of the same conversation from a second start.
+if [ "$probe" = false ] && [ -f "$config/fixture-launches" ]; then
+    printf '%s\n' "${resumed:-new}" >> "$config/fixture-launches"
+fi
+# Optional resume failure: while fixture-fail-resume exists, the next resumed
+# start exits before it answers, as a provider that cannot start would. The
+# file is removed first, so the start after it resumes normally.
+if [ "$probe" = false ] && [ -n "$resumed" ] && [ -e "$config/fixture-fail-resume" ]; then
+    rm -f "$config/fixture-fail-resume"
+    printf '%s\n' 'fixture: the resumed provider could not start' >&2
+    exit 1
 fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
@@ -151,7 +172,9 @@ stop_agent() {
 # Optional scripted tool calls: each line of fixture-tools.jsonl is
 # {"name":..., "input":{...}, "result":"...", "is_error":bool}, emitted as a
 # tool call and its result on every turn, so a rendering check can choose the
-# exact calls and outputs it needs.
+# exact calls and outputs it needs. A spec with "stream": SECONDS first
+# streams its input as Claude does, in input_json_delta fragments that many
+# seconds apart, so the native UI's partial states can be observed.
 tools_file=$config/fixture-tools.jsonl
 tools_turn() {
     call=0
@@ -159,9 +182,63 @@ tools_turn() {
         [ -n "$spec" ] || continue
         call=$((call + 1))
         id="tool-$turn-$call"
+        delay=$(printf '%s' "$spec" | jq -r '.stream // empty')
+        if [ -n "$delay" ]; then
+            jq -cn --arg id "fixture-$id" '{type:"stream_event",event:{type:"message_start",message:{id:$id,role:"assistant"}}}'
+            printf '%s' "$spec" | jq -c --arg id "$id" '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"tool_use",id:$id,name:.name,input:{}}}}'
+            printf '%s' "$spec" | jq -c '.input | tojson | [range(0; length; 12) as $at | .[$at:$at + 12]] | .[]' |
+                while IFS= read -r delta; do
+                    jq -cn --argjson delta "$delta" '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"input_json_delta",partial_json:$delta}}}'
+                    sleep "$delay"
+                done
+            jq -cn '{type:"stream_event",event:{type:"content_block_stop",index:0}}'
+            jq -cn '{type:"stream_event",event:{type:"message_stop"}}'
+        fi
         emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"assistant",uuid:("fixture-"+$id),message:{id:("fixture-"+$id),role:"assistant",content:[{type:"tool_use",id:$id,name:.name,input:.input}]}}')"
         emit_record "$(printf '%s' "$spec" | jq -c --arg id "$id" '{type:"user",uuid:("fixture-"+$id+"-result"),message:{role:"user",content:[{type:"tool_result",tool_use_id:$id,is_error:(.is_error // false),content:(.result // "")}]}}')"
     done < "$tools_file"
+}
+
+# Optional raw stream: each line of fixture-frames.jsonl is one stream-json
+# frame, emitted in order on every turn before its answer, with "@TURN@" in any
+# string replaced by the turn number so IDs stay unique. Assistant and user
+# frames are also recorded in the synthetic history, as Claude records them;
+# system frames, such as a background task's lifecycle, are live only. A frame
+# with "_history": true is only recorded, as Claude records a queued
+# notification. A frame with "_live": true is only emitted, as a subagent's
+# frames are, which Claude records in the subagent's own transcript. A line
+# {"_sleep": SECONDS} pauses, so a running state can be observed. A line
+# {"_end": true} ends the turn there: the frames supply its closing result,
+# such as a failed one, and the fixture adds no answer of its own.
+frames_file=$config/fixture-frames.jsonl
+frames_ended=0
+frames_turn() {
+    frames_ended=0
+    while IFS= read -r spec; do
+        [ -n "$spec" ] || continue
+        delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
+        if [ -n "$delay" ]; then
+            sleep "$delay"
+            continue
+        fi
+        if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then
+            frames_ended=1
+            return
+        fi
+        frame=$(printf '%s' "$spec" | jq -c --arg turn "$turn" 'walk(if type == "string" then gsub("@TURN@"; $turn) else . end)')
+        if [ "$(printf '%s' "$frame" | jq -r '._history // false')" = true ]; then
+            printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            continue
+        fi
+        if [ "$(printf '%s' "$frame" | jq -r '._live // false')" = true ]; then
+            printf '%s\n' "$frame" | jq -c 'del(._live)'
+            continue
+        fi
+        case $(printf '%s' "$frame" | jq -r '.type') in
+            assistant|user) emit_record "$frame" ;;
+            *) printf '%s\n' "$frame" ;;
+        esac
+    done < "$frames_file"
 }
 
 # Optional provider-produced image for image preview/viewer acceptance: each
@@ -276,9 +353,22 @@ while IFS= read -r frame; do
                         '{type:"result",uuid:("fixture-result-"+$turn),subtype:"error_during_execution",is_error:true,errors:[$error | sub("\\s+$"; "")],session_id:$session}'
                     continue
                 fi
+                # Optional provider death mid-turn, as when the system runs
+                # out of memory: the next prompt gets the start of an answer,
+                # then the provider kills itself with SIGKILL. The switch is
+                # consumed first, so a resumed provider answers normally.
+                if [ "$probe" = false ] && [ -e "$config/fixture-stop-on-prompt" ]; then
+                    rm -f "$config/fixture-stop-on-prompt"
+                    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-stopping-"+$turn),message:{id:("fixture-stopping-"+$turn),role:"assistant",content:[{type:"text",text:"Starting the full evaluation run now; this step needs a lot of memory."}]}}')"
+                    kill -KILL $$
+                fi
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
                 if [ "$subagents" = 1 ]; then subagents_turn; fi
                 if [ -f "$tools_file" ]; then tools_turn; fi
+                if [ -f "$frames_file" ]; then
+                    frames_turn
+                    if [ "$frames_ended" = 1 ]; then continue; fi
+                fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live

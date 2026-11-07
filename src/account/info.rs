@@ -311,6 +311,7 @@ mod tests {
                     email: Some("fixture@example.test".into()),
                     organization: None,
                     plan: Some("pro".into()),
+                    disputed_by: None,
                 }),
                 observed_identity: None,
                 identity_conflict: false,

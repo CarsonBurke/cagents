@@ -612,11 +612,16 @@ exit 83
         # Cargo's dependency lists stay there, so nothing here can say the
         # products are current.
         offload = self.runner.with_name("cargo-offload")
+        # One slot there serves all three builds: the hold runs the script.
         offload.write_text('#!/bin/sh\n[ "$1" != --host ] || { echo build-host; exit 0; }\n'
+                           '[ "$1" != --hold ] || { shift; printf "hold\\n" >>"$CARGO_CALLS"; exec "$@"; }\n'
                            'exec cargo "$@"\n')
         offload.chmod(0o755)
-        self.assert_built("--browserless")
-        self.assert_built("--browserless")
+        for _ in range(2):
+            result, calls = self.launch("--browserless")
+            self.assertEqual(calls[0], "hold", result.stderr)
+            self.assertEqual(len(calls), 4, calls)
+            self.assertNotIn("skipping the build", result.stderr)
 
     def test_identity_records_hide_environment_values_and_stay_private(self):
         # Build tools are inert; these are synthetic values, including an
@@ -800,6 +805,20 @@ exit 83
         leftovers = [path.name for path in (self.target / "dev-runtime").iterdir()
                      if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
+
+    def test_both_lanes_build_one_cli_and_daemon_and_differ_only_in_the_ui(self):
+        _, browserless = self.launch("--browserless")
+        _, integrated = self.launch()
+        common = "build --locked --profile dev-runtime"
+        self.assertEqual(browserless[:2], [
+            f"{common} --no-default-features --features development --bin cagents",
+            f"{common} --no-default-features --features development,host --bin cagentsd",
+        ])
+        self.assertEqual(integrated[:2], browserless[:2])
+        self.assertEqual(browserless[2:], [
+            f"{common} --no-default-features --features development,ui --bin cagents-ui"])
+        self.assertEqual(integrated[2:], [
+            f"{common} --features development,integrated-browser --bin cagents-ui"])
 
     def test_the_other_lane_rebuilds_and_invalidates_this_one(self):
         self.assert_built("--browserless")

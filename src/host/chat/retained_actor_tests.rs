@@ -254,6 +254,12 @@ fn retained_upgrade_tail(fail_final_save: bool) {
             crate::agent_execution::HostedSession::Chat(source),
         )
         .unwrap();
+    // A run's prompt is refused until the provider is ready, so wait as
+    // agent execution does; on a loaded host Claude's initialize reply can
+    // still be outstanding here.
+    super::super::agent_execution::await_provider_ready(&handle)
+        .map_err(|(_, error)| error)
+        .unwrap();
     handle
         .command_for_run(
             accepted.run.id,
@@ -724,6 +730,12 @@ fn retained_turn_final_action(action: &str) {
             None,
             crate::agent_execution::HostedSession::Chat(hosted_source.clone()),
         )
+        .unwrap();
+    // A run's prompt is refused until the provider is ready, so wait as
+    // agent execution does; on a loaded host Claude's initialize reply can
+    // still be outstanding here.
+    super::super::agent_execution::await_provider_ready(&handle)
+        .map_err(|(_, error)| error)
         .unwrap();
     handle
         .command_for_run(
@@ -1506,11 +1518,26 @@ def trace(value):
 trace({'event':'bootstrap','HOME':os.environ.get('HOME'),'CLAUDE_CONFIG_DIR':os.environ.get('CLAUDE_CONFIG_DIR'),'cwd':os.getcwd(),'scriptroot':str(scriptroot)})
 root=pathlib.Path(os.environ['HOME']).parent
 trace({'event':'marker-root','markerroot':str(root)})
-session=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
-def send(value): print(json.dumps(value),flush=True)
+resumed=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--resume=')), None)
+session=resumed or next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
+with (root/'launches').open('a') as log: log.write((resumed or 'new')+'\n')
+history=None
+if (root/'persist-history').exists():
+    # Claude's own record of the conversation, which a resumed start reads.
+    project=''.join(c if c.isascii() and c.isalnum() else '-' for c in os.getcwd())
+    history=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects'/project/(session+'.jsonl')
+    history.parent.mkdir(parents=True,exist_ok=True)
+records=[json.loads(line) for line in history.read_text().splitlines()] if history is not None and history.exists() else []
+def send(value):
+    print(json.dumps(value),flush=True)
+    if history is not None and value.get('type') in ('user','assistant','result'):
+        record=dict(value,uuid=f'history-{len(records)}',sessionId=session,parentUuid=records[-1]['uuid'] if records else None)
+        records.append(record)
+        with history.open('a') as log: log.write(json.dumps(record)+'\n')
 for line in sys.stdin:
     frame=json.loads(line)
-    trace({'event':'input','type':str(frame.get('type'))[:96],'uuid':str(frame.get('uuid'))[:96]})
+    request=frame.get('request')
+    trace({'event':'input','type':str(frame.get('type'))[:96],'subtype':str(request.get('subtype') if isinstance(request,dict) else None)[:96],'uuid':str(frame.get('uuid'))[:96]})
     if frame.get('type')=='control_request':
         send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
     elif frame.get('type')=='user':
@@ -1521,6 +1548,13 @@ for line in sys.stdin:
             (root/'survivor-pid').write_text(str(survivor.pid))
         received=frame['uuid']
         send({'type':'user','uuid':received,'session_id':session,'parent_tool_use_id':None,'message':frame['message']})
+        if (root/'stop-on-prompt').exists():
+            # The provider dies mid-turn, as under an out-of-memory kill. The
+            # marker is consumed first, so a resumed provider answers normally.
+            (root/'stop-on-prompt').unlink()
+            send({'type':'assistant','uuid':'stopping','message':{'id':'stopping','role':'assistant','content':[{'type':'text','text':'STOPPING|'}]}})
+            import signal
+            os.kill(os.getpid(), signal.SIGKILL)
         send({'type':'command_lifecycle','command_uuid':received,'state':'started','session_id':session,'uuid':'lifecycle-'+received})
         for index in range(40):
             send({'type':'assistant','uuid':f'frame-{index}','message':{'id':f'frame-{index}','role':'assistant','content':[{'type':'text','text':f'FRAME_{index:03}|'}]}})
@@ -2258,8 +2292,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
             "successor cannot pass without exact original-parent collection"
         );
         assert!(
-            !receipt.identity.record.holder.is_current()
-                && !receipt.identity.record.root.is_current()
+            receipt.identity.record.holder.reaped() && !receipt.identity.record.root.is_current()
         );
         coordinator.successful = true;
         return;
@@ -2382,6 +2415,10 @@ fn sigkill_host_fixture(semantic_held: bool) {
                 None,
                 crate::agent_execution::HostedSession::Chat(source),
             )
+            .unwrap();
+        // As agent execution does, wait for Claude's initialize reply first.
+        super::super::agent_execution::await_provider_ready(&handle)
+            .map_err(|(_, error)| error)
             .unwrap();
         handle
             .command_for_run(
@@ -2893,7 +2930,7 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
     );
     handle.close().unwrap();
     retained_actor::finish_close(&successor, &handle, &replacement).unwrap();
-    assert!(!identity.record.root.is_current() && !identity.record.holder.is_current());
+    assert!(!identity.record.root.is_current() && identity.record.holder.reaped());
     let registry = super::super::agent_execution::registry(&successor).unwrap();
     let retirement = registry
         .lock()
@@ -3108,7 +3145,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
         // semantic ACKs and completes discovery teardown. Deliberately stop at
         // the next instruction boundary before the host's SQL receipt commit.
         handle.finish_retained_close().unwrap();
-        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
         assert!(
             registry
                 .lock()
@@ -3144,9 +3181,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
     assert_eq!(role, "successor");
     let receipt: Receipt =
         serde_json::from_slice(&fs::read(root.join("retired-before-sql.json")).unwrap()).unwrap();
-    assert!(
-        !receipt.identity.record.holder.is_current() && !receipt.identity.record.root.is_current()
-    );
+    assert!(receipt.identity.record.holder.reaped() && !receipt.identity.record.root.is_current());
     let registry = super::super::agent_execution::registry(&host).unwrap();
     assert!(
         registry
@@ -3647,7 +3682,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
             super::native_cleanup::close_retained(&successor, &requested)
                 .is_err_and(|error| error.contains("fixture unattached retirement commit failure"))
         );
-        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
         let state = successor.lock().unwrap();
         assert!(
             state.chats.contains_key(&id),
@@ -3675,9 +3710,9 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         drop(fault);
     }
     super::native_cleanup::close_retained(&successor, &requested).unwrap();
-    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
     if let Some(pair) = pair {
-        assert!(!pair.holder.is_current() && !pair.root.is_current());
+        assert!(pair.holder.reaped() && !pair.root.is_current());
     }
     let state = successor.lock().unwrap();
     assert!(!state.chats.contains_key(&id));
@@ -3792,7 +3827,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         successor.lock().unwrap().chats.is_empty(),
         "resume preparation must not launch a provider"
     );
-    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
     assert_eq!(
         fs::read_to_string(root.join("prompts"))
             .unwrap()
@@ -3985,6 +4020,12 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
         fault.execute_batch("CREATE TRIGGER reject_exit_commit BEFORE INSERT ON native_actor_cursors BEGIN SELECT RAISE(ABORT, 'fixture exit commit failure'); END;").unwrap();
     }
     fs::remove_file(root.join("provider-done")).unwrap();
+    let outcome_clock = || {
+        handle
+            .retained_outcome_clock_until(Instant::now() + Duration::from_secs(2))
+            .map(|(_, latest)| latest)
+    };
+    let journaled_before = outcome_clock().unwrap();
     handle
         .command(chat::Command::Prompt {
             text: "A second turn before the exit".into(),
@@ -3992,9 +4033,14 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             mode: chat::PromptMode::Send,
         })
         .unwrap();
+    // The provider's marker follows its result frame, which the actor may not
+    // have read yet. Exit only once the actor has journaled the turn's outcome.
     wait_until(
-        || root.join("provider-done").exists(),
-        "fixture provider never finished its second turn",
+        || {
+            root.join("provider-done").exists()
+                && outcome_clock().is_ok_and(|latest| latest > journaled_before)
+        },
+        "the actor never journaled its second turn's outcome",
     );
     if console_survives {
         // Killed right after closing the provider, before its CLI view or
@@ -4012,7 +4058,12 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             &host, &mut error, false
         ));
         if interrupted {
-            let error = error.expect("the unfinished retirement must be reported");
+            let error = error.unwrap_or_else(|| {
+                panic!(
+                    "the unfinished retirement must be reported; provider trace:\n{}",
+                    fs::read_to_string(root.join("provider-trace.jsonl")).unwrap_or_default()
+                )
+            });
             assert!(
                 error.to_string().contains("fixture exit commit failure"),
                 "{error}"
@@ -4021,7 +4072,7 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             assert!(error.is_none(), "{error:?}");
         }
         assert!(
-            !pair.holder.is_current() && !pair.root.is_current(),
+            pair.holder.reaped() && !pair.root.is_current(),
             "ordinary exit must stop the paired console"
         );
         assert!(
@@ -4734,4 +4785,313 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
     assert_ne!(reopened.id, running);
     assert_eq!(reopened.launch.session_id, closed_early.launch.session_id);
     assert!(successor.lock().unwrap().chats.is_empty());
+}
+
+/// A card whose provider died under a running daemon, as under an
+/// out-of-memory kill, resumes the exact conversation in a successor started
+/// by that same daemon: once, however often it is asked, with nothing the
+/// ended actor held sent again.
+#[cfg(target_os = "linux")]
+#[test]
+fn exited_claude_card_resumes_its_conversation_once_in_the_same_daemon() {
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_EXITED_CLAUDE_RESUME_TEST";
+    if std::env::var_os(MODE).is_none() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = directory.path();
+        for path in [
+            "home/.claude",
+            "run",
+            "data",
+            "config",
+            "cache",
+            "bin",
+            "project",
+        ] {
+            fs::create_dir_all(root.join(path)).unwrap();
+        }
+        // The provider keeps Claude's history, which the resumed start reads.
+        fs::write(root.join("persist-history"), "").unwrap();
+        let test = thread::current().name().unwrap().to_owned();
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &test, "--nocapture"])
+            .env_clear()
+            .env(
+                "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                retained_helper_executable(),
+            )
+            .env(MODE, "1")
+            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+            .env("CAGENTS_HOLDER_ROOT", root)
+            .env("HOME", root.join("home"))
+            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+            .env("XDG_RUNTIME_DIR", root.join("run"))
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CONFIG_HOME", root.join("config"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .env(
+                "PATH",
+                format!("{}:/usr/bin:/bin", root.join("bin").display()),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "exited resume failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    install_provider(&root.join("bin/claude"));
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new("exited-resume-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new("only"),
+    };
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let mut state = HostState::new(proof.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&root.join("registry.sqlite3")).unwrap());
+    let host = Arc::new(HostLock::new(state));
+    let _notifications = {
+        let broker = super::super::notifications::Broker::start(
+            &host,
+            crate::notifications::Application::Cagents,
+        )
+        .unwrap();
+        host.lock().unwrap().notifications = Some(broker.handle());
+        broker
+    };
+    struct Cleanup(crate::daemon::holder_registry::Record);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in [&self.0.root, &self.0.holder] {
+                if process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+    }
+    let lines = |name: &str| {
+        fs::read_to_string(root.join(name))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+    let prompt = |handle: &Handle, text: &str| {
+        handle
+            .command(chat::Command::Prompt {
+                text: text.into(),
+                attachments: Vec::new(),
+                mode: chat::PromptMode::Send,
+            })
+            .unwrap();
+    };
+    let launch = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = launch.id;
+    start_execution(
+        &host,
+        0,
+        launch,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().unwrap();
+    let _cleanup = Cleanup(identity.record.clone());
+    wait_until(
+        || handle.attachment_snapshot().ready,
+        "actor never initialized",
+    );
+    prompt(&handle, "A turn that names the conversation");
+    wait_until(
+        || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
+        "fixture provider never confirmed its conversation",
+    );
+    let conversation = handle.confirmed_session_id();
+    // The card holds the descriptor the daemon publishes for its chat.
+    let ServerResponse::ChatListed { sessions } =
+        process(&host, 1, ClientRequest::ChatList).unwrap()
+    else {
+        panic!("the daemon did not list its chats");
+    };
+    let card = sessions
+        .into_iter()
+        .find(|session| session.id == id)
+        .unwrap();
+    assert_eq!(card.launch.session_id, conversation);
+    assert_eq!(card.proof.as_ref(), Some(&proof));
+    process(
+        &host,
+        1,
+        ClientRequest::ChatAttach {
+            session: card.clone(),
+        },
+    )
+    .unwrap();
+
+    // The provider dies mid-turn; its helper and the daemon keep running.
+    fs::remove_file(root.join("provider-done")).unwrap();
+    fs::write(root.join("stop-on-prompt"), "").unwrap();
+    prompt(&handle, "A turn the provider dies during");
+    wait_until(
+        || handle.is_completed() && handle.attachment_snapshot().exited,
+        "the provider's death never reached the card",
+    );
+    assert!(!root.join("stop-on-prompt").exists());
+    assert!(
+        identity.record.holder.is_current(),
+        "the helper outlives its provider"
+    );
+    // Attaching again, all Reconnect used to do, only brings it back stopped.
+    let ServerResponse::ChatAttached { snapshot, .. } = process(
+        &host,
+        1,
+        ClientRequest::ChatAttach {
+            session: card.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("the stopped chat did not attach");
+    };
+    assert!(snapshot.exited);
+    assert_eq!(lines("launches"), ["new"]);
+
+    // Resume retires the stopped actor and prepares one successor on the
+    // same conversation, without starting anything itself.
+    let ServerResponse::ChatResumePrepared { session: successor } = process_inner(
+        &host,
+        2,
+        ClientRequest::ChatPrepareResume {
+            source: card.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("a stopped card must prepare its resume");
+    };
+    assert!(
+        chat::is_retained_resume_successor(&card, &successor),
+        "not a successor of {card:?}: {successor:?}"
+    );
+    assert_eq!(successor.launch.session_id, conversation);
+    assert!(
+        !host.lock().unwrap().chats.contains_key(&id),
+        "the stopped actor is retired before its successor starts"
+    );
+    wait_until(
+        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
+        "the stopped actor never exited",
+    );
+    // A second press before the first start lands may prepare again, but
+    // can never start a second provider beside the first.
+    let again = process_inner(
+        &host,
+        3,
+        ClientRequest::ChatPrepareResume {
+            source: card.clone(),
+        },
+    );
+    let ServerResponse::ChatAttached {
+        session: started,
+        snapshot,
+    } = process(
+        &host,
+        2,
+        ClientRequest::ChatStart {
+            session: successor.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap()
+    else {
+        panic!("the prepared successor did not start");
+    };
+    assert!(chat::is_retained_resume_commit(&card, &started));
+    let resumed = host.lock().unwrap().chats[&started.id].handle.clone();
+    let _resumed_cleanup = Cleanup(resumed.actor_identity().unwrap().record);
+    if let Ok(ServerResponse::ChatResumePrepared { session: second }) = again {
+        assert!(
+            process(
+                &host,
+                3,
+                ClientRequest::ChatStart {
+                    session: second,
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                },
+            )
+            .is_err(),
+            "a second successor must not start beside the first"
+        );
+    }
+    assert!(
+        process_inner(
+            &host,
+            4,
+            ClientRequest::ChatPrepareResume {
+                source: card.clone(),
+            },
+        )
+        .is_err(),
+        "a running successor is never prepared again"
+    );
+    assert_eq!(host.lock().unwrap().chats.len(), 1);
+    wait_until(
+        || resumed.attachment_snapshot().ready,
+        "the successor never initialized",
+    );
+    assert!(snapshot.session_id.is_none() || snapshot.session_id == conversation);
+    assert_eq!(
+        lines("launches"),
+        ["new".to_owned(), conversation.clone().unwrap()],
+        "exactly one provider resumed the exact conversation"
+    );
+    assert_eq!(
+        lines("prompts").len(),
+        2,
+        "nothing the stopped actor held is sent again"
+    );
+    // The successor shows the conversation read back from its history.
+    resumed.set_visible(true);
+    wait_until(
+        || {
+            resumed.snapshot(None).is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.role == chat::Role::User)
+            })
+        },
+        "the resumed conversation lost its transcript",
+    );
+    // The conversation continues in the successor.
+    prompt(&resumed, "A follow-up after resuming");
+    wait_until(
+        || root.join("provider-done").exists() && resumed.confirmed_session_id() == conversation,
+        "the resumed conversation never answered",
+    );
+    assert_eq!(lines("prompts").len(), 3);
+    process(
+        &host,
+        2,
+        ClientRequest::ChatClose {
+            chat_id: started.id,
+        },
+    )
+    .unwrap();
 }

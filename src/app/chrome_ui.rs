@@ -67,6 +67,22 @@ pub(super) struct State {
 
 #[cfg(test)]
 mod tests {
+    /// A close that starts under a rename would have its message dropped, so the
+    /// pane stays queued until the rename ends.
+    #[test]
+    fn a_rename_holds_the_close_queue_until_it_ends() {
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.queue_card_close(card, false);
+        app.chrome_ui.rename = Some((RenameTarget::Pane(card), String::new()));
+        drop(app.next_queued_card_close());
+        assert_eq!(app.queued_card_closes.len(), 1);
+
+        app.chrome_ui.rename = None;
+        drop(app.next_queued_card_close());
+        assert!(app.queued_card_closes.is_empty());
+    }
+
     #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -3196,6 +3212,7 @@ impl Cagents {
         };
         let mut children = vec![tooltip(crate::reorder::handle(title_control, id), tip)];
         let status = match self.cards.get(&id) {
+            _ if self.terminal_close_in_progress(id) => Some(("Checking before closing", true)),
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             _ if self.saved_terminal_current(id).is_some() => self.saved_terminal_status(id),
@@ -3267,7 +3284,7 @@ impl Cagents {
                     || card_control_id(id, "close"),
                     |chrome| chrome.close_id.clone(),
                 ),
-                Some(Message::CloseCard(id)),
+                (!self.terminal_close_in_progress(id)).then_some(Message::CloseCard(id)),
             ));
         }
         let tab = crate::tab_strip::middle_click_close(
@@ -3434,17 +3451,25 @@ impl Cagents {
             .into();
         }
         let indicators = self.context_rail_indicators();
+        // A conversation that worked on or mentioned pull requests lists
+        // them wherever it runs, folder scope included.
+        let conversation_pull_requests = self.conversation_lists_pull_requests();
         let tabs = widget::row::with_children(
             ContextTab::ALL
                 .into_iter()
-                .filter(|tab| {
-                    !self.active_folder_scope()
-                        || !matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                .filter(|tab| match tab {
+                    ContextTab::Changes => !self.active_folder_scope(),
+                    ContextTab::PullRequest => {
+                        !self.active_folder_scope() || conversation_pull_requests
+                    }
+                    ContextTab::Files | ContextTab::Details => true,
                 })
                 .map(|tab| {
                     let selected = self.context_tab == tab;
                     let enabled = !self.modal_is_open()
-                        && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
+                        && (tab != ContextTab::PullRequest
+                            || self.active_workspace.is_some()
+                            || conversation_pull_requests);
                     let icon = match tab {
                         ContextTab::Files => Icon::Folder,
                         ContextTab::Changes => Icon::Changes,
