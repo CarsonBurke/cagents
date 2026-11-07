@@ -577,10 +577,16 @@ impl ExecutionEvidence {
     /// console runs outside the server, so a paired pane stays unproved.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
+        // A console paired in an earlier kernel boot cannot still run; one of
+        // this boot, or with incomplete evidence, is outside what this sees.
+        let console_ended = source.terminal.as_ref().is_none_or(|terminal| {
+            terminal
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete() && proof.boot_id != self.boot)
+        });
         let Some(listener) = source.owned_codex_listener.as_ref().filter(|_| {
-            source.owns_codex_listener()
-                && source.has_valid_native_continuity()
-                && source.terminal.is_none()
+            source.owns_codex_listener() && source.has_valid_native_continuity() && console_ended
         }) else {
             return SavedExecution::Unproved;
         };
@@ -1613,12 +1619,31 @@ mod tests {
         foreign.launch.recipe.arguments[1] = "unix:///elsewhere/control.sock".into();
         let mut unproved = card.clone();
         unproved.proof = None;
-        for card in [paired, unowned, foreign, unproved] {
+        // A console paired in this boot may still run outside the server.
+        let mut console = paired.clone();
+        let mut console_proof = card.proof.clone().unwrap();
+        console.terminal.as_mut().unwrap().continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: console_proof.host_session_id.clone(),
+            boot_id: console_proof.boot_id.clone(),
+            host_incarnation: console_proof.host_incarnation.clone(),
+        };
+        for card in [paired, unowned, foreign, unproved, console.clone()] {
             assert_eq!(
                 evidence(holders.path(), Vec::new()).classify(&card),
                 SavedExecution::Unproved
             );
         }
+        // One paired in an earlier boot cannot, so the server alone decides.
+        console_proof.boot_id = BootId::new("previous-boot");
+        console.terminal.as_mut().unwrap().continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: console_proof.host_session_id,
+            boot_id: console_proof.boot_id,
+            host_incarnation: console_proof.host_incarnation,
+        };
+        assert_eq!(
+            evidence(holders.path(), Vec::new()).classify(&console),
+            SavedExecution::Ended
+        );
         let mut unreadable = evidence(holders.path(), Vec::new());
         unreadable.native_holders = Err("unavailable".into());
         assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
