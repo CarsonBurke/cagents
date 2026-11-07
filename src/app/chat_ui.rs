@@ -98,6 +98,7 @@ mod scroll;
 mod selectable_prose;
 mod selection;
 mod step;
+mod stopped;
 mod text_copy;
 mod thumbnails;
 mod tool_text;
@@ -2392,6 +2393,9 @@ pub(super) struct Runtime {
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
+    /// Resuming this card's stopped provider failed, so it offers to try
+    /// again; the failure itself stands in `error`.
+    resume_failed: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
     /// Notices raised while an earlier page is shown. That page holds
@@ -3350,6 +3354,7 @@ impl Runtime {
             visible: AtomicBool::new(visible),
             error: None,
             capacity_refused: false,
+            resume_failed: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
@@ -5200,6 +5205,21 @@ impl Runtime {
         self.session.launch.session_id.is_some()
             && self.snapshot.exited
             && self.snapshot.session_id != self.session.launch.session_id
+    }
+    /// Whether this card's provider stopped while the daemon that ran it still
+    /// holds its ended actor, so a new provider can resume the same
+    /// conversation in this card. Only a retained Claude actor proves its end
+    /// that way; a saved-history reader resumes through its own action.
+    pub(super) fn resumes_in_place(&self) -> bool {
+        self.connected()
+            && self.snapshot.exited
+            && self.session.launch.provider == crate::agent::Provider::Claude
+            && matches!(
+                self.session.native_continuity,
+                chat::NativeContinuity::RetainedClaudeActor { .. }
+            )
+            && self.session.proof.is_some()
+            && !self.has_connected_saved_history(&self.snapshot)
     }
     /// Whether this runtime still has a daemon connection to its own actor.
     fn connected(&self) -> bool {
@@ -7818,6 +7838,11 @@ impl Cagents {
     pub(super) fn chat_start_matches(&self, card: CardId, session: &chat::Session) -> bool {
         matches!(self.chat_ui.phases.get(&card), Some(Phase::Starting(attempt)) if &attempt.session == session)
     }
+    /// Whether `session` is the conversation an unfinished resume of `card`
+    /// is starting in place of the one the card holds.
+    pub(super) fn chat_resume_in_flight(&self, card: CardId, session: &chat::Session) -> bool {
+        matches!(self.chat_ui.phases.get(&card), Some(Phase::Starting(attempt)) if chat::is_retained_resume_commit(&attempt.session, session))
+    }
     /// Whether a card that could not put its saved conversation back on screen
     /// should offer to start a new one in the same place.
     ///
@@ -10303,7 +10328,13 @@ impl Cagents {
                             runtime.later_asked = None;
                             runtime.error = None;
                             runtime.capacity_refused = false;
+                            runtime.resume_failed = false;
                             runtime.show(visible);
+                            // Show the new connection's state at once, as a
+                            // new runtime does, rather than the ended one's
+                            // until the next publication: a resumed card must
+                            // not offer Resume again in between.
+                            runtime.refresh();
                         } else {
                             let mut runtime = Runtime::new(
                                 target,
@@ -10484,7 +10515,13 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
-                            runtime.disconnected = true;
+                            // A resume that failed leaves its card where it
+                            // was, stopped with its conversation kept, so it
+                            // tries again. Reconnecting instead would look for
+                            // the actor the resume may already have ended.
+                            runtime.resume_failed = attempt.intent == chat::Intent::Resume
+                                && runtime.resumes_in_place();
+                            runtime.disconnected = !runtime.resume_failed;
                             self.observe_agent_activity_for_card(target.card, None);
                         } else if matches!(
                             self.card_state(target.card).map(|state| &state.kind),
@@ -10824,7 +10861,15 @@ impl Cagents {
                     return Task::none();
                 }
                 let session = runtime.session.clone();
-                let intent = self.chat_retry_intent(target.card, &session);
+                // Attaching again to an actor whose provider exited would only
+                // bring back the same stopped snapshot. Its conversation is
+                // resumed instead; the card keeps its transcript and draft
+                // while the daemon proves the old actor gone.
+                let intent = if runtime.resumes_in_place() {
+                    chat::Intent::Resume
+                } else {
+                    self.chat_retry_intent(target.card, &session)
+                };
                 return self.start_chat(target.card, session, intent, None, false);
             }
             Action::ResumeSaved(target) => {
@@ -22119,6 +22164,364 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A card whose provider stopped under the running daemon (#1068) offers
+    /// one labeled Resume. It starts a successor on the same conversation in
+    /// this card, keeping the transcript on screen and the unsent draft, and a
+    /// second press while it starts begins nothing more.
+    #[test]
+    fn resuming_a_stopped_chat_keeps_its_transcript_and_draft_and_starts_once() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let live = crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        };
+        let mut source = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        source.proof = Some(live.clone());
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        // The card is in a channel shared through the daemon's workspace model.
+        let channel = crate::model::ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: crate::model::ProjectId::new(),
+            title: "evaluation".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![],
+            focused: None,
+        });
+        durable.active_channel = Some(channel);
+        drop(app.insert_chat_card(source.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        app.persist();
+        // The daemon's view of the channel already holds the card.
+        let pane = |app: &Cagents, session: &chat::Session| {
+            let mut pane =
+                crate::workspace_model::views::Pane::from_card(app.card_state(card).unwrap(), None)
+                    .unwrap();
+            pane.kind = CardKind::Chat(session.clone());
+            pane
+        };
+        let scope = crate::workspace_model::views::Scope::Channel(channel);
+        let mut view = crate::workspace_model::views::View::empty(channel);
+        view.revision = 1;
+        view.panes.push(pane(&app, &source));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.views = vec![view.clone()];
+        app.shared_views.initialize(scope, view.panes.clone());
+        drop(app.reconcile_shared_views());
+        let text = |id: &str, role, body: &str| {
+            Arc::new(chat::Item {
+                id: id.into(),
+                role,
+                content: chat::ItemContent::Text {
+                    text: body.into(),
+                    thinking: false,
+                    phase: Default::default(),
+                },
+                started_at: None,
+                at: None,
+            })
+        };
+        let transcript = vec![
+            text("prompt", chat::Role::User, "Run the full evaluation"),
+            text(
+                "partial",
+                chat::Role::Assistant,
+                "Starting the full evaluation run now",
+            ),
+        ];
+        let stopped = Snapshot {
+            ready: true,
+            exited: true,
+            session_id: source.launch.session_id.clone(),
+            native_continuity: source.native_continuity.clone(),
+            items: transcript.clone(),
+            ..Snapshot::default()
+        };
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Ok(Arc::new(ClientHandle::fixture(source.clone(), stopped))),
+        );
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!("the card holds a chat"),
+        };
+        // The reader is looking at what the ended actor left on screen.
+        runtime.visible.store(true, Ordering::Relaxed);
+        Arc::make_mut(&mut runtime.snapshot).items = transcript.clone();
+        runtime.replace_draft(text_editor::Content::with_text("keep this draft"));
+        runtime
+            .attachments
+            .push(Attachment::file("/fixture/unsent-image.png"));
+        let attachments = runtime.attachments.clone();
+        let target = runtime.target;
+        assert!(runtime.resumes_in_place());
+        let offer = runtime.stopped(false, false);
+        assert_eq!(
+            offer.primary,
+            Some(("Resume conversation", stopped::Press::Reconnect, true)),
+            "{offer:?}"
+        );
+        assert_eq!(offer.secondary, None);
+
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let attempt = app.chat_ui.attempt(card).expect("Resume starts");
+        assert_eq!(attempt.intent, chat::Intent::Resume);
+        assert_eq!(attempt.session, source);
+        let resume = attempt.target;
+        // A second press, by either control, while it starts begins nothing.
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+        assert_eq!(chat_runtime_attempt(&app, card), resume);
+        let runtime = chat_runtime(&app, card);
+        let offer = runtime.stopped(true, true);
+        assert_eq!(
+            offer.primary,
+            Some(("Resuming…", stopped::Press::Reconnect, false))
+        );
+        assert_eq!(runtime.snapshot.items, transcript);
+        assert_eq!(runtime.composer.text(), "keep this draft");
+
+        // The daemon answers with the successor it started on the same
+        // conversation, which reads that conversation back.
+        let mut successor = source.clone();
+        successor.id = TerminalId::new();
+        let handle = Arc::new(ClientHandle::fixture_resumed(
+            source.clone(),
+            successor.clone(),
+            Snapshot {
+                ready: true,
+                session_id: successor.launch.session_id.clone(),
+                native_continuity: successor.native_continuity.clone(),
+                items: transcript.clone(),
+                ..Snapshot::default()
+            },
+        ));
+        // The daemon publishes the successor's pane before the start replies.
+        // The echo leaves the card, its runtime and its draft to the start.
+        view.revision += 1;
+        view.panes = vec![pane(&app, &successor)];
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(chat_runtime_attempt(&app, card), resume);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert_eq!(runtime.attachments, attachments);
+        // Nor does this window publish the ended conversation back over it.
+        app.persist();
+        app.publish_view_changes();
+        assert!(
+            !app.shared_views
+                .pending_changes()
+                .any(|(_, change)| matches!(
+                    change,
+                    crate::workspace_model::views::Change::Update { before, pane }
+                        if before.kind == CardKind::Chat(successor.clone())
+                            && pane.kind != before.kind
+                )),
+            "{:?}",
+            app.shared_views.pending_changes().collect::<Vec<_>>()
+        );
+        let task = app.update(Message::ChatUi(Action::Ready(
+            resume,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        let reply = resume_commit_reply(task);
+        let _ = app.update(reply);
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(successor.clone()),
+            "the same card now names the successor"
+        );
+        let runtime = chat_runtime(&app, card);
+        // The card shows the successor at once, not the ended actor's state,
+        // so it does not offer Resume again before the next publication.
+        assert!(!runtime.snapshot.exited);
+        assert!(!runtime.disconnected);
+        assert!(!runtime.resumes_in_place());
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert_eq!(runtime.attachments, attachments);
+        assert!(runtime.pending.is_none(), "the draft was not sent");
+    }
+
+    /// A resume that fails leaves the card stopped with its conversation and
+    /// draft, says so, and resumes again when pressed, rather than offering to
+    /// reconnect to the actor the failed resume may already have ended.
+    #[test]
+    fn a_failed_resume_offers_to_try_again_and_resumes_when_pressed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let mut source = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        source.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        });
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        drop(app.insert_chat_card(source.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        app.persist();
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Ok(Arc::new(ClientHandle::fixture(
+                source.clone(),
+                Snapshot {
+                    ready: true,
+                    exited: true,
+                    session_id: source.launch.session_id.clone(),
+                    native_continuity: source.native_continuity.clone(),
+                    ..Snapshot::default()
+                },
+            ))),
+        );
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!("the card holds a chat"),
+        };
+        runtime.replace_draft(text_editor::Content::with_text("keep this draft"));
+        let target = runtime.target;
+
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let resume = chat_runtime_attempt(&app, card);
+        assert_eq!(
+            app.chat_ui.attempt(card).unwrap().intent,
+            chat::Intent::Resume
+        );
+        answer_start(
+            &mut app,
+            resume,
+            Err(chat::StartFailure::retry(
+                "fixture: Claude Code did not start",
+            )),
+        );
+        assert!(!app.chat_start_pending(card));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert!(runtime.resumes_in_place());
+        let offer = runtime.stopped(false, false);
+        assert_eq!(
+            offer.guidance,
+            "Claude Code did not start again. The conversation and your draft are kept."
+        );
+        assert_eq!(
+            offer.primary,
+            Some(("Try again", stopped::Press::Reconnect, true)),
+            "{offer:?}"
+        );
+        assert_eq!(offer.secondary, None);
+
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let attempt = app.chat_ui.attempt(card).expect("Try again resumes");
+        assert_eq!(attempt.intent, chat::Intent::Resume);
+        assert_eq!(attempt.session, source);
+    }
+
+    /// Every state a stopped or disconnected card can be in names its action
+    /// on a labeled button, and none offers one that would only attach the
+    /// same stopped actor again.
+    #[test]
+    fn stopped_and_disconnected_cards_label_an_action_that_works() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut session = chat::fresh_session(
+            Provider::Codex,
+            TerminalId::new(),
+            PathBuf::from("/project"),
+            &crate::account::Account::system(Provider::Codex),
+        )
+        .unwrap();
+        session.launch.session_id = Some("codex-thread".into());
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        });
+        drop(app.insert_chat_card(session.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Ok(Arc::new(ClientHandle::fixture(
+                session.clone(),
+                Snapshot {
+                    ready: true,
+                    exited: true,
+                    session_id: session.launch.session_id.clone(),
+                    ..Snapshot::default()
+                },
+            ))),
+        );
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!("the card holds a chat"),
+        };
+        let target = runtime.target;
+        // An exited provider this card cannot start again says what to do.
+        assert!(!runtime.resumes_in_place());
+        let offer = runtime.stopped(false, false);
+        assert_eq!(offer.primary, None, "{offer:?}");
+        assert!(offer.guidance.contains("Resume conversation"), "{offer:?}");
+        // A lost connection reconnects.
+        runtime.disconnected = true;
+        let offer = runtime.stopped(false, false);
+        assert_eq!(
+            offer.primary,
+            Some(("Reconnect", stopped::Press::Reconnect, true))
+        );
+        // A resume that never loaded its conversation retries or starts anew.
+        runtime.disconnected = false;
+        Arc::make_mut(&mut runtime.snapshot).session_id = None;
+        let offer = runtime.stopped(false, false);
+        assert_eq!(
+            offer.primary,
+            Some(("Try again", stopped::Press::Reconnect, true))
+        );
+        assert_eq!(
+            offer.secondary,
+            Some(("Start a new conversation", stopped::Press::StartFresh, true))
+        );
     }
 
     fn resume_commit_reply(task: Task<Message>) -> Message {
