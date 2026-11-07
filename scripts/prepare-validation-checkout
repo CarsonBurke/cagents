@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Stage a committed revision at an owned, stable validation checkout.
 
 The caller must hold the real exclusive build-lane allocation and positively

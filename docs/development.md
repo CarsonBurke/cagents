@@ -1156,6 +1156,30 @@ Published releases still come from `scripts/build-release-linux`; see
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
 
+## Scripts and mise shims
+
+A mise shim on `PATH` under a moved `HOME` or `XDG_DATA_HOME`, as in a fixture, finds
+itself and re-executes without end: no error, and the process keeps its pid and
+restarts forever, outliving a `timeout` on its parent. So scripts here name
+`/usr/bin/python3` rather than finding `python3` on `PATH`, and a host running them
+needs it there. `scripts/cargo-gate` also sets `MISE_DATA_DIR` from the shims directory
+on `PATH`, so what it runs can move `HOME` without that loop.
+
+Separately, a shim under a `mise.toml` that mise has not been told to trust stops at
+mise's trust prompt and waits for an answer whenever its stderr is a terminal, even with
+stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
+`scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
+for you, because trusting a checkout's configuration is your decision. Run `mise trust`
+in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
+such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
+only that file pins can fail at once with `No version is set for shim`.
+
+A harness of your own that moves `HOME` should take the shims off `PATH` and name the
+tools it needs by their real paths. mise keeps its trust list under `HOME`, so setting
+`MISE_DATA_DIR` stops the loop but not the prompt. Run it in a systemd scope with a time
+limit too, which stops everything it started.
+
 ## Standalone editor
 
 ```sh

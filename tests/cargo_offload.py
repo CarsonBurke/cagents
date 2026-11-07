@@ -850,6 +850,17 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("`cargo install` may compile", result.stderr)
 
+    def test_a_build_on_a_host_with_shims_names_their_data_directory(self):
+        # A test there may move HOME, and a shim would then re-execute forever.
+        shims = self.host_home / ".local/share/mise/shims"
+        shims.mkdir(parents=True)
+        main = self.crate / "src/main.rs"
+        main.write_text('fn main() { println!("{}", env!("MISE_DATA_DIR")); }\n')
+        result = self.gate_run("build", "--bin", "probe", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = self.scope.run([self.crate / "target/debug/probe"], capture_output=True, text=True).stdout
+        self.assertEqual(printed.strip(), str(shims.parent))
+
     def test_cargo_in_an_exec_command_builds_there(self):
         result = self.gate_run(
             "exec", "sh", "-ec",
