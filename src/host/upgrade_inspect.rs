@@ -382,6 +382,9 @@ struct ExecutionEvidence {
     retired: Result<Vec<crate::daemon::holder_registry::Record>, String>,
     /// Where process and socket tables are read; `/proc` outside tests.
     processes: std::path::PathBuf,
+    /// How long a process that may still run can show no arguments before
+    /// it proves nothing.
+    exec_settle: Duration,
 }
 
 /// Every retained helper the durable census registered, by pane.
@@ -406,6 +409,7 @@ impl ExecutionEvidence {
             census: store.clone().and_then(|path| read_census(&path)),
             retired: store.and_then(|path| read_retired_owners(&path)),
             processes: "/proc".into(),
+            exec_settle: EXEC_SETTLE,
         }
     }
 
@@ -533,7 +537,7 @@ impl ExecutionEvidence {
         // publishes its record, so a starting holder is seen by that socket.
         let mut sockets = vec![listener.socket.as_path(), control.as_path()];
         sockets.extend(published.as_deref());
-        match codex_listener_survives(&self.processes, source.id, &sockets) {
+        match codex_listener_survives(&self.processes, source.id, &sockets, self.exec_settle) {
             Ok(true) => SavedExecution::Running,
             Ok(false) => SavedExecution::Ended,
             Err(_) => SavedExecution::Unproved,
@@ -545,21 +549,10 @@ impl ExecutionEvidence {
 /// in its arguments, or a socket is still bound at one of `sockets`. A
 /// process shows no arguments once its group leader has released its memory,
 /// and between `execve` and publishing its new ones. It is evidence of
-/// absence only when none of its threads can run again (see
-/// [`threads_ended`]); one that still could is read again for a bounded
-/// moment, then proves nothing.
+/// absence only when none of its threads can run again, and a live thread
+/// shows the arguments its leader no longer does (see [`threads`]). One that
+/// still shows none is read again for up to `settle`, then proves nothing.
 fn codex_listener_survives(
-    processes: &Path,
-    pane: crate::model::TerminalId,
-    sockets: &[&Path],
-) -> Result<bool, String> {
-    codex_listener_survives_with(processes, pane, sockets, EXEC_SETTLE)
-}
-
-/// How long one process may take to publish its arguments after `execve`.
-const EXEC_SETTLE: Duration = Duration::from_millis(100);
-
-fn codex_listener_survives_with(
     processes: &Path,
     pane: crate::model::TerminalId,
     sockets: &[&Path],
@@ -581,8 +574,10 @@ fn codex_listener_survives_with(
             if !argv.is_empty() {
                 return Ok(Some(argv));
             }
-            if threads_ended(path)? {
-                return Ok(None);
+            match threads(path)? {
+                Threads::Ended => return Ok(None),
+                Threads::Arguments(argv) => return Ok(Some(argv)),
+                Threads::Unsettled => {}
             }
             if Instant::now() >= deadline {
                 return Err("A process has not published its arguments yet".into());
@@ -637,63 +632,111 @@ fn codex_listener_survives_with(
     }))
 }
 
-/// A process or thread that has been reaped.
+/// A process or thread no longer found, or a thread whose id an `execve`
+/// from another of its threads took.
 fn gone(error: &io::Error) -> bool {
     error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
 }
 
-/// Whether no thread of a process can run again, so it can write nothing:
-/// each is a zombie, exiting (`PF_EXITING`), or has `SIGKILL` pending. A group
-/// exit sends that to every other thread before they run again, and the last
-/// one out tears down the shared memory, which takes a while for a large
-/// process under load. A zombie group leader whose other threads still run
-/// can yet `execve`.
-fn threads_ended(process: &Path) -> Result<bool, String> {
+/// What the threads of a process showing no arguments say about it.
+enum Threads {
+    /// None can run again, so the process can write nothing.
+    Ended,
+    /// A live thread shows the arguments of the memory the threads share,
+    /// which a group leader that exited early no longer shows.
+    Arguments(Vec<u8>),
+    /// One may still run but shows no arguments yet, as during `execve`.
+    Unsettled,
+}
+
+/// Reads every thread of a process. It has ended once none can run again:
+/// each is a zombie, exiting (`PF_EXITING`) or has `SIGKILL` pending, which a
+/// group exit sends every other thread before they run again. The last one
+/// out tears down the shared memory, which takes a while for a large process
+/// under load. A thread that cannot run cannot create another, so the
+/// threads listed again afterwards must all be ones already read. The leader
+/// is read last: a thread that runs `execve` takes the leader's id, and stops
+/// being found under its own, only once the old leader has gone.
+fn threads(process: &Path) -> Result<Threads, String> {
     let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
-    let threads = match std::fs::read_dir(process.join("task")) {
-        Ok(threads) => threads,
+    let list = || -> Result<Option<Vec<std::ffi::OsString>>, String> {
+        let threads = match std::fs::read_dir(process.join("task")) {
+            Ok(threads) => threads,
+            Err(error) if gone(&error) => return Ok(None),
+            Err(error) => return Err(unreadable(error)),
+        };
+        threads
+            .map(|thread| thread.map(|thread| thread.file_name()).map_err(unreadable))
+            .collect::<Result<_, _>>()
+            .map(Some)
+    };
+    let Some(mut read) = list()? else {
+        return Ok(Threads::Ended);
+    };
+    let leader = process.file_name();
+    read.sort_by_key(|thread| Some(thread.as_os_str()) == leader);
+    let mut unsettled = false;
+    for thread in &read {
+        let thread = process.join("task").join(thread);
+        if thread_ended(&thread)? {
+            continue;
+        }
+        match std::fs::read(thread.join("cmdline")) {
+            Ok(argv) if !argv.is_empty() => return Ok(Threads::Arguments(argv)),
+            Ok(_) => unsettled = true,
+            Err(error) if gone(&error) => unsettled = true,
+            Err(error) => return Err(unreadable(error)),
+        }
+    }
+    if unsettled {
+        return Ok(Threads::Unsettled);
+    }
+    Ok(match list()? {
+        Some(listed) if listed.iter().any(|thread| !read.contains(thread)) => Threads::Unsettled,
+        _ => Threads::Ended,
+    })
+}
+
+/// Whether one thread can never run again: reaped, a zombie, exiting
+/// (`PF_EXITING`), or with `SIGKILL` pending. A status it cannot read
+/// whole says it can.
+fn thread_ended(thread: &Path) -> Result<bool, String> {
+    let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
+    let stat = match std::fs::read_to_string(thread.join("stat")) {
+        Ok(stat) => stat,
         Err(error) if gone(&error) => return Ok(true),
         Err(error) => return Err(unreadable(error)),
     };
-    for thread in threads {
-        let thread = thread.map_err(unreadable)?.path();
-        let stat = match std::fs::read_to_string(thread.join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if gone(&error) => continue,
-            Err(error) => return Err(unreadable(error)),
-        };
-        // Fields after the command name begin at state (3); flags is field 9.
-        let fields = stat
-            .rsplit_once(')')
-            .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
-            .unwrap_or_default();
-        let Some(flags) = fields.get(6).and_then(|flags| flags.parse::<u64>().ok()) else {
-            return Ok(false);
-        };
-        if matches!(fields[0], "Z" | "X") || flags & PF_EXITING != 0 {
-            continue;
-        }
-        let status = match std::fs::read_to_string(thread.join("status")) {
-            Ok(status) => status,
-            Err(error) if gone(&error) => continue,
-            Err(error) => return Err(unreadable(error)),
-        };
-        let killed = status
-            .lines()
-            .filter_map(|line| {
-                line.strip_prefix("SigPnd:")
-                    .or_else(|| line.strip_prefix("ShdPnd:"))
-            })
-            .any(|mask| {
-                u64::from_str_radix(mask.trim(), 16)
-                    .is_ok_and(|mask| mask & 1 << (libc::SIGKILL - 1) != 0)
-            });
-        if !killed {
-            return Ok(false);
-        }
+    // Fields after the command name begin at state (3); flags is field 9.
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(flags) = fields.get(6).and_then(|flags| flags.parse::<u64>().ok()) else {
+        return Ok(false);
+    };
+    if matches!(fields[0], "Z" | "X") || flags & PF_EXITING != 0 {
+        return Ok(true);
     }
-    Ok(true)
+    let status = match std::fs::read_to_string(thread.join("status")) {
+        Ok(status) => status,
+        Err(error) if gone(&error) => return Ok(true),
+        Err(error) => return Err(unreadable(error)),
+    };
+    Ok(status
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("SigPnd:")
+                .or_else(|| line.strip_prefix("ShdPnd:"))
+        })
+        .any(|mask| {
+            u64::from_str_radix(mask.trim(), 16)
+                .is_ok_and(|mask| mask & 1 << (libc::SIGKILL - 1) != 0)
+        }))
 }
+
+/// How long one process may take to publish its arguments after `execve`.
+const EXEC_SETTLE: Duration = Duration::from_millis(100);
 
 /// `PF_EXITING`, set once a thread enters `do_exit`.
 const PF_EXITING: u64 = 0x4;
@@ -1074,6 +1117,7 @@ mod tests {
             census: Ok(census),
             retired: Ok(Vec::new()),
             processes: "/proc".into(),
+            exec_settle: EXEC_SETTLE,
         }
     }
 
@@ -1330,10 +1374,14 @@ mod tests {
                 }
             })
         };
+        // It checks that an exec in flight is read again, not how soon the
+        // kernel finishes one, which reclaim can stall well past the bound.
+        let evidence = ExecutionEvidence {
+            exec_settle: Duration::from_secs(2),
+            ..evidence(holders.path(), Vec::new())
+        };
         let unproved = (0..300)
-            .filter(|_| {
-                evidence(holders.path(), Vec::new()).classify(&card) != SavedExecution::Ended
-            })
+            .filter(|_| evidence.classify(&card) != SavedExecution::Ended)
             .count();
         stop.store(true, Ordering::Relaxed);
         churn.join().unwrap();
@@ -1452,8 +1500,8 @@ mod tests {
         // A process that has not published its arguments might be the
         // server, unless none of its threads can run again: each is a zombie,
         // exiting (PF_EXITING, like a PID-namespace init waiting in do_exit)
-        // or has SIGKILL pending, as a group exit leaves the threads behind
-        // a zombie leader. A zombie leader with a live thread can still exec.
+        // or has SIGKILL pending. A group exit leaves killed or exiting
+        // threads behind a zombie leader. A live thread can still exec.
         let processes = tempfile::tempdir_in("/var/tmp").unwrap();
         std::fs::create_dir_all(processes.path().join("net")).unwrap();
         std::fs::write(
@@ -1485,6 +1533,7 @@ mod tests {
                 ),
             )
             .unwrap();
+            std::fs::write(thread.join("cmdline"), b"").unwrap();
         };
         let kill = 1 << (libc::SIGKILL - 1);
         let term = 1 << (libc::SIGTERM - 1);
@@ -1524,6 +1573,11 @@ mod tests {
                 Some(('R', 0, (0, 0))),
                 SavedExecution::Unproved,
             ),
+            (
+                ('R', 0, (0, 0)),
+                Some(('Z', 0, (0, 0))),
+                SavedExecution::Unproved,
+            ),
             (('R', 0, (0, 0)), None, SavedExecution::Unproved),
             (('D', 0, (0, 0)), None, SavedExecution::Unproved),
         ] {
@@ -1533,6 +1587,21 @@ mod tests {
                 thread(4243, other.0, other.1, other.2);
             }
             assert_eq!(table.classify(&card), expected, "{leader:?} {other:?}");
+        }
+        // A live thread behind a zombie leader shows the arguments they share.
+        let served = card.owned_codex_listener.clone().unwrap().socket;
+        for (argv, expected) in [
+            ("python\0worker\0".to_owned(), SavedExecution::Ended),
+            (
+                format!("codex\0app-server\0--listen\0unix://{}\0", served.display()),
+                SavedExecution::Running,
+            ),
+        ] {
+            std::fs::remove_dir_all(process.join("task")).unwrap();
+            thread(4242, 'Z', 0x4, (0, 0));
+            thread(4243, 'S', 0, (0, 0));
+            std::fs::write(process.join("task/4243/cmdline"), &argv).unwrap();
+            assert_eq!(table.classify(&card), expected, "{argv:?}");
         }
         // A thread already reaped is gone; the group is gone with its last one.
         std::fs::remove_dir_all(process.join("task")).unwrap();
