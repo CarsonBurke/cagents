@@ -13,6 +13,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+mod manager;
 mod workload;
 pub(crate) use workload::{CommandStop, Killer, ProviderScope};
 
@@ -385,13 +386,55 @@ fn enroll_proven_process(pid: u32, divide: bool) -> io::Result<Enrolled> {
     let requests: &[&[&str]] = if divide { DIVIDED_SCOPE } else { &[&[]] };
     first_accepted(requests, |properties| {
         let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
-        enroll_with(
+        #[cfg(test)]
+        tests::requested(&unit);
+        match enroll_with(
             scope_request(&unit, pid, properties),
             &unit,
             TIMEOUT,
             || cgroup(pid),
-        )
+        ) {
+            // systemd may still run a request given up on, once the process
+            // has exited or is exiting: the scope it starts holds nothing and
+            // is never stopped. Settle it before the process goes on.
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                match manager::withdraw(&unit, || cgroup(pid)) {
+                    Ok(Some(membership)) => Ok(membership),
+                    Ok(None) => Err(error),
+                    Err(withdrawal) => Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("{error}; withdrawing the request failed: {withdrawal}"),
+                    )),
+                }
+            }
+            result => result,
+        }
     })
+}
+
+/// How long a session scope must have run before an empty one is collected.
+/// A scope starts with its processes, so a minute leaves wide room for
+/// anything about systemd's start this code doesn't foresee.
+const COLLECTABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// Stop the running session scopes that hold no process: those an enrollment
+/// couldn't withdraw, under a user manager too slow to answer in time, and
+/// those earlier versions left. Returns how many were stopped; a scope with a
+/// process, a queued job or a recent start is left alone.
+pub(crate) fn collect_empty_scopes() -> io::Result<usize> {
+    collect_empty_scopes_after(COLLECTABLE_AFTER)
+}
+
+fn collect_empty_scopes_after(age: Duration) -> io::Result<usize> {
+    if !manager_available() {
+        return Ok(0);
+    }
+    let mut stopped = 0;
+    with_verified_manager(ManagerNamespace::connect(), || {
+        stopped = manager::collect_empty_scopes(age)?;
+        Ok(())
+    })?;
+    Ok(stopped)
 }
 
 /// The membership from the first request systemd accepts. Only a refused
@@ -429,7 +472,10 @@ fn scope_request(unit: &str, pid: u32, properties: &[&str]) -> Command {
     command
         .args([
             "--user",
-            "--timeout=1s",
+            // enroll_with's deadline bounds the request. busctl's own must not
+            // end it first: a request systemd may still run would read as
+            // refused, and be followed by a second one.
+            "--timeout=60s",
             "call",
             "org.freedesktop.systemd1",
             "/org/freedesktop/systemd1",
@@ -610,6 +656,116 @@ pub(crate) fn warn_if_bootstrap_shared(root: u32) {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    thread_local! {
+        static REQUESTED: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    /// Each scope this thread requests, for tests that check what became of it.
+    pub(super) fn requested(unit: &str) {
+        REQUESTED.with(|requested| requested.borrow_mut().push(unit.to_owned()));
+    }
+
+    /// Many requests at once, for processes that exit while theirs may still
+    /// be queued: the conditions that left thousands of empty scopes. A
+    /// manager this loaded can outlast a withdrawal, so the collection that
+    /// backs it up runs too. Run by hand; it loads the user manager.
+    #[test]
+    #[ignore = "loads the OS user manager"]
+    fn concurrent_requests_for_exiting_processes_leave_no_scope_running() {
+        if !manager_available() {
+            eprintln!("scope withdrawal unqualified: OS user manager unavailable");
+            return;
+        }
+        let workers: Vec<_> = (0..200)
+            .map(|index| {
+                thread::spawn(move || {
+                    let mut child = Command::new("/bin/sleep")
+                        .arg(format!("0.0{}", index % 9 + 1))
+                        .spawn()
+                        .unwrap();
+                    let enrolled = with_verified_manager(ManagerNamespace::connect(), || {
+                        enroll_proven_process(child.id(), false).map(drop)
+                    });
+                    // Reaped late, as a busy parent would.
+                    thread::sleep(Duration::from_secs(3));
+                    child.wait().unwrap();
+                    (
+                        enrolled.is_ok(),
+                        REQUESTED.with(|requested| requested.take()),
+                    )
+                })
+            })
+            .collect();
+        let mut enrolled = 0;
+        let mut units = Vec::new();
+        for worker in workers {
+            let (ok, requested) = worker.join().unwrap();
+            enrolled += usize::from(ok);
+            units.extend(requested);
+        }
+        // Give systemd time to stop scopes whose processes exited.
+        thread::sleep(Duration::from_secs(5));
+        let collected = collect_empty_scopes_after(Duration::ZERO).unwrap();
+        let state = Command::new("systemctl")
+            .args(["--user", "show", "--property=ActiveState", "--value"])
+            .args(&units)
+            .output()
+            .unwrap();
+        let running = String::from_utf8_lossy(&state.stdout)
+            .lines()
+            .filter(|state| *state == "active")
+            .count();
+        eprintln!(
+            "{} requests, {enrolled} enrolled, {collected} collected, {running} left running",
+            units.len()
+        );
+        assert_eq!(running, 0);
+    }
+
+    /// A process that has exited but isn't reaped gets a scope systemd
+    /// starts empty and never stops (#2414). Enrollment must not leave it.
+    #[test]
+    fn a_scope_requested_for_an_exiting_process_is_not_left_running() {
+        if !manager_available() {
+            eprintln!("scope withdrawal unqualified: OS user manager unavailable");
+            return;
+        }
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !fs::read_to_string(format!("/proc/{pid}/stat"))
+            .unwrap()
+            .rsplit_once(") ")
+            .unwrap()
+            .1
+            .starts_with('Z')
+        {
+            assert!(Instant::now() < deadline, "the child never exited");
+            thread::sleep(POLL);
+        }
+        REQUESTED.with(|requested| requested.borrow_mut().clear());
+        for divide in [false, true] {
+            let enrolled = with_verified_manager(ManagerNamespace::connect(), || {
+                enroll_proven_process(pid, divide).map(drop)
+            });
+            assert!(enrolled.is_err(), "an exited process was enrolled");
+        }
+        child.wait().unwrap();
+        let units = REQUESTED.with(|requested| requested.take());
+        assert!(!units.is_empty());
+        for unit in units {
+            let state = Command::new("systemctl")
+                .args(["--user", "show", "--property=ActiveState", "--value", &unit])
+                .output()
+                .unwrap();
+            assert_ne!(
+                String::from_utf8_lossy(&state.stdout).trim(),
+                "active",
+                "{unit} was left running"
+            );
+        }
+    }
     #[test]
     fn unproved_manager_never_attempts_numeric_pid_enrollment() {
         for error in [libc::ENOPROTOOPT, libc::EPERM, libc::EACCES, libc::ENOENT] {
