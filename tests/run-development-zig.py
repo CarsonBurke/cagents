@@ -730,6 +730,62 @@ exit 83
                      if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
 
+    def test_listing_shows_a_development_daemon_its_checkout_and_starter(self):
+        checkout = self.root / "worktree"
+        daemon = checkout / "target/dev-runtime/cagentsd"
+        daemon.parent.mkdir(parents=True)
+        shutil.copy2("/bin/sleep", daemon)
+        runtime = self.root / "nh-fixture"
+        runtime.mkdir()
+        starter = os.getpid()
+        start = Path(f"/proc/{starter}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        (runtime / "cagents-run-development.owner").write_text(
+            f"checkout={checkout}\nowner={starter}\nowner_start={start}\n"
+            "owner_name=fixture-agent\nhosted=true\n")
+        lock = runtime / "cagents-development-fx1/cagentsd.lock"
+        lock.parent.mkdir()
+        # Like a daemon, it keeps its instance's lock open.
+        process = subprocess.Popen(
+            ["/bin/sh", "-c", 'exec 9>>"$1" && exec "$2" 30', "sh", str(lock), str(daemon)],
+            env={"XDG_RUNTIME_DIR": str(runtime), "CAGENTS_DEVELOPMENT_INSTANCE": "fx1"})
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+
+        def listing():
+            result = subprocess.run(
+                [str(self.runner), "--list-instances"], cwd=self.root,
+                env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
+            return lines[index:index + 5]
+
+        deadline = time.monotonic() + 5
+        while not any(os.readlink(f"/proc/{process.pid}/fd/{fd}") == str(lock)
+                      for fd in os.listdir(f"/proc/{process.pid}/fd")):
+            self.assertLess(time.monotonic(), deadline, "fixture daemon never opened its lock")
+            time.sleep(0.01)
+        block = listing()
+        self.assertEqual(
+            block[4],
+            f"  stop:       scripts/run-development --stop-instance fx1, once niri-harness is installed; or kill {process.pid}")
+        # A harness that knows no such session.
+        harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
+        harness.write_text("#!/bin/sh\nexit 1\n")
+        harness.chmod(0o755)
+        block = listing()
+        self.assertTrue(block[0].startswith(f"fx1, pid {process.pid}, running "), block)
+        self.assertEqual(block[1], f"  checkout:   {checkout}")
+        self.assertEqual(block[2], f"  runtime:    {runtime}")
+        self.assertEqual(
+            block[3],
+            f"  started by: fixture-agent (pid {starter}), still running, in a cagents session")
+        # Without a runner session, only its process can be named.
+        self.assertTrue(block[4].startswith(f"  stop:       kill {process.pid} "), block)
+        shutil.rmtree(checkout)
+        self.assertEqual(listing()[1], f"  checkout:   {checkout} (removed)")
+        self.assertFalse(self.cargo_calls.exists(), "listing built")
+
     def test_nested_only_refuses_the_callers_desktop_before_building(self):
         session_runtime = self.root / "nh-fixture"
         session_runtime.mkdir()

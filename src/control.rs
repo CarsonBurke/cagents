@@ -4583,6 +4583,17 @@ mod tests {
         use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
         const CHILD: &str = "CAGENTS_TEST_HOSTED_STOP_FOR_REBUILD";
         let name = thread::current().name().unwrap().to_owned();
+        // A production build refuses every hosted stop; see the test above.
+        if !crate::instance::IS_DEVELOPMENT {
+            return;
+        }
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
         let Some(host) = std::env::var_os(CHILD) else {
             for host in ["elsewhere", "itself"] {
                 let directory = tempfile::Builder::new().prefix("hs-").tempdir().unwrap();
@@ -4596,11 +4607,13 @@ mod tests {
                 std::fs::create_dir(&runtime).unwrap();
                 let lock = runtime.join("cagentsd.lock");
                 std::fs::write(&lock, "").unwrap();
-                let mut daemon = Command::new("/bin/sh")
-                    .args(["-c", "exec 9>>\"$1\" && flock -x 9 && exec sleep 60", "sh"])
-                    .arg(&lock)
-                    .spawn()
-                    .unwrap();
+                let mut daemon = Daemon(
+                    Command::new("/bin/sh")
+                        .args(["-c", "exec 9>>\"$1\" && flock -x 9 && exec sleep 60", "sh"])
+                        .arg(&lock)
+                        .spawn()
+                        .unwrap(),
+                );
                 let deadline = Instant::now() + Duration::from_secs(10);
                 while Command::new("flock")
                     .args(["-n", "-x"])
@@ -4616,7 +4629,7 @@ mod tests {
                     );
                     thread::sleep(Duration::from_millis(5));
                 }
-                std::fs::write(&lock, format!("{{\"pid\":{}}}", daemon.id())).unwrap();
+                std::fs::write(&lock, format!("{{\"pid\":{}}}", daemon.0.id())).unwrap();
                 let out = directory.path().join("stdout");
                 let err = directory.path().join("stderr");
                 let status = Command::new(std::env::current_exe().unwrap())
@@ -4648,7 +4661,7 @@ mod tests {
                 );
                 let deadline = Instant::now() + Duration::from_secs(10);
                 let ended = loop {
-                    if let Some(status) = daemon.try_wait().unwrap() {
+                    if let Some(status) = daemon.0.try_wait().unwrap() {
                         break Some(status);
                     }
                     if host == "itself" || Instant::now() >= deadline {
@@ -4663,8 +4676,6 @@ mod tests {
                     );
                 } else {
                     assert!(ended.is_none(), "the hosting daemon was stopped");
-                    daemon.kill().unwrap();
-                    daemon.wait().unwrap();
                 }
             }
             return;
@@ -4676,7 +4687,7 @@ mod tests {
         } else {
             PathBuf::from("/fixture/production-runtime")
         };
-        crate::daemon::hosting::fake_process_tree(&tree, std::process::id(), &host_runtime, None);
+        crate::daemon::hosting::fake_process_tree(&tree, &host_runtime, None);
         *crate::daemon::hosting::TEST_PROC_ROOT.lock().unwrap() = Some(tree);
         let argv = [
             "cagents",
@@ -4798,7 +4809,6 @@ mod tests {
             let tree = std::env::current_dir().unwrap().join("proc");
             crate::daemon::hosting::fake_process_tree(
                 &tree,
-                std::process::id(),
                 &PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()),
                 None,
             );

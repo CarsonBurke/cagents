@@ -268,14 +268,22 @@ work there as they do in your own terminal, with the session's
 - It refuses the daemon that hosts the session, or one hosting a session it
   descends from, since stopping that would end them. Every process a daemon
   hosts runs below one of the daemon's own processes, so this holds for hosts
-  of any version and after a daemon restart.
+  of any version and after a daemon restart. `niri-harness` detaches an
+  instance from the session that started it, so `--instance` also records the
+  runtime directories of the daemons hosting that session in
+  `CAGENTS_DEVELOPMENT_HOSTED_BY`, and the check reads it from each daemon
+  above the caller. A session in instance B, started from a session in
+  instance A, can't stop A either.
 - It refuses the unnamed development daemon in the login runtime
   (`/run/user/UID/cagents-development`), which belongs to the person at the
   computer, and every production daemon. A production CLI still refuses all
   lifecycle commands from a hosted session.
 
 Other lifecycle commands, such as `daemon stop` and `daemon upgrade`, remain
-refused in every hosted session.
+refused in every hosted session. Stopping an instance also ends whatever else
+runs in its harness session, so the runner refuses `--stop-instance` and
+`--fresh-daemon` for an instance whose daemon hosts the caller, or a session it
+descends from, before it asks the CLI.
 
 #### Finding and stopping instances
 
@@ -298,8 +306,10 @@ the agent's provider; otherwise the shell that ran the runner. An instance whose
 starter has ended is usually safe to stop. Daemons started another way have no
 record, and no runner session to stop, so the listing names their process ID;
 `kill PID` ends such a daemon and its jobs. The listing says when a daemon hosts
-the session that runs it, or is the login session's own development daemon,
-instead of offering a stop command.
+the session that runs it, or one that started it, or is the login session's own
+development daemon, instead of offering a stop command. It finds development
+daemons by the instance lock they hold, so it also lists those built outside a
+checkout's `target/`.
 
 An instance keeps running when the session that started it ends, so that
 another agent or a person can go on using it. Stop it when you're done, and

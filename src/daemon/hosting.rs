@@ -14,6 +14,13 @@
 //! it started from its own executable with its own environment. That stays
 //! true after the daemon restarts and adopts its holders, and for daemons
 //! built before this check existed.
+//!
+//! An instance's own processes leave the tree of the session that started it:
+//! `niri-harness start` detaches its compositor. So `scripts/run-development
+//! --instance` gives the instance [`HOSTED_BY_ENV`], the runtime directories of
+//! every daemon above the starting session, and a daemon's environment carries
+//! those too. A session the instance hosts then can't stop the daemons hosting
+//! the session that started it.
 
 use std::{
     ffi::OsStr,
@@ -27,6 +34,10 @@ use crate::instance;
 
 const DAEMON_EXECUTABLE: &str = "cagentsd";
 const MAX_ANCESTORS: usize = 1024;
+
+/// Newline-separated runtime directories of the daemons hosting the session
+/// that started a development instance; see the module documentation.
+pub(crate) const HOSTED_BY_ENV: &str = "CAGENTS_DEVELOPMENT_HOSTED_BY";
 
 pub(crate) const LIFECYCLE_REFUSAL: &str = "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon";
 
@@ -71,7 +82,7 @@ pub(crate) fn stop_refusal() -> Option<Refusal> {
         &target,
         instance::development_instance().is_none(),
         &login_runtime,
-        host_runtime_directories(&proc_root(), std::process::id()),
+        host_runtime_directories(&proc_root()),
     )
 }
 
@@ -103,12 +114,16 @@ fn same_path(left: &Path, right: &Path) -> bool {
         )
 }
 
-/// The runtime directories of every daemon above `pid`: each directory the
-/// daemon's environment could select, production or development, since its
-/// build is not visible from outside.
-fn host_runtime_directories(proc_root: &Path, pid: u32) -> Result<Vec<PathBuf>, String> {
+/// The runtime directories of every daemon above this process: each directory
+/// the daemon's environment could select, production or development, since its
+/// build is not visible from outside. `self` names this process in the
+/// namespace of the `/proc` being read, which its own ID might not.
+fn host_runtime_directories(proc_root: &Path) -> Result<Vec<PathBuf>, String> {
     let mut directories = Vec::new();
-    let mut process = pid;
+    let mut process: u32 = fs::read_link(proc_root.join("self"))
+        .ok()
+        .and_then(|process| process.to_str()?.parse().ok())
+        .ok_or_else(|| format!("cannot find this process in {}", proc_root.display()))?;
     for _ in 0..MAX_ANCESTORS {
         let directory = proc_root.join(process.to_string());
         if runs_daemon_executable(&directory) {
@@ -182,6 +197,15 @@ fn daemon_runtime_directories(environment: &[u8]) -> Option<Vec<PathBuf>> {
         namespace.extend_from_slice(name);
         directories.push(base.join(OsStr::from_bytes(&namespace)));
     }
+    if let Some(hosts) = variable(HOSTED_BY_ENV) {
+        directories.extend(
+            hosts
+                .split(|byte| *byte == b'\n')
+                .map(|host| Path::new(OsStr::from_bytes(host)))
+                .filter(|host| host.is_absolute())
+                .map(Path::to_path_buf),
+        );
+    }
     Some(directories)
 }
 
@@ -205,10 +229,11 @@ fn proc_root() -> PathBuf {
         .expect("a test reaching the hosted stop check must choose its process tree")
 }
 
-/// A fake `/proc` in which `pid` runs below a host whose environment selects
-/// `runtime` and, optionally, a development instance.
+/// A fake `/proc` in which `self`, process 40, runs below a host whose
+/// environment selects `runtime` and, optionally, a development instance.
 #[cfg(test)]
-pub(crate) fn fake_process_tree(root: &Path, pid: u32, runtime: &Path, instance: Option<&str>) {
+pub(crate) fn fake_process_tree(root: &Path, runtime: &Path, instance: Option<&str>) {
+    let pid = 40;
     let write = |pid: u32, parent: u32, executable: &str, environment: &[u8]| {
         let directory = root.join(pid.to_string());
         fs::create_dir_all(&directory).unwrap();
@@ -228,6 +253,7 @@ pub(crate) fn fake_process_tree(root: &Path, pid: u32, runtime: &Path, instance:
     }
     environment.push(0);
     write(pid, pid + 1, "/usr/bin/sh", b"");
+    std::os::unix::fs::symlink(pid.to_string(), root.join("self")).unwrap();
     write(
         pid + 1,
         1,
@@ -242,8 +268,8 @@ mod tests {
 
     fn hosts(runtime: &str, instance: Option<&str>) -> Result<Vec<PathBuf>, String> {
         let root = tempfile::tempdir().unwrap();
-        fake_process_tree(root.path(), 40, Path::new(runtime), instance);
-        host_runtime_directories(root.path(), 40)
+        fake_process_tree(root.path(), Path::new(runtime), instance);
+        host_runtime_directories(root.path())
     }
 
     #[test]
@@ -260,24 +286,60 @@ mod tests {
         assert_eq!(hosts("/run/user/7", None).unwrap().len(), 2);
     }
 
+    /// Puts a daemon process `pid`, with `environment`, between `self` (40)
+    /// and its parent.
+    fn insert_daemon(root: &Path, pid: u32, environment: &[u8]) {
+        let parent = parent_of(&root.join("40")).unwrap();
+        let directory = root.join(pid.to_string());
+        fs::create_dir(&directory).unwrap();
+        fs::write(
+            directory.join("stat"),
+            format!("{pid} (cagents-native) S {parent} 0\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink("/w/target/dev-runtime/cagentsd", directory.join("exe"))
+            .unwrap();
+        fs::write(directory.join("environ"), environment).unwrap();
+        fs::write(root.join("40/stat"), format!("40 (sh) S {pid} 0\n")).unwrap();
+    }
+
     #[test]
     fn every_daemon_above_the_caller_counts_not_only_the_nearest() {
         let root = tempfile::tempdir().unwrap();
-        // 10 is hosted by an instance whose UI was started from a session
-        // that production (12) hosts.
-        fake_process_tree(root.path(), 11, Path::new("/run/user/7"), None);
-        let inner = root.path().join("10");
-        fs::create_dir(&inner).unwrap();
-        fs::write(inner.join("stat"), "10 (cagents-native) S 11 0\n").unwrap();
-        std::os::unix::fs::symlink("/w/target/dev-runtime/cagentsd", inner.join("exe")).unwrap();
-        fs::write(
-            inner.join("environ"),
+        // Hosted by an instance whose UI a production-hosted session started.
+        fake_process_tree(root.path(), Path::new("/run/user/7"), None);
+        insert_daemon(
+            root.path(),
+            30,
             b"XDG_RUNTIME_DIR=/run/user/7/nh-x\0CAGENTS_DEVELOPMENT_INSTANCE=a\0",
-        )
-        .unwrap();
-        let directories = host_runtime_directories(root.path(), 10).unwrap();
+        );
+        let directories = host_runtime_directories(root.path()).unwrap();
         assert!(directories.contains(&PathBuf::from("/run/user/7/nh-x/cagents-development-a")));
         assert!(directories.contains(&PathBuf::from("/run/user/7/cagents")));
+    }
+
+    #[test]
+    fn an_instance_keeps_the_hosts_of_the_session_that_started_it() {
+        let root = tempfile::tempdir().unwrap();
+        // The harness detached instance b from the session in instance a
+        // that started it, so a is only in b's record.
+        fake_process_tree(root.path(), Path::new("/run/user/7/nh-b"), Some("b"));
+        fs::write(
+            root.path().join("41/environ"),
+            b"XDG_RUNTIME_DIR=/run/user/7/nh-b\0CAGENTS_DEVELOPMENT_INSTANCE=b\0\
+              CAGENTS_DEVELOPMENT_HOSTED_BY=/run/user/7/nh-a/cagents-development-a\n\
+              relative\n/run/user/7/cagents\0",
+        )
+        .unwrap();
+        let directories = host_runtime_directories(root.path()).unwrap();
+        for host in [
+            "/run/user/7/nh-b/cagents-development-b",
+            "/run/user/7/nh-a/cagents-development-a",
+            "/run/user/7/cagents",
+        ] {
+            assert!(directories.contains(&PathBuf::from(host)), "{host}");
+        }
+        assert!(!directories.contains(&PathBuf::from("relative")));
     }
 
     #[test]
@@ -286,11 +348,16 @@ mod tests {
         let directory = root.path().join("5");
         fs::create_dir(&directory).unwrap();
         fs::write(directory.join("stat"), "5 (sh) S 1 0\n").unwrap();
-        assert!(host_runtime_directories(root.path(), 5).is_err());
+        std::os::unix::fs::symlink("5", root.path().join("self")).unwrap();
+        assert!(host_runtime_directories(root.path()).is_err());
 
-        fake_process_tree(root.path(), 20, Path::new("/run/user/7"), None);
-        fs::remove_file(root.path().join("21/environ")).unwrap();
-        assert!(host_runtime_directories(root.path(), 20).is_err());
+        let root = tempfile::tempdir().unwrap();
+        assert!(host_runtime_directories(root.path()).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        fake_process_tree(root.path(), Path::new("/run/user/7"), None);
+        fs::remove_file(root.path().join("41/environ")).unwrap();
+        assert!(host_runtime_directories(root.path()).is_err());
 
         assert!(hosts("relative", None).is_err());
     }
