@@ -431,6 +431,7 @@ class Settings(unittest.TestCase):
         self.assertEqual(offload.path_settings({
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER": "/t/cagentsd", "CAGENTS_LIVE_TESTS": "0",
             "CAGENTS_BUILD_LOCK": "/var/tmp/l", "TMPDIR": "/tmp/x", "CAGENTS_ZIG": "/z/zig",
+            "CAGENTS_DEVELOPMENT_HOSTED_BY": "/run/user/1/cagents\n/run/user/1/nh-a/cagents-development-a",
             "CAGENTS_FIXTURE": "~/f", "CAGENTS_API_KEY_FILE": "/k"}),
             ["CAGENTS_FIXTURE", "CAGENTS_TEST_RETAINED_ACTOR_HELPER"])
 
