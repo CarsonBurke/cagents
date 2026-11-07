@@ -595,9 +595,10 @@ impl Cagents {
                             )
                         })
                         .unwrap_or(Cow::Borrowed("the channel"));
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not delete {title}: {error}"
-                    )));
+                    self.status = Some(
+                        TransientNotice::error(format!("Could not delete {title}: {error}"))
+                            .with_key(NoticeKey::ChannelDelete(id)),
+                    );
                     self.channel_ui.failed.insert(id, error);
                     self.refresh_sidebar_channels();
                     Task::none()
@@ -1362,6 +1363,7 @@ impl Cagents {
         );
         self.forget_channel_revival(id);
         self.channel_ui.failed.remove(&id);
+        self.resolve_notice(NoticeKey::ChannelDelete(id));
         self.refresh_sidebar_channels();
         // Settling spawns and closing sessions take a round trip each, and the
         // row reports them meanwhile. The workspace leaves the channel now, so
@@ -1587,6 +1589,7 @@ impl Cagents {
         let focused = self.durable.channels[index].focused;
         let mut retained_scope = None;
         let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
+        self.resolve_notice(NoticeKey::ChannelDelete(id));
         // Every window loses the channel, not only this one. A deletion that
         // arrived from the registry publishes it right back, which the registry
         // answers as a no-op because the channel is already gone - cheaper than
@@ -2842,8 +2845,19 @@ mod tests {
         );
         assert!(app.durable.channels.iter().any(|row| row.id == doomed));
 
+        // Trying again takes back what the last attempt reported, in the
+        // notices list as well as the toast.
+        app.notices.record(app.status.clone().unwrap());
+        let reported = |app: &Cagents| {
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message.starts_with("Could not delete"))
+        };
+        assert!(reported(&app));
         let _ = app.handle_channel_ui(Action::RetryFailed(doomed));
         assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+        assert!(app.status.is_none());
+        assert!(!reported(&app));
         let _ = app.handle_channel_ui(Action::SessionsClosed(
             doomed,
             app.channel_ui.close_operation(doomed),

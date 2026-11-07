@@ -299,6 +299,8 @@ enum NoticeKey {
     GitCommit(ActiveWorktreeKey),
     /// Saving this chat's return to a terminal.
     ChatReturn(CardId),
+    /// Deleting this channel, until a retry starts or the channel is gone.
+    ChannelDelete(ChannelId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
