@@ -352,7 +352,8 @@ fn limit_name(reached: Option<&str>) -> &str {
 /// "(America/Vancouver) (error type rate_limit, HTTP 429, …)" keeps the zone.
 fn reported_reset(message: &str) -> Option<String> {
     let lower = message.to_ascii_lowercase();
-    let (at, marker) = ["resets at ", "resets ", "reset at "]
+    // Codex says "… Try again at Nov 8th, 2026 11:11 AM."
+    let (at, marker) = ["resets at ", "resets ", "reset at ", "try again at "]
         .into_iter()
         .filter_map(|marker| lower.find(marker).map(|at| (at, marker)))
         .min_by_key(|(at, _)| *at)?;
@@ -371,7 +372,7 @@ fn reported_reset(message: &str) -> Option<String> {
         kept.push_str(zone);
         kept.push(')');
     }
-    let line = kept.as_str();
+    let line = kept.trim_end_matches('.');
     if line.is_empty()
         || line.chars().count() > 128
         || !line.chars().any(|c| c.is_ascii_digit())
@@ -911,9 +912,12 @@ mod tests {
     fn a_listed_failure_reads_as_one_line_never_a_raw_payload() {
         let limit = summary(Provider::Codex, "Usage limit reached for this plan");
         assert!(limit.starts_with("Codex usage limit reached"), "{limit}");
-        // An unclassified message keeps its own words, such as a reset time.
+        // A limit keeps the time it can be used again.
         let own = "You\u{2019}ve hit your usage limit. Try again at Nov 8th, 2026 11:11 AM.";
-        assert_eq!(summary(Provider::Codex, own), own);
+        assert_eq!(
+            summary(Provider::Codex, own),
+            "Codex usage limit reached · resets Nov 8th, 2026 11:11 AM"
+        );
         assert_eq!(
             summary(
                 Provider::Claude,
