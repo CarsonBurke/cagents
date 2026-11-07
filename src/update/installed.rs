@@ -156,6 +156,9 @@ pub(super) fn perform(
                 "the installed build or session ownership changed; review the update again",
             ));
         }
+        // Prepare the capture while the source daemon still runs: failing to
+        // create it must not leave the runtime without a daemon.
+        let output = StartupOutput::create(state)?;
         if let Some(daemon) = current.daemon {
             let socket = crate::terminal_ipc::daemon_socket_path()?;
             let mut client =
@@ -176,7 +179,7 @@ pub(super) fn perform(
                 .join(crate::companion::Product::Cli.file_name()),
         );
         command.args(["--json", "daemon", "start"]);
-        let output = StartupOutput::attach(&mut command, state)?;
+        output.attach(&mut command)?;
         guard.inherit_for_install(&mut command)?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
@@ -336,13 +339,18 @@ struct StartupOutput {
 }
 
 impl StartupOutput {
-    fn attach(command: &mut Command, state: &Path) -> io::Result<Self> {
-        let stdout = tempfile::tempfile_in(state)?;
-        let stderr = tempfile::tempfile_in(state)?;
+    fn create(state: &Path) -> io::Result<Self> {
+        Ok(Self {
+            stdout: tempfile::tempfile_in(state)?,
+            stderr: tempfile::tempfile_in(state)?,
+        })
+    }
+
+    fn attach(&self, command: &mut Command) -> io::Result<()> {
         command
-            .stdout(stdout.try_clone()?)
-            .stderr(stderr.try_clone()?);
-        Ok(Self { stdout, stderr })
+            .stdout(self.stdout.try_clone()?)
+            .stderr(self.stderr.try_clone()?);
+        Ok(())
     }
 
     /// Copies both streams, bounded, into `log` and returns the command's own
@@ -438,7 +446,7 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
         .iter()
         .any(|part| part.contains("cagents daemon status"))
     {
-        parts.push("Check cagents daemon status before retrying.".to_owned());
+        parts.push("Check cagents daemon status before retrying the update.".to_owned());
     }
     invalid(parts.join(" "))
 }
@@ -457,7 +465,8 @@ mod tests {
         let state = tempfile::tempdir().unwrap();
         let mut command = Command::new("/bin/sh");
         command.args(["-c", script]);
-        let output = StartupOutput::attach(&mut command, state.path()).unwrap();
+        let output = StartupOutput::create(state.path()).unwrap();
+        output.attach(&mut command).unwrap();
         let started =
             crate::install_guard::wait_daemon_start(&mut command, Duration::from_secs(10));
         let mut log = Vec::new();
@@ -495,14 +504,14 @@ exit 1"#,
             startup_failure(&failure.error, Some(&reason), false).to_string(),
             "The matched daemon startup command failed (exit status: 1). It reported: could not \
              verify the running cagents daemon: daemon response deadline expired. Check cagents \
-             daemon status before retrying."
+             daemon status before retrying the update."
         );
         assert_eq!(
             startup_failure(&failure.error, Some(&reason), true).to_string(),
             "The installed version's terminal service is running, but its startup command did \
              not confirm it. The matched daemon startup command failed (exit status: 1). It \
              reported: could not verify the running cagents daemon: daemon response deadline \
-             expired. Check cagents daemon status before retrying."
+             expired. Check cagents daemon status before retrying the update."
         );
     }
 

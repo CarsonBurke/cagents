@@ -1333,7 +1333,8 @@ enum PendingRequest {
 /// Returns the per-user daemon socket, starting the sibling `cagentsd` if necessary.
 ///
 /// Ordinary startup is bounded to five seconds; upgrade restoration receives a
-/// bounded per-session allowance. On systemd hosts the daemon runs in its own
+/// bounded per-session allowance, which also bounds the handshake with a
+/// daemon this call launched. On systemd hosts the daemon runs in its own
 /// user scope, keeping UI cgroup shutdown and memory-pressure kills away from
 /// hosted sessions. Other hosts retain the detached process-group fallback.
 pub fn ensure_daemon_ready() -> Result<PathBuf, HostedTerminalStartError> {
