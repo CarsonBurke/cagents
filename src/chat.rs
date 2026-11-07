@@ -319,6 +319,11 @@ pub enum Intent {
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
+    /// Start a new provider on the conversation of a card whose provider
+    /// exited, in place of the ended actor the daemon still holds. The daemon
+    /// retires that actor and proves it gone before the successor starts, and
+    /// nothing it held is resubmitted.
+    Resume,
 }
 
 /// A conversation that could not be put on screen, and the one thing left that

@@ -21,6 +21,7 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 /// By full name, because other enums are also called `Response`.
 const WORK_RESPONSE: &str = "cagents::work::Response";
 const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
+const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 
 /// Fields appended to a struct that ends the frame, which an older client stops
 /// reading before. Each is named, so nothing else gets this allowance by accident.
@@ -66,6 +67,9 @@ struct Comparison<'a> {
     /// older client's variant count.
     gated: Vec<(&'static str, usize)>,
     appended_at_frame_end: &'a [&'a str],
+    /// Variants of the named enum that the connection refuses, so their
+    /// contents need not match. Their positions still must.
+    refused: Vec<(&'static str, &'static [&'static str])>,
     visited: BTreeSet<(Direction, bool, String, String)>,
     differences: Vec<String>,
 }
@@ -129,6 +133,11 @@ impl Comparison<'_> {
                     };
                     if name != next {
                         self.differ(&path, format!("variant {index} is now {next}"));
+                    }
+                    if self.refused.iter().any(|(enum_name, variants)| {
+                        *enum_name == current && variants.contains(&name.as_str())
+                    }) {
+                        continue;
                     }
                     match (fields, next_fields) {
                         (Some(old), Some(new)) => {
@@ -259,6 +268,7 @@ fn differences(
     older: &Shapes,
     current: &Shapes,
     gated: Vec<(&'static str, usize)>,
+    refused: Vec<(&'static str, &'static [&'static str])>,
     appended_at_frame_end: &[&str],
 ) -> Vec<String> {
     let mut comparison = Comparison {
@@ -266,6 +276,7 @@ fn differences(
         current,
         gated,
         appended_at_frame_end,
+        refused,
         visited: BTreeSet::new(),
         differences: Vec::new(),
     };
@@ -316,8 +327,14 @@ fn this_protocols_wire_format_is_recorded() {
         return;
     }
     let recorded = recorded(PROTOCOL_VERSION);
-    let mut changed = differences(&recorded, &current, Vec::new(), &[]);
-    changed.extend(differences(&current, &recorded, Vec::new(), &[]));
+    let mut changed = differences(&recorded, &current, Vec::new(), Vec::new(), &[]);
+    changed.extend(differences(
+        &current,
+        &recorded,
+        Vec::new(),
+        Vec::new(),
+        &[],
+    ));
     assert!(
         changed.is_empty(),
         "the wire format differs from protocol {PROTOCOL_VERSION}'s recording. Postcard is \
@@ -366,6 +383,11 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
             ],
+            if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
+                vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]
+            } else {
+                Vec::new()
+            },
             APPENDED_AT_FRAME_END,
         );
         assert!(
@@ -393,7 +415,12 @@ fn matched_sets_an_update_replaces_keep_their_messages() {
         ]
         .map(|name| (name, variant_count(&older, name) as usize))
         .to_vec();
-        let differences = differences(&older, &current, gated, APPENDED_AT_FRAME_END);
+        let refused = if protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
+            vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]
+        } else {
+            Vec::new()
+        };
+        let differences = differences(&older, &current, gated, refused, APPENDED_AT_FRAME_END);
         assert!(
             differences.is_empty(),
             "protocol {protocol} would misread an update:\n{}",
@@ -457,6 +484,7 @@ mod frame_end {
         differences(
             &Shapes::trace::<Client, Older>().unwrap(),
             &Shapes::trace::<Client, Current>().unwrap(),
+            Vec::new(),
             Vec::new(),
             appended,
         )

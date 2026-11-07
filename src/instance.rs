@@ -498,7 +498,7 @@ pub fn report_ui_startup(result: &Result<(), String>) -> io::Result<()> {
 pub use crate::runtime_state::{RecoveredPanicScope, recovered_panic_scope};
 
 pub fn install_panic_hook(product: &'static str) {
-    install_panic_hook_with_version(product, crate::VERSION);
+    install_panic_hook_with_version(product, crate::version());
 }
 
 pub fn install_panic_hook_with_version(product: &'static str, version: &'static str) {

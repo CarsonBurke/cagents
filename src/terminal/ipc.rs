@@ -209,11 +209,13 @@ use crate::{
 /// Version 155 appends two agent operations and their replies: the transcript
 /// read and the channel member listing. Versions 152 to 154 are reserved for
 /// parallel branches and are not adopted.
-/// Version 156 appends the saved-transcript list to the directory and member
+/// Version 156 appends the exact skipped-occurrence count and range to Firing.
+/// An older client is refused the replies holding one.
+/// Version 157 appends the saved-transcript list to the directory and member
 /// replies. A client of this version can't read those replies from an earlier
 /// daemon, while an earlier client stops reading before the list and is
 /// unaffected.
-pub const PROTOCOL_VERSION: u16 = 156;
+pub const PROTOCOL_VERSION: u16 = 157;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -227,7 +229,7 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 /// only appended messages an update doesn't exchange, so an update speaks that
 /// source's protocol as it does the candidate line's. A protocol bump adds the
 /// number it replaces here.
-pub const EARLIER_MATCHED_SETS: [u16; 3] = [129, 151, 155];
+pub const EARLIER_MATCHED_SETS: [u16; 4] = [129, 151, 155, 156];
 
 mod older_clients;
 #[cfg(test)]

@@ -432,6 +432,9 @@ fn ready_preview(client: &mut ControlClient, socket: &Path, args: &Args) -> Resu
         thread::sleep(Duration::from_secs(1));
     }
 }
+
+cagents::stamp_version!();
+
 fn main() -> Result<()> {
     let mut args = Args::parse();
     if cfg!(any(debug_assertions, feature = "development")) {

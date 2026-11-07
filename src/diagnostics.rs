@@ -372,7 +372,7 @@ struct Recorder {
 impl Recorder {
     #[cfg(test)]
     fn open(path: &Path, product: Product) -> io::Result<Self> {
-        Self::open_version(path, product, crate::VERSION)
+        Self::open_version(path, product, crate::version())
     }
     fn open_version(path: &Path, product: Product, version: &'static str) -> io::Result<Self> {
         if version.len() > 128
@@ -897,7 +897,7 @@ fn inspect_at(path: PathBuf) -> io::Result<Report> {
         .collect();
     Ok(Report {
         schema_version: SCHEMA_VERSION,
-        cli_version: crate::VERSION,
+        cli_version: crate::version(),
         cli_protocol: crate::terminal::ipc::PROTOCOL_VERSION,
         path,
         products,
@@ -1035,7 +1035,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(previous.version, crate::VERSION);
+        assert_eq!(previous.version, crate::version());
         let run = previous.run;
         let mut next = Recorder::open(&path, Product::Ui).unwrap();
         next.append(Event::Startup).unwrap();

@@ -1464,7 +1464,7 @@ pub(super) fn process_request(
         }
         ClientRequest::BuildInfo => Ok((
             ServerResponse::BuildInfo {
-                version: crate::VERSION.into(),
+                version: crate::version().into(),
             },
             Vec::new(),
             false,

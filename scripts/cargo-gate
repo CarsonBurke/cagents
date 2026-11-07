@@ -34,7 +34,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=15
+gate_version=16
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -1014,6 +1014,21 @@ started_by_flock() {
     done
     return 1
 }
+# Puts a `cargo` first on PATH that leads back to this gate, for an `exec`
+# command's Cargo commands. The shim reaches this gate by its own path,
+# naming Cargo so that `cargo --help` is Cargo's; the gate takes the shim off
+# PATH again, so it reaches this host's Cargo. The caller removes $shims.
+cargo_shim() {
+    self=$(readlink -f -- "$0")
+    shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
+    quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
+    printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
+    chmod 755 "$shims/cargo"
+    CAGENTS_BUILD_EXEC_SHIMS=$shims
+    PATH=$shims:$PATH
+    export CAGENTS_BUILD_EXEC_SHIMS PATH
+}
+
 # Rust compiles on the build host when there is one, whether or not this
 # command is inside a slot here. `scripts/cargo-offload --host` exits 0 when
 # there is one, and 75 when this is the build host or CAGENTS_BUILD_REMOTE is
@@ -1055,20 +1070,11 @@ if [ "$where" -eq 0 ]; then
     # Each Cargo command in COMMAND goes through this gate, with its own
     # admission budget: nothing here holds a slot while they build there.
     # With --hold, the offload holds one slot there for all of them.
-    # The shim reaches this gate by its own path, naming Cargo so that
-    # `cargo --help` is Cargo's; the gate takes the shim off PATH again, so
-    # it reaches this host's Cargo.
-    self=$(readlink -f -- "$0")
-    shims=$(mktemp -d "${TMPDIR:-/tmp}/cagents-cargo-shim.XXXXXX")
-    quoted=$(printf '%s' "$self" | sed "s/'/'\\\\''/g")
-    printf "#!/bin/sh\nexec '%s' cargo \"\$@\"\n" "$quoted" >"$shims/cargo"
-    chmod 755 "$shims/cargo"
     # Cargo reached some other way would compile here; see the guard.
     CAGENTS_BUILD_EXEC_RUSTC_WRAPPER=${RUSTC_WRAPPER-}
-    CAGENTS_BUILD_EXEC_SHIMS=$shims
-    PATH=$shims:$PATH
+    cargo_shim
     RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
-    export CAGENTS_BUILD_EXEC_SHIMS CAGENTS_BUILD_EXEC_RUSTC_WRAPPER PATH RUSTC_WRAPPER
+    export CAGENTS_BUILD_EXEC_RUSTC_WRAPPER RUSTC_WRAPPER
     status=0
     if [ "$hold" = true ]; then
         supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
@@ -1081,10 +1087,92 @@ if [ "$where" -eq 0 ]; then
     exit "$status"
 fi
 
-# Building here. Already inside a slot: a gated command running Cargo again,
-# or a caller that took the lock itself.
+# Building here, with the version stamp a build host's offload would pass.
+# Without it, build.rs reads this checkout's Git state and reruns at each
+# commit, which recompiles the whole library; with it, a new stamp relinks
+# only the executables. Each Cargo command works it out afresh once it has its
+# slot, as one offloaded would, so a commit made while it waited is included.
+# A stamp marked as a gate's was inherited, as by a program that `cargo run`
+# started, and may be another build's.
+if [ "${CAGENTS_BUILD_METADATA_SUPPLIED-}" = 1 ]; then
+    unset CAGENTS_BUILD_METADATA CAGENTS_BUILD_METADATA_SUPPLIED
+fi
+
+# Whether Cargo already has a runner for the programs it starts. Two
+# `cfg(..)` runners are an error and a target's own overrides one, so the
+# gate's would fail the command or do nothing.
+has_runner() {
+    setting=false
+    for argument do
+        if [ "$setting" = true ]; then
+            case $argument in
+                *runner*) return 0 ;;
+            esac
+            grep -qs runner "$argument" && return 0
+        fi
+        setting=false
+        case $argument in
+            --) break ;;
+            --config) setting=true ;;
+            --config=*runner*) return 0 ;;
+        esac
+    done
+    env | grep -q '^CARGO_TARGET_[A-Z0-9_]*_RUNNER=' && return 0
+    for config in "${CARGO_HOME:-$HOME/.cargo}/config" "${CARGO_HOME:-$HOME/.cargo}/config.toml"; do
+        grep -qs runner "$config" && return 0
+    done
+    directory=$PWD
+    while :; do
+        for config in "$directory/.cargo/config" "$directory/.cargo/config.toml"; do
+            grep -qs runner "$config" && return 0
+        done
+        [ "$directory" != / ] || return 1
+        directory=$(dirname -- "$directory")
+    done
+}
+
+# Stamps this Cargo command, given its arguments, and sets `unstamped_runner`
+# to the Cargo setting that gives a program `run` or `test` starts the
+# caller's environment back, so a bare Cargo it runs later reads its own
+# checkout rather than this stamp.
+unstamped_runner=
+stamp_command() {
+    [ -x "$offload" ] || return 0
+    stamp=$(CAGENTS_BUILD_CARGO=$cargo "$offload" --stamp "$@") || return 0
+    if ! has_runner "$@"; then
+        unstamped_runner='["env", "-u", "CAGENTS_BUILD_METADATA_SUPPLIED", "-u", "CAGENTS_BUILD_METADATA"'
+        case ${CAGENTS_BUILD_METADATA-} in
+            '') ;;
+            *[!A-Za-z0-9.-]*) ;;
+            *) unstamped_runner="$unstamped_runner, \"CAGENTS_BUILD_METADATA=$CAGENTS_BUILD_METADATA\"" ;;
+        esac
+        unstamped_runner="target.'cfg(all())'.runner=$unstamped_runner]"
+    fi
+    CAGENTS_BUILD_METADATA=$stamp
+    CAGENTS_BUILD_METADATA_SUPPLIED=1
+    export CAGENTS_BUILD_METADATA CAGENTS_BUILD_METADATA_SUPPLIED
+}
+
+# Already inside a slot: a gated command running Cargo again, or a caller
+# that took the lock itself. An `exec` command there keeps the shim of the
+# gate that admitted it, which the start of this gate took off PATH.
 if inside_gate || inherits_slot || started_by_flock; then
-    [ "$mode" = exec ] || set -- "$cargo" "$@"
+    if [ "$mode" = exec ] && [ -d "${CAGENTS_BUILD_EXEC_SHIMS-}" ]; then
+        PATH=$CAGENTS_BUILD_EXEC_SHIMS:$PATH
+    fi
+    if [ "$mode" = cargo ]; then
+        stamp_command "$@"
+        case $1 in
+            run|test|bench)
+                if [ -n "$unstamped_runner" ]; then
+                    subcommand=$1
+                    shift
+                    set -- "$subcommand" --config "$unstamped_runner" "$@"
+                fi
+                ;;
+        esac
+        set -- "$cargo" "$@"
+    fi
     exec "$@"
 fi
 
@@ -1124,10 +1212,14 @@ fi
 
 if [ "$mode" = exec ]; then
     cost=$(expected_cost "$@")
+    # Each Cargo command in COMMAND comes back through this gate, in the
+    # slot this holds, and gets the stamp a gated command would.
+    cargo_shim
     acquire
     status=0
     held "$@" || status=$?
     release
+    rm -rf -- "$shims"
     exit "$status"
 fi
 
@@ -1149,11 +1241,13 @@ done
 
 cost=$(expected_cost "$subcommand" "$@")
 acquire
+stamp_command "$subcommand" "$@"
 status=0
 if [ "$runs_separately" = true ]; then
     build_phase "$@" || status=$?
     release
     [ "$status" -eq 0 ] || exit "$status"
+    [ -z "$unstamped_runner" ] || set -- --config "$unstamped_runner" "$@"
     exec "$cargo" "$subcommand" "$@"
 fi
 held "$cargo" "$subcommand" "$@" || status=$?

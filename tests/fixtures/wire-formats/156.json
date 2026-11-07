@@ -1651,12 +1651,6 @@
               "Container": "cagents::agent_execution::directory::Entry"
             }
           }
-        ],
-        [
-          "saved_transcripts",
-          {
-            "Seq": "Bytes"
-          }
         ]
       ]
     },
@@ -1802,12 +1796,6 @@
             "Seq": {
               "Container": "cagents::agent_execution::directory::Member"
             }
-          }
-        ],
-        [
-          "saved_transcripts",
-          {
-            "Seq": "Bytes"
           }
         ]
       ]
@@ -2482,6 +2470,14 @@
           "diagnostic",
           {
             "Option": "Str"
+          }
+        ],
+        [
+          "skipped_occurrences",
+          {
+            "Option": {
+              "Container": "cagents::automations::SkippedOccurrences"
+            }
           }
         ]
       ]
@@ -3337,6 +3333,22 @@
         [
           "disabled",
           "Unit"
+        ]
+      ]
+    },
+    "cagents::automations::SkippedOccurrences": {
+      "Struct": [
+        [
+          "count",
+          "U64"
+        ],
+        [
+          "first_occurrence_ms",
+          "U64"
+        ],
+        [
+          "last_occurrence_ms",
+          "U64"
         ]
       ]
     },
