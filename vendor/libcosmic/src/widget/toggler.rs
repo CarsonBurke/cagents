@@ -1,13 +1,13 @@
 //! Show toggle controls using togglers.
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::{Element, anim};
 use iced_core::renderer::{self, Renderer};
-use iced_core::widget::{self, Tree, tree};
+use iced_core::widget::{self, Tree, operation, tree};
 use iced_core::{
     Border, Clipboard, Event, Layout, Length, Pixels, Rectangle, Shell, Size, Widget, alignment,
-    event, layout, mouse, text, touch, window,
+    keyboard, layout, mouse, text, touch, window,
 };
 use iced_widget::Id;
 use iced_widget::toggler::Status;
@@ -21,6 +21,7 @@ pub fn toggler<'a, Message>(is_checked: bool) -> Toggler<'a, Message> {
 #[allow(missing_debug_implementations)]
 pub struct Toggler<'a, Message> {
     id: Id,
+    implicit_id: bool,
     is_toggled: bool,
     on_toggle: Option<Box<dyn Fn(bool) -> Message + 'a>>,
     label: Option<String>,
@@ -51,6 +52,7 @@ impl<'a, Message> Toggler<'a, Message> {
     pub fn new(is_toggled: bool) -> Self {
         Toggler {
             id: Id::unique(),
+            implicit_id: true,
             is_toggled,
             on_toggle: None,
             label: None,
@@ -125,6 +127,7 @@ impl<'a, Message> Toggler<'a, Message> {
 
     pub fn id(mut self, id: Id) -> Self {
         self.id = id;
+        self.implicit_id = false;
         self
     }
 
@@ -143,7 +146,7 @@ impl<'a, Message> Toggler<'a, Message> {
         self
     }
 
-    /// Sets the label of the [`Button`].
+    /// Sets the visible and accessible label of the [`Toggler`].
     pub fn label(mut self, label: impl Into<Option<String>>) -> Self {
         self.label = label.into();
         self
@@ -162,6 +165,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
     fn state(&self) -> tree::State {
         tree::State::new(State {
             prev_toggled: self.is_toggled,
+            label: self.label.clone(),
             ..State::default()
         })
     }
@@ -172,6 +176,72 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
 
     fn set_id(&mut self, id: Id) {
         self.id = id;
+    }
+
+    fn diff(&mut self, tree: &mut Tree) {
+        let state = tree.state.downcast_mut::<State>();
+        if self.implicit_id && state.label != self.label {
+            // Filtered Settings rows can put another switch at this position.
+            // A retained ID/focus must not retarget the previous label's action.
+            self.id = Id::unique();
+            tree.id = Some(self.id.clone());
+            *state = State {
+                prev_toggled: self.is_toggled,
+                label: self.label.clone(),
+                ..State::default()
+            };
+        } else {
+            state.label = self.label.clone();
+        }
+        if self.on_toggle.is_none() {
+            state.is_focused = false;
+        }
+    }
+
+    fn operate(
+        &mut self,
+        tree: &mut Tree,
+        layout: Layout<'_>,
+        _renderer: &crate::Renderer,
+        operation: &mut dyn operation::Operation,
+    ) {
+        if self.on_toggle.is_some() {
+            operation.focusable(
+                Some(&self.id),
+                layout.bounds(),
+                tree.state.downcast_mut::<State>(),
+            );
+        }
+    }
+
+    #[cfg(feature = "a11y")]
+    fn a11y_nodes(
+        &self,
+        layout: Layout<'_>,
+        _tree: &Tree,
+        _cursor: mouse::Cursor,
+    ) -> iced_accessibility::A11yTree {
+        use iced_accessibility::accesskit::{Action, Node, Rect, Role};
+
+        let bounds = layout.bounds() - layout.virtual_offset();
+        let mut node = Node::new(Role::Switch);
+        node.set_bounds(Rect::new(
+            f64::from(bounds.x),
+            f64::from(bounds.y),
+            f64::from(bounds.x + bounds.width),
+            f64::from(bounds.y + bounds.height),
+        ));
+        if let Some(label) = &self.label {
+            node.set_label(label.clone());
+        }
+        node.set_toggled(self.is_toggled.into());
+        if self.on_toggle.is_some() {
+            node.add_action(Action::Focus);
+            node.add_action(Action::Click);
+        } else {
+            node.set_disabled();
+        }
+        iced_accessibility::A11yTree::leaf(node, self.id.clone())
     }
 
     fn layout(
@@ -236,9 +306,6 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         shell: &mut Shell<'_, Message>,
         _viewport: &Rectangle,
     ) {
-        let Some(on_toggle) = self.on_toggle.as_ref() else {
-            return;
-        };
         let state = tree.state.downcast_mut::<State>();
 
         // animate external changes
@@ -248,22 +315,61 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
             state.prev_toggled = self.is_toggled;
         }
 
-        match event {
+        // Animation also follows external changes while the control is disabled.
+        if let Event::Window(window::Event::RedrawRequested(_)) = event {
+            state.anim.anim_done(self.duration);
+            if state.anim.last_change.is_some() {
+                shell.request_redraw();
+            }
+            return;
+        }
+
+        let Some(on_toggle) = self.on_toggle.as_ref() else {
+            state.is_focused = false;
+            return;
+        };
+        let activate = match event {
+            Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left))
+            | Event::Touch(touch::Event::FingerPressed { .. }) => {
+                if state.is_focused {
+                    state.is_focused = false;
+                    shell.request_redraw();
+                }
+                false
+            }
             Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left))
             | Event::Touch(touch::Event::FingerLifted { .. }) => {
-                let mouse_over = cursor_position.is_over(layout.bounds());
-
-                if mouse_over {
-                    shell.publish((on_toggle)(!self.is_toggled));
-                    state.anim.changed(self.duration);
-                    state.prev_toggled = !self.is_toggled;
-                    shell.capture_event();
-                }
+                cursor_position.is_over(layout.bounds())
             }
-            Event::Window(window::Event::RedrawRequested(now)) => {
-                state.anim.anim_done(self.duration);
-                if state.anim.last_change.is_some() {
-                    shell.request_redraw();
+            Event::Keyboard(keyboard::Event::KeyPressed {
+                key,
+                modifiers,
+                repeat,
+                ..
+            }) if state.is_focused
+                && modifiers.is_empty()
+                && matches!(
+                    key.as_ref(),
+                    keyboard::Key::Named(keyboard::key::Named::Enter)
+                        | keyboard::Key::Character(" ")
+                ) =>
+            {
+                // Holding a switch key should not repeatedly flip its setting.
+                shell.capture_event();
+                !*repeat
+            }
+            #[cfg(feature = "a11y")]
+            Event::A11y(id, request) if iced_accessibility::IdEq::eq(id, &self.id) => {
+                use iced_accessibility::accesskit::Action;
+                match request.action {
+                    Action::Focus => {
+                        state.is_focused = true;
+                        shell.request_redraw();
+                        shell.capture_event();
+                        false
+                    }
+                    Action::Click => true,
+                    _ => false,
                 }
             }
             Event::Mouse(mouse::Event::CursorMoved { .. }) => {
@@ -276,8 +382,16 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
                     state.hovered = hovered;
                     shell.request_redraw();
                 }
+                false
             }
-            _ => {}
+            _ => false,
+        };
+        if activate {
+            shell.publish((on_toggle)(!self.is_toggled));
+            state.anim.changed(self.duration);
+            state.prev_toggled = !self.is_toggled;
+            shell.request_redraw();
+            shell.capture_event();
         }
     }
 
@@ -289,7 +403,7 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         _viewport: &Rectangle,
         _renderer: &crate::Renderer,
     ) -> mouse::Interaction {
-        if cursor_position.is_over(layout.bounds()) {
+        if self.on_toggle.is_some() && cursor_position.is_over(layout.bounds()) {
             mouse::Interaction::Pointer
         } else {
             mouse::Interaction::default()
@@ -350,7 +464,11 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
 
         let style = theme.style(
             &(),
-            if is_mouse_over {
+            if self.on_toggle.is_none() {
+                Status::Disabled {
+                    is_toggled: self.is_toggled,
+                }
+            } else if is_mouse_over {
                 Status::Hovered {
                     is_toggled: self.is_toggled,
                 }
@@ -362,6 +480,21 @@ impl<'a, Message> Widget<Message, crate::Theme, crate::Renderer> for Toggler<'a,
         );
 
         let space = style.handle_margin;
+
+        if state.is_focused && self.on_toggle.is_some() {
+            renderer.fill_quad(
+                renderer::Quad {
+                    bounds: bounds.expand(4.0),
+                    border: Border {
+                        radius: style.border_radius,
+                        width: 2.0,
+                        color: theme.cosmic().accent_color().into(),
+                    },
+                    ..renderer::Quad::default()
+                },
+                iced_core::Color::TRANSPARENT,
+            );
+        }
 
         let toggler_background_bounds = Rectangle {
             x: bounds.x,
@@ -450,8 +583,24 @@ pub fn next_to_each_other(
 
 #[derive(Debug, Default)]
 pub struct State {
+    label: Option<String>,
     text: widget::text::State<<crate::Renderer as iced_core::text::Renderer>::Paragraph>,
     anim: anim::State,
     prev_toggled: bool,
     hovered: bool,
+    is_focused: bool,
+}
+
+impl operation::Focusable for State {
+    fn is_focused(&self) -> bool {
+        self.is_focused
+    }
+
+    fn focus(&mut self) {
+        self.is_focused = true;
+    }
+
+    fn unfocus(&mut self) {
+        self.is_focused = false;
+    }
 }
