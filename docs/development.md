@@ -62,6 +62,14 @@ scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
+Each of these commands waits in the build host's queue on its own, and on a
+busy host the wait is most of its time: on fw16 under a full queue, the CLI
+check above took 26 s to compile and 19 minutes in all. The CLI, host and
+browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
+[below](#testing)) type-check everything the lane's check does, so when you are
+about to run them, skip that check. The integrated UI has no test lane; keep
+its check.
+
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
 `default-members = ["."]` selects only cagents: root UI checks and root
@@ -158,8 +166,10 @@ How the runner works:
 - A launch with nothing to build skips the gate and starts at once, printing
   `The matched set is already built for this checkout; skipping the build.`
   See [Up-to-date launches](#up-to-date-launches).
-- The normal runner enables `integrated-browser` only for the UI; the matched
-  CLI and daemon keep the same full-product identity without resolving Servo.
+- The normal runner enables `integrated-browser` only for the UI. Both lanes
+  build the same CLI and daemon, without `full`: that feature selects the
+  shipped product's application ID, peer package and self-update, none of which
+  a development build uses, so switching lanes rebuilds only the UI.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
   usable performance while the ordinary `dev` profile stays cheap for checks.
 - The development instance has its own application ID, configuration, session
@@ -221,8 +231,10 @@ the matched set as usual, then starts the UI in a headless
 
 `CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
 ignores it. The runner sets it for `--instance` and clears it otherwise, so an
-inherited value never selects an instance. Provider accounts and tools keep
-the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+inherited value never selects an instance. The instance's daemon gives it to
+every agent and terminal it starts, so a `cagents` they run reaches that
+daemon. Provider accounts and tools keep the caller's `HOME`, so an
+instance's agents use the same provider sign-ins.
 
 The runner starts the session without the caller's `WAYLAND_DISPLAY`,
 `WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
@@ -351,12 +363,15 @@ within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
 host that does not report pressure is treated as having room. Each build has an
 expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
-GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
-script such as the development runner; a slot held by a plain `flock` counts as
-9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
+GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
+script and 9 GiB for an `exec --hold` one such as the development runner's; a
+slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
+overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
-beyond what they already hold, covers its own. A lone build always starts,
-whatever the memory or pressure, so no build waits forever. Each build gets a
+beyond what they already hold, covers its own, and while the kernel's memory
+pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
+stalled on reclaim) is below 10% (`CAGENTS_BUILD_MEMORY_PRESSURE`; `0` disables
+it). A lone build always starts, whatever the memory or pressure. Each build gets a
 share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
@@ -367,6 +382,34 @@ throughout; a plain `cargo test` compiles its doctests after the slot is
 released. The development runner builds its matched set through the gate
 itself, and skips the gate when the set is [already
 current](#up-to-date-launches).
+
+The running builds are those of the whole host, not only of one family of
+slots. Builds in the shared families, whose first lock is named
+`/var/tmp/cagents-*.lock` (such as `/var/tmp/cagents-cargo.lock` and
+`/var/tmp/cagents-fw16-cargo.lock`), and builds in the slots offloaded to the
+build host each record themselves in `/var/tmp/cagents-builds-UID`
+(`CAGENTS_BUILD_REGISTRY`; empty disables it), naming the lock they hold. Every
+family prices the others' running builds beside its own, and a build is lone
+only when nothing on the host builds. Without this each family filled the same
+memory: on fw16, three families admitted builds independently and the host
+swapped about 20 GiB each way every six minutes. A private family, such as a
+test's or a native session's own lock elsewhere (including one in a directory
+under `/var/tmp` named like a shared lock), stays out of the registry unless
+the variable names one. A record whose lock is free is stale and ignored, and
+one whose holder has exited is priced at the largest cost. Families decide one
+at a time, under the registry's `.decision` lock. A slot held by a plain
+`flock`, by a gate from before the registry or by an offload agent sent from
+such a checkout writes no record, so only its own family prices it.
+
+So that no build waits forever behind smaller ones from other families that
+keep fitting, a build refused room while it holds a free slot records itself
+as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
+read on the host that admits the build; `0` disables it), the build refused
+longest on the host starts beside the running builds whatever the memory or
+pressure. Only one such build ramps up at a time: while one admitted that way
+started less than 10 minutes ago and its holder lives, the next waits. Time
+spent queued behind its own family, or waiting for one of its slots, does not
+count, and a build no longer refused for 10 seconds loses its place.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly
@@ -389,9 +432,15 @@ To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
 `scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
 host](#building-on-another-host), each Cargo command in it goes there on its
-own. Building here, it holds one slot until the command exits, and gated
+own, unless `exec --hold` holds one slot there for all of them. Building here,
+it holds one slot until the command exits, with or without `--hold`, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
+
+Queue and slot lock requests die with their gate, including when it is killed
+without a chance to handle a signal. Waiters retain only their lock descriptor
+and standard streams; inherited pipes and locks remain with the gate for the
+admitted command.
 
 Cancelling a held command keeps its slot until the command and its descendants
 have exited. The Linux Python 3 supervisor sends TERM, allows the command one
@@ -427,12 +476,24 @@ command that compiles there through `scripts/cargo-offload`, without taking a
 slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
-script of builds, such as the development runner or
-`scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. A Cargo reached any other way inside COMMAND, by path,
-through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
-also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
-compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+script of builds, such as `scripts/build-ceditor-product`, builds there too,
+each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
+leases one slot there first, at the cost of a UI build, and holds it until
+COMMAND exits: each gated Cargo command in it builds in that slot, one at a
+time, with no admission of its own. It is for a script that only builds, such
+as the development runner's three: a launch waits in the host's queue once
+rather than three times. Tests run in that slot too, priced by what they hold
+while they run and as a UI build again once they end. A Cargo command run from
+another checkout, or after the hold's lease has ended, leases a slot of its
+own. Anything slow between its builds would keep the slot leased and its memory
+reserved while it ran, so leave `--hold` off for such a script. A Cargo
+reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
+or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
+`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
+why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+Programs launched by `cargo run` inside that `exec` inherit the same Cargo
+shim and guard. Their named `cargo` reenters the gate after the program's
+build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
 above. A gate without `scripts/cargo-offload` beside it refuses to build
@@ -467,9 +528,22 @@ running builds, only when the host's available memory, less what those builds
 are expected to take beyond what they already hold, covers this build's
 expected peak (at least 2 GiB), while the host's memory pressure (`some
 avg10` in `/proc/pressure/memory`) is below 10%, and while its CPU pressure
-(`/proc/pressure/cpu`) is below 40%; a lone build always starts. A plain
+(`/proc/pressure/cpu`) is below 40%; a lone build always starts. The running
+builds counted include those the host's own gate admits in its shared
+families, through the registry described [above](#sharing-a-host-between-several-checkouts),
+where these slots record their builds in turn. A plain
 `cargo test` runs its tests there, in the slot, which stays leased until they
-end. One build's
+end. Cargo builds everything a test run needs before it runs any test, so the
+compile's expected peak stops applying once it only runs executables it built
+into a `deps` directory: from then on the slot is priced at the most its
+processes have held since its tests began, sampled every 2 s, and never below
+2 GiB. Builds the host admits meanwhile may take the memory the compile no
+longer reserves, while whatever the tests hold stays counted. Growth beyond
+that peak is not reserved, as the memory of tests the gate runs on this host
+is not; memory pressure then holds further builds back. Running a compiler or build
+script again, as doctests do, prices it as a build again. Without this, slots
+running only tests on fw16 reserved about 18 of its 26 GiB available, and
+queued builds waited beside idle slots. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
@@ -595,8 +669,7 @@ directory a plain `cargo` would create. After copying a target by hand, run
 there, before its first build. It fails when it can't find this checkout's
 crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
 fingerprints has nothing to forget. Seeded directories carry Cargo's
-`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
-is removed.
+markers, so `scripts/prune-build-dirs` reclaims them once they go unused.
 
 The gate's helpers run from the gate's own directory. Install a changed gate
 for every checkout with `scripts/install-cargo-gate`, never by copying
@@ -604,14 +677,35 @@ for every checkout with `scripts/install-cargo-gate`, never by copying
 the staged gate runs a command, renames them into `/var/tmp`, and checks the
 result.
 
-Build directories share one disk. When the file system holding them has less
-than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
-runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
-directories at once with `prune-cargo-build-dirs`, at most every ten minutes
-across the host; idle live worktrees' are left to the pruner's own schedule.
-Below the floor it refuses the build and says why. Remove worktrees you no
-longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
-to change the floor, or `0` to disable the guard.
+Build directories share one disk, and Cargo never removes one. Worktrees'
+`target/`s, `CARGO_TARGET_DIR`s under `~/.cache` and `/var/tmp`, and test
+roots under `~/.local/state` all stay until something removes them.
+`scripts/build-disk-guard`, which `scripts/cargo-gate` runs before every
+local build, removes them with `scripts/prune-build-dirs` in two ways:
+
+- **On a schedule.** While the file system has room, at most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, it starts the pruner in the background, in a session of its own at idle CPU and I/O priority, with none of the build's open files. The build doesn't wait for it. A run that is cut short or killed is started again by the next build; none starts while one is running.
+- **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout; on the schedule they wait six hours.
+- **Below the floor.** The guard starts the same background run, unless one did within the hour. The build waits for the pruner, at most every ten minutes across the host, or for the run already pruning. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If there is still too little room, the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with. A `CAGENTS_BUILD_PRUNE` command runs before the build whenever there is less than twice the floor free.
+
+The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the first three. It skips a checkout's committed directories, which hold only sources.
+
+It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. It removes a build directory only when all of these hold:
+
+- nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees;
+- every Cargo lock in it is free;
+- no process has its working directory, an open file, its executable or a mapping inside it.
+
+Under those locks it renames the directory aside, so a build that starts afterwards begins with an empty directory rather than a partly removed one. Still holding them, it puts the renamed copy back if a process opened it meanwhile, such as a build waiting for one of those locks; afterwards, if anything wrote to it. A directory holding a `.git` or `Cargo.toml` is a checkout and never counts as build output. A gated build marks its build directory as used before it waits for a slot, so another build's pruner doesn't take it meanwhile.
+
+It never touches:
+- the build directory being guarded;
+- the build of this repository's main checkout, in its `target/` or the mirror;
+- `~/.local/share`;
+- the offload slots, which their leases manage;
+- other users' files;
+- anything reached through a symlink.
+
+What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's
@@ -774,9 +868,9 @@ be outside the account home reported by `getent passwd "$(id -u)"`, even when
 `HOME` points elsewhere: bundled-skill tests deliberately refuse installation
 beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
-On fw16, `/opt/resolve/.cot` is the existing user-owned private disk-backed base
-used for this preparation. On another host, select and verify a suitable base;
-do not create directories in an unrelated application's tree or change shared
+Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
+with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
+host. Do not borrow another application's tree, and do not change shared
 directories or Git markers. The **final** nested Unix
 socket path must be shorter than 108 bytes, including fixture suffixes. For
 example, `/.tmpXXXXXX/tmp/cagents-codex-<36-byte UUID>/control.sock` adds 79
@@ -784,8 +878,9 @@ bytes, so that layout requires a temporary base of at most 28 bytes. Longer
 fixture layouts need more room; a short base alone is not proof.
 
 ```sh
-# Set this only after verifying the base above; this value is specific to fw16.
-export CAGENTS_TEST_TMP_BASE=/opt/resolve/.cot
+# Set this only after verifying the base above.
+mkdir -p -m 700 /var/tmp/ct
+export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
     TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
     export TMPDIR
@@ -805,6 +900,16 @@ separately retained fixture evidence until their original children have settled;
 this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
+
+Tests that spawn the retained helper call `retained_fixture::run_isolated()`
+first. The helper calls `setsid` and enters its own systemd scope, so killing a
+process group or cgroup misses it. `run_isolated()` reruns the exact test as a
+worker beneath a private subreaper. When the worker exits, for any reason, the
+subreaper kills and reaps every remaining descendant. Only killing the
+subreaper itself, for example by the OOM killer, leaves them behind. After a
+passing worker it prints how many it killed: a nonzero count means the product
+left processes behind. Same-test reexecs that call `env_clear()` must pass
+`retained_fixture::owner_env()` through.
 
 Prefer the narrow target that covers the changed contract, for example:
 
@@ -1060,6 +1165,14 @@ refused so that the version names its exact source. If that version is already
 current, the build is skipped. After staging, older `+local` builds are removed,
 except the two most recent and any that a running process still uses.
 
+The script first fetches and checks what `HEAD` is, because a checkout nobody
+updated would install old code. It refuses a detached `HEAD` that is not the
+tip of `origin/main`, and a branch that is behind its upstream, and prints the
+command that updates the checkout, such as
+`git checkout main && git pull --ff-only`. Pass `--this-commit` to build that
+exact commit anyway, for example to install a known-good build again. Any other
+branch is built, and the script names it.
+
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).
 
@@ -1073,6 +1186,30 @@ Published releases still come from `scripts/build-release-linux`; see
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
+
+## Scripts and mise shims
+
+A mise shim on `PATH` under a moved `HOME` or `XDG_DATA_HOME`, as in a fixture, finds
+itself and re-executes without end: no error, and the process keeps its pid and
+restarts forever, outliving a `timeout` on its parent. So scripts here name
+`/usr/bin/python3` rather than finding `python3` on `PATH`, and a host running them
+needs it there. `scripts/cargo-gate` also sets `MISE_DATA_DIR` from the shims directory
+on `PATH`, so what it runs can move `HOME` without that loop.
+
+Separately, a shim under a `mise.toml` that mise has not been told to trust stops at
+mise's trust prompt and waits for an answer whenever its stderr is a terminal, even with
+stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
+`scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
+for you, because trusting a checkout's configuration is your decision. Run `mise trust`
+in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
+such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
+only that file pins can fail at once with `No version is set for shim`.
+
+A harness of your own that moves `HOME` should take the shims off `PATH` and name the
+tools it needs by their real paths. mise keeps its trust list under `HOME`, so setting
+`MISE_DATA_DIR` stops the loop but not the prompt. Run it in a systemd scope with a time
+limit too, which stops everything it started.
 
 ## Standalone editor
 

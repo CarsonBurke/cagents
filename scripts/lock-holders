@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Show who holds a shared lock and whether it is doing anything. Read-only."""
 import glob
 import os
@@ -12,7 +12,7 @@ LEGITIMATE = {"cargo", "cargo-gate", "flock", "kwin_wayland", "native-evidence",
 # Run as `sh PATH`, or longer than a kernel process name.
 SCRIPTS = {
     "build-disk-guard", "cagents-cargo-gate", "cargo-gate", "cargo-gate-command.py",
-    "native-evidence",
+    "native-evidence", "prune-build-dirs",
 }
 SAMPLE_SECONDS = 1.0
 

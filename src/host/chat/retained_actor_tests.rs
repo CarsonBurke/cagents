@@ -28,11 +28,17 @@ pub(super) fn retained_helper_executable() -> std::path::PathBuf {
 // provider, holder, checkpoint and successor all retain one issued session.
 #[test]
 fn committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_upgrade_tail(false);
 }
 
 #[test]
 fn failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_upgrade_tail(true);
 }
 
@@ -70,6 +76,7 @@ fn retained_upgrade_tail(fail_final_save: bool) {
         for (key, _) in std::env::vars_os() {
             if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
                 && key != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+                && key != std::ffi::OsStr::new(crate::retained_fixture::OWNER_ENV)
             {
                 command = command.env_remove(key);
             }
@@ -246,6 +253,12 @@ fn retained_upgrade_tail(fail_final_save: bool) {
             None,
             crate::agent_execution::HostedSession::Chat(source),
         )
+        .unwrap();
+    // A run's prompt is refused until the provider is ready, so wait as
+    // agent execution does; on a loaded host Claude's initialize reply can
+    // still be outstanding here.
+    super::super::agent_execution::await_provider_ready(&handle)
+        .map_err(|(_, error)| error)
         .unwrap();
     handle
         .command_for_run(
@@ -441,21 +454,33 @@ fn retained_upgrade_tail(fail_final_save: bool) {
 
 #[test]
 fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("close");
 }
 
 #[test]
 fn retained_terminal_handoff_proves_original_console_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("handoff");
 }
 
 #[test]
 fn retained_checked_terminal_close_proves_original_console_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("checked");
 }
 
 #[test]
 fn retained_completed_terminal_release_proves_original_console_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("release");
 }
 
@@ -486,6 +511,7 @@ fn retained_turn_final_action(action: &str) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                 retained_helper_executable(),
@@ -704,6 +730,12 @@ fn retained_turn_final_action(action: &str) {
             None,
             crate::agent_execution::HostedSession::Chat(hosted_source.clone()),
         )
+        .unwrap();
+    // A run's prompt is refused until the provider is ready, so wait as
+    // agent execution does; on a loaded host Claude's initialize reply can
+    // still be outstanding here.
+    super::super::agent_execution::await_provider_ready(&handle)
+        .map_err(|(_, error)| error)
         .unwrap();
     handle
         .command_for_run(
@@ -1490,7 +1522,8 @@ session=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--s
 def send(value): print(json.dumps(value),flush=True)
 for line in sys.stdin:
     frame=json.loads(line)
-    trace({'event':'input','type':str(frame.get('type'))[:96],'uuid':str(frame.get('uuid'))[:96]})
+    request=frame.get('request')
+    trace({'event':'input','type':str(frame.get('type'))[:96],'subtype':str(request.get('subtype') if isinstance(request,dict) else None)[:96],'uuid':str(frame.get('uuid'))[:96]})
     if frame.get('type')=='control_request':
         send({'type':'control_response','response':{'subtype':'success','request_id':frame['request_id'],'response':{}}})
     elif frame.get('type')=='user':
@@ -1638,6 +1671,7 @@ fn sigkill_child(root: &Path, role: &str, case: &SigkillCase) -> std::process::C
     command
         .args(["--exact", &case.selected_test, "--nocapture"])
         .env_clear()
+        .envs(crate::retained_fixture::owner_env())
         .env(
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
             retained_helper_executable(),
@@ -2010,12 +2044,18 @@ impl Drop for SigkillCoordinator {
 #[cfg(target_os = "linux")]
 #[test]
 fn slow_turn_survives_sigkill_of_the_host_owner_process() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     sigkill_host_fixture(false);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn semantic_retirement_precedes_original_parent_wait_after_host_sigkill() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     sigkill_host_fixture(true);
 }
 
@@ -2231,8 +2271,7 @@ fn sigkill_host_fixture(semantic_held: bool) {
             "successor cannot pass without exact original-parent collection"
         );
         assert!(
-            !receipt.identity.record.holder.is_current()
-                && !receipt.identity.record.root.is_current()
+            receipt.identity.record.holder.reaped() && !receipt.identity.record.root.is_current()
         );
         coordinator.successful = true;
         return;
@@ -2355,6 +2394,10 @@ fn sigkill_host_fixture(semantic_held: bool) {
                 None,
                 crate::agent_execution::HostedSession::Chat(source),
             )
+            .unwrap();
+        // As agent execution does, wait for Claude's initialize reply first.
+        super::super::agent_execution::await_provider_ready(&handle)
+            .map_err(|(_, error)| error)
             .unwrap();
         handle
             .command_for_run(
@@ -2609,6 +2652,9 @@ fn sigkill_host_fixture(semantic_held: bool) {
 /// provider-confirmed thread while its exact ownership proof rotates.
 #[test]
 fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provider_result() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNNAMED_ACTOR_PERSISTENCE_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -2628,6 +2674,7 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                 retained_helper_executable(),
@@ -2862,7 +2909,7 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
     );
     handle.close().unwrap();
     retained_actor::finish_close(&successor, &handle, &replacement).unwrap();
-    assert!(!identity.record.root.is_current() && !identity.record.holder.is_current());
+    assert!(!identity.record.root.is_current() && identity.record.holder.reaped());
     let registry = super::super::agent_execution::registry(&successor).unwrap();
     let retirement = registry
         .lock()
@@ -2887,6 +2934,9 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
 /// commit using the roster and private receipt, without recreating an actor.
 #[test]
 fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const EXACT: &str = "host::chat::retained_actor_tests::retired_helper_receipt_completes_after_host_sigkill_before_registry_commit";
     const ROLE: &str = "CAGENTS_RETIRED_HOST_PROCESS_ROLE";
@@ -2901,6 +2951,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
         command
             .args(["--exact", EXACT, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                 retained_helper_executable(),
@@ -3073,7 +3124,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
         // semantic ACKs and completes discovery teardown. Deliberately stop at
         // the next instruction boundary before the host's SQL receipt commit.
         handle.finish_retained_close().unwrap();
-        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
         assert!(
             registry
                 .lock()
@@ -3109,9 +3160,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
     assert_eq!(role, "successor");
     let receipt: Receipt =
         serde_json::from_slice(&fs::read(root.join("retired-before-sql.json")).unwrap()).unwrap();
-    assert!(
-        !receipt.identity.record.holder.is_current() && !receipt.identity.record.root.is_current()
-    );
+    assert!(receipt.identity.record.holder.reaped() && !receipt.identity.record.root.is_current());
     let registry = super::super::agent_execution::registry(&host).unwrap();
     assert!(
         registry
@@ -3338,6 +3387,9 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
 
 #[test]
 fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNATTACHED_CLAUDE_CLOSE_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -3359,6 +3411,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -3608,7 +3661,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
             super::native_cleanup::close_retained(&successor, &requested)
                 .is_err_and(|error| error.contains("fixture unattached retirement commit failure"))
         );
-        assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+        assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
         let state = successor.lock().unwrap();
         assert!(
             state.chats.contains_key(&id),
@@ -3636,9 +3689,9 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         drop(fault);
     }
     super::native_cleanup::close_retained(&successor, &requested).unwrap();
-    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
     if let Some(pair) = pair {
-        assert!(!pair.holder.is_current() && !pair.root.is_current());
+        assert!(pair.holder.reaped() && !pair.root.is_current());
     }
     let state = successor.lock().unwrap();
     assert!(!state.chats.contains_key(&id));
@@ -3753,7 +3806,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
         successor.lock().unwrap().chats.is_empty(),
         "resume preparation must not launch a provider"
     );
-    assert!(!identity.record.holder.is_current() && !identity.record.root.is_current());
+    assert!(identity.record.holder.reaped() && !identity.record.root.is_current());
     assert_eq!(
         fs::read_to_string(root.join("prompts"))
             .unwrap()
@@ -3774,6 +3827,9 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
 /// owner.
 #[test]
 fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_PAIRED_INTERRUPTED_EXIT_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -3795,6 +3851,7 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -3942,6 +3999,12 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
         fault.execute_batch("CREATE TRIGGER reject_exit_commit BEFORE INSERT ON native_actor_cursors BEGIN SELECT RAISE(ABORT, 'fixture exit commit failure'); END;").unwrap();
     }
     fs::remove_file(root.join("provider-done")).unwrap();
+    let outcome_clock = || {
+        handle
+            .retained_outcome_clock_until(Instant::now() + Duration::from_secs(2))
+            .map(|(_, latest)| latest)
+    };
+    let journaled_before = outcome_clock().unwrap();
     handle
         .command(chat::Command::Prompt {
             text: "A second turn before the exit".into(),
@@ -3949,9 +4012,14 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             mode: chat::PromptMode::Send,
         })
         .unwrap();
+    // The provider's marker follows its result frame, which the actor may not
+    // have read yet. Exit only once the actor has journaled the turn's outcome.
     wait_until(
-        || root.join("provider-done").exists(),
-        "fixture provider never finished its second turn",
+        || {
+            root.join("provider-done").exists()
+                && outcome_clock().is_ok_and(|latest| latest > journaled_before)
+        },
+        "the actor never journaled its second turn's outcome",
     );
     if console_survives {
         // Killed right after closing the provider, before its CLI view or
@@ -3969,7 +4037,12 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             &host, &mut error, false
         ));
         if interrupted {
-            let error = error.expect("the unfinished retirement must be reported");
+            let error = error.unwrap_or_else(|| {
+                panic!(
+                    "the unfinished retirement must be reported; provider trace:\n{}",
+                    fs::read_to_string(root.join("provider-trace.jsonl")).unwrap_or_default()
+                )
+            });
             assert!(
                 error.to_string().contains("fixture exit commit failure"),
                 "{error}"
@@ -3978,7 +4051,7 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             assert!(error.is_none(), "{error:?}");
         }
         assert!(
-            !pair.holder.is_current() && !pair.root.is_current(),
+            pair.holder.reaped() && !pair.root.is_current(),
             "ordinary exit must stop the paired console"
         );
         assert!(
@@ -4118,12 +4191,28 @@ fn unattached_claude_cleanup_refuses_unsupported_protocol_before_reservation() {
     assert!(state.native_closing.is_empty());
 }
 
+/// Kills an actor the way a crash takes it down with its daemon, helper
+/// first. A helper still alive when its provider dies terminates the
+/// provider's whole process group, which would remove a survivor the test
+/// means to leave behind.
+fn kill_helper_then_provider(record: &crate::daemon::holder_registry::Record) {
+    for process in [&record.holder, &record.root] {
+        unsafe {
+            libc::kill(process.pid, libc::SIGKILL);
+        }
+        wait_until(|| !process.is_current(), "the killed actor never exited");
+    }
+}
+
 /// A same-boot actor that died without writing retirement grants disk resume
 /// only once its helper, its provider and every process left in either's
 /// process group or session are gone. A survivor in the provider's group
 /// refuses, and its exit then allows exactly one proved successor.
 #[test]
 fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_ABANDONED_CLAUDE_RESUME_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -4145,6 +4234,7 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -4265,15 +4355,7 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
     drop(handle);
     drop(host);
     drop(lease);
-    for process in [&identity.record.root, &identity.record.holder] {
-        unsafe {
-            libc::kill(process.pid, libc::SIGKILL);
-        }
-    }
-    wait_until(
-        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
-        "the killed actor never exited",
-    );
+    kill_helper_then_provider(&identity.record);
     let next = proof("successor");
     let _lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
     let mut state = HostState::new(next.clone());
@@ -4347,6 +4429,9 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
 
 #[test]
 fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNNAMED_CLAUDE_RESUME_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -4368,6 +4453,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -4482,11 +4568,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
         drop(notifications);
         drop(host);
         drop(lease);
-        for process in [&identity.record.root, &identity.record.holder] {
-            unsafe {
-                libc::kill(process.pid, libc::SIGKILL);
-            }
-        }
+        kill_helper_then_provider(&identity.record);
     } else {
         // An ordinary close retires the actor with a verified receipt that
         // records the conversation it confirmed, if any.

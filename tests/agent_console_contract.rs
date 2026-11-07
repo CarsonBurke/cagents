@@ -5,6 +5,8 @@ mod hosted_agent_cleanup;
 
 #[path = "support/private_cli_capture.rs"]
 mod private_cli_capture;
+#[path = "support/retained_fixture.rs"]
+mod retained_fixture;
 
 use serde_json::Value;
 use std::{
@@ -263,6 +265,9 @@ impl Drop for Fixture {
 
 #[test]
 fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::with_provider(include_str!("fixtures/automation-claude.sh"));
     let project_path = fixture.root.path().join("project");
     let project = project_path.to_str().unwrap();
@@ -362,6 +367,9 @@ fn user_cli_keeps_100_completed_chats_open_and_replays_without_another_prompt() 
 
 #[test]
 fn terminal_console_answers_requests_and_submits_durable_followups() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
@@ -494,6 +502,9 @@ fn repeated_private_cli_capture_does_not_renew_original_deadline() {
 
 #[test]
 fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
@@ -556,6 +567,9 @@ fn failed_console_publication_retires_terminal_and_retains_idle_provider() {
 
 #[test]
 fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let worktree = fixture.root.path().join("linked");
@@ -629,6 +643,9 @@ fn cli_checkout_and_linked_worktree_share_project_and_keep_retry_receipts() {
 
 #[test]
 fn an_owner_drives_its_agent_by_short_handles() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::new();
     let project = fixture.root.path().join("project");
     let project = project.to_str().unwrap();
@@ -687,6 +704,9 @@ fn an_owner_drives_its_agent_by_short_handles() {
 
 #[test]
 fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     let fixture = Fixture::with_provider(include_str!("fixtures/wait-outcomes-claude.sh"));
     let project_path = fixture.root.path().join("project");
     let project = project_path.to_str().unwrap();
@@ -773,6 +793,9 @@ fn waiting_cli_commands_report_timeout_cancellation_failure_and_success() {
 
 #[test]
 fn active_native_chat_moves_without_restarting_and_accepts_followups() {
+    if retained_fixture::run_isolated() {
+        return;
+    }
     use cagents::{
         control::{ControlClient, ControlError},
         model::{CardId, CardKind, ChannelId},

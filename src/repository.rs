@@ -15,7 +15,7 @@ pub use worktree_setup_intent::{WorktreeSetupIntent, WorktreeSetupPlan};
 
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ffi::{OsStr, OsString},
     fmt, fs,
     io::{self, Read},
@@ -1424,17 +1424,16 @@ pub enum MutationOutcome {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MutationScope {
     /// The command works through its pathspecs and reports the ones it could
-    /// not handle at the end: `git add -A -- good ignored` exits 1 *having
-    /// staged* `good`, so a non-zero exit leaves the split between the two
-    /// halves unknown.
+    /// not handle at the end: `git add -A -- good outside-sparse` exits 1
+    /// *having staged* `good`, so a non-zero exit leaves the split between
+    /// the two halves unknown.
     Incremental,
     /// The command assembles its whole result in memory and commits it with a
     /// single write, so a non-zero exit means nothing was written at all:
-    /// Path-limited `git reset --no-refresh` and `git update-index` each write
-    /// the index once, after the last selected path, under `index.lock`.
-    /// That single write says nothing about unmatched pathspecs — `reset`
-    /// ignores those and still exits 0 — so a caller that must refuse ghosts
-    /// validates the selection first (see `unstage`).
+    /// `git update-index` and path-limited `git reset --no-refresh` each
+    /// write the index once, after the last selected path, under
+    /// `index.lock`. Neither refuses a path that matches nothing, so a caller
+    /// that must refuse ghosts validates the selection first (see `unstage`).
     AllOrNothing,
     /// The command resolves every pathspec before it writes anything, and
     /// then writes entry by entry.
@@ -2549,6 +2548,26 @@ pub fn parse_working_files(output: &[u8]) -> Result<WorkingFiles, GitParseError>
         tracked_count,
         ..WorkingFiles::default()
     })
+}
+
+/// Parses `git ls-files -t -z` index records into each path and whether its
+/// entry is skip-worktree (`S`). Conflict stages repeat a path.
+fn parse_tagged_index_paths(output: &[u8]) -> Result<Vec<(RepoPath, bool)>, GitParseError> {
+    const FORMAT: &str = "git ls-files -t";
+    let mut paths = Vec::new();
+    for (record, field) in nul_fields(output, FORMAT)?.into_iter().enumerate() {
+        if field.is_empty() {
+            continue;
+        }
+        if field.len() < 2 || field[1] != b' ' {
+            return Err(malformed(FORMAT, record, "record has no status tag"));
+        }
+        paths.push((
+            repo_path_field(&field[2..], FORMAT, record)?,
+            field[0] == b'S',
+        ));
+    }
+    Ok(paths)
 }
 
 /// Git's file mode for a gitlink, i.e. a submodule's recorded commit.
@@ -4615,7 +4634,16 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             .stdin(pathspec_input(paths))
     }
 
-    /// The `git add` invocation for an already-resolved pathspec list.
+    /// Stages exactly these paths with one index write.
+    ///
+    /// `git add` matches every pathspec against every index entry, which
+    /// takes tens of seconds for tens of thousands of selected files; `update-index`
+    /// looks each path up directly. `--remove` stages deletions and
+    /// `--replace` a file that became a directory or the reverse, as `add -A`
+    /// does. Skip-worktree entries are absent by design, so they are left
+    /// alone rather than staged as deletions. A path it cannot stage,
+    /// such as a plain directory or one beyond a symlink, stops it before the
+    /// index is written.
     pub fn stage_command(
         &self,
         worktree: &Path,
@@ -4624,7 +4652,20 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         if paths.is_empty() {
             return Err(ValidationError::EmptySelection);
         }
-        Ok(self.git_pathspec_mutation(worktree, ["add", "-A"], paths))
+        Ok(self
+            .git_literal_mutation(
+                worktree,
+                [
+                    "update-index",
+                    "--add",
+                    "--remove",
+                    "--replace",
+                    "--ignore-skip-worktree-entries",
+                    "-z",
+                    "--stdin",
+                ],
+            )
+            .stdin(pathspec_input(paths)))
     }
 
     /// Stages the selected paths, including the deletion half of a rename the
@@ -4637,19 +4678,168 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         // Keep the actual mutation protected even if its UI task is dropped.
         let _protection = crate::worktree_cleanup::protect(&request.worktree)
             .map_err(|error| ValidationError::Io(error.to_string()))?;
-        let paths =
-            self.matchable_pathspecs(&request.worktree, &request.selection, cancellation)?;
-        let command = self.stage_command(&request.worktree, &paths)?;
-        Ok(self.run_mutation(&command, paths, MutationScope::Incremental, cancellation))
+        let worktree = &request.worktree;
+        let paths = self.matchable_pathspecs(worktree, &request.selection, cancellation)?;
+        if paths.is_empty() {
+            return Err(ValidationError::EmptySelection.into());
+        }
+        // `git add` matches every path against every index entry, so the
+        // checks below avoid it except where only Git itself can decide.
+        let add_all = |paths: Vec<RepoPath>| -> Result<MutationOutcome, RepositoryError> {
+            let command = self.git_pathspec_mutation(worktree, ["add", "-A"], &paths);
+            Ok(self.run_mutation(&command, paths, MutationScope::Incremental, cancellation))
+        };
+        if self.sparse_checkout(worktree, cancellation)? {
+            // `git add` refuses paths outside the sparse checkout, which
+            // update-index would stage, along with present files whose
+            // skip-worktree Git clears on reading the index.
+            return add_all(paths);
+        }
+        let indexed: HashSet<_> = self
+            .indexed_paths(worktree, &paths, cancellation)?
+            .into_iter()
+            .collect();
+        let untracked: Vec<_> = paths
+            .iter()
+            .filter(|path| !indexed.contains(*path))
+            .cloned()
+            .collect();
+        if !untracked.is_empty() {
+            let gitlinks = if untracked.iter().any(|path| path.as_bytes().contains(&b'/')) {
+                match self.index_gitlinks(worktree, cancellation)? {
+                    Some(gitlinks) => gitlinks,
+                    // The index is too large to list within the output bound.
+                    None => return add_all(paths),
+                }
+            } else {
+                HashSet::new()
+            };
+            if let Some(reason) =
+                self.untracked_refusal(worktree, &untracked, &gitlinks, cancellation)?
+            {
+                return Ok(MutationOutcome::NotApplied {
+                    failure: MutationFailure::Rejected { reason },
+                });
+            }
+        }
+        // update-index only removes a tracked file that has become a nested
+        // repository; naming it again adds the repository's gitlink.
+        let mut input = paths.clone();
+        input.extend(
+            paths
+                .iter()
+                .filter(|path| {
+                    indexed.contains(*path)
+                        && fs::symlink_metadata(worktree.join(path.as_os_str()).join(".git"))
+                            .is_ok()
+                })
+                .cloned(),
+        );
+        let command = self.stage_command(worktree, &input)?;
+        Ok(self.run_mutation(&command, paths, MutationScope::AllOrNothing, cancellation))
+    }
+
+    /// Why `git add` would refuse one of these untracked paths, which
+    /// `update-index` would add or report staged regardless: it no longer
+    /// exists, it is ignored, perhaps only since status listed it, or it lies
+    /// inside a submodule, one of `gitlinks`, which `--replace` would
+    /// overwrite.
+    fn untracked_refusal(
+        &self,
+        worktree: &Path,
+        untracked: &[RepoPath],
+        gitlinks: &HashSet<Vec<u8>>,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<String>, RepositoryError> {
+        // `git add` refuses the whole request for a path that matches
+        // nothing; update-index would report it staged.
+        if let Some(ghost) = untracked.iter().find(|path| {
+            fs::symlink_metadata(worktree.join(path.as_os_str()))
+                .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+        }) {
+            return Ok(Some(format!(
+                "{ghost}: path does not match anything known to git"
+            )));
+        }
+        // check-ignore rejects --literal-pathspecs. Git reads magic only at
+        // the start of a pathspec, so a "./" prefix keeps ":(top)x" literal.
+        // --no-index skips matching each path against the whole index, which
+        // these paths are not in; a path beyond a symlink still fails here.
+        let mut input = Vec::new();
+        for path in untracked {
+            input.extend_from_slice(b"./");
+            input.extend_from_slice(path.as_bytes());
+            input.push(0);
+        }
+        let command = self
+            .git_read(worktree, ["check-ignore", "--no-index", "-z", "--stdin"])
+            .stdin(input);
+        let output = self.run(&command, cancellation)?;
+        match output.exit_code {
+            // No path is ignored.
+            Some(1) => {}
+            Some(0) => {
+                let first = output.stdout.split(|byte| *byte == 0).next();
+                let ignored = first
+                    .and_then(|name| name.strip_prefix(b"./"))
+                    .and_then(|name| RepoPath::from_bytes(name).ok());
+                return match ignored {
+                    Some(path) => Ok(Some(format!("{path}: path is ignored"))),
+                    None => Err(RepositoryError::InvalidOutput {
+                        field: "check_ignore",
+                        reason: "an ignored path was not one this sent".into(),
+                    }),
+                };
+            }
+            _ => return Err(git_failure(&command, output).into()),
+        }
+
+        // A file at an enclosing directory is a legitimate replacement; a
+        // gitlink there, whether or not its commit is present, is a submodule.
+        for path in untracked {
+            let bytes = path.as_bytes();
+            let submodule = bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, byte)| **byte == b'/')
+                .map(|(end, _)| &bytes[..end])
+                .find(|directory| gitlinks.contains(*directory));
+            if let Some(directory) = submodule {
+                let directory = String::from_utf8_lossy(directory);
+                return Ok(Some(format!("{path}: path is in submodule '{directory}'")));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The index's gitlinks, from one listing of the whole index, or `None`
+    /// when that listing exceeds the normal output bound. Git before 2.51
+    /// cannot report a single entry's mode through `cat-file`, and a
+    /// path-limited `ls-files` would list every entry under each directory.
+    fn index_gitlinks(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<HashSet<Vec<u8>>>, RepositoryError> {
+        let command = self.git_literal_read(worktree, ["ls-files", "-s", "-z"]);
+        Ok(self
+            .membership_census(&command, parse_index_entries, cancellation)?
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.mode == GITLINK_MODE)
+                    .map(|entry| entry.path.as_bytes().to_vec())
+                    .collect()
+            }))
     }
 
     /// The pathspecs a worktree-side mutation can actually match.
     ///
-    /// `git add` and `git restore --worktree` resolve a pathspec against the
-    /// index and the working tree, never against HEAD. The source half of a
-    /// *staged* rename is in neither — only HEAD still has that name — so
-    /// listing it makes `add` exit 128 having staged nothing and `restore` exit
-    /// 1 having restored nothing, for the whole selection. Whether the source
+    /// `git restore --worktree` resolves a pathspec against the index and the
+    /// working tree, never against HEAD. The source half of a *staged* rename
+    /// is in neither — only HEAD still has that name — so listing it makes
+    /// `restore` exit 1 having restored nothing, for the whole selection, and
+    /// staging it would do nothing while reporting it staged. Whether the source
     /// is matchable is a property of the index at this moment rather than of
     /// the selection, which is why it is asked here and not at the point the
     /// selection was built: the same [`PathSelection`] names an unmatchable
@@ -4700,41 +4890,58 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             return Err(ValidationError::EmptySelection.into());
         }
         if let Some(head) = self.resolve_head(&request.worktree, cancellation)? {
-            // `reset` silently ignores pathspecs that match nothing and still
-            // exits 0, so a stale selection would report ghosts as applied
-            // while unstaging the rest. Refuse the whole request up front
-            // when any selected path resolves to nothing git knows — the
-            // index, or the HEAD tree for renamed-away sources.
-            let indexed: HashSet<_> = self
-                .indexed_paths(&request.worktree, &paths, cancellation)?
+            // Refuse the whole request up front when any selected path
+            // matches nothing git knows — the index, or the HEAD tree for
+            // renamed-away sources — rather than reporting a ghost as applied.
+            let membership = self.index_membership(&request.worktree, &paths, cancellation)?;
+            let skip_worktree = membership.iter().any(|(_, skip)| *skip);
+            let indexed: HashSet<_> = membership.into_iter().map(|(path, _)| path).collect();
+            let in_head: HashMap<_, _> = self
+                .head_tree_entries(&request.worktree, &head, &paths, cancellation)?
                 .into_iter()
+                .map(|entry| (entry.path.clone(), entry))
                 .collect();
-            let unindexed: Vec<&RepoPath> = paths
+            if let Some(ghost) = paths
                 .iter()
-                .filter(|path| !indexed.contains(*path))
-                .collect();
-            if !unindexed.is_empty() {
-                let in_head: HashSet<_> = self
-                    .head_tree_paths(&request.worktree, &head, &unindexed, cancellation)?
-                    .into_iter()
-                    .collect();
-                if let Some(ghost) = unindexed.iter().find(|path| !in_head.contains(**path)) {
-                    return Ok(MutationOutcome::NotApplied {
-                        failure: MutationFailure::Rejected {
-                            reason: format!("{ghost}: path does not match anything known to git"),
-                        },
-                    });
-                }
+                .find(|path| !indexed.contains(*path) && !in_head.contains_key(*path))
+            {
+                return Ok(MutationOutcome::NotApplied {
+                    failure: MutationFailure::Rejected {
+                        reason: format!("{ghost}: path does not match anything known to git"),
+                    },
+                });
             }
-            // `restore --staged` preloads worktree stat information and runs
-            // post-checkout hooks. Neither belongs in an index-only operation.
-            // A path-limited reset never moves HEAD; --no-refresh also skips
-            // the otherwise repository-wide stat refresh after updating it.
-            let command = self.git_pathspec_mutation(
-                &request.worktree,
-                ["reset", "--no-refresh", "--quiet", head.as_str()],
-                &paths,
-            );
+            let command = if skip_worktree
+                || self.sparse_checkout(&request.worktree, cancellation)?
+            {
+                // `reset` keeps skip-worktree on an entry and sets it on one
+                // it restores outside the sparse checkout. Without it the
+                // next stage would record that absent file as deleted. This
+                // path costs selected paths times index entries.
+                self.git_pathspec_mutation(
+                    &request.worktree,
+                    ["reset", "--no-refresh", "--quiet", head.as_str()],
+                    &paths,
+                )
+            } else {
+                // Put back each path's HEAD entry, or drop one HEAD lacks, in
+                // one index write, looking each path up directly. Like
+                // `reset --no-refresh`, this leaves stat data for the next
+                // status to refresh.
+                let absent = "0".repeat(head.as_str().len());
+                let mut input = Vec::new();
+                for path in &paths {
+                    let entry = match in_head.get(path) {
+                        Some(entry) => format!("{:o} {}\t", entry.mode, entry.oid.as_str()),
+                        None => format!("0 {absent}\t"),
+                    };
+                    input.extend_from_slice(entry.as_bytes());
+                    input.extend_from_slice(path.as_bytes());
+                    input.push(0);
+                }
+                self.git_literal_mutation(&request.worktree, ["update-index", "-z", "--index-info"])
+                    .stdin(input)
+            };
             return Ok(self.run_mutation(
                 &command,
                 paths,
@@ -4758,6 +4965,25 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         Ok(self.run_mutation(&command, indexed, MutationScope::AllOrNothing, cancellation))
     }
 
+    /// Whether `core.sparseCheckout` is on for this worktree.
+    fn sparse_checkout(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            ["config", "--type=bool", "--get", "core.sparseCheckout"],
+        );
+        let output = self.run(&command, cancellation)?;
+        match output.exit_code {
+            // Unset.
+            Some(1) => Ok(false),
+            Some(0) => Ok(output.stdout.trim_ascii() == b"true"),
+            _ => Err(git_failure(&command, output).into()),
+        }
+    }
+
     /// Filters a selection down to the paths the index actually contains,
     /// preserving the caller's order.
     fn indexed_paths(
@@ -4766,101 +4992,109 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         paths: &[RepoPath],
         cancellation: &CancellationToken,
     ) -> Result<Vec<RepoPath>, RepositoryError> {
+        Ok(self
+            .index_membership(worktree, paths, cancellation)?
+            .into_iter()
+            .map(|(path, _)| path)
+            .collect())
+    }
+
+    /// The selected paths the index contains, in the caller's order, each
+    /// with whether its entry is skip-worktree.
+    fn index_membership(
+        &self,
+        worktree: &Path,
+        paths: &[RepoPath],
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<(RepoPath, bool)>, RepositoryError> {
+        let mut listed = HashMap::new();
+        let mut census = None;
         if bounded_pathspec_batches(paths).nth(1).is_some() {
             // Matching many literal pathspecs makes Git compare every index
             // entry against the selection, once again for each argv batch.
             // A single bounded census avoids that quadratic matching cost.
-            let command = self.git_literal_read(worktree, ["ls-files", "-z"]);
-            if let Some(listed) = self.membership_census(&command, "git ls-files", cancellation)? {
-                return Ok(paths
-                    .iter()
-                    .filter(|path| listed.contains(*path))
-                    .cloned()
-                    .collect());
-            }
+            let command = self.git_literal_read(worktree, ["ls-files", "-t", "-z"]);
+            census = self.membership_census(&command, parse_tagged_index_paths, cancellation)?;
         }
-        // ls-files has no stdin pathspec support. Bound both argv and stdout
-        // by querying selected literal paths in small batches; a one-file
-        // operation must not enumerate an arbitrarily large repository index.
-        let mut listed = HashSet::new();
-        for batch in bounded_pathspec_batches(paths) {
-            let mut arguments = vec![
-                OsString::from("ls-files"),
-                OsString::from("-z"),
-                OsString::from("--"),
-            ];
-            arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
-            let command = self.git_literal_read(worktree, arguments);
-            let output = self.run_checked(&command, cancellation)?;
-            let parsed = parse_path_list(&output.stdout, "git ls-files");
-            listed.extend(invalid_output(parsed, output)?);
+        if let Some(entries) = census {
+            listed.extend(entries);
+        } else {
+            // ls-files has no stdin pathspec support. Bound both argv and
+            // stdout by querying selected literal paths in small batches; a
+            // one-file operation must not enumerate a large repository index.
+            for batch in bounded_pathspec_batches(paths) {
+                let mut arguments = vec![
+                    OsString::from("ls-files"),
+                    OsString::from("-t"),
+                    OsString::from("-z"),
+                    OsString::from("--"),
+                ];
+                arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
+                let command = self.git_literal_read(worktree, arguments);
+                let output = self.run_checked(&command, cancellation)?;
+                let parsed = parse_tagged_index_paths(&output.stdout);
+                listed.extend(invalid_output(parsed, output)?);
+            }
         }
         Ok(paths
             .iter()
-            .filter(|path| listed.contains(*path))
-            .cloned()
+            .filter_map(|path| Some((path.clone(), *listed.get(path)?)))
             .collect())
     }
 
-    /// Filters paths down to the ones present in a commit's tree, preserving
-    /// the caller's order. Renamed-away sources live here even after leaving
-    /// the index, so this is the second half of "matches something git
-    /// knows" for selections that may name renames.
-    fn head_tree_paths(
+    /// The selected paths' entries in a commit's tree, in the caller's order.
+    /// Renamed-away sources live here even after leaving the index, so this
+    /// is the second half of "matches something git knows".
+    fn head_tree_entries(
         &self,
         worktree: &Path,
         revision: &Oid,
-        paths: &[&RepoPath],
+        paths: &[RepoPath],
         cancellation: &CancellationToken,
-    ) -> Result<Vec<RepoPath>, RepositoryError> {
-        let mut listed = HashSet::new();
-        let paths: Vec<RepoPath> = paths.iter().map(|path| (*path).clone()).collect();
-        if bounded_pathspec_batches(&paths).nth(1).is_some() {
-            let command = self.git_literal_read(
-                worktree,
-                ["ls-tree", "-r", "--name-only", "-z", revision.as_str()],
-            );
-            if let Some(listed) = self.membership_census(&command, "git ls-tree", cancellation)? {
-                return Ok(paths
-                    .iter()
-                    .filter(|path| listed.contains(*path))
-                    .cloned()
-                    .collect());
-            }
+    ) -> Result<Vec<TreeEntry>, RepositoryError> {
+        let mut listed = HashMap::new();
+        let mut census = None;
+        if bounded_pathspec_batches(paths).nth(1).is_some() {
+            let command =
+                self.git_literal_read(worktree, ["ls-tree", "-r", "-z", revision.as_str()]);
+            census = self.membership_census(&command, parse_tree_entries, cancellation)?;
         }
-        for batch in bounded_pathspec_batches(&paths) {
-            let mut arguments = vec![
-                OsString::from("ls-tree"),
-                OsString::from("-r"),
-                OsString::from("-z"),
-                OsString::from(revision.as_str()),
-                OsString::from("--"),
-            ];
-            arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
-            let command = self.git_literal_read(worktree, arguments);
-            let output = self.run_checked(&command, cancellation)?;
-            let parsed = parse_tree_entries(&output.stdout);
-            let entries = invalid_output(parsed, output)?;
-            listed.extend(entries.into_iter().map(|entry| entry.path));
+        if let Some(entries) = census {
+            listed.extend(entries.into_iter().map(|entry| (entry.path.clone(), entry)));
+        } else {
+            for batch in bounded_pathspec_batches(paths) {
+                let mut arguments = vec![
+                    OsString::from("ls-tree"),
+                    OsString::from("-r"),
+                    OsString::from("-z"),
+                    OsString::from(revision.as_str()),
+                    OsString::from("--"),
+                ];
+                arguments.extend(batch.iter().map(|path| path.as_os_str().to_owned()));
+                let command = self.git_literal_read(worktree, arguments);
+                let output = self.run_checked(&command, cancellation)?;
+                let parsed = parse_tree_entries(&output.stdout);
+                let entries = invalid_output(parsed, output)?;
+                listed.extend(entries.into_iter().map(|entry| (entry.path.clone(), entry)));
+            }
         }
         Ok(paths
             .iter()
-            .filter(|path| listed.contains(*path))
-            .cloned()
+            .filter_map(|path| listed.get(path).cloned())
             .collect())
     }
 
     /// A large selection can use one name census while it fits the normal
     /// process-output bound. Never use a truncated census to decide absence:
     /// an oversized repository falls back to selected-path queries instead.
-    /// Small selections skip the census entirely, so selecting one file never
-    /// enumerates a repository with hundreds of thousands of unrelated names.
-    fn membership_census(
+    /// Membership of a small selection skips the census, so selecting one
+    /// file does not enumerate hundreds of thousands of unrelated names.
+    fn membership_census<T>(
         &self,
         command: &CommandSpec,
-        format: &'static str,
+        parse: impl FnOnce(&[u8]) -> Result<Vec<T>, GitParseError>,
         cancellation: &CancellationToken,
-    ) -> Result<Option<HashSet<RepoPath>>, RepositoryError> {
+    ) -> Result<Option<Vec<T>>, RepositoryError> {
         let output = match self.executor.execute(command, cancellation) {
             Ok(output) if output.success => output,
             Ok(output) => return Err(git_failure(command, output).into()),
@@ -4875,8 +5109,8 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 return Err(failure.into());
             }
         };
-        let parsed = parse_path_list(&output.stdout, format);
-        Ok(Some(invalid_output(parsed, output)?.into_iter().collect()))
+        let parsed = parse(&output.stdout);
+        Ok(Some(invalid_output(parsed, output)?))
     }
 
     /// Restores tracked paths from the index and deletes untracked files.
@@ -7206,9 +7440,11 @@ mod tests {
                     ));
                     let head = service.resolve_head(root, &cancel).unwrap().unwrap();
                     assert_eq!(
-                        service
-                            .head_tree_paths(root, &head, &[&path("selected.txt")], &cancel)
-                            .unwrap(),
+                        tree_paths(
+                            service
+                                .head_tree_entries(root, &head, &[path("selected.txt")], &cancel)
+                                .unwrap()
+                        ),
                         vec![path("selected.txt")]
                     );
                 },
@@ -7277,9 +7513,11 @@ mod tests {
                 indexed
             );
             assert_eq!(
-                service
-                    .head_tree_paths(root, &head, &paths.iter().collect::<Vec<_>>(), &cancel)
-                    .unwrap(),
+                tree_paths(
+                    service
+                        .head_tree_entries(root, &head, &paths, &cancel)
+                        .unwrap()
+                ),
                 expected
             );
         }
@@ -9053,11 +9291,18 @@ mod tests {
                 OsString::from("/repo"),
                 OsString::from("-c"),
                 OsString::from("core.fsmonitor=false"),
-                OsString::from("add"),
-                OsString::from("-A"),
-                OsString::from("--pathspec-from-file=-"),
-                OsString::from("--pathspec-file-nul"),
+                OsString::from("update-index"),
+                OsString::from("--add"),
+                OsString::from("--remove"),
+                OsString::from("--replace"),
+                OsString::from("--ignore-skip-worktree-entries"),
+                OsString::from("-z"),
+                OsString::from("--stdin"),
             ]
+        );
+        assert_eq!(
+            command.stdin.as_deref(),
+            Some(b":(top)old.txt\0new name.txt\0".as_slice())
         );
         // A mutation must not disable optional locks: it needs the index lock.
         assert!(
@@ -9072,6 +9317,18 @@ mod tests {
 
         let empty = service.stage_command(Path::new("/repo"), &[]);
         assert!(matches!(empty, Err(ValidationError::EmptySelection)));
+    }
+
+    /// NUL-terminated names as `git ls-files -t -z` lists cached entries.
+    fn tagged(names: &[u8]) -> Vec<u8> {
+        names
+            .split_inclusive(|byte| *byte == 0)
+            .flat_map(|name| [b"H ".as_slice(), name].concat())
+            .collect()
+    }
+
+    fn tree_paths(entries: Vec<TreeEntry>) -> Vec<RepoPath> {
+        entries.into_iter().map(|entry| entry.path).collect()
     }
 
     fn large_membership_paths() -> Vec<RepoPath> {
@@ -9103,7 +9360,12 @@ mod tests {
         // An unmerged index lists one name per stage. Directory descendants
         // and unrelated names must never validate the directory itself.
         census.extend_from_slice(b"conflict\0conflict\0directory/child\0unselected\0");
-        let service = fake_service(vec![success(&census), success(&census)]);
+        let mut tree = Vec::new();
+        for name in census.split_inclusive(|byte| *byte == 0) {
+            tree.extend_from_slice(format!("100644 blob {}\t", oid(1)).as_bytes());
+            tree.extend_from_slice(name);
+        }
+        let service = fake_service(vec![success(&tagged(&census)), success(&tree)]);
         let cancel = CancellationToken::new();
         assert_eq!(
             service
@@ -9112,14 +9374,11 @@ mod tests {
             expected
         );
         assert_eq!(
-            service
-                .head_tree_paths(
-                    Path::new("/repo"),
-                    &oid(1),
-                    &paths.iter().collect::<Vec<_>>(),
-                    &cancel
-                )
-                .unwrap(),
+            tree_paths(
+                service
+                    .head_tree_entries(Path::new("/repo"), &oid(1), &paths, &cancel)
+                    .unwrap()
+            ),
             expected
         );
         let commands = service.executor.commands.lock().unwrap();
@@ -9144,6 +9403,8 @@ mod tests {
                 for path in batch.iter().filter(|path| path.as_bytes() != b"ghost") {
                     if tree {
                         output.extend_from_slice(format!("100644 blob {}\t", oid(1)).as_bytes());
+                    } else {
+                        output.extend_from_slice(b"H ");
                     }
                     output.extend_from_slice(path.as_bytes());
                     output.push(0);
@@ -9153,12 +9414,9 @@ mod tests {
             let service = fake_service(outputs);
             let cancel = CancellationToken::new();
             let listed = if tree {
-                service.head_tree_paths(
-                    Path::new("/repo"),
-                    &oid(1),
-                    &paths.iter().collect::<Vec<_>>(),
-                    &cancel,
-                )
+                service
+                    .head_tree_entries(Path::new("/repo"), &oid(1), &paths, &cancel)
+                    .map(tree_paths)
             } else {
                 service.indexed_paths(Path::new("/repo"), &paths, &cancel)
             };
@@ -9223,7 +9481,7 @@ mod tests {
         selection.push(PathSelection::new(path("ghost")));
         let service = fake_service(vec![
             success(oid(1).as_str().as_bytes()),
-            success(&pathspec_input(&indexed)),
+            success(&tagged(&pathspec_input(&indexed))),
             success(b""),
         ]);
         assert!(matches!(
@@ -9253,13 +9511,23 @@ mod tests {
             path: path("new name.txt"),
             old_path: Some(path("old name.txt")),
         }];
+        let worktree = tempfile::tempdir().unwrap();
+        fs::write(worktree.path().join("new name.txt"), b"renamed").unwrap();
+        // Sources, sparse checkout, index, ignore rules, then update-index.
+        let unset = exit(1, b"");
 
         // The index no longer has the source: only HEAD does.
-        let service = fake_service(vec![success(b""), success(b"")]);
+        let service = fake_service(vec![
+            success(b""),
+            unset.clone(),
+            success(b""),
+            exit(1, b""),
+            success(b""),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {
-                    worktree: PathBuf::from("/repo"),
+                    worktree: worktree.path().into(),
                     selection: selection.clone(),
                 },
                 &CancellationToken::new(),
@@ -9273,23 +9541,24 @@ mod tests {
         );
         let commands = service.executor.commands.lock().unwrap();
         assert_eq!(
-            commands[1].stdin.as_deref(),
+            commands[4].stdin.as_deref(),
             Some(b"new name.txt\0".as_slice())
-        );
-        assert!(
-            !commands[1]
-                .arguments
-                .contains(&OsString::from("old name.txt"))
         );
         drop(commands);
 
         // The index still has it, which is the unstaged rename this
         // application also has to stage as a pair.
-        let service = fake_service(vec![success(b"old name.txt\0"), success(b"")]);
+        let service = fake_service(vec![
+            success(b"H old name.txt\0"),
+            unset,
+            success(b"H old name.txt\0"),
+            exit(1, b""),
+            success(b""),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {
-                    worktree: PathBuf::from("/repo"),
+                    worktree: worktree.path().into(),
                     selection,
                 },
                 &CancellationToken::new(),
@@ -9301,6 +9570,135 @@ mod tests {
                 paths: vec![path("old name.txt"), path("new name.txt")]
             }
         );
+    }
+
+    /// Matching paths against the whole index is what made `git add` and
+    /// `git check-ignore` cost selected paths times index entries, so
+    /// tracked paths skip the untracked checks entirely.
+    #[test]
+    fn stage_checks_only_untracked_paths_and_refuses_a_path_inside_a_gitlink() {
+        let worktree = tempfile::tempdir().unwrap();
+        let root = worktree.path();
+        // `b` was a tracked file and is now a nested repository.
+        fs::create_dir_all(root.join("b/.git")).unwrap();
+        fs::create_dir_all(root.join("dir/sub")).unwrap();
+        fs::write(root.join("dir/new"), b"new").unwrap();
+        fs::write(root.join("dir/sub/new"), b"new").unwrap();
+        let request = |names: &[&str]| StageRequest {
+            worktree: root.into(),
+            selection: names
+                .iter()
+                .map(|name| PathSelection::new(path(name)))
+                .collect(),
+        };
+        let selected = request(&["a", "b", "dir/new", "dir/sub/new"]);
+        let cancel = CancellationToken::new();
+        let unset = exit(1, b"");
+        let index = success(b"H a\0H b\0");
+        let listing = |entries: &[(&str, &str)]| {
+            let mut listing = Vec::new();
+            for (mode, name) in entries {
+                listing.extend_from_slice(format!("{mode} {} 0\t{name}\0", oid(1)).as_bytes());
+            }
+            success(&listing)
+        };
+        let files = listing(&[("100644", "a"), ("100644", "b"), ("100644", "dir")]);
+        let service = fake_service(vec![
+            unset.clone(),
+            index.clone(),
+            files,
+            exit(1, b""),
+            success(b""),
+        ]);
+        assert!(matches!(
+            service.stage(&selected, &cancel).unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        let commands = service.executor.commands.lock().unwrap();
+        assert!(commands[2].arguments.contains(&OsString::from("-s")));
+        assert!(
+            commands[3]
+                .arguments
+                .contains(&OsString::from("--no-index"))
+        );
+        assert_eq!(
+            commands[3].stdin.as_deref(),
+            Some(b"./dir/new\0./dir/sub/new\0".as_slice())
+        );
+        // Naming `b` again adds the gitlink after its file entry is removed.
+        assert_eq!(
+            commands[4].stdin.as_deref(),
+            Some(b"a\0b\0dir/new\0dir/sub/new\0b\0".as_slice())
+        );
+        drop(commands);
+
+        // A gitlink at an enclosing directory is a submodule.
+        let gitlink = listing(&[("100644", "a"), ("100644", "b"), ("160000", "dir/sub")]);
+        let service = fake_service(vec![unset.clone(), index.clone(), gitlink, exit(1, b"")]);
+        let MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { reason },
+        } = service.stage(&selected, &cancel).unwrap()
+        else {
+            panic!("a path inside a submodule must not be staged");
+        };
+        assert_eq!(reason, "dir/sub/new: path is in submodule 'dir/sub'");
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 4);
+
+        // An index too large to list leaves the checks to `git add`.
+        let mut capped = launched_failure(b"");
+        capped.kind = ProcessFailureKind::OutputLimit;
+        let service = fake_service(vec![
+            unset.clone(),
+            index.clone(),
+            Err(capped),
+            success(b""),
+        ]);
+        assert!(matches!(
+            service.stage(&selected, &cancel).unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 4);
+        assert!(commands[3].arguments.contains(&OsString::from("add")));
+        drop(commands);
+
+        // Only an untracked path inside a directory needs the index listing.
+        let service = fake_service(vec![
+            unset.clone(),
+            success(b""),
+            exit(1, b""),
+            success(b""),
+        ]);
+        fs::write(root.join("top"), b"new").unwrap();
+        assert!(matches!(
+            service.stage(&request(&["top"]), &cancel).unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 4);
+
+        // An untracked path that no longer exists is refused before Git
+        // checks ignores or writes anything.
+        let service = fake_service(vec![unset.clone(), success(b""), listing(&[])]);
+        let MutationOutcome::NotApplied {
+            failure: MutationFailure::Rejected { reason },
+        } = service
+            .stage(&request(&["dir/new", "gone"]), &cancel)
+            .unwrap()
+        else {
+            panic!("a ghost must not be reported staged");
+        };
+        assert_eq!(reason, "gone: path does not match anything known to git");
+        assert_eq!(service.executor.commands.lock().unwrap().len(), 3);
+
+        // A sparse checkout keeps `git add`, which refuses paths outside it.
+        let service = fake_service(vec![success(b"true\n"), success(b"")]);
+        assert!(matches!(
+            service.stage(&selected, &cancel).unwrap(),
+            MutationOutcome::Applied { .. }
+        ));
+        let commands = service.executor.commands.lock().unwrap();
+        assert_eq!(commands.len(), 2);
+        assert!(commands[1].arguments.contains(&OsString::from("add")));
     }
 
     /// `core.fsmonitor` set to a non-boolean value names a program Git runs
@@ -9323,13 +9721,7 @@ mod tests {
                 })
                 .unwrap(),
             service.push_command(&publish_request()).unwrap(),
-            service.git_literal_mutation(
-                &worktree,
-                pathspec_arguments(
-                    ["reset", "--no-refresh", "--quiet", "HEAD"],
-                    &[path("new.txt")],
-                ),
-            ),
+            service.git_literal_mutation(&worktree, ["update-index", "-z", "--index-info"]),
             service.git_literal_mutation(
                 &worktree,
                 pathspec_arguments(["update-index", "--force-remove"], &[path("new.txt")]),
@@ -9444,7 +9836,11 @@ mod tests {
 
     #[test]
     fn stage_that_never_started_is_definitively_not_applied() {
-        let service = fake_service(vec![Err(unstarted_failure())]);
+        let service = fake_service(vec![
+            exit(1, b""),
+            success(b"H a.txt\0"),
+            Err(unstarted_failure()),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {
@@ -9456,7 +9852,11 @@ mod tests {
             .unwrap();
         assert!(matches!(outcome, MutationOutcome::NotApplied { .. }));
 
-        let service = fake_service(vec![Err(launched_failure(b""))]);
+        let service = fake_service(vec![
+            exit(1, b""),
+            success(b"H a.txt\0"),
+            Err(launched_failure(b"")),
+        ]);
         let outcome = service
             .stage(
                 &StageRequest {

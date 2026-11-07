@@ -4,6 +4,8 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+#[cfg(test)]
+mod lost_agent_close_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -878,6 +880,155 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         .map_err(unavailable)
 }
 
+/// Whether `session`'s complete proof names a kernel boot other than this one,
+/// which proves every process it named is gone.
+pub(super) fn from_earlier_boot(host: &SharedHost, session: &Session) -> bool {
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    session
+        .proof
+        .as_ref()
+        .is_some_and(|saved| saved.is_complete() && saved.boot_id != boot)
+}
+
+/// Holds a lost agent's allocation while its close commits, once nothing could
+/// be running under it: no owner, no start, handoff or close in flight, no
+/// live paired terminal or console, and no capability issued in this boot.
+/// Start registers its capability before adoption rebinds the agent, so the
+/// agent's old proof alone is not enough. A Start admitted while this is held
+/// is refused as already starting or closing.
+pub(super) struct LostHolderFence(#[allow(dead_code)] capacity::Reservation);
+
+pub(super) fn fence_lost_holder(
+    host: &SharedHost,
+    session: &Session,
+    console: Option<&crate::model::TerminalSession>,
+) -> Result<LostHolderFence, String> {
+    const REFUSED: &str =
+        "A provider may be running for this agent since the computer restarted; it was not closed";
+    let fence =
+        reserve_quiet_allocation(host, session, console).map_err(|()| REFUSED.to_owned())?;
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let authority = super::agent_execution::registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_authority_source(session.id)?;
+    let issued_now = authority.is_some_and(|stored| match stored {
+        crate::agent_execution::HostedSession::Chat(stored) => stored
+            .proof
+            .as_ref()
+            .is_none_or(|proof| proof.boot_id == boot),
+        crate::agent_execution::HostedSession::Terminal(_) => true,
+    });
+    if issued_now {
+        return Err(REFUSED.into());
+    }
+    Ok(LostHolderFence(fence))
+}
+
+/// Reserve `session`'s allocation for a close that ends nothing itself, once
+/// nothing in this daemon holds it or the terminals that belong with it (its
+/// paired CLI view and an agent's console): no resident or live terminal, no
+/// start, handoff or close in flight, and no discovery record of a holder.
+/// The reservation comes first, so a Start cannot begin between these checks
+/// and the close; discovery is read only after it is held.
+fn reserve_quiet_allocation(
+    host: &SharedHost,
+    session: &Session,
+    console: Option<&crate::model::TerminalSession>,
+) -> Result<capacity::Reservation, ()> {
+    let mut terminals: Vec<TerminalId> = session
+        .terminal
+        .iter()
+        .chain(console)
+        .map(|terminal| terminal.id)
+        .collect();
+    terminals.sort();
+    terminals.dedup();
+    let fence = {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        // A terminal counts from its spawn reservation until its teardown
+        // completes, and a chat while any record of it remains.
+        let held = |id: &TerminalId| {
+            state.chats.contains_key(id) || terminal_claim_pending(&state, *id) || state.is_live(id)
+        };
+        if state.shutting_down || held(&session.id) || terminals.iter().any(held) {
+            return Err(());
+        }
+        capacity::Reservation::closing(host, &mut state, session).map_err(|_| ())?
+    };
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let terminal_owner = |id: &TerminalId| {
+        registry::directory(Kind::Terminal)
+            .and_then(|directory| {
+                registry::recovery_candidate(&registry::socket(&directory, *id), Kind::Terminal)
+            })
+            // An unreadable record still claims the terminal.
+            .map_or(true, |record| record.is_some())
+    };
+    if has_native_owner(session).unwrap_or(true) || terminals.iter().any(terminal_owner) {
+        return Err(());
+    }
+    Ok(fence)
+}
+
+/// What a pane's Close asks of a conversation with no resident actor. An agent
+/// lost with an earlier boot ends as an agent. A plain retained Claude
+/// conversation an earlier boot left, with no owner, agent or launch, has
+/// nothing to close. Everything else needs its exact close receipt.
+pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> Result<(), String> {
+    if super::agent_execution::close_lost_agent_from_pane(host, session)? {
+        return Ok(());
+    }
+    let plain = matches!(
+        session.native_continuity,
+        chat::NativeContinuity::RetainedClaudeActor { .. }
+    ) && session.launch.provider == Provider::Claude
+        && from_earlier_boot(host, session)
+        // An owner or resident has something to close, through its receipt.
+        && !has_native_owner(session).map_err(|error| error.message)?
+        && !host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .contains_key(&session.id)
+        && super::agent_execution::registry(host).is_ok_and(|registry| {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            registry
+                .agent_for_session(session.id)
+                .is_ok_and(|agent| agent.is_none())
+                && registry
+                    .has_agent_launch_for_session(session.id)
+                    .is_ok_and(|pending| !pending)
+        });
+    if plain {
+        const CHANGED: &str = "The conversation is starting or changing; it was not closed";
+        // A Start can own this allocation before publishing a resident or a
+        // helper. Hold the same reservation through the final no-op decision;
+        // observing an empty resident map alone does not settle that Start.
+        let _fence =
+            reserve_quiet_allocation(host, session, None).map_err(|()| CHANGED.to_owned())?;
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.agent_for_session(session.id)?.is_some()
+            || registry.has_agent_launch_for_session(session.id)?
+        {
+            return Err(CHANGED.into());
+        }
+        return Ok(());
+    }
+    close_retained_native(host, session)
+}
+
 pub(super) fn require_unreserved_terminals(
     state: &HostState,
     session: &Session,
@@ -962,6 +1113,15 @@ fn start_with_execution(
     }
     // A failed pre-discovery helper still owns its exact cleanup context.
     retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
+    // A named Claude Start in place of an owner an earlier boot left runs under
+    // the account home that owner used.
+    if session.launch.provider == Provider::Claude
+        && session.launch.session_id.is_some()
+        && !session.native_continuity.retains_provider()
+        && super::agent_execution::registry(host).is_ok()
+    {
+        retained_resume::ensure_prior_boot_account(host, &session).map_err(unavailable)?;
+    }
     // Reserve before provider/account initialization. Pending owners recovered above
     // use their own exact reservation through restore.
     let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
@@ -1564,6 +1724,14 @@ fn start_with_execution(
                 spec.environment
                     .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
             }
+        }
+        // Equally transient: the provider's own `cagents` must reach this
+        // development instance's daemon.
+        if let Some(instance) = crate::instance::development_instance() {
+            spec.environment.insert(
+                crate::instance::DEVELOPMENT_INSTANCE_ENV.into(),
+                instance.into(),
+            );
         }
         // Like the capability, transient: a cagents process the provider
         // starts must not take this conversation's account for the system
@@ -2660,6 +2828,11 @@ fn process_inner(
                 return Err(unavailable(
                     "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
+            }
+            // A changed boot proves the old owner is gone, not that the
+            // recorded launch still selects the account home it ran under.
+            if previous_boot && source.launch.provider == Provider::Claude {
+                retained_resume::ensure_prior_boot_account(host, &source).map_err(unavailable)?;
             }
             // The old process is proved ended, as after a daemon stop: its
             // authority and unfinished runs end and its agent stays open, so
@@ -4552,9 +4725,8 @@ IFS= read -r finish < finish
         assert_eq!(retired.source().id, source.id);
         // The retirement receipt can precede the startup reaper consuming the
         // original helper's zombie. Observe that exact incarnation disappearing.
-        completion_wait_until(|| !identity.record.holder.is_current());
         assert!(
-            !identity.record.holder.is_current(),
+            identity.record.holder.reaped(),
             "real helper was not retired"
         );
         host.lock().unwrap().chats.clear();

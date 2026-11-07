@@ -221,6 +221,13 @@ metadata links under `${XDG_DATA_HOME:-$HOME/.local/share}`, and exposes only
 installed binary and icon by absolute path, so launching from the desktop does
 not depend on `PATH`; using `cagents` from a terminal does.
 
+Those links point into `current`, so an update reaches them. If a desktop
+tool has replaced one with a plain copy, and the copy is byte-for-byte the
+installed file, the installer puts the link back and says so. It refuses
+anything else at those paths, such as an edited copy, a directory, or a link
+to somewhere else, and leaves it unchanged. If the installation then fails,
+the copy is restored.
+
 The standard installation starts its per-user `cagentsd` immediately and
 registers it for graphical-login autostart. See [Daemon and
 upgrades](daemon.md) for how the daemon, sessions, and upgrades interact.

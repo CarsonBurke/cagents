@@ -334,7 +334,9 @@ const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received t
 
 /// Waits, without the agent's gate, until a bound provider can take its
 /// first prompt.
-fn await_provider_ready(handle: &chat::runtime::Handle) -> Result<(), (State, String)> {
+pub(in crate::host) fn await_provider_ready(
+    handle: &chat::runtime::Handle,
+) -> Result<(), (State, String)> {
     await_provider_ready_until(handle, Instant::now() + Duration::from_secs(30))
 }
 
@@ -922,6 +924,88 @@ pub(in crate::host) fn adopt_successor(
     Ok(changed)
 }
 
+/// Whether closing `agent` may rely on its bound process having been left by
+/// an earlier kernel boot: an open agent with no unconfirmed launch, bound to
+/// a chat whose complete proof names another boot. A scheduled agent is its
+/// automation's to end, and keeps the ordinary refusal.
+fn lost_with_earlier_boot(
+    host: &SharedHost,
+    agent: &Agent,
+    pending: Option<&HostedSession>,
+) -> bool {
+    !agent.closed
+        && pending.is_none()
+        && !matches!(agent.origin, Origin::Automation { .. })
+        && matches!(&agent.session, Some(HostedSession::Chat(bound))
+            if super::chat::from_earlier_boot(host, bound))
+}
+
+/// Holds a lost agent's close against anything that could be running under it
+/// in this boot. A startup cleanup owner retained for the agent is a launch of
+/// this boot whose teardown is unconfirmed.
+fn fence_lost_agent(
+    host: &SharedHost,
+    agent: &Agent,
+    session: &chat::Session,
+) -> Result<super::chat::LostHolderFence, String> {
+    if host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .execution_startups
+        .contains_key(&agent.id)
+    {
+        return Err(
+            "Startup teardown remains unconfirmed; its exact cleanup owner was retained".into(),
+        );
+    }
+    super::chat::fence_lost_holder(host, session, agent.console.as_ref())
+}
+
+/// A pane's Close of an agent an earlier boot left, which has no actor to
+/// close and no recorded daemon stop. `false` leaves anything else to the
+/// ordinary retained close.
+pub(super) fn close_lost_agent_from_pane(
+    host: &SharedHost,
+    session: &chat::Session,
+) -> Result<bool, String> {
+    let Ok(registry) = registry(host) else {
+        return Ok(false);
+    };
+    let bound_here = |agent: &Agent| {
+        matches!(&agent.session, Some(HostedSession::Chat(bound))
+            if crate::agent_execution::same_chat_process(bound, session))
+    };
+    let Some(agent) = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent_for_session(session.id)?
+        .filter(bound_here)
+    else {
+        return Ok(false);
+    };
+    let gate = agent_gate(host, agent.id);
+    let _dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    // Decided under the gate: a close or adoption may have just run.
+    let (agent, pending) = {
+        let store = registry.lock().unwrap_or_else(|p| p.into_inner());
+        (
+            store.agent(agent.id)?,
+            store.pending_agent_launch(agent.id)?,
+        )
+    };
+    if !bound_here(&agent) || !lost_with_earlier_boot(host, &agent, pending.as_ref()) {
+        // Includes an unconfirmed launch, which the ordinary close refuses
+        // before changing anything.
+        return Ok(false);
+    }
+    let Some(HostedSession::Chat(bound)) = &agent.session else {
+        return Ok(false);
+    };
+    let _fence = fence_lost_agent(host, &agent, bound)?;
+    retired(host, bound)?;
+    Ok(true)
+}
+
 /// Reads only the managed presentation. No registry means ordinary interactive
 /// conversations still close without the optional managed-agent subsystem.
 pub(super) fn preflight_retirement(
@@ -990,6 +1074,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     };
     // A daemon stop already proved this agent's process ended and revoked its
     // authority; only its saved conversation remains to retire.
+    let mut lost_holder_fence = None;
     if let Some(source) = agent
         .session
         .as_ref()
@@ -1011,6 +1096,13 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                 };
                 if let Some(target) = hosted {
                     super::chat::close_captured(host, target).map_err(|error| error.message)?;
+                } else if lost_with_earlier_boot(host, &agent, pending.as_ref()) {
+                    // A changed kernel boot proves that process is gone, even
+                    // with no daemon stop recorded for it. The fence refuses
+                    // anything started since, and holds until the close
+                    // commits. An unconfirmed launch has no such process to
+                    // reason about, and stays with the refusal below.
+                    lost_holder_fence = Some(fence_lost_agent(host, &agent, session)?);
                 } else {
                     let startup = host
                         .lock()
@@ -1061,7 +1153,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .retire_agent_authority(source)?;
+            .retire_agent_process_authority(source, lost_holder_fence.is_some())?;
     }
     // No dispatch can race this proof: it uses this same per-agent gate and
     // revalidates the durable open/accepted record before creating any child.
@@ -1080,6 +1172,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
     }
     let result = store.close_agent(&origin, id)?;
     drop(store);
+    drop(lost_holder_fence);
     host.lock()
         .unwrap_or_else(|p| p.into_inner())
         .execution_startups

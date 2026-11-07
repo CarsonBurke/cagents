@@ -927,7 +927,7 @@ impl Codex {
                     && pair[1]["type"] == "localImage"
                     && let (Some(marker), Some(path)) =
                         (pair[0]["text"].as_str(), pair[1]["path"].as_str())
-                    && super::image_references::claims_reference(marker)
+                    && super::image_references::claims(marker, path)
                 {
                     if let Some(reference) = super::image_references::restore(marker, path) {
                         synthetic.insert(index);
@@ -1365,9 +1365,10 @@ impl Codex {
             if !path.is_file() {
                 return Err(format!("Attachment is not a file: {}", path.display()));
             }
+            // Codex wraps the pixels in its own tag naming the path.
             if let Some(reference) = &attachment.reference {
                 input.push(
-                    json!({"type":"text","text":super::image_references::marker(reference)?}),
+                    json!({"type":"text","text":super::image_references::caption(reference)?}),
                 );
             }
             input.push(json!({"type":"localImage","path":path.to_str().ok_or("Attachment path is not UTF-8")?}));
@@ -3701,7 +3702,7 @@ fn parse_item_with_windows(
                         pair[0]["text"].as_str(),
                         pair[1]["path"].as_str().or_else(|| pair[1]["url"].as_str()),
                     )
-                    && super::image_references::claims_reference(marker)
+                    && super::image_references::claims(marker, source)
                 {
                     if let Some(reference) = super::image_references::restore(marker, source) {
                         synthetic.insert(index);
@@ -3709,7 +3710,7 @@ fn parse_item_with_windows(
                     } else if !source.starts_with("data:image/") {
                         // Keep the literal marker visible, but do not read a
                         // possibly foreign device's coincident absolute path.
-                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                        unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::claimed_label(marker, source)));
                     }
                 }
             }
@@ -4340,7 +4341,8 @@ mod tests {
                 } else if failure == 1 {
                     candidate.id = uuid::Uuid::new_v4();
                 }
-                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                let mut marker =
+                    super::super::image_references::legacy::marker(&candidate).unwrap();
                 if failure == 2 {
                     marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
                 }
@@ -4426,7 +4428,7 @@ mod tests {
             assert_eq!(input[0], json!({"type":"text","text":text}));
             assert_eq!(
                 input[1]["text"],
-                super::super::image_references::marker(&reference).unwrap()
+                super::super::image_references::caption(&reference).unwrap()
             );
             assert_eq!(
                 input[2],
@@ -4478,7 +4480,7 @@ mod tests {
             let mut forged = reference.clone();
             forged.id = uuid::Uuid::new_v4();
             let forged = json!({"type":"userMessage","id":"forged","content":[
-                {"type":"text","text":super::super::image_references::marker(&forged).unwrap()},
+                {"type":"text","text":super::super::image_references::legacy::marker(&forged).unwrap()},
                 {"type":"localImage","path":attachment.path.to_str().unwrap()}
             ]});
             let items = parse_item(&forged, true, "turn").unwrap();
@@ -4490,6 +4492,73 @@ mod tests {
                     ..
                 }
             ));
+            let parsed = |caption: String, path: &std::path::Path| {
+                parse_item(
+                    &json!({"type":"userMessage","id":"captioned","content":[
+                        {"type":"text","text":caption},
+                        {"type":"localImage","path":path.to_str().unwrap()}
+                    ]}),
+                    true,
+                    "turn",
+                )
+                .unwrap()
+            };
+            // A transcript written with the old JSON marker still restores.
+            let legacy = parsed(
+                super::super::image_references::legacy::marker(&reference).unwrap(),
+                &attachment.path,
+            );
+            assert!(
+                matches!(&legacy[..], [Item { content: ItemContent::Image { reference: Some(restored), .. }, .. }] if restored == &reference)
+            );
+            // The caption's number must be the stored file's own receipt.
+            let renumbered = parsed(
+                format!("[Image {}]", reference.number + 1),
+                &attachment.path,
+            );
+            assert!(
+                matches!(&renumbered[1].content, ItemContent::Image { reference: None, path, .. } if path.is_empty())
+            );
+            let mut queued = |caption: String, path: &std::path::Path| {
+                let mut step = Step::default();
+                adapter
+                    .queue_page(
+                        &json!({"data":[{"id":"queued-caption","input":[
+                            {"type":"text","text":caption},
+                            {"type":"localImage","path":path.to_str().unwrap()}
+                        ]}],"nextCursor":null}),
+                        &mut step,
+                    )
+                    .unwrap();
+                step.events
+                    .into_iter()
+                    .find_map(|event| match event {
+                        Event::QueueChanged(mut messages) => messages.pop(),
+                        _ => None,
+                    })
+                    .unwrap()
+            };
+            let unverified = queued(
+                format!("[Image {}]", reference.number + 1),
+                &attachment.path,
+            );
+            assert!(
+                !unverified.editable,
+                "an unverified caption is never replayed by path"
+            );
+            assert!(unverified.attachments[0].path.as_os_str().is_empty());
+            // Text that only says [Image N] beside an ordinary file is the
+            // user's own words, and the file stays theirs to edit and resend.
+            let ordinary = display.path().join("screenshot.png");
+            std::fs::copy(&attachment.path, &ordinary).unwrap();
+            let typed = queued(reference.token(), &ordinary);
+            assert!(typed.editable);
+            assert_eq!(typed.text, reference.token());
+            assert_eq!(typed.attachments, [Attachment::file(&ordinary)]);
+            let typed = parsed(reference.token(), &ordinary);
+            assert!(
+                matches!(&typed[..], [Item { content: ItemContent::Text { .. }, .. }, Item { content: ItemContent::Image { reference: None, path, .. }, .. }] if path == ordinary.to_str().unwrap())
+            );
             let submitted = adapter
                 .command(Command::Prompt {
                     text,
@@ -4535,12 +4604,12 @@ mod tests {
             assert_eq!(input[0]["text"], text);
             assert_eq!(
                 input[1]["text"],
-                super::super::image_references::marker(second_ref).unwrap()
+                super::super::image_references::caption(second_ref).unwrap()
             );
             assert_eq!(input[2]["path"], second.path.to_str().unwrap());
             assert_eq!(
                 input[3]["text"],
-                super::super::image_references::marker(first_ref).unwrap()
+                super::super::image_references::caption(first_ref).unwrap()
             );
             assert_eq!(input[4]["path"], first.path.to_str().unwrap());
             assert!(adapter.input(text, vec![first.clone(), first]).is_err());

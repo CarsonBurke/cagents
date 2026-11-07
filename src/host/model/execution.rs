@@ -722,6 +722,19 @@ impl Registry {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    pub(crate) fn has_agent_launch_for_session(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE session_id = ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn pending_agent_launch(
         &self,
         id: AgentId,
@@ -870,6 +883,42 @@ impl Registry {
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// [`Self::retire_agent_authority`] after confirmed teardown. `by_process`
+    /// also retires a capability recorded for the same process under older
+    /// conversation metadata, as [`Self::retire_agent_process`] does; a close
+    /// that proves its process gone without a receipt has no fresher record.
+    pub(crate) fn retire_agent_process_authority(
+        &mut self,
+        source: &HostedSession,
+        by_process: bool,
+    ) -> Result<(), String> {
+        if !by_process {
+            return self.retire_agent_authority(source);
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                [source.id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(stored) = stored
+            && source.same_process(&decode::<HostedSession>(&stored)?)
+        {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1 AND source = ?2",
+                params![source.id().to_string(), stored],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Invoked only after holder authentication and a successful adoption of
@@ -1561,6 +1610,7 @@ impl Registry {
                         .ok_or("Agent run revision exhausted")?;
                     tx.execute("UPDATE agent_runs SET state = 'cancelled', revision = ?2, record = ?3 WHERE id = ?1",
                         params![run.id.to_string(), run.revision, encode(&run)?]).map_err(|e| e.to_string())?;
+                    super::automation_attention::stage(&tx, &run)?;
                 }
                 if end == ProcessEnd::Closed {
                     tx.execute(
@@ -2014,6 +2064,7 @@ pub(super) fn update_agent_run_in(
         ],
     )
     .map_err(|error| error.to_string())?;
+    super::automation_attention::stage(tx, &run)?;
     tx.execute(
         "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
         [],
@@ -3696,6 +3747,100 @@ mod tests {
                 .is_err()
         );
         assert_eq!(registry.model().unwrap(), before);
+    }
+
+    #[test]
+    fn process_retirement_and_automation_attention_commit_or_roll_back_together() {
+        let (mut registry, _directory, request) = fixture();
+        let Destination::New(spec) = request.destination else {
+            unreachable!()
+        };
+        let definition = serde_json::from_value(serde_json::json!({
+            "name":"Fixture", "prompt":"Fixture prompt", "agent":spec,
+            "schedule":{"pattern":{"daily":{"hour":9,"minute":0}},"timezone":"UTC"},
+            "session_mode":"fresh","precheck":null
+        }))
+        .unwrap();
+        let automation = registry
+            .create_automation(
+                definition,
+                100,
+                crate::automations::DirectoryIdentity {
+                    device: 1,
+                    inode: 1,
+                },
+            )
+            .unwrap();
+        let accepted = registry
+            .claim_automation(
+                automation.id,
+                1,
+                None,
+                crate::automations::Trigger::Manual {
+                    request: uuid::Uuid::new_v4(),
+                },
+                None,
+                true,
+                200,
+            )
+            .unwrap()
+            .accepted
+            .unwrap();
+        let retained = source();
+        registry
+            .bind_agent(accepted.agent.id, None, retained.clone())
+            .unwrap();
+        let started = registry
+            .update_agent_run(
+                accepted.run.id,
+                accepted.run.revision,
+                Update::Started {
+                    provider_key: "fixture".into(),
+                },
+                300,
+            )
+            .unwrap();
+        let waiting = registry
+            .update_agent_run(started.id, started.revision, Update::Waiting, 400)
+            .unwrap();
+        let original = registry
+            .pending_automation_attention(100)
+            .unwrap()
+            .remove(0);
+        registry
+            .db
+            .execute_batch(
+                "CREATE TEMP TRIGGER fail_attention BEFORE INSERT ON automation_run_attention
+            BEGIN SELECT RAISE(ABORT, 'fixture attention staging failure'); END;",
+            )
+            .unwrap();
+        assert!(registry.retire_agent_process(&retained, 500).is_err());
+        assert_eq!(registry.agent_run(waiting.id).unwrap(), waiting);
+        assert!(!registry.agent(accepted.agent.id).unwrap().closed);
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending[0].receipt, original.receipt);
+        assert_eq!(
+            pending[0].event, original.event,
+            "failed replacement retains the previous edge"
+        );
+        registry
+            .db
+            .execute_batch("DROP TRIGGER fail_attention")
+            .unwrap();
+        assert!(registry.retire_agent_process(&retained, 500).unwrap());
+        assert!(registry.agent(accepted.agent.id).unwrap().closed);
+        let cancelled = registry.agent_run(waiting.id).unwrap();
+        assert_eq!(cancelled.state, State::Cancelled);
+        let pending = registry.pending_automation_attention(100).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].receipt.run, waiting.id);
+        assert_eq!(pending[0].receipt.revision, cancelled.revision);
+        assert_eq!(
+            pending[0].event.evidence.kind,
+            crate::notifications::Kind::Cancelled
+        );
+        assert_eq!(pending[0].event.source_session, Some(retained.id()));
+        assert!(!registry.ack_automation_attention(original.receipt).unwrap());
     }
 
     #[test]

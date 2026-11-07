@@ -70,6 +70,7 @@ fn private_runtime(test: &str, retained_actor: bool) -> Option<PathBuf> {
     for (name, _) in std::env::vars_os() {
         if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
             && name != std::ffi::OsStr::new(RETAINED_HELPER)
+            && name != std::ffi::OsStr::new(crate::retained_fixture::OWNER_ENV)
         {
             command = command.env_remove(name);
         }
@@ -618,6 +619,9 @@ fn cleanup_refusal_is_reported_and_healthy_owners_still_stop() {
 
 #[test]
 fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor",
         FinalCommit::Healthy,
@@ -626,6 +630,9 @@ fn ordinary_shutdown_commits_final_outcomes_and_retires_completed_retained_actor
 
 #[test]
 fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners",
         FinalCommit::RetriedInPlace,
@@ -638,6 +645,9 @@ fn ordinary_shutdown_retains_uncommitted_actor_and_still_closes_healthy_owners()
 /// as a live conversation that blocks its own resume.
 #[test]
 fn next_daemon_finishes_an_exit_interrupted_between_close_and_retirement() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     ordinary_retained_shutdown(
         "host::provider_shutdown_tests::next_daemon_finishes_an_exit_interrupted_between_close_and_retirement",
         FinalCommit::LeftToNextDaemon,
