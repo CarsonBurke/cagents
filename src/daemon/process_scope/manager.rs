@@ -19,6 +19,7 @@ use super::{POLL, Refused, manager_runtime, workload::cgroup_path};
 
 /// Bounds a collection's calls, and settling a request given up on.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+const LISTING_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const SCOPES: &str = "cagents-session-*.scope";
 
 /// One `busctl --user` call through the bus broker, the route a scope
@@ -210,8 +211,10 @@ pub(super) fn settle(
 /// which systemd may still have queued. Returns the membership when systemd
 /// placed the process after all.
 ///
-/// The bus broker delivers this process's later calls to systemd after the
-/// request, so a unit that isn't loaded by then was never started.
+/// A unit that isn't loaded yet is taken as never started. These calls go on
+/// connections of their own, which D-Bus doesn't order after the request's,
+/// though the broker delivers them that way in practice. Should one overtake
+/// it, the scope it starts is only left empty, and collection stops it.
 pub(super) fn withdraw(
     unit: &str,
     membership: impl Fn() -> io::Result<String>,
@@ -279,11 +282,12 @@ pub(super) fn running_for(scope: &Scope, age: Duration, now: Duration) -> bool {
 /// were stopped. A scope with a process or a queued job is never stopped.
 pub(super) fn collect_empty_scopes(age: Duration) -> io::Result<usize> {
     let call = || Instant::now() + CALL_TIMEOUT;
+    // Thousands of leaked units make a long listing from a busy manager.
     let listing = manager(
         "ListUnitsByPatterns",
         "asas",
         &["1", "active", "1", SCOPES],
-        call(),
+        Instant::now() + LISTING_TIMEOUT,
     )?;
     let units = listing
         .first()
@@ -302,7 +306,10 @@ pub(super) fn collect_empty_scopes(age: Duration) -> io::Result<usize> {
         if !running_for(&current, age, monotonic_now()) {
             continue;
         }
-        if settle(&current, || populated(&current.control_group))? == Settle::Stop
+        // A scope that stops meanwhile takes its cgroup with it: skip it,
+        // as anything this pass can't judge.
+        if settle(&current, || populated(&current.control_group))
+            .is_ok_and(|settle| settle == Settle::Stop)
             && stop(name, call()).is_ok()
         {
             stopped += 1;
