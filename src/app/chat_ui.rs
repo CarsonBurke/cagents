@@ -7834,6 +7834,11 @@ impl Cagents {
     pub(super) fn chat_start_matches(&self, card: CardId, session: &chat::Session) -> bool {
         matches!(self.chat_ui.phases.get(&card), Some(Phase::Starting(attempt)) if &attempt.session == session)
     }
+    /// Whether `session` is the conversation an unfinished resume of `card`
+    /// is starting in place of the one the card holds.
+    pub(super) fn chat_resume_in_flight(&self, card: CardId, session: &chat::Session) -> bool {
+        matches!(self.chat_ui.phases.get(&card), Some(Phase::Starting(attempt)) if chat::is_retained_resume_commit(&attempt.session, session))
+    }
     /// Whether a card that could not put its saved conversation back on screen
     /// should offer to start a new one in the same place.
     ///
@@ -22179,9 +22184,39 @@ mod tests {
         source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
         source.proof = Some(live.clone());
         source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        // The card is in a channel shared through the daemon's workspace model.
+        let channel = crate::model::ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: crate::model::ProjectId::new(),
+            title: "evaluation".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![],
+            focused: None,
+        });
+        durable.active_channel = Some(channel);
         drop(app.insert_chat_card(source.clone(), None, None));
         let card = app.workspace.focused().unwrap();
         app.persist();
+        // The daemon's view of the channel already holds the card.
+        let pane = |app: &Cagents, session: &chat::Session| {
+            let mut pane =
+                crate::workspace_model::views::Pane::from_card(app.card_state(card).unwrap(), None)
+                    .unwrap();
+            pane.kind = CardKind::Chat(session.clone());
+            pane
+        };
+        let scope = crate::workspace_model::views::Scope::Channel(channel);
+        let mut view = crate::workspace_model::views::View::empty(channel);
+        view.revision = 1;
+        view.panes.push(pane(&app, &source));
+        app.workspace_model.identity = uuid::Uuid::new_v4();
+        app.workspace_model.views = vec![view.clone()];
+        app.shared_views.initialize(scope, view.panes.clone());
+        drop(app.reconcile_shared_views());
         let text = |id: &str, role, body: &str| {
             Arc::new(chat::Item {
                 id: id.into(),
@@ -22272,6 +22307,20 @@ mod tests {
                 ..Snapshot::default()
             },
         ));
+        // The daemon publishes the successor's pane before the start replies.
+        // The echo leaves the card, its runtime and its draft to the start.
+        view.revision += 1;
+        view.panes = vec![pane(&app, &successor)];
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(chat_runtime_attempt(&app, card), resume);
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert_eq!(runtime.attachments, attachments);
         let task = app.update(Message::ChatUi(Action::Ready(
             resume,
             Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
