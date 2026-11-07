@@ -76,8 +76,10 @@ VALUED = {
 # sometimes.
 PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir", "--out-dir"}
 # Settings naming a path that only this repository's scripts read, never a
-# build or its tests; they stay here.
-SCRIPT_SETTINGS = {"CAGENTS_ZIG"}
+# build or its tests; they stay here. A development instance's daemon gives
+# CAGENTS_DEVELOPMENT_HOSTED_BY, runtime directories on this host, to the
+# terminals and agents it hosts.
+SCRIPT_SETTINGS = {"CAGENTS_ZIG", "CAGENTS_DEVELOPMENT_HOSTED_BY"}
 RUN_MARKER = "cargo-offload-run "
 # What `--hold` gives the command it runs: the build host, the slot it holds
 # there and the checkout it holds it for, and a lock it keeps while it does.

@@ -129,6 +129,26 @@ class InstallLocalHead(unittest.TestCase):
                       " && scripts/install-local --stage-only\n", result.stderr)
         self.assertFalse(self.builds.exists())
 
+    def test_main_worktree_is_found_when_the_worktree_list_outgrows_a_pipe(self):
+        # The lookup once stopped reading at its first match. Once the list
+        # outgrew a pipe buffer, git died of SIGPIPE, and pipefail with set -e
+        # ended the script without a word.
+        deep = Path(*(["d" * 200] * 15))
+        for index in range(30):
+            self.git(self.checkout, "worktree", "add", "--quiet", "--detach",
+                     str(Path(".worktrees") / f"w{index}" / deep))
+        listing = self.git(self.checkout, "worktree", "list", "--porcelain")
+        self.assertGreater(len(listing.encode()), 65536, "the listing must outgrow a pipe buffer")
+        review = self.checkout / ".worktrees/w0" / deep
+        self.publish("second")
+        result = subprocess.run(["bash", str(review / "scripts/install-local")],
+                                cwd=review, env=self.environment, capture_output=True,
+                                text=True, timeout=60)
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn(f"To build main, run: cd {self.checkout} && git pull --ff-only"
+                      " && scripts/install-local\n", result.stderr)
+        self.assertFalse(self.builds.exists())
+
     def test_detached_head_is_built_when_chosen(self):
         self.publish("second")
         self.git(self.checkout, "checkout", "--quiet", "--detach")

@@ -730,6 +730,198 @@ exit 83
                      if path.name.startswith((".run-development-started", ".run-development-record"))]
         self.assertEqual(leftovers, [])
 
+    def test_listing_shows_a_development_daemon_its_checkout_and_starter(self):
+        checkout = self.root / "worktree"
+        daemon = checkout / "target/dev-runtime/cagentsd"
+        daemon.parent.mkdir(parents=True)
+        shutil.copy2("/bin/sleep", daemon)
+        runtime = self.root / "nh-fixture"
+        runtime.mkdir()
+        starter = os.getpid()
+        start = Path(f"/proc/{starter}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+        (runtime / "cagents-run-development.owner").write_text(
+            f"checkout={checkout}\nowner={starter}\nowner_start={start}\n"
+            "owner_name=fixture-agent\nhosted=true\n")
+        lock = runtime / "cagents-development-fx1/cagentsd.lock"
+        lock.parent.mkdir()
+        # Like a daemon, it keeps its instance's lock open.
+        process = subprocess.Popen(
+            ["/bin/sh", "-c", 'exec 9>>"$1" && exec "$2" 30', "sh", str(lock), str(daemon)],
+            env={"XDG_RUNTIME_DIR": str(runtime), "CAGENTS_DEVELOPMENT_INSTANCE": "fx1"})
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+
+        def listing():
+            result = subprocess.run(
+                [str(self.runner), "--list-instances"], cwd=self.root,
+                env=self.env, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            lines = result.stdout.splitlines()
+            index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
+            return lines[index:index + 5]
+
+        deadline = time.monotonic() + 5
+        while not any(os.readlink(f"/proc/{process.pid}/fd/{fd}") == str(lock)
+                      for fd in os.listdir(f"/proc/{process.pid}/fd")):
+            self.assertLess(time.monotonic(), deadline, "fixture daemon never opened its lock")
+            time.sleep(0.01)
+        block = listing()
+        self.assertEqual(
+            block[4],
+            f"  stop:       scripts/run-development --stop-instance fx1, once niri-harness is installed; or kill {process.pid}")
+        # A harness that knows no such session.
+        harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
+        harness.write_text("#!/bin/sh\nexit 1\n")
+        harness.chmod(0o755)
+        block = listing()
+        self.assertTrue(block[0].startswith(f"fx1, pid {process.pid}, running "), block)
+        self.assertEqual(block[1], f"  checkout:   {checkout}")
+        self.assertEqual(block[2], f"  runtime:    {runtime}")
+        self.assertEqual(
+            block[3],
+            f"  started by: fixture-agent (pid {starter}), still running, in a cagents session")
+        # Without a runner session, only its process can be named.
+        self.assertTrue(block[4].startswith(f"  stop:       kill {process.pid} "), block)
+        # A session whose hosts can't be told is offered no way to stop it.
+        unknown = self.below_daemon(
+            ["--list-instances"], [f"XDG_RUNTIME_DIR={self.root / 'elsewhere'}"],
+            ["XDG_RUNTIME_DIR=relative"])
+        self.assertEqual(unknown.returncode, 0, unknown.stderr)
+        lines = unknown.stdout.splitlines()
+        index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
+        self.assertEqual(
+            lines[index + 4], "  stop:       not from here: which daemons host this session can't be told")
+        shutil.rmtree(checkout)
+        self.assertEqual(listing()[1], f"  checkout:   {checkout} (removed)")
+        self.assertFalse(self.cargo_calls.exists(), "listing built")
+
+    def below_daemon(self, arguments, daemon_environment, inner_environment=None, **changes):
+        """Run the runner below a shell named cagentsd with `daemon_environment`,
+        as a session a daemon hosts is; with `inner_environment`, below a second
+        such daemon that runs below the first."""
+        daemon = self.root / "daemon/cagentsd"
+        if not daemon.exists():
+            daemon.parent.mkdir()
+            shutil.copy2("/bin/sh", daemon)
+        environment = self.env | {"CAGENTS_AGENT_AUTHORITY": "inert-fixture-role"} | changes
+        for name in ("CAGENTS_DEVELOPMENT_INSTANCE", "CAGENTS_DEVELOPMENT_HOSTED_BY"):
+            environment.pop(name, None)
+        environment.update(variable.split("=", 1) for variable in daemon_environment)
+        environment = {name: value for name, value in environment.items() if value is not None}
+        # The trailing command keeps the shell from replacing itself.
+        command = [str(daemon), "-c", '"$@"; exit $?', "sh", str(self.runner), *arguments]
+        if inner_environment is not None:
+            command = [str(daemon), "-c", '"$@"; exit $?', "sh", "env", *inner_environment, *command]
+        return subprocess.run(
+            command,
+            cwd=self.root, env=environment, capture_output=True, text=True, timeout=10)
+
+    def fake_harness_session(self):
+        """A harness whose instance session is live, with its runtime directory."""
+        runtime = self.root / "harness-runtime/nh-fixture"
+        runtime.mkdir(parents=True)
+        harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
+        harness.write_text(f"""#!/bin/sh
+for argument do
+    case $argument in
+        env) printf "XDG_RUNTIME_DIR='%s'\\n" '{runtime}'; exit 0 ;;
+        stop) exit 0 ;;
+        exec) exit 1 ;;
+    esac
+done
+exit 1
+""")
+        harness.chmod(0o755)
+        return runtime
+
+    def test_a_hosted_stop_refuses_an_instance_that_hosts_the_session_or_its_starter(self):
+        runtime = self.fake_harness_session()
+        elsewhere = self.root / "elsewhere"
+        hosts = "the daemon hosting this session"
+        starter = "the daemons hosting the session that started this one"
+        for name, daemon_environment, refused, *inner in (
+            (hosts, [f"XDG_RUNTIME_DIR={runtime}"], "hosts this session"),
+            (hosts + " under its instance name",
+             [f"XDG_RUNTIME_DIR={runtime}", "CAGENTS_DEVELOPMENT_INSTANCE=hx"], "hosts this session"),
+            # A line that names no directory doesn't end the record.
+            (starter, [f"XDG_RUNTIME_DIR={elsewhere}",
+                       f"CAGENTS_DEVELOPMENT_HOSTED_BY={elsewhere}/other\nrelative\n{runtime}/cagents-development"],
+             "hosts this session"),
+            ("a daemon above, nearer one whose runtime can't be read",
+             [f"XDG_RUNTIME_DIR={elsewhere}"], "cannot tell", ["XDG_RUNTIME_DIR=relative"]),
+            ("a daemon elsewhere", [f"XDG_RUNTIME_DIR={elsewhere}",
+                                    f"CAGENTS_DEVELOPMENT_HOSTED_BY={elsewhere}/other"], None),
+        ):
+            with self.subTest(name):
+                result = self.below_daemon(["--stop-instance", "hx"], daemon_environment, *inner)
+                if refused:
+                    self.assertEqual(result.returncode, 1, result.stderr)
+                    self.assertIn(refused, result.stderr)
+                    self.assertNotIn("Stopping instance", result.stderr)
+                else:
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertIn("stopped instance hx", result.stdout)
+        self.assertFalse(self.cargo_calls.exists(), "stopping built")
+
+    def test_a_hosted_stop_with_no_daemon_above_it_is_refused(self):
+        process = os.getpid()
+        while process > 1:
+            try:
+                executable = os.readlink(f"/proc/{process}/exe")
+            except OSError:
+                executable = ""
+            if os.path.basename(executable).startswith("cagentsd"):
+                self.skipTest("these tests run in a session a daemon hosts")
+            process = int(Path(f"/proc/{process}/stat").read_text().rsplit(") ", 1)[1].split()[1])
+        self.fake_harness_session()
+        hosted = subprocess.run(
+            [str(self.runner), "--stop-instance", "hx"], cwd=self.root,
+            env=self.env | {"CAGENTS_AGENT_AUTHORITY": "inert-fixture-role"},
+            capture_output=True, text=True, timeout=10)
+        self.assertEqual(hosted.returncode, 1, hosted.stderr)
+        self.assertIn("cannot tell", hosted.stderr)
+        # A person's own terminal has no daemon above it either.
+        environment = self.env.copy()
+        environment.pop("CAGENTS_AGENT_AUTHORITY", None)
+        own = subprocess.run(
+            [str(self.runner), "--stop-instance", "hx"], cwd=self.root,
+            env=environment, capture_output=True, text=True, timeout=10)
+        self.assertEqual(own.returncode, 0, own.stderr)
+
+    def test_the_app_keeps_the_daemons_hosting_its_starter(self):
+        self.fake_cargo_reports_its_guard()
+        app_environment = self.root / "app-environment"
+        elsewhere = self.root / "elsewhere"
+        result = self.below_daemon(
+            ["--browserless"],
+            [f"XDG_RUNTIME_DIR={elsewhere}", "CAGENTS_DEVELOPMENT_INSTANCE=parent",
+             f"CAGENTS_DEVELOPMENT_HOSTED_BY={elsewhere}/first\n{elsewhere}/second"],
+            APP_ENV=str(app_environment))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        launched = app_environment.read_text()
+        record = launched.split("CAGENTS_DEVELOPMENT_HOSTED_BY=", 1)[1].splitlines()
+        for line in ("cagents", "cagents-development", "cagents-development-parent", "first", "second"):
+            self.assertIn(f"{elsewhere}/{line}", record)
+        self.assertNotIn("warning:", result.stderr)
+
+    def test_a_hosted_launch_warns_of_a_host_it_cant_read(self):
+        self.fake_cargo_reports_its_guard()
+        app_environment = self.root / "app-environment"
+        elsewhere = self.root / "elsewhere"
+        for hosted in (True, False):
+            with self.subTest(hosted=hosted):
+                changes = {} if hosted else {"CAGENTS_AGENT_AUTHORITY": None}
+                result = self.below_daemon(
+                    ["--browserless"], [f"XDG_RUNTIME_DIR={elsewhere}"],
+                    ["XDG_RUNTIME_DIR=relative"], APP_ENV=str(app_environment), **changes)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("can't all be told" in result.stderr, hosted, result.stderr)
+                launched = app_environment.read_text()
+                app_environment.unlink()
+                record = launched.split("CAGENTS_DEVELOPMENT_HOSTED_BY=", 1)[1].splitlines()
+                self.assertIn(f"{elsewhere}/cagents", record)
+                self.assertNotIn("?", record)
+
     def test_nested_only_refuses_the_callers_desktop_before_building(self):
         session_runtime = self.root / "nh-fixture"
         session_runtime.mkdir()
