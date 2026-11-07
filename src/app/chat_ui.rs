@@ -796,6 +796,10 @@ pub(super) struct State {
     /// workspace snapshot saves this stash across a restart.
     drafts: HashMap<CardId, String>,
     draft_attachments: HashMap<CardId, Vec<Attachment>>,
+    /// The conversation each card attached to when another window started its
+    /// draft. If that window's start fails, the shared pane goes back to the
+    /// same conversation as a draft, and so does this card.
+    peer_started: HashMap<CardId, TerminalId>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -832,6 +836,7 @@ impl Default for State {
             retiring: HashSet::new(),
             drafts: HashMap::new(),
             draft_attachments: HashMap::new(),
+            peer_started: HashMap::new(),
             default_chats: HashSet::new(),
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
@@ -3600,6 +3605,20 @@ impl Runtime {
         self.snapshot.capabilities.attachments || self.has_connected_saved_history(&self.snapshot)
     }
 
+    /// A conversation attached to here whose first start has yet to finish. Its
+    /// provider would refuse a message, so one waits in the composer until it
+    /// can go. One with history that isn't ready has lost its provider instead,
+    /// and sending there is what tells the reader so.
+    pub(super) fn provider_coming_up(&self) -> bool {
+        !self.is_draft()
+            && self.connected()
+            && !self.snapshot.ready
+            && !self.snapshot.exited
+            && self.snapshot.error.is_none()
+            && self.snapshot.items.is_empty()
+            && self.queued.is_none()
+    }
+
     /// Whether the composer takes a message now. A first or queued message
     /// still waiting goes before anything else is sent.
     pub(super) fn composer_available(&self, transitioning: bool) -> bool {
@@ -5224,6 +5243,16 @@ impl Runtime {
     /// Whether this runtime still has a daemon connection to its own actor.
     fn connected(&self) -> bool {
         self.handle().is_some() && !self.disconnected
+    }
+    /// Whether a message of this window's has yet to reach the provider, so
+    /// that ending the conversation now would lose it.
+    fn message_on_its_way(&self) -> bool {
+        self.queued.is_some()
+            || !self.followups.is_empty()
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| pending.sent.is_some())
     }
     pub(super) fn inspector_runtime_status(&self) -> InspectorRuntimeStatus {
         if self.disconnected {
@@ -6871,14 +6900,92 @@ impl Cagents {
         self.load_draft_skills(target)
     }
 
-    /// Catches draft `card` up, once it can choose again, with launch options
-    /// another window chose while it could not: while its file chooser was
-    /// open or its first message was on the way.
+    /// Takes the draft out of `card` when another window has started the very
+    /// conversation it shows, so the card can attach to it.
+    ///
+    /// The draft runtime cannot attach in place: its start attempt would be
+    /// taken for this window's own first send, and a failure would retire the
+    /// other window's running conversation. A window with a start of its own
+    /// under way keeps it, whatever the shared view says. So does a file choice
+    /// or paste under way, whose result the draft runtime has to receive;
+    /// `adopt_stored_draft_session` catches the card up once each has ended.
+    pub(super) fn release_draft_started_elsewhere(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> bool {
+        if session.is_unstarted() || self.chat_start_pending(card) {
+            return false;
+        }
+        let draft_of_session = matches!(
+            self.cards.get(&card),
+            Some(CardRuntime::Chat(runtime))
+                if runtime.is_draft()
+                    && runtime.session.is_unstarted()
+                    && runtime.session.id == session.id
+                    && runtime.attachment_chooser_pending.is_none()
+                    && runtime.pastes_pending == 0
+        );
+        if !draft_of_session {
+            return false;
+        }
+        // A first message whose start was given up is unsent writing again.
+        if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
+            runtime.unqueue();
+        }
+        self.stash_unsent_chat(card);
+        self.cards.remove(&card);
+        self.lifecycle.remove(card);
+        self.shared_views.attached.insert(card);
+        self.chat_ui.peer_started.insert(card, session.id);
+        true
+    }
+
+    /// Takes down what `card` attached to when the window that started its
+    /// conversation has given the start up, so the card can show the draft
+    /// that window is back on. The attachment is dropped, not retired: the
+    /// conversation is the other window's to end.
+    pub(super) fn release_chat_returned_to_draft(
+        &mut self,
+        card: CardId,
+        session: &chat::Session,
+    ) -> bool {
+        if !session.is_unstarted()
+            || self.chat_ui.peer_started.get(&card) != Some(&session.id)
+            || self.chat_is_draft(card)
+        {
+            return false;
+        }
+        self.chat_ui.peer_started.remove(&card);
+        self.chat_ui.phases.remove(&card);
+        self.stash_unsent_chat(card);
+        self.cards.remove(&card);
+        self.lifecycle.remove(card);
+        self.resolve_notice(NoticeKey::ChatAttach(card));
+        self.observe_agent_activity_for_card(card, None);
+        true
+    }
+
+    pub(super) fn forget_peer_started(&mut self, card: CardId) {
+        self.chat_ui.peer_started.remove(&card);
+    }
+
+    pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
+        matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+    }
+
+    /// Catches draft `card` up, once it can choose again, with what another
+    /// window did while it could not: launch options chosen, or the
+    /// conversation started, while its file chooser was open, a paste was
+    /// under way or its first message was on the way.
     fn adopt_stored_draft_session(&mut self, card: CardId) -> Task<Message> {
         let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| state.kind.clone())
         else {
             return Task::none();
         };
+        if !session.is_unstarted() {
+            return self.attach_draft_started_elsewhere(card, &session);
+        }
         self.adopt_shared_draft_session(card, &session)
     }
 
@@ -8020,6 +8127,83 @@ impl Cagents {
             .values()
             .find_map(|runtime| runtime.restart_blocker())
     }
+    /// The conversation a close of `card` would stop while it is working, and
+    /// whether that is known. This window may be unable to tell: it is still
+    /// attaching, failed to attach to a start made elsewhere, or still holds
+    /// the draft that start came from.
+    pub(super) fn chat_working_session(&self, card: CardId) -> Option<(TerminalId, bool)> {
+        let Some(CardKind::Chat(session)) = self.card_state(card).map(|state| &state.kind) else {
+            return None;
+        };
+        let pending = self.chat_start_pending(card);
+        // A return already under way has given the conversation up; closing
+        // only says not to keep its terminal.
+        if (session.is_unstarted() && !pending)
+            || self.chat_close_owned(card)
+            || self.chat_closed_elsewhere(card)
+            || matches!(
+                self.chat_ui.phases.get(&card),
+                Some(Phase::Returning { .. })
+            )
+        {
+            return None;
+        }
+        // A window sending its own first message knows what it just started.
+        if session.is_unstarted() {
+            return Some((session.id, true));
+        }
+        let certain = match self.cards.get(&card) {
+            // The handle's snapshot, not the runtime's copy: that one is only
+            // refreshed while the pane is on screen, and a tab can be closed
+            // without ever being shown.
+            Some(CardRuntime::Chat(runtime)) if runtime.connected() && !pending => {
+                let snapshot = runtime.handle()?.snapshot();
+                match snapshot.activity() {
+                    crate::agent::ActivityState::Working | crate::agent::ActivityState::Waiting => {
+                        true
+                    }
+                    crate::agent::ActivityState::Unknown => return None,
+                    // The provider says nothing of what it has not been handed.
+                    crate::agent::ActivityState::Idle if runtime.message_on_its_way() => true,
+                    // Nor can one that has not come up yet say it is idle.
+                    crate::agent::ActivityState::Idle
+                        if !snapshot.ready && snapshot.error.is_none() =>
+                    {
+                        false
+                    }
+                    crate::agent::ActivityState::Idle => return None,
+                }
+            }
+            // A pane that lost its connection or provider says so already, and
+            // closing is how the reader clears it.
+            Some(CardRuntime::Chat(runtime))
+                if runtime.disconnected
+                    || runtime
+                        .handle()
+                        .is_some_and(|handle| handle.snapshot().exited) =>
+            {
+                return None;
+            }
+            Some(CardRuntime::Chat(_)) => false,
+            Some(CardRuntime::Loading) if pending => false,
+            Some(CardRuntime::Failed(_)) if self.chat_ui.peer_started.contains_key(&card) => false,
+            _ => return None,
+        };
+        Some((session.id, certain))
+    }
+
+    /// The first message this window is still sending, which closing would
+    /// discard.
+    pub(super) fn chat_first_message_on_its_way(&self, card: CardId) -> Option<String> {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime
+                .queued
+                .as_ref()
+                .map(|queued| queued.source.text().to_owned()),
+            _ => None,
+        }
+    }
+
     /// Whether closing or a close-after-return already owns this card.
     pub(super) fn chat_close_owned(&self, card: CardId) -> bool {
         matches!(
@@ -9523,7 +9707,25 @@ impl Cagents {
             }
             _ => None,
         };
+        let insert_ended = match &action {
+            Action::PastedImage(target, ..)
+            | Action::PastedText(target, ..)
+            | Action::PasteRefused(target, ..)
+            | Action::ImageSaved(target, ..)
+            | Action::AttachmentsPrepared(target, ..) => Some(*target),
+            _ => None,
+        };
         let task = self.handle_chat_ui_inner(action);
+        let task = match insert_ended {
+            Some(target)
+                if self
+                    .chat_runtime_mut(target)
+                    .is_some_and(|runtime| runtime.pastes_pending == 0) =>
+            {
+                Task::batch([task, self.adopt_stored_draft_session(target.card)])
+            }
+            _ => task,
+        };
         self.reconcile_chat_failure_presentations();
         if let Some(card) = closed_refresh {
             self.sync_closed_chat_draft(card);
@@ -11261,7 +11463,8 @@ impl Cagents {
                 if !runtime.is_draft()
                     && (runtime.disconnected
                         || runtime.snapshot.exited
-                        || runtime.snapshot.read_only_reason.is_some())
+                        || runtime.snapshot.read_only_reason.is_some()
+                        || runtime.provider_coming_up())
                 {
                     return Task::none();
                 }
@@ -17033,7 +17236,7 @@ mod tests {
     fn draft_chat(app: &mut Cagents) -> CardId {
         draft_chat_for_provider(app, Provider::Codex)
     }
-    fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
+    pub(super) fn draft_chat_for_provider(app: &mut Cagents, provider: Provider) -> CardId {
         let _ = app.new_native_chat(provider, Some(PathBuf::from(FIXTURE_DIRECTORY)));
         let card = app.workspace.focused().unwrap();
         assert!(
@@ -19163,7 +19366,7 @@ mod tests {
     }
 
     /// Sends what the composer of `card` holds.
-    fn submit(app: &mut Cagents, card: CardId) {
+    pub(super) fn submit(app: &mut Cagents, card: CardId) {
         let target = chat_runtime(app, card).target;
         submit_target(app, target);
     }
@@ -20634,7 +20837,7 @@ mod tests {
         (card, target)
     }
 
-    fn answer_start(
+    pub(super) fn answer_start(
         app: &mut Cagents,
         target: Target,
         result: Result<Arc<ClientHandle>, chat::StartFailure>,
@@ -20775,7 +20978,11 @@ mod tests {
             })
     }
 
-    fn fixture_handle(app: &Cagents, card: CardId, session_id: Option<&str>) -> Arc<ClientHandle> {
+    pub(super) fn fixture_handle(
+        app: &Cagents,
+        card: CardId,
+        session_id: Option<&str>,
+    ) -> Arc<ClientHandle> {
         let mut session = app.chat_ui.attempt(card).unwrap().session.clone();
         // The daemon starts a new Codex thread on a listener of its own and
         // hands the thread back naming it.
@@ -20802,7 +21009,7 @@ mod tests {
     fn live_chat(app: &mut Cagents, session_id: Option<&str>) -> CardId {
         live_chat_for_provider(app, Provider::Codex, session_id)
     }
-    fn live_chat_for_provider(
+    pub(super) fn live_chat_for_provider(
         app: &mut Cagents,
         provider: Provider,
         session_id: Option<&str>,
@@ -21161,7 +21368,7 @@ mod tests {
         card
     }
 
-    fn chat_runtime_attempt(app: &Cagents, card: CardId) -> Target {
+    pub(super) fn chat_runtime_attempt(app: &Cagents, card: CardId) -> Target {
         app.chat_ui
             .attempt(card)
             .expect("a start is in flight")
@@ -30472,7 +30679,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_live_model_upgrade_candidates_keep_account_recipe_proof_and_unstarted_guards() {
+    fn retained_live_model_upgrade_candidates_keep_account_recipe_and_proof_guards() {
         for mutation in [
             "account",
             "program",
@@ -30480,7 +30687,6 @@ mod tests {
             "directory",
             "boot",
             "proof",
-            "unstarted",
         ] {
             let mut f = live_shared_recovery_fixture();
             match mutation {
@@ -30503,15 +30709,7 @@ mod tests {
                 }
                 "boot" => f.canonical.proof.as_mut().unwrap().boot_id = "other-boot".into(),
                 "proof" => f.canonical.proof.as_mut().unwrap().host_incarnation = "".into(),
-                _ => {
-                    f.source.proof = None;
-                    f.source.launch.session_id = None;
-                    f.source.native_continuity = chat::NativeContinuity::ReconnectOnly;
-                    let runtime = f.app.chat_runtime_mut(f.target).unwrap();
-                    runtime.session = f.source.clone();
-                    runtime.connection = Connection::Draft;
-                    f.app.install_chat_session(f.card, f.source.clone());
-                }
+                other => unreachable!("{other}"),
             }
             assert!(
                 !chat::client::UpgradeRecovery::is_candidate(&f.source, &f.canonical),
@@ -30528,6 +30726,38 @@ mod tests {
             assert_live_recovery_content(&f);
             assert_eq!(chat_runtime(&f.app, f.card).session, f.source);
         }
+    }
+
+    /// A draft has no lineage for the strict upgrade to prove. Another window
+    /// started its conversation, so this one attaches as a late window does,
+    /// with what it wrote still unsent.
+    #[test]
+    fn retained_live_model_upgrade_leaves_an_unstarted_source_to_an_ordinary_attachment() {
+        let mut f = live_shared_recovery_fixture();
+        f.source.proof = None;
+        f.source.launch.session_id = None;
+        f.source.native_continuity = chat::NativeContinuity::ReconnectOnly;
+        let runtime = f.app.chat_runtime_mut(f.target).unwrap();
+        runtime.session = f.source.clone();
+        runtime.connection = Connection::Draft;
+        f.app.install_chat_session(f.card, f.source.clone());
+        assert!(!chat::client::UpgradeRecovery::is_candidate(
+            &f.source,
+            &f.canonical
+        ));
+        f.model.views[0].panes[0].kind = CardKind::Chat(f.canonical.clone());
+        drop(f.app.update(Message::WorkspaceModelObserved(
+            super::super::workspace_model_sync::ModelUpdate::Read(f.model.clone()),
+        )));
+        assert!(matches!(
+            f.app.chat_ui.phases.get(&f.card),
+            Some(Phase::Starting(attempt))
+                if attempt.session == f.canonical
+                    && attempt.intent == chat::Intent::Restore
+                    && attempt.upgrade_admission.is_none()
+        ));
+        assert_eq!(f.app.chat_ui.drafts.get(&f.card), Some(&f.draft));
+        assert!(f.app.chat_ui.retiring.is_empty());
     }
 
     #[test]
@@ -31520,3 +31750,7 @@ mod first_start_checkpoint_tests;
 #[cfg(test)]
 #[path = "chat_ui/absence_tests.rs"]
 mod absence_tests;
+
+#[cfg(test)]
+#[path = "chat_ui/peer_draft_tests.rs"]
+mod peer_draft_tests;

@@ -68,7 +68,7 @@ pub(super) struct State {
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
-    pending: Vec<(uuid::Uuid, Scope, Change)>,
+    pub(super) pending: Vec<(uuid::Uuid, Scope, Change)>,
     /// Immutable logical-source identity captured when each Update is queued.
     /// A later watcher snapshot must not redefine the origin of a stale edit.
     source_bases: HashMap<uuid::Uuid, (uuid::Uuid, PathBuf)>,
@@ -236,6 +236,25 @@ impl Cagents {
             // An old-scope receipt cannot retire an already retargeted retry.
             return self.reconcile_workspace_model();
         };
+        // Another window can publish the same session update first, as when two
+        // windows attached to one conversation both learn its provider session.
+        // Only a session update qualifies: a refused name or width edit can be lost.
+        let session_already_applied = matches!(&change, Change::Update { before, pane } if {
+            let same_source = |a: &Pane, b: &Pane| {
+                a.kind == b.kind
+                    && a.pending_terminal_start == b.pending_terminal_start
+                    && a.scope == b.scope
+            };
+            let mut owners = self
+                .workspace_model
+                .views
+                .iter()
+                .flat_map(|view| &view.panes)
+                .filter(|current| current.id == pane.id);
+            !same_source(before, pane)
+                && owners.next().is_some_and(|current| same_source(current, pane))
+                && owners.next().is_none()
+        });
         let mut retry = None;
         if let Change::Update { before, pane } = &change
             && before.id == pane.id
@@ -295,7 +314,28 @@ impl Cagents {
                 }
             }
         }
-        tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        // Nothing was lost once any name or width it changed is on its way again
+        // or already there, so there is nothing to tell anyone about. A field it
+        // did not change may have moved on since, as a suggested title does.
+        let already_applied = session_already_applied
+            && (retry.is_some()
+                || matches!(&change, Change::Update { before, pane }
+                    if self
+                        .workspace_model
+                        .views
+                        .iter()
+                        .flat_map(|view| &view.panes)
+                        .any(|current| current.id == pane.id
+                            && (before.title == pane.title || current.title == pane.title)
+                            && (before.user_title == pane.user_title
+                                || current.user_title == pane.user_title)
+                            && (before.width_fraction == pane.width_fraction
+                                || current.width_fraction == pane.width_fraction))));
+        if already_applied {
+            tracing::debug!(?scope, %operation, %error, "pane session update lost to an identical one");
+        } else {
+            tracing::warn!(?scope, %operation, %error, "refused source-sensitive pane intent; host applied no fields");
+        }
         self.shared_views.pending.remove(index);
         let source_basis = self.shared_views.source_bases.remove(&operation);
         if let Some((operation, scope, revision, change)) = retry {
@@ -314,9 +354,11 @@ impl Cagents {
                 change,
             });
         }
-        self.notices.record(TransientNotice::warning(
-            "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
-        ));
+        if !already_applied {
+            self.notices.record(TransientNotice::warning(
+                "The pane session update was refused because its source changed. Independent name and width edits were retried where safe."
+            ));
+        }
         self.reconcile_workspace_model()
     }
 
@@ -1995,6 +2037,7 @@ impl Cagents {
                         if !same_session {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
+                            self.forget_peer_started(pane.id);
                             // Text the reader is composing in a draft was never
                             // sent anywhere, so the chat that replaces the draft
                             // opens with it: another unstarted draft, or the
@@ -2043,7 +2086,13 @@ impl Cagents {
                     } else if !self.cards.contains_key(&pane.id) && !starting {
                         tasks.push(self.attach_shared_pane(pane));
                     } else if let CardKind::Chat(session) = &pane.kind {
-                        tasks.push(self.adopt_shared_draft_session(pane.id, session));
+                        if self.release_chat_returned_to_draft(pane.id, session)
+                            || self.release_draft_started_elsewhere(pane.id, session)
+                        {
+                            tasks.push(self.attach_shared_pane(pane));
+                        } else {
+                            tasks.push(self.adopt_shared_draft_session(pane.id, session));
+                        }
                     }
                 }
                 _ => {
@@ -2126,6 +2175,29 @@ impl Cagents {
             self.persist();
         }
         Task::batch(tasks)
+    }
+
+    /// Attaches draft `card` to the conversation another window started in the
+    /// shared view while the card could not let its draft go.
+    pub(super) fn attach_draft_started_elsewhere(
+        &mut self,
+        card: CardId,
+        session: &crate::chat::Session,
+    ) -> Task<Message> {
+        let Some(pane) = self
+            .workspace_model
+            .views
+            .iter()
+            .flat_map(|view| &view.panes)
+            .find(|pane| pane.id == card && pane.kind == CardKind::Chat(session.clone()))
+            .cloned()
+        else {
+            return Task::none();
+        };
+        if !self.release_draft_started_elsewhere(card, session) {
+            return Task::none();
+        }
+        self.attach_shared_pane(&pane)
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {
@@ -3160,6 +3232,67 @@ mod tests {
                     .message
                     .contains("incoming session update could not be verified")
             }));
+        }
+    }
+
+    /// Another window made the same session update, but this one also renamed
+    /// the pane. Quiet is only right while the name is still on its way.
+    #[test]
+    fn losing_a_session_update_race_stays_quiet_only_if_its_rename_survives() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        for can_retry in [true, false] {
+            let (mut app, source, _, before) = channel_move_fixture();
+            let (tx, rx) = async_channel::unbounded();
+            app.workspace_model_tx = tx;
+            let operation = uuid::Uuid::new_v4();
+            let mut desired = before.clone();
+            desired.title = "Renamed here".into();
+            desired.scope = Some("/same-new-source".into());
+            let change = Change::Update {
+                before: before.clone(),
+                pane: desired.clone(),
+            };
+            app.shared_views
+                .pending
+                .push((operation, Scope::Channel(source), change.clone()));
+            if can_retry {
+                app.publish_model_edit(ModelEdit::ChangeView {
+                    scope: Scope::Channel(source),
+                    expected_revision: 17,
+                    operation,
+                    change: change.clone(),
+                });
+                rx.try_recv().unwrap();
+            }
+            let mut model = app.workspace_model.clone();
+            model.views[0].panes[0].scope = desired.scope.clone();
+            model.sequence += 1;
+            drop(
+                app.apply_workspace_model_update(ModelUpdate::ViewConflicted {
+                    scope: Scope::Channel(source),
+                    operation,
+                    change,
+                    model,
+                    error: "The pane source changed".into(),
+                }),
+            );
+
+            let warned = app
+                .notices
+                .recent()
+                .any(|entry| entry.notice.message.contains("session update was refused"));
+            assert_eq!(warned, !can_retry);
+            if can_retry {
+                let ModelEdit::ChangeView { change, .. } = rx.try_recv().unwrap() else {
+                    panic!("presentation retry");
+                };
+                let Change::Update { pane, .. } = change else {
+                    panic!("update");
+                };
+                assert_eq!(pane.title, desired.title);
+            } else {
+                assert!(rx.try_recv().is_err());
+            }
         }
     }
 
