@@ -3529,6 +3529,17 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    /// The current confirmed connection's owner, without issuing a request.
+    pub(super) fn startup_host_proof(&self) -> Option<crate::model::HostSessionProof> {
+        if self.disconnected {
+            return None;
+        }
+        self.handle()
+            .filter(|handle| handle.is_connected())
+            .and_then(|handle| handle.proof())
+            .filter(|proof| proof.is_complete())
+    }
+
     /// Readiness for the updater's saved-pane gate; no provider is launched here.
     pub(super) fn restored_pane_ready(&self) -> Result<bool, String> {
         if self.is_draft() {
@@ -15785,10 +15796,13 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.disconnected = true;
         runtime.error = Some("Upgrade replacement changed configuration".into());
+        let reason = app.startup_pane_check().unwrap_err();
+        let title = app.card_display_title(app.card_state(card).unwrap());
         assert!(
-            app.startup_pane_check()
-                .unwrap_err()
-                .contains(&card.to_string())
+            reason.starts_with(&format!(
+                "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+            )),
+            "{reason}"
         );
         assert_eq!(chat_runtime(&app, card).composer.text().trim(), "Draft 99");
         app.chat_runtime_mut(target).unwrap().disconnected = false;
@@ -15814,10 +15828,13 @@ mod tests {
                 card,
                 CardRuntime::Failed("Fixture terminal failed to attach".into()),
             );
+            let reason = app.startup_pane_check().unwrap_err();
+            let title = app.card_display_title(app.card_state(card).unwrap());
             assert!(
-                app.startup_pane_check()
-                    .unwrap_err()
-                    .contains(&card.to_string())
+                reason.starts_with(&format!(
+                    "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+                )),
+                "{program}: {reason}"
             );
             app.cards.remove(&card);
             assert_eq!(

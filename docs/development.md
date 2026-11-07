@@ -510,7 +510,17 @@ builds counted include those the host's own gate admits in its shared
 families, through the registry described [above](#sharing-a-host-between-several-checkouts),
 where these slots record their builds in turn. A plain
 `cargo test` runs its tests there, in the slot, which stays leased until they
-end. One build's
+end. Cargo builds everything a test run needs before it runs any test, so the
+compile's expected peak stops applying once it only runs executables it built
+into a `deps` directory: from then on the slot is priced at the most its
+processes have held since its tests began, sampled every 2 s, and never below
+2 GiB. Builds the host admits meanwhile may take the memory the compile no
+longer reserves, while whatever the tests hold stays counted. Growth beyond
+that peak is not reserved, as the memory of tests the gate runs on this host
+is not; memory pressure then holds further builds back. Running a compiler or build
+script again, as doctests do, prices it as a build again. Without this, slots
+running only tests on fw16 reserved about 18 of its 26 GiB available, and
+queued builds waited beside idle slots. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
