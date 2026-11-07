@@ -12,7 +12,9 @@ the sources, and Cargo's messages with their paths turned into this host's.
 
 Each slot's checkout path never changes, so every worktree built in a slot
 reuses what the previous one compiled there, and the slot a worktree used
-last is preferred. While the host is unreachable, does not answer or is low
+last is preferred. With CAGENTS_BUILD_REMOTE_LOOPBACK=1, the build host's own
+commands build in its slots too, as another host's would, through a local
+stand-in for ssh. While the host is unreachable, does not answer or is low
 on disk, the command waits for it, saying so once a minute, within the gate's
 admission budget; it never builds here instead. Cargo commands that do not
 compile run here directly. A command that compiles but cannot run there
@@ -20,11 +22,13 @@ faithfully is refused with the reason.
 """
 
 import base64
+import contextlib
 import fcntl
 import hashlib
 import ipaddress
 import json
 import os
+import pwd
 import queue
 import re
 import resource
@@ -78,12 +82,21 @@ PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir",
 # Settings naming a path that only this repository's scripts read, never a
 # build or its tests; they stay here. A development instance's daemon gives
 # CAGENTS_DEVELOPMENT_HOSTED_BY, runtime directories on this host, to the
-# terminals and agents it hosts.
+# terminals and agents it hosts. scripts/native-evidence reads its own, such
+# as the CAGENTS_EVIDENCE_TASK its users export, whose builds come here.
 SCRIPT_SETTINGS = {"CAGENTS_ZIG", "CAGENTS_DEVELOPMENT_HOSTED_BY"}
+SCRIPT_PREFIXES = ("CAGENTS_EVIDENCE_",)
 RUN_MARKER = "cargo-offload-run "
 # What `--hold` gives the command it runs: the build host, the slot it holds
 # there and the checkout it holds it for, and a lock it keeps while it does.
 HELD = "CAGENTS_BUILD_OFFLOAD_HELD"
+# Set to 1, the build host's own commands build in its slots rather than
+# here: what they make comes back, and the slots keep the build output.
+LOOPBACK = "CAGENTS_BUILD_REMOTE_LOOPBACK"
+# How `--host` reports a build host that is this one, reached by loopback.
+LOOPBACK_MARK = "\tloopback"
+# The shell a loopback runs commands in, instead of the user's login shell.
+LOOPBACK_SHELL = "CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL"
 # Set beside CAGENTS_BUILD_METADATA, whose value it then owns: an empty one is
 # no metadata, and build.rs leaves the checkout alone. Its own value never
 # changes between commits, so watching it costs build.rs no reruns.
@@ -315,7 +328,8 @@ def path_settings(environment):
     such as the retained-actor helper the HOST tests execute."""
     return [name for name, value in sorted(environment.items())
             if name.startswith("CAGENTS_") and not name.startswith("CAGENTS_BUILD_")
-            and name not in SCRIPT_SETTINGS and value.startswith(("/", "~"))
+            and name not in SCRIPT_SETTINGS and not name.startswith(SCRIPT_PREFIXES)
+            and value.startswith(("/", "~"))
             and not secret(name)]
 
 
@@ -487,6 +501,65 @@ def is_this_host(host):
         lookup.join(1)
         addresses = set(found)
     return bool(addresses & (local_addresses() | {"127.0.0.1", "::1"}))
+
+
+# ssh's options that take a value, as `-o NAME=VALUE` does.
+SSH_VALUED = set("BbcDEeFIiJLlmOoPpQRSWw")
+
+
+def loopback_shell(arguments):
+    """Stands in for `ssh [OPTIONS] HOST COMMAND...` to this host. It runs
+    COMMAND as sshd would: in the user's login shell, from the home
+    directory, with only the basics a session starts from (the shell's own
+    configuration adds the rest), so nothing of the caller's build, such as
+    its CARGO_TARGET_DIR, reaches the slot. sshd's SSH_CONNECTION, ~/.ssh/rc
+    and ~/.ssh/environment have no counterpart. A control command (`-O`) has
+    no shared connection to act on.
+
+    The command reads its input through this process, as through an ssh
+    connection: when this ends, even by SIGKILL, the command sees its input
+    close and ends what it started, as the build host's agent does when its
+    caller's connection drops. A shell that does not `exec` its command
+    would otherwise leave that running."""
+    while arguments and arguments[0].startswith("-") and len(arguments[0]) > 1:
+        option = arguments.pop(0)
+        if option[1] == "O":
+            return 0
+        if option[1] in SSH_VALUED and len(option) == 2 and arguments:
+            arguments.pop(0)
+    if len(arguments) < 2:
+        say("loopback: missing host or command")
+        return 2
+    account = pwd.getpwuid(os.getuid())
+    shell = os.environ.get(LOOPBACK_SHELL) or account.pw_shell or "/bin/sh"
+    environment = {"HOME": account.pw_dir, "USER": account.pw_name,
+                   "LOGNAME": account.pw_name, "SHELL": shell,
+                   "PATH": "/usr/local/bin:/usr/bin:/bin"}
+    for name in ("LANG", "LC_ALL", "LC_CTYPE"):
+        if name in os.environ:
+            environment[name] = os.environ[name]
+    runtime = f"/run/user/{os.getuid()}"
+    if os.path.isdir(runtime):
+        environment["XDG_RUNTIME_DIR"] = runtime
+    home = account.pw_dir if os.path.isdir(account.pw_dir) else "/"
+    # ssh passes the command to the shell as one string, its words joined.
+    command = subprocess.Popen([shell, "-c", " ".join(arguments[1:])], env=environment,
+                               cwd=home, stdin=subprocess.PIPE)
+
+    def relay():
+        try:
+            while data := os.read(0, 65536):
+                command.stdin.write(data)
+                command.stdin.flush()
+        except OSError:
+            pass  # The command stopped reading; its status says why.
+        finally:
+            with contextlib.suppress(OSError):
+                command.stdin.close()
+    threading.Thread(target=relay, daemon=True).start()
+    status = command.wait()
+    sys.stdout.flush()
+    os._exit(status if status >= 0 else 128 - status)
 
 
 def resolve(name, found):
@@ -1502,8 +1575,9 @@ def sweep_connections(directory, age=120):
 
 
 class Offload:
-    def __init__(self, host, plan, environment):
+    def __init__(self, host, plan, environment, loopback=False):
         self.host = host
+        self.loopback = loopback
         self.plan = plan
         self.environment = environment
         self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 8)
@@ -1519,6 +1593,9 @@ class Offload:
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4",
         ]
+        if loopback:
+            # The same commands and copies, run here as ssh would run them there.
+            self.ssh = [sys.executable, os.path.abspath(__file__), "--loopback-shell"]
         self.control = None
         self.children = []
         self.command = None
@@ -1712,7 +1789,9 @@ class Offload:
         results it takes back) one ssh session to the host rather than one
         each: every session costs a login there, which its sshd audits. The
         session is this build's alone, so cancelling it, which ends what it
-        started, cuts no other build's."""
+        started, cuts no other build's. A loopback has no connection."""
+        if self.loopback:
+            return
         candidates = [self.environment.get("XDG_RUNTIME_DIR") or "", tempfile.gettempdir(), "/tmp"]
         for directory in dict.fromkeys(candidates):
             if not os.path.isdir(directory):
@@ -2237,8 +2316,8 @@ class Hold(Offload):
     they run and at the hold's cost again once they end. The slot stays
     leased until the command ends, so hold only for builds."""
 
-    def __init__(self, host, command, environment):
-        super().__init__(host, None, environment)
+    def __init__(self, host, command, environment, loopback=False):
+        super().__init__(host, None, environment, loopback)
         self.program = command
 
     def build_identity(self, directory):
@@ -2382,10 +2461,13 @@ def say(message):
 
 
 def main(arguments):
+    if arguments[:1] == ["--loopback-shell"]:
+        return loopback_shell(arguments[1:])
     # The gate passes on where it found builds go, so this cannot decide
     # otherwise, such as when a slow name lookup ends differently, and exit
     # FALL_BACK having built nothing. Nothing this starts inherits it.
     decided = os.environ.pop("CAGENTS_BUILD_OFFLOAD_HOST", "")
+    decided, loopback = decided.removesuffix(LOOPBACK_MARK), decided.endswith(LOOPBACK_MARK)
     environment = dict(os.environ)
     if arguments[:1] == ["--stamp"]:
         # The version stamp for a build here of the workspace the Cargo
@@ -2399,13 +2481,20 @@ def main(arguments):
         return 0
     # Only `local` builds here; an empty setting is no setting.
     host = decided or environment.get("CAGENTS_BUILD_REMOTE") or "fw16"
-    here = not decided and (host == "local" or is_this_host(host))
+    here = False
+    if not decided and host == "local":
+        here = True
+    elif not decided and is_this_host(host):
+        # The build host itself builds in place, unless asked to use its slots.
+        loopback = environment.get(LOOPBACK) == "1"
+        here = not loopback
     if arguments[:1] == ["--host"]:
-        # Where builds go: 0, printing the build host, or FALL_BACK when
-        # this host builds. Any other status is a failure.
+        # Where builds go: 0, printing the build host, marked when that is
+        # this host reached by loopback, or FALL_BACK when this host builds
+        # in place. Any other status is a failure.
         if here:
             return FALL_BACK
-        print(host)
+        print(host + (LOOPBACK_MARK if loopback else ""))
         return 0
     if here:
         return FALL_BACK
@@ -2413,7 +2502,7 @@ def main(arguments):
         if len(arguments) < 2:
             say("missing command for --hold")
             return 2
-        return Hold(host, arguments[1:], environment).run()
+        return Hold(host, arguments[1:], environment, loopback).run()
     try:
         plan = parse(arguments)
     except Refusal as refusal:
@@ -2422,7 +2511,7 @@ def main(arguments):
     if plan is None:
         cargo = real_cargo(environment)
         os.execvp(cargo, [cargo, *arguments])
-    return Offload(host, plan, environment).run()
+    return Offload(host, plan, environment, loopback).run()
 
 
 if __name__ == "__main__":
