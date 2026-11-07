@@ -510,6 +510,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
     if let Some(work) = work {
         work.unwatch(client_id);
+        work.unwatch_conversation(client_id);
     }
 }
 
@@ -1201,6 +1202,33 @@ pub(super) fn process_request(
                 ServerResponse::Work(crate::work::Response::Watching {
                     revision,
                     board: Box::new(board),
+                }),
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::WatchConversationPullRequests { conversation } => {
+            drop(_shared);
+            let (work, delivery) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.work.clone(),
+                    state.clients.get(&client_id).map(Arc::downgrade),
+                )
+            };
+            let unavailable = |message: &str| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            };
+            let work = work.ok_or_else(|| unavailable("The Work board is unavailable"))?;
+            let delivery =
+                delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
+            let (revision, pull_requests) = work
+                .watch_conversation(host, client_id, conversation, delivery)
+                .map_err(|message| unavailable(&message))?;
+            Ok((
+                ServerResponse::Work(crate::work::Response::WatchingConversation {
+                    revision,
+                    pull_requests: Box::new(pull_requests),
                 }),
                 Vec::new(),
                 false,
