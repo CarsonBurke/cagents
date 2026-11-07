@@ -231,6 +231,7 @@ impl Listing {
                         run: None,
                         skip: Some(automations::SkipReason::Capacity),
                         diagnostic: None,
+                        skipped_occurrences: None,
                     }]
                 } else {
                     vec![]

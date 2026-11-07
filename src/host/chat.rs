@@ -2755,6 +2755,11 @@ fn process_inner(
             if let Some(session) = capacity::prepare_saved_history(host, &source)? {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
+            // A card still attached to an actor whose provider exited under
+            // this daemon resumes the same way as one a daemon stop ended:
+            // the exited actor is retired as a stop first, so the checks
+            // below find its verified retirement rather than a present owner.
+            retained_actor::finish_exited_attachment(host, &source).map_err(unavailable)?;
             // An unnamed pane resumes the conversation its ended actors
             // confirmed, through the same checks as a named one; when they
             // confirmed none, every actor's end is already proved and the

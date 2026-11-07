@@ -52,7 +52,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 21;
+const SCHEMA_VERSION: u32 = 22;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -706,6 +706,10 @@ fn migrate_through(
         automation_attention::migrate(tx)?;
         schema::migration_checkpoint(21)?;
     }
+    if version < 22 && target >= 22 {
+        automations::migrate_history(tx)?;
+        schema::migration_checkpoint(22)?;
+    }
     Ok(())
 }
 
@@ -1243,7 +1247,12 @@ mod tests {
         registry
             .db
             .execute_batch(
-                "DROP TABLE automation_run_attention;
+                "DROP TABLE automation_precheck_history_cleanup;
+                 DROP TABLE automation_retired_manual_requests;
+                 DROP INDEX automation_removed_history;
+                 DROP INDEX automation_firing_successors;
+                 ALTER TABLE automation_firings DROP COLUMN previous_firing;
+                 DROP TABLE automation_run_attention;
                  DROP TABLE shared_terminal_retention_pins;
                  DROP TABLE terminal_retention_pins;
                  DROP TABLE automation_notifications;

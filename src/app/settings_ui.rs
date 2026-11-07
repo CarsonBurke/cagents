@@ -288,9 +288,9 @@ fn settings_category_controls<'a>(
         SettingsCategory::About => {
             let updates = &context.updates;
             let version = if crate::instance::NAME == "development" {
-                format!("{} (development build)", crate::VERSION)
+                format!("{} (development build)", crate::version())
             } else {
-                crate::VERSION.to_owned()
+                crate::version().to_owned()
             };
             let status = design::body(updates.status.clone())
                 .wrapping(iced::widget::text::Wrapping::Word)

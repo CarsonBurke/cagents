@@ -1921,6 +1921,22 @@ impl ClientHandle {
         {
             return Err("Only an exact explicit history start can be retried".into());
         }
+        if intent == Intent::Resume
+            && (source.is_some()
+                || terminate_source
+                || selection.is_some()
+                || account_recovery.is_some()
+                || upgrade_expected.is_some()
+                || session.launch.provider != crate::agent::Provider::Claude
+                || !matches!(
+                    session.native_continuity,
+                    super::NativeContinuity::RetainedClaudeActor { .. }
+                ))
+        {
+            return Err(StartFailure::from(
+                "Only a Claude conversation whose provider stopped can be resumed in its card",
+            ));
+        }
         if let Some(expected) = &upgrade_expected
             && (intent != Intent::Restore
                 || source.is_some()
@@ -2021,6 +2037,32 @@ impl ClientHandle {
                 source: source
                     .ok_or("Selected conversation activation requires a proven source terminal")?,
                 token,
+            }
+        } else if intent == Intent::Resume {
+            // Only this daemon's own proof names the ended actor it still
+            // holds. A card from an earlier incarnation has no actor here to
+            // retire, and its ordinary restore already resumes it from disk.
+            if session.proof.as_ref() != Some(&proof) {
+                restore(
+                    &mut stream,
+                    &mut codec,
+                    &mut attach_request,
+                    &proof,
+                    session,
+                    &mut upgrade_recovery,
+                    &mut resumed_from,
+                    false,
+                )?
+            } else {
+                resume_retained_claude(
+                    &mut stream,
+                    &mut codec,
+                    &mut attach_request,
+                    &proof,
+                    session,
+                    &mut resumed_from,
+                    None,
+                )?
             }
         } else if intent == Intent::Start {
             let execution_environment = native_environment(&session, source.is_none());

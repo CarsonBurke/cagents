@@ -36,6 +36,8 @@ Options:
   -h, --help                Show this help
 ";
 
+cagents::stamp_version!();
+
 pub(crate) fn main() -> std::process::ExitCode {
     main_with_before_start(|| Ok(()))
 }
@@ -99,7 +101,7 @@ pub(crate) fn main_with_before_start(
     // unobservable, because the subscriber was installed after it.
     cagents::instance::install_panic_hook(PRODUCT);
     cagents::instance::install_tracing(PRODUCT, DEFAULT_LOG_FILTER);
-    tracing::info!(version = cagents::VERSION, "starting cagents-ui");
+    tracing::info!(version = cagents::version(), "starting cagents-ui");
 
     let main_thread = std::thread::current().id();
     let previous_hook = std::panic::take_hook();
@@ -343,7 +345,7 @@ fn parse<'a>(arguments: &'a [String]) -> Result<Option<Options<'a>>, Box<dyn std
                 return Ok(None);
             }
             "--version" | "-V" => {
-                println!("{PRODUCT} {}", cagents::VERSION);
+                println!("{PRODUCT} {}", cagents::version());
                 return Ok(None);
             }
             // Naming the accepted arguments matters more here than for most

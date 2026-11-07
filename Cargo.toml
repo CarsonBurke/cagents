@@ -35,7 +35,6 @@ host = [
     "dep:base64",
     "dep:hmac",
     "dep:image",
-    "dep:imara-diff",
     "dep:ksni",
     "dep:libghostty-vt",
     "dep:notify",
@@ -63,7 +62,6 @@ ui = [
     "image/bmp",
     "image/ico",
     "image/tiff",
-    "dep:imara-diff",
     "dep:jiff",
     "dep:libcosmic",
     "dep:lsp-types",
@@ -240,7 +238,7 @@ keyboard-types = { version = "=0.8.3", features = ["serde"], optional = true }
 # `highlighter` backs the editor's syntax highlighting; it is not in libcosmic's
 # default set and the editor is the only consumer.
 libcosmic = { git = "https://github.com/pop-os/libcosmic.git", rev = "caec74c2559924443f12fc6faf97a5bcefe6271d", default-features = false, features = ["a11y", "highlighter", "markdown", "multi-window", "surface-message", "tokio", "wgpu", "winit", "xdg-portal"], optional = true }
-imara-diff = { version = "0.2.0", optional = true }
+imara-diff = "0.2.0"
 ksni = { version = "0.3.6", optional = true }
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }

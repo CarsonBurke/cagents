@@ -103,6 +103,8 @@ fn every_read_can_skip_daemon_start_through_flag_or_environment() {
             vec!["project", "list"],
             vec!["sessions"],
             vec!["whoami"],
+            vec!["sessions", "--channel"],
+            vec!["transcript", "0000"],
             vec!["account", "info"],
             vec!["daemon", "start"],
         ] {

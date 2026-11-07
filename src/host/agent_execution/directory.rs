@@ -6,9 +6,11 @@ use crate::{
     agent::{ActivityState, Provider},
     agent_execution::{
         Authority, Lineage, Origin,
-        directory::{Delegation, Directory, Entry, Owner, Relation, Scope, Surface},
+        directory::{
+            Delegation, Directory, Entry, Member, Members, Owner, Relation, Scope, Surface,
+        },
     },
-    model::TerminalId,
+    model::{ChannelId, TerminalId},
     project_location::{Placement, place},
 };
 use std::{
@@ -24,6 +26,33 @@ pub(in crate::host) struct Live {
     pub(in crate::host) title: Option<String>,
     pub(in crate::host) state: ActivityState,
     pub(in crate::host) directory: PathBuf,
+    /// A chat whose provider exited; only channel listings include one.
+    pub(in crate::host) exited: bool,
+    pub(in crate::host) failure: Option<String>,
+}
+
+/// A failure is context in a listing, not a diagnostic dump.
+const FAILURE_BYTES: usize = 300;
+
+/// Which sessions a listing returns.
+pub(super) enum Wanted {
+    Scope(Scope),
+    /// Members of this channel, or of the caller's own when absent.
+    Channel(Option<ChannelId>),
+}
+
+/// Sessions with the state a member view reports.
+pub(super) struct Listing {
+    pub(super) caller: Option<Member>,
+    pub(super) sessions: Vec<Member>,
+    /// What was served: a directory widened to `All`, or the caller's channel.
+    pub(super) served: Wanted,
+}
+
+impl Listing {
+    pub(super) fn members(&self) -> impl Iterator<Item = &Member> {
+        self.caller.iter().chain(&self.sessions)
+    }
 }
 
 pub(super) fn read(
@@ -31,10 +60,67 @@ pub(super) fn read(
     authority: &Authority,
     scope: Scope,
 ) -> Result<Directory, String> {
+    let listing = list(host, authority, Wanted::Scope(scope), false)?;
+    let Wanted::Scope(scope) = listing.served else {
+        unreachable!("a directory read serves a scope");
+    };
+    Ok(Directory {
+        caller: listing.caller.map(|member| member.session),
+        scope,
+        sessions: listing
+            .sessions
+            .into_iter()
+            .map(|member| member.session)
+            .collect(),
+    })
+}
+
+/// The sessions in a channel, including chats whose provider exited.
+pub(super) fn channel(
+    host: &SharedHost,
+    authority: &Authority,
+    channel: Option<ChannelId>,
+) -> Result<Members, String> {
+    let mut listing = list(host, authority, Wanted::Channel(channel), true)?;
+    let Wanted::Channel(Some(channel)) = listing.served else {
+        unreachable!("a channel read serves one channel");
+    };
+    // How recently each session worked is what a reader picking up a
+    // channel's work needs first; it costs a file lookup per session, so only
+    // the small channel listing pays for it.
+    for member in listing.caller.iter_mut().chain(&mut listing.sessions) {
+        member.active_at = super::transcript::source(host, member.session.id, false)
+            .ok()
+            .and_then(|source| source.modified());
+    }
+    // Whoever worked most recently is likeliest the one to pick up from.
+    listing
+        .sessions
+        .sort_by_key(|member| std::cmp::Reverse(member.active_at));
+    Ok(Members {
+        channel,
+        caller: listing.caller,
+        sessions: listing.sessions,
+    })
+}
+
+/// The listing behind every directory read. A view of individual members, as
+/// of one channel or one session's history, also includes chats whose
+/// provider exited, and names each session only by its own title: the
+/// channel's title, a fallback elsewhere, would label every member alike.
+pub(super) fn list(
+    host: &SharedHost,
+    authority: &Authority,
+    wanted: Wanted,
+    members: bool,
+) -> Result<Listing, String> {
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
     let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
     let mut live = live_sessions(host);
+    if members {
+        live.extend(exited_chats(host));
+    }
     let (model, delegations, lineages) = {
         let registry = registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -91,13 +177,23 @@ pub(super) fn read(
             .or_insert_with(|| place(directory, &model));
         (placement.worktree.clone(), placement.project.clone())
     };
-    let (scope, wanted) = match scope {
-        Scope::All => (Scope::All, None),
-        Scope::Containing(directory) => match place_cached(&directory).1 {
-            Some(project) => (Scope::Project(project.clone()), Some(project)),
-            None => (Scope::All, None),
+    let (served, wanted) = match wanted {
+        Wanted::Channel(Some(channel)) if model.channel(channel).is_none() => {
+            return Err(format!(
+                "No channel {channel}; list them with `cagents channel list`"
+            ));
+        }
+        // Resolved against the caller's own entry below.
+        Wanted::Channel(channel) => (Wanted::Channel(channel), None),
+        Wanted::Scope(Scope::All) => (Wanted::Scope(Scope::All), None),
+        Wanted::Scope(Scope::Containing(directory)) => match place_cached(&directory).1 {
+            Some(project) => (
+                Wanted::Scope(Scope::Project(project.clone())),
+                Some(project),
+            ),
+            None => (Wanted::Scope(Scope::All), None),
         },
-        Scope::Project(path) => {
+        Wanted::Scope(Scope::Project(path)) => {
             let project = if model.project(&path).is_some() {
                 path
             } else if path.is_relative() {
@@ -107,21 +203,34 @@ pub(super) fn read(
                     .1
                     .ok_or_else(|| format!("No open project contains {}", path.display()))?
             };
-            (Scope::Project(project.clone()), Some(project))
+            (
+                Wanted::Scope(Scope::Project(project.clone())),
+                Some(project),
+            )
         }
     };
 
     let scopes = session_scopes(&model);
+    let view_scope = |id: TerminalId| {
+        scopes
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| delegations.get(&id).map(|(_, scope)| scope.clone()))
+    };
+    let channel_of = |scope: &Option<crate::agent_execution::Placement>| match scope {
+        Some(crate::agent_execution::Placement::Channel(id)) => Some(*id),
+        _ => None,
+    };
+    let caller_channel = caller.and_then(|caller| channel_of(&view_scope(caller)));
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
-        let (delegation, delegated_scope) = delegations.get(&live.id).cloned().unzip();
-        let view_scope = scopes.get(&live.id).cloned().unwrap_or(delegated_scope);
-        let channel = match &view_scope {
-            Some(crate::agent_execution::Placement::Channel(id)) => Some(*id),
-            _ => None,
-        };
+        let delegation = delegations
+            .get(&live.id)
+            .map(|(delegation, _)| delegation.clone());
+        let view_scope = view_scope(live.id);
+        let channel = channel_of(&view_scope);
         let relation = if Some(live.id) == caller {
             Relation::Myself
         } else if Some(lineage(live.id)) == parent {
@@ -147,9 +256,12 @@ pub(super) fn read(
                 .and_then(|id| model.channel(id))
                 .map(|channel| channel.repository.clone()),
             provider: live.provider,
-            // Channel metadata supplies a fallback when the provider has no title.
+            // Channel metadata supplies a fallback when the provider has no
+            // title, except where it would name the caller's own channel, or
+            // every member of one alike.
             title: live.title.or_else(|| {
                 channel
+                    .filter(|channel| !members && Some(*channel) != caller_channel)
                     .and_then(|channel| model.channel(channel))
                     .map(|channel| channel.title.clone())
             }),
@@ -165,13 +277,49 @@ pub(super) fn read(
             relation,
             lineage: lineage(live.id),
         };
+        let member = Member {
+            session: entry,
+            exited: live.exited,
+            failure: live.failure.map(|failure| {
+                let mut failure = match live.provider {
+                    Some(provider) => {
+                        crate::chat::failure::summary(provider, &failure).into_owned()
+                    }
+                    None => failure,
+                };
+                if crate::agent_execution::truncate(&mut failure, FAILURE_BYTES) {
+                    failure.push('…');
+                }
+                failure
+            }),
+            active_at: None,
+        };
         if relation == Relation::Myself {
-            me = Some(entry);
+            me = Some(member);
         } else {
-            sessions.push(entry);
+            sessions.push(member);
         }
     }
-    sessions.sort_by_cached_key(|entry| {
+    let served = match served {
+        Wanted::Channel(channel) => {
+            let channel = channel
+                .or_else(|| me.as_ref().and_then(|me: &Member| me.session.channel))
+                .ok_or(
+                    "This caller is not in a channel; name one with --channel CHANNEL, \
+                     from `cagents channel list`",
+                )?;
+            sessions.retain(|member| member.session.channel == Some(channel));
+            if me
+                .as_ref()
+                .is_some_and(|me| me.session.channel != Some(channel))
+            {
+                me = None;
+            }
+            Wanted::Channel(Some(channel))
+        }
+        served => served,
+    };
+    sessions.sort_by_cached_key(|Member { session: entry, .. }| {
         (
             match entry.relation {
                 Relation::Parent => 0,
@@ -191,10 +339,10 @@ pub(super) fn read(
             entry.title.clone(),
         )
     });
-    Ok(Directory {
+    Ok(Listing {
         caller: me,
-        scope,
         sessions,
+        served,
     })
 }
 
@@ -242,6 +390,8 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             title: record.handle.title(),
             state: record.handle.activity(),
             directory: record.session.launch.recipe.working_directory.clone(),
+            exited: false,
+            failure: record.handle.failure(),
         });
     }
     for (id, record) in &state.terminals {
@@ -261,9 +411,32 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             title: record.conversation_title().map(str::to_owned),
             state: activity.map_or(ActivityState::Unknown, |activity| activity.state),
             directory: record.current_directory().to_path_buf(),
+            exited: false,
+            failure: None,
         });
     }
     live
+}
+
+/// Chats whose provider exited but whose pane remains, so their
+/// conversation can still be read.
+fn exited_chats(host: &SharedHost) -> Vec<Live> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state
+        .chats
+        .iter()
+        .filter(|(_, record)| record.handle.is_completed())
+        .map(|(id, record)| Live {
+            id: *id,
+            surface: Surface::Chat,
+            provider: Some(record.session.launch.provider),
+            title: record.handle.title(),
+            state: ActivityState::Idle,
+            directory: record.session.launch.recipe.working_directory.clone(),
+            exited: true,
+            failure: record.handle.failure(),
+        })
+        .collect()
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views

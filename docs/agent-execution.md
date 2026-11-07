@@ -123,7 +123,7 @@ for the full report contract.
 
 ## Finding other sessions
 
-`cagents sessions` (alias `ls`) lists the live provider conversations in the current project, whoever started them. That includes native chats, provider CLIs running in terminals, delegated agents, and automations. `--project PATH` selects another open project; `--all` lists every project. A directory outside every open project lists everything, and the reply's `scope` says so.
+`cagents sessions` (alias `ls`) lists the live provider conversations in the current project, whoever started them. That includes native chats, provider CLIs running in terminals, delegated agents, and automations. `--project PATH` selects another open project; `--all` lists every project; `--channel` lists the caller's channel (see [Reading your channel](#reading-your-channel)). A directory outside every open project lists everything, and the reply's `scope` says so.
 
 ```sh
 cagents ls
@@ -140,6 +140,35 @@ cagents whoami
 Each entry carries the live session ID, provider, `Idle`/`Working`/`Waiting` state, working directory, checkout (repository or linked worktree), project, and, for delegated agents, the owner and latest run. `relation` places it relative to the caller: `Myself`, `Parent` (a session of the lineage that owns the caller), `Child` (an agent the caller may control; one started by a CLI outside cagents is shown as a user agent, because every such caller shares it), or `Peer`. A plain shell appears only as the caller or as the owner of a listed agent. `whoami` reports the calling session, its relatives, and peers working in the same checkout, which are the sessions most likely to collide with its edits.
 
 The caller's identity comes from its daemon-issued capability, never from an environment variable a process could set. A CLI outside cagents has no session of its own. Listing is read-only: the agent commands below remain restricted to an agent's owner. Inside a hosted session the lower-level `cagents terminal` commands are restricted too. That includes a plain shell, since an agent may be running in it. They still list, snapshot and wait on any terminal, but `write` and `close` reach only the terminals the session's lineage controls: its own session, the terminals it started with `cagents terminal spawn`, and the sessions and consoles of the agents it delegated to. To reach anyone else's, message its owner. The daemon records which lineage started each terminal, from registry schema version 6, so this survives a reconnect and a daemon restart; a terminal relaunched in its card keeps its owner. A spawn from inside a session may start a new terminal but not relaunch an existing one. The check applies to the connection the CLI authenticates with the session's capability, which also refuses everything outside the terminal surface. Like a CLI outside cagents, a process that reaches the daemon socket without authenticating acts for the user. So does a command run with `CAGENTS_AGENT_AUTHORITY` unset, which a person at a hosted shell can use to act as themselves. Session IDs address the live process; a relaunched or recovered conversation is listed under a new ID. Its `lineage`, printed beneath a session whose lineage differs from its ID, names the root session it succeeds and stays the same across those relaunches and recoveries.
+
+## Reading your channel
+
+`cagents ls --channel` lists the sessions in the caller's channel, or in `--channel CHANNEL`. It includes native chats whose provider has exited, for example after a usage limit, until their card is closed, and lists the most recently active first, with when each conversation was last saved. With `--json` it returns `data.channel`, plus `data.me` (when the caller is in that channel) and `data.sessions`. Each member holds its directory entry as `session`, with `exited`, `failure` and `active_at` (Unix milliseconds). `whoami` marks the peers that share the caller's channel.
+
+`cagents transcript SESSION` (alias `history`) reads a page of another session's conversation from the provider's own saved history: Claude's project transcript or Codex's rollout, including an archived one. It names sessions as `cagents send` does. The daemon locates the file from that session's own launch: provider, conversation, working directory and account home. Callers never pass a path. Reading neither starts the provider nor requires it to be running, and it grants no control, like listing.
+
+```sh
+cagents ls --channel
+cagents transcript 7c0f
+cagents transcript 7c0f --before 3f2a1b7c-0d9e-4c8b-a7f6-5e4d3c2b1a00
+cagents transcript 7c0f --tools --full --json
+```
+
+```text
+Session 7c0fba49-2f0e-4b8e-9d0a-1c2b3d4e5f60 (claude, exited), active 12 min ago
+Failed: Claude usage limit reached · resets 3pm
+Earlier: cagents transcript 7c0f --before 3f2a1b7c-0d9e-4c8b-a7f6-5e4d3c2b1a00
+
+[user]
+  The login test fails one run in ten; find out why.
+
+[tools] Run ×9, Read ×4, Edit ×2; edited tests/login.rs, src/auth.rs
+
+[assistant]
+  The session cookie expires during the retry loop. I extended its lifetime in the fixture and ...
+```
+
+A page holds the last `--limit` messages (10 by default, at most 200): user messages, assistant text, messages delivered by other sessions and reports from subagents. Notices between them, including Claude's compaction summaries and Codex's compaction markers, come along. Each run of consecutive tool calls folds into one line with counts, failures and edited paths; `--tools` lists every call with clipped output instead. Messages are clipped to 2,000 bytes and notices to 600, with the omitted size shown; `--full` keeps them whole, except that a Codex command's output is kept to 64 KiB. The page lists oldest first, so the newest message is last. Each entry's text is indented under its label, so text that quotes another transcript cannot read as an entry. A failure is summarized in one line. A listing of one channel, and a transcript's heading, show only a session's own title, never its channel's. Its `Earlier:` line gives the command for the previous page, with the same options. `--json` returns the session as a channel listing reports it, the entries with their IDs and the `earlier` cursor. A forked Codex thread includes the history it replays from its parent; Codex's own instructions and environment context are left out. Reasoning never appears, and tool output appears only with `--tools`. A provider CLI in a terminal is read from the conversation it is resuming or was last seen in. Omp conversations cannot be read yet.
 
 ## Messages between sessions
 
@@ -179,7 +208,7 @@ A message body is at most 64 KiB, and a lineage holds at most 64 undelivered mes
 
 ## Console surface
 
-`--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console streams a bounded transcript, structured usage, run outcomes, approvals, and questions.
+`--surface terminal` creates a real hosted terminal running a cagents console over the same native provider actor. It does not launch another provider process and does not emulate the provider's stock TUI. The console prints what the agent said and one line per finished step, plus a line for any step still running after a few seconds; command output, tool payloads and delivered reports are left out. It also prints run outcomes with their token usage, approvals, and questions. A line appears once it is complete, and a step that finishes after later text was printed appears as one new line, so the transcript is not reprinted.
 
 - Ordinary input submits a new durable run.
 - `/interrupt` requests interruption through the native adapter. It refuses an interruption that would stop running background subagents; `/interrupt --including-subagents` permits that wider impact. A successful interrupt takes the agent over; a refusal leaves its owner in control.

@@ -79,8 +79,8 @@ pub(crate) struct BuildIdentity {
 impl BuildIdentity {
     pub(crate) fn current(kind: Kind) -> Self {
         Self {
-            version: crate::VERSION.into(),
-            commit: crate::VERSION
+            version: crate::version().into(),
+            commit: crate::version()
                 .split("+local.")
                 .nth(1)
                 .and_then(|metadata| metadata.split('.').next())
@@ -292,7 +292,7 @@ pub(crate) fn connect(path: &Path) -> io::Result<std::os::unix::net::UnixStream>
 impl Record {
     pub(crate) fn is_outdated(&self) -> bool {
         self.build.as_ref().is_none_or(|build| {
-            build.version != crate::VERSION
+            build.version != crate::version()
                 || (self.kind == Kind::Native
                     && !build
                         .capabilities
