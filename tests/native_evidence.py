@@ -804,6 +804,22 @@ class Evidence(unittest.TestCase):
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
 
+    def test_a_sessions_builds_never_start_the_pruner(self) -> None:
+        # Its runner's builds replay what `build` made. Their disk guard would
+        # otherwise start the account's pruner, under the fixture's HOME,
+        # while the app is being captured.
+        self.built()
+        self.run_tool("start", "after", extra={"CAGENTS_BUILD_FREE_FLOOR_GIB": "7"})
+        for _ in range(100):
+            if (self.logs / "runner-env").exists():
+                break
+            time.sleep(0.05)
+        runner = (self.logs / "runner-env").read_text()
+        self.assertIn("CAGENTS_BUILD_FREE_FLOOR_GIB=0\n", runner)
+        # Only the runner's: the fixture's other commands keep their guard.
+        self.assertNotIn("CAGENTS_BUILD_FREE_FLOOR_GIB=", self.run_tool("cli", "print-env").stdout)
+        self.run_tool("stop")
+
     def killed_supervisor_processes(self, signal: int, extra: dict | None = None) -> None:
         self.built()
         self.run_tool("start", "after", extra=extra)

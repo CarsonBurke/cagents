@@ -44,6 +44,7 @@ import contextlib
 import fcntl
 import math
 import os
+import pwd
 import re
 import shutil
 import stat
@@ -52,7 +53,20 @@ import sys
 import time
 from pathlib import Path
 
-HOME = Path.home()
+
+def account_home() -> Path:
+    """The account's home from the password database, or $HOME for a user
+    it has no entry for, such as a container's arbitrary one."""
+    try:
+        return Path(pwd.getpwuid(os.geteuid()).pw_dir)
+    except KeyError:
+        return Path.home()
+
+
+# The account's home, whose build output this prunes, and $HOME: a fixture or
+# a native-evidence session runs builds, and so this, under a private HOME
+# that holds none of it, and a user may keep builds under a HOME of their own.
+HOMES = list(dict.fromkeys((account_home(), Path.home())))
 MIRROR = Path("/var/tmp/cargo-build")
 LOCK_NAMES = (".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock")
 PRUNED = re.compile(r"^\.(?P<name>.+)\.cagents-pruned-(?P<pid>\d+)$")
@@ -62,11 +76,12 @@ EVIDENCE_TASK = ".native-evidence"
 
 
 def default_roots() -> list[Path]:
-    return [HOME / ".cache", HOME / ".local/state", Path("/var/tmp")]
+    return [home / place for home in HOMES for place in (".cache", ".local/state")] + \
+        [Path("/var/tmp")]
 
 
 def never() -> list[Path]:
-    return [HOME / ".local/share", HOME / ".cache/cagents-offload"]
+    return [home / place for home in HOMES for place in (".local/share", ".cache/cagents-offload")]
 
 
 def within(path: Path, parents: list[Path]) -> bool:
@@ -365,8 +380,9 @@ def nonnegative(value: str) -> float:
 def main() -> int:
     parser = argparse.ArgumentParser(
         description=__doc__.split("\n\n")[0],
-        epilog="Roots default to ~/.cache, ~/.local/state and /var/tmp, or "
-               "CAGENTS_BUILD_PRUNE_ROOTS (colon-separated) when set.")
+        epilog="Roots default to ~/.cache and ~/.local/state, of both the account's "
+               "home and HOME when they differ, and /var/tmp, or CAGENTS_BUILD_PRUNE_ROOTS "
+               "(colon-separated) when set.")
     parser.add_argument("--apply", action="store_true", help="remove (default: only report)")
     parser.add_argument("--max-idle", type=nonnegative, default=7.0, metavar="DAYS",
                         help="remove build directories unwritten this long (default 7)")

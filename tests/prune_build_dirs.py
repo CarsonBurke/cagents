@@ -2,7 +2,9 @@
 """Exercise scripts/prune-build-dirs on private directories only."""
 
 import fcntl
+import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import sys
@@ -265,6 +267,48 @@ class PruneBuildDirs(unittest.TestCase):
         self.prune("--evidence-hours", "0")
         self.assertFalse(after.exists())
         self.assertFalse(before.exists())
+
+    def test_a_moved_home_still_searches_the_accounts_own(self):
+        # A fixture's builds, and so the pruner they start, run under a
+        # private HOME that holds none of the account's builds. Searching only
+        # that would find nothing, yet stamp the schedule.
+        account = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        self.assertNotEqual(account, self.home)
+        roots, never = self.homes()
+        self.assertEqual(roots, [str(account / ".cache"), str(account / ".local/state"),
+                                 str(self.home / ".cache"), str(self.home / ".local/state"),
+                                 "/var/tmp"])
+        # Both homes' installs and offload slots stay untouched.
+        for home in (account, self.home):
+            for place in (".local/share", ".cache/cagents-offload"):
+                self.assertIn(str(home / place), never)
+
+    def test_an_account_without_a_password_entry_searches_its_home(self):
+        # As a container's arbitrary user is.
+        roots, never = self.homes(registered=False)
+        self.assertEqual(roots, [str(self.home / ".cache"), str(self.home / ".local/state"),
+                                 "/var/tmp"])
+        self.assertEqual(never, [str(self.home / ".local/share"),
+                                 str(self.home / ".cache/cagents-offload")])
+
+    def homes(self, registered=True):
+        """The pruner's default roots and never-touched directories."""
+        probe = """
+import importlib.machinery, importlib.util, json, pwd, sys
+def unregistered(uid):
+    raise KeyError(uid)
+if sys.argv[2] == "unregistered":
+    pwd.getpwuid = unregistered
+loader = importlib.machinery.SourceFileLoader("pruner", sys.argv[1])
+pruner = importlib.util.module_from_spec(importlib.util.spec_from_loader("pruner", loader))
+loader.exec_module(pruner)
+print(json.dumps([[str(path) for path in pruner.default_roots()],
+                  [str(path) for path in pruner.never()]]))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(PRUNER), "registered" if registered else "unregistered"],
+            env=self.env, capture_output=True, text=True, check=True, timeout=30)
+        return json.loads(result.stdout)
 
     def test_kept_and_protected_directories_stay(self):
         kept = self.target(self.roots / "repo/target")

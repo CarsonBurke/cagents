@@ -668,9 +668,13 @@ run_app() {
     session_path=$state/session-bin:
     # The runner still calls scripts/cargo-gate, which must not join the shared queue.
     # Its builds replay the recorded ones through the session's cargo, here.
+    # They write nothing, so their disk guard is off: it would start the
+    # pruner, under this private HOME, beside the app being captured, and
+    # sync the file system for each one while the disk is low. Builds run
+    # inside the session once it is ready are not disk-guarded either.
     local status=0
     fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
-        CAGENTS_BUILD_REMOTE=local \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
