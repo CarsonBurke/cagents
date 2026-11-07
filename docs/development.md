@@ -310,7 +310,8 @@ starter has ended is usually safe to stop. Daemons started another way have no
 record, and no runner session to stop, so the listing names their process ID;
 `kill PID` ends such a daemon and its jobs. The listing says when a daemon hosts
 the session that runs it, or one that started it, or is the login session's own
-development daemon, instead of offering a stop command. It finds development
+development daemon, instead of offering a stop command. In a cagents session
+whose hosts can't be told, it offers none. It finds development
 daemons by the instance lock they hold, so it also lists those built outside a
 checkout's `target/`.
 

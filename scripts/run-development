@@ -134,11 +134,11 @@ caller_host_runtimes() {
     process=$$
     while [ "${process:-0}" -gt 1 ]; do
         if runs_daemon "$process"; then
-            base=$(process_variable "$process" XDG_RUNTIME_DIR) || base=
+            base=$(process_variable "$process" XDG_RUNTIME_DIR)
             case $base in
                 /*)
                     printf '%s/cagents\n%s/cagents-development\n' "$base" "$base"
-                    name=$(process_variable "$process" CAGENTS_DEVELOPMENT_INSTANCE) || name=
+                    name=$(process_variable "$process" CAGENTS_DEVELOPMENT_INSTANCE)
                     [ -z "$name" ] || printf '%s/cagents-development-%s\n' "$base" "$name"
                     ;;
                 *) printf '%s\n' '?' ;;
@@ -150,6 +150,13 @@ caller_host_runtimes() {
             break
         }
     done | awk '!seen[$0]++'
+}
+
+# Whether a hosted caller's hosts, as caller_host_runtimes lists them, can't be
+# told. Like the CLI, a session cagents hosts then stops nothing.
+hosts_unknown() {
+    [ -n "${CAGENTS_AGENT_AUTHORITY+x}" ] || return 1
+    [ -z "$1" ] || printf '%s\n' "$1" | grep -qxF '?'
 }
 
 # Who an instance belongs to: in a session cagents hosts, the process that
@@ -194,7 +201,7 @@ holds_open() {
 
 list_development_instances() {
     found=false
-    hosts=$(caller_host_runtimes) || hosts=
+    hosts=$(caller_host_runtimes)
     harness=false
     ! command -v niri-harness >/dev/null 2>&1 || harness=true
     for status in /proc/[0-9]*/status; do
@@ -240,6 +247,8 @@ list_development_instances() {
         fi
         if printf '%s\n' "$hosts" | grep -qxF "$directory"; then
             stop='not from here: it hosts this session, or one that started it'
+        elif hosts_unknown "$hosts"; then
+            stop='not from here: which daemons host this session can'"'"'t be told'
         elif [ -z "$name" ] && [ "$runtime" = "/run/user/$(id -u)" ]; then
             stop='not from a cagents session: it is the login session'"'"'s own development daemon'
         elif [ -n "$name" ] && [ "$harness" = true ] &&
@@ -710,14 +719,13 @@ instance_cli_path() {
 refuse_hosting_session() {
     harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
     runtime=$(
+        unset XDG_RUNTIME_DIR
         eval "$harness_env"
         printf '%s' "${XDG_RUNTIME_DIR-}"
     )
     [ -n "$runtime" ] || return 0
-    hosts=$(caller_host_runtimes) || hosts='?'
-    # Like the CLI, a hosted caller whose hosts can't be told is refused.
-    if [ -n "${CAGENTS_AGENT_AUTHORITY+x}" ] &&
-        { [ -z "$hosts" ] || printf '%s\n' "$hosts" | grep -qxF '?'; }; then
+    hosts=$(caller_host_runtimes)
+    if hosts_unknown "$hosts"; then
         printf '%s\n' "cannot tell which daemons host this session, so instance $instance can't be told apart from them; stop it from a terminal outside cagents" >&2
         exit 1
     fi
@@ -731,6 +739,7 @@ refuse_hosting_session() {
 stop_instance_session() {
     harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
     runtime=$(
+        unset XDG_RUNTIME_DIR
         eval "$harness_env"
         printf '%s' "${XDG_RUNTIME_DIR-}"
     )
@@ -825,7 +834,11 @@ find_products
 # What the app is started with: the daemons hosting this session, for the
 # CLI's hosted stop check, because the app's own processes may leave this
 # session's process tree. The harness detaches an instance at once.
-hosted_by=$(caller_host_runtimes | grep -vxF '?') || hosted_by=
+hosts=$(caller_host_runtimes)
+if hosts_unknown "$hosts"; then
+    printf '%s\n' "warning: which daemons host this session can't all be told, so a session in this app could stop one of them" >&2
+fi
+hosted_by=$(printf '%s\n' "$hosts" | grep -vxF '?') || hosted_by=
 if [ -n "$hosted_by" ]; then
     export CAGENTS_DEVELOPMENT_HOSTED_BY="$hosted_by"
 else
@@ -848,6 +861,7 @@ if [ -n "$instance" ]; then
         "$products/cagents-ui" "$@"
     harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) &&
         record_owner "$(
+            unset XDG_RUNTIME_DIR
             eval "$harness_env"
             printf '%s' "${XDG_RUNTIME_DIR-}"
         )" || :

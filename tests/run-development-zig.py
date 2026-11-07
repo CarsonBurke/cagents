@@ -782,13 +782,23 @@ exit 83
             f"  started by: fixture-agent (pid {starter}), still running, in a cagents session")
         # Without a runner session, only its process can be named.
         self.assertTrue(block[4].startswith(f"  stop:       kill {process.pid} "), block)
+        # A session whose hosts can't be told is offered no way to stop it.
+        unknown = self.below_daemon(
+            ["--list-instances"], [f"XDG_RUNTIME_DIR={self.root / 'elsewhere'}"],
+            ["XDG_RUNTIME_DIR=relative"])
+        self.assertEqual(unknown.returncode, 0, unknown.stderr)
+        lines = unknown.stdout.splitlines()
+        index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
+        self.assertEqual(
+            lines[index + 4], "  stop:       not from here: which daemons host this session can't be told")
         shutil.rmtree(checkout)
         self.assertEqual(listing()[1], f"  checkout:   {checkout} (removed)")
         self.assertFalse(self.cargo_calls.exists(), "listing built")
 
-    def below_daemon(self, arguments, daemon_environment, **changes):
+    def below_daemon(self, arguments, daemon_environment, inner_environment=None, **changes):
         """Run the runner below a shell named cagentsd with `daemon_environment`,
-        as a session a daemon hosts is."""
+        as a session a daemon hosts is; with `inner_environment`, below a second
+        such daemon that runs below the first."""
         daemon = self.root / "daemon/cagentsd"
         if not daemon.exists():
             daemon.parent.mkdir()
@@ -798,8 +808,11 @@ exit 83
             environment.pop(name, None)
         environment.update(variable.split("=", 1) for variable in daemon_environment)
         # The trailing command keeps the shell from replacing itself.
+        command = [str(daemon), "-c", '"$@"; exit $?', "sh", str(self.runner), *arguments]
+        if inner_environment is not None:
+            command = [str(daemon), "-c", '"$@"; exit $?', "sh", "env", *inner_environment, *command]
         return subprocess.run(
-            [str(daemon), "-c", '"$@"; exit $?', "sh", str(self.runner), *arguments],
+            command,
             cwd=self.root, env=environment, capture_output=True, text=True, timeout=10)
 
     def fake_harness_session(self):
@@ -825,19 +838,21 @@ exit 1
         elsewhere = self.root / "elsewhere"
         hosts = "the daemon hosting this session"
         starter = "the daemons hosting the session that started this one"
-        for name, daemon_environment, refused in (
+        for name, daemon_environment, refused, *inner in (
             (hosts, [f"XDG_RUNTIME_DIR={runtime}"], "hosts this session"),
             (hosts + " under its instance name",
              [f"XDG_RUNTIME_DIR={runtime}", "CAGENTS_DEVELOPMENT_INSTANCE=hx"], "hosts this session"),
+            # A line that names no directory doesn't end the record.
             (starter, [f"XDG_RUNTIME_DIR={elsewhere}",
-                       f"CAGENTS_DEVELOPMENT_HOSTED_BY={elsewhere}/other\n{runtime}/cagents-development"],
+                       f"CAGENTS_DEVELOPMENT_HOSTED_BY={elsewhere}/other\nrelative\n{runtime}/cagents-development"],
              "hosts this session"),
-            ("a daemon whose runtime can't be read", ["XDG_RUNTIME_DIR=relative"], "cannot tell"),
+            ("a daemon above, nearer one whose runtime can't be read",
+             [f"XDG_RUNTIME_DIR={elsewhere}"], "cannot tell", ["XDG_RUNTIME_DIR=relative"]),
             ("a daemon elsewhere", [f"XDG_RUNTIME_DIR={elsewhere}",
                                     f"CAGENTS_DEVELOPMENT_HOSTED_BY={elsewhere}/other"], None),
         ):
             with self.subTest(name):
-                result = self.below_daemon(["--stop-instance", "hx"], daemon_environment)
+                result = self.below_daemon(["--stop-instance", "hx"], daemon_environment, *inner)
                 if refused:
                     self.assertEqual(result.returncode, 1, result.stderr)
                     self.assertIn(refused, result.stderr)
