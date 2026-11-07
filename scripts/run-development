@@ -12,6 +12,7 @@ hot=false
 log_file=
 instance=
 stop_instance=false
+list_instances=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --browserless) browserless=true ;;
@@ -40,6 +41,7 @@ while [ "$#" -gt 0 ]; do
                 exit 2
             }
             ;;
+        --list-instances) list_instances=true ;;
         --log-file)
             if [ "$#" -lt 2 ] || [ -z "$2" ]; then
                 printf '%s\n' "--log-file requires a path" >&2
@@ -69,7 +71,14 @@ Options:
   --stop-instance NAME
                    Stop that instance's daemon, its jobs and its session; keep
                    its storage
+  --list-instances List the development daemons running on this computer: their
+                   checkout, age, instance, who started them and how to stop them
   --help           Show this help
+
+A session hosted by cagents may stop or replace an instance it started, or any
+development daemon with a runtime directory of its own. It may not stop the
+daemon that hosts it or a session it descends from, nor the default development
+daemon in the login session.
 
 Environment:
   CAGENTS_ZIG      Absolute Zig path; zig env must report an executable named zig
@@ -91,6 +100,178 @@ USAGE
     esac
     shift
 done
+
+# What a process was started as and when, which tells it from a later process
+# given the same ID. The command name in parentheses may contain spaces.
+process_parent() {
+    sed 's/.*) [^ ]* \([0-9]*\) .*/\1/' "/proc/$1/stat" 2>/dev/null
+}
+process_start() {
+    sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | cut -d ' ' -f 20
+}
+runs_daemon() {
+    case $(readlink "/proc/$1/exe" 2>/dev/null) in
+        */cagentsd | */cagentsd' (deleted)') return 0 ;;
+    esac
+    return 1
+}
+process_variable() {
+    { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null | sed -n "s/^$2=//p" | head -n 1
+}
+process_hosted_by() {
+    { tr '\0' '\n' <"/proc/$1/environ"; } 2>/dev/null |
+        awk 'found && /^[A-Za-z_][A-Za-z0-9_]*=/ { exit }
+            /^CAGENTS_DEVELOPMENT_HOSTED_BY=/ { sub(/^[^=]*=/, ""); found = 1 }
+            found && /^\// { print }'
+}
+
+# The runtime directories of every daemon above this process, one per line,
+# as the CLI's hosted stop check finds them: each directory a daemon's
+# environment could select, and those of the daemons above the session that
+# started its instance, which the harness detached from that session. A
+# daemon whose runtime can't be read is a line with a single "?".
+caller_host_runtimes() {
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        if runs_daemon "$process"; then
+            base=$(process_variable "$process" XDG_RUNTIME_DIR)
+            case $base in
+                /*)
+                    printf '%s/cagents\n%s/cagents-development\n' "$base" "$base"
+                    name=$(process_variable "$process" CAGENTS_DEVELOPMENT_INSTANCE)
+                    [ -z "$name" ] || printf '%s/cagents-development-%s\n' "$base" "$name"
+                    ;;
+                *) printf '%s\n' '?' ;;
+            esac
+            process_hosted_by "$process"
+        fi
+        process=$(process_parent "$process") && [ -n "$process" ] || {
+            printf '%s\n' '?'
+            break
+        }
+    done | awk '!seen[$0]++'
+}
+
+# Whether a hosted caller's hosts, as caller_host_runtimes lists them, can't be
+# told. Like the CLI, a session cagents hosts then stops nothing.
+hosts_unknown() {
+    [ -n "${CAGENTS_AGENT_AUTHORITY+x}" ] || return 1
+    [ -z "$1" ] || printf '%s\n' "$1" | grep -qxF '?'
+}
+
+# Who an instance belongs to: in a session cagents hosts, the process that
+# session runs, whose parent is one of the daemon's own processes; otherwise
+# the shell that ran this.
+owner_process() {
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        parent=$(process_parent "$process") || break
+        if runs_daemon "$parent"; then
+            printf '%s\n' "$process"
+            return
+        fi
+        process=$parent
+    done
+    printf '%s\n' "$PPID"
+}
+
+# Kept in the session's runtime directory, which ends with it.
+owner_record=cagents-run-development.owner
+record_owner() {
+    [ -n "$1" ] || return 0
+    owner=$(owner_process)
+    {
+        printf 'checkout=%s\n' "$root"
+        printf 'owner=%s\n' "$owner"
+        printf 'owner_start=%s\n' "$(process_start "$owner")"
+        printf 'owner_name=%s\n' "$(cat "/proc/$owner/comm" 2>/dev/null)"
+        if [ -n "${CAGENTS_AGENT_AUTHORITY+x}" ]; then
+            printf 'hosted=true\n'
+        fi
+    } >"$1/$owner_record"
+}
+
+# Whether a process has a file open; a daemon keeps its lock open.
+holds_open() {
+    for descriptor in "/proc/$1/fd/"*; do
+        [ "$(readlink -- "$descriptor" 2>/dev/null)" != "$2" ] || return 0
+    done
+    return 1
+}
+
+list_development_instances() {
+    found=false
+    hosts=$(caller_host_runtimes)
+    harness=false
+    ! command -v niri-harness >/dev/null 2>&1 || harness=true
+    for status in /proc/[0-9]*/status; do
+        process=${status#/proc/}
+        process=${process%/status}
+        # The daemon itself; its holders and actors run under another name.
+        [ "$(cat "/proc/$process/comm" 2>/dev/null)" = cagentsd ] || continue
+        executable=$(readlink "/proc/$process/exe" 2>/dev/null) || continue
+        name=$(process_variable "$process" CAGENTS_DEVELOPMENT_INSTANCE) || name=
+        runtime=$(process_variable "$process" XDG_RUNTIME_DIR) || runtime=
+        directory=$runtime/cagents-development${name:+-$name}
+        # A production daemon holds the lock of another directory.
+        holds_open "$process" "$directory/cagentsd.lock" || continue
+        found=true
+        case $executable in
+            */target/*)
+                checkout=${executable%%/target/*}
+                if [ ! -d "$checkout" ]; then
+                    checkout="$checkout (removed)"
+                else
+                    case $executable in
+                        *' (deleted)') checkout="$checkout, executable rebuilt since" ;;
+                    esac
+                fi
+                ;;
+            *) checkout="unknown; it runs $executable" ;;
+        esac
+        age=$(ps -o etime= -p "$process" 2>/dev/null | tr -d ' ') || age=
+        started_by='not recorded: started without --instance, or by an older runner'
+        record=$runtime/$owner_record
+        if [ -f "$record" ]; then
+            owner=$(sed -n 's/^owner=//p' "$record" 2>/dev/null) || owner=
+            owner_name=$(sed -n 's/^owner_name=//p' "$record" 2>/dev/null) || owner_name=
+            owner_start=$(sed -n 's/^owner_start=//p' "$record" 2>/dev/null) || owner_start=
+            if [ -n "$owner" ] && [ "$(process_start "$owner")" = "$owner_start" ]; then
+                started_by="$owner_name (pid $owner), still running"
+            else
+                started_by="$owner_name (pid $owner), which has ended"
+            fi
+            if grep -qx 'hosted=true' "$record" 2>/dev/null; then
+                started_by="$started_by, in a cagents session"
+            fi
+        fi
+        if printf '%s\n' "$hosts" | grep -qxF "$directory"; then
+            stop='not from here: it hosts this session, or one that started it'
+        elif hosts_unknown "$hosts"; then
+            stop='not from here: which daemons host this session can'"'"'t be told'
+        elif [ -z "$name" ] && [ "$runtime" = "/run/user/$(id -u)" ]; then
+            stop='not from a cagents session: it is the login session'"'"'s own development daemon'
+        elif [ -n "$name" ] && [ "$harness" = true ] &&
+            niri-harness --session "cagents-$name" env >/dev/null 2>&1; then
+            stop="scripts/run-development --stop-instance $name"
+        elif [ -n "$name" ] && [ "$harness" = false ]; then
+            stop="scripts/run-development --stop-instance $name, once niri-harness is installed; or kill $process"
+        else
+            stop="kill $process  (no runner session; this ends the daemon and its jobs)"
+        fi
+        printf '%s, pid %s, running %s\n' "${name:-unnamed}" "$process" "$age"
+        printf '  checkout:   %s\n' "$checkout"
+        printf '  runtime:    %s\n' "$runtime"
+        printf '  started by: %s\n' "$started_by"
+        printf '  stop:       %s\n' "$stop"
+    done
+    [ "$found" = true ] || printf '%s\n' 'No development daemons are running.'
+}
+
+if [ "$list_instances" = true ]; then
+    list_development_instances
+    exit 0
+fi
 
 if [ -n "$instance" ]; then
     if [ "$hot" = true ] || [ -n "$log_file" ]; then
@@ -532,11 +713,35 @@ instance_cli_path() {
 
 # The instance's daemon lives in the harness session's private runtime
 # directory, which stopping the session deletes, so stop the daemon first.
+# Stopping a session ends every process left in its runtime directory, which
+# the CLI's own check does not cover, so first refuse a session whose daemon
+# hosts this process or a session it descends from.
+refuse_hosting_session() {
+    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
+    runtime=$(
+        unset XDG_RUNTIME_DIR
+        eval "$harness_env"
+        printf '%s' "${XDG_RUNTIME_DIR-}"
+    )
+    [ -n "$runtime" ] || return 0
+    hosts=$(caller_host_runtimes)
+    if hosts_unknown "$hosts"; then
+        printf '%s\n' "cannot tell which daemons host this session, so instance $instance can't be told apart from them; stop it from a terminal outside cagents" >&2
+        exit 1
+    fi
+    if printf '%s\n' "$hosts" |
+        awk -v prefix="$runtime/" 'index($0, prefix) == 1 { found = 1 } END { exit !found }'; then
+        printf '%s\n' "instance $instance hosts this session, or one that started it, so stopping it would end them; stop it from a terminal outside cagents" >&2
+        exit 1
+    fi
+}
+
 stop_instance_session() {
     harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) || return 0
     runtime=$(
+        unset XDG_RUNTIME_DIR
         eval "$harness_env"
-        printf '%s' "$XDG_RUNTIME_DIR"
+        printf '%s' "${XDG_RUNTIME_DIR-}"
     )
     socket=$runtime/cagents-development-$instance/cagentsd.sock
     if [ -e "$socket" ]; then
@@ -599,6 +804,10 @@ sweep_instance_runtime() {
     rm -rf -- "$1"
 }
 
+if [ -n "$instance" ] && { [ "$stop_instance" = true ] || [ "$fresh_daemon" = true ]; }; then
+    refuse_hosting_session
+fi
+
 if [ "$stop_instance" = true ]; then
     if ! niri-harness --session "$harness_session" env >/dev/null 2>&1; then
         printf '%s\n' "instance $instance is not running" >&2
@@ -622,6 +831,20 @@ else
 fi
 find_products
 
+# What the app is started with: the daemons hosting this session, for the
+# CLI's hosted stop check, because the app's own processes may leave this
+# session's process tree. The harness detaches an instance at once.
+hosts=$(caller_host_runtimes)
+if hosts_unknown "$hosts"; then
+    printf '%s\n' "warning: which daemons host this session can't all be told, so a session in this app could stop one of them" >&2
+fi
+hosted_by=$(printf '%s\n' "$hosts" | grep -vxF '?') || hosted_by=
+if [ -n "$hosted_by" ]; then
+    export CAGENTS_DEVELOPMENT_HOSTED_BY="$hosted_by"
+else
+    unset CAGENTS_DEVELOPMENT_HOSTED_BY
+fi
+
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
 if [ -n "$instance" ]; then
@@ -636,6 +859,12 @@ if [ -n "$instance" ]; then
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
         niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
         "$products/cagents-ui" "$@"
+    harness_env=$(niri-harness --session "$harness_session" env 2>/dev/null) &&
+        record_owner "$(
+            unset XDG_RUNTIME_DIR
+            eval "$harness_env"
+            printf '%s' "${XDG_RUNTIME_DIR-}"
+        )" || :
     printf '%s\n' \
         "Instance $instance is running in niri-harness session $harness_session." \
         "  observe: niri-harness --session $harness_session observe" \
