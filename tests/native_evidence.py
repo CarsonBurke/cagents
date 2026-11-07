@@ -193,11 +193,13 @@ class Evidence(unittest.TestCase):
     def stop_quietly(self) -> None:
         self.run_tool("stop", check=False)
 
-    def run_tool(self, *args: str, check: bool = True, extra=None) -> subprocess.CompletedProcess:
+    def run_tool(self, *args: str, check: bool = True, extra=None,
+                 cwd=None) -> subprocess.CompletedProcess:
         env = {**self.env, **(extra or {})}
         result = subprocess.run(
             [str(SCRIPT), *args],
             env=env,
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -432,6 +434,19 @@ class Evidence(unittest.TestCase):
         self.run_tool("build", "after", str(after), "--seed-target", str(seed))
         self.assertTrue((self.task / "target-after").is_dir())
         self.assertFalse((self.task / "target-after.partial").exists())
+
+    def test_a_relative_seed_target_is_the_callers_not_the_checkouts(self) -> None:
+        # The build runs from the checkout, inside the gate's hold.
+        probe = self.root / "reflink-probe"
+        probe.touch()
+        if subprocess.run(["cp", "--reflink=always", probe, f"{probe}-copy"],
+                          capture_output=True).returncode != 0:
+            self.skipTest("this file system cannot reflink")
+        self.built("before")
+        after = self.checkout("after")
+        (after / "Cargo.lock").write_text('[[package]]\nname = "cagents"\nversion = "0.1.0"\n')
+        self.run_tool("build", "after", str(after), "--seed-target", "target-before", cwd=self.task)
+        self.assertTrue((self.task / "target-after").is_dir())
 
     def test_a_failed_seed_copy_cannot_pass_as_the_seeds_build(self) -> None:
         if os.geteuid() == 0:
