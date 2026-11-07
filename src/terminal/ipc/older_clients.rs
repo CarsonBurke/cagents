@@ -52,7 +52,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 151,
+    proven_at: 153,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -60,6 +60,10 @@ const CANDIDATE_LINE: OlderClient = OlderClient {
 };
 
 const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
+
+/// The first protocol whose `Firing` carries its skipped occurrences. Postcard
+/// is positional, so a client before this one cannot read a reply holding one.
+const FIRING_WITH_SKIPPED_OCCURRENCES: u16 = 153;
 
 /// The older protocol a client opened its connection with, when this daemon
 /// serves it.
@@ -109,6 +113,10 @@ impl OlderClient {
                     ServerResponse::Work(work) => {
                         variant_index(work).is_some_and(|index| index < self.work_responses)
                     }
+                    ServerResponse::Automation(automation) => {
+                        self.protocol >= FIRING_WITH_SKIPPED_OCCURRENCES
+                            || !holds_a_firing(automation)
+                    }
                     _ => true,
                 };
                 nested && variant_index(response).is_some_and(|index| index < self.server_responses)
@@ -129,6 +137,14 @@ impl OlderClient {
             false,
         )
     }
+}
+
+fn holds_a_firing(response: &crate::automations::Response) -> bool {
+    use crate::automations::Response;
+    matches!(
+        response,
+        Response::Listed(_) | Response::Firing(_) | Response::History(_) | Response::Detail(_)
+    )
 }
 
 /// Requests that stop, update or hand off the daemon itself.
@@ -398,6 +414,30 @@ mod tests {
                 }),
             }))
         );
+    }
+
+    #[test]
+    fn an_automation_reply_holding_a_firing_is_refused_before_it_changed() {
+        use crate::automations::{HistoryPage, Response};
+
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = |response| ServerMessage::Response {
+            response: ServerResponse::Automation(response),
+        };
+        assert!(!client.admits_message(&reply(Response::Listed(Vec::new()))));
+        assert!(
+            !client.admits_message(&reply(Response::History(HistoryPage {
+                firings: Vec::new(),
+                next: None,
+            })))
+        );
+        assert!(client.admits_message(&reply(Response::Removed)));
+        assert!(client.admits_message(&reply(Response::Proposals(Vec::new()))));
+        let changed = OlderClient {
+            protocol: FIRING_WITH_SKIPPED_OCCURRENCES,
+            ..client
+        };
+        assert!(changed.admits_message(&reply(Response::Listed(Vec::new()))));
     }
 
     #[test]

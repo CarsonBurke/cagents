@@ -36,7 +36,8 @@ running `cagents daemon bridge`, which relays a remote device's window. An
 older window or daemon is still refused at its handshake, which is how a stale window learns
 that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
-reply the CLI couldn't read. It withholds notifications the CLI couldn't read.
+reply the CLI couldn't read, such as `automation list`, `automation history` and
+`automation run` on protocols before 153. It withholds notifications the CLI couldn't read.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
 encodes the same way, except for what is refused or withheld. It checks
