@@ -133,10 +133,16 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
 struct InspectionFailures {
     count: usize,
     details: Vec<String>,
+    /// Every distinct reason, so one pane retained by several saved windows
+    /// is one problem to resolve rather than one per store.
+    seen: HashSet<String>,
 }
 
 impl InspectionFailures {
     fn push(&mut self, reason: String) {
+        if !self.seen.insert(reason.clone()) {
+            return;
+        }
         self.count += 1;
         if self.details.len() < 40 {
             self.details.push(reason);
@@ -217,6 +223,14 @@ fn inspect(request: Request) -> Result<(), String> {
                 && (source.proof.as_ref() != request.proof.as_ref()
                     || !initial_inventory.iter().any(|live| live.id == source.id))
                 && !resolutions.iter().any(|(issued, _)| issued == source)
+                && !request.proof.as_ref().is_some_and(|proof| {
+                    relisted_codex_conversation(
+                        source,
+                        &initial_inventory,
+                        proof,
+                        request.require_resumable,
+                    )
+                })
             {
                 let missing = !initial_inventory.iter().any(|live| live.id == source.id);
                 // Nothing of its old owner remains to adopt or preserve.
@@ -307,7 +321,14 @@ fn inspect(request: Request) -> Result<(), String> {
                 }
             }
             CardKind::Chat(source) if !source.is_unstarted() => {
-                if cold_history.iter().any(|issued| issued == &source) {
+                if cold_history.iter().any(|issued| issued == &source)
+                    || relisted_codex_conversation(
+                        &source,
+                        &inventory,
+                        proof,
+                        request.require_resumable,
+                    )
+                {
                     continue;
                 }
                 if let Some(problem) =
@@ -425,6 +446,9 @@ impl ExecutionEvidence {
     /// twice, before resolution and against the final roster, to narrow it.
     fn classify(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
+        if source.proof.is_none() {
+            return self.classify_proofless(source);
+        }
         let Some(proof) = source.proof.as_ref().filter(|proof| proof.is_complete()) else {
             return SavedExecution::Unproved;
         };
@@ -481,6 +505,59 @@ impl ExecutionEvidence {
                     .is_ok_and(|retired| retired.contains(owner))
             {
                 return SavedExecution::Unproved;
+            }
+        }
+        execution
+    }
+
+    /// A pane with no issued proof names no daemon that owns it. If it once
+    /// ran as a retained Claude actor, the census still names every owner it
+    /// had under its pane. It has ended only when each of those owners,
+    /// including one a discovery record names, has a recorded retirement and
+    /// none of this boot's remains with its provider or anything in their
+    /// process group or session. Without any census owner nothing proves
+    /// what ran it.
+    fn classify_proofless(&self, source: &Session) -> SavedExecution {
+        use crate::daemon::holder_registry::{self, Kind};
+        if source.launch.provider != crate::agent::Provider::Claude
+            || source.terminal.is_some()
+            || source.owned_codex_listener.is_some()
+        {
+            return SavedExecution::Unproved;
+        }
+        let (Ok(census), Ok(native_holders), Ok(retired)) =
+            (&self.census, &self.native_holders, &self.retired)
+        else {
+            return SavedExecution::Unproved;
+        };
+        let mut owners = census
+            .iter()
+            .filter(|(pane, _)| *pane == source.id)
+            .map(|(_, owner)| owner)
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            return SavedExecution::Unproved;
+        }
+        let discovered = match holder_registry::recovery_candidate(
+            &holder_registry::socket(native_holders, source.id),
+            Kind::Native,
+        ) {
+            Ok(discovered) => discovered,
+            Err(_) => return SavedExecution::Unproved,
+        };
+        owners.extend(&discovered);
+        let mut execution = SavedExecution::Ended;
+        for owner in owners {
+            if !retired.contains(owner) {
+                return SavedExecution::Unproved;
+            }
+            if owner.boot != self.boot {
+                continue;
+            }
+            match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
+                Ok(true) => {}
+                Ok(false) => execution = SavedExecution::Running,
+                Err(_) => return SavedExecution::Unproved,
             }
         }
         execution
@@ -828,6 +905,41 @@ fn read_census(path: &Path) -> Result<Census, String> {
         census.push((owner.terminal, owner));
     }
     Ok(census)
+}
+
+/// A live Codex conversation can outlast more daemon generations than its
+/// source keeps upgrade aliases for, so a pane its window never reattached
+/// still holds an older issued proof that the source no longer resolves. When
+/// the source lists that conversation under its current proof and every other
+/// issued field is identical, including the listener its original allocator
+/// issued, the pane names exactly that conversation. The conversation migrates
+/// as the source's live work and is qualified as such above; the update does
+/// not change whether this pane can reattach, which the source already refuses.
+fn relisted_codex_conversation(
+    saved: &Session,
+    inventory: &[Session],
+    proof: &HostSessionProof,
+    require_resumable: bool,
+) -> bool {
+    if !saved.owns_codex_listener()
+        || !saved.has_valid_native_continuity()
+        || saved
+            .proof
+            .as_ref()
+            .is_none_or(|issued| !issued.is_complete() || issued == proof)
+    {
+        return false;
+    }
+    let mut current = saved.clone();
+    current.proof = Some(proof.clone());
+    let mut listed = inventory.iter().filter(|live| live.id == saved.id);
+    match (listed.next(), listed.next()) {
+        (Some(live), None) => {
+            handoff::issued_chat_matches(live, &current)
+                && validate_live_chat(live, require_resumable).is_ok()
+        }
+        _ => false,
+    }
 }
 
 /// Classify again against the final roster: a pane adopted since the first
@@ -1967,6 +2079,153 @@ mod tests {
             .environment
             .insert("ACCOUNT".into(), "another".into());
         assert!(qualify_terminal(&saved, &[descriptor.into()], &replacement).is_err());
+    }
+
+    #[test]
+    fn a_pane_held_by_several_saved_windows_is_one_problem() {
+        let mut failures = InspectionFailures::default();
+        let card = crate::model::CardId::new();
+        for _ in 0..3 {
+            failures.push(format!(
+                "Saved conversation pane {card} needs exact conversation recovery."
+            ));
+        }
+        failures.push("Source conversation has no qualified immutable migration.".into());
+        let message = failures.finish().unwrap_err();
+        assert!(message.contains("2 saved-state problem(s)"), "{message}");
+        assert_eq!(message.matches(&card.to_string()).count(), 1, "{message}");
+    }
+
+    #[test]
+    fn a_proofless_pane_ends_only_when_every_owner_it_had_is_retired() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut card = session();
+        card.proof = None;
+        let ended = owner(&card, ended_process(), ended_process());
+        let mut earlier = ended.clone();
+        earlier.boot = BootId::new("previous-boot");
+        let running = owner(&card, running_process(), running_process());
+
+        let mut retired = evidence(
+            holders.path(),
+            vec![(card.id, ended.clone()), (card.id, earlier.clone())],
+        );
+        retired.retired = Ok(vec![ended.clone(), earlier.clone()]);
+        assert_eq!(retired.classify(&card), SavedExecution::Ended);
+
+        // A recorded retirement is required for every owner, in any boot.
+        let mut unrecorded = evidence(
+            holders.path(),
+            vec![(card.id, ended.clone()), (card.id, earlier.clone())],
+        );
+        unrecorded.retired = Ok(vec![ended.clone()]);
+        assert_eq!(unrecorded.classify(&card), SavedExecution::Unproved);
+
+        // A retirement record does not outweigh a process that remains.
+        let mut alive = evidence(holders.path(), vec![(card.id, running.clone())]);
+        alive.retired = Ok(vec![running]);
+        assert_eq!(alive.classify(&card), SavedExecution::Running);
+
+        // No census owner is no evidence of what ran the pane.
+        let mut unknown = evidence(holders.path(), Vec::new());
+        unknown.retired = Ok(vec![ended.clone()]);
+        assert_eq!(unknown.classify(&card), SavedExecution::Unproved);
+
+        // An unreadable retirement table proves nothing.
+        let mut unreadable = evidence(holders.path(), vec![(card.id, ended.clone())]);
+        unreadable.retired = Err("unreadable".into());
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+
+        // Only a retained Claude pane has an owner roster; an incomplete proof
+        // is not the absence of one.
+        let mut codex = card.clone();
+        codex.launch.provider = Provider::Codex;
+        assert_eq!(retired.classify(&codex), SavedExecution::Unproved);
+        let mut incomplete = card.clone();
+        incomplete.proof = Some(HostSessionProof {
+            host_session_id: HostSessionId::new(""),
+            boot_id: current_boot(),
+            host_incarnation: HostIncarnation::new("actor"),
+        });
+        assert_eq!(retired.classify(&incomplete), SavedExecution::Unproved);
+    }
+
+    #[test]
+    fn a_codex_pane_relisted_under_a_newer_proof_names_that_live_conversation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let saved = codex_card(root.path(), NativeContinuity::ReconnectOnly);
+        let current = HostSessionProof {
+            host_session_id: HostSessionId::new("current"),
+            boot_id: current_boot(),
+            host_incarnation: HostIncarnation::new("current"),
+        };
+        let mut live = saved.clone();
+        live.proof = Some(current.clone());
+        let inventory = [live.clone()];
+        assert!(relisted_codex_conversation(
+            &saved, &inventory, &current, false
+        ));
+
+        // The pane's own proof, an incomplete proof or a missing one is not
+        // an older issued identity of a relisted conversation.
+        assert!(!relisted_codex_conversation(
+            &live, &inventory, &current, false
+        ));
+        let mut proofless = saved.clone();
+        proofless.proof = None;
+        assert!(!relisted_codex_conversation(
+            &proofless, &inventory, &current, false
+        ));
+
+        // Every other issued field must be identical.
+        for change in 0..4 {
+            let mut other = live.clone();
+            match change {
+                0 => other.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                1 => other.launch.recipe.working_directory = "/elsewhere".into(),
+                2 => other.owned_codex_listener.as_mut().unwrap().allocator = current.clone(),
+                _ => {
+                    other.terminal = Some(
+                        crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                            other.id,
+                            other.launch.recipe.clone(),
+                            None,
+                        )
+                        .session,
+                    )
+                }
+            }
+            assert!(
+                !relisted_codex_conversation(&saved, &[other], &current, false),
+                "change {change}"
+            );
+        }
+        // Two listings are ambiguous, and a listing under another proof is
+        // not the source's current work.
+        assert!(!relisted_codex_conversation(
+            &saved,
+            &[live.clone(), live.clone()],
+            &current,
+            false
+        ));
+        let mut foreign = live.clone();
+        foreign.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("foreign");
+        assert!(!relisted_codex_conversation(
+            &saved,
+            &[foreign],
+            &current,
+            false
+        ));
+        // A retained Claude pane keeps its exact recovery contract.
+        let claude = retained_card(current_boot());
+        let mut relisted = claude.clone();
+        relisted.proof = Some(current.clone());
+        assert!(!relisted_codex_conversation(
+            &claude,
+            &[relisted],
+            &current,
+            false
+        ));
     }
 }
 

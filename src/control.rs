@@ -2715,6 +2715,9 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 }
 
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
+    // `daemon upgrade` selects its own worker: an older owner's updater would
+    // apply that owner's preflight, which cannot qualify panes this release
+    // knows how to carry (`update::installed_update_worker`).
     !matches!(
         command,
         TopCommand::Completions { .. }
@@ -2725,7 +2728,9 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::UpdateWorker { .. }
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
-                command: DaemonCommand::ProtocolVersion | DaemonCommand::StopForRebuild { .. }
+                command: DaemonCommand::ProtocolVersion
+                    | DaemonCommand::StopForRebuild { .. }
+                    | DaemonCommand::Upgrade { .. }
             }
     )
 }
@@ -4584,6 +4589,28 @@ mod tests {
         );
         let other = ControlError::Connect(std::io::Error::other("refused"));
         assert_eq!(other.reason(), "could not connect to the daemon: refused");
+    }
+
+    /// The installed coordinator, not an older owner's updater, chooses who
+    /// performs the update: an older updater would apply its own preflight.
+    /// Daemon lifecycle verbs still reach the owner's matched CLI.
+    #[test]
+    fn upgrade_is_never_handed_to_an_older_owner_cli() {
+        use clap::Parser;
+        let routed = |argv: &[&str]| {
+            super::routes_to_staged_owner(&super::Cli::try_parse_from(argv).unwrap().command)
+        };
+        assert!(!routed(&["cagents", "daemon", "upgrade", "--yes"]));
+        assert!(!routed(&[
+            "cagents",
+            "daemon",
+            "upgrade",
+            "--yes",
+            "--interrupt"
+        ]));
+        assert!(routed(&["cagents", "daemon", "prepare-upgrade", "--yes"]));
+        assert!(routed(&["cagents", "daemon", "abandon-upgrade", "--yes"]));
+        assert!(routed(&["cagents", "daemon", "start"]));
     }
 
     /// A hosted session stops a development daemon with a runtime of its own,
