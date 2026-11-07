@@ -66,6 +66,10 @@ impl Runtime {
             return Stopped {
                 guidance: if resuming {
                     format!("Starting {provider} again on this conversation…")
+                } else if self.resume_failed && !unresumable {
+                    format!(
+                        "{provider} did not start again. The conversation and your draft are kept."
+                    )
                 } else if unresumable {
                     format!(
                         "{provider} stopped before the saved conversation loaded. Try again, or start a new conversation beside it: the old one stays on disk, but this card stops pointing at it."
@@ -76,7 +80,7 @@ impl Runtime {
                 primary: Some((
                     if resuming {
                         "Resuming…"
-                    } else if unresumable {
+                    } else if unresumable || self.resume_failed {
                         "Try again"
                     } else {
                         "Resume conversation"
@@ -124,7 +128,7 @@ impl Runtime {
         // nothing here can start its provider on the conversation yet.
         Stopped {
             guidance: format!(
-                "{provider} stopped, and this card can't start it again. To continue, copy your draft, close this card, then reopen the conversation from Resume conversation."
+                "{provider} stopped, and this card can't start it again. To continue, copy your draft, close this card, then reopen the conversation with Resume conversation in the new tab (+) menu."
             ),
             primary: None,
             secondary: None,

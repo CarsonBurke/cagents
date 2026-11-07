@@ -2393,6 +2393,9 @@ pub(super) struct Runtime {
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
+    /// Resuming this card's stopped provider failed, so it offers to try
+    /// again; the failure itself stands in `error`.
+    resume_failed: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
     /// Notices raised while an earlier page is shown. That page holds
@@ -3351,6 +3354,7 @@ impl Runtime {
             visible: AtomicBool::new(visible),
             error: None,
             capacity_refused: false,
+            resume_failed: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
@@ -10324,6 +10328,7 @@ impl Cagents {
                             runtime.later_asked = None;
                             runtime.error = None;
                             runtime.capacity_refused = false;
+                            runtime.resume_failed = false;
                             runtime.show(visible);
                             // Show the new connection's state at once, as a
                             // new runtime does, rather than the ended one's
@@ -10510,7 +10515,13 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
-                            runtime.disconnected = true;
+                            // A resume that failed leaves its card where it
+                            // was, stopped with its conversation kept, so it
+                            // tries again. Reconnecting instead would look for
+                            // the actor the resume may already have ended.
+                            runtime.resume_failed = attempt.intent == chat::Intent::Resume
+                                && runtime.resumes_in_place();
+                            runtime.disconnected = !runtime.resume_failed;
                             self.observe_agent_activity_for_card(target.card, None);
                         } else if matches!(
                             self.card_state(target.card).map(|state| &state.kind),
@@ -22321,6 +22332,21 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert_eq!(runtime.composer.text(), "keep this draft");
         assert_eq!(runtime.attachments, attachments);
+        // Nor does this window publish the ended conversation back over it.
+        app.persist();
+        app.publish_view_changes();
+        assert!(
+            !app.shared_views
+                .pending_changes()
+                .any(|(_, change)| matches!(
+                    change,
+                    crate::workspace_model::views::Change::Update { before, pane }
+                        if before.kind == CardKind::Chat(successor.clone())
+                            && pane.kind != before.kind
+                )),
+            "{:?}",
+            app.shared_views.pending_changes().collect::<Vec<_>>()
+        );
         let task = app.update(Message::ChatUi(Action::Ready(
             resume,
             Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
@@ -22342,6 +22368,94 @@ mod tests {
         assert_eq!(runtime.composer.text(), "keep this draft");
         assert_eq!(runtime.attachments, attachments);
         assert!(runtime.pending.is_none(), "the draft was not sent");
+    }
+
+    /// A resume that fails leaves the card stopped with its conversation and
+    /// draft, says so, and resumes again when pressed, rather than offering to
+    /// reconnect to the actor the failed resume may already have ended.
+    #[test]
+    fn a_failed_resume_offers_to_try_again_and_resumes_when_pressed() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (writer, _) = crate::session::SessionRuntime::open(
+            directory.path().join("state.sqlite3"),
+            crate::model::BootId::new("boot-test"),
+        )
+        .unwrap();
+        app.session = Some(writer);
+        let mut source = chat::fresh_session(
+            Provider::Claude,
+            TerminalId::new(),
+            directory.path().into(),
+            &crate::account::Account::system(Provider::Claude),
+        )
+        .unwrap();
+        source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        source.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "fixture-host".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "fixture-incarnation".into(),
+        });
+        source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        drop(app.insert_chat_card(source.clone(), None, None));
+        let card = app.workspace.focused().unwrap();
+        app.persist();
+        let target = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            target,
+            Ok(Arc::new(ClientHandle::fixture(
+                source.clone(),
+                Snapshot {
+                    ready: true,
+                    exited: true,
+                    session_id: source.launch.session_id.clone(),
+                    native_continuity: source.native_continuity.clone(),
+                    ..Snapshot::default()
+                },
+            ))),
+        );
+        let runtime = match app.cards.get_mut(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime,
+            _ => panic!("the card holds a chat"),
+        };
+        runtime.replace_draft(text_editor::Content::with_text("keep this draft"));
+        let target = runtime.target;
+
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let resume = chat_runtime_attempt(&app, card);
+        assert_eq!(
+            app.chat_ui.attempt(card).unwrap().intent,
+            chat::Intent::Resume
+        );
+        answer_start(
+            &mut app,
+            resume,
+            Err(chat::StartFailure::retry(
+                "fixture: Claude Code did not start",
+            )),
+        );
+        assert!(!app.chat_start_pending(card));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert!(runtime.resumes_in_place());
+        let offer = runtime.stopped(false, false);
+        assert_eq!(
+            offer.guidance,
+            "Claude Code did not start again. The conversation and your draft are kept."
+        );
+        assert_eq!(
+            offer.primary,
+            Some(("Try again", stopped::Press::Reconnect, true)),
+            "{offer:?}"
+        );
+        assert_eq!(offer.secondary, None);
+
+        let target = runtime.target;
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let attempt = app.chat_ui.attempt(card).expect("Try again resumes");
+        assert_eq!(attempt.intent, chat::Intent::Resume);
+        assert_eq!(attempt.session, source);
     }
 
     /// Every state a stopped or disconnected card can be in names its action
