@@ -65,6 +65,10 @@ const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
 /// is positional, so a client before this one cannot read a reply holding one.
 const FIRING_WITH_SKIPPED_OCCURRENCES: u16 = 153;
 
+/// The `automations::Response` variants holding a `Firing`. The wire format
+/// proof skips exactly these, so a variant here is one no older client gets.
+const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
+
 /// The older protocol a client opened its connection with, when this daemon
 /// serves it.
 pub fn older_client(protocol: u16) -> Option<OlderClient> {
@@ -143,13 +147,16 @@ impl OlderClient {
         }
     }
 
-    /// Answers a request whose reply exists only in a newer protocol.
+    /// Answers a request this client may not make, or whose reply it cannot
+    /// read.
     pub fn refusal(&self) -> ProtocolError {
         ProtocolError::new(
             ProtocolErrorCode::UnsupportedVersion,
             format!(
-                "this cagents CLI speaks protocol {}, and this request needs protocol \
-                 {PROTOCOL_VERSION}. Run the cagents CLI installed with the running daemon.",
+                "this cagents CLI is from an older release (protocol {}) and the running daemon \
+                 (protocol {PROTOCOL_VERSION}) can't serve this request to it. Start a new \
+                 session, or run `bin/cagents` in the daemon's runtime directory \
+                 ($XDG_RUNTIME_DIR/cagents by default).",
                 self.protocol
             ),
             false,
@@ -158,11 +165,7 @@ impl OlderClient {
 }
 
 fn holds_a_firing(response: &crate::automations::Response) -> bool {
-    use crate::automations::Response;
-    matches!(
-        response,
-        Response::Firing(_) | Response::History(_) | Response::Detail(_)
-    )
+    variant_name(response).is_some_and(|name| FIRING_REPLIES.contains(&name))
 }
 
 /// Requests that stop, update or hand off the daemon itself.
@@ -200,7 +203,15 @@ pub fn is_cli_peer(executable: &Path, command_line: &[u8]) -> bool {
 /// declaration, which is what an older peer decodes.
 pub(super) fn variant_index<T: Serialize + ?Sized>(value: &T) -> Option<u32> {
     match value.serialize(VariantIndex) {
-        Err(Captured::Variant(index)) => Some(index),
+        Err(Captured::Variant(index, _)) => Some(index),
+        Ok(()) | Err(Captured::NotAnEnum) => None,
+    }
+}
+
+/// The name of this value's enum variant.
+fn variant_name<T: Serialize + ?Sized>(value: &T) -> Option<&'static str> {
+    match value.serialize(VariantIndex) {
+        Err(Captured::Variant(_, name)) => Some(name),
         Ok(()) | Err(Captured::NotAnEnum) => None,
     }
 }
@@ -211,7 +222,7 @@ struct VariantIndex;
 
 #[derive(Debug)]
 enum Captured {
-    Variant(u32),
+    Variant(u32, &'static str),
     NotAnEnum,
 }
 
@@ -272,19 +283,19 @@ impl Serializer for VariantIndex {
         self,
         _: &'static str,
         index: u32,
-        _: &'static str,
+        name: &'static str,
     ) -> Result<(), Captured> {
-        Err(Captured::Variant(index))
+        Err(Captured::Variant(index, name))
     }
 
     fn serialize_newtype_variant<T: Serialize + ?Sized>(
         self,
         _: &'static str,
         index: u32,
-        _: &'static str,
+        name: &'static str,
         _: &T,
     ) -> Result<(), Captured> {
-        Err(Captured::Variant(index))
+        Err(Captured::Variant(index, name))
     }
 
     fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, Captured> {
@@ -307,10 +318,10 @@ impl Serializer for VariantIndex {
         self,
         _: &'static str,
         index: u32,
-        _: &'static str,
+        name: &'static str,
         _: usize,
     ) -> Result<Self::SerializeTupleVariant, Captured> {
-        Err(Captured::Variant(index))
+        Err(Captured::Variant(index, name))
     }
 
     fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, Captured> {
@@ -329,10 +340,10 @@ impl Serializer for VariantIndex {
         self,
         _: &'static str,
         index: u32,
-        _: &'static str,
+        name: &'static str,
         _: usize,
     ) -> Result<Self::SerializeStructVariant, Captured> {
-        Err(Captured::Variant(index))
+        Err(Captured::Variant(index, name))
     }
 
     fn is_human_readable(&self) -> bool {
@@ -481,6 +492,9 @@ mod tests {
             limit: 1,
         })));
         assert!(!client.admits_request(&asking(Request::ShowFiring { id: Uuid::nil() })));
+        assert!(!client.admits_request(&asking(Request::ShowRun {
+            run: crate::model::RunId::new(),
+        })));
         assert!(client.admits_request(&asking(Request::Cancel {
             id: Uuid::nil(),
             firing: Uuid::nil(),

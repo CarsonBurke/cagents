@@ -206,9 +206,9 @@ use crate::{
 /// `WatchConversationPullRequests` request, its `work::Response` and the
 /// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
 /// and are not adopted here.
-/// Version 153 appends the exact skipped-occurrence count and range to Firing,
-/// so all executables must match. An update never exchanges a Firing. 152 is
-/// taken by an unmerged branch and is not adopted here.
+/// Version 153 appends the exact skipped-occurrence count and range to Firing.
+/// An older client is refused the replies holding one. 152 is taken by an
+/// unmerged branch and is not adopted here.
 pub const PROTOCOL_VERSION: u16 = 153;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
