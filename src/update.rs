@@ -432,8 +432,9 @@ pub fn apply_installed(
         ));
     }
     // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. Ordinary skew uses that owner's CLI; an authenticated
-    // supported source also permits bootstrap from the staged coordinator.
+    // owns the sessions. The worker is that owner's version unless the staged
+    // candidate can upgrade it: an authenticated supported source or a
+    // compatible older build is updated by the candidate's own worker.
     installation.version = installed_entry_worker(&layout, &served)?;
     let version = served
         .file_name()

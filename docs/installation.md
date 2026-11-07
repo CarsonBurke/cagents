@@ -277,8 +277,10 @@ approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
 additionally permits active native turns to stop. `--accept-unreopenable`
 carries saved panes whose ended Claude actor never recorded its conversation:
 the update otherwise refuses them, naming each pane. They stay in their windows
-but will not resume or start a conversation; a conversation one began stays on
-disk and can be reopened with Resume.
+but, unless their conversation can still be proved, will not resume or start
+one; a conversation one began stays on disk and can be reopened with Resume.
+The flag accepts this for every such pane found during the update, not only the
+ones a previous refusal named.
 
 To make a verified build available without saving or closing running windows,
 append `--stage-only` to the installer invocation. It publishes the complete

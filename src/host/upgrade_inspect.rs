@@ -602,7 +602,8 @@ impl ExecutionEvidence {
     /// pane's listener, and no socket is bound at that path or at the socket
     /// Codex publishes it as a symlink to. Tool work that
     /// left a dead server's process group writes no conversation. A paired
-    /// console runs outside the server, so a paired pane stays unproved.
+    /// console runs outside the server, so a pane whose console was paired in
+    /// this boot stays unproved.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
         // A console paired in an earlier kernel boot cannot still run; one of
@@ -1007,7 +1008,7 @@ fn unqualified_chat_pane(card: crate::model::CardId, execution: Option<SavedExec
         )
     } else if execution == Some(SavedExecution::Unrecorded) {
         format!(
-            "Saved conversation pane {card} ended before it recorded which conversation it had, so the update cannot reopen it. Nothing of it still runs. To update anyway, run `cagents daemon upgrade --accept-unreopenable` (or `scripts/install-local --accept-unreopenable`): the pane stays in its window but will not resume or start a conversation. A conversation it began stays on disk and can be reopened with Resume."
+            "Saved conversation pane {card} ended before it recorded which conversation it had, so the update may not be able to reopen it. Nothing of it still runs. To update anyway, run `cagents daemon upgrade --accept-unreopenable` (or `scripts/install-local --accept-unreopenable`): the pane stays in its window, and if its conversation cannot be proved it will not resume or start one. A conversation it began stays on disk and can be reopened with Resume."
         )
     } else {
         format!("Saved conversation pane {card} needs exact conversation recovery.")
