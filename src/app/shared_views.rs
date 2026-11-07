@@ -1900,6 +1900,16 @@ impl Cagents {
         ))
     }
 
+    /// Why `card` cannot start a provider on its session, when another pane
+    /// holds that session: starting one retires the actor that pane shows.
+    pub(super) fn session_held_elsewhere_start_refusal(&self, card: CardId) -> Option<String> {
+        let (view, _) = self.pane_holding_card_session(card, &[])?;
+        Some(format!(
+            "This conversation is now in {}. Resume it from there.",
+            self.scope_display_name(&view.scope)
+        ))
+    }
+
     /// What going without `card` leaves behind, when another pane holds its session.
     pub(super) fn session_held_elsewhere_note(
         &self,

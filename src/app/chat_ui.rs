@@ -7476,6 +7476,18 @@ impl Cagents {
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
+    /// Says so on the card, and returns true, when a start here would end the
+    /// session in the pane holding it.
+    fn refuse_start_held_elsewhere(&mut self, target: Target) -> bool {
+        let Some(refusal) = self.session_held_elsewhere_start_refusal(target.card) else {
+            return false;
+        };
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.error = Some(refusal);
+        }
+        true
+    }
+
     pub(super) fn chat_retry_intent(&self, card: CardId, session: &chat::Session) -> chat::Intent {
         if self.chat_ui.explicit_starts.get(&card) == Some(session)
             && match self.cards.get(&card) {
@@ -10993,10 +11005,14 @@ impl Cagents {
                 } else {
                     self.chat_retry_intent(target.card, &session)
                 };
+                if intent != chat::Intent::Restore && self.refuse_start_held_elsewhere(target) {
+                    return Task::none();
+                }
                 return self.start_chat(target.card, session, intent, None, false);
             }
             Action::ResumeSaved(target) => {
-                if self.chat_start_pending(target.card) {
+                if self.chat_start_pending(target.card) || self.refuse_start_held_elsewhere(target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -22730,6 +22746,23 @@ mod tests {
             "{offer:?}"
         );
         assert_eq!(offer.secondary, None);
+
+        // A pane holding the session keeps its actor: neither control starts here.
+        let views = app.workspace_model.views.clone();
+        let mut holder = crate::workspace_model::views::View::empty(crate::model::ChannelId::new());
+        let mut held = pane(&app, &source);
+        held.id = CardId::new();
+        holder.panes.push(held);
+        app.workspace_model.views.push(holder);
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+        assert!(app.chat_ui.attempt(card).is_none());
+        let refusal = chat_runtime(&app, card).error.clone().unwrap_or_default();
+        assert!(refusal.contains("Resume it from there"), "{refusal}");
+        app.workspace_model.views = views;
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.error = None;
+        }
 
         drop(app.handle_chat_ui(Action::Reconnect(target)));
         let attempt = app.chat_ui.attempt(card).expect("Resume starts");
