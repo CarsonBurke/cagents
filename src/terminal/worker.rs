@@ -123,7 +123,8 @@ enum Command {
     Mouse(MouseInput),
     ReadViewport {
         offset: Option<u64>,
-        rows: u16,
+        /// `None` reads as many rows as the terminal has.
+        rows: Option<u16>,
         reply: Sender<Result<Arc<RenderSnapshot>, String>>,
     },
     Focus(bool),
@@ -1237,31 +1238,49 @@ impl TerminalHandle {
         }
     }
 
+    /// `shown` says the host has asked this worker to show the terminal.
+    /// Until the worker has done so, what it published is a hibernation
+    /// marker, nothing, or the screen from before it was hidden. Such a read
+    /// is answered on the worker, after the reveal queued ahead of it.
     pub(crate) fn viewport_snapshot(
         &self,
         offset: Option<u64>,
-        rows: u16,
+        rows: Option<u16>,
+        shown: bool,
     ) -> Result<Arc<RenderSnapshot>, String> {
         let published = self.snapshot();
-        if published.detached || published.rows == 0 {
+        let drawn = !published.detached && published.rows > 0;
+        if !shown && !drawn {
             return Ok(published);
         }
-        if offset.is_none()
-            && rows == published.rows
-            && published.scroll.offset == published.scroll.max_offset()
-        {
+        let current = !shown || self.inner.published.visible.load(Ordering::Acquire);
+        let default_view = drawn
+            && offset.is_none()
+            && rows.is_none_or(|rows| rows == published.rows)
+            && published.scroll.offset == published.scroll.max_offset();
+        if current && default_view {
             return Ok(published);
         }
         let (reply, receive) = crossbeam_channel::bounded(1);
-        self.try_command(Command::ReadViewport {
+        match self.try_command(Command::ReadViewport {
             offset,
             rows,
             reply,
-        })
-        .map_err(|error| error.to_string())?;
-        receive
-            .recv_timeout(Duration::from_secs(3))
-            .map_err(|error| error.to_string())?
+        }) {
+            Ok(()) => {}
+            // A closed worker shows nothing new: what it left is its screen.
+            Err(TerminalSendError::Closed) if !drawn || default_view => {
+                return Ok(self.snapshot());
+            }
+            Err(error) => return Err(error.to_string()),
+        }
+        match receive.recv_timeout(Duration::from_secs(3)) {
+            Ok(result) => result,
+            // A completed terminal whose history could not be kept reports
+            // that once, as an event, and keeps its marker.
+            Err(RecvTimeoutError::Disconnected) if !drawn => Ok(self.snapshot()),
+            Err(error) => Err(error.to_string()),
+        }
     }
 
     pub fn snapshot(&self) -> Arc<RenderSnapshot> {
@@ -2591,7 +2610,7 @@ struct Worker {
     capture_dirty: bool,
     viewport_reads: Vec<(
         Option<u64>,
-        u16,
+        Option<u16>,
         Sender<Result<Arc<RenderSnapshot>, String>>,
         Option<Arc<admission::Permit>>,
     )>,
@@ -3705,6 +3724,24 @@ impl Worker {
                 rows,
                 reply,
             } => {
+                if self.visibility != Visibility::Visible {
+                    // Nothing is captured until a reveal, so the read cannot
+                    // wait for one. Hibernated or never shown, the published
+                    // marker is the answer; hidden, the parser's screen is.
+                    let base = self.published.snapshot.load_full();
+                    let _ = reply.send(if self.visual.is_none() {
+                        Ok(base)
+                    } else {
+                        super::snapshot::capture_viewport(
+                            &self.terminal,
+                            &base,
+                            offset,
+                            rows.unwrap_or(base.rows),
+                        )
+                        .map_err(|error| error.to_string())
+                    });
+                    return false;
+                }
                 self.viewport_reads
                     .push((offset, rows, reply, self.current_admission.clone()));
                 if self.capture_dirty {
@@ -4313,6 +4350,7 @@ impl Worker {
         }
         let base = self.published.snapshot.load_full();
         for (offset, rows, reply, _permit) in std::mem::take(&mut self.viewport_reads) {
+            let rows = rows.unwrap_or(base.rows);
             let result = super::snapshot::capture_viewport(&self.terminal, &base, offset, rows)
                 .map_err(|error| error.to_string());
             let _ = reply.send(result);
@@ -7908,7 +7946,7 @@ mod tests {
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
             offset: Some(0),
-            rows: 10,
+            rows: Some(10),
             reply,
         });
         let capture = receive
@@ -7935,7 +7973,7 @@ mod tests {
         let (reply, receive) = crossbeam_channel::bounded(1);
         worker.handle_command(Command::ReadViewport {
             offset: Some(0),
-            rows: 10,
+            rows: Some(10),
             reply,
         });
         assert!(receive.try_recv().is_err());
