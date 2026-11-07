@@ -300,6 +300,13 @@ pub(crate) fn enroll_holder() -> io::Result<()> {
     })
 }
 
+/// A confirmed scope membership, and whether systemd delegated the scope.
+#[derive(Debug)]
+struct Enrolled {
+    membership: String,
+    delegated: bool,
+}
+
 /// Enroll this holder in a divided scope before it starts its provider, so
 /// the provider begins in the holder's leaf and its commands can be kept
 /// apart once it runs (see [`ProviderScope::keep_commands_apart`]). The
@@ -309,14 +316,18 @@ pub(crate) fn enroll_dividing_holder() -> io::Result<Option<ProviderScope>> {
         return Ok(None);
     }
     let pid = std::process::id();
-    let mut membership = None;
+    let mut enrolled = None;
     with_verified_manager(ManagerNamespace::connect(), || {
-        membership = Some(enroll_proven_process(pid, true)?);
+        enrolled = Some(enroll_proven_process(pid, true)?);
         Ok(())
     })?;
-    let membership = membership.ok_or_else(|| io::Error::other("scope membership unknown"))?;
+    let enrolled = enrolled.ok_or_else(|| io::Error::other("scope membership unknown"))?;
     // A holder has no tracing subscriber; its daemon reports shared scopes.
-    Ok(Some(ProviderScope::divide(&membership, pid)?.0))
+    Ok(Some(if enrolled.delegated {
+        ProviderScope::divide(&enrolled.membership, pid)?.0
+    } else {
+        ProviderScope::whole(&enrolled.membership)?
+    }))
 }
 
 /// Enroll an unreaped owned provider before its first prompt is submitted,
@@ -334,57 +345,112 @@ pub(crate) fn enroll_provider(
     if !manager_available() {
         return Ok(None);
     }
-    let mut membership = None;
+    let mut enrolled = None;
     with_verified_manager(ManagerNamespace::connect(), || {
-        membership = Some(enroll_proven_process(pid, true)?);
+        enrolled = Some(enroll_proven_process(pid, true)?);
         Ok(())
     })?;
-    let membership = membership.ok_or_else(|| io::Error::other("scope membership unknown"))?;
-    let (scope, unsplit) = ProviderScope::new(&membership, pid, wake)?;
+    let enrolled = enrolled.ok_or_else(|| io::Error::other("scope membership unknown"))?;
+    let (scope, unsplit) = if enrolled.delegated {
+        ProviderScope::new(&enrolled.membership, pid, wake)?
+    } else {
+        (
+            ProviderScope::whole(&enrolled.membership)?,
+            Some(io::Error::other("systemd did not delegate the scope")),
+        )
+    };
     if let Some(error) = unsplit {
         tracing::warn!(%error, pid, "provider commands share its cgroup; a memory kill can end the provider with them");
     }
     Ok(Some(scope))
 }
 
+/// What a divided scope is requested with, most capable first. systemd
+/// rejects a whole transient unit request for one property it doesn't know:
+/// scopes accept `OOMPolicy` from systemd 253, and older ones have no OOM
+/// policy to stop them. Without delegation the scope stays one leaf.
+const DIVIDED_SCOPE: &[&[&str]] = &[
+    // An OOM kill in one leaf must not stop the scope, and with it the
+    // provider: `continue` is systemd's default for delegated units, but the
+    // provider's survival depends on it, so it is stated.
+    &["Delegate", "b", "true", "OOMPolicy", "s", "continue"],
+    &["Delegate", "b", "true"],
+    &[],
+];
+
 /// Delegation lets the provider's owner divide the scope; systemd leaves the
-/// cgroups below a delegated unit to it. Returns the confirmed membership.
-fn enroll_proven_process(pid: u32, delegate: bool) -> io::Result<String> {
-    let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
+/// cgroups below a delegated unit to it. A divided scope is asked for in
+/// forms older systemd accepts too, down to the undelegated scope.
+fn enroll_proven_process(pid: u32, divide: bool) -> io::Result<Enrolled> {
+    let requests: &[&[&str]] = if divide { DIVIDED_SCOPE } else { &[&[]] };
+    first_accepted(requests, |properties| {
+        let unit = format!("cagents-session-{}.scope", uuid::Uuid::new_v4());
+        enroll_with(
+            scope_request(&unit, pid, properties),
+            &unit,
+            TIMEOUT,
+            || cgroup(pid),
+        )
+    })
+}
+
+/// The membership from the first request systemd accepts. Only a refused
+/// request is retried: one that timed out may still be queued, and could
+/// yet move the process into its unit.
+fn first_accepted(
+    requests: &[&'static [&'static str]],
+    mut enroll: impl FnMut(&'static [&'static str]) -> io::Result<String>,
+) -> io::Result<Enrolled> {
+    let mut refused = io::Error::other("no scope request");
+    for properties in requests {
+        match enroll(properties) {
+            Ok(membership) => {
+                return Ok(Enrolled {
+                    membership,
+                    delegated: properties.contains(&"Delegate"),
+                });
+            }
+            Err(error) if error.get_ref().is_some_and(|inner| inner.is::<Refused>()) => {
+                refused = error;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(refused)
+}
+
+fn scope_request(unit: &str, pid: u32, properties: &[&str]) -> Command {
     let mut command = Command::new("busctl");
     command
         .env("XDG_RUNTIME_DIR", manager_runtime())
         .env_remove("DBUS_SESSION_BUS_ADDRESS");
-    command.args([
-        "--user",
-        "--timeout=1s",
-        "call",
-        "org.freedesktop.systemd1",
-        "/org/freedesktop/systemd1",
-        "org.freedesktop.systemd1.Manager",
-        "StartTransientUnit",
-        "ssa(sv)a(sa(sv))",
-        &unit,
-        "fail",
-        if delegate { "5" } else { "3" },
-        "PIDs",
-        "au",
-        "1",
-        &pid.to_string(),
-        "Slice",
-        "s",
-        "app.slice",
-        "CollectMode",
-        "s",
-        "inactive-or-failed",
-    ]);
-    if delegate {
-        // An OOM kill in one leaf must not stop the scope, and with it the
-        // provider: `continue` is systemd's default for delegated units, but
-        // the provider's survival depends on it, so it is stated.
-        command.args(["Delegate", "b", "true", "OOMPolicy", "s", "continue"]);
-    }
+    let count = (3 + properties.len() / 3).to_string();
+    let pid = pid.to_string();
     command
+        .args([
+            "--user",
+            "--timeout=1s",
+            "call",
+            "org.freedesktop.systemd1",
+            "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager",
+            "StartTransientUnit",
+            "ssa(sv)a(sa(sv))",
+            unit,
+            "fail",
+            &count,
+            "PIDs",
+            "au",
+            "1",
+            &pid,
+            "Slice",
+            "s",
+            "app.slice",
+            "CollectMode",
+            "s",
+            "inactive-or-failed",
+        ])
+        .args(properties)
         .arg("0")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -394,8 +460,20 @@ fn enroll_proven_process(pid: u32, delegate: bool) -> io::Result<String> {
     unsafe {
         command.pre_exec(super::seal_inherited_descriptors);
     }
-    enroll_with(command, &unit, TIMEOUT, || cgroup(pid))
+    command
 }
+
+/// systemd answered a scope request with an error.
+#[derive(Debug)]
+struct Refused(std::process::ExitStatus);
+
+impl std::fmt::Display for Refused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "user scope request failed: {}", self.0)
+    }
+}
+
+impl std::error::Error for Refused {}
 
 fn enroll_with(
     mut command: Command,
@@ -410,9 +488,7 @@ fn enroll_with(
     loop {
         if let Some(status) = child.try_wait()? {
             if !status.success() {
-                return Err(io::Error::other(format!(
-                    "user scope request failed: {status}"
-                )));
+                return Err(io::Error::other(Refused(status)));
             }
             break;
         }
@@ -764,6 +840,63 @@ pub(crate) mod tests {
         assert_ne!(flags, -1);
         assert_ne!(flags & libc::O_NONBLOCK, 0);
         assert!(connect_nonblocking(&directory.path().join("absent")).is_err());
+    }
+
+    #[test]
+    fn older_systemd_still_gets_a_scope_and_a_queued_request_is_not_repeated() {
+        // Each request's properties, and whether this fixture systemd knows
+        // them all: it predates scope `OOMPolicy`.
+        let mut asked = Vec::new();
+        let enrolled = first_accepted(DIVIDED_SCOPE, |properties| {
+            asked.push(properties.to_vec());
+            let command = if properties.contains(&"OOMPolicy") {
+                "/bin/false"
+            } else {
+                "/bin/true"
+            };
+            enroll_with(
+                Command::new(command),
+                "fixture.scope",
+                Duration::from_secs(1),
+                || Ok("/app.slice/fixture.scope".into()),
+            )
+        })
+        .unwrap();
+        assert_eq!(asked, [DIVIDED_SCOPE[0], DIVIDED_SCOPE[1]]);
+        assert!(enrolled.delegated);
+        assert_eq!(enrolled.membership, "/app.slice/fixture.scope");
+
+        // Refused throughout: the scope stays whole, as without division.
+        let enrolled = first_accepted(DIVIDED_SCOPE, |properties| {
+            enroll_with(
+                Command::new(if properties.is_empty() {
+                    "/bin/true"
+                } else {
+                    "/bin/false"
+                }),
+                "fixture.scope",
+                Duration::from_secs(1),
+                || Ok("/app.slice/fixture.scope".into()),
+            )
+        })
+        .unwrap();
+        assert!(!enrolled.delegated);
+
+        let mut attempts = 0;
+        let error = first_accepted(DIVIDED_SCOPE, |_| {
+            attempts += 1;
+            let mut command = Command::new("/bin/sleep");
+            command.arg("30");
+            enroll_with(
+                command,
+                "fixture.scope",
+                Duration::from_millis(30),
+                || unreachable!(),
+            )
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+        assert_eq!(attempts, 1);
     }
 
     #[test]

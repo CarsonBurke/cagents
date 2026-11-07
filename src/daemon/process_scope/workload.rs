@@ -108,6 +108,16 @@ impl ProviderScope {
         Ok((divided, unsplit))
     }
 
+    /// A scope systemd did not delegate stays one leaf, the existing layout:
+    /// its cgroups belong to systemd, not the provider's owner.
+    pub(crate) fn whole(scope: &str) -> io::Result<Self> {
+        Ok(Self {
+            provider: open_directory(&cgroup_path(scope)?)?,
+            layout: None,
+            sweeper: None,
+        })
+    }
+
     /// Move everything in the scope, `owner` included, into the provider
     /// leaf. A holder that starts its provider later divides its scope first,
     /// so the provider begins in that leaf, then keeps commands apart.
