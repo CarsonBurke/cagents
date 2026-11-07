@@ -654,6 +654,7 @@ pub(crate) fn wait_daemon_start(
 
 /// Reports once when the startup budget is crossed with the original child
 /// still running. Reporting failure cannot unwind child or caller-fence custody.
+/// The caller chooses where the command's stdout and stderr go.
 pub(crate) fn wait_daemon_start_with_progress(
     command: &mut Command,
     timeout: Duration,
@@ -662,7 +663,6 @@ pub(crate) fn wait_daemon_start_with_progress(
     let deadline = Instant::now() + timeout;
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .process_group(0)
         .spawn()
         .map_err(|error| DaemonStartError {
@@ -687,7 +687,9 @@ pub(crate) fn wait_daemon_start_with_progress(
                     Ok(())
                 } else {
                     Err(DaemonStartError {
-                        error: io::Error::other("The matched daemon startup command failed"),
+                        error: io::Error::other(format!(
+                            "The matched daemon startup command failed ({status})"
+                        )),
                         spawned: true,
                     })
                 };
@@ -924,7 +926,7 @@ mod tests {
         assert_eq!(error.error.kind(), io::ErrorKind::Other);
         assert_eq!(
             error.error.to_string(),
-            "The matched daemon startup command failed"
+            "The matched daemon startup command failed (exit status: 1)"
         );
         let root = tempfile::tempdir().unwrap();
         let error = wait_daemon_start(
