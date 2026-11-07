@@ -1059,3 +1059,67 @@ fn a_working_chat_asks_only_after_the_close_ahead_of_it() {
     assert!(app.chat_close_asked(working));
     assert!(!app.chat_close_owned(working));
 }
+
+/// History means this chat has lost its provider rather than yet to get one.
+/// Holding the message there would be a dead composer with no explanation.
+#[test]
+fn a_chat_with_history_that_lost_its_provider_does_not_hold_a_message() {
+    let mut peer = peer();
+    attached_with_update_pending(&mut peer);
+    let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+        panic!("expected a chat runtime");
+    };
+    Arc::make_mut(&mut runtime.snapshot).ready = false;
+    assert!(runtime.provider_coming_up());
+
+    Arc::make_mut(&mut runtime.snapshot).items = vec![
+        chat::Item {
+            id: "earlier".into(),
+            role: chat::Role::Assistant,
+            content: chat::ItemContent::Text {
+                text: "An earlier reply".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+            started_at: None,
+            at: None,
+        }
+        .into(),
+    ];
+
+    assert!(!runtime.provider_coming_up());
+}
+
+/// Esc goes through update like the dialog's buttons, so the close waiting
+/// behind the question gets its turn straight away.
+#[test]
+fn escape_on_the_question_lets_the_next_close_ask() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let mut working = |thread| {
+        let card = super::tests::live_chat_for_provider(&mut app, Provider::Claude, Some(thread));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("expected a chat runtime");
+        };
+        let handle = runtime.handle().unwrap();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.busy = true;
+        handle.publish_snapshot_for_test(snapshot);
+        card
+    };
+    let asked = working("asked-thread");
+    let next = working("next-thread");
+    drop(app.update(Message::CloseCard(asked)));
+    drop(app.begin_card_close(next));
+    assert!(app.chat_close_asked(asked));
+
+    let task = app.update(Message::KeyEvent {
+        event: crate::app::dialog_ui::tests::key_press(iced::keyboard::key::Named::Escape),
+        captured: false,
+    });
+    let cancel = crate::app::tests::task_app_message(task);
+    assert!(matches!(cancel, Message::CancelChatClose));
+    drop(app.update(cancel));
+
+    assert!(app.chat_close_asked(next));
+    assert!(!app.chat_close_owned(asked));
+}

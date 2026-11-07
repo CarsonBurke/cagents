@@ -3600,19 +3600,22 @@ impl Runtime {
         self.snapshot.capabilities.attachments || self.has_connected_saved_history(&self.snapshot)
     }
 
-    /// Whether the composer takes a message now. A first or queued message
-    /// still waiting goes before anything else is sent.
-    /// A conversation attached to here whose provider has yet to come up. It
-    /// would refuse a message, so one waits in the composer until it can go.
+    /// A conversation attached to here whose first start has yet to finish. Its
+    /// provider would refuse a message, so one waits in the composer until it
+    /// can go. One with history that isn't ready has lost its provider instead,
+    /// and sending there is what tells the reader so.
     pub(super) fn provider_coming_up(&self) -> bool {
         !self.is_draft()
             && self.connected()
             && !self.snapshot.ready
             && !self.snapshot.exited
             && self.snapshot.error.is_none()
+            && self.snapshot.items.is_empty()
             && self.queued.is_none()
     }
 
+    /// Whether the composer takes a message now. A first or queued message
+    /// still waiting goes before anything else is sent.
     pub(super) fn composer_available(&self, transitioning: bool) -> bool {
         !transitioning
             && !self.closed_elsewhere

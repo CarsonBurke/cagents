@@ -17738,7 +17738,7 @@ impl Application for Cagents {
                         return self.cancel_terminal_close();
                     }
                     if self.chat_close_dialog_visible() {
-                        return self.cancel_chat_close();
+                        return cosmic::task::message(Message::CancelChatClose);
                     }
                     if self.sidebar_state.pending_discard().is_some() {
                         return cosmic::task::message(Message::Sidebar(
