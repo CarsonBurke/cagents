@@ -3437,17 +3437,25 @@ impl Cagents {
             .into();
         }
         let indicators = self.context_rail_indicators();
+        // A conversation that worked on or mentioned pull requests lists
+        // them wherever it runs, folder scope included.
+        let conversation_pull_requests = self.conversation_lists_pull_requests();
         let tabs = widget::row::with_children(
             ContextTab::ALL
                 .into_iter()
-                .filter(|tab| {
-                    !self.active_folder_scope()
-                        || !matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                .filter(|tab| match tab {
+                    ContextTab::Changes => !self.active_folder_scope(),
+                    ContextTab::PullRequest => {
+                        !self.active_folder_scope() || conversation_pull_requests
+                    }
+                    ContextTab::Files | ContextTab::Details => true,
                 })
                 .map(|tab| {
                     let selected = self.context_tab == tab;
                     let enabled = !self.modal_is_open()
-                        && (tab != ContextTab::PullRequest || self.active_workspace.is_some());
+                        && (tab != ContextTab::PullRequest
+                            || self.active_workspace.is_some()
+                            || conversation_pull_requests);
                     let icon = match tab {
                         ContextTab::Files => Icon::Folder,
                         ContextTab::Changes => Icon::Changes,

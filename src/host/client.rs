@@ -14,7 +14,8 @@ use crate::{
         MAX_FRAME_BYTES, MAX_INPUT_BYTES, MAX_RESUME_TERMINALS, PROTOCOL_VERSION, ProtocolError,
         ProtocolErrorCode, ResumeCursor, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage,
         ServerResponse, ShutdownOperation, ShutdownOutcome, TerminalScroll, TerminalSnapshot,
-        TerminalVisibility, WireTerminalEvent, read_frame_with_limit, validate_proof,
+        TerminalVisibility, WireTerminalEvent, is_cli_peer, older_client, read_frame_with_limit,
+        validate_proof,
     },
 };
 
@@ -182,9 +183,22 @@ fn may_release_retention(request: &ClientRequest) -> bool {
     )
 }
 
+/// Whether the peer process runs the `cagents` CLI, the only client this
+/// daemon serves at an older protocol.
+fn peer_runs_cli(pid: u32) -> bool {
+    let (Ok(executable), Ok(command_line)) = (
+        std::fs::read_link(format!("/proc/{pid}/exe")),
+        std::fs::read(format!("/proc/{pid}/cmdline")),
+    ) else {
+        return false;
+    };
+    is_cli_peer(&executable, &command_line)
+}
+
 fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
     let registration = Registration::new(Arc::clone(&host), client_id);
-    if let Some(pid) = peer_pid(&stream) {
+    let peer = peer_pid(&stream);
+    if let Some(pid) = peer {
         host.lock()
             .unwrap_or_else(|p| p.into_inner())
             .record_client_pid(client_id, pid);
@@ -215,6 +229,11 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
     let handshake_deadline = Instant::now() + HANDSHAKE_TIMEOUT;
     let mut codec = FrameCodec::new(MAX_CLIENT_FRAME_BYTES);
     let mut connected = false;
+    // The first frame's version is the connection's: this protocol's, or an
+    // older one this daemon still serves to the CLI of a chat carried across
+    // an update. Any other older client is refused as before.
+    let mut protocol = None;
+    let mut older = None;
     loop {
         let frame = if connected {
             codec.read::<ClientEnvelope>(&mut reader)
@@ -224,17 +243,33 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
         let Ok(Some(envelope)) = frame else {
             break;
         };
-        if envelope.version != PROTOCOL_VERSION {
+        if protocol.is_none() {
+            older = older_client(envelope.version).filter(|_| peer.is_some_and(peer_runs_cli));
+            if let Some(client) = older {
+                delivery.speak_older(client);
+            }
+            if older.is_some() || envelope.version == PROTOCOL_VERSION {
+                protocol = Some(envelope.version);
+            }
+        }
+        if protocol != Some(envelope.version) {
+            let expected = protocol.unwrap_or(PROTOCOL_VERSION);
             let error = ProtocolError::new(
                 ProtocolErrorCode::UnsupportedVersion,
                 format!(
-                    "protocol version {} is unsupported; expected {PROTOCOL_VERSION}",
+                    "protocol version {} is unsupported; expected {expected}",
                     envelope.version
                 ),
                 false,
             );
             let _ = push_error(&delivery, &host, envelope.request_id, error);
             break;
+        }
+        if let Some(client) = older
+            && !client.admits_request(&envelope.request)
+        {
+            let _ = push_error(&delivery, &host, envelope.request_id, client.refusal());
+            continue;
         }
 
         if !connected {
@@ -510,6 +545,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     let work = host.lock().unwrap_or_else(|p| p.into_inner()).work.clone();
     if let Some(work) = work {
         work.unwatch(client_id);
+        work.unwatch_conversation(client_id);
     }
 }
 
@@ -1201,6 +1237,33 @@ pub(super) fn process_request(
                 ServerResponse::Work(crate::work::Response::Watching {
                     revision,
                     board: Box::new(board),
+                }),
+                Vec::new(),
+                false,
+            ))
+        }
+        ClientRequest::WatchConversationPullRequests { conversation } => {
+            drop(_shared);
+            let (work, delivery) = {
+                let state = host.lock().unwrap_or_else(|p| p.into_inner());
+                (
+                    state.work.clone(),
+                    state.clients.get(&client_id).map(Arc::downgrade),
+                )
+            };
+            let unavailable = |message: &str| {
+                ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
+            };
+            let work = work.ok_or_else(|| unavailable("The Work board is unavailable"))?;
+            let delivery =
+                delivery.ok_or_else(|| unavailable("This connection cannot be sent updates"))?;
+            let (revision, pull_requests) = work
+                .watch_conversation(host, client_id, conversation, delivery)
+                .map_err(|message| unavailable(&message))?;
+            Ok((
+                ServerResponse::Work(crate::work::Response::WatchingConversation {
+                    revision,
+                    pull_requests: Box::new(pull_requests),
                 }),
                 Vec::new(),
                 false,

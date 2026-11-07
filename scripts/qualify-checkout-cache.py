@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Qualify owned source/stamp freshness across worktrees sharing a Cargo cache.
 
 The tiny workspace uses this repository's actual Cargo config and build script.

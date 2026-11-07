@@ -10,11 +10,31 @@
 # further build only slows the running ones and every other workload.
 set -eu
 
+# A mise shim finds its target on PATH, passing over its own directory only if
+# that is the shims directory of mise's data directory. With HOME or XDG_DATA_HOME
+# moved, as in a fixture, the shim finds itself and re-executes without end. Naming
+# the directory here covers this gate's helpers and whatever moves HOME below it.
+# mise treats an empty value as unset.
+if [ -z "${MISE_DATA_DIR-}" ]; then
+    rest=$PATH:
+    while [ -n "$rest" ]; do
+        entry=${rest%%:*}
+        rest=${rest#*:}
+        case $entry in
+        /*/mise/shims)
+            MISE_DATA_DIR=${entry%/shims}
+            export MISE_DATA_DIR
+            break
+            ;;
+        esac
+    done
+fi
+
 # Raise this whenever the gate or a helper beside it changes what it does. A
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=13
+gate_version=15
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -33,7 +53,7 @@ if [ -z "$synced" ] && [ "${CAGENTS_BUILD_INSTALL_SYNC-1}" != 0 ] &&
     main=$(git rev-parse -q --verify 'refs/remotes/origin/main^{commit}' 2>/dev/null) &&
     [ "$(cat -- "$installed.checked" 2>/dev/null)" != "$main" ]; then
     was=$(readlink -f -- "$installed" 2>/dev/null) || was=
-    if python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
+    if /usr/bin/python3 "$here/cargo-gate-sync.py" "$installed" "$main"; then
         # This gate was the installed one, so main's runs in its place.
         case $here/ in
             "$(readlink -f -- "$(dirname -- "$installed")")/cagents-cargo-gate.d/"*)
@@ -62,7 +82,7 @@ fail() {
 usage() {
     cat <<'EOF'
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
-       scripts/cargo-gate exec COMMAND [ARGS...]
+       scripts/cargo-gate exec [--hold] COMMAND [ARGS...]
 
 Rust compiles only on the build host in CAGENTS_BUILD_REMOTE, through
 scripts/cargo-offload: in one of its build slots, with this checkout's
@@ -77,12 +97,16 @@ with the reason.
 
 `exec` runs any command, such as a script of several Cargo builds, with a
 `cargo` first on PATH that leads back to this gate, so every Cargo command in
-it builds on that host.
+it builds on that host, each admitted there on its own. With --hold, for a
+script that only builds, one slot there is leased first, priced as a UI
+build, and held until COMMAND exits: its Cargo commands build in that slot one
+at a time, with no wait for admission of their own.
 
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here, each once a build slot is free. For `test`, `bench` and `run`, only the
 build (`--no-run`, or `build`) holds the slot; the tests or program run
-afterwards without it. `exec` holds one slot until COMMAND exits: a drop-in
+afterwards without it. `exec`, with or without --hold, holds one slot
+until COMMAND exits: a drop-in
 for `flock /var/tmp/cagents-cargo.lock COMMAND`, whose gated commands run in
 that slot without waiting.
 
@@ -204,8 +228,13 @@ case $1 in
     cargo) shift; named=true ;;
 esac
 [ "$#" -gt 0 ] || fail 'missing Cargo subcommand'
+hold=false
 if [ "$1" = exec ] && [ "$named" = false ]; then
     shift
+    if [ "${1-}" = --hold ]; then
+        hold=true
+        shift
+    fi
     [ "$#" -gt 0 ] || fail 'missing command for exec'
     mode=exec
 else
@@ -289,14 +318,22 @@ overdue_ramp=600
 # The memory a build is expected to need at its peak, in KiB: the whole
 # process tree's resident memory, measured on this repository's builds with 8
 # jobs (p90 rounded up). A UI build links the libcosmic, Servo and iced
-# graphs; a host build, Ghostty; a check generates no code. A script of
-# builds, such as the development runner, is costed as its largest.
+# graphs; a host build, Ghostty; a check generates no code. A held script
+# of builds, such as the development runner's, may build any lane in its
+# slot, so it is costed as the largest, a UI build.
 expected_cost() {
     if [ -n "${CAGENTS_BUILD_COST_GIB:-}" ]; then
         printf '%s' $((CAGENTS_BUILD_COST_GIB * gib))
         return
     fi
-    [ "$mode" = cargo ] || { printf '%s' $((8 * gib)); return; }
+    if [ "$mode" != cargo ]; then
+        if [ "$hold" = true ]; then
+            printf '%s' $((9 * gib))
+        else
+            printf '%s' $((8 * gib))
+        fi
+        return
+    fi
     # The lane is in the selected features and executables.
     lane=cli
     selection=false
@@ -660,7 +697,7 @@ acquire() {
     exec 6>>"$lock.queue"
     if ! flock -n 6; then
         announce
-        python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
+        /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "${admission_deadline:-}" \
             8>&- 9>&- </dev/null >/dev/null &
         waiter=$!
         status=0
@@ -676,7 +713,7 @@ acquire() {
             # A killed gate must leave neither an abandoned slot request nor
             # any helper holding its caller's pipes, locks or queue descriptor.
             # This loop enforces the deadline itself, so the waiter needs none.
-            python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
+            /usr/bin/python3 "$here/cargo-gate-command.py" --wait-lock "$$" 6 "" \
                 8>&- 9>&- </dev/null >/dev/null &
             waiter=$!
         fi
@@ -745,7 +782,7 @@ acquire() {
 check_admission() {
     [ -n "$admission_deadline" ] || return 0
     admission_status=0
-    python3 "$here/cargo-gate-command.py" \
+    /usr/bin/python3 "$here/cargo-gate-command.py" \
         --admission-check "$admission_deadline" 6>&- 8>&- 9>&- || admission_status=$?
     if [ "$admission_status" -ne 0 ]; then
         withdraw
@@ -847,7 +884,7 @@ supervised() {
     if [ -z "$slot_marker" ] && [ -n "${admission_deadline:-}" ]; then
         set -- --admission-until "$admission_deadline" "$@"
     fi
-    CAGENTS_BUILD_SLOT_HELD=$slot_marker python3 "$here/cargo-gate-command.py" \
+    CAGENTS_BUILD_SLOT_HELD=$slot_marker /usr/bin/python3 "$here/cargo-gate-command.py" \
         "$@" 0<&8 8>&- 9>&- &
     child=$!
     exec 8<&-
@@ -1000,7 +1037,7 @@ esac
 if [ "$where" -eq 0 ]; then
     deadline=
     if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-        deadline=$(python3 "$here/cargo-gate-command.py" \
+        deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
             --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
     fi
     admission_deadline=
@@ -1017,6 +1054,7 @@ if [ "$where" -eq 0 ]; then
     fi
     # Each Cargo command in COMMAND goes through this gate, with its own
     # admission budget: nothing here holds a slot while they build there.
+    # With --hold, the offload holds one slot there for all of them.
     # The shim reaches this gate by its own path, naming Cargo so that
     # `cargo --help` is Cargo's; the gate takes the shim off PATH again, so
     # it reaches this host's Cargo.
@@ -1032,7 +1070,13 @@ if [ "$where" -eq 0 ]; then
     RUSTC_WRAPPER=$here/cargo-gate-rustc-guard
     export CAGENTS_BUILD_EXEC_SHIMS CAGENTS_BUILD_EXEC_RUSTC_WRAPPER PATH RUSTC_WRAPPER
     status=0
-    supervised '' "$@" || status=$?
+    if [ "$hold" = true ]; then
+        supervised '' env CAGENTS_BUILD_ADMISSION_DEADLINE="$deadline" \
+            CAGENTS_BUILD_EXPECTED_KIB="$(expected_cost "$@")" \
+            CAGENTS_BUILD_OFFLOAD_HOST="$build_host" "$offload" --hold "$@" || status=$?
+    else
+        supervised '' "$@" || status=$?
+    fi
     rm -rf -- "$shims"
     exit "$status"
 fi
@@ -1046,7 +1090,7 @@ fi
 
 admission_deadline=
 if [ "${CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS+x}" = x ]; then
-    admission_deadline=$(python3 "$here/cargo-gate-command.py" \
+    admission_deadline=$(/usr/bin/python3 "$here/cargo-gate-command.py" \
         --admission-deadline "$CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS") || exit "$?"
 fi
 

@@ -21,10 +21,10 @@ set -- --edition 2024 --check \
     src/host/model/views/placement_tests.rs \
     tests/support/iced_tree.rs \
     tests/support/repository_scale.rs
-if [ "$cargo_status" -eq 0 ] && command -v python3 >/dev/null 2>&1; then
+if [ "$cargo_status" -eq 0 ] && [ -x /usr/bin/python3 ]; then
     # A successful check of identical source and formatter inputs can be reused.
     # The helper falls back to rustfmt whenever it cannot prove that identity.
-    python3 "$root/scripts/check-format-cache.py" "$@" || included_status=$?
+    /usr/bin/python3 "$root/scripts/check-format-cache.py" "$@" || included_status=$?
 else
     # Keep formatting available without Python, and report both diagnostics
     # when the Cargo-root check fails.

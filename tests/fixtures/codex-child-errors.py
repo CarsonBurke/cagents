@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Offline Codex child-error peer using the existing fixture WebSocket framing.
 
 Use a private CAGENTS_CHILD_ERROR_FIXTURE_ROOT, CODEX_HOME beneath that root,

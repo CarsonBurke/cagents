@@ -682,6 +682,7 @@ class ScriptContractsApplicability(unittest.TestCase):
             "Not applicable: build offload (source and fixture both absent at this head)",
             "Not applicable: focused lib tests (source and fixture both absent at this head)",
             "Not applicable: lock holders (source and fixture both absent at this head)",
+            "Not applicable: local install head check (source and fixture both absent at this head)",
         ])
         self.assertEqual(self.calls(root), [])
         self.assertEqual(list(root.iterdir()), [])
@@ -700,6 +701,7 @@ class ScriptContractsApplicability(unittest.TestCase):
                              "Not applicable: build offload (source and fixture both absent at this head)",
                              "Not applicable: focused lib tests (source and fixture both absent at this head)",
                              "Not applicable: lock holders (source and fixture both absent at this head)",
+                             "Not applicable: local install head check (source and fixture both absent at this head)",
                          ])
         self.assertEqual(self.calls(root), self.expected_calls(*range(len(self.pairs))))
 
