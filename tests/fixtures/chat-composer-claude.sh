@@ -52,6 +52,14 @@ fi
 if [ "$probe" = false ] && [ -f "$config/fixture-launches" ]; then
     printf '%s\n' "${resumed:-new}" >> "$config/fixture-launches"
 fi
+# Optional resume failure: while fixture-fail-resume exists, the next resumed
+# start exits before it answers, as a provider that cannot start would. The
+# file is removed first, so the start after it resumes normally.
+if [ "$probe" = false ] && [ -n "$resumed" ] && [ -e "$config/fixture-fail-resume" ]; then
+    rm -f "$config/fixture-fail-resume"
+    printf '%s\n' 'fixture: the resumed provider could not start' >&2
+    exit 1
+fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"

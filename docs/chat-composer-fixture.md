@@ -113,6 +113,9 @@ first, so a resumed provider answers normally. Create an empty
 conversation ID it resumed, or `new`. After pressing **Resume conversation**
 on the stopped card, the file ends with exactly one line naming the
 conversation that stopped, and no prompt is sent until you send one.
+To see a resume that fails, create `fixture-fail-resume` too: the next
+resumed start exits before it answers, and the card offers **Try again**. The
+file is removed first, so pressing it resumes normally.
 
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
