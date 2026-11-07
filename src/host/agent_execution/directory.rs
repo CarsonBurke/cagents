@@ -80,7 +80,7 @@ pub(in crate::host) fn read(
 }
 
 /// The sessions in a channel, including chats whose provider exited.
-pub(super) fn channel(
+pub(in crate::host) fn channel(
     host: &SharedHost,
     authority: &Authority,
     channel: Option<ChannelId>,
@@ -229,7 +229,7 @@ pub(super) fn list(
     let caller_channel = caller.and_then(|caller| channel_of(&view_scope(caller)));
     let mut me = None;
     let mut sessions = Vec::new();
-    let mut saved_transcripts = Vec::new();
+    let mut readers = std::collections::HashSet::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
         let delegation = delegations
@@ -254,7 +254,7 @@ pub(super) fn list(
             continue;
         }
         if live.history_only {
-            saved_transcripts.push(live.id);
+            readers.insert(live.id);
         }
         let entry = Entry {
             id: live.id,
@@ -328,6 +328,12 @@ pub(super) fn list(
         }
         served => served,
     };
+    let saved_transcripts = me
+        .iter()
+        .chain(&sessions)
+        .map(|member: &Member| member.session.id)
+        .filter(|id| readers.contains(id))
+        .collect();
     sessions.sort_by_cached_key(|Member { session: entry, .. }| {
         (
             match entry.relation {
@@ -445,6 +451,7 @@ fn exited_chats(host: &SharedHost) -> Vec<Live> {
             title: record.handle.title(),
             state: ActivityState::Idle,
             directory: record.session.launch.recipe.working_directory.clone(),
+            // Whatever it was reading, it's listed as exited.
             history_only: false,
             exited: true,
             failure: record.handle.failure(),

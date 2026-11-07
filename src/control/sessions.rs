@@ -450,6 +450,19 @@ mod tests {
         members.caller = Some(me);
         assert!(members_human(&members, 0).contains(&format!("\n(your channel {channel};")));
 
+        // A reader in the listing says so; only the daemon's list marks one.
+        let mut reader = members.sessions[0].clone();
+        reader.exited = false;
+        reader.failure = None;
+        reader.session.relation = Relation::Peer;
+        let reader_id = reader.session.id;
+        members.caller = None;
+        members.sessions = vec![reader];
+        assert!(!members_human(&members, 0).contains("saved transcript"));
+        members.saved_transcripts = vec![reader_id];
+        assert!(members_human(&members, 0).contains("saved transcript"));
+        members.saved_transcripts.clear();
+
         members.caller = None;
         members.sessions.clear();
         assert_eq!(
