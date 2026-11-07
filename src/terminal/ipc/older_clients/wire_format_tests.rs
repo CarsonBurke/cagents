@@ -24,7 +24,7 @@ const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 
 /// The automation replies `holds_a_firing` refuses a client before
 /// `FIRING_WITH_SKIPPED_OCCURRENCES`.
-const FIRING_REPLIES: &[&str] = &["Listed", "Firing", "History", "Detail"];
+const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
 
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

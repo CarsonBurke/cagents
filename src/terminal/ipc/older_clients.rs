@@ -97,6 +97,24 @@ impl OlderClient {
     pub fn admits_request(&self, request: &ClientRequest) -> bool {
         variant_index(request).is_some_and(|index| index < self.client_requests)
             && !changes_the_daemon(request)
+            && !self.cannot_read_the_firing_for(request)
+    }
+
+    /// A run-now started here would look refused, so its request is turned
+    /// away before anything starts rather than at its reply.
+    fn cannot_read_the_firing_for(&self, request: &ClientRequest) -> bool {
+        use crate::automations::Request;
+        self.protocol < FIRING_WITH_SKIPPED_OCCURRENCES
+            && matches!(
+                request,
+                ClientRequest::Automation {
+                    operation: Request::RunNow { .. }
+                        | Request::History { .. }
+                        | Request::ShowFiring { .. }
+                        | Request::ShowRun { .. },
+                    ..
+                }
+            )
     }
 
     /// Whether the client can decode this message.
@@ -143,7 +161,7 @@ fn holds_a_firing(response: &crate::automations::Response) -> bool {
     use crate::automations::Response;
     matches!(
         response,
-        Response::Listed(_) | Response::Firing(_) | Response::History(_) | Response::Detail(_)
+        Response::Firing(_) | Response::History(_) | Response::Detail(_)
     )
 }
 
@@ -424,20 +442,54 @@ mod tests {
         let reply = |response| ServerMessage::Response {
             response: ServerResponse::Automation(response),
         };
-        assert!(!client.admits_message(&reply(Response::Listed(Vec::new()))));
-        assert!(
-            !client.admits_message(&reply(Response::History(HistoryPage {
+        let history = || {
+            Response::History(HistoryPage {
                 firings: Vec::new(),
                 next: None,
-            })))
-        );
+            })
+        };
+        assert!(!client.admits_message(&reply(history())));
+        assert!(client.admits_message(&reply(Response::Listed(Vec::new()))));
         assert!(client.admits_message(&reply(Response::Removed)));
         assert!(client.admits_message(&reply(Response::Proposals(Vec::new()))));
         let changed = OlderClient {
             protocol: FIRING_WITH_SKIPPED_OCCURRENCES,
             ..client
         };
-        assert!(changed.admits_message(&reply(Response::Listed(Vec::new()))));
+        assert!(changed.admits_message(&reply(history())));
+    }
+
+    #[test]
+    fn a_request_answered_with_a_firing_is_turned_away_before_it_changed() {
+        use crate::{agent_execution::Authority, automations::Request};
+        use uuid::Uuid;
+
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let asking = |operation| ClientRequest::Automation {
+            authority: Authority::default(),
+            operation,
+        };
+        assert!(!client.admits_request(&asking(Request::RunNow {
+            id: Uuid::nil(),
+            execution_revision: 0,
+            request: Uuid::nil(),
+            confirmed: true,
+        })));
+        assert!(!client.admits_request(&asking(Request::History {
+            id: None,
+            before: None,
+            limit: 1,
+        })));
+        assert!(!client.admits_request(&asking(Request::ShowFiring { id: Uuid::nil() })));
+        assert!(client.admits_request(&asking(Request::Cancel {
+            id: Uuid::nil(),
+            firing: Uuid::nil(),
+        })));
+        let changed = OlderClient {
+            protocol: FIRING_WITH_SKIPPED_OCCURRENCES,
+            ..client
+        };
+        assert!(changed.admits_request(&asking(Request::ShowFiring { id: Uuid::nil() })));
     }
 
     #[test]
