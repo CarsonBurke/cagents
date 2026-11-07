@@ -424,7 +424,7 @@ pub(super) enum Unstarted {
 
 const STARTED_HERE: &str = "This pane's earlier Claude process may still be running, so nothing was started in its place. Retry once it has exited";
 
-const OPEN_ELSEWHERE: &str = "Another pane may still be writing to this Claude conversation, so nothing was started. Close that pane, then resume this conversation again";
+const OPEN_ELSEWHERE: &str = "This conversation may still be running, so nothing was started. If a pane shows it, close that pane and resume again. If none does, `cagents sessions` says how to put it in a channel";
 
 /// Whether `source` is a resume successor that never started, and how it
 /// resumes. Nothing in this daemon may run, start or admit its conversation,

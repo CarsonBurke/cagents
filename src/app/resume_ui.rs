@@ -817,7 +817,7 @@ impl Cagents {
                     client
                         .prepare_chat_resume(source)
                         .map(Some)
-                        .map_err(|error| error.to_string())
+                        .map_err(prepare_error_text)
                 })
                 .await
                 .unwrap_or_else(|error| Err(error.to_string()));
@@ -1156,6 +1156,15 @@ fn unstarted_successor(session: &chat::Session) -> bool {
 
 /// Shape validation of the authenticated preparation reply. It grants no
 /// provider ownership; Start/Attach still runs normal HOST admission.
+/// The daemon's refusal is written for the person reading it. Its protocol
+/// wrapping isn't.
+fn prepare_error_text(error: crate::control::ControlError) -> String {
+    match error {
+        crate::control::ControlError::Remote { message, .. } => message,
+        error => error.to_string(),
+    }
+}
+
 fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> bool {
     // An ended retained Claude actor resumes as a reconnect-only successor,
     // on the conversation the daemon proved it confirmed.
@@ -1370,6 +1379,19 @@ mod tests {
             .unwrap();
         assert_eq!(row.title, "Parser recovery");
         assert!(matches!(&row.source, Source::Saved(saved) if saved.title == "Parser recovery"));
+    }
+
+    #[test]
+    fn a_daemon_refusal_of_a_resume_reads_without_its_protocol_wrapping() {
+        let refused = crate::control::ControlError::Remote {
+            code: crate::terminal::ipc::ProtocolErrorCode::TerminalUnavailable,
+            message: "This conversation may still be running".into(),
+            retryable: false,
+        };
+        assert_eq!(
+            prepare_error_text(refused),
+            "This conversation may still be running"
+        );
     }
 
     #[test]

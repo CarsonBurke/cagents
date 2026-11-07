@@ -26,6 +26,8 @@ pub(in crate::host) struct Live {
     pub(in crate::host) title: Option<String>,
     pub(in crate::host) state: ActivityState,
     pub(in crate::host) directory: PathBuf,
+    /// A reader of a saved transcript, with no provider process behind it.
+    pub(in crate::host) history_only: bool,
     /// A chat whose provider exited; only channel listings include one.
     pub(in crate::host) exited: bool,
     pub(in crate::host) failure: Option<String>,
@@ -47,6 +49,7 @@ pub(super) struct Listing {
     pub(super) sessions: Vec<Member>,
     /// What was served: a directory widened to `All`, or the caller's channel.
     pub(super) served: Wanted,
+    pub(super) saved_transcripts: Vec<TerminalId>,
 }
 
 impl Listing {
@@ -55,7 +58,7 @@ impl Listing {
     }
 }
 
-pub(super) fn read(
+pub(in crate::host) fn read(
     host: &SharedHost,
     authority: &Authority,
     scope: Scope,
@@ -72,11 +75,12 @@ pub(super) fn read(
             .into_iter()
             .map(|member| member.session)
             .collect(),
+        saved_transcripts: listing.saved_transcripts,
     })
 }
 
 /// The sessions in a channel, including chats whose provider exited.
-pub(super) fn channel(
+pub(in crate::host) fn channel(
     host: &SharedHost,
     authority: &Authority,
     channel: Option<ChannelId>,
@@ -101,6 +105,7 @@ pub(super) fn channel(
         channel,
         caller: listing.caller,
         sessions: listing.sessions,
+        saved_transcripts: listing.saved_transcripts,
     })
 }
 
@@ -224,6 +229,7 @@ pub(super) fn list(
     let caller_channel = caller.and_then(|caller| channel_of(&view_scope(caller)));
     let mut me = None;
     let mut sessions = Vec::new();
+    let mut readers = std::collections::HashSet::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
         let delegation = delegations
@@ -246,6 +252,9 @@ pub(super) fn list(
         let related = relation != Relation::Peer;
         if !related && wanted.is_some() && project != wanted {
             continue;
+        }
+        if live.history_only {
+            readers.insert(live.id);
         }
         let entry = Entry {
             id: live.id,
@@ -319,6 +328,12 @@ pub(super) fn list(
         }
         served => served,
     };
+    let saved_transcripts = me
+        .iter()
+        .chain(&sessions)
+        .map(|member: &Member| member.session.id)
+        .filter(|id| readers.contains(id))
+        .collect();
     sessions.sort_by_cached_key(|Member { session: entry, .. }| {
         (
             match entry.relation {
@@ -342,6 +357,7 @@ pub(super) fn list(
     Ok(Listing {
         caller: me,
         sessions,
+        saved_transcripts,
         served,
     })
 }
@@ -390,6 +406,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             title: record.handle.title(),
             state: record.handle.activity(),
             directory: record.session.launch.recipe.working_directory.clone(),
+            history_only: record.handle.is_read_only_history(),
             exited: false,
             failure: record.handle.failure(),
         });
@@ -411,6 +428,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             title: record.conversation_title().map(str::to_owned),
             state: activity.map_or(ActivityState::Unknown, |activity| activity.state),
             directory: record.current_directory().to_path_buf(),
+            history_only: false,
             exited: false,
             failure: None,
         });
@@ -433,6 +451,8 @@ fn exited_chats(host: &SharedHost) -> Vec<Live> {
             title: record.handle.title(),
             state: ActivityState::Idle,
             directory: record.session.launch.recipe.working_directory.clone(),
+            // Whatever it was reading, it's listed as exited.
+            history_only: false,
             exited: true,
             failure: record.handle.failure(),
         })

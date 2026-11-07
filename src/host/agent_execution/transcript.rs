@@ -376,6 +376,7 @@ mod tests {
             caller: None,
             sessions,
             served: directory::Wanted::Scope(Scope::All),
+            saved_transcripts: Vec::new(),
         }
     }
 

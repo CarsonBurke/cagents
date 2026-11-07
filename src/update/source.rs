@@ -187,8 +187,11 @@ impl Client {
         protocol: u16,
     ) -> Result<Self, ControlError> {
         match protocol {
-            crate::terminal_ipc::PROTOCOL_VERSION
-            | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL => {
+            protocol
+                if protocol == crate::terminal_ipc::PROTOCOL_VERSION
+                    || protocol == crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+                    || crate::terminal_ipc::EARLIER_MATCHED_SETS.contains(&protocol) =>
+            {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -197,8 +200,8 @@ impl Client {
                 let peer = Peer::observe(&stream, socket).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
-                // The candidate line differs only by its number and by
-                // StartupState, which the update never sends.
+                // These sources differ from this release only by their number
+                // and by messages an update doesn't exchange.
                 let client =
                     ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
                 peer.verify(client.proof()).map_err(|error| {
@@ -347,7 +350,7 @@ pub(super) fn is_qualified_source(protocol: u16) -> bool {
         77 | 119
             | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
             | crate::terminal_ipc::PROTOCOL_VERSION
-    )
+    ) || crate::terminal_ipc::EARLIER_MATCHED_SETS.contains(&protocol)
 }
 
 /// Installed entry routing, not permission to decode or mutate an unknown

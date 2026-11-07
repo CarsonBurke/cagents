@@ -40,8 +40,10 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
-encoding, not meaning, and not JSON carried as text inside a message.
+encodes the same way, except for what is refused or withheld, and for a named
+field appended where a reply's frame ends, which an older client stops reading
+before. It checks encoding, not meaning, and not JSON carried as text inside a
+message.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
 directory at its own matched CLI. That runtime directory is
@@ -95,8 +97,8 @@ cagents daemon stop --confirm
 | `daemon protocol-version` | Print this executable's wire protocol version without contacting a daemon |
 | `terminal list`, `spawn`, `write`, `close`, `snapshot`, `wait` | Inspect and drive daemon-hosted terminals |
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
-| `channel spawn`, `list`, `close` | Manage the channels every window shares |
-| `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement |
+| `channel spawn`, `list`, `close` | Manage the channels every window shares. `close` is refused while a live session is in the channel: move it, or delete the channel in the app, which closes its sessions |
+| `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement. A live session marked `no shared pane` in `cagents sessions` gets a pane in the channel instead. Refused inside a hosted session, including an in-app shell |
 | `sessions [--project PATH \| --all \| --channel [CHANNEL]]` (alias `ls`), `whoami` | List live agent sessions in this project or everyone in a channel, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
 | `transcript SESSION [-n N] [--before ID] [--tools] [--full]` (alias `history`) | Read one page of a session's conversation from its provider's saved history; see [Reading your channel](agent-execution.md#reading-your-channel) |
 | `work ls [--project PATH] [--column COLUMN] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show every worktree and branch in progress across open projects, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |

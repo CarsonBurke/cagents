@@ -89,6 +89,7 @@ impl Listing {
                         caller: None,
                         scope: agent_execution::directory::Scope::All,
                         sessions,
+                        saved_transcripts: vec![],
                     },
                 ))
             }
@@ -516,6 +517,7 @@ fn accepted_wait_output(
                                 accepted.agent.spec.target.repository.clone(),
                             ),
                             sessions: vec![],
+                            saved_transcripts: vec![],
                         })
                     }
                     Operation::List => Reply::Listed(vec![]),

@@ -637,10 +637,20 @@ impl Cagents {
             self.sidebar_selection_ui.dialog = Some(dialog);
             return iced::widget::operation::focus(focus).map(cosmic::Action::App);
         }
-        let mut tasks = Vec::new();
+        // Channels go as one deletion, so a session whose card and pane are both
+        // selected closes with them, as the dialog said.
+        let channels = dialog
+            .targets
+            .iter()
+            .filter_map(|target| match target.row {
+                SelectionRow::Channel(id) => Some(id),
+                _ => None,
+            })
+            .collect();
+        let mut tasks = vec![self.delete_channels(channels)];
         for target in dialog.targets {
             tasks.push(match target.row {
-                SelectionRow::Channel(id) => self.delete_channel(id),
+                SelectionRow::Channel(_) => Task::none(),
                 SelectionRow::Worktree(project, id) => self.delete_selected_worktree(project, id),
                 SelectionRow::Project(project_id) => {
                     // Prepare the same project removal used by its row, then
@@ -704,7 +714,7 @@ impl Cagents {
                  Terminals and chats running in them, including detached ones, are closed first.",
             ),
             SelectionRow::Channel(_) => {
-                let conversations = dialog
+                let channels = dialog
                     .targets
                     .iter()
                     .filter_map(|target| match target.row {
@@ -715,15 +725,32 @@ impl Cagents {
                             .find(|channel| channel.id == id),
                         _ => None,
                     })
-                    .map(|channel| self.channel_conversation_count(channel))
+                    .collect::<Vec<_>>();
+                let going = channels
+                    .iter()
+                    .map(|channel| channel.id)
+                    .collect::<Vec<_>>();
+                let conversations = channels
+                    .iter()
+                    .map(|channel| self.channel_conversation_count(channel, &going))
                     .sum::<usize>();
+                let closes = (conversations > 0).then(|| {
+                    format!(
+                        "Deleting them closes the {conversations} conversation{} inside them.",
+                        if conversations == 1 { "" } else { "s" }
+                    )
+                });
+                let cascade = closes
+                    .into_iter()
+                    .chain(
+                        channels
+                            .iter()
+                            .flat_map(|channel| self.channel_held_elsewhere_notes(channel, &going)),
+                    )
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 (
-                    (conversations > 0).then(|| {
-                        format!(
-                            "Deleting them closes the {conversations} conversation{} inside them.",
-                            if conversations == 1 { "" } else { "s" }
-                        )
-                    }),
+                    (!cascade.is_empty()).then_some(cascade),
                     "The channels and the conversations they hold are removed from this \
                      workspace. Nothing outside them is touched.",
                 )

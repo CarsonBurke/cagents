@@ -294,6 +294,9 @@ pub struct State {
     /// Deletions under way. Each runs behind its channel's row rather than a
     /// dialog, so the rest of the window stays usable meanwhile.
     deleting: HashSet<ChannelId>,
+    /// The rest of the selection a bulk deletion is working through, so the
+    /// first channel knows the others are going too.
+    deleting_together: Vec<ChannelId>,
     /// Exact local targets retained until the matching close worker completes.
     closing: HashMap<ChannelId, ChannelCloseAttempt>,
     /// Deletions that failed, with why, until retried or declined.
@@ -422,6 +425,8 @@ struct Deletion {
     title: String,
     /// Open conversations the deletion closes, reported before it happens.
     chats: usize,
+    /// What it leaves running in another channel, in the reader's terms.
+    held_elsewhere: Vec<String>,
     /// Why the last deletion of this channel failed, when the dialog is
     /// opened again after it. Confirming retries it.
     failure: Option<String>,
@@ -447,6 +452,14 @@ impl State {
             .get(&id)
             .expect("channel close worker")
             .operation
+    }
+
+    /// Whether `id` is being deleted, is about to be with a selection, or has
+    /// been and the daemon hasn't yet dropped its view.
+    pub(super) fn is_going(&self, id: ChannelId) -> bool {
+        self.deleting.contains(&id)
+            || self.deleting_together.contains(&id)
+            || self.deleted.contains(&id)
     }
 
     pub(super) fn is_deleting(&self, id: ChannelId) -> bool {
@@ -582,9 +595,10 @@ impl Cagents {
                             )
                         })
                         .unwrap_or(Cow::Borrowed("the channel"));
-                    self.status = Some(TransientNotice::error(format!(
-                        "Could not delete {title}: {error}"
-                    )));
+                    self.status = Some(
+                        TransientNotice::error(format!("Could not delete {title}: {error}"))
+                            .with_key(NoticeKey::ChannelDelete(id)),
+                    );
                     self.channel_ui.failed.insert(id, error);
                     self.refresh_sidebar_channels();
                     Task::none()
@@ -1235,22 +1249,28 @@ impl Cagents {
         };
         let title = channel_display_title(channel, self.sidebar_model.project(channel.project_id))
             .into_owned();
-        let chats = self.channel_conversation_count(channel);
-        if chats == 0 && !always_confirm {
+        let chats = self.channel_conversation_count(channel, &[id]);
+        let held_elsewhere = self.channel_held_elsewhere_notes(channel, &[id]);
+        if chats == 0 && held_elsewhere.is_empty() && !always_confirm {
             return self.delete_channel(id);
         }
         self.channel_ui.dialog = Some(Deletion {
             channel: id,
             title,
             chats,
+            held_elsewhere,
             failure: self.channel_ui.failed.get(&id).cloned(),
         });
         iced::widget::operation::focus(State::focus_target()).map(cosmic::Action::App)
     }
 
     /// The open conversations - chats and terminals - that deleting
-    /// `channel` closes with it.
-    pub(super) fn channel_conversation_count(&self, channel: &ProjectChannel) -> usize {
+    /// `channel` closes with it, when the channels in `going` go as well.
+    pub(super) fn channel_conversation_count(
+        &self,
+        channel: &ProjectChannel,
+        going: &[ChannelId],
+    ) -> usize {
         channel
             .cards
             .iter()
@@ -1259,13 +1279,55 @@ impl Cagents {
                     state.id == **card
                         && state.existence.is_open()
                         && matches!(&state.kind, CardKind::Chat(_) | CardKind::Terminal(_))
-                })
+                }) && !self.another_pane_holds_session_beyond(**card, going)
             })
             .count()
     }
 
+    /// What deleting `channel` leaves running because another pane holds it.
+    pub(super) fn channel_held_elsewhere_notes(
+        &self,
+        channel: &ProjectChannel,
+        going: &[ChannelId],
+    ) -> Vec<String> {
+        channel
+            .cards
+            .iter()
+            .filter(|card| {
+                self.card_state(**card)
+                    .is_some_and(|state| state.existence.is_open())
+            })
+            .filter_map(|card| self.session_held_elsewhere_note(*card, going))
+            .collect()
+    }
+
+    /// One that has to wait for a pane move stays, so it isn't counted as going
+    /// and what it holds stays held.
     pub(super) fn delete_channels(&mut self, ids: Vec<ChannelId>) -> Task<Message> {
-        Task::batch(ids.into_iter().map(|id| self.delete_channel(id)))
+        self.channel_ui.deleting_together = ids
+            .iter()
+            .copied()
+            .filter(|id| !self.channel_pane_transfer_pending(*id))
+            .collect();
+        let tasks = ids
+            .into_iter()
+            .map(|id| self.delete_channel(id))
+            .collect::<Vec<_>>();
+        self.channel_ui.deleting_together.clear();
+        Task::batch(tasks)
+    }
+
+    fn channel_pane_transfer_pending(&self, id: ChannelId) -> bool {
+        self.durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .is_some_and(|channel| {
+                channel
+                    .cards
+                    .iter()
+                    .any(|card| self.pane_transfer_pending(*card))
+            })
     }
 
     /// Removes a channel along with everything that existed only inside it.
@@ -1284,7 +1346,7 @@ impl Cagents {
         else {
             return Task::none();
         };
-        if cards.iter().any(|card| self.pane_transfer_pending(*card)) {
+        if self.channel_pane_transfer_pending(id) {
             self.status = Some(TransientNotice::warning(
                 "Wait for the pane move to finish before deleting this channel.",
             ));
@@ -1301,6 +1363,7 @@ impl Cagents {
         );
         self.forget_channel_revival(id);
         self.channel_ui.failed.remove(&id);
+        self.resolve_notice(NoticeKey::ChannelDelete(id));
         self.refresh_sidebar_channels();
         // Settling spawns and closing sessions take a round trip each, and the
         // row reports them meanwhile. The workspace leaves the channel now, so
@@ -1328,11 +1391,17 @@ impl Cagents {
             });
             return Task::batch([leave, retry]);
         }
+        // A session another pane holds is not this channel's to end; its card
+        // leaves with the channel and the session stays there.
         let sessions: Vec<_> = self
             .durable
             .cards
             .iter()
-            .filter(|card| cards.contains(&card.id) && card.existence.is_open())
+            .filter(|card| {
+                cards.contains(&card.id)
+                    && card.existence.is_open()
+                    && !self.another_pane_holds_session(card.id)
+            })
             .map(|card| card.kind.clone())
             .collect();
         if !sessions
@@ -1481,6 +1550,23 @@ impl Cagents {
     }
 
     pub(super) fn finish_delete_channel(&mut self, id: ChannelId) -> Task<Message> {
+        // Text moves only now that the channel is certain to go: a close that
+        // fails leaves the channel, and the text stays on its card.
+        let cards = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == id)
+            .map(|channel| channel.cards.clone())
+            .unwrap_or_default();
+        for card in cards {
+            if self
+                .card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+            {
+                self.carry_draft_of_card_held_elsewhere(card, &[id]);
+            }
+        }
         self.retire_channel(id, false)
     }
 
@@ -1503,6 +1589,7 @@ impl Cagents {
         let focused = self.durable.channels[index].focused;
         let mut retained_scope = None;
         let channel = Arc::make_mut(&mut self.durable).channels.remove(index);
+        self.resolve_notice(NoticeKey::ChannelDelete(id));
         // Every window loses the channel, not only this one. A deletion that
         // arrived from the registry publishes it right back, which the registry
         // answers as a no-op because the channel is already gone - cheaper than
@@ -1694,6 +1781,12 @@ impl Cagents {
                 ),
             }),
         ];
+        rows.extend(
+            dialog
+                .held_elsewhere
+                .iter()
+                .map(|note| super::notice_body(note.as_str())),
+        );
         if let Some(failure) = &dialog.failure {
             rows.push(super::notice_body(format!(
                 "The last attempt failed: {failure}"
@@ -2752,8 +2845,19 @@ mod tests {
         );
         assert!(app.durable.channels.iter().any(|row| row.id == doomed));
 
+        // Trying again takes back what the last attempt reported, in the
+        // notices list as well as the toast.
+        app.notices.record(app.status.clone().unwrap());
+        let reported = |app: &Cagents| {
+            app.notices
+                .recent()
+                .any(|entry| entry.notice.message.starts_with("Could not delete"))
+        };
+        assert!(reported(&app));
         let _ = app.handle_channel_ui(Action::RetryFailed(doomed));
         assert_eq!(deletion(&app), Some(RowDeletion::Deleting));
+        assert!(app.status.is_none());
+        assert!(!reported(&app));
         let _ = app.handle_channel_ui(Action::SessionsClosed(
             doomed,
             app.channel_ui.close_operation(doomed),

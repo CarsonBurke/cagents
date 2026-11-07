@@ -4745,10 +4745,10 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
         )
         .err()
         .expect("a running conversation is never prepared again");
+        // A running conversation may have no pane to close.
         assert!(
-            refused
-                .message
-                .contains("may still be writing to this Claude conversation"),
+            refused.message.contains("may still be running")
+                && refused.message.contains("`cagents sessions`"),
             "{}",
             refused.message
         );

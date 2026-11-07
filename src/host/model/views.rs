@@ -1514,6 +1514,47 @@ mod tests {
         seed(&mut r, a, vec![p]);
         assert!(read(&r.db, &Scope::Channel(a)).unwrap().panes.is_empty());
     }
+    /// `cagents channel move` on a session no view holds: a channel that has
+    /// never held a pane accepts it at revision 0, and a second client's insert
+    /// of the same session changes nothing, so a caller has to check the reply.
+    #[test]
+    fn inserting_a_session_no_view_holds_places_it_once() {
+        let (mut r, _, a, b) = setup();
+        let p = pane();
+        assert_eq!(r.view_revision(&Scope::Channel(a)).unwrap(), 0);
+        let first = edit(
+            &mut r,
+            a,
+            Change::Insert {
+                pane: p.clone(),
+                before: None,
+            },
+        );
+        r.apply(&first).unwrap();
+        assert_eq!(
+            read(&r.db, &Scope::Channel(a)).unwrap().panes,
+            vec![p.clone()]
+        );
+        for channel in [a, b] {
+            let mut second = p.clone();
+            second.id = CardId::new();
+            let again = edit(
+                &mut r,
+                channel,
+                Change::Insert {
+                    pane: second,
+                    before: None,
+                },
+            );
+            r.apply(&again).unwrap();
+            assert_eq!(
+                read(&r.db, &Scope::Channel(a)).unwrap().panes,
+                vec![p.clone()]
+            );
+            assert!(read(&r.db, &Scope::Channel(b)).unwrap().panes.is_empty());
+        }
+    }
+
     #[test]
     fn transfer_is_atomic_unique_and_reversible() {
         let (mut r, _, a, b) = setup();

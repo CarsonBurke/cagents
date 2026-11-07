@@ -86,6 +86,10 @@ pub(super) struct State {
     pub defaults: HashMap<CardId, TerminalSession>,
     default_requests: HashSet<CardId>,
     pub blocked: HashSet<Scope>,
+    /// Open cards whose local work is holding up a shared pane of their session.
+    /// Cards whose work keeps them from giving way to the pane that holds their
+    /// session, each with that pane.
+    blocked_aliases: HashMap<CardId, CardId>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
@@ -1580,6 +1584,7 @@ impl Cagents {
 
     fn prepare_shared_aliases(&mut self, views: &[View], owned: &HashSet<CardId>) {
         self.shared_views.blocked = blocked_managed_view_scopes(&self.workspace_model, views);
+        let previously_blocked = std::mem::take(&mut self.shared_views.blocked_aliases);
         let mut attention_owners: HashMap<_, usize> = HashMap::new();
         for pane in views.iter().flat_map(|view| &view.panes) {
             if let Some(resource) = attention_resource(&pane.kind) {
@@ -1628,22 +1633,25 @@ impl Cagents {
                         }
                         continue;
                     }
-                    let local_work = self.shared_chat_has_local_work(alias);
-                    let can_adopt = if matches!(shared.kind, CardKind::Terminal(_)) {
-                        self.can_rekey_shared_terminal_draft(alias, shared.id)
-                    } else {
-                        !local_work
-                    };
-                    if !can_adopt {
+                    if !self.can_adopt_shared_alias(alias, shared.id) {
                         self.shared_views.blocked.insert(view.scope.clone());
                         for scope in self.local_view_scopes() {
                             if self.local_view_cards(&scope).contains(&alias) {
                                 self.shared_views.blocked.insert(scope);
                             }
                         }
-                        self.status = Some(TransientNotice::warning(
-                            "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
-                        ));
+                        self.shared_views.blocked_aliases.insert(alias, shared.id);
+                        // Every reconcile lands here while the card waits, so
+                        // it speaks up once, and again only if what it said
+                        // stopped being true. A dismissed notice has no entry
+                        // to compare and stays dismissed.
+                        let message = self.alias_held_notice(alias, shared, &view.scope);
+                        let key = NoticeKey::SessionHeld(alias);
+                        if !previously_blocked.contains_key(&alias)
+                            || self.notices.says_otherwise(&key, &message)
+                        {
+                            self.status = Some(TransientNotice::warning(message).with_key(key));
+                        }
                         continue;
                     }
                     adoptions.push((view.scope.clone(), alias, shared.clone()));
@@ -1655,7 +1663,7 @@ impl Cagents {
                 continue;
             }
             if let CardKind::Terminal(session) = &shared.kind {
-                if !self.rekey_shared_terminal_draft(alias, shared.id) {
+                if !self.rekey_shared_draft(alias, shared.id) {
                     continue;
                 }
                 self.shared_views
@@ -1678,11 +1686,304 @@ impl Cagents {
             {
                 self.sidebar_state.transfer_card_update(alias, shared.id);
             }
+            let carried = matches!(shared.kind, CardKind::Chat(_))
+                && self.carry_chat_draft_to_pane(alias, shared.id);
+            // Unsent text left the view the person was typing in, and a
+            // confirmation retires before they may look up, so that one stays.
+            if carried {
+                self.status = Some(TransientNotice::warning(
+                    self.alias_moved_notice(alias, &shared, &scope, carried),
+                ));
+            } else if previously_blocked.contains_key(&alias) {
+                self.status = Some(TransientNotice::success(
+                    self.alias_moved_notice(alias, &shared, &scope, carried),
+                ));
+            }
+            self.shared_views.retained.remove(&alias);
             self.detach_shared_pane(alias);
-            for channel in &mut Arc::make_mut(&mut self.durable).channels {
+            let durable = Arc::make_mut(&mut self.durable);
+            durable.local_only_cards.remove(&alias);
+            for channel in &mut durable.channels {
                 channel.cards.retain(|id| *id != alias);
             }
         }
+        // Whatever ended a hold, its promise about moving has ended with it.
+        for alias in previously_blocked.keys() {
+            if !self.shared_views.blocked_aliases.contains_key(alias) {
+                self.resolve_notice(NoticeKey::SessionHeld(*alias));
+            }
+        }
+    }
+
+    fn can_adopt_shared_alias(&self, alias: CardId, canonical: CardId) -> bool {
+        match self.card_state(alias).map(|state| &state.kind) {
+            Some(CardKind::Terminal(_)) => self.can_rekey_shared_draft(alias, canonical),
+            Some(CardKind::Chat(_)) => self.can_move_chat_to_pane(alias, canonical),
+            _ => !self.shared_chat_has_local_work(alias),
+        }
+    }
+
+    /// What a person calls the place `scope` shows, as the sidebar labels it.
+    fn scope_display_name(&self, scope: &Scope) -> String {
+        let Scope::Channel(id) = scope else {
+            return "its worktree".to_owned();
+        };
+        let Some(channel) = self
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == *id)
+        else {
+            return "another channel".to_owned();
+        };
+        let project = self.sidebar_model.project(channel.project_id);
+        format!(
+            "\u{201c}{}\u{201d}",
+            super::channel_ui::channel_display_title(channel, project)
+        )
+    }
+
+    fn alias_title<'a>(&'a self, alias: CardId, shared: &'a Pane) -> &'a str {
+        self.card_state(alias)
+            .map_or(shared.title.as_str(), |card| card.title.as_str())
+    }
+
+    fn alias_held_notice(&self, alias: CardId, shared: &Pane, scope: &Scope) -> String {
+        let session = match shared.kind {
+            CardKind::Chat(_) => "conversation",
+            _ => "session",
+        };
+        let title = self.alias_title(alias, shared);
+        let place = self.scope_display_name(scope);
+        // Only a chat card's text can follow it.
+        let carries_text = matches!(
+            self.card_state(alias).map(|state| &state.kind),
+            Some(CardKind::Chat(_))
+        );
+        if self.chat_closed_elsewhere_here(alias) {
+            let after = if carries_text {
+                format!("Your unsent text goes with it and the {session} keeps running.")
+            } else {
+                format!("The {session} keeps running.")
+            };
+            return format!(
+                "\u{201c}{title}\u{201d} is also in {place}. Close this card to show it there. {after}"
+            );
+        }
+        let closing = if carries_text {
+            format!(
+                "Closing it here keeps the {session} running, sends your unsent text there and discards anything else waiting."
+            )
+        } else {
+            format!("Closing it here keeps the {session} running and discards what's waiting.")
+        };
+        format!(
+            "\u{201c}{title}\u{201d} is also in {place}. It moves there once what's waiting here is finished or cleared. {closing}"
+        )
+    }
+
+    fn alias_moved_notice(
+        &self,
+        alias: CardId,
+        shared: &Pane,
+        scope: &Scope,
+        carried: bool,
+    ) -> String {
+        format!(
+            "\u{201c}{}\u{201d} moved to {}{}",
+            self.alias_title(alias, shared),
+            self.scope_display_name(scope),
+            if carried {
+                ", with what you hadn't sent."
+            } else {
+                "."
+            },
+        )
+    }
+
+    /// Nothing else reconciles when a blocked card's local work clears, and until
+    /// then the views it blocks neither publish nor project.
+    pub(super) fn reconcile_cleared_blocked_aliases(&mut self) -> Task<Message> {
+        let cleared = self
+            .shared_views
+            .blocked_aliases
+            .iter()
+            .any(|(alias, canonical)| self.can_adopt_shared_alias(*alias, *canonical));
+        if cleared {
+            self.reconcile_shared_views()
+        } else {
+            Task::none()
+        }
+    }
+
+    /// Settles a card's own publication and lets `scope` project, as the daemon's
+    /// answers would.
+    #[cfg(test)]
+    pub(super) fn mark_view_ready_for_test(&mut self, scope: Scope) {
+        self.shared_views.pending.clear();
+        self.shared_views.initialized.insert(scope);
+    }
+
+    /// The view where a pane other than `card` holds `session`.
+    ///
+    /// A session ends only when the pane holding it does: every route by which
+    /// a card ends one asks this first. A chat and the terminal view of its
+    /// conversation share an ID and end together, so the kinds need not match.
+    ///
+    /// A channel on its way out holds nothing: its panes go with it, and a
+    /// session counted as held there would run on with no pane anywhere.
+    /// `going` names the channels a confirmation is asking about.
+    fn pane_holding_session(
+        &self,
+        card: CardId,
+        session: TerminalId,
+        going: &[ChannelId],
+    ) -> Option<(&View, &Pane)> {
+        self.workspace_model
+            .views
+            .iter()
+            .filter(|view| {
+                !matches!(view.scope, Scope::Channel(id)
+                    if going.contains(&id) || self.channel_ui.is_going(id))
+            })
+            .find_map(|view| {
+                let pane = view.panes.iter().find(|pane| {
+                    pane.id != card
+                        && match &pane.kind {
+                            CardKind::Chat(held) => held.id == session,
+                            CardKind::Terminal(held) => held.id == session,
+                            _ => false,
+                        }
+                })?;
+                Some((view, pane))
+            })
+    }
+
+    pub(super) fn another_pane_holds(&self, card: CardId, session: TerminalId) -> bool {
+        self.pane_holding_session(card, session, &[]).is_some()
+    }
+
+    /// Where another pane holds the session `card` shows, leaving out `going`.
+    fn pane_holding_card_session(
+        &self,
+        card: CardId,
+        going: &[ChannelId],
+    ) -> Option<(&View, &Pane)> {
+        let session = match &self.card_state(card)?.kind {
+            CardKind::Chat(session) => session.id,
+            CardKind::Terminal(session) => session.id,
+            _ => return None,
+        };
+        self.pane_holding_session(card, session, going)
+    }
+
+    pub(super) fn another_pane_holds_session(&self, card: CardId) -> bool {
+        self.another_pane_holds_session_beyond(card, &[])
+    }
+
+    /// Whether another pane holds `card`'s session once `going` has been deleted.
+    pub(super) fn another_pane_holds_session_beyond(
+        &self,
+        card: CardId,
+        going: &[ChannelId],
+    ) -> bool {
+        self.pane_holding_card_session(card, going).is_some()
+    }
+
+    /// Why `card` cannot change what its session runs as, when another pane
+    /// holds that session.
+    pub(super) fn session_held_elsewhere_reason(&self, card: CardId) -> Option<String> {
+        self.session_held_elsewhere_directions(card, "Switch views from there.")
+    }
+
+    /// Why `card` cannot start a provider on its session, when another pane
+    /// holds that session: starting one retires the actor that pane shows.
+    pub(super) fn session_held_elsewhere_start_refusal(&self, card: CardId) -> Option<String> {
+        self.session_held_elsewhere_directions(card, "Resume it from there.")
+    }
+
+    /// Where `card`'s session has gone, and how to reach it. A card still held
+    /// here also keeps the destination from showing the session in this window,
+    /// so sending the reader there has to come after what releases the card.
+    fn session_held_elsewhere_directions(&self, card: CardId, there: &str) -> Option<String> {
+        let (view, _) = self.pane_holding_card_session(card, &[])?;
+        let place = self.scope_display_name(&view.scope);
+        Some(if self.chat_closed_elsewhere_here(card) {
+            format!("This conversation is also in {place}. Close this card first. {there}")
+        } else if self.shared_views.blocked_aliases.contains_key(&card) {
+            format!(
+                "This conversation moves to {place} once what's waiting here is finished or cleared. {there}"
+            )
+        } else {
+            format!("This conversation is now in {place}. {there}")
+        })
+    }
+
+    /// What going without `card` leaves behind, when another pane holds its session.
+    pub(super) fn session_held_elsewhere_note(
+        &self,
+        card: CardId,
+        going: &[ChannelId],
+    ) -> Option<String> {
+        let (view, pane) = self.pane_holding_card_session(card, going)?;
+        let title = &self.card_state(card)?.title;
+        let scope = self.scope_display_name(&view.scope);
+        let running = format!("\u{201c}{title}\u{201d} keeps running in {scope}");
+        let has_text = matches!(self.card_state(card)?.kind, CardKind::Chat(_))
+            && self.chat_has_unsent_draft(card);
+        Some(if has_text && self.chat_draft_can_go_to_pane(pane.id) {
+            format!(
+                "{running}, and your unsent text goes with it. Anything else waiting for it here is discarded."
+            )
+        } else if has_text {
+            format!("{running}. What's waiting for it here, including unsent text, is discarded.")
+        } else if self.shared_views.blocked_aliases.contains_key(&card) {
+            format!("{running}. What's waiting for it here is discarded.")
+        } else {
+            format!("{running}.")
+        })
+    }
+
+    /// Sends what a departing `card` has not sent to the pane holding its
+    /// session, and says where it went, so giving up the card keeps the text.
+    pub(super) fn carry_draft_of_card_held_elsewhere(&mut self, card: CardId, going: &[ChannelId]) {
+        let Some(CardKind::Chat(_)) = self.card_state(card).map(|state| &state.kind) else {
+            return;
+        };
+        let Some((scope, shared)) = self
+            .pane_holding_card_session(card, going)
+            .map(|(view, pane)| (view.scope.clone(), pane.clone()))
+        else {
+            return;
+        };
+        if self.carry_released_chat_draft(card, shared.id) {
+            self.status = Some(TransientNotice::warning(
+                self.alias_moved_notice(card, &shared, &scope, true),
+            ));
+        }
+    }
+
+    /// Lets go of a card whose session a shared pane holds. The session belongs
+    /// to that pane now, so only this card and its local work go away.
+    pub(super) fn release_card_held_elsewhere(&mut self, card: CardId) -> Task<Message> {
+        self.carry_draft_of_card_held_elsewhere(card, &[]);
+        self.chat_discard_local_work(card);
+        // Read before this card leaves its channel's membership.
+        let emptied = self.close_emptied_channels(&[card]);
+        self.shared_views.retained.remove(&card);
+        self.shared_views.blocked_aliases.remove(&card);
+        self.detach_shared_pane(card);
+        if let Some(state) = self.card_state_mut(card) {
+            state.existence = super::project_ui::removed_existence("closed by user");
+        }
+        let durable = Arc::make_mut(&mut self.durable);
+        durable.local_only_cards.remove(&card);
+        durable.card_scopes.remove(&card);
+        for channel in &mut durable.channels {
+            channel.cards.retain(|id| *id != card);
+        }
+        self.persist();
+        Task::batch([emptied, self.reconcile_shared_views()])
     }
 
     fn prepare_terminal_restoration(&mut self, pane: &Pane) {
@@ -2438,6 +2739,7 @@ fn same_attention_update_source(left: &CardKind, right: &CardKind) -> bool {
 
 #[cfg(test)]
 mod tests {
+    mod attached_session;
     mod history_start;
     mod published_card_edits;
     mod startup_admission;

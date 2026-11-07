@@ -211,18 +211,29 @@ use crate::{
 /// parallel branches and are not adopted.
 /// Version 156 appends the exact skipped-occurrence count and range to Firing.
 /// An older client is refused the replies holding one.
-pub const PROTOCOL_VERSION: u16 = 156;
+/// Version 157 appends the saved-transcript list to the directory and member
+/// replies. A client of this version can't read those replies from an earlier
+/// daemon, while an earlier client stops reading before the list and is
+/// unaffected.
+pub const PROTOCOL_VERSION: u16 = 157;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
 /// encoding, so an update may speak it as a source with this release's
 /// client. Its daemons and windows are never peers. Its CLI, which chats
 /// carried across an update keep running, is served as an [`OlderClient`]:
-/// the one wire difference, the device account `Restore` operation this
-/// release appended, is a request that CLI cannot send.
+/// what has changed since is a request that CLI cannot send, a reply it is
+/// refused, or a list it stops reading before.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+/// The matched sets since the candidate line that remain update sources. Each
+/// only appended messages an update doesn't exchange, so an update speaks that
+/// source's protocol as it does the candidate line's. A protocol bump adds the
+/// number it replaces here.
+pub const EARLIER_MATCHED_SETS: [u16; 4] = [129, 151, 155, 156];
 
 mod older_clients;
+#[cfg(test)]
+pub(crate) use older_clients::recorded_protocols;
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
@@ -2536,6 +2547,71 @@ mod tests {
         assert_eq!(
             TerminalSnapshot::full(&next).apply(None).unwrap().scroll,
             next.scroll
+        );
+    }
+
+    #[test]
+    fn a_client_from_an_earlier_protocol_reads_the_directory_reply() {
+        use crate::{
+            agent::{ActivityState, Provider},
+            agent_execution::{
+                Lineage, Reply,
+                directory::{Directory, Entry, Relation, Scope, Surface},
+            },
+        };
+
+        #[derive(Debug, PartialEq, serde::Deserialize)]
+        struct EarlierDirectory {
+            caller: Option<Entry>,
+            scope: Scope,
+            sessions: Vec<Entry>,
+        }
+
+        let id = TerminalId::new();
+        let entry = Entry {
+            id,
+            surface: Surface::Chat,
+            provider: Some(Provider::Claude),
+            title: Some("title".to_owned()),
+            channel: None,
+            view_scope: None,
+            channel_repository: None,
+            state: ActivityState::Working,
+            directory: Some("/fixture".into()),
+            worktree: None,
+            project: None,
+            project_name: None,
+            delegation: None,
+            relation: Relation::Peer,
+            lineage: Lineage(id),
+        };
+        let directory = Directory {
+            caller: Some(entry.clone()),
+            scope: Scope::All,
+            sessions: vec![entry.clone(), entry.clone()],
+            saved_transcripts: vec![id],
+        };
+        let reply = postcard::to_stdvec(&directory).unwrap();
+        let frame = postcard::to_stdvec(&ServerEnvelope {
+            version: PROTOCOL_VERSION,
+            request_id: Some(1),
+            proof: proof("session", "boot", "incarnation"),
+            message: ServerMessage::Response {
+                response: ServerResponse::Agent(Reply::Directory(directory)),
+            },
+        })
+        .unwrap();
+        assert!(
+            frame.ends_with(&reply),
+            "an earlier client can only skip what ends the frame"
+        );
+        assert_eq!(
+            postcard::from_bytes::<EarlierDirectory>(&reply).unwrap(),
+            EarlierDirectory {
+                caller: Some(entry.clone()),
+                scope: Scope::All,
+                sessions: vec![entry.clone(), entry],
+            }
         );
     }
 
