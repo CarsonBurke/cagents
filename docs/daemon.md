@@ -28,6 +28,16 @@ handshake rejects incompatible clients without terminating their PTYs.
 Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
 together.
 
+A session carried across an update keeps running the `cagents` CLI it was
+launched with. The daemon still serves a CLI from a listed older protocol whose
+messages it reads and writes the same way: currently protocol 128, the
+0.1.3+local.c68275e94 line. It answers in that protocol's version, and refuses a
+request whose reply that CLI couldn't read. Each protocol's wire format is
+recorded under `tests/fixtures/wire-formats/`, and a test proves every listed
+older protocol against it. A daemon points `$XDG_RUNTIME_DIR/cagents/bin` at
+its own matched CLI when it starts, and the sessions it launches find `cagents`
+there. A later update then gives them the new daemon's CLI.
+
 Each window holds an exclusive slot lease and its own session database, and a
 shared compatibility fence excludes older single-window UIs. Startup rejects an
 older running UI or Debian peer package that predates the lease marker; upgrade

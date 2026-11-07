@@ -208,8 +208,13 @@ pub const PROTOCOL_VERSION: u16 = 129;
 /// inspector's frozen and saved-history requests) has this release's
 /// encoding, so an update may speak it as a source with this release's
 /// client. Other parts differ, such as device account operations, so it is
-/// never an ordinary peer.
+/// never an ordinary peer. Its CLI, which chats carried across an update keep
+/// running, is served as an [`OlderClient`].
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+
+mod older_clients;
+pub use older_clients::{OlderClient, older_client};
+
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
