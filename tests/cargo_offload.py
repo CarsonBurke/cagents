@@ -880,13 +880,17 @@ class StandInHost(unittest.TestCase):
         # Its shim is gone afterwards.
         self.assertFalse(Path(result.stdout.strip()).exists())
 
-    def leases(self, log):
-        """How many slots the build host was asked to lease."""
+    def lease_costs(self, log):
+        """The expected cost of each slot the build host was asked to lease."""
         if not log.exists():
-            return 0
+            return []
         requests = [json.loads(base64.b64decode(shlex.split(line)[-1]))[1]
                     for line in log.read_text().splitlines() if "cargo-offload" in line]
-        return sum(1 for request in requests if request[:1] == ["lease"])
+        return [request[6] for request in requests if request[:1] == ["lease"]]
+
+    def leases(self, log):
+        """How many slots the build host was asked to lease."""
+        return len(self.lease_costs(log))
 
     def test_a_held_exec_builds_all_its_cargo_commands_in_one_lease(self):
         log = self.root / "requests"
@@ -897,7 +901,8 @@ class StandInHost(unittest.TestCase):
             "cargo metadata --format-version 1 >/dev/null; exit 7",
             env=env)
         self.assertEqual(result.returncode, 7, result.stderr)
-        self.assertEqual(self.leases(log), 1, log.read_text())
+        # Priced as the largest build it may run, a UI build.
+        self.assertEqual(self.lease_costs(log), [str(9 * 2**30)], log.read_text())
         self.assertNotIn("waiting", result.stderr)
         self.assertTrue((self.crate / "target/debug/probe").is_file())
         self.assertTrue((self.crate / "target/release/probe").is_file())
@@ -935,6 +940,39 @@ class StandInHost(unittest.TestCase):
                 self.assertEqual(self.leases(log), 1)
                 self.assertFalse((self.host_home / ".cache/cagents-offload/crate/slot-1").exists())
                 log.unlink()
+
+    def test_a_build_leases_its_own_slot_when_a_hold_names_no_slot(self):
+        log = self.root / "requests"
+        lock = self.root / "runtime" / "cagents-hold-held" / "lock"
+        lock.parent.mkdir(parents=True)
+        holder = open(lock, "w")
+        self.addCleanup(holder.close)
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        base = "~/.cache/cagents-offload/crate"
+        for slot in ("/home/someone/slot-1/../other", "/home/someone/../slot-1",
+                     "/home/someone/slot-1/src", f"{base}/slot-1", "slot-1"):
+            with self.subTest(slot=slot):
+                held = json.dumps({"host": "stand-in", "base": base,
+                                   "top": str(self.crate.resolve()), "slot": slot,
+                                   "marker": None, "lock": str(lock)})
+                env = self.remote_env() | {"STAND_IN_LOG": str(log),
+                                           "CAGENTS_BUILD_OFFLOAD_HELD": held}
+                result = self.gate_run("build", "--bin", "probe", env=env)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(self.leases(log), 1)
+                log.unlink()
+
+    def test_tests_in_a_hold_run_in_a_slot_of_their_own(self):
+        # A hold lasts for its builds, priced as builds; tests are priced by
+        # what they hold, in a lease that ends with them.
+        log = self.root / "requests"
+        env = self.remote_env() | {"STAND_IN_LOG": str(log)}
+        result = self.gate_run(
+            "exec", "--hold", "sh", "-ec",
+            "cargo build --bin probe; cargo test; cargo test --no-run; cargo build --bin probe",
+            env=env, timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.leases(log), 2, log.read_text())
 
     def test_tests_in_a_hold_stop_under_a_stray_git_marker_and_builds_do_not(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}

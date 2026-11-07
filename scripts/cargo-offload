@@ -26,6 +26,7 @@ import ipaddress
 import json
 import os
 import queue
+import re
 import resource
 from pathlib import Path
 import shlex
@@ -1546,7 +1547,9 @@ class Offload:
 
         if self.cancelled:
             return 128 + self.cancelled
-        if self.held(base, top) is not None:
+        # Tests run in a slot of their own, priced by what they hold, so a
+        # hold, which lasts for its builds, never keeps a slot through tests.
+        if not self.runs_tests_there() and self.held(base, top) is not None:
             status = self.build_held(base, top, workspace, cwd, metadata)
             if status is not None:
                 return status
@@ -1589,10 +1592,16 @@ class Offload:
         try:
             if os.fstat(descriptor).st_uid != os.getuid():
                 return None
+            # The build host's own path to one of its slots: nothing else is
+            # a slot to build in.
+            slot = str(held["slot"])
+            if not (os.path.isabs(slot) and os.path.normpath(slot) == slot
+                    and re.fullmatch(r"slot-[0-9]+", os.path.basename(slot))):
+                return None
             fcntl.flock(descriptor, fcntl.LOCK_SH | fcntl.LOCK_NB)
             return None
         except BlockingIOError:
-            return str(held["slot"]), held.get("marker"), held["lock"]
+            return slot, held.get("marker"), held["lock"]
         finally:
             os.close(descriptor)
 
@@ -1624,8 +1633,13 @@ class Offload:
                 self.close_connection()
 
     def tests_there(self):
-        """Whether the command runs tests on the build host."""
+        """Whether the command builds tests for the build host, where a Git
+        marker would change what they see."""
         return self.plan.subcommand in ("test", "bench")
+
+    def runs_tests_there(self):
+        """Whether the command runs tests on the build host."""
+        return self.tests_there() and not self.plan.no_run
 
     def refuse_marker(self, marker):
         # Tests that check Git ancestry would fail there for a reason
@@ -2159,8 +2173,9 @@ class Hold(Offload):
     """Leases one slot on the build host and holds it while `command` runs
     here, for a script of builds such as the development runner's: each
     gated Cargo command in it builds in that slot, one at a time, with no
-    admission of its own. The slot stays leased, at the hold's expected
-    cost, until the command ends, so hold only for builds."""
+    admission of its own; one that runs tests leases a slot of its own. The
+    slot stays leased, at the hold's expected cost, until the command ends,
+    so hold only for builds."""
 
     def __init__(self, host, command, environment):
         super().__init__(host, None, environment)

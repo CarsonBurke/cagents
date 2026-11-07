@@ -64,9 +64,11 @@ scripts/cargo-gate check --locked --package ceditor --bin ceditor
 
 Each of these commands waits in the build host's queue on its own, and on a
 busy host the wait is most of its time: on fw16 under a full queue, the CLI
-check above took 26 s to compile and 19 minutes in all. A lane's tests
-(`scripts/cargo-gate test ... --all-targets`, [below](#testing)) type-check
-everything its check does, so when you are about to run them, skip the check.
+check above took 26 s to compile and 19 minutes in all. The CLI, host and
+browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
+[below](#testing)) type-check everything the lane's check does, so when you are
+about to run them, skip that check. The integrated UI has no test lane; keep
+its check.
 
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
@@ -361,9 +363,10 @@ within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
 host that does not report pressure is treated as having room. Each build has an
 expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
-GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
-script such as the development runner; a slot held by a plain `flock` counts as
-9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
+GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
+script and 9 GiB for an `exec --hold` one such as the development runner's; a
+slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
+overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
 beyond what they already hold, covers its own, and while the kernel's memory
 pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
@@ -475,15 +478,15 @@ slot here. Commands that compile nothing, such as `metadata`, `tree` or
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
 script of builds, such as `scripts/build-ceditor-product`, builds there too,
 each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
-leases one slot there first, at the `exec` cost, and holds it until COMMAND
-exits: each gated Cargo command in it builds in that slot, one at a time, with
-no admission of its own. It is for a script that only builds, such as the
-development runner's three: a launch waits in the host's queue once rather
-than three times. A command that runs tests or anything slow between its builds
-would keep the slot leased and its memory reserved while it did, so leave
-`--hold` off for those. A Cargo command run from another checkout, or after the
-hold's lease has ended, leases a slot of its own. A Cargo reached any other way inside COMMAND, by path,
-through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
+leases one slot there first, at the cost of a UI build, and holds it until
+COMMAND exits: each gated Cargo command in it builds in that slot, one at a
+time, with no admission of its own. It is for a script that only builds, such
+as the development runner's three: a launch waits in the host's queue once
+rather than three times. A Cargo command that runs tests, one run from another
+checkout, and one run after the hold's lease has ended each lease a slot of
+their own. Anything slow between its builds would keep the slot leased and its
+memory reserved while it ran, so leave `--hold` off for such a script. A Cargo
+reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
 also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
 compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
 Programs launched by `cargo run` inside that `exec` inherit the same Cargo

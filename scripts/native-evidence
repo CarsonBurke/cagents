@@ -176,6 +176,8 @@ cmd_build() {
     done
     refuse_running_side "$side"
     checkout=$(cd -- "$checkout" && pwd -P)
+    # The build runs from the checkout, so a relative seed is the caller's.
+    [ -z "$seed_target" ] || seed_target=$(realpath -m -- "$seed_target")
     git -C "$checkout" rev-parse --git-dir >/dev/null
     local target zig cargo_path
     target=$(target_of "$side")

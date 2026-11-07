@@ -98,9 +98,10 @@ with the reason.
 `exec` runs any command, such as a script of several Cargo builds, with a
 `cargo` first on PATH that leads back to this gate, so every Cargo command in
 it builds on that host, each admitted there on its own. With --hold, for a
-script that only builds, one slot there is leased first and held until
-COMMAND exits: its Cargo commands build in that slot one at a time, with no
-wait for admission of their own.
+script that only builds, one slot there is leased first, priced as a UI
+build, and held until COMMAND exits: its Cargo commands build in that slot one
+at a time, with no wait for admission of their own. A command that runs tests
+still leases a slot of its own.
 
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here, each once a build slot is free. For `test`, `bench` and `run`, only the
@@ -318,14 +319,22 @@ overdue_ramp=600
 # The memory a build is expected to need at its peak, in KiB: the whole
 # process tree's resident memory, measured on this repository's builds with 8
 # jobs (p90 rounded up). A UI build links the libcosmic, Servo and iced
-# graphs; a host build, Ghostty; a check generates no code. A script of
-# builds, such as the development runner, is costed as its largest.
+# graphs; a host build, Ghostty; a check generates no code. A held script
+# of builds, such as the development runner's, may build any lane in its
+# slot, so it is costed as the largest, a UI build.
 expected_cost() {
     if [ -n "${CAGENTS_BUILD_COST_GIB:-}" ]; then
         printf '%s' $((CAGENTS_BUILD_COST_GIB * gib))
         return
     fi
-    [ "$mode" = cargo ] || { printf '%s' $((8 * gib)); return; }
+    if [ "$mode" != cargo ]; then
+        if [ "$hold" = true ]; then
+            printf '%s' $((9 * gib))
+        else
+            printf '%s' $((8 * gib))
+        fi
+        return
+    fi
     # The lane is in the selected features and executables.
     lane=cli
     selection=false
