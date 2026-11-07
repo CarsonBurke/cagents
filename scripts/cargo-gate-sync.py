@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Install origin/main's Cargo gate when main has changed it since the
 installed one.
 

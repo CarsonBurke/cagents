@@ -229,16 +229,15 @@ sys.exit(101 if mode == "failed" else 0)
         self.assertIn("/custom-target/dev-runtime/", json.loads(self.launch.read_text())["executable"])
 
     def test_missing_python_fails_before_any_build_or_desktop_change(self):
-        minimal = self.directory / "minimal-tools"
-        minimal.mkdir()
-        (minimal / "dirname").symlink_to(shutil.which("dirname"))
-        self.environment["PATH"] = str(minimal)
+        # They check what they will run. `python3` stays on PATH: that isn't it.
         for name, arguments in (("run-ceditor-development", ()),
                                 ("install-ceditor", ("--prefix", str(self.prefix)))):
             with self.subTest(script=name):
+                script = self.checkout / "scripts" / name
+                script.write_text(script.read_text().replace("/usr/bin/python3", "/nonexistent/python3"))
                 result = self.run_script(name, *arguments)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("required command not found: python3", result.stderr)
+                self.assertIn("required command not found: /nonexistent/python3", result.stderr)
                 self.assertFalse(self.calls.exists())
                 self.assertFalse(self.prefix.exists())
                 self.assertFalse((self.home / "data").exists())

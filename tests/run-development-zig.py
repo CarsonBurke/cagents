@@ -97,7 +97,7 @@ exit 83
                 self.assertEqual(len(calls), 1)
                 self.assertIn("build --locked --profile dev-runtime --no-default-features", calls[0])
                 self.assertIn(f"zig={self.real}", calls[0])
-                self.assertIn(f"home={self.home}|xdg={self.xdg}|mise=unset", calls[0])
+                self.assertIn(f"home={self.home}|xdg={self.xdg}|mise={self.data}", calls[0])
                 self.cargo_calls.unlink()
 
     def test_explicit_paths_and_failure_before_build(self):

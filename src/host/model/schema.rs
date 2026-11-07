@@ -786,9 +786,10 @@ mod tests {
             (22, "DROP TABLE automation_precheck_history_cleanup;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
+            (22, "DROP INDEX automation_firing_successors;"),
             (
                 22,
-                "ALTER TABLE automation_firings DROP COLUMN previous_firing;",
+                "DROP INDEX automation_firing_successors; ALTER TABLE automation_firings DROP COLUMN previous_firing;",
             ),
             (17, "DROP TABLE channel_work_operations;"),
             (17, "DROP TABLE channel_work_entries;"),
@@ -1090,6 +1091,7 @@ mod tests {
                 "global_pending_automation_proposals",
                 "automation_proposal_notifications",
                 "pending_automation_proposal_notifications",
+                "automation_firing_successors",
             ];
             for name in retention_names {
                 let index = inventory

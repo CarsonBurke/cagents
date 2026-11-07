@@ -1713,7 +1713,7 @@ fn read_definition(db: &Connection, id: Uuid, revision: u64) -> Result<Definitio
 }
 /// An alert or a row on screen can outlive the history entry it points to.
 const RUN_DETAILS_EXPIRED: &str =
-    "This run's details are no longer available. Run history keeps only the most recent entries.";
+    "This run's details are no longer available. Older run history is removed over time.";
 
 fn read_firing(db: &Connection, id: Uuid) -> Result<Firing, String> {
     let record = db

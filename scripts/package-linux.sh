@@ -110,7 +110,7 @@ fi
 BUILD_SECONDS=skipped
 if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     BUILD_STARTED=$(date +%s)
-    command -v python3 >/dev/null 2>&1 || fail 'required command not found: python3'
+    [ -x /usr/bin/python3 ] || fail 'required command not found: /usr/bin/python3'
     command -v zig >/dev/null 2>&1 || fail 'required command not found: zig'
     # Native build scripts run outside the repository and cannot rely on a mise
     # shim rediscovering mise.toml. Resolve the real executable up front.
@@ -137,7 +137,7 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     build_target() {
         product=$1
         shift
-        python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
+        /usr/bin/python3 "$SCRIPT_DIR/build-ceditor-product" "$product" \
             --manifest-path "$ROOT_DIR/Cargo.toml" \
             --locked \
             --profile "$PROFILE" \

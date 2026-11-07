@@ -55,7 +55,8 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
             evidence TEXT NOT NULL CHECK(evidence IN ('retired','not_launched'))
          ) STRICT;
          CREATE INDEX automation_removed_history ON automations(deleted_ms)
-             WHERE deleted_ms IS NOT NULL;",
+             WHERE deleted_ms IS NOT NULL;
+         CREATE INDEX automation_firing_successors ON automation_firings(automation,previous_firing);",
     ).map_err(|error| error.to_string())
 }
 

@@ -722,8 +722,17 @@ impl RemoteActor {
                 resident.ready = false;
                 resident.idle = false;
                 resident.busy = false;
+                let (changed, generation) = (resident.changed, resident.generation);
                 if !self.publish_resident_inner(resident, true) {
-                    return Err("Closed actor metadata was superseded during refresh".into());
+                    // Another refresh, such as the outcome broker's while a
+                    // close drains the outbox, can publish a newer closed
+                    // reply first. This older one is then only stale.
+                    let current = self.state();
+                    if !(current.completed
+                        && (current.changed > changed || current.generation > generation))
+                    {
+                        return Err("Closed actor metadata was superseded during refresh".into());
+                    }
                 }
             } else if !self.publish_resident(resident) && self.0.stop.load(Ordering::Acquire) {
                 return Err("Retained actor attachment closed during refresh".into());
@@ -3940,8 +3949,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
             .join(format!("{}.json", record.terminal));
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            let snapshot = server.actor.snapshot(None).unwrap();
+            // Completion is published after the exit is applied, so a snapshot
+            // taken once completion is seen includes it; one taken before may not.
             if server.actor.is_completed() {
+                let snapshot = server.actor.snapshot(None).unwrap();
                 assert!(snapshot.exited);
                 assert!(snapshot.error.is_none(), "{:?}", snapshot.error);
                 assert!(snapshot.items.iter().any(|item| matches!(
@@ -4565,7 +4576,9 @@ while IFS= read -r frame; do :; done
                 close.0.finish_close().unwrap();
             }
             assert!(!identity.record.root.is_current());
-            assert!(!identity.record.holder.is_current());
+            // The retirement proof sees the helper exit before its reaper
+            // collects it.
+            assert!(identity.record.holder.reaped());
             let retired = RemoteActor::retired_actor_receipt(&identity.record, &proof)
                 .unwrap()
                 .unwrap();
@@ -6036,6 +6049,55 @@ exec /bin/sleep 60
         stop.send(()).unwrap();
         peer.join().unwrap();
     }
+    /// #2339: while a close drains the outbox, the outcome broker refreshes
+    /// the same closed actor. When its newer reply is published first, the
+    /// close's older reply is stale, not a failed close.
+    #[test]
+    fn a_closed_refresh_overtaken_by_a_newer_one_is_stale_not_a_failure() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let socket = root.path().join("closed-refresh.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let actor = RemoteActor::fixture_at(socket);
+        let mut older = actor.state().as_ref().clone();
+        older.completed = true;
+        older.close.completed = true;
+        let mut newer = older.clone();
+        newer.changed += 1;
+        newer.outbox_ack = 1;
+        newer.outbox_latest = 1;
+        actor.publish_closed_inner(
+            Snapshot {
+                exited: true,
+                ..Default::default()
+            },
+            Some(newer.clone()),
+        );
+        // Current, yet it contradicts the acknowledged installation.
+        let mut contradictory = newer.clone();
+        contradictory.installed = false;
+        let replies = [older, contradictory];
+        let peer = thread::spawn(move || {
+            for reply in replies {
+                let (stream, _) = listener.accept().unwrap();
+                let request: Invocation = receive(&stream, TIMEOUT).unwrap();
+                assert_eq!(request.method, "state");
+                send(
+                    &stream,
+                    &Ok::<Value, String>(serde_json::to_value(Some(reply)).unwrap()),
+                    TIMEOUT,
+                )
+                .unwrap();
+            }
+        });
+        actor.refresh_state().unwrap();
+        assert_eq!(actor.state().changed, newer.changed);
+        assert_eq!(actor.state().outbox_ack, 1);
+        assert_eq!(
+            actor.refresh_state().unwrap_err(),
+            "Closed actor metadata was superseded during refresh"
+        );
+        peer.join().unwrap();
+    }
     #[test]
     fn oversized_input_refusal_keeps_the_next_normal_input_admissible() {
         let actor = RemoteActor::fixture();
@@ -6596,13 +6658,17 @@ exec /bin/sleep 60
                 "the refusal lifts the fence"
             );
             // The refusal is the input's outcome: a late copy of its frame
-            // returns it even after the refusal's cause has cleared.
+            // returns it even after the refusal's cause has cleared. Once the
+            // caller has heard it, the proxy retires that receipt on its own
+            // worker, and from then on a late copy is refused as retired.
             toggle(&mut served.fixture.lock().unwrap().server, false);
-            let late = served.invoke_input(served.input_request(1)).unwrap();
-            assert_eq!(
-                serde_json::from_value::<InputReceipt>(late).unwrap().state,
-                InputState::Acknowledged(Err(expected.into()))
-            );
+            match served.invoke_input(served.input_request(1)) {
+                Ok(late) => assert_eq!(
+                    serde_json::from_value::<InputReceipt>(late).unwrap().state,
+                    InputState::Acknowledged(Err(expected.into()))
+                ),
+                Err(refusal) => assert!(refusal.contains("never replay"), "{refusal}"),
+            }
             // The next input is admitted.
             let next = actor.enqueue(None, Command::Refresh).unwrap();
             assert_eq!(next.recv_timeout(ACKNOWLEDGEMENT_WAIT).unwrap(), Ok(()));
