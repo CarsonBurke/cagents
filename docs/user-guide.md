@@ -1006,18 +1006,44 @@ is also removed for provider/version compatibility.
 `CLAUDE_CONFIG_DIR` or `CODEX_HOME` as cagents was started with, otherwise
 `~/.claude` or `~/.codex`. A home cagents itself selected is never taken for it.
 Every cagents terminal and conversation exports its account's home, and one on
-a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`. A
-cagents window, daemon, or `cagents` command started from one - by you or by an
-agent - ignores a variable that still holds the listed home, or any path inside
-a cagents `accounts/<provider>/<id>` directory, when deciding the system
-default. A daemon started before this protection keeps its environment until it
-restarts.
+a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`.
+The one exception is Claude's default home: unless cagents was started with
+`CLAUDE_CONFIG_DIR`, a terminal, conversation or sign-in on the System default
+Claude login leaves `CLAUDE_CONFIG_DIR` unset, as your own shell does, whichever
+cagents process starts it. Claude Code keeps who a login is in `~/.claude.json`,
+and an explicit `CLAUDE_CONFIG_DIR=~/.claude` moves that record to
+`~/.claude/.claude.json` instead, although history and credentials stay in
+`~/.claude` either way. If you set it yourself, cagents keeps it and uses that
+record too. Its terminals and conversations then list it in
+`CAGENTS_SYSTEM_HOMES`, so a cagents window, daemon or command started from
+them keeps it as well, provided the cagents daemon was started with the same
+setting; restart the daemon after changing it. Earlier versions of cagents
+exported it for every launch, so their conversations kept a second record;
+conversations saved then still resume with the setting they started with, and
+can rewrite that record.
+A cagents window, daemon, or `cagents` command started from a cagents terminal
+or conversation - by you or by an agent - ignores a variable that still holds
+the listed home, any path inside a cagents `accounts/<provider>/<id>`
+directory, or a `CLAUDE_CONFIG_DIR` naming `~/.claude` that an earlier version
+exported, when deciding the system default. A daemon started before this
+protection keeps its environment until it restarts.
 
 The Accounts pane flags a row whose home is not a login of its own: **Login
 changed** when a managed or linked home reports a different login than the one
 it was added with (the recorded login is kept; sign that account in again to
 accept the new one, or remove it), and **Same home** or **Same login** when two
 rows are the same directory or signed in to the same login.
+
+**Identity conflict** means a row's login is not known to be the one it names.
+On the System default Claude login, the two records described above name
+different logins: the row names one and lists the other beneath it, its figures
+may be either one's, and **Sign in again** settles it. Signing in again from
+your own terminal settles it as well when it changes the login `~/.claude.json`
+names. On another row, it reports the same login as a row whose records
+disagree, or as a row whose weekly limit resets at a different time, which one
+login's could not; **Sign in again** on a row whose limit differs settles which
+login it is. Neither row offers **Archive duplicate**, and neither prevents a
+new sign-in to that login.
 
 For an unchanged **Same login** row, its menu offers **Archive duplicate**.
 This hides the extra account from choices without signing out or deleting its

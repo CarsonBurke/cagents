@@ -70,7 +70,7 @@ pub(super) fn output(report: &Report) -> CommandOutput {
                         "{}{}",
                         account.name.unwrap_or("identity unknown"),
                         if account.identity_conflict {
-                            " (identity changed)"
+                            " (identity conflict)"
                         } else {
                             ""
                         }
@@ -283,7 +283,7 @@ mod tests {
             })
         );
         assert!(output.human.starts_with("ACCOUNT"));
-        assert!(output.human.contains("My account (identity changed)"));
+        assert!(output.human.contains("My account (identity conflict)"));
         assert!(!output.human.contains("plan detail"));
         assert!(output.data.get("caller").is_none());
         assert!(output.data["accounts"][0].get("usage").is_none());

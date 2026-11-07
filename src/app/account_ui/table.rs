@@ -855,6 +855,9 @@ fn account_cell<'a>(
     project: Option<(crate::model::ProjectId, &'a str, &'a Path)>,
 ) -> Element<'a, Message> {
     let state = &app.account_ui;
+    // A login whose records disagree is listed by the address it reports,
+    // and the other one beneath it, so neither is cut off by the badges.
+    let row_name = state.name(account, false);
     let renaming = state
         .table
         .rename
@@ -871,7 +874,7 @@ fn account_cell<'a>(
         }
         // Filling the cell is what lets a long name give way to the badge
         // after it instead of running under the row's actions.
-        None => design::body(state.display_name(account))
+        None => design::body(row_name.clone())
             .wrapping(cosmic::iced::widget::text::Wrapping::None)
             .ellipsize(cosmic::iced::widget::text::Ellipsize::End(
                 cosmic::iced::advanced::text::EllipsizeHeightLimit::Lines(1),
@@ -907,7 +910,9 @@ fn account_cell<'a>(
         && renaming.is_none()
     {
         let tone = match conflict {
-            LoginConflict::Changed { .. } => design::destructive_color,
+            LoginConflict::Changed { .. }
+            | LoginConflict::Disputed { .. }
+            | LoginConflict::Contradicted { .. } => design::destructive_color,
             LoginConflict::SameHome { .. } | LoginConflict::SameLogin { .. } => {
                 design::warning_color
             }
@@ -925,8 +930,17 @@ fn account_cell<'a>(
             "Kept by {}, which picks the login to use",
             probe::cli_name(account.account.provider)
         ));
-    } else if let Some(email) = email.filter(|email| *email != state.display_name(account)) {
-        subtitle.push(email.to_owned());
+    } else if let Some(email) = email {
+        let disputed = account
+            .identity
+            .as_ref()
+            .and_then(|identity| identity.disputed_by.as_deref());
+        match (email == row_name, disputed) {
+            (true, None) => {}
+            (true, Some(other)) => subtitle.push(format!("Also recorded as {other}")),
+            (false, None) => subtitle.push(email.to_owned()),
+            (false, Some(other)) => subtitle.push(format!("{email}, also recorded as {other}")),
+        }
     }
     if account.account.is_system() {
         subtitle.push(format!(
