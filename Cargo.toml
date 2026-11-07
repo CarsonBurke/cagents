@@ -148,6 +148,10 @@ name = "agent_console_contract"
 required-features = ["host"]
 
 [[test]]
+name = "older_client_contract"
+required-features = ["host"]
+
+[[test]]
 name = "automation_cli_contract"
 required-features = ["host"]
 

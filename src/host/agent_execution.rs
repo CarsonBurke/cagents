@@ -334,7 +334,9 @@ const UNDELIVERED_CANCELLATION: &str = "Cancelled before the provider received t
 
 /// Waits, without the agent's gate, until a bound provider can take its
 /// first prompt.
-fn await_provider_ready(handle: &chat::runtime::Handle) -> Result<(), (State, String)> {
+pub(in crate::host) fn await_provider_ready(
+    handle: &chat::runtime::Handle,
+) -> Result<(), (State, String)> {
     await_provider_ready_until(handle, Instant::now() + Duration::from_secs(30))
 }
 

@@ -62,6 +62,14 @@ scripts/cargo-gate check --locked --features integrated-browser --bin cagents-ui
 scripts/cargo-gate check --locked --package ceditor --bin ceditor
 ```
 
+Each of these commands waits in the build host's queue on its own, and on a
+busy host the wait is most of its time: on fw16 under a full queue, the CLI
+check above took 26 s to compile and 19 minutes in all. The CLI, host and
+browserless UI lanes' tests (`scripts/cargo-gate test ... --all-targets`,
+[below](#testing)) type-check everything the lane's check does, so when you are
+about to run them, skip that check. The integrated UI has no test lane; keep
+its check.
+
 Changes to ceditor or shared UI, editor, or notification public contracts also
 require the standalone editor check above. The workspace's
 `default-members = ["."]` selects only cagents: root UI checks and root
@@ -158,8 +166,10 @@ How the runner works:
 - A launch with nothing to build skips the gate and starts at once, printing
   `The matched set is already built for this checkout; skipping the build.`
   See [Up-to-date launches](#up-to-date-launches).
-- The normal runner enables `integrated-browser` only for the UI; the matched
-  CLI and daemon keep the same full-product identity without resolving Servo.
+- The normal runner enables `integrated-browser` only for the UI. Both lanes
+  build the same CLI and daemon, without `full`: that feature selects the
+  shipped product's application ID, peer package and self-update, none of which
+  a development build uses, so switching lanes rebuilds only the UI.
 - It uses the `dev-runtime` profile, which keeps UI dependencies optimized for
   usable performance while the ordinary `dev` profile stays cheap for checks.
 - The development instance has its own application ID, configuration, session
@@ -221,8 +231,10 @@ the matched set as usual, then starts the UI in a headless
 
 `CAGENTS_DEVELOPMENT_INSTANCE` only affects development builds; production
 ignores it. The runner sets it for `--instance` and clears it otherwise, so an
-inherited value never selects an instance. Provider accounts and tools keep
-the caller's `HOME`, so an instance's agents use the same provider sign-ins.
+inherited value never selects an instance. The instance's daemon gives it to
+every agent and terminal it starts, so a `cagents` they run reaches that
+daemon. Provider accounts and tools keep the caller's `HOME`, so an
+instance's agents use the same provider sign-ins.
 
 The runner starts the session without the caller's `WAYLAND_DISPLAY`,
 `WAYLAND_SOCKET`, `NIRI_SOCKET`, `DISPLAY` and `XAUTHORITY`, and stops an
@@ -351,9 +363,10 @@ within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
 host that does not report pressure is treated as having room. Each build has an
 expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
-GiB for a host build or test build, 9 GiB for a UI one and 8 GiB for an `exec`
-script such as the development runner; a slot held by a plain `flock` counts as
-9 GiB. `CAGENTS_BUILD_COST_GIB` overrides it. A build starts beside others only
+GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
+script and 9 GiB for an `exec --hold` one such as the development runner's; a
+slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
+overrides it. A build starts beside others only
 when the memory available, less what the running builds are expected to take
 beyond what they already hold, covers its own, and while the kernel's memory
 pressure (`some avg10` in `/proc/pressure/memory`, the share of time some task
@@ -419,7 +432,8 @@ To gate a script that runs several Cargo commands, replace
 `flock /var/tmp/cagents-cargo.lock COMMAND` with
 `scripts/cargo-gate exec COMMAND`. Where Rust compiles on [another
 host](#building-on-another-host), each Cargo command in it goes there on its
-own. Building here, it holds one slot until the command exits, and gated
+own, unless `exec --hold` holds one slot there for all of them. Building here,
+it holds one slot until the command exits, with or without `--hold`, and gated
 commands inside it run in that slot; gating each Cargo command instead keeps
 test runs out of the slot.
 
@@ -462,12 +476,21 @@ command that compiles there through `scripts/cargo-offload`, without taking a
 slot here. Commands that compile nothing, such as `metadata`, `tree` or
 `clean`, run here at once. Under `scripts/cargo-gate exec COMMAND`, a `cargo`
 first on `PATH` leads every Cargo command in COMMAND back to the gate, so a
-script of builds, such as the development runner or
-`scripts/build-ceditor-product`, builds there too, each command with its own
-admission budget. A Cargo reached any other way inside COMMAND, by path,
-through `$CARGO`, `rustup run` or `mise exec`, would compile here, so `exec`
-also sets `RUSTC_WRAPPER` to `scripts/cargo-gate-rustc-guard`, which refuses to
-compile a crate and says why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
+script of builds, such as `scripts/build-ceditor-product`, builds there too,
+each command with its own admission. `scripts/cargo-gate exec --hold COMMAND`
+leases one slot there first, at the cost of a UI build, and holds it until
+COMMAND exits: each gated Cargo command in it builds in that slot, one at a
+time, with no admission of its own. It is for a script that only builds, such
+as the development runner's three: a launch waits in the host's queue once
+rather than three times. Tests run in that slot too, priced by what they hold
+while they run and as a UI build again once they end. A Cargo command run from
+another checkout, or after the hold's lease has ended, leases a slot of its
+own. Anything slow between its builds would keep the slot leased and its memory
+reserved while it ran, so leave `--hold` off for such a script. A Cargo
+reached any other way inside COMMAND, by path, through `$CARGO`, `rustup run`
+or `mise exec`, would compile here, so `exec` also sets `RUSTC_WRAPPER` to
+`scripts/cargo-gate-rustc-guard`, which refuses to compile a crate and says
+why; Cargo's queries of rustc pass, and a wrapper the caller set still runs.
 Programs launched by `cargo run` inside that `exec` inherit the same Cargo
 shim and guard. Their named `cargo` reenters the gate after the program's
 build releases its slot; their absolute `$CARGO` cannot compile here.
@@ -1149,6 +1172,14 @@ refused so that the version names its exact source. If that version is already
 current, the build is skipped. After staging, older `+local` builds are removed,
 except the two most recent and any that a running process still uses.
 
+The script first fetches and checks what `HEAD` is, because a checkout nobody
+updated would install old code. It refuses a detached `HEAD` that is not the
+tip of `origin/main`, and a branch that is behind its upstream, and prints the
+command that updates the checkout, such as
+`git checkout main && git pull --ff-only`. Pass `--this-commit` to build that
+exact commit anyway, for example to install a known-good build again. Any other
+branch is built, and the script names it.
+
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).
 
@@ -1162,6 +1193,30 @@ Published releases still come from `scripts/build-release-linux`; see
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
+
+## Scripts and mise shims
+
+A mise shim on `PATH` under a moved `HOME` or `XDG_DATA_HOME`, as in a fixture, finds
+itself and re-executes without end: no error, and the process keeps its pid and
+restarts forever, outliving a `timeout` on its parent. So scripts here name
+`/usr/bin/python3` rather than finding `python3` on `PATH`, and a host running them
+needs it there. `scripts/cargo-gate` also sets `MISE_DATA_DIR` from the shims directory
+on `PATH`, so what it runs can move `HOME` without that loop.
+
+Separately, a shim under a `mise.toml` that mise has not been told to trust stops at
+mise's trust prompt and waits for an answer whenever its stderr is a terminal, even with
+stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
+`scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
+for you, because trusting a checkout's configuration is your decision. Run `mise trust`
+in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
+such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
+only that file pins can fail at once with `No version is set for shim`.
+
+A harness of your own that moves `HOME` should take the shims off `PATH` and name the
+tools it needs by their real paths. mise keeps its trust list under `HOME`, so setting
+`MISE_DATA_DIR` stops the loop but not the prompt. Run it in a systemd scope with a time
+limit too, which stops everything it started.
 
 ## Standalone editor
 

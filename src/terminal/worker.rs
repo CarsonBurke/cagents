@@ -2837,6 +2837,10 @@ impl Worker {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        match crate::instance::development_instance() {
+            Some(instance) => command.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance),
+            None => command.env_remove(crate::instance::DEVELOPMENT_INSTANCE_ENV),
+        };
         // A cagents process started in this terminal must not take the
         // account selected for it for the system account.
         match crate::account::registry::selection_marker(|name| {
@@ -9323,6 +9327,9 @@ mod tests {
                 assert!(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "terminal::worker::tests::removed_managed_home_cannot_relaunch_from_final_pty_environment", "--nocapture"])
                     .env_clear().env(CHILD, mode).env("HOME", directory.path())
+                    // The child names its storage as this process does.
+                    .envs(std::env::var_os(crate::instance::DEVELOPMENT_INSTANCE_ENV)
+                        .map(|instance| (crate::instance::DEVELOPMENT_INSTANCE_ENV, instance)))
                     .env("XDG_DATA_HOME", directory.path().join("data"))
                     .env("PATH", "/usr/bin:/bin")
                     .env("CODEX_HOME", directory.path().join("data").join(crate::instance::storage_name()).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
@@ -9407,6 +9414,75 @@ mod tests {
             }
             worker.run();
             std::fs::remove_file(directory.path().join("isolated")).unwrap();
+        }
+    }
+
+    /// A shell in a development instance runs `cagents` against that
+    /// instance's daemon, whatever environment it was handed; outside one it
+    /// never inherits a stale instance.
+    #[test]
+    fn terminals_keep_their_development_instance_and_only_theirs() {
+        const CHILD: &str = "CAGENTS_TERMINAL_INSTANCE_TEST";
+        const NAME: &str = "probe";
+        let test =
+            "terminal::worker::tests::terminals_keep_their_development_instance_and_only_theirs";
+        let Some(expected) = std::env::var_os(CHILD) else {
+            let directory = tempfile::tempdir().unwrap();
+            for instance in [Some(NAME), None] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", test, "--nocapture"])
+                    .env_clear()
+                    .env(CHILD, instance.unwrap_or("unset"))
+                    .env("HOME", directory.path())
+                    .env("PATH", "/usr/bin:/bin")
+                    .envs(std::env::var_os("TMPDIR").map(|tmp| ("TMPDIR", tmp)));
+                if let Some(instance) = instance {
+                    child.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance);
+                }
+                assert!(child.status().unwrap().success(), "{instance:?}");
+            }
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        for returned in [false, true] {
+            let mut recipe = env_recipe(BTreeMap::new());
+            recipe.working_directory = directory.path().into();
+            recipe.arguments = vec![
+                "-c".into(),
+                "printf %s \"${CAGENTS_DEVELOPMENT_INSTANCE-unset}\" > seen.tmp && mv seen.tmp seen"
+                    .into(),
+            ];
+            // An environment handed back from a chat may carry another value.
+            let config = TerminalConfig {
+                execution_environment: returned.then(|| {
+                    crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        (
+                            crate::instance::DEVELOPMENT_INSTANCE_ENV.into(),
+                            "stale".into(),
+                        ),
+                    ]))
+                }),
+                ..TerminalConfig::default()
+            };
+            let (worker, _) = capture_worker_with(recipe, config);
+            let seen = directory.path().join("seen");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !seen.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the shell never reported"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            worker.run();
+            assert_eq!(
+                std::fs::read_to_string(&seen).unwrap(),
+                expected.to_str().unwrap(),
+                "returned: {returned}"
+            );
+            std::fs::remove_file(&seen).unwrap();
         }
     }
 

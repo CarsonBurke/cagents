@@ -26760,6 +26760,7 @@ mod tests {
                 >= 512 * 1024
         );
         let old_item = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
+        let client_retired = handle.observe_snapshot_retirement_for_test();
         runtime.replace_draft(text_editor::Content::with_text("unsent reader draft"));
         runtime.find = Some("kept query".into());
         runtime.expanded.insert("scratch-owner".into());
@@ -26770,6 +26771,11 @@ mod tests {
         // A live hidden presentation releases the graph and its parser scratch;
         // a draft has no provider transcript to suspend.
         assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
+        // The client's publication still holds the old body until it retires
+        // on its own worker, which the presentation barrier does not cover.
+        client_retired
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the hidden client's exact publication must retire");
         assert!(old_item.upgrade().is_none());
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);

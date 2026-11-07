@@ -1442,6 +1442,8 @@ fn staged_cli_routes_new_windows_and_control_to_kernel_verified_matched_owner() 
             .env("XDG_DATA_HOME", root.path().join("data"))
             .env("XDG_CACHE_HOME", root.path().join("cache"))
             .env("XDG_RUNTIME_DIR", &runtime)
+            // The daemon directory above is the shared development one.
+            .env_remove("CAGENTS_DEVELOPMENT_INSTANCE")
             .output()
             .unwrap();
         assert!(output.status.success(), "{output:?}");

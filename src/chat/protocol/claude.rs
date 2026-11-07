@@ -2243,6 +2243,9 @@ impl Adapter for Claude {
     fn initialization_pending(&self) -> bool {
         !self.history_only && !self.ready
     }
+    fn outcome_pending(&self) -> bool {
+        !self.deferred_attention.is_empty()
+    }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = if self.history_only {
             Step::default()

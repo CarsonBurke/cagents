@@ -2239,6 +2239,17 @@ fn namespace() -> &'static str {
     })
 }
 
+/// The development instance this process belongs to. Agents and terminals it
+/// starts keep it, so a `cagents` they run reaches this instance's daemon
+/// rather than starting a shared one.
+pub fn development_instance() -> Option<&'static str> {
+    instance_in(namespace())
+}
+
+fn instance_in(namespace: &str) -> Option<&str> {
+    namespace.strip_prefix(STORAGE_NAME)?.strip_prefix('-')
+}
+
 /// Names this instance's data, configuration and state directories.
 pub fn storage_name() -> &'static str {
     namespace()
@@ -2264,6 +2275,15 @@ mod tests {
     use std::os::unix::fs::symlink;
 
     use tempfile::tempdir;
+
+    #[test]
+    fn a_namespace_names_its_development_instance() {
+        assert_eq!(instance_in(STORAGE_NAME), None);
+        assert_eq!(
+            instance_in(&format!("{STORAGE_NAME}-pr2064")),
+            Some("pr2064")
+        );
+    }
 
     #[test]
     fn development_instance_names_are_short_path_safe_words() {

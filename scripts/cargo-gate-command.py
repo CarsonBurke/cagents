@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Supervise one owned command without passing build-slot descriptors on."""
 
 import sys

@@ -50,10 +50,18 @@ elif args[0] == 'verify-install-guard':
     record('verify')
 elif args == ['--json', 'daemon', 'status']:
     record('status')
+    rewrite = os.environ.get('FIXTURE_STATUS_REWRITES')
+    if rewrite:
+        # Something else writes the link path after the installer checked it.
+        path = pathlib.Path(rewrite)
+        path.unlink()
+        path.write_text('written during the installation\n')
     print(json.dumps({'ok': True, 'command': 'daemon.status', 'data': {'running': False}},
                      separators=(',', ':')))
 elif args == ['daemon', 'start']:
     record('daemon-start-fixture')
+    if os.environ.get('FIXTURE_DAEMON_START_FAILS'):
+        sys.exit(1)
 else:
     raise AssertionError(args)
 '''
@@ -139,9 +147,10 @@ class InstallerCoordinator(unittest.TestCase):
     def python(self, path, body):
         self.executable(path, f"#!{sys.executable}\n" + body)
 
-    def install(self):
+    def install(self, *options):
         return subprocess.run(
-            ["/bin/sh", str(ROOT / "install.sh"), "--version", VERSION, "--prefix", str(self.prefix)],
+            ["/bin/sh", str(ROOT / "install.sh"), "--version", VERSION, "--prefix", str(self.prefix),
+             *options],
             env=self.environment, cwd=self.directory, capture_output=True, text=True, timeout=10,
         )
 
@@ -235,6 +244,127 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
 
     def test_archive_requires_autostart_independently_of_the_ui_lease_marker(self):
         self.assert_missing_member_rejected('share/autostart/dev.cagents.Cagents.Daemon.desktop')
+
+    def managed_link(self, member):
+        if member == "bin/cagents":
+            return self.home / ".local/bin/cagents"
+        if member.startswith("share/autostart/"):
+            return self.home / "config/autostart" / Path(member).name
+        return self.home / "data" / member.removeprefix("share/")
+
+    def place_copy(self, member, content):
+        """A regular file where the installer keeps a link, as desktop tools leave it."""
+        copy = self.managed_link(member)
+        copy.parent.mkdir(parents=True, exist_ok=True)
+        copy.write_bytes(content)
+        return copy
+
+    def assert_no_backups(self, copy):
+        self.assertEqual(sorted(p.name for p in copy.parent.iterdir() if p.name != copy.name), [])
+
+    def assert_adopted(self, result, member):
+        copy = self.managed_link(member)
+        self.assertEqual(os.readlink(copy), str(self.prefix / "current" / member))
+        self.assertEqual(result.stderr.count("was an unchanged copy of the installed file"), 1,
+                         result.stderr)
+        self.assertIn(f"{copy} was an unchanged copy", result.stderr)
+        self.assert_no_backups(copy)
+
+    def test_copy_of_the_candidate_file_becomes_the_managed_link(self):
+        member = "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg"
+        self.place_copy(member, (self.payload / member).read_bytes())
+        result = self.install()
+        self.assert_installed(result, 'candidate')
+        self.assert_adopted(result, member)
+
+    def test_copy_of_the_current_version_file_becomes_the_managed_link(self):
+        # The candidate's file differs: the copy matches the version it was made from.
+        previous = self.installed_cli(guarded=True).parent
+        member = "share/metainfo/dev.cagents.Cagents.metainfo.xml"
+        self.write(previous / member, "<component>previous</component>\n")
+        self.place_copy(member, (previous / member).read_bytes())
+        result = self.install()
+        self.assert_installed(result, 'installed')
+        self.assert_adopted(result, member)
+
+    def test_copy_of_the_generated_autostart_entry_becomes_the_managed_link(self):
+        # The workstation case: the entry install.sh generated, copied over its link.
+        previous = self.installed_cli(guarded=True).parent
+        member = "share/autostart/dev.cagents.Cagents.Daemon.desktop"
+        self.write(previous / member, (
+            "[Desktop Entry]\nType=Application\nName=cagents daemon\n"
+            "Comment=Keep cagents sessions available in the system tray\n"
+            f'Exec="{self.prefix}/current/bin/cagents" daemon start\n'
+            "Terminal=false\nNoDisplay=true\nX-GNOME-Autostart-enabled=true\n"))
+        self.place_copy(member, (previous / member).read_bytes())
+        result = self.install()
+        self.assert_installed(result, 'installed')
+        self.assert_adopted(result, member)
+        self.assertEqual(self.managed_link(member).read_bytes(), (previous / member).read_bytes())
+
+    def test_changed_copy_is_refused_before_installation_changes(self):
+        previous = self.installed_cli(guarded=True).parent
+        for member in ("bin/cagents", "share/applications/dev.cagents.Cagents.desktop",
+                       "share/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg",
+                       "share/icons/hicolor/128x128/apps/dev.cagents.Cagents.png",
+                       "share/metainfo/dev.cagents.Cagents.metainfo.xml",
+                       "share/autostart/dev.cagents.Cagents.Daemon.desktop"):
+            with self.subTest(member=member):
+                self.write(previous / member, "previous\n")
+                copy = self.place_copy(member, b"edited by the user\n")
+                result = self.install()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(f"refusing to replace existing file {copy}", result.stderr)
+                self.assertEqual(copy.read_bytes(), b"edited by the user\n")
+                self.assert_no_backups(copy)
+                self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
+                self.assertFalse((self.prefix / "versions" / VERSION).exists())
+                self.assertFalse(any(e['event'] == 'daemon-start-fixture' for e in self.events()))
+                copy.unlink()
+
+    def test_directory_at_a_link_path_is_still_refused(self):
+        member = "share/autostart/dev.cagents.Cagents.Daemon.desktop"
+        self.managed_link(member).mkdir(parents=True)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"refusing to replace existing file {self.managed_link(member)}", result.stderr)
+        self.assertTrue(self.managed_link(member).is_dir())
+
+    def test_failed_update_restores_the_adopted_copy(self):
+        previous = self.installed_cli(guarded=True).parent
+        member = "share/autostart/dev.cagents.Cagents.Daemon.desktop"
+        self.write(previous / member, "[Desktop Entry]\nName=previous\n")
+        copy = self.place_copy(member, (previous / member).read_bytes())
+        before = copy.stat()
+        self.environment["FIXTURE_DAEMON_START_FAILS"] = "1"
+        result = self.install("--restart-daemon")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("replacement daemon startup failed", result.stderr)
+        self.assertIn(f"{copy} was an unchanged copy", result.stderr, "the copy was never replaced")
+        self.assertIn(
+            f"rolled back; restored the original file at {copy}",
+            result.stderr,
+            "the user was not told the earlier replacement was undone",
+        )
+        self.assertFalse(copy.is_symlink())
+        self.assertEqual(copy.read_bytes(), (previous / member).read_bytes())
+        self.assertEqual(copy.stat().st_ino, before.st_ino, "the original file was not the one restored")
+        self.assert_no_backups(copy)
+        self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
+        self.assertFalse((self.prefix / "versions" / VERSION).exists())
+
+    def test_copy_rewritten_after_the_check_is_kept_and_refused(self):
+        previous = self.installed_cli(guarded=True).parent
+        member = "share/autostart/dev.cagents.Cagents.Daemon.desktop"
+        self.write(previous / member, "[Desktop Entry]\nName=previous\n")
+        copy = self.place_copy(member, (previous / member).read_bytes())
+        self.environment["FIXTURE_STATUS_REWRITES"] = str(copy)
+        result = self.install()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(f"refusing to replace existing file {copy}", result.stderr)
+        self.assertEqual(copy.read_text(), "written during the installation\n")
+        self.assert_no_backups(copy)
+        self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
 
 
 if __name__ == "__main__":

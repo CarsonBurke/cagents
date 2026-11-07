@@ -38,6 +38,23 @@ impl Process {
     pub fn is_current(&self) -> bool {
         Self::read(self.pid).is_ok_and(|actual| actual == *self)
     }
+
+    /// Whether this exact process is gone within 15 seconds. Exit proofs, such
+    /// as a readable pidfd or a zombie state, come before the parent reaps the
+    /// process, and until then its `/proc` entry still names this identity.
+    /// How soon the reaper runs depends on scheduling, so a test asserting
+    /// absence after such a proof waits for it here.
+    #[cfg(test)]
+    pub fn reaped(&self) -> bool {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while self.is_current() {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        true
+    }
 }
 
 /// A process reaped between opening and reading its stat file fails the read
@@ -391,15 +408,40 @@ impl Record {
 }
 
 fn read(path: &Path) -> io::Result<Record> {
-    let file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
-        .open(path)?;
-    read_file(file, false)
+    read_current(|| {
+        OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC)
+            .open(path)
+    })
+}
+
+/// A record its holder unlinks between our open and fstat no longer names the
+/// path. Open the path again to read whatever it names now, rather than
+/// rejecting the retired inode as unsafe; repeated churn still is. One fstat
+/// both decides this and authorizes the read: an unlink after it leaves the
+/// held bytes intact.
+fn read_current(mut open: impl FnMut() -> io::Result<std::fs::File>) -> io::Result<Record> {
+    for _ in 1..3 {
+        let file = open()?;
+        let metadata = file.metadata()?;
+        if metadata.nlink() != 0 {
+            return read_checked(file, &metadata, false);
+        }
+    }
+    read_file(open()?, false)
 }
 
 fn read_file(file: std::fs::File, allow_unlinked: bool) -> io::Result<Record> {
     let metadata = file.metadata()?;
+    read_checked(file, &metadata, allow_unlinked)
+}
+
+fn read_checked(
+    file: std::fs::File,
+    metadata: &fs::Metadata,
+    allow_unlinked: bool,
+) -> io::Result<Record> {
     if !metadata.is_file()
         || metadata.uid() != crate::daemon::current_uid()
         || metadata.mode() & 0o077 != 0
@@ -584,6 +626,60 @@ mod tests {
         let error = stat.read_to_end(&mut Vec::new()).unwrap_err();
         assert_eq!(error.raw_os_error(), Some(libc::ESRCH));
         assert_eq!(exited_as_absent(error).kind(), io::ErrorKind::NotFound);
+    }
+
+    /// #2339: a holder that removes its record while it is being read made
+    /// the paired console's close confirmation fail as an unsafe record.
+    #[test]
+    fn a_record_unlinked_while_it_is_read_is_read_again_by_path() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let directory = root.path().join("holders");
+        crate::secure_file::prepare_private_directory(&directory).unwrap();
+        let record = record();
+        record.create(&directory).unwrap();
+        let path = record.path(&directory);
+        let open = || fs::File::open(&path);
+        // Removed after the open: the path is absent.
+        let mut unlinked = false;
+        let removed = read_current(|| {
+            let file = open()?;
+            if !std::mem::replace(&mut unlinked, true) {
+                record.remove(&directory);
+            }
+            Ok(file)
+        });
+        assert_eq!(removed.unwrap_err().kind(), io::ErrorKind::NotFound);
+        // Replaced after the open: the path names the successor.
+        let mut successor = self::record();
+        successor.terminal = record.terminal;
+        successor.version = 4;
+        record.create(&directory).unwrap();
+        let mut replaced = false;
+        let current = read_current(|| {
+            let file = open()?;
+            if !std::mem::replace(&mut replaced, true) {
+                fs::remove_file(&path).unwrap();
+                successor.create(&directory).unwrap();
+            }
+            Ok(file)
+        });
+        assert_eq!(current.unwrap(), successor);
+        // A path that never stops churning is still refused as unsafe.
+        let churning = read_current(|| {
+            let file = open()?;
+            fs::remove_file(&path).unwrap();
+            successor.create(&directory).unwrap();
+            Ok(file)
+        });
+        assert_eq!(
+            churning.unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        // Unlinked after the fstat that authorized it: the held bytes read.
+        let file = open().unwrap();
+        let metadata = file.metadata().unwrap();
+        fs::remove_file(&path).unwrap();
+        assert_eq!(read_checked(file, &metadata, false).unwrap(), successor);
     }
 
     #[test]
