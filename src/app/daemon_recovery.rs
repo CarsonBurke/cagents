@@ -1281,6 +1281,44 @@ mod tests {
         assert!(reason.contains("process 4242"), "{reason}");
     }
 
+    /// A terminal listed with no exit was handed over and may still be running in
+    /// its holder, so only a recorded exit lets Retry pass over that holder.
+    #[test]
+    fn retry_refuses_beside_the_holder_of_a_terminal_listed_without_an_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = TerminalDescriptor::relaunchable(id, original.launch.clone(), None);
+        assert!(matches!(
+            listed.session.continuity,
+            TerminalContinuity::RelaunchAvailable {
+                last_exit: None,
+                ..
+            }
+        ));
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 1);
+        let recovered = reconcile_with(
+            original,
+            true,
+            &socket,
+            directory.path(),
+            |terminal, kind| {
+                Ok(
+                    (terminal == id && kind == crate::daemon::holder_registry::Kind::Terminal)
+                        .then_some(4242),
+                )
+            },
+        );
+        server.join().unwrap();
+        let Err(reason) = recovered else {
+            panic!("nothing should start beside the holder");
+        };
+        assert!(reason.contains("process 4242"), "{reason}");
+    }
+
     /// The refusal is shown on the pane, so it names the process to stop and not
     /// the identifiers behind it.
     #[test]

@@ -1329,6 +1329,30 @@ mod tests {
         assert!(!app.card_state(first).unwrap().existence.is_open());
     }
 
+    /// Pressing Close again on a pane whose close is running starts nothing, and
+    /// leaves that close as it was.
+    #[test]
+    fn a_second_close_while_its_own_close_runs_starts_nothing() {
+        let (mut app, card) = retry_close_fixture();
+        drop(app.update(Message::CloseCard(card)));
+        let running = app.terminal_close.clone().expect("the close is running");
+        assert_eq!(app.close_card_as(card, false, false).units(), 0);
+        let after = app.terminal_close.clone().expect("the close still runs");
+        assert_eq!(after.generation, running.generation);
+        assert_eq!(after.pending, running.pending);
+    }
+
+    /// The same for an ended terminal, which is released rather than closed.
+    #[test]
+    fn a_second_close_while_its_own_release_runs_starts_nothing() {
+        let (mut app, card) = retry_close_fixture();
+        app.retire_ended_terminal(card, 0, None, false);
+        app.cards.insert(card, CardRuntime::Completed);
+        assert!(app.close_card_as(card, false, false).units() > 0);
+        assert_eq!(app.completed_release, Some(card));
+        assert_eq!(app.close_card_as(card, false, false).units(), 0);
+    }
+
     /// A pane the daemon has closed but the workspace wouldn't remove is still
     /// there, so its Close and Retry have to keep working.
     #[test]

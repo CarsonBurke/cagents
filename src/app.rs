@@ -13362,8 +13362,8 @@ impl Cagents {
         match self.commit_card_removal(id, None) {
             Some(task) => task,
             None => {
-                // Refused after all: the pane stays, and nothing else
-                // will advance the closes queued behind it.
+                // Refused after all: the pane stays, and the closes queued
+                // behind it move on.
                 self.abandon_removal(id);
                 self.next_queued_card_close()
             }
