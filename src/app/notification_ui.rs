@@ -270,16 +270,8 @@ impl State {
 }
 
 fn connect() -> Result<ControlClient, String> {
-    let authority = crate::agent_execution::Authority::from_environment();
-    if authority.token().is_some() && crate::device::is_remote() {
-        return Err("A local session capability cannot use remote notification APIs".into());
-    }
     let socket = crate::terminal_ipc::daemon_socket_path().map_err(|error| error.to_string())?;
-    let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-    client
-        .authenticate(authority)
-        .map_err(|error| error.to_string())?;
-    Ok(client)
+    ControlClient::connect(&socket).map_err(|error| error.to_string())
 }
 
 /// Resolve only the current, unambiguous live terminal owner. This is a
@@ -443,6 +435,23 @@ impl Cagents {
             .notices
             .iter()
             .filter(|notice| session.is_some() && notice.event.source_session() == session)
+            .map(|notice| notice.id)
+            .collect();
+        for id in ids {
+            self.notification_ui.acknowledge(id);
+        }
+    }
+
+    /// A decided request has nothing left to review, wherever it was decided.
+    pub(super) fn acknowledge_proposal_notices(&mut self, proposal: uuid::Uuid) {
+        let ids: Vec<_> = self
+            .notification_ui
+            .snapshot
+            .notices
+            .iter()
+            .filter(|notice| {
+                matches!(notice.event.target(), Target::AutomationProposal { id, .. } if id == proposal)
+            })
             .map(|notice| notice.id)
             .collect();
         for id in ids {

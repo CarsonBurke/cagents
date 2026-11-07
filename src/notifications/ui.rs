@@ -127,14 +127,10 @@ impl Observer {
                         &presence,
                         |presence| {
                             let result = (|| {
-                                let authority =
-                                    crate::agent_execution::Authority::from_environment();
-                                if authority.token().is_some() && crate::device::is_remote() {return Err("A local session capability cannot use remote notification APIs".into());}
                                 let socket = crate::terminal_ipc::daemon_socket_path()
                                     .map_err(|e| e.to_string())?;
                                 let mut client =
                                     ControlClient::connect(&socket).map_err(|e| e.to_string())?;
-                                client.authenticate(authority).map_err(|e| e.to_string())?;
                                 client
                                     .notification_presence(presence)
                                     .map_err(|e| e.to_string())?;
@@ -168,25 +164,11 @@ impl Observer {
                 let mut reported = None;
                 while !sender.is_closed() {
                     let result = (|| -> Result<(), String> {
-                        let authority = crate::agent_execution::Authority::from_environment();
-                        if authority.token().is_some() && crate::device::is_remote() {
-                            return Err(
-                                "A local session capability cannot use remote notification APIs"
-                                    .into(),
-                            );
-                        }
-                        let socket = if authority.token().is_some() {
-                            crate::terminal_ipc::daemon_socket_path()
-                                .map_err(|error| error.to_string())?
-                        } else {
+                        let socket =
                             crate::terminal::ensure_daemon_ready_for(super::Application::Ceditor)
-                                .map_err(|error| error.to_string())?
-                        };
+                                .map_err(|error| error.to_string())?;
                         let mut client =
                             ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-                        client
-                            .authenticate(authority)
-                            .map_err(|error| error.to_string())?;
                         let snapshot = client
                             .watch_notifications(
                                 presence.lock().unwrap_or_else(|p| p.into_inner()).clone(),

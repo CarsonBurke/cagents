@@ -1,5 +1,6 @@
 //! Explicit user commands; inherited authority is never replaced or cleared.
 use super::*;
+use crate::automations::ProposalState;
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
@@ -178,7 +179,52 @@ pub(super) fn execute(
             )
             .map_err(protocol_error)?;
     }
-    super::response_output(name, reply, None)
+    let Some((_, _, _, approved)) = decision else {
+        return super::response_output(name, reply, None);
+    };
+    decision_output(name, approved, reply)
+}
+
+/// An already-resolved request answers with its terminal state. Only the same
+/// decision is a success: the other was not carried out.
+fn decision_output(
+    name: &'static str,
+    approved: bool,
+    reply: Response,
+) -> Result<CommandOutput, AppError> {
+    let Response::ProposalReview(review) = &reply else {
+        return Err(AppError::new(
+            "automation_proposal",
+            "The daemon did not return the exact proposal decision",
+        ));
+    };
+    let human = super::proposal_human(&review.proposal);
+    match (&review.proposal.state, approved) {
+        (ProposalState::Pending, _) => {
+            return Err(AppError::new(
+                "automation_proposal",
+                "The daemon did not resolve this request; review it again",
+            ));
+        }
+        (ProposalState::Declined, true) => {
+            return Err(AppError::new(
+                "automation_proposal_declined",
+                "This request was already declined, so it was not approved and no schedule was created",
+            ));
+        }
+        (ProposalState::Approved { automation, .. }, false) => {
+            return Err(AppError::new(
+                "automation_proposal_approved",
+                format!(
+                    "This request was already approved as automation {automation}, so it was not declined"
+                ),
+            ));
+        }
+        _ => {}
+    }
+    let mut output = super::response_output(name, reply, None)?;
+    output.human = human;
+    Ok(output)
 }
 
 pub(super) fn list_human(proposals: &[crate::automations::ProposalSummary]) -> String {
@@ -215,6 +261,161 @@ pub(super) fn page_human(page: &crate::automations::ProposalPage) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{
+        agent::Provider,
+        agent_execution::{Origin, Spec, Surface, Target},
+        automations::{
+            Definition, DirectoryIdentity, ProposalPage, ProposalReview, Schedule, SchedulePattern,
+            SessionMode,
+        },
+    };
+
+    fn proposal(state: ProposalState) -> crate::automations::Proposal {
+        let definition = Definition {
+            name: "Weekday recap".into(),
+            prompt: "Review only the approved project".into(),
+            agent: Spec {
+                provider: Provider::Codex,
+                account: None,
+                target: Target {
+                    repository: "/fixture".into(),
+                    directory: "/fixture".into(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                reasoning_effort: None,
+                permission_mode: None,
+            },
+            schedule: Schedule {
+                timezone: "UTC".into(),
+                pattern: SchedulePattern::Weekdays {
+                    hour: 9,
+                    minute: 30,
+                },
+            },
+            session_mode: SessionMode::Fresh,
+            precheck: None,
+        };
+        crate::automations::Proposal {
+            id: Uuid::from_u128(7),
+            revision: 3,
+            owner: Origin::User,
+            requested: definition.clone(),
+            definition,
+            target_identity: DirectoryIdentity {
+                device: 1,
+                inode: 2,
+            },
+            channel_title: None,
+            created_ms: 1,
+            state,
+        }
+    }
+
+    fn review(state: ProposalState) -> Response {
+        Response::ProposalReview(ProposalReview {
+            identity: Uuid::from_u128(1),
+            proposal: Box::new(proposal(state)),
+        })
+    }
+
+    #[test]
+    fn listing_and_decisions_keep_their_json_shapes() {
+        let page = Response::ProposalPage(ProposalPage {
+            identity: Uuid::from_u128(1),
+            automation_proposal_sequence: 9,
+            after: None,
+            proposals: vec![(&proposal(ProposalState::Pending)).into()],
+        });
+        let listed = super::super::response_output("automation.proposals", page, None).unwrap();
+        let page = &listed.data["proposal_page"];
+        assert_eq!(page["automation_proposal_sequence"], 9);
+        assert_eq!(page["proposals"][0]["name"], "Weekday recap");
+        assert_eq!(page["proposals"][0]["revision"], 3);
+
+        let approved = ProposalState::Approved {
+            automation: Uuid::from_u128(8),
+            execution_revision: 1,
+        };
+        for (name, is_approval, state) in [
+            ("automation.approve", true, approved),
+            ("automation.decline", false, ProposalState::Declined),
+        ] {
+            let output = decision_output(name, is_approval, review(state)).unwrap();
+            assert_eq!(output.command, name);
+            assert_eq!(output.data["registry"], Uuid::from_u128(1).to_string());
+            assert_eq!(output.data["proposal"]["revision"], 3);
+            assert!(!output.human.contains('{'), "{}", output.human);
+        }
+    }
+
+    #[test]
+    fn a_decision_that_lost_to_the_other_one_is_a_failure_in_plain_terms() {
+        let approved = ProposalState::Approved {
+            automation: Uuid::from_u128(8),
+            execution_revision: 1,
+        };
+        for (is_approval, state, code, says) in [
+            (
+                true,
+                ProposalState::Declined,
+                "automation_proposal_declined",
+                "already declined",
+            ),
+            (
+                false,
+                approved,
+                "automation_proposal_approved",
+                "already approved",
+            ),
+        ] {
+            let error = decision_output("automation.decide", is_approval, review(state))
+                .err()
+                .expect("the other decision was not carried out");
+            assert_eq!(error.kind, code);
+            assert!(error.message.contains(says), "{}", error.message);
+        }
+        assert!(
+            decision_output("automation.decide", true, review(ProposalState::Pending)).is_err(),
+            "a pending reply is not a decision"
+        );
+    }
+
+    #[test]
+    fn an_inherited_session_capability_is_refused_before_any_daemon_is_contacted() {
+        for command in [
+            Command::Proposals {
+                after: None,
+                registry: None,
+                sequence: None,
+                limit: 50,
+            },
+            Command::ReviewProposal {
+                id: Uuid::from_u128(7),
+                registry: Uuid::from_u128(1),
+            },
+            Command::Approve {
+                id: Uuid::from_u128(7),
+                registry: Uuid::from_u128(1),
+                revision: 3,
+                confirm: true,
+            },
+            Command::Decline {
+                id: Uuid::from_u128(7),
+                registry: Uuid::from_u128(1),
+                revision: 3,
+            },
+        ] {
+            let error = execute(
+                command,
+                crate::agent_execution::Authority::session("unit-only-scope".into()),
+            )
+            .err()
+            .expect("a session capability cannot decide global requests");
+            assert_eq!(error.kind, "automation_authority");
+        }
+    }
 
     fn parse(args: &[&str]) -> Command {
         match Cli::try_parse_from(args).unwrap().command {

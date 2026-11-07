@@ -156,24 +156,12 @@ impl ReviewRequest {
 
 #[cfg(feature = "ui")]
 pub async fn report(observed: ObservedRequests) -> Result<(), String> {
-    let authority = crate::agent_execution::Authority::from_environment();
     tokio::task::spawn_blocking(move || {
-        if authority.token().is_some() && crate::device::is_remote() {
-            return Err("A local session capability cannot use remote notification APIs".into());
-        }
         observed.validate()?;
-        let socket = if authority.token().is_some() {
-            crate::terminal_ipc::daemon_socket_path().map_err(|error| error.to_string())?
-        } else {
-            crate::terminal::ensure_daemon_ready_for(observed.destination.application)
-                .map_err(|error| error.to_string())?
-        };
-        let mut client =
-            crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
-        client
-            .authenticate(authority)
+        let socket = crate::terminal::ensure_daemon_ready_for(observed.destination.application)
             .map_err(|error| error.to_string())?;
-        client
+        crate::control::ControlClient::connect(&socket)
+            .map_err(|error| error.to_string())?
             .observe_review_requests(observed)
             .map_err(|error| error.to_string())
     })

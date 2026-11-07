@@ -518,14 +518,13 @@ fn reconnect_and_registry_replacement_revoke_old_decisions_and_old_acknowledgeme
     let key = install(&mut app, &[a.clone(), b.clone()]);
     open(&mut app, &a);
     let old_generation = app.automation_approval.generation;
-    let child = crate::agent_execution::Authority::session("unit-only-reviewed-scope".into());
-    let (request, identity, retained) =
-        app.automation_approval
-            .global
-            .decision_request(&a, false, child.clone());
-    assert_eq!(retained, child);
+    let (request, identity) = app
+        .automation_approval
+        .global
+        .decision_request(&a, false)
+        .expect("an open review has a registry");
     assert!(!request.allowed_from_hosted_conversation());
-    assert_eq!(identity, Some(key.identity));
+    assert_eq!(identity, key.identity);
     assert!(
         matches!(request, Request::ResolveReviewedProposal { identity, proposal, approved: false }
         if identity == key.identity && proposal.as_ref() == &a)
@@ -728,8 +727,7 @@ fn same_clock_recovery_clears_transport_error_without_resetting_the_later_page()
 }
 
 #[test]
-fn scoped_discovery_refusal_cannot_turn_the_legacy_request_into_user_authority() {
-    use crate::agent_execution::Authority;
+fn a_scoped_discovery_refusal_shows_a_retry_and_offers_nothing_to_decide() {
     let mut app = app();
     let held = flight(&app);
     drop(complete(
@@ -737,11 +735,65 @@ fn scoped_discovery_refusal_cannot_turn_the_legacy_request_into_user_authority()
         held,
         Err("synthetic scoped discovery refusal".into()),
     ));
-    assert!(!app.automation_approval.global.has_seen_delivery());
+    assert!(app.automation_approval.global.total.is_none());
     assert!(app.automation_approval.global.error.is_some());
+    assert!(app.global_proposal_banner().is_some());
 
-    // Keep the legitimate pre-capability, per-project discovery route. These
-    // are the existing App fixture/project types, not an alternate transport.
+    // Without a snapshot an Open only asks for one; it cannot reach a review.
+    let proposal = proposal(1);
+    app.automation_approval.available = Some(proposal.clone());
+    drop(
+        app.update(Message::AutomationApproval(ApprovalAction::Open {
+            id: proposal.id,
+            revision: proposal.revision,
+        })),
+    );
+    assert!(!app.automation_approval_open());
+    assert!(
+        app.automation_approval
+            .global
+            .decision_request(&proposal, false)
+            .is_none()
+    );
+}
+
+#[test]
+fn a_background_delivery_does_not_swallow_a_click_on_a_rendered_row() {
+    let mut app = app();
+    let a = proposal(1);
+    let key = install(&mut app, &[a.clone()]);
+    model(&mut app, key.identity, 2, false);
+    let held = flight(&app);
+    assert_eq!(held.2, Read::Delivery);
+    assert!(!app.automation_approval.global.explicit_read_in_flight());
+    drop(global(
+        &mut app,
+        Action::Open {
+            key,
+            id: a.id,
+            revision: a.revision,
+        },
+    ));
+    drop(complete(
+        &mut app,
+        held,
+        Ok(delivery(key.identity, 1, 1, &[a.clone()])),
+    ));
+    let read = flight(&app);
+    assert!(matches!(read.2, Read::Open { id, .. } if id == a.id));
+    assert!(app.automation_approval.global.explicit_read_in_flight());
+    drop(complete(&mut app, read, Ok(review(key.identity, &a))));
+    assert_eq!(app.automation_approval.proposal, Some(a));
+}
+
+#[test]
+fn the_project_in_view_keeps_a_direct_row_for_its_own_request() {
+    let mut app = app();
+    let mut elsewhere = proposal(1);
+    elsewhere.definition.agent.target.repository = "/other-project".into();
+    let here = proposal(2);
+    install(&mut app, &[elsewhere.clone(), here.clone()]);
+    assert!(app.current_project_proposal().is_none());
     app.sidebar_model.projects.push(
         SidebarProject::new(
             ProjectId::new(),
@@ -754,53 +806,67 @@ fn scoped_discovery_refusal_cannot_turn_the_legacy_request_into_user_authority()
         .with_kind(ProjectKind::Folder),
     );
     app.active_workspace = Some("/fixture".into());
-    let tick = app.update(Message::AutomationApproval(ApprovalAction::Tick));
-    assert!(tick.units() > 0);
-    drop(tick); // No legacy request is actually sent.
-    let generation = app.automation_approval.generation;
-    let proposal = proposal(1);
-    drop(
-        app.update(Message::AutomationApproval(ApprovalAction::Read {
-            generation,
-            result: Arc::new(Ok(vec![proposal.clone()])),
-        })),
-    );
-    assert_eq!(app.automation_approval.available, Some(proposal.clone()));
-    drop(
-        app.update(Message::AutomationApproval(ApprovalAction::Open {
-            id: proposal.id,
-            revision: proposal.revision,
-        })),
-    );
-    assert_eq!(app.automation_approval.proposal, Some(proposal.clone()));
-    assert!(app.automation_approval.global.reviewed_identity.is_none());
-
-    // Exercise the actual decision request builder with explicit synthetic
-    // scopes; no process environment or credentials are read/changed here.
-    // The real Decide caller supplies Authority::from_environment once.
-    let child = Authority::session("unit-only-proposal-scope".into());
-    let (request, identity, retained) =
-        app.automation_approval
-            .global
-            .decision_request(&proposal, false, child.clone());
-    assert_eq!(retained, child);
-    assert_eq!(identity, None);
-    assert!(
-        matches!(request, Request::ResolveProposal { id, revision, approved: false }
-        if id == proposal.id && revision == proposal.revision)
-    );
-    assert!(!request.allowed_from_hosted_conversation());
-    let user = Authority::default();
-    let (user_request, identity, retained) =
-        app.automation_approval
-            .global
-            .decision_request(&proposal, false, user.clone());
-    assert_eq!(retained, user);
-    assert_eq!(identity, None);
     assert_eq!(
-        user_request, request,
-        "normal User intent keeps its original request shape"
+        app.current_project_proposal().map(|row| row.id),
+        Some(here.id)
     );
+}
+
+#[test]
+fn an_empty_list_shows_nothing_even_while_its_snapshot_is_being_replaced() {
+    let mut app = app();
+    let key = install(&mut app, &[]);
+    assert_eq!(app.automation_approval.global.total, Some(0));
+    app.automation_approval.global.key = None;
+    assert!(app.global_proposal_banner_is_empty());
+    app.automation_approval.global.error = Some("Could not refresh".into());
+    assert!(!app.global_proposal_banner_is_empty());
+    drop(key);
+}
+
+#[test]
+fn a_decided_request_clears_only_its_own_attention_entries() {
+    let mut app = app();
+    let a = proposal(1);
+    let key = install(&mut app, &[a.clone()]);
+    let notice = |id: uuid::Uuid, proposal: uuid::Uuid| crate::notifications::Notice {
+        id,
+        event: crate::notifications::Event {
+            target: crate::notifications::Target::AutomationProposal {
+                registry: key.identity,
+                id: proposal,
+                revision: 1,
+            },
+            source_session: None,
+            provider: None,
+            directory: None,
+            destination: None,
+            evidence: crate::notifications::Evidence {
+                key: format!("proposal:{}:{proposal}:revision:1:created", key.identity),
+                kind: crate::notifications::Kind::ProposalCreated,
+            },
+            content: None,
+        },
+        delivered: true,
+        acknowledged: false,
+        window: None,
+    };
+    let own = uuid::Uuid::from_u128(71);
+    let other = uuid::Uuid::from_u128(72);
+    app.notification_ui.snapshot.notices =
+        vec![notice(own, a.id), notice(other, uuid::Uuid::from_u128(2))];
+    let task = app.open_proposal_notice(key.identity, a.id, a.revision);
+    drop(task);
+    let held = flight(&app);
+    let mut terminal = a.clone();
+    terminal.state = ProposalState::Declined;
+    drop(complete(
+        &mut app,
+        held,
+        Ok(review(key.identity, &terminal)),
+    ));
+    assert!(app.notification_ui.acknowledged_for_test(own));
+    assert!(!app.notification_ui.acknowledged_for_test(other));
 }
 
 #[test]
@@ -1103,38 +1169,6 @@ fn an_initial_delivery_error_keeps_a_rendered_retry_without_fabricating_a_count_
     assert_eq!(app.automation_approval.global.total, Some(2));
     assert!(!app.automation_approval_open());
     assert!(app.automation_approval.global.reviewed_identity.is_none());
-}
-
-#[test]
-fn proposal_discovery_has_no_time_based_subscription_even_when_focused_with_a_project() {
-    use crate::{model::ProjectKind, workspace_model::ModelProject};
-    use cosmic::iced::advanced::subscription::into_recipes;
-    let mut app = app();
-    for projects in [
-        vec![],
-        vec![ModelProject {
-            repository: "/fixture".into(),
-            name: "Visible project".into(),
-            kind: ProjectKind::Folder,
-            ordinal: 1,
-        }],
-    ] {
-        let snapshot = WorkspaceModel {
-            identity: app.workspace_model.identity,
-            sequence: app.workspace_model.sequence + 1,
-            projects,
-            ..WorkspaceModel::default()
-        };
-        drop(app.update(Message::WorkspaceModelObserved(ModelUpdate::Read(snapshot))));
-        for focused in [false, true] {
-            app.refresh_ui.focused = focused;
-            assert!(into_recipes(app.automation_approval_subscription()).is_empty());
-        }
-    }
-    assert!(
-        !app.workspace_model.projects.is_empty(),
-        "the original focused/project timer condition is actually present"
-    );
 }
 
 #[test]

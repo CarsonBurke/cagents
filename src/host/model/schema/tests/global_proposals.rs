@@ -1,4 +1,4 @@
-//! Real published22 -> 22 admission. Only typed private fixture data is created;
+//! Real published22 -> 23 admission. Only typed private fixture data is created;
 //! no worker, daemon, provider, portal or native UI is started by these tests.
 use super::*;
 use crate::{

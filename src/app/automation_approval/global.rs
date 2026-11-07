@@ -1,5 +1,5 @@
-//! Candidate UI-only extraction. Requires A281's separately allocated backend.
-//! Discovery never supplies consent or replaces the current modal owner.
+//! Pending requests from every project. Discovery never supplies consent or
+//! replaces the current modal owner.
 use super::*;
 use crate::automations::{PROPOSAL_PAGE_SIZE, ProposalDelivery, ProposalSummary};
 
@@ -82,24 +82,10 @@ pub(super) struct State {
     authorized: Option<(Key, uuid::Uuid, u64)>,
     latest_open: Option<(Key, uuid::Uuid, u64, u64)>,
     reviewed_identity: Option<uuid::Uuid>,
-    // One explicit notice activation may precede the first model/delivery.
-    // It conveys no registry or consent authority until the scoped full read.
-    initial_open: Option<(
-        uuid::Uuid,
-        u64,
-        Option<CardId>,
-        Option<WorkspaceDestination>,
-    )>,
     pub(super) review_stale: bool,
 }
 
 impl State {
-    pub(super) fn has_consent_read(&self) -> bool {
-        self.latest_open.is_some()
-            || matches!(self.flight, Some((_, _, Read::Review { .. })))
-            || matches!(self.wanted, Some(Read::Review { .. }))
-    }
-
     pub(super) fn can_decide(&self) -> bool {
         !self.exhausted
             && !self.review_stale
@@ -112,54 +98,39 @@ impl State {
         self.key
     }
 
-    pub(super) fn has_seen_delivery(&self) -> bool {
-        self.total.is_some()
-    }
-
-    pub(super) fn defer_initial_open(
-        &mut self,
-        id: uuid::Uuid,
-        revision: u64,
-        focused: Option<CardId>,
-        destination: Option<WorkspaceDestination>,
-    ) {
-        self.initial_open = Some((id, revision, focused, destination));
-        self.dirty = true;
-    }
-
     pub(super) fn decision_request(
         &self,
         proposal: &Proposal,
         approved: bool,
-        authority: crate::agent_execution::Authority,
-    ) -> (
-        Request,
-        Option<uuid::Uuid>,
-        crate::agent_execution::Authority,
-    ) {
-        if let Some(identity) = self.reviewed_identity {
-            (
-                Request::ResolveReviewedProposal {
-                    identity,
-                    proposal: Box::new(proposal.clone()),
-                    approved,
-                },
-                Some(identity),
-                authority,
-            )
-        } else {
-            // Original per-project request shape, with the same inherited
-            // authority. A scoped refusal never manufactures User authority.
-            (
-                Request::ResolveProposal {
-                    id: proposal.id,
-                    revision: proposal.revision,
-                    approved,
-                },
-                None,
-                authority,
-            )
-        }
+    ) -> Option<(Request, uuid::Uuid)> {
+        let identity = self.reviewed_identity?;
+        Some((
+            Request::ResolveReviewedProposal {
+                identity,
+                proposal: Box::new(proposal.clone()),
+                approved,
+            },
+            identity,
+        ))
+    }
+
+    // A wake's background read must not disable what the person is clicking;
+    // its reply reconciles an action queued behind it.
+    fn explicit_read_in_flight(&self) -> bool {
+        self.flight
+            .as_ref()
+            .is_some_and(|(_, _, read)| *read != Read::Delivery)
+    }
+
+    #[cfg(test)]
+    pub(super) fn offer_for_test(&mut self, proposal: &Proposal) {
+        let key = Key {
+            identity: uuid::Uuid::from_u128(1),
+            sequence: 1,
+            epoch: self.epoch,
+        };
+        self.key = Some(key);
+        self.authorized = Some((key, proposal.id, proposal.revision));
     }
 
     pub(super) fn authorizes(&self, proposal: &Proposal) -> bool {
@@ -242,9 +213,6 @@ impl Cagents {
         global.authorized = None;
         global.latest_open = None;
         global.wanted = None;
-        if global.total.is_some() {
-            global.initial_open = None;
-        }
         global.dirty = false;
         if let Some(next) = global.epoch.checked_add(1) {
             global.epoch = next;
@@ -252,14 +220,12 @@ impl Cagents {
             global.exhausted = true;
         }
         state.available = None;
-        state.reading = false;
         // Preserve the exact visible consent and neutral dismissal. Reconnect
         // invalidates queued decisions and old ACKs, not the user's saved text.
         if state.proposal.is_some() {
             global.review_stale = true;
             state.deciding = false;
         }
-        // This also fences a legacy per-project Read that was already in flight.
         if let Some(next) = state.generation.checked_add(1) {
             state.generation = next;
         } else {
@@ -356,7 +322,7 @@ impl Cagents {
         })
     }
 
-    /// Notification activation has no cached/legacy full-consent shortcut.
+    /// Notification activation has no cached full-consent shortcut.
     pub(in crate::app) fn proposal_notice_read_state(&self, registry: uuid::Uuid) -> (bool, bool) {
         let state = &self.automation_approval.global;
         (
@@ -524,6 +490,7 @@ impl Cagents {
                             self.automation_approval.global.latest_open = None;
                             self.automation_approval.global.authorized = None;
                             self.automation_approval.global.resolved(id);
+                            self.acknowledge_proposal_notices(id);
                             return self.drive_global_proposal_read();
                         }
                         self.automation_approval.global.authorized = Some((key, id, revision));
@@ -560,6 +527,7 @@ impl Cagents {
                                 if review.proposal.state != ProposalState::Pending {
                                     self.status = resolved_proposal_notice(&review.proposal.state);
                                     self.automation_approval.global.resolved(id);
+                                    self.acknowledge_proposal_notices(id);
                                     let closed = self.close_automation_approval();
                                     return Task::batch([
                                         closed,
@@ -588,17 +556,6 @@ impl Cagents {
                         self.automation_approval.error = Some("The request could not be refreshed. Choose Not now, then reopen it before deciding.".into());
                     }
                     (_, Err(_)) => {
-                        if self
-                            .automation_approval
-                            .global
-                            .initial_open
-                            .take()
-                            .is_some()
-                        {
-                            self.status = Some(TransientNotice::warning(
-                                "The request could not be loaded. It remains unresolved; reopen it when connected.",
-                            ));
-                        }
                         self.automation_approval.global.error = Some(
                             "Approval requests could not be refreshed. Retry when connected."
                                 .into(),
@@ -618,17 +575,6 @@ impl Cagents {
 
     fn install_proposal_delivery(&mut self, delivery: &ProposalDelivery) {
         let reviewing = self.automation_approval.proposal.is_some();
-        // Read whole-App guards before borrowing the delivery state mutably.
-        let initial_open_is_current = self.automation_approval.global.initial_open.is_some_and(
-            |(_, _, focused, destination)| {
-                self.workspace.focused() == focused
-                    && self.active_workspace_destination() == destination
-                    && self.refresh_ui.focused
-                    && !self.update_prepared
-                    && !self.modal_is_open()
-                    && self.chrome_ui.workspace_preview_since.is_none()
-            },
-        );
         let state = &mut self.automation_approval.global;
         if delivery.identity != self.workspace_model.identity
             || delivery.automation_proposal_sequence == 0
@@ -645,7 +591,7 @@ impl Cagents {
             state.key = None;
             state.authorized = None;
             state.review_stale |= reviewing;
-            state.error = Some("The global approval snapshot is unavailable. Local approval discovery remains enabled.".into());
+            state.error = Some("Approval requests could not be refreshed. Retry when connected.".into());
             return;
         }
         let key = Key {
@@ -682,22 +628,6 @@ impl Cagents {
         state.page_end = Some(state.pending.len() as u64);
         state.authorized = None;
         state.error = None;
-        let initial_open = state.initial_open.take();
-        if let Some((id, revision, focused, destination)) = initial_open {
-            if initial_open_is_current {
-                self.automation_approval.global.latest_open =
-                    Some((key, id, revision, self.automation_approval.generation));
-                self.automation_approval.global.wanted = Some(Read::Open {
-                    key,
-                    id,
-                    revision,
-                    generation: self.automation_approval.generation,
-                    focused,
-                    destination,
-                });
-                return;
-            }
-        }
         if self
             .automation_approval
             .proposal
@@ -716,6 +646,21 @@ impl Cagents {
             // request must confirm Pending or an immutable terminal state.
             self.queue_global_review_refresh();
         }
+    }
+
+    // The project in view keeps its one-step path to its own request.
+    fn current_project_proposal(&self) -> Option<&ProposalSummary> {
+        let repository = self.approval_repository()?;
+        self.automation_approval
+            .global
+            .pending
+            .iter()
+            .find(|proposal| proposal.repository == repository)
+    }
+
+    fn global_proposal_banner_is_empty(&self) -> bool {
+        let state = &self.automation_approval.global;
+        state.total == Some(0) && state.error.is_none()
     }
 
     pub(super) fn global_proposal_banner(&self) -> Option<Element<'_, Message>> {
@@ -746,11 +691,11 @@ impl Cagents {
                 .into(),
             );
         };
-        if total == 0 && state.key.is_some() && state.error.is_none() {
-            return Some(iced::widget::Space::new().height(Length::Shrink).into());
+        if self.global_proposal_banner_is_empty() {
+            return None;
         }
         let current = state.key.is_some() && !state.exhausted;
-        let busy = state.flight.is_some();
+        let busy = state.explicit_read_in_flight();
         let title = if current {
             format!("Pending approvals ({total})")
         } else {
@@ -781,34 +726,42 @@ impl Cagents {
         if let Some(error) = &state.error {
             body = body.push(design::body(error));
         }
+        let review_row = |label: String, proposal: &ProposalSummary| -> Element<'_, Message> {
+            widget::row::with_children(vec![
+                design::body(label).width(Length::Fill).into(),
+                crate::ui_controls::button::secondary("Review request")
+                    .on_press_maybe(
+                        state
+                            .key
+                            .filter(|_| !busy && !self.modal_is_open() && !self.update_prepared)
+                            .map(|key| {
+                                message(Action::Open {
+                                    key,
+                                    id: proposal.id,
+                                    revision: proposal.revision,
+                                })
+                            }),
+                    )
+                    .into(),
+            ])
+            .spacing(space::S)
+            .align_y(Alignment::Center)
+            .into()
+        };
+        if !state.expanded
+            && let Some(proposal) = self.current_project_proposal()
+        {
+            body = body.push(review_row(
+                format!("Scheduled work requested: {}", proposal.name),
+                proposal,
+            ));
+        }
         if state.expanded {
             let rows = state.pending.iter().map(|proposal| {
-                let row: Element<'_, Message> = widget::row::with_children(vec![
-                    design::body(format!(
-                        "{} · {}",
-                        proposal.name,
-                        proposal.repository.display()
-                    ))
-                    .width(Length::Fill)
-                    .into(),
-                    crate::ui_controls::button::secondary("Review request")
-                        .on_press_maybe(
-                            state
-                                .key
-                                .filter(|_| !busy && !self.modal_is_open() && !self.update_prepared)
-                                .map(|key| {
-                                    message(Action::Open {
-                                        key,
-                                        id: proposal.id,
-                                        revision: proposal.revision,
-                                    })
-                                }),
-                        )
-                        .into(),
-                ])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into();
+                let row = review_row(
+                    format!("{} · {}", proposal.name, proposal.repository.display()),
+                    proposal,
+                );
                 let row = widget::container(row)
                     .padding([0.0, 0.0, space::S, 0.0])
                     .into();

@@ -260,6 +260,25 @@ pub(super) fn execute_with_context(
     response_output(name, reply, outcome)
 }
 
+fn proposal_human(proposal: &crate::automations::Proposal) -> String {
+    match &proposal.state {
+        crate::automations::ProposalState::Pending => format!(
+            "{}\tAwaiting user approval in cagents. No schedule is enabled.",
+            proposal.id
+        ),
+        crate::automations::ProposalState::Approved {
+            automation,
+            execution_revision,
+        } => format!(
+            "{}\tApproved automation {automation}, execution revision {execution_revision}",
+            proposal.id
+        ),
+        crate::automations::ProposalState::Declined => {
+            format!("{}\tUser declined. No schedule was created.", proposal.id)
+        }
+    }
+}
+
 fn response_output(
     name: &'static str,
     reply: Response,
@@ -267,22 +286,7 @@ fn response_output(
 ) -> Result<CommandOutput, AppError> {
     let (mut data, human) = match reply {
         Response::Proposal(proposal) => {
-            let human = match &proposal.state {
-                crate::automations::ProposalState::Pending => format!(
-                    "{}\tAwaiting user approval in cagents. No schedule is enabled.",
-                    proposal.id
-                ),
-                crate::automations::ProposalState::Approved {
-                    automation,
-                    execution_revision,
-                } => format!(
-                    "{}\tApproved automation {automation}, execution revision {execution_revision}",
-                    proposal.id
-                ),
-                crate::automations::ProposalState::Declined => {
-                    format!("{}\tUser declined. No schedule was created.", proposal.id)
-                }
-            };
+            let human = proposal_human(&proposal);
             (json!({"proposal":proposal}), human)
         }
         Response::Proposals(proposals) => {

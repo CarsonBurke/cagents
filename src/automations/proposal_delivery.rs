@@ -7,8 +7,7 @@ use super::ProposalSummary;
 pub const PROPOSAL_PAGE_SIZE: usize = 64;
 
 /// One proposal-only SQLite snapshot, independent of the workspace snapshot.
-/// The positive clock is a delivery capability; zero must not disable legacy
-/// polling. This is all pending requests, not an unread-notification count.
+/// This is all pending requests, not an unread-notification count.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProposalDelivery {
     pub identity: Uuid,

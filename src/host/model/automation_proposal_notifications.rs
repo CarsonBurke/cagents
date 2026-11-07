@@ -1,6 +1,5 @@
-//! Future proposal creations only. Registered in the published schema24 opener
-//! transaction alongside maintained delivery metadata. No historical backfill
-//! or lifecycle-table change belongs to this leaf.
+//! Alerts for proposals created from schema 23 on, migrated alongside the
+//! delivery metadata. Requests already pending are not alerted again.
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

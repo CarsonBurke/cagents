@@ -18406,7 +18406,6 @@ impl Application for Cagents {
             self.automation_subscription(),
             self.work_subscription(),
             self.channel_work_subscription(),
-            self.automation_approval_subscription(),
             self.document_tone_subscription(),
             self.update_subscription(),
             Subscription::run_with(

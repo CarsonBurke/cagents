@@ -1,5 +1,4 @@
-//! Minimal extraction of the donor's global pending discovery. Migration
-//! registration is part of the published schema24 opener transaction.
+//! Pending requests across every project, read in one snapshot.
 use super::*;
 use crate::automations::{PROPOSAL_PAGE_SIZE, ProposalDelivery, ProposalPage, ProposalReview};
 
@@ -7,8 +6,7 @@ const PENDING_PAGE_SQL: &str = "SELECT summary FROM automation_proposals \
     INDEXED BY global_pending_automation_proposals \
     WHERE pending=1 AND id>?1 ORDER BY id LIMIT ?2";
 
-/// Published schema24 delivery metadata, registered once in the authoritative
-/// opener transaction alongside the proposal-created source outbox.
+/// Schema 23 delivery metadata, migrated alongside the proposal-created outbox.
 /// Existing pending rows are counted once; no notification/history replay.
 pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(
