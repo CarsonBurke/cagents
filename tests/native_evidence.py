@@ -804,9 +804,9 @@ class Evidence(unittest.TestCase):
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
 
-    def killed_supervisor_processes(self, signal: int) -> None:
+    def killed_supervisor_processes(self, signal: int, extra: dict | None = None) -> None:
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", extra=extra)
         for _ in range(100):
             if (self.logs / "runner").exists():
                 break
@@ -843,7 +843,8 @@ class Evidence(unittest.TestCase):
         self.assertEqual(self.fixture_process_count(), 0)
 
     def test_stop_ends_what_a_killed_supervisor_left(self) -> None:
-        self.killed_supervisor_processes(9)
+        # With a limit, the session's scope goes with its supervisor and leaves nothing.
+        self.killed_supervisor_processes(9, extra={"CAGENTS_MEMORY_MAX": "0"})
         self.assertIn("lost", self.run_tool("status").stdout)
         self.assertIn("lost session", self.run_tool("stop").stdout)
         self.assertEqual(self.fixture_process_count(), 0)
