@@ -110,9 +110,11 @@ check_head() {
             behind=" ($(commits "$(git rev-list --count "HEAD..$tip")") behind origin/$default)"
         fi
         # A branch checked out in another worktree cannot be checked out here.
+        # awk reads to the end: exiting early could kill git with SIGPIPE,
+        # which pipefail and set -e would turn into a silent exit.
         worktree=$(git worktree list --porcelain | awk -v ref="refs/heads/$default" '
             /^worktree / { path = substr($0, 10) }
-            $0 == "branch " ref { print path; exit }')
+            $0 == "branch " ref && !found { print path; found = 1 }')
         if [[ -n $worktree ]]; then
             refuse_stale_head "HEAD is detached at $SHORT$behind." \
                 "To build $default, run: cd $(printf '%q' "$worktree") && git pull --ff-only && scripts/install-local$ARGUMENTS"
