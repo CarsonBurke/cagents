@@ -287,6 +287,10 @@ pub enum DaemonCommand {
         /// Permit active native turns and their background subagents to stop.
         #[arg(long)]
         interrupt: bool,
+        /// Carry saved panes whose ended actor never recorded its
+        /// conversation; they stay in their windows but will not reopen.
+        #[arg(long)]
+        accept_unreopenable: bool,
     },
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
@@ -3249,8 +3253,12 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             "bridge",
             "stdio bridge must run before command output",
         )),
-        DaemonCommand::Upgrade { yes, interrupt } => {
-            let job = crate::update::upgrade_installed(yes, interrupt)
+        DaemonCommand::Upgrade {
+            yes,
+            interrupt,
+            accept_unreopenable,
+        } => {
+            let job = crate::update::upgrade_installed(yes, interrupt, accept_unreopenable)
                 .map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
                 command: "daemon.upgrade",

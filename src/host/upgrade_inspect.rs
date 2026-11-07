@@ -195,7 +195,10 @@ fn inspect(request: Request) -> Result<(), String> {
     let evidence = ExecutionEvidence::load(&current_boot);
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => {
-            session.is_unstarted() || evidence.classify(session) == SavedExecution::Ended
+            session.is_unstarted()
+                || evidence
+                    .classify(session)
+                    .leaves_nothing_to_carry(request.accept_unreopenable)
         }
         CardKind::Terminal(session) => !terminal_requires_migration(session, &current_boot),
         _ => true,
@@ -234,7 +237,11 @@ fn inspect(request: Request) -> Result<(), String> {
             {
                 let missing = !initial_inventory.iter().any(|live| live.id == source.id);
                 // Nothing of its old owner remains to adopt or preserve.
-                if missing && evidence.classify(source) == SavedExecution::Ended {
+                if missing
+                    && evidence
+                        .classify(source)
+                        .leaves_nothing_to_carry(request.accept_unreopenable)
+                {
                     continue;
                 }
                 let result = if missing && request.reconcile_retained {
@@ -331,8 +338,13 @@ fn inspect(request: Request) -> Result<(), String> {
                 {
                     continue;
                 }
-                if let Some(problem) =
-                    saved_chat_problem(card, &source, &inventory, &evidence, || {
+                if let Some(problem) = saved_chat_problem(
+                    card,
+                    &source,
+                    &inventory,
+                    &evidence,
+                    request.accept_unreopenable,
+                    || {
                         qualify_with_mode(
                             &source,
                             &inventory,
@@ -348,8 +360,8 @@ fn inspect(request: Request) -> Result<(), String> {
                                     })
                             },
                         )
-                    })
-                {
+                    },
+                ) {
                     failures.push(problem);
                 }
             }
@@ -390,6 +402,20 @@ enum SavedExecution {
     /// The pane has execution this evidence does not cover, or the evidence
     /// is absent, foreign or unreadable.
     Unproved,
+    /// A pane that never learned its conversation, every actor of which has
+    /// ended, but at least one without the retirement that records what it
+    /// confirmed. Nothing still runs, yet nothing durable names a
+    /// conversation to reopen: the destination keeps the pane and refuses to
+    /// resume or replace it. Carrying it is a loss the person must accept.
+    Unrecorded,
+}
+
+impl SavedExecution {
+    /// Whether replacing the source cannot lose this pane's execution: it has
+    /// ended, or ended unrecorded and the person accepted it will not reopen.
+    fn leaves_nothing_to_carry(self, accept_unreopenable: bool) -> bool {
+        self == Self::Ended || (accept_unreopenable && self == Self::Unrecorded)
+    }
 }
 
 /// The source daemon's own ownership evidence, read without its lease and
@@ -492,22 +518,24 @@ impl ExecutionEvidence {
         // its ended actor leaves it nothing to reopen.
         let unnamed = source.has_unnamed_retained_claude_actor();
         let mut execution = SavedExecution::Ended;
+        let mut unrecorded = false;
         for owner in owners.into_iter().filter(|owner| owner.boot == self.boot) {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
                 Err(_) => return SavedExecution::Unproved,
             }
-            if unnamed
-                && !self
-                    .retired
-                    .as_ref()
-                    .is_ok_and(|retired| retired.contains(owner))
-            {
-                return SavedExecution::Unproved;
+            match &self.retired {
+                Ok(retired) => unrecorded |= unnamed && !retired.contains(owner),
+                Err(_) if unnamed => return SavedExecution::Unproved,
+                Err(_) => {}
             }
         }
-        execution
+        if execution == SavedExecution::Ended && unrecorded {
+            SavedExecution::Unrecorded
+        } else {
+            execution
+        }
     }
 
     /// A pane with no issued proof names no daemon that owns it. If it once
@@ -959,11 +987,12 @@ fn saved_chat_problem(
     source: &Session,
     inventory: &[Session],
     evidence: &ExecutionEvidence,
+    accept_unreopenable: bool,
     qualify: impl FnOnce() -> Result<(), String>,
 ) -> Option<String> {
     let execution =
         (!inventory.iter().any(|live| live.id == source.id)).then(|| evidence.classify(source));
-    if execution == Some(SavedExecution::Ended) {
+    if execution.is_some_and(|execution| execution.leaves_nothing_to_carry(accept_unreopenable)) {
         return None;
     }
     qualify()
@@ -975,6 +1004,10 @@ fn unqualified_chat_pane(card: crate::model::CardId, execution: Option<SavedExec
     if execution == Some(SavedExecution::Running) {
         format!(
             "Saved conversation pane {card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
+        )
+    } else if execution == Some(SavedExecution::Unrecorded) {
+        format!(
+            "Saved conversation pane {card} ended before it recorded which conversation it had, so the update cannot reopen it. Nothing of it still runs. To update anyway, run `cagents daemon upgrade --accept-unreopenable` (or `scripts/install-local --accept-unreopenable`): the pane stays in its window but will not resume or start a conversation. A conversation it began stays on disk and can be reopened with Resume."
         )
     } else {
         format!("Saved conversation pane {card} needs exact conversation recovery.")
@@ -1332,7 +1365,7 @@ mod tests {
         assert_eq!(evidence.classify(&card), SavedExecution::Ended);
         assert_eq!(
             evidence.classify(&issued),
-            SavedExecution::Unproved,
+            SavedExecution::Unrecorded,
             "a pre-ID card reopens only what a recorded retirement confirmed"
         );
         evidence.retired = read_retired_owners(&path);
@@ -1849,9 +1882,11 @@ mod tests {
             (crate::model::CardId::new(), &previous),
             (held_card, &held),
         ] {
-            if let Some(problem) = saved_chat_problem(card, source, &inventory, &evidence, || {
-                Err("unqualified".into())
-            }) {
+            if let Some(problem) =
+                saved_chat_problem(card, source, &inventory, &evidence, false, || {
+                    Err("unqualified".into())
+                })
+            {
                 failures.push(problem);
             }
         }
@@ -1865,9 +1900,73 @@ mod tests {
             "Saved conversation pane {held_card} needs exact conversation recovery."
         )));
         assert!(
-            saved_chat_problem(live_card, &live, &inventory, &evidence, || Ok(())).is_none(),
+            saved_chat_problem(live_card, &live, &inventory, &evidence, false, || Ok(())).is_none(),
             "a live actor the source adopted and qualified is not a problem"
         );
+    }
+
+    #[test]
+    fn an_unnamed_pane_whose_actor_ended_unrecorded_is_carried_only_when_accepted() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut unrecorded = retained_card(current_boot());
+        unrecorded.launch.session_id = None;
+        let mut running = retained_card(current_boot());
+        running.launch.session_id = None;
+        let ended = owner(&unrecorded, ended_process(), ended_process());
+        let census = vec![
+            (unrecorded.id, ended.clone()),
+            (
+                running.id,
+                owner(&running, running_process(), running_process()),
+            ),
+        ];
+        let mut evidence = evidence(holders.path(), census);
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
+        // A surviving provider is live work, which no acceptance waives.
+        assert_eq!(evidence.classify(&running), SavedExecution::Running);
+        let card = crate::model::CardId::new();
+        let refusal = saved_chat_problem(card, &unrecorded, &[], &evidence, false, || {
+            Err("unqualified".into())
+        })
+        .unwrap();
+        assert!(
+            refusal.contains(&format!(
+                "Saved conversation pane {card} ended before it recorded"
+            )),
+            "{refusal}"
+        );
+        assert!(refusal.contains("--accept-unreopenable"), "{refusal}");
+        assert!(refusal.contains("reopened with Resume"), "{refusal}");
+        assert_eq!(
+            saved_chat_problem(card, &unrecorded, &[], &evidence, true, || panic!(
+                "an accepted unrecorded pane needs no qualification"
+            )),
+            None
+        );
+        assert!(
+            saved_chat_problem(card, &running, &[], &evidence, true, || Err(
+                "unqualified".into()
+            ))
+            .is_some()
+        );
+        // Once the source lists it, it is the source's live work again.
+        assert!(
+            saved_chat_problem(
+                card,
+                &unrecorded,
+                std::slice::from_ref(&unrecorded),
+                &evidence,
+                true,
+                || Err("unqualified".into())
+            )
+            .is_some()
+        );
+        // A recorded retirement names what it confirmed; nothing to accept.
+        evidence.retired = Ok(vec![ended]);
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
+        // Unreadable retirements prove nothing either way.
+        evidence.retired = Err("unreadable".into());
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unproved);
     }
 
     #[test]

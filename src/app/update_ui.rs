@@ -1012,7 +1012,7 @@ impl Cagents {
                 self.update_ui.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::update::apply_installed(&installed)
+                        crate::update::apply_installed(&installed, false)
                             .map_err(|error| error.to_string())
                     })
                     .await

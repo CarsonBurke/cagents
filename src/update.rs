@@ -396,7 +396,13 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 #[derive(Serialize, Deserialize)]
 enum UpdateRequest {
     Release(Release),
-    Installed { root: PathBuf },
+    Installed {
+        root: PathBuf,
+        /// See `SourceInspectionRequest::accept_unreopenable`. An older
+        /// worker that cannot honor it ignores it and refuses those panes.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        accept_unreopenable: bool,
+    },
 }
 
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
@@ -413,7 +419,10 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
     )
 }
 
-pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
+pub fn apply_installed(
+    executable: &Path,
+    accept_unreopenable: bool,
+) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
@@ -434,7 +443,10 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     start_job(
         &installation,
         &version,
-        &UpdateRequest::Installed { root: served },
+        &UpdateRequest::Installed {
+            root: served,
+            accept_unreopenable,
+        },
     )
 }
 
@@ -558,7 +570,11 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// CLI entry point for the same leased worker, exact preview and window fence
 /// used by the application. This installed coordinator chooses the worker
 /// (`installed_update_worker`); it is never delegated to an older owner's CLI.
-pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
+pub fn upgrade_installed(
+    yes: bool,
+    interrupt: bool,
+    accept_unreopenable: bool,
+) -> Result<UpdateJob, UpdateError> {
     use std::io::IsTerminal;
     if !yes && !io::stdin().is_terminal() {
         return Err(invalid(
@@ -567,7 +583,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
     }
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
-    let initial = apply_installed(&candidate)?;
+    let initial = apply_installed(&candidate, accept_unreopenable)?;
     let policy = if interrupt {
         impact::Policy::Interrupt
     } else {
@@ -972,7 +988,7 @@ pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard
         .prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-            crate::install_guard::preflight_source_panes(guard, None, false)
+            crate::install_guard::preflight_source_panes(guard, None, false, false)
         })?;
     // Saving and closing takes as long as the windows need, and another install
     // can land inside it. Reopen whatever is served now, so this relaunch does
@@ -1031,8 +1047,11 @@ fn perform_update(
             Installation::detect()?;
             release
         }
-        UpdateRequest::Installed { root } => {
-            return installed::perform(installation, state, job, &root);
+        UpdateRequest::Installed {
+            root,
+            accept_unreopenable,
+        } => {
+            return installed::perform(installation, state, job, &root, accept_unreopenable);
         }
     };
     let cancellation = CancellationToken::new();
@@ -1074,7 +1093,7 @@ fn perform_update(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    reconcile_saved_sources(staged.identity.protocol)?;
+    reconcile_saved_sources(staged.identity.protocol, false)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
         observe_impact(&staged.identity, policy)
@@ -1089,7 +1108,7 @@ fn perform_update(
     crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
         crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
+            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, false)?;
         let latest = observe_impact(&staged.identity, confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
             .map_err(io::Error::other)?;
         if !confirmed.preserves_consent(&latest) {
@@ -1152,13 +1171,17 @@ pub(crate) fn inspect_source_panes(
     guard: &crate::instance::UiUpdateGuard,
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
+    accept_unreopenable: bool,
 ) -> Result<(), UpdateError> {
-    inspect_source_panes_mode(guard, proof, require_resumable, false)
+    inspect_source_panes_mode(guard, proof, require_resumable, false, accept_unreopenable)
 }
 
 // Recover only already-owned providers before publishing the inventory the
 // user will consent to. Never expand consent after windows have prepared.
-fn reconcile_saved_sources(destination_protocol: u16) -> Result<(), UpdateError> {
+fn reconcile_saved_sources(
+    destination_protocol: u16,
+    accept_unreopenable: bool,
+) -> Result<(), UpdateError> {
     let guard = crate::instance::UiUpdateGuard::acquire()?;
     let (protocol, proof) = source::inspect_identity(None)?;
     let mut problems = Vec::new();
@@ -1167,9 +1190,13 @@ fn reconcile_saved_sources(destination_protocol: u16) -> Result<(), UpdateError>
     {
         problems.push(error.to_string());
     }
-    if let Err(error) =
-        inspect_source_panes_mode(&guard, proof, protocol != destination_protocol, true)
-    {
+    if let Err(error) = inspect_source_panes_mode(
+        &guard,
+        proof,
+        protocol != destination_protocol,
+        true,
+        accept_unreopenable,
+    ) {
         problems.push(error.to_string());
     }
     if problems.is_empty() {
@@ -1184,6 +1211,7 @@ fn inspect_source_panes_mode(
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
     reconcile_retained: bool,
+    accept_unreopenable: bool,
 ) -> Result<(), UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
@@ -1201,6 +1229,7 @@ fn inspect_source_panes_mode(
         proof,
         require_resumable,
         reconcile_retained,
+        accept_unreopenable,
     };
     let mut command = Command::new(&helper);
     crate::install_guard::sanitize_child_environment(&mut command);
