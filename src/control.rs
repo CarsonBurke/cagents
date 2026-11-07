@@ -699,6 +699,17 @@ impl ControlClient {
         }
     }
 
+    /// Handshake with a daemon that may still be restoring behind its bound
+    /// listener. The reply may arrive as late as `deadline`, and never gets
+    /// less time than an ordinary handshake.
+    pub(crate) fn from_stream_until(
+        stream: UnixStream,
+        deadline: Instant,
+    ) -> Result<Self, ControlError> {
+        let deadline = deadline.max(Instant::now() + Self::handshake_timeout());
+        Self::from_stream_inner(stream, deadline, Instant::now() + IO_TIMEOUT)
+    }
+
     pub(crate) fn from_stream_with_deadline(
         stream: UnixStream,
         deadline: Instant,

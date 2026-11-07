@@ -1359,7 +1359,7 @@ fn ensure_daemon_ready_at(
             // A listening socket can belong to an older development build.
             // Verify the wire protocol before opening a window whose actions
             // would otherwise all fail against that daemon.
-            return verify_daemon_protocol(stream);
+            return verify_daemon_protocol(crate::control::ControlClient::from_stream(stream));
         }
         Err(error)
             if !matches!(
@@ -1386,15 +1386,28 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    start_daemon_at(
-        socket,
-        timeout,
-        &daemon_binary,
-        systemd_user_manager_available()
-            && !crate::instance::has_inherited_daemon_fence()
-                .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?,
-        |scoped| spawn_daemon(&daemon_binary, application, scoped),
-    )?;
+    let scoped = systemd_user_manager_available()
+        && !crate::instance::has_inherited_daemon_fence()
+            .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
+        spawn_daemon(&daemon_binary, application, scoped)
+    })
+}
+
+/// The daemon binds its listener before restoring retained sessions and
+/// accepts clients only once restoration finishes, so a connected socket
+/// proves the reservation, not service. The handshake therefore shares the
+/// startup allowance: an ordinary five-second reply budget turned a restore of
+/// 34 sessions that took 5.5 s into a failed `daemon start` (#2400).
+fn start_and_verify_daemon_at(
+    socket: &Path,
+    timeout: Duration,
+    daemon_binary: &Path,
+    scoped: bool,
+    launch: impl FnMut(bool) -> io::Result<Child>,
+) -> Result<(), HostedTerminalStartError> {
+    let deadline = Instant::now() + timeout;
+    start_daemon_at(socket, timeout, daemon_binary, scoped, launch)?;
     // Another launcher can win the daemon lease while we wait for readiness;
     // it must satisfy the same protocol contract as an existing daemon.
     let stream =
@@ -1402,18 +1415,20 @@ fn ensure_daemon_ready_at(
             path: socket.to_owned(),
             source,
         })?;
-    verify_daemon_protocol(stream)
+    verify_daemon_protocol(crate::control::ControlClient::from_stream_until(
+        stream, deadline,
+    ))
 }
 
-fn verify_daemon_protocol(stream: UnixStream) -> Result<(), HostedTerminalStartError> {
-    crate::control::ControlClient::from_stream(stream)
-        .map(|_| ())
-        .map_err(|error| match error {
-            crate::control::ControlError::UnsupportedVersion { actual } => {
-                HostedTerminalStartError::HostIncompatible { actual }
-            }
-            error => HostedTerminalStartError::HostProtocol(error),
-        })
+fn verify_daemon_protocol(
+    client: Result<crate::control::ControlClient, crate::control::ControlError>,
+) -> Result<(), HostedTerminalStartError> {
+    client.map(|_| ()).map_err(|error| match error {
+        crate::control::ControlError::UnsupportedVersion { actual } => {
+            HostedTerminalStartError::HostIncompatible { actual }
+        }
+        error => HostedTerminalStartError::HostProtocol(error),
+    })
 }
 
 fn start_daemon_at(
@@ -1556,7 +1571,7 @@ fn daemon_startup_ready(
     }
     if let Some(status) = child_status {
         // A concurrent launch can win the lease while our child exits. Its
-        // listener is deliberately absent until every session has restored.
+        // listener may not be bound yet; the lease proves its ownership.
         if !crate::daemon::HostLease::is_held_at(socket)
             .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
         {
@@ -3151,6 +3166,91 @@ mod tests {
             }
             server.join().unwrap();
         }
+    }
+
+    /// A fixture daemon whose listener is bound at launch and serves only
+    /// after `restore`, as `listener_before_restore` does.
+    fn restoring_daemon(
+        socket: &Path,
+        restore: Duration,
+    ) -> impl FnMut(bool) -> io::Result<Child> + use<> {
+        let socket = socket.to_owned();
+        move |_scoped| {
+            let listener = UnixListener::bind(&socket).unwrap();
+            thread::spawn(move || {
+                thread::sleep(restore);
+                // Readiness probes connect and close; answer the handshake.
+                loop {
+                    let mut stream = accept_connection(&listener);
+                    let Ok(Some(request)) = read_frame::<ClientEnvelope>(&mut stream) else {
+                        continue;
+                    };
+                    let proof = proof("restored");
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(request.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof,
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                    return;
+                }
+            });
+            Command::new("/bin/true").spawn()
+        }
+    }
+
+    #[test]
+    fn launched_daemon_handshake_waits_out_restoration_beyond_five_seconds() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        // The #2400 rehearsal restored 34 sessions in 5.48 s; the CLI's ordinary
+        // handshake gave up at 5 s while the startup allowance was far larger.
+        let started = Instant::now();
+        start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(30),
+            Path::new("fixture-daemon"),
+            false,
+            restoring_daemon(&socket, Duration::from_millis(5_600)),
+        )
+        .unwrap();
+        assert!(started.elapsed() >= Duration::from_millis(5_600));
+    }
+
+    #[test]
+    fn launched_daemon_that_dies_while_restoring_fails_without_its_allowance() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let path = socket.clone();
+        let started = Instant::now();
+        let result = start_and_verify_daemon_at(
+            &socket,
+            Duration::from_secs(60),
+            Path::new("fixture-daemon"),
+            false,
+            move |_scoped| {
+                let listener = UnixListener::bind(&path).unwrap();
+                thread::spawn(move || {
+                    thread::sleep(Duration::from_millis(200));
+                    drop(listener);
+                });
+                Command::new("/bin/true").spawn()
+            },
+        );
+        assert!(
+            matches!(result, Err(HostedTerminalStartError::HostProtocol(_))),
+            "{result:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]
