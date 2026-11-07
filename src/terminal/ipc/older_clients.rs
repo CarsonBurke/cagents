@@ -55,7 +55,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 156,
+    proven_at: 160,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -518,7 +518,7 @@ mod tests {
     fn an_agent_reply_after_the_older_protocol_is_refused() {
         use crate::agent_execution::{
             Reply,
-            directory::{Directory, Members, Scope},
+            directory::{Directory, Members, Scope, Sessions},
         };
         let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
         let reply = |reply| ServerMessage::Response {
@@ -533,6 +533,13 @@ mod tests {
         assert!(!client.admits_message(&reply(Reply::Members(Members {
             channel: crate::model::ChannelId::new(),
             caller: None,
+            sessions: Vec::new(),
+        }))));
+        // A carried CLI lists sessions with the read it knows, which reports
+        // no usage limit or account.
+        assert!(!client.admits_message(&reply(Reply::Sessions(Sessions {
+            caller: None,
+            scope: Scope::All,
             sessions: Vec::new(),
         }))));
     }

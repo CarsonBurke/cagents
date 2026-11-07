@@ -13,7 +13,10 @@ use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
         AcceptanceError, Authority, Lineage, Origin,
-        mailbox::{Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To},
+        directory::{Member, Scope},
+        mailbox::{
+            Delivery, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To,
+        },
     },
     chat::{self, runtime::Rejection},
     model::{MessageId, TerminalId},
@@ -34,17 +37,39 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// a stranger that happens to share one character.
 const MIN_HANDLE: usize = 4;
 
+/// Sends as an older CLI asks to, without reporting the recipient.
 pub(in crate::host) fn send(
     host: &SharedHost,
     authority: &Authority,
     outgoing: Outgoing,
 ) -> Result<Sent, AcceptanceError> {
+    post(host, authority, outgoing).map(|delivery| delivery.sent)
+}
+
+/// Leaves a message and reports what its recipient can do with it now.
+///
+/// A recipient stopped by a usage limit keeps the message until the limit
+/// resets, so the sender is not left waiting on a reply that cannot come
+/// before then. One whose provider exited cannot receive it at all.
+pub(in crate::host) fn post(
+    host: &SharedHost,
+    authority: &Authority,
+    outgoing: Outgoing,
+) -> Result<Delivery, AcceptanceError> {
     outgoing.validate()?;
     let (_, session) = caller(host, authority)?;
+    // Read first, as the listing takes the registry lock itself.
+    let listing = directory::list(
+        host,
+        authority,
+        directory::Wanted::Scope(Scope::All),
+        true,
+        true,
+    )?;
     let live = directory::live_sessions(host);
     let registry = registry(host)?;
     let now = super::now();
-    let (message, reach) = {
+    let (message, reach, recipient) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let lineages =
             registry.session_lineages(live.iter().map(|entry| entry.id).chain(session))?;
@@ -77,7 +102,10 @@ pub(in crate::host) fn send(
         };
         let (to, reply_to) = match &outgoing.to {
             To::Session(handle) => (
-                Some(resolve(&model.agents, &live, &lineage_of, handle)?),
+                Some(
+                    resolve(&model.agents, &live, &lineage_of, handle)
+                        .map_err(|error| stopped(&listing, handle).unwrap_or(error))?,
+                ),
                 None,
             ),
             To::Parent => (parent(&registry, session, from.lineage)?, None),
@@ -108,6 +136,10 @@ pub(in crate::host) fn send(
                 }
             }
         };
+        let recipient = to.and_then(|to| recipient(&listing, to));
+        let limited = recipient
+            .as_ref()
+            .is_some_and(|member| member.limit.is_some());
         let to_title = to.and_then(|to| {
             live.iter()
                 .find(|entry| lineage_of(entry.id) == to)
@@ -123,20 +155,82 @@ pub(in crate::host) fn send(
             },
             reply_to,
             body: outgoing.body,
-            // No one can answer before a session of it starts, so the asker
-            // does not wait and a later reply is not held for it.
+            // No one can answer before a session of it starts, or before
+            // its usage limit resets, so the asker does not wait and a later
+            // reply is not held for it.
             wait_until_ms: outgoing
                 .wait_ms
-                .filter(|_| reach != Reach::Offline)
+                .filter(|_| reach != Reach::Offline && !limited)
                 .map(|wait| now.saturating_add(wait)),
             state: State::Pending,
             created_ms: now,
         };
         registry.post_message(&message)?;
-        (message, reach)
+        (message, reach, recipient)
     };
     wake(host);
-    Ok(Sent { message, reach })
+    Ok(Delivery {
+        sent: Sent { message, reach },
+        recipient,
+    })
+}
+
+/// Whether a usage limit stopped the conversation and still holds, so a
+/// message waits for its reset rather than becoming a prompt the provider
+/// refuses at once. The account is read only for a conversation whose
+/// provider reported a limit.
+fn limited(provider: crate::agent::Provider, handle: &chat::runtime::Handle) -> bool {
+    let Some(failure) = handle.failure() else {
+        return false;
+    };
+    let now = super::now();
+    if directory::usage_limit(provider, &failure, None, now).is_none() {
+        return false;
+    }
+    let account = super::account_info::Accounts::load(now)
+        .and_then(|accounts| accounts.of(provider, &handle.execution_environment().0));
+    directory::usage_limit(provider, &failure, account.as_ref(), now).is_some()
+}
+
+/// The session of `lineage` a message reaches, as the listing reports it: a
+/// live conversation before a terminal, and either before one whose provider
+/// exited.
+fn recipient(listing: &directory::Listing, lineage: Lineage) -> Option<Member> {
+    listing
+        .members()
+        .filter(|member| member.session.lineage == lineage)
+        .min_by_key(|member| {
+            (
+                member.exited,
+                member.session.surface != crate::agent_execution::directory::Surface::Chat,
+            )
+        })
+        .cloned()
+}
+
+/// Why `handle` names no live session when it names one whose provider
+/// exited: such a session cannot take a message until it is resumed.
+fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
+    let handle = handle.to_ascii_lowercase();
+    if handle.len() < MIN_HANDLE {
+        return None;
+    }
+    let member = listing.members().find(|member| {
+        member.exited
+            && (member.session.id.to_string().starts_with(&handle)
+                || member.session.lineage.to_string().starts_with(&handle))
+    })?;
+    let mut reason = format!(
+        "Session {} has stopped: its provider exited, so it cannot receive messages",
+        member.session.id
+    );
+    if let Some(failure) = &member.failure {
+        reason.push_str(&format!(" ({failure})"));
+    }
+    reason.push_str(
+        ". Resume its conversation first, or message another session from `cagents sessions --all`",
+    );
+    Some(reason)
 }
 
 pub(in crate::host) fn inbox(
@@ -577,13 +671,13 @@ impl Handle {
         if crate::host::client::ensure_control_open(host).is_err() {
             return Ok(released);
         }
-        let chats: Vec<(TerminalId, chat::runtime::Handle)> = {
+        let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             state
                 .chats
                 .iter()
                 .filter(|(_, record)| !record.handle.is_completed())
-                .map(|(id, record)| (*id, record.handle.clone()))
+                .map(|(id, record)| (*id, record.session.launch.provider, record.handle.clone()))
                 .collect()
         };
         let lineages = self
@@ -591,15 +685,16 @@ impl Handle {
             .registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .session_lineages(chats.iter().map(|(id, _)| *id))?;
+            .session_lineages(chats.iter().map(|(id, _, _)| *id))?;
         for message in pending {
             let Some(recipient) = message.to.lineage else {
                 continue;
             };
-            let Some((session, handle)) = chats
-                .iter()
-                .find(|(id, handle)| lineages.get(id) == Some(&recipient) && handle.is_idle())
-            else {
+            let Some((session, _, handle)) = chats.iter().find(|(id, provider, handle)| {
+                lineages.get(id) == Some(&recipient)
+                    && handle.is_idle()
+                    && !limited(*provider, handle)
+            }) else {
                 continue;
             };
             self.hand_over(&message, *session, handle)?;

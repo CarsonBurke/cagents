@@ -516,6 +516,14 @@ pub enum Operation {
     Transcript(transcript::Query),
     /// List the sessions in this channel, or in the caller's own when absent.
     Members(Option<crate::model::ChannelId>),
+    /// Read the caller and the sessions in a scope as members, with each
+    /// one's usage limit and account. `Directory` is this read without them,
+    /// as older CLIs make it. Grants no control.
+    Sessions(directory::Scope),
+    /// Leave a message for another session, or answer one, and learn what
+    /// its recipient can do with it now. `SendMessage` is this as older CLIs
+    /// send it.
+    Send(mailbox::Outgoing),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -582,6 +590,8 @@ pub enum Reply {
     InboxAcknowledged,
     Transcript(transcript::Page),
     Members(directory::Members),
+    Sessions(directory::Sessions),
+    Delivered(mailbox::Delivery),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

@@ -11032,6 +11032,7 @@ impl Cagents {
                             provider: runtime.session.launch.provider,
                             state: handle.take_activity(),
                         };
+                        let limited = runtime.usage_limited();
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
                         // Pane names use the same bounded observation cache as
@@ -11043,6 +11044,7 @@ impl Cagents {
                             self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        self.sidebar_state.set_card_limited(target.card, limited);
                         self.commit_chat_session(target.card, session);
                         if let Some(title) = title
                             && self.apply_reported_title(target.card, title)
@@ -15498,6 +15500,44 @@ mod tests {
         snapshot.items.clear();
         assert!(observation.observe(&snapshot).is_none());
         assert!(observation.title.is_none());
+    }
+
+    #[test]
+    fn a_usage_limited_conversation_reads_limited_in_the_sidebar_until_a_turn_starts() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let mut snapshot = (*handle.snapshot()).clone();
+        let mut publish = |app: &mut Cagents, error: Option<&str>| {
+            snapshot.generation += 1;
+            snapshot.error = error.map(str::to_owned);
+            handle.publish_snapshot_for_test(snapshot.clone());
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+            app.sidebar_state.card_attention(card)
+        };
+        let limited = publish(
+            &mut app,
+            Some("You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)"),
+        );
+        assert_eq!(
+            limited.state(),
+            Some(crate::sidebar::AttentionState::Limited)
+        );
+        assert_eq!(limited.working, 0);
+        assert_eq!(
+            chat_runtime(&app, card).conversation_status(false).1,
+            "Account limit reached · resets Nov 8, 8am (America/Vancouver)"
+        );
+        // Another failure is not a usage limit.
+        let failed = publish(&mut app, Some("connection reset by peer"));
+        assert_eq!(failed.limited, 0);
+        publish(
+            &mut app,
+            Some("You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)"),
+        );
+        // A turn that starts clears the provider's error, and the limit with it.
+        assert_eq!(publish(&mut app, None).limited, 0);
     }
 
     #[test]

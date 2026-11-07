@@ -7,7 +7,8 @@ use crate::{
     agent_execution::{
         Authority, Lineage, Origin,
         directory::{
-            Delegation, Directory, Entry, Member, Members, Owner, Relation, Scope, Surface,
+            Delegation, Directory, Entry, Member, Members, Owner, Relation, Scope, SessionAccount,
+            Sessions, Surface, UsageLimit,
         },
     },
     model::{ChannelId, TerminalId},
@@ -29,6 +30,8 @@ pub(in crate::host) struct Live {
     /// A chat whose provider exited; only channel listings include one.
     pub(in crate::host) exited: bool,
     pub(in crate::host) failure: Option<String>,
+    /// A chat's runtime, for what a listing reads after releasing the host.
+    pub(in crate::host) chat: Option<crate::chat::runtime::Handle>,
 }
 
 /// A failure is context in a listing, not a diagnostic dump.
@@ -60,7 +63,7 @@ pub(super) fn read(
     authority: &Authority,
     scope: Scope,
 ) -> Result<Directory, String> {
-    let listing = list(host, authority, Wanted::Scope(scope), false)?;
+    let listing = list(host, authority, Wanted::Scope(scope), false, false)?;
     let Wanted::Scope(scope) = listing.served else {
         unreachable!("a directory read serves a scope");
     };
@@ -75,13 +78,30 @@ pub(super) fn read(
     })
 }
 
+/// A directory read as members, with each session's usage limit and account.
+pub(super) fn sessions(
+    host: &SharedHost,
+    authority: &Authority,
+    scope: Scope,
+) -> Result<Sessions, String> {
+    let listing = list(host, authority, Wanted::Scope(scope), false, true)?;
+    let Wanted::Scope(scope) = listing.served else {
+        unreachable!("a directory read serves a scope");
+    };
+    Ok(Sessions {
+        caller: listing.caller,
+        scope,
+        sessions: listing.sessions,
+    })
+}
+
 /// The sessions in a channel, including chats whose provider exited.
 pub(super) fn channel(
     host: &SharedHost,
     authority: &Authority,
     channel: Option<ChannelId>,
 ) -> Result<Members, String> {
-    let mut listing = list(host, authority, Wanted::Channel(channel), true)?;
+    let mut listing = list(host, authority, Wanted::Channel(channel), true, true)?;
     let Wanted::Channel(Some(channel)) = listing.served else {
         unreachable!("a channel read serves one channel");
     };
@@ -108,11 +128,14 @@ pub(super) fn channel(
 /// of one channel or one session's history, also includes chats whose
 /// provider exited, and names each session only by its own title: the
 /// channel's title, a fallback elsewhere, would label every member alike.
+/// With `standing`, each chat member also reports its usage limit and the
+/// account it runs on, which costs a read of the account registry and cache.
 pub(super) fn list(
     host: &SharedHost,
     authority: &Authority,
     wanted: Wanted,
     members: bool,
+    standing: bool,
 ) -> Result<Listing, String> {
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
@@ -222,6 +245,10 @@ pub(super) fn list(
         _ => None,
     };
     let caller_channel = caller.and_then(|caller| channel_of(&view_scope(caller)));
+    let now = super::now();
+    let accounts = standing
+        .then(|| super::account_info::Accounts::load(now))
+        .flatten();
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
@@ -277,9 +304,24 @@ pub(super) fn list(
             relation,
             lineage: lineage(live.id),
         };
+        let account = accounts
+            .as_ref()
+            .zip(live.chat.as_ref())
+            .zip(live.provider)
+            .and_then(|((accounts, chat), provider)| {
+                accounts.of(provider, &chat.execution_environment().0)
+            });
+        let limit = live
+            .failure
+            .as_deref()
+            .zip(live.provider)
+            .filter(|_| standing && !live.exited)
+            .and_then(|(failure, provider)| usage_limit(provider, failure, account.as_ref(), now));
         let member = Member {
             session: entry,
             exited: live.exited,
+            limit,
+            account,
             failure: live.failure.map(|failure| {
                 let mut failure = match live.provider {
                     Some(provider) => {
@@ -392,6 +434,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             directory: record.session.launch.recipe.working_directory.clone(),
             exited: false,
             failure: record.handle.failure(),
+            chat: Some(record.handle.clone()),
         });
     }
     for (id, record) in &state.terminals {
@@ -413,6 +456,7 @@ pub(in crate::host) fn live_sessions(host: &SharedHost) -> Vec<Live> {
             directory: record.current_directory().to_path_buf(),
             exited: false,
             failure: None,
+            chat: None,
         });
     }
     live
@@ -435,8 +479,49 @@ fn exited_chats(host: &SharedHost) -> Vec<Live> {
             directory: record.session.launch.recipe.working_directory.clone(),
             exited: true,
             failure: record.handle.failure(),
+            chat: Some(record.handle.clone()),
         })
         .collect()
+}
+
+/// The usage limit a provider's reported `failure` names, while it holds.
+///
+/// The provider's message says which limit and, in its own words, when it
+/// resets. The account's latest usage reading supplies the reset as a time:
+/// the latest reset among its exhausted windows, since the account is out
+/// until all of them have reset. A limit whose known reset has passed no
+/// longer holds, though the failure stays until the next turn starts.
+pub(in crate::host) fn usage_limit(
+    provider: Provider,
+    failure: &str,
+    account: Option<&SessionAccount>,
+    now_ms: u64,
+) -> Option<UsageLimit> {
+    let failure = crate::chat::failure::Failure::parse(provider, failure)?;
+    if failure.kind != crate::chat::failure::FailureKind::AccountLimit {
+        return None;
+    }
+    let mut summary = failure.summary;
+    if let Some(reset) = &failure.reset {
+        let suffix = format!(" · resets {reset}");
+        if let Some(stripped) = summary.strip_suffix(&suffix) {
+            summary.truncate(stripped.len());
+        }
+    }
+    let resets_at = account.and_then(|account| {
+        account
+            .remaining
+            .iter()
+            .filter(|window| window.remaining_fraction <= 0.0 && !window.reset_elapsed)
+            .filter_map(|window| window.window.resets_at)
+            .max()
+    });
+    let limit = UsageLimit {
+        summary,
+        reset: failure.reset,
+        resets_at,
+    };
+    (!limit.has_reset(now_ms)).then_some(limit)
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views
@@ -469,6 +554,56 @@ fn session_scopes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_usage_limit_is_dated_by_its_exhausted_window_until_that_window_resets() {
+        use crate::account::{UsageWindow, WindowKind, info::RemainingWindow};
+        let failure = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
+        let window = |key: &str, remaining: f32, resets_at: i64| RemainingWindow {
+            window: UsageWindow {
+                key: key.into(),
+                kind: WindowKind::Weekly,
+                label: key.into(),
+                used: 1.0 - remaining,
+                resets_at: Some(resets_at),
+                span_secs: None,
+                binding: false,
+            },
+            remaining_fraction: remaining,
+            reset_elapsed: false,
+        };
+        let account = SessionAccount {
+            id: "claude/system".parse().unwrap(),
+            label: None,
+            status: Some(crate::account::UsageStatus::Limited),
+            // The window with allowance left does not date the reset.
+            remaining: vec![window("Session", 0.5, 9_000), window("Weekly", 0.0, 7_200)],
+            stale: false,
+        };
+        let limit = usage_limit(Provider::Claude, failure, Some(&account), 3_600_000).unwrap();
+        assert_eq!(limit.summary, "Claude weekly limit reached");
+        assert_eq!(
+            limit.reset.as_deref(),
+            Some("Nov 8, 8am (America/Vancouver)")
+        );
+        assert_eq!(limit.resets_at, Some(7_200));
+        assert_eq!(
+            usage_limit(Provider::Claude, failure, Some(&account), 7_200_000),
+            None,
+            "a reset that passed lifts the limit"
+        );
+        let undated = usage_limit(Provider::Claude, failure, None, u64::MAX).unwrap();
+        assert_eq!(undated.resets_at, None, "only the provider's words date it");
+        assert_eq!(
+            usage_limit(
+                Provider::Claude,
+                "API Error: 500 Internal server error",
+                None,
+                0
+            ),
+            None
+        );
+    }
 
     #[test]
     fn terminal_membership_reports_worktree_views_and_refuses_ambiguous_placement() {

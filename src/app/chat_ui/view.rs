@@ -1472,7 +1472,13 @@ impl Runtime {
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
-        let failure_label = active.and_then(|failure| match failure.kind {
+        // The reset is when the conversation can carry on, so a limit says it.
+        let limit_reset = active
+            .as_ref()
+            .filter(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
+            .and_then(|failure| failure.reset.as_deref())
+            .map(|reset| format!("Account limit reached · resets {reset}"));
+        let failure_label = active.as_ref().and_then(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
             chat::failure::FailureKind::Authentication => Some("Sign-in required"),
             chat::failure::FailureKind::Capacity => Some("Provider at capacity"),
@@ -1484,8 +1490,8 @@ impl Runtime {
             chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
         });
         let mut parts = Vec::new();
-        if let Some(label) = failure_label {
-            parts.push(label.to_owned());
+        if let Some(label) = limit_reset.as_deref().or(failure_label) {
+            parts.push(Self::short_description(label, 72));
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
@@ -1620,6 +1626,15 @@ impl Runtime {
 
     /// The errors this conversation reports as its state: its own and its
     /// provider's, leaving out notices of things the agent carried on past.
+    /// Whether a provider usage limit stops this conversation: its latest
+    /// reported failure is one, and no turn has started since.
+    pub(super) fn usage_limited(&self) -> bool {
+        self.reported_errors().any(|message| {
+            chat::failure::Failure::parse(self.session.launch.provider, message)
+                .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
+        })
+    }
+
     pub(super) fn reported_errors(&self) -> impl Iterator<Item = &str> {
         self.error
             .as_deref()

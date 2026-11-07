@@ -482,7 +482,8 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::AgentWorking),
-            "Account limit reached · 1 subagent working".into(),
+            "Account limit reached · resets 1:30pm (America/Los_Angeles) · 1 subagent working"
+                .into(),
         )
     );
     snapshot.subagents[0].waiting = true;
@@ -490,14 +491,18 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
         publish(&mut snapshot),
         (
             Some(Icon::Warning),
-            "Account limit reached · 1 subagent waiting".into(),
+            "Account limit reached · resets 1:30pm (America/Los_Angeles) · 1 subagent waiting"
+                .into(),
         )
     );
     snapshot.subagents[0].status = ToolStatus::Succeeded;
     snapshot.subagents[0].waiting = false;
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::Warning), "Account limit reached".into())
+        (
+            Some(Icon::Warning),
+            "Account limit reached · resets 1:30pm (America/Los_Angeles)".into()
+        )
     );
     snapshot.error = None;
     for status in [
@@ -568,7 +573,10 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         "The image insertion point changed while loading. Attach the image again at the new caret.";
     let local_capacity = "overloaded_error: provider temporarily at capacity";
     for (provider_error, label) in [
-        (quota("1:30pm", "snapshot-quota"), "Account limit reached"),
+        (
+            quota("1:30pm", "snapshot-quota"),
+            "Account limit reached · resets 1:30pm (America/Los_Angeles)",
+        ),
         (
             "authentication_error: invalid credentials".into(),
             "Sign-in required",

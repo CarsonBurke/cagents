@@ -148,6 +148,11 @@ while IFS= read -r frame; do
       case "$frame" in
         # Ends the provider mid-turn, as a usage limit does.
         *EXIT_NOW*) exit 3 ;;
+        # Refuses the turn as Claude does when the account is out of usage.
+        *USAGE_LIMIT*)
+          printf '{"type":"result","uuid":"result-%s","subtype":"success","is_error":true,"result":"You'"'"'ve hit your weekly limit · resets Nov 8, 8am (America/Vancouver)","session_id":"%s","usage":{"input_tokens":0,"output_tokens":0}}\n' "$n" "$session"
+          continue
+          ;;
       esac
       case "$frame" in
         *HOLD_CLEANUP_BUSY*)
@@ -4413,6 +4418,107 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
             .count(),
         2,
         "one original prompt and one courier prompt, including after another scan"
+    );
+    drop(courier);
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+#[test]
+fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
+    use crate::agent_execution::mailbox::{Outgoing, State as Delivery, To};
+    if isolated("a_usage_limited_session_lists_its_limit_and_holds_its_messages").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    request.prompt = "USAGE_LIMIT".into();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    settled(&host, accepted.run.id);
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let Reply::Sessions(listing) = process(
+        &host,
+        Authority::default(),
+        Operation::Sessions(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("sessions reply");
+    };
+    let member = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session)
+        .expect("the limited session is listed");
+    let limit = member.limit.as_ref().expect("its limit is reported");
+    assert_eq!(limit.summary, "Claude weekly limit reached");
+    assert_eq!(
+        limit.reset.as_deref(),
+        Some("Nov 8, 8am (America/Vancouver)")
+    );
+    // The fixture has no usage reading to date the reset by.
+    assert_eq!(limit.resets_at, None);
+    assert_eq!(member.state_label(), "limited");
+    // The read older CLIs make keeps its layout and reports no limit.
+    let Reply::Directory(directory) = process(
+        &host,
+        Authority::default(),
+        Operation::Directory(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("directory reply");
+    };
+    assert!(directory.sessions.iter().any(|entry| entry.id == session));
+
+    let Reply::Delivered(delivery) = process(
+        &host,
+        Authority::default(),
+        Operation::Send(Outgoing {
+            to: To::Session(session.to_string()),
+            body: "Can you look at this?".into(),
+            wait_ms: Some(60_000),
+        }),
+    )
+    .unwrap() else {
+        panic!("delivery reply");
+    };
+    let recipient = delivery
+        .recipient
+        .as_ref()
+        .expect("the recipient is reported");
+    assert_eq!(recipient.session.id, session);
+    assert_eq!(recipient.limit.as_ref(), Some(limit));
+    assert_eq!(
+        delivery.sent.message.wait_until_ms, None,
+        "no reply can come before the limit resets, so none is held for the asker"
+    );
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    let stored = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.state,
+        Delivery::Pending,
+        "the limit holds the message"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the limited provider received no courier prompt"
     );
     drop(courier);
     close(&host, &Authority::default(), accepted.agent.id).unwrap();

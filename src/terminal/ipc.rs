@@ -211,7 +211,11 @@ use crate::{
 /// parallel branches and are not adopted.
 /// Version 156 appends the exact skipped-occurrence count and range to Firing.
 /// An older client is refused the replies holding one.
-pub const PROTOCOL_VERSION: u16 = 156;
+/// Version 160 appends the `Sessions` and `Send` agent operations and their
+/// replies, which report each session's usage limit and account, and extends
+/// the gated `Member` with them. 157 to 159 are reserved for parallel
+/// branches and are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 160;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

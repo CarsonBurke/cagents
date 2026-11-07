@@ -1,7 +1,9 @@
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    mailbox::{Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short},
+    mailbox::{
+        Delivery, Inbox, MAX_MESSAGE_BYTES, Message, Outgoing, Reach, Sent, State, To, short,
+    },
 };
 #[cfg(feature = "ui")]
 use crate::chat::coordination::{Receipt, Received};
@@ -103,15 +105,15 @@ fn recipient(to: String) -> To {
 
 pub(super) fn send(arguments: SendArgs) -> Result<CommandOutput, AppError> {
     let mut client = Mailbox::connect()?;
-    let sent = client.send(Outgoing {
+    let delivery = client.send(Outgoing {
         to: recipient(arguments.to),
         body: arguments.message.read()?,
         wait_ms: None,
     })?;
     Ok(CommandOutput {
         command: "send",
-        human: sent_line(&sent),
-        data: json!({ "message": sent.message, "reach": sent.reach }),
+        human: delivery_lines(&delivery),
+        data: delivery_json(&delivery),
     })
 }
 
@@ -133,11 +135,11 @@ pub(super) fn reply(arguments: ReplyArgs) -> Result<CommandOutput, AppError> {
     if arguments.wait {
         return converse("reply", outgoing, arguments.timeout);
     }
-    let sent = Mailbox::connect()?.send(outgoing)?;
+    let delivery = Mailbox::connect()?.send(outgoing)?;
     Ok(CommandOutput {
         command: "reply",
-        human: sent_line(&sent),
-        data: json!({ "message": sent.message, "reach": sent.reach }),
+        human: delivery_lines(&delivery),
+        data: delivery_json(&delivery),
     })
 }
 
@@ -178,16 +180,19 @@ fn converse(
 ) -> Result<CommandOutput, AppError> {
     let mut client = Mailbox::connect()?;
     outgoing.wait_ms = Some((timeout * 1000.0).ceil() as u64);
-    let sent = client.send(outgoing)?;
+    let delivery = client.send(outgoing)?;
+    let sent = &delivery.sent;
+    let mut data = delivery_json(&delivery);
     // The daemon holds no reply for an asker no one can answer yet.
     if sent.message.wait_until_ms.is_none() {
+        data["replies"] = json!([]);
         return Ok(CommandOutput {
             command,
             human: format!(
                 "{}\nNot waiting, since no one can answer before then; a later reply arrives as a message.",
-                sent_line(&sent)
+                delivery_lines(&delivery)
             ),
-            data: json!({ "message": sent.message, "reach": sent.reach, "replies": [] }),
+            data,
         });
     }
     let query = Inbox {
@@ -195,23 +200,75 @@ fn converse(
         replies_to: Some(sent.message.id),
     };
     match client.wait(query, timeout)? {
-        Some(replies) => Ok(CommandOutput {
-            command,
-            human: replies
-                .iter()
-                .map(message_lines)
-                .collect::<Vec<_>>()
-                .join("\n\n"),
-            data: json!({ "message": sent.message, "reach": sent.reach, "replies": replies }),
-        }),
+        Some(replies) => {
+            data["replies"] = json!(replies);
+            Ok(CommandOutput {
+                command,
+                human: replies
+                    .iter()
+                    .map(message_lines)
+                    .collect::<Vec<_>>()
+                    .join("\n\n"),
+                data,
+            })
+        }
         None => Err(AppError::new(
             "timeout",
             format!(
                 "{}\nNo reply within {timeout} s. A later reply arrives as a message; read it with `cagents inbox`.",
-                sent_line(&sent)
+                delivery_lines(&delivery)
             ),
         )),
     }
+}
+
+/// A delivery as `--json` reports it: the message, how it reaches its
+/// recipient, the recipient's session as `sessions --json` lists it, and
+/// what keeps the recipient from acting on it, in words.
+fn delivery_json(delivery: &Delivery) -> Value {
+    json!({
+        "message": delivery.sent.message,
+        "reach": delivery.sent.reach,
+        "recipient": delivery.recipient.as_ref().map(super::sessions::session_json),
+        "notice": recipient_notice(delivery),
+    })
+}
+
+/// The sent line, then what keeps the recipient from acting on the message.
+fn delivery_lines(delivery: &Delivery) -> String {
+    let line = sent_line(&delivery.sent);
+    match recipient_notice(delivery) {
+        Some(notice) => format!("{line}\n{notice}"),
+        None => line,
+    }
+}
+
+/// Why the recipient cannot act on a message now, when it cannot: its usage
+/// limit holds the message. An account the latest
+/// reading shows out of allowance is a warning, since that reading can be
+/// out of date.
+fn recipient_notice(delivery: &Delivery) -> Option<String> {
+    let member = delivery.recipient.as_ref()?;
+    let now = super::sessions::now_ms();
+    let id = member.session.id;
+    if let Some(limit) = &member.limit {
+        let held = if limit.resets_at.is_some() {
+            "The message waits until then"
+        } else {
+            "The message waits until the limit resets or that conversation continues"
+        };
+        return Some(format!(
+            "{id} is stopped by a usage limit ({}). {held}, and no reply can come before.",
+            super::sessions::limit_phrase(limit, now)
+        ));
+    }
+    let account = member.account.as_ref()?;
+    (account.status == Some(crate::account::UsageStatus::Limited)).then(|| {
+        format!(
+            "{id}'s account is out of allowance as last read ({}); it may not be able to act on the message until it resets.",
+            super::sessions::account_phrase(account, now)
+        )
+    })
 }
 
 /// When a sent message reaches its recipient, as a sent line tells it.
@@ -381,16 +438,16 @@ impl Mailbox {
         })
     }
 
-    fn send(&mut self, outgoing: Outgoing) -> Result<Sent, AppError> {
+    fn send(&mut self, outgoing: Outgoing) -> Result<Delivery, AppError> {
         outgoing
             .validate()
             .map_err(|e| AppError::new("message", e))?;
         match self
             .client
-            .agent(self.authority.clone(), Operation::SendMessage(outgoing))
+            .agent(self.authority.clone(), Operation::Send(outgoing))
             .map_err(protocol_error)?
         {
-            Reply::Sent(sent) => Ok(sent),
+            Reply::Delivered(delivery) => Ok(delivery),
             _ => Err(AppError::new("message", "Unexpected send response")),
         }
     }
@@ -581,6 +638,96 @@ mod tests {
             })
             .ends_with("to the user; the user reads it with `cagents inbox`")
         );
+    }
+
+    #[test]
+    fn a_limited_recipient_is_named_beside_the_sent_line() {
+        use crate::agent_execution::directory::{
+            Entry, Member, Relation, SessionAccount, Surface, UsageLimit,
+        };
+        let id = TerminalId::new();
+        let message = Message {
+            id: crate::model::MessageId::new(),
+            from: crate::agent_execution::mailbox::Party::user(),
+            to: crate::agent_execution::mailbox::Party {
+                lineage: Some(crate::agent_execution::Lineage(id)),
+                session: Some(id),
+                title: None,
+            },
+            reply_to: None,
+            body: "hi".into(),
+            wait_until_ms: None,
+            state: crate::agent_execution::mailbox::State::Pending,
+            created_ms: 0,
+        };
+        let session = Entry {
+            id,
+            surface: Surface::Chat,
+            provider: Some(crate::agent::Provider::Claude),
+            title: None,
+            channel: None,
+            view_scope: None,
+            channel_repository: None,
+            state: crate::agent::ActivityState::Idle,
+            directory: None,
+            worktree: None,
+            project: None,
+            project_name: None,
+            delegation: None,
+            relation: Relation::Peer,
+            lineage: crate::agent_execution::Lineage(id),
+        };
+        let mut delivery = Delivery {
+            sent: Sent {
+                message,
+                reach: Reach::Conversation,
+            },
+            recipient: Some(Member {
+                session,
+                exited: false,
+                failure: Some("Claude weekly limit reached · resets 3pm".into()),
+                active_at: None,
+                limit: Some(UsageLimit {
+                    summary: "Claude weekly limit reached".into(),
+                    reset: Some("3pm".into()),
+                    resets_at: None,
+                }),
+                account: None,
+            }),
+        };
+        let lines = delivery_lines(&delivery);
+        let (first, notice) = lines.split_once('\n').unwrap();
+        assert_eq!(first, sent_line(&delivery.sent));
+        assert_eq!(
+            notice,
+            format!(
+                "{id} is stopped by a usage limit (Claude weekly limit reached, resets 3pm). The message waits until the limit resets or that conversation continues, and no reply can come before."
+            )
+        );
+        let value = delivery_json(&delivery);
+        assert_eq!(value["recipient"]["state"], "Limited");
+        assert_eq!(value["notice"], notice);
+        assert_eq!(value["message"]["id"], json!(delivery.sent.message.id));
+
+        // A reading that shows the account spent only warns, since it can be
+        // out of date.
+        let recipient = delivery.recipient.as_mut().unwrap();
+        recipient.limit = None;
+        recipient.account = Some(SessionAccount {
+            id: "claude/system".parse().unwrap(),
+            label: None,
+            status: Some(crate::account::UsageStatus::Limited),
+            remaining: Vec::new(),
+            stale: true,
+        });
+        let notice = recipient_notice(&delivery).unwrap();
+        assert!(
+            notice.starts_with(&format!("{id}'s account is out of allowance as last read")),
+            "{notice}"
+        );
+        delivery.recipient.as_mut().unwrap().account = None;
+        assert_eq!(delivery_lines(&delivery), sent_line(&delivery.sent));
+        assert!(delivery_json(&delivery)["notice"].is_null());
     }
 
     #[cfg(feature = "ui")]

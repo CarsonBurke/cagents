@@ -1225,6 +1225,9 @@ pub(super) fn process_request(
         crate::agent_execution::Operation::SendMessage(outgoing) => {
             mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
         }
+        crate::agent_execution::Operation::Send(outgoing) => {
+            mailbox::post(host, &authority, outgoing).map(crate::agent_execution::Reply::Delivered)
+        }
         other => process(host, authority, other).map_err(Into::into),
     }
 }
@@ -1299,6 +1302,12 @@ pub(super) fn process(
         Operation::Members(channel) => {
             directory::channel(host, &authority, channel).map(Reply::Members)
         }
+        Operation::Sessions(scope) => {
+            directory::sessions(host, &authority, scope).map(Reply::Sessions)
+        }
+        Operation::Send(outgoing) => mailbox::post(host, &authority, outgoing)
+            .map(Reply::Delivered)
+            .map_err(|error| error.to_string()),
     }
 }
 
