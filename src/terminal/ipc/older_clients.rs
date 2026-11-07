@@ -66,7 +66,7 @@ pub fn older_client(protocol: u16) -> Option<OlderClient> {
 impl OlderClient {
     /// A client that knows only the first `server_messages` messages and
     /// `server_responses` replies.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "host"))]
     pub(crate) fn knowing(protocol: u16, server_messages: u32, server_responses: u32) -> Self {
         Self {
             protocol,
