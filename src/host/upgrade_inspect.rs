@@ -186,8 +186,11 @@ fn inspect(request: Request) -> Result<(), String> {
             Err(_) => failures.push(format!("Saved window {} has an unreadable or unsupported pane store; its contents were preserved.", window + 1)),
         }
     }
+    let evidence = ExecutionEvidence::load(&current_boot);
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
-        CardKind::Chat(session) => session.is_unstarted(),
+        CardKind::Chat(session) => {
+            session.is_unstarted() || evidence.classify(session) == SavedExecution::Ended
+        }
         CardKind::Terminal(session) => !terminal_requires_migration(session, &current_boot),
         _ => true,
     });
@@ -216,6 +219,10 @@ fn inspect(request: Request) -> Result<(), String> {
                 && !resolutions.iter().any(|(issued, _)| issued == source)
             {
                 let missing = !initial_inventory.iter().any(|live| live.id == source.id);
+                // Nothing of its old owner remains to adopt or preserve.
+                if missing && evidence.classify(source) == SavedExecution::Ended {
+                    continue;
+                }
                 let result = if missing && request.reconcile_retained {
                     reader
                         .reconcile_retained(source)
@@ -303,24 +310,26 @@ fn inspect(request: Request) -> Result<(), String> {
                 if cold_history.iter().any(|issued| issued == &source) {
                     continue;
                 }
-                if qualify_with_mode(
-                    &source,
-                    &inventory,
-                    proof,
-                    request.require_resumable,
-                    |source| {
-                        resolutions
-                            .iter()
-                            .find(|(issued, _)| issued == source)
-                            .map(|(_, result)| result.clone())
-                            .unwrap_or_else(|| Err("No authenticated source resolution".into()))
-                    },
-                )
-                .is_err()
+                if let Some(problem) =
+                    saved_chat_problem(card, &source, &inventory, &evidence, || {
+                        qualify_with_mode(
+                            &source,
+                            &inventory,
+                            proof,
+                            request.require_resumable,
+                            |source| {
+                                resolutions
+                                    .iter()
+                                    .find(|(issued, _)| issued == source)
+                                    .map(|(_, result)| result.clone())
+                                    .unwrap_or_else(|| {
+                                        Err("No authenticated source resolution".into())
+                                    })
+                            },
+                        )
+                    })
                 {
-                    failures.push(format!(
-                        "Saved conversation pane {card} needs exact conversation recovery."
-                    ));
+                    failures.push(problem);
                 }
             }
             _ => {}
@@ -343,6 +352,414 @@ fn terminal_requires_migration(
             .continuity
             .live_proof()
             .is_some_and(|proof| proof.is_complete() && &proof.boot_id != current_boot),
+    }
+}
+
+/// What read-only evidence proves about the old owner of a saved chat pane
+/// the source service does not list.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SavedExecution {
+    /// No process of any owner it ever had can remain. Replacing the source
+    /// service cannot lose or strand work it no longer has; the destination
+    /// decides separately, through its own resume proof, whether to reopen it.
+    Ended,
+    /// A registered helper, its provider, or a process in their group or
+    /// session still exists outside the source inventory.
+    Running,
+    /// The pane has execution this evidence does not cover, or the evidence
+    /// is absent, foreign or unreadable.
+    Unproved,
+}
+
+/// The source daemon's own ownership evidence, read without its lease and
+/// without changing it. Retirement receipts stay lease-gated in the
+/// destination's resume path: this proves only an absence of execution.
+struct ExecutionEvidence {
+    boot: crate::model::BootId,
+    native_holders: Result<std::path::PathBuf, String>,
+    census: Result<Census, String>,
+    /// The census owners whose retirement is recorded, with what it confirmed.
+    retired: Result<Vec<crate::daemon::holder_registry::Record>, String>,
+    /// Where process and socket tables are read; `/proc` outside tests.
+    processes: std::path::PathBuf,
+}
+
+/// Every retained helper the durable census registered, by pane.
+type Census = Vec<(
+    crate::model::TerminalId,
+    crate::daemon::holder_registry::Record,
+)>;
+
+/// The census is a bounded roster, not a log; a larger one is not inspected.
+const MAX_CENSUS_ROWS: usize = 16 * 1024;
+
+impl ExecutionEvidence {
+    fn load(boot: &crate::model::BootId) -> Self {
+        let store = crate::instance::project_dirs()
+            .ok_or_else(|| "The data directory is unavailable".to_owned())
+            .map(|dirs| dirs.data_dir().join("workspace-model.sqlite3"));
+        Self {
+            boot: boot.clone(),
+            native_holders: crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native,
+            ),
+            census: store.clone().and_then(|path| read_census(&path)),
+            retired: store.and_then(|path| read_retired_owners(&path)),
+            processes: "/proc".into(),
+        }
+    }
+
+    /// A kernel boot change ends every process of the saved boot. Within this
+    /// boot a Codex pane is judged by its own listener (`classify_codex`).
+    /// Among Claude panes only a retained actor has an owner roster: each helper
+    /// registers in the durable census once it answers, and its discovery
+    /// record is published shortly before that. Every owner either names must
+    /// be gone with its provider and nothing left in their process group or
+    /// session: the process proof the destination requires before it resumes
+    /// an abandoned actor, which a verified retirement also satisfies. A
+    /// restart still before its record is invisible here; `inspect` looks
+    /// twice, before resolution and against the final roster, to narrow it.
+    fn classify(&self, source: &Session) -> SavedExecution {
+        use crate::daemon::holder_registry::{self, Kind};
+        let Some(proof) = source.proof.as_ref().filter(|proof| proof.is_complete()) else {
+            return SavedExecution::Unproved;
+        };
+        if proof.boot_id != self.boot {
+            return SavedExecution::Ended;
+        }
+        if source.launch.provider == crate::agent::Provider::Codex {
+            return self.classify_codex(source);
+        }
+        // A paired console runs outside the actor; this roster cannot see it.
+        if !matches!(
+            source.native_continuity,
+            crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
+        ) || !source.has_valid_native_continuity()
+            || source.terminal.is_some()
+        {
+            return SavedExecution::Unproved;
+        }
+        let (Ok(census), Ok(native_holders)) = (&self.census, &self.native_holders) else {
+            return SavedExecution::Unproved;
+        };
+        let mut owners = census
+            .iter()
+            .filter(|(pane, _)| *pane == source.id)
+            .map(|(_, owner)| owner)
+            .collect::<Vec<_>>();
+        // No registered owner is no evidence that one ended.
+        if owners.is_empty() {
+            return SavedExecution::Unproved;
+        }
+        let discovered = match holder_registry::recovery_candidate(
+            &holder_registry::socket(native_holders, source.id),
+            Kind::Native,
+        ) {
+            Ok(discovered) => discovered,
+            Err(_) => return SavedExecution::Unproved,
+        };
+        owners.extend(&discovered);
+        // A pane that never learned its conversation resumes only the one a
+        // recorded retirement says its actor confirmed; without that record
+        // its ended actor leaves it nothing to reopen.
+        let unnamed = source.has_unnamed_retained_claude_actor();
+        let mut execution = SavedExecution::Ended;
+        for owner in owners.into_iter().filter(|owner| owner.boot == self.boot) {
+            match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
+                Ok(true) => {}
+                Ok(false) => execution = SavedExecution::Running,
+                Err(_) => return SavedExecution::Unproved,
+            }
+            if unnamed
+                && !self
+                    .retired
+                    .as_ref()
+                    .is_ok_and(|retired| retired.contains(owner))
+            {
+                return SavedExecution::Unproved;
+            }
+        }
+        execution
+    }
+
+    /// A Codex pane of this boot is served by one `codex app-server` that
+    /// listens on the pane's own daemon-allocated socket, run either by the
+    /// daemon itself or by a native holder. That socket path names the pane,
+    /// and the server is the only writer of its conversation. It has ended
+    /// when its holder, if one registered, is gone with everything in its
+    /// process group and session, no process of this user still names the
+    /// pane's listener, and no socket is bound at that path or at the socket
+    /// Codex publishes it as a symlink to. Tool work that
+    /// left a dead server's process group writes no conversation. A paired
+    /// console runs outside the server, so a paired pane stays unproved.
+    fn classify_codex(&self, source: &Session) -> SavedExecution {
+        use crate::daemon::holder_registry::{self, Kind};
+        let Some(listener) = source.owned_codex_listener.as_ref().filter(|_| {
+            source.owns_codex_listener()
+                && source.has_valid_native_continuity()
+                && source.terminal.is_none()
+        }) else {
+            return SavedExecution::Unproved;
+        };
+        let Ok(native_holders) = &self.native_holders else {
+            return SavedExecution::Unproved;
+        };
+        let control = holder_registry::socket(native_holders, source.id);
+        // Discovery refuses a record of another boot.
+        let holder = match holder_registry::recovery_candidate(&control, Kind::Native) {
+            Ok(holder) => holder,
+            Err(_) => return SavedExecution::Unproved,
+        };
+        if let Some(holder) = holder {
+            match crate::chat::runtime::retained_actor_abandoned(&holder.holder, &holder.root) {
+                Ok(true) => {}
+                Ok(false) => return SavedExecution::Running,
+                Err(_) => return SavedExecution::Unproved,
+            }
+        }
+        // Recent Codex releases bind a socket in their own runtime directory
+        // and publish the listener path as a symlink to it.
+        let published = match std::fs::read_link(&listener.socket) {
+            Ok(target) => Some(listener.socket.with_file_name(target)),
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::EINVAL) =>
+            {
+                None
+            }
+            Err(_) => return SavedExecution::Unproved,
+        };
+        // A holder binds its control socket before it starts the server and
+        // publishes its record, so a starting holder is seen by that socket.
+        let mut sockets = vec![listener.socket.as_path(), control.as_path()];
+        sockets.extend(published.as_deref());
+        match codex_listener_survives(&self.processes, source.id, &sockets) {
+            Ok(true) => SavedExecution::Running,
+            Ok(false) => SavedExecution::Ended,
+            Err(_) => SavedExecution::Unproved,
+        }
+    }
+}
+
+/// Whether any process of this user names a Codex pane's listener directory
+/// in its arguments, or a socket is still bound at one of `sockets`. A
+/// process between `execve` and publishing its new arguments briefly shows
+/// none; it is read again for a bounded moment. One that still shows none is
+/// evidence of absence only when its last thread is a zombie or exiting (a
+/// PID-namespace init waiting in `do_exit`, or one blocked closing files after
+/// releasing its memory), which can no longer write anything. A zombie group
+/// leader whose other threads still run shows no arguments either.
+fn codex_listener_survives(
+    processes: &Path,
+    pane: crate::model::TerminalId,
+    sockets: &[&Path],
+) -> Result<bool, String> {
+    codex_listener_survives_with(processes, pane, sockets, EXEC_SETTLE)
+}
+
+/// How long one process may take to publish its arguments after `execve`.
+const EXEC_SETTLE: Duration = Duration::from_millis(100);
+
+fn codex_listener_survives_with(
+    processes: &Path,
+    pane: crate::model::TerminalId,
+    sockets: &[&Path],
+    settle: Duration,
+) -> Result<bool, String> {
+    use std::os::unix::ffi::OsStrExt;
+    let marker = format!("cagents-codex-{pane}");
+    let marker = marker.as_bytes();
+    let uid = crate::daemon::current_uid().to_string();
+    let unavailable = |error: &std::io::Error| {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    };
+    // The arguments a process shows, or None once it has exited.
+    let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
+        let deadline = Instant::now() + settle;
+        loop {
+            let argv = match std::fs::read(path.join("cmdline")) {
+                Ok(argv) => argv,
+                Err(error) if unavailable(&error) => return Ok(None),
+                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+            };
+            if !argv.is_empty() {
+                return Ok(Some(argv));
+            }
+            let stat = match std::fs::read(path.join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if unavailable(&error) => return Ok(None),
+                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+            };
+            // Fields after the command name begin at state (3): flags is
+            // field 9 and the thread count field 20.
+            let stat = String::from_utf8_lossy(&stat);
+            let fields = stat
+                .rsplit_once(')')
+                .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+                .unwrap_or_default();
+            let exiting = fields
+                .get(6)
+                .and_then(|flags| flags.parse::<u64>().ok())
+                .is_some_and(|flags| flags & 0x4 != 0);
+            let ended = matches!(fields.first(), Some(&"Z" | &"X")) || exiting;
+            if ended && fields.get(17) == Some(&"1") {
+                return Ok(None);
+            }
+            if Instant::now() >= deadline {
+                return Err("A process has not published its arguments yet".into());
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    };
+    let entries = std::fs::read_dir(processes)
+        .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+        if entry
+            .file_name()
+            .to_str()
+            .is_none_or(|name| name.parse::<u32>().is_err())
+        {
+            continue;
+        }
+        let path = entry.path();
+        // The effective user, not the owner of `/proc/<pid>`, which becomes
+        // root for a process that made itself non-dumpable.
+        let status = match std::fs::read_to_string(path.join("status")) {
+            Ok(status) => status,
+            Err(error) if unavailable(&error) => continue,
+            Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+        };
+        let effective = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Uid:"))
+            .and_then(|ids| ids.split_whitespace().nth(1));
+        match effective {
+            Some(effective) if effective != uid => continue,
+            Some(_) => {}
+            None => return Err("Cannot read a process's user".into()),
+        }
+        if arguments(&path)?
+            .is_some_and(|argv| argv.windows(marker.len()).any(|window| window == marker))
+        {
+            return Ok(true);
+        }
+    }
+    let bound = std::fs::read(processes.join("net/unix"))
+        .map_err(|error| format!("Cannot inspect bound sockets: {error}"))?;
+    // The path is the last field, after the fixed-width columns.
+    Ok(bound.split(|byte| *byte == b'\n').skip(1).any(|line| {
+        sockets.iter().any(|socket| {
+            let socket = socket.as_os_str().as_bytes();
+            line.len() > socket.len()
+                && line.ends_with(socket)
+                && line[line.len() - socket.len() - 1] == b' '
+        })
+    }))
+}
+
+/// The census owners whose retirement the store records, read like the census.
+fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
+    use rusqlite::{Connection, OpenFlags, config::DbConfig};
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|error| error.to_string())?;
+    db.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut statement = db
+        .prepare(
+            "SELECT o.ownership FROM native_actor_ownerships o \
+             JOIN native_actor_retirements r ON r.actor = o.actor ORDER BY o.actor LIMIT ?1",
+        )
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([MAX_CENSUS_ROWS as i64 + 1], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut retired = Vec::new();
+    for (index, row) in rows.enumerate() {
+        if index >= MAX_CENSUS_ROWS {
+            return Err("The retained actor census exceeds its inspection bound".into());
+        }
+        let ownership: crate::host::model::NativeActorOwnership =
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        retired.push(ownership.owner().clone());
+    }
+    Ok(retired)
+}
+
+/// One read transaction over the census, opened read-only: no schema
+/// admission, migration, checkpoint or lock beyond SQLite's shared read.
+fn read_census(path: &Path) -> Result<Census, String> {
+    use rusqlite::{Connection, OpenFlags, config::DbConfig};
+    let db = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_NOFOLLOW,
+    )
+    .map_err(|error| error.to_string())?;
+    db.set_db_config(DbConfig::SQLITE_DBCONFIG_NO_CKPT_ON_CLOSE, true)
+        .map_err(|error| error.to_string())?;
+    db.busy_timeout(Duration::from_secs(2))
+        .map_err(|error| error.to_string())?;
+    let mut statement = db
+        .prepare("SELECT ownership FROM native_actor_ownerships ORDER BY actor LIMIT ?1")
+        .map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([MAX_CENSUS_ROWS as i64 + 1], |row| row.get::<_, String>(0))
+        .map_err(|error| error.to_string())?;
+    let mut census = Vec::new();
+    for (index, row) in rows.enumerate() {
+        if index >= MAX_CENSUS_ROWS {
+            return Err("The retained actor census exceeds its inspection bound".into());
+        }
+        let ownership: crate::host::model::NativeActorOwnership =
+            serde_json::from_str(&row.map_err(|error| error.to_string())?)
+                .map_err(|error| error.to_string())?;
+        let owner = ownership.owner().clone();
+        if ownership.source().id != owner.terminal {
+            census.push((ownership.source().id, owner.clone()));
+        }
+        census.push((owner.terminal, owner));
+    }
+    Ok(census)
+}
+
+/// Classify again against the final roster: a pane adopted since the first
+/// look is held and qualifies like any live chat, and an owner that started
+/// since then is no longer Ended. Only a pane the source does not list and
+/// whose execution has ended is exempt from exact qualification.
+fn saved_chat_problem(
+    card: crate::model::CardId,
+    source: &Session,
+    inventory: &[Session],
+    evidence: &ExecutionEvidence,
+    qualify: impl FnOnce() -> Result<(), String>,
+) -> Option<String> {
+    let execution =
+        (!inventory.iter().any(|live| live.id == source.id)).then(|| evidence.classify(source));
+    if execution == Some(SavedExecution::Ended) {
+        return None;
+    }
+    qualify()
+        .err()
+        .map(|_| unqualified_chat_pane(card, execution))
+}
+
+fn unqualified_chat_pane(card: crate::model::CardId, execution: Option<SavedExecution>) -> String {
+    if execution == Some(SavedExecution::Running) {
+        format!(
+            "Saved conversation pane {card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
+        )
+    } else {
+        format!("Saved conversation pane {card} needs exact conversation recovery.")
     }
 }
 
@@ -558,6 +975,578 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: NativeContinuity::ReconnectOnly,
         }
+    }
+
+    fn retained_card(boot: BootId) -> Session {
+        let mut card = session();
+        card.native_continuity = NativeContinuity::RetainedClaudeActor { protocol: 2 };
+        card.proof.as_mut().unwrap().boot_id = boot;
+        card
+    }
+
+    fn current_boot() -> BootId {
+        crate::daemon::read_boot_id().unwrap()
+    }
+
+    fn running_process() -> crate::daemon::holder_registry::Process {
+        crate::daemon::holder_registry::Process::read(std::process::id() as i32).unwrap()
+    }
+
+    /// The exact identity of a reaped child that led no process group or
+    /// session: an incarnation that no longer exists and left nothing behind.
+    fn ended_process() -> crate::daemon::holder_registry::Process {
+        let mut child = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .unwrap();
+        let identity = crate::daemon::holder_registry::Process::read(child.id() as i32).unwrap();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        identity
+    }
+
+    /// The helper identity a retained actor registers and publishes.
+    fn owner(
+        card: &Session,
+        holder: crate::daemon::holder_registry::Process,
+        root: crate::daemon::holder_registry::Process,
+    ) -> crate::daemon::holder_registry::Record {
+        use crate::daemon::holder_registry::{BuildIdentity, Kind, Record};
+        Record {
+            version: 4,
+            build: Some(BuildIdentity::current(Kind::Native)),
+            kind: Kind::Native,
+            application: crate::instance::APPLICATION_ID.into(),
+            boot: current_boot(),
+            terminal: card.id,
+            holder,
+            root,
+        }
+    }
+
+    fn evidence(
+        holders: &Path,
+        census: Vec<(TerminalId, crate::daemon::holder_registry::Record)>,
+    ) -> ExecutionEvidence {
+        ExecutionEvidence {
+            boot: current_boot(),
+            native_holders: Ok(holders.to_owned()),
+            census: Ok(census),
+            retired: Ok(Vec::new()),
+            processes: "/proc".into(),
+        }
+    }
+
+    /// A Codex pane served on its own daemon-allocated listener under `root`.
+    fn codex_card(root: &Path, continuity: NativeContinuity) -> Session {
+        let mut card = session();
+        card.launch.provider = Provider::Codex;
+        card.launch.recipe.program = "codex".into();
+        card.native_continuity = continuity;
+        card.proof.as_mut().unwrap().boot_id = current_boot();
+        let socket = root
+            .join(format!("cagents-codex-{}", card.id))
+            .join("control.sock");
+        card.launch.recipe.arguments =
+            vec!["--remote".into(), format!("unix://{}", socket.display())];
+        card.owned_codex_listener = Some(crate::chat::OwnedCodexListener {
+            socket,
+            allocator: card.proof.clone().unwrap(),
+        });
+        assert!(card.owns_codex_listener() && card.has_valid_native_continuity());
+        card
+    }
+
+    fn codex_cards(root: &Path) -> [Session; 2] {
+        [
+            codex_card(root, NativeContinuity::ReconnectOnly),
+            codex_card(
+                root,
+                NativeContinuity::Durable {
+                    provider_version: "0.157.1".into(),
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn verified_retired_pane_read_from_the_real_census_has_nothing_to_preserve() {
+        use crate::account::scope::LaunchAccountScope;
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut issued = retained_card(current_boot());
+        issued.launch.session_id = None;
+        issued.launch.recipe.working_directory = root.path().into();
+        let mut card = issued.clone();
+        card.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        let retired = owner(&card, ended_process(), ended_process());
+        let metadata = std::fs::metadata(root.path()).unwrap();
+        let scope = LaunchAccountScope {
+            provider: Provider::Claude,
+            canonical_home: root.path().canonicalize().unwrap(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            registered_id: None,
+            purge_ids: vec![],
+        };
+        let path = root.path().join("registry.sqlite3");
+        let actor = uuid::Uuid::new_v4();
+        let mut registry = crate::host::model::Registry::at(&path).unwrap();
+        registry
+            .register_native_actor_ownership(actor, &retired, &issued, Ok(&scope))
+            .unwrap();
+        registry
+            .commit_native_actor_retirement(
+                actor,
+                &retired,
+                &card,
+                Ok(&scope),
+                card.launch.session_id.as_deref(),
+            )
+            .unwrap();
+        // The census is read while its writer still holds the store open.
+        let census = read_census(&path).unwrap();
+        assert_eq!(census, vec![(card.id, retired.clone())]);
+        // Verified retirement removed the discovery record.
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut evidence = evidence(holders.path(), census);
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        assert_eq!(
+            evidence.classify(&issued),
+            SavedExecution::Unproved,
+            "a pre-ID card reopens only what a recorded retirement confirmed"
+        );
+        evidence.retired = read_retired_owners(&path);
+        assert_eq!(evidence.retired, Ok(vec![retired.clone()]));
+        assert_eq!(
+            evidence.classify(&issued),
+            SavedExecution::Ended,
+            "a pre-ID card whose actor retired holds no live work either"
+        );
+        drop(registry);
+        assert!(read_census(&root.path().join("absent.sqlite3")).is_err());
+        assert!(
+            !root.path().join("absent.sqlite3").exists(),
+            "inspection never creates a store"
+        );
+    }
+
+    #[test]
+    fn previous_boot_pane_has_nothing_to_preserve_without_any_census() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut evidence = evidence(holders.path(), Vec::new());
+        evidence.census = Err("unreadable".into());
+        let mut card = retained_card(BootId::new("previous-boot"));
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        card.native_continuity = NativeContinuity::ReconnectOnly;
+        card.launch.provider = Provider::Codex;
+        assert_eq!(
+            evidence.classify(&card),
+            SavedExecution::Ended,
+            "a kernel boot change ends every provider"
+        );
+    }
+
+    #[test]
+    fn abandoned_actor_is_ended_only_when_no_owner_process_survives() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        let abandoned = owner(&card, ended_process(), ended_process());
+        // A stale discovery record of the same ended helper.
+        abandoned.create(holders.path()).unwrap();
+        let mut older_boot = abandoned.clone();
+        older_boot.boot = BootId::new("previous-boot");
+        older_boot.holder = running_process();
+        let census = vec![(card.id, abandoned.clone()), (card.id, older_boot)];
+        assert_eq!(
+            evidence(holders.path(), census).classify(&card),
+            SavedExecution::Ended
+        );
+        for (holder, root) in [
+            (running_process(), ended_process()),
+            (ended_process(), running_process()),
+        ] {
+            let card = retained_card(current_boot());
+            let census = vec![(card.id, owner(&card, holder, root))];
+            assert_eq!(
+                evidence(holders.path(), census).classify(&card),
+                SavedExecution::Running,
+                "a surviving helper or provider is live work"
+            );
+        }
+    }
+
+    #[test]
+    fn a_helper_not_yet_in_the_census_is_live_work() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        // An earlier actor ended; a restart published its record but has not
+        // answered the census registration yet.
+        owner(&card, running_process(), running_process())
+            .create(holders.path())
+            .unwrap();
+        let census = vec![(card.id, owner(&card, ended_process(), ended_process()))];
+        assert_eq!(
+            evidence(holders.path(), census).classify(&card),
+            SavedExecution::Running
+        );
+    }
+
+    #[test]
+    fn same_boot_execution_without_complete_evidence_is_unproved() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        let ended = vec![(card.id, owner(&card, ended_process(), ended_process()))];
+        assert_eq!(
+            evidence(holders.path(), Vec::new()).classify(&card),
+            SavedExecution::Unproved,
+            "no registered owner is no evidence that one ended"
+        );
+        let mut paired = card.clone();
+        paired.terminal = Some(
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                paired.id,
+                paired.launch.recipe.clone(),
+                None,
+            )
+            .session,
+        );
+        let mut unowned = card.clone();
+        unowned.proof = None;
+        let mut reconnect_only = card.clone();
+        reconnect_only.native_continuity = NativeContinuity::ReconnectOnly;
+        let mut codex = reconnect_only.clone();
+        codex.launch.provider = Provider::Codex;
+        for card in [paired, unowned, reconnect_only, codex] {
+            assert_eq!(
+                evidence(holders.path(), ended.clone()).classify(&card),
+                SavedExecution::Unproved
+            );
+        }
+        let mut unreadable = evidence(holders.path(), ended.clone());
+        unreadable.census = Err("unreadable".into());
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+        // Discovery evidence that cannot be authenticated is never absence.
+        std::fs::write(
+            crate::daemon::holder_registry::socket(holders.path(), card.id).with_extension("json"),
+            b"{\"not\":\"a record\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            evidence(holders.path(), ended).classify(&card),
+            SavedExecution::Unproved
+        );
+    }
+
+    #[test]
+    fn codex_pane_whose_server_is_gone_has_nothing_to_preserve() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        for card in codex_cards(root.path()) {
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Ended,
+                "{:?}",
+                card.native_continuity
+            );
+            // A stale record of a holder that ended with its server.
+            owner(&card, ended_process(), ended_process())
+                .create(holders.path())
+                .unwrap();
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Ended
+            );
+            // Discovery refuses a record of another boot; that proves nothing.
+            let mut older = owner(&card, running_process(), running_process());
+            older.boot = BootId::new("previous-boot");
+            let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+            older.create(holders.path()).unwrap();
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Unproved
+            );
+        }
+    }
+
+    /// A process between `execve` and publishing its new arguments shows
+    /// none for a moment. Any process of this user starting while the update
+    /// inspects must not turn an ended Codex pane into an unproved one.
+    #[test]
+    fn processes_starting_during_inspection_do_not_unprove_an_ended_codex_pane() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let _ = std::process::Command::new("true").status();
+                }
+            })
+        };
+        let unproved = (0..300)
+            .filter(|_| {
+                evidence(holders.path(), Vec::new()).classify(&card) != SavedExecution::Ended
+            })
+            .count();
+        stop.store(true, Ordering::Relaxed);
+        churn.join().unwrap();
+        assert_eq!(
+            unproved, 0,
+            "an exec in progress is read again, not absence"
+        );
+    }
+
+    #[test]
+    fn codex_pane_with_a_surviving_server_or_holder_is_live_work() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        for card in codex_cards(root.path()) {
+            let socket = card.owned_codex_listener.clone().unwrap().socket;
+            let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+            // A server still naming the pane's listener, as `codex app-server
+            // --listen unix://<socket>` does.
+            let mut server = std::process::Command::new("sh")
+                .args(["-c", "sleep 60; :", "server", "app-server", "--listen"])
+                .arg(format!("unix://{}", socket.display()))
+                .spawn()
+                .unwrap();
+            let published = std::path::PathBuf::from(format!("/proc/{}/cmdline", server.id()));
+            while !std::fs::read(&published)
+                .unwrap()
+                .windows(b"app-server".len())
+                .any(|window| window == b"app-server")
+            {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let named = evidence(holders.path(), Vec::new()).classify(&card);
+            server.kill().unwrap();
+            server.wait().unwrap();
+            assert_eq!(named, SavedExecution::Running);
+            // A server under another name still bound to the listener path.
+            std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+            let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Running
+            );
+            drop(bound);
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Ended,
+                "a socket file nobody listens on is no server"
+            );
+            std::fs::remove_file(&socket).unwrap();
+            // Recent Codex binds in its own runtime directory and publishes
+            // the listener path as a symlink to that socket.
+            let runtime = tempfile::tempdir_in("/var/tmp").unwrap();
+            let target = runtime.path().join("served");
+            std::os::unix::fs::symlink(&target, &socket).unwrap();
+            let bound = std::os::unix::net::UnixListener::bind(&target).unwrap();
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Running,
+                "a server bound behind the published listener"
+            );
+            drop(bound);
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Ended
+            );
+            std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
+            for (holder, provider) in [
+                (running_process(), ended_process()),
+                (ended_process(), running_process()),
+            ] {
+                let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+                owner(&card, holder, provider)
+                    .create(holders.path())
+                    .unwrap();
+                assert_eq!(
+                    evidence(holders.path(), Vec::new()).classify(&card),
+                    SavedExecution::Running,
+                    "a registered holder or its server survives"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn codex_pane_without_complete_evidence_is_unproved() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let mut paired = card.clone();
+        paired.terminal = Some(
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                paired.id,
+                paired.launch.recipe.clone(),
+                None,
+            )
+            .session,
+        );
+        let mut unowned = card.clone();
+        unowned.owned_codex_listener = None;
+        let mut foreign = card.clone();
+        foreign.launch.recipe.arguments[1] = "unix:///elsewhere/control.sock".into();
+        let mut unproved = card.clone();
+        unproved.proof = None;
+        for card in [paired, unowned, foreign, unproved] {
+            assert_eq!(
+                evidence(holders.path(), Vec::new()).classify(&card),
+                SavedExecution::Unproved
+            );
+        }
+        let mut unreadable = evidence(holders.path(), Vec::new());
+        unreadable.native_holders = Err("unavailable".into());
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+        // A process table that cannot be read proves nothing.
+        let mut absent = evidence(holders.path(), Vec::new());
+        absent.processes = root.path().join("absent");
+        assert_eq!(absent.classify(&card), SavedExecution::Unproved);
+        // A process that has not published its arguments might be the
+        // server. One whose last thread is a zombie, or exiting (PF_EXITING,
+        // like a PID-namespace init waiting in do_exit), can write nothing; a
+        // zombie group leader or exiting thread with live threads still can.
+        let processes = tempfile::tempdir_in("/var/tmp").unwrap();
+        std::fs::create_dir_all(processes.path().join("net")).unwrap();
+        std::fs::write(
+            processes.path().join("net/unix"),
+            "Num       RefCount Protocol Flags    Type St Inode Path\n",
+        )
+        .unwrap();
+        let process = processes.path().join("4242");
+        std::fs::create_dir(&process).unwrap();
+        std::fs::write(process.join("cmdline"), b"").unwrap();
+        let uid = crate::daemon::current_uid();
+        let user = |uid: u32| format!("Name:\tcodex\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
+        std::fs::write(process.join("status"), user(uid)).unwrap();
+        let mut table = evidence(holders.path(), Vec::new());
+        table.processes = processes.path().into();
+        let stat = |state: char, flags: u64, threads: u32| {
+            format!(
+                "4242 (a) b) {state} 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 1"
+            )
+        };
+        for (state, flags, threads, expected) in [
+            ('Z', 0, 1, SavedExecution::Ended),
+            ('X', 0, 1, SavedExecution::Ended),
+            ('D', 0x4, 1, SavedExecution::Ended),
+            ('Z', 0, 2, SavedExecution::Unproved),
+            ('D', 0x4, 2, SavedExecution::Unproved),
+            ('R', 0, 1, SavedExecution::Unproved),
+        ] {
+            std::fs::write(process.join("stat"), stat(state, flags, threads)).unwrap();
+            assert_eq!(
+                table.classify(&card),
+                expected,
+                "{state} {flags:#x} {threads}"
+            );
+        }
+        // A truncated status line proves nothing.
+        std::fs::write(process.join("stat"), b"4242 (codex) Z 1 4242 4242").unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        // The effective user decides, not the owner of the process directory,
+        // which is root for a non-dumpable process of this user.
+        std::fs::write(process.join("stat"), stat('R', 0, 1)).unwrap();
+        std::fs::write(process.join("status"), user(uid.wrapping_add(1))).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        std::fs::write(process.join("status"), b"Name:\tcodex\n").unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        std::fs::write(process.join("status"), user(uid)).unwrap();
+        let named = card.owned_codex_listener.clone().unwrap().socket;
+        std::fs::write(
+            process.join("cmdline"),
+            format!("codex\0app-server\0--listen\0unix://{}\0", named.display()),
+        )
+        .unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Running);
+        std::fs::remove_dir_all(&process).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        // A socket bound at the listener, or at a starting holder's control
+        // endpoint, is live work; a different path that ends alike is not.
+        let listener = card.owned_codex_listener.clone().unwrap().socket;
+        let control = crate::daemon::holder_registry::socket(holders.path(), card.id);
+        for (path, expected) in [
+            (listener.clone(), SavedExecution::Running),
+            (control, SavedExecution::Running),
+            (
+                format!("/elsewhere{}", listener.display()).into(),
+                SavedExecution::Ended,
+            ),
+        ] {
+            std::fs::write(
+                processes.path().join("net/unix"),
+                format!(
+                    "Num       RefCount Protocol Flags    Type St Inode Path\n\
+                     0000000000000000: 00000002 00000000 00010000 0001 01 4242 {}\n",
+                    std::path::Path::new(&path).display()
+                ),
+            )
+            .unwrap();
+            assert_eq!(table.classify(&card), expected, "{}", path.display());
+        }
+        // Discovery evidence that cannot be authenticated is never absence.
+        std::fs::write(
+            crate::daemon::holder_registry::socket(holders.path(), card.id).with_extension("json"),
+            b"{\"not\":\"a record\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            evidence(holders.path(), Vec::new()).classify(&card),
+            SavedExecution::Unproved
+        );
+    }
+
+    #[test]
+    fn ended_panes_neither_hide_nor_join_a_live_refusal() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let retired = retained_card(current_boot());
+        let previous = retained_card(BootId::new("previous-boot"));
+        let live = retained_card(current_boot());
+        let held = retained_card(current_boot());
+        let census = vec![
+            (
+                retired.id,
+                owner(&retired, ended_process(), ended_process()),
+            ),
+            (live.id, owner(&live, running_process(), running_process())),
+            (held.id, owner(&held, ended_process(), ended_process())),
+        ];
+        let evidence = evidence(holders.path(), census);
+        let inventory = [held.clone()];
+        let (live_card, held_card) = (crate::model::CardId::new(), crate::model::CardId::new());
+        let mut failures = InspectionFailures::default();
+        for (card, source) in [
+            (crate::model::CardId::new(), &retired),
+            (live_card, &live),
+            (crate::model::CardId::new(), &previous),
+            (held_card, &held),
+        ] {
+            if let Some(problem) = saved_chat_problem(card, source, &inventory, &evidence, || {
+                Err("unqualified".into())
+            }) {
+                failures.push(problem);
+            }
+        }
+        let message = failures.finish().unwrap_err();
+        assert!(message.contains("2 saved-state problem(s)"), "{message}");
+        assert!(message.contains(&format!(
+            "Saved conversation pane {live_card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
+        )));
+        // A listed chat is the source's live work and always qualifies exactly.
+        assert!(message.contains(&format!(
+            "Saved conversation pane {held_card} needs exact conversation recovery."
+        )));
+        assert!(
+            saved_chat_problem(live_card, &live, &inventory, &evidence, || Ok(())).is_none(),
+            "a live actor the source adopted and qualified is not a problem"
+        );
     }
 
     #[test]

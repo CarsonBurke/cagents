@@ -143,7 +143,14 @@ pub enum Action {
     Resume(CardId),
     More,
     Submit,
-    Prepared(u64, SavedConversation, Result<chat::Session, String>),
+    /// The service's answer to preparing a resume. `Ok(None)` means it could
+    /// not be reached to prepare an unstarted successor, which then resumes as
+    /// a conversation of its own, as it would without one.
+    Prepared(
+        u64,
+        SavedConversation,
+        Result<Option<chat::Session>, String>,
+    ),
 }
 
 /// What indexing has found so far, in the order it is found.
@@ -176,9 +183,8 @@ fn same_conversation(a: &chat::Session, b: &chat::Session) -> bool {
     a.launch.provider == b.launch.provider
         && a.launch.session_id == b.launch.session_id
         && a.launch.recipe.working_directory == b.launch.recipe.working_directory
-        && crate::account::home_variable(a.launch.provider).is_none_or(|variable| {
-            a.launch.recipe.environment.get(variable) == b.launch.recipe.environment.get(variable)
-        })
+        && conversation_home(a.launch.provider, &a.launch.recipe)
+            == conversation_home(b.launch.provider, &b.launch.recipe)
 }
 
 /// What makes two listings the same conversation: its provider, its ID, and
@@ -189,13 +195,23 @@ fn identity(provider: Provider, id: Option<&str>, recipe: &LaunchRecipe) -> Iden
     (
         provider,
         id.map(str::to_owned),
-        crate::account::home_variable(provider)
-            .and_then(|variable| recipe.environment.get(variable))
-            .map(|home| {
-                let path = PathBuf::from(home);
-                path.canonicalize().unwrap_or(path)
-            }),
+        conversation_home(provider, recipe),
     )
+}
+
+/// The directory a launch keeps its provider's history in, however the
+/// launch names it: a recipe that exports the provider's default home and one
+/// that leaves the CLI to resolve that default keep the same history.
+fn conversation_home(provider: Provider, recipe: &LaunchRecipe) -> Option<PathBuf> {
+    let root = provider.session_root(recipe).or_else(|| {
+        let variable = crate::account::home_variable(provider)?;
+        recipe
+            .environment
+            .get(variable)
+            .filter(|home| !home.is_empty())
+            .map(PathBuf::from)
+    })?;
+    Some(root.canonicalize().unwrap_or(root))
 }
 
 /// Lists saved conversations, then every conversation the seeds' providers
@@ -612,7 +628,7 @@ impl Cagents {
                 }
                 self.resume_ui.loading = false;
                 match result {
-                    Ok(session) => {
+                    Ok(Some(session)) => {
                         if !prepared_resume_matches(&entry.session, &session) {
                             self.resume_error("The service did not prepare this exact saved conversation. Its original identity was retained.");
                             return Task::none();
@@ -623,6 +639,7 @@ impl Cagents {
                         }
                         self.insert_resumed_conversation(entry, true)
                     }
+                    Ok(None) => self.insert_resumed_conversation(entry, false),
                     Err(error) => {
                         self.resume_error(&error);
                         Task::none()
@@ -780,17 +797,26 @@ impl Cagents {
             return task;
         }
         let session = &entry.session;
-        if session.native_continuity.retains_provider() {
+        if session.native_continuity.retains_provider() || unstarted_successor(session) {
             let generation = self.resume_ui.generation;
             self.resume_ui.loading = true;
+            let unstarted = unstarted_successor(session);
             return cosmic::task::future(async move {
                 let source = entry.session.clone();
                 let result = tokio::task::spawn_blocking(move || {
                     let socket = crate::terminal::ipc::daemon_socket_path()
                         .map_err(|error| error.to_string())?;
-                    crate::control::ControlClient::connect(&socket)
-                        .map_err(|error| error.to_string())?
+                    let mut client = match crate::control::ControlClient::connect(&socket) {
+                        Ok(client) => client,
+                        // Nothing runs to vouch for it, or to refuse it.
+                        Err(crate::control::ControlError::Connect(_)) if unstarted => {
+                            return Ok(None);
+                        }
+                        Err(error) => return Err(error.to_string()),
+                    };
+                    client
                         .prepare_chat_resume(source)
+                        .map(Some)
                         .map_err(|error| error.to_string())
                 })
                 .await
@@ -1117,10 +1143,23 @@ impl Cagents {
     }
 }
 
+/// A resume successor the daemon prepared but that never started. Resuming it
+/// again through the daemon keeps the lineage, and the agent, it was prepared
+/// to take over.
+fn unstarted_successor(session: &chat::Session) -> bool {
+    session.launch.provider == Provider::Claude
+        && session.native_continuity == chat::NativeContinuity::ReconnectOnly
+        && session.proof.is_none()
+        && session.terminal.is_none()
+        && session.launch.session_id.is_some()
+}
+
 /// Shape validation of the authenticated preparation reply. It grants no
 /// provider ownership; Start/Attach still runs normal HOST admission.
 fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> bool {
-    if source == prepared {
+    // An ended retained Claude actor resumes as a reconnect-only successor,
+    // on the conversation the daemon proved it confirmed.
+    if source == prepared || chat::is_retained_resume_successor(source, prepared) {
         return true;
     }
     if !source.has_valid_native_continuity()
@@ -1155,6 +1194,32 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> Vec<usize
 mod tests {
     use super::*;
 
+    /// A conversation saved while cagents exported Claude's default home and
+    /// the same conversation found under a launch that leaves the CLI to
+    /// resolve it are one listing, kept in one history.
+    #[test]
+    fn exporting_the_default_home_or_not_lists_one_conversation() {
+        let mut exported = LaunchRecipe::shell("/w".into()).unwrap();
+        exported.environment.insert("HOME".into(), "/home/a".into());
+        let mut resolved = exported.clone();
+        exported
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/home/a/.claude".into());
+        resolved.environment.remove("CLAUDE_CONFIG_DIR");
+        assert_eq!(
+            identity(Provider::Claude, Some("id"), &exported),
+            identity(Provider::Claude, Some("id"), &resolved)
+        );
+        let mut other = exported.clone();
+        other
+            .environment
+            .insert("CLAUDE_CONFIG_DIR".into(), "/home/a/work".into());
+        assert_ne!(
+            identity(Provider::Claude, Some("id"), &other),
+            identity(Provider::Claude, Some("id"), &resolved)
+        );
+    }
+
     fn saved(directory: &Path) -> SavedConversation {
         let mut session = chat::fresh_session(
             Provider::Claude,
@@ -1164,6 +1229,12 @@ mod tests {
         )
         .unwrap();
         session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+        // A saved conversation that ran carries the proof of its last start.
+        session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
         SavedConversation {
             card: CardId::new(),
             title: "Review peripheral Rust modules".into(),
@@ -1191,11 +1262,6 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let mut entry = saved(directory.path());
-        entry.session.proof = Some(crate::model::HostSessionProof {
-            host_session_id: "saved-owner".into(),
-            boot_id: "fixture-boot".into(),
-            host_incarnation: "saved-incarnation".into(),
-        });
         entry.session.native_continuity =
             chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
         assert!(entry.session.has_valid_native_continuity());
@@ -1210,8 +1276,15 @@ mod tests {
         prepared.id = TerminalId::new();
         prepared.proof = None;
         prepared.terminal = None;
+        // The daemon answers for an ended actor with its reconnect-only
+        // successor, never another retained actor.
+        prepared.native_continuity = chat::NativeContinuity::ReconnectOnly;
         let generation = app.resume_ui.generation;
-        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+        drop(app.update_resume(Action::Prepared(
+            generation,
+            entry,
+            Ok(Some(prepared.clone())),
+        )));
         let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
         assert_eq!(card.kind, CardKind::Chat(prepared));
         assert_eq!(card.title, "Review peripheral Rust modules");
@@ -1245,7 +1318,11 @@ mod tests {
         assert!(app.resume_ui.loading);
         let generation = app.resume_ui.generation;
         let before_settings = app.settings_save_generation;
-        drop(app.update_resume(Action::Prepared(generation, entry, Ok(prepared.clone()))));
+        drop(app.update_resume(Action::Prepared(
+            generation,
+            entry,
+            Ok(Some(prepared.clone())),
+        )));
 
         let card = app
             .card_state(app.workspace.focused().unwrap())
@@ -1296,11 +1373,63 @@ mod tests {
     }
 
     #[test]
+    fn unstarted_successor_resumes_through_the_daemon_which_may_refuse_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        // A prepared successor the card closed before it ever started.
+        let mut entry = saved(directory.path());
+        entry.session.proof = None;
+        assert!(unstarted_successor(&entry.session));
+        let source = entry.session.clone();
+        drop(app.resume_saved_conversation(entry.clone()));
+        assert!(app.resume_ui.loading, "the daemon keeps its lineage");
+        assert!(app.durable.cards.is_empty());
+        let mut prepared = source.clone();
+        prepared.id = TerminalId::new();
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Prepared(
+            generation,
+            entry.clone(),
+            Ok(Some(prepared.clone())),
+        )));
+        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
+        assert_eq!(card.kind, CardKind::Chat(prepared));
+
+        // A refusal, such as another pane still writing to the conversation,
+        // is shown and starts nothing.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        drop(app.resume_saved_conversation(entry.clone()));
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Prepared(
+            generation,
+            entry.clone(),
+            Err("Another pane may still be writing to this Claude conversation".into()),
+        )));
+        assert!(app.durable.cards.is_empty());
+        assert!(app.resume_ui.error.is_some());
+
+        // With no daemon to vouch for it or refuse it, it resumes on its own.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        drop(app.resume_saved_conversation(entry.clone()));
+        let generation = app.resume_ui.generation;
+        drop(app.update_resume(Action::Prepared(generation, entry, Ok(None))));
+        let card = app.card_state(app.workspace.focused().unwrap()).unwrap();
+        let CardKind::Chat(session) = &card.kind else {
+            panic!("the conversation resumes as a chat");
+        };
+        assert_ne!(session.id, source.id);
+        assert_eq!(session.launch, source.launch);
+        assert!(app.resume_ui.error.is_none());
+    }
+
+    #[test]
     fn preparation_cannot_change_the_saved_thread_account_or_launch() {
         let directory = tempfile::tempdir().unwrap();
         let source = saved(directory.path()).session;
         let mut prepared = source.clone();
         prepared.id = TerminalId::new();
+        prepared.proof = None;
         assert!(prepared_resume_matches(&source, &prepared));
         for mutation in 0..4 {
             let mut altered = prepared.clone();
@@ -1454,7 +1583,7 @@ mod tests {
         let _ = app.update_resume(Action::Prepared(
             7,
             entry.clone(),
-            Ok(entry.session.clone()),
+            Ok(Some(entry.session.clone())),
         ));
         assert!(app.durable.cards.is_empty());
         let _ = app.resume_saved_conversation(entry);
@@ -1473,7 +1602,7 @@ mod tests {
         let _ = app.update_resume(Action::Prepared(
             generation,
             entry.clone(),
-            Ok(entry.session),
+            Ok(Some(entry.session)),
         ));
         assert_eq!(app.durable.cards.len(), 1);
         assert_eq!(app.workspace.focused(), card);

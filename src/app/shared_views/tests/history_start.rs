@@ -390,7 +390,12 @@ fn begin_history() -> (tempfile::TempDir, Cagents, Scope, Task<Message>) {
         updated_at_unix_ms: 1,
         session: Session {
             id: TerminalId::new(),
-            proof: None,
+            // A saved conversation that ran carries the proof of its last start.
+            proof: Some(HostSessionProof {
+                host_session_id: "saved-owner".into(),
+                boot_id: "saved-boot".into(),
+                host_incarnation: "saved-incarnation".into(),
+            }),
             terminal: None,
             owned_codex_listener: None,
             native_continuity: Default::default(),

@@ -227,6 +227,20 @@ impl Launch {
         }
         Some(recipe)
     }
+
+    /// Whether `recipe` is a terminal this conversation may hand off to: its
+    /// exact resume, either as launched or under one valid permission mode. The
+    /// mode comes from the live session, which storage does not hold, so this
+    /// cannot prove which mode was confirmed; it proves the recipe differs from
+    /// the resume by nothing else.
+    pub(crate) fn resumes_in_terminal(&self, recipe: &LaunchRecipe) -> bool {
+        let mode = match recipe.arguments.as_slice() {
+            [.., flag, mode] if flag == "--permission-mode" => Some(mode.as_str()),
+            _ => None,
+        };
+        self.terminal_recipe_with_permission_mode(mode).as_ref() == Some(recipe)
+    }
+
     /// Return to the CLI using the current provider-confirmed identity, not a
     /// stale ID from the original argv before a native /clear or session switch.
     pub fn terminal_recipe(&self) -> Option<LaunchRecipe> {
@@ -603,6 +617,15 @@ impl NativeContinuity {
     }
 }
 
+impl Session {
+    /// A holder or listener outside the daemon's actors can answer a close of
+    /// this session. Anything else has only a lost actor, which proves nothing.
+    pub fn closes_without_hosted_actor(&self) -> bool {
+        self.owned_codex_listener.is_some()
+            || matches!(self.native_continuity, NativeContinuity::Durable { .. })
+    }
+}
+
 /// Account recovery changes only account selection. It never changes the
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.
@@ -639,6 +662,8 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     }
     for recipe in [&mut *original, &mut *candidate] {
         recipe.environment.remove(home);
+        // The system Claude login binds its home by leaving it unset.
+        recipe.unset_environment.remove(home);
         recipe
             .environment
             .retain(|name, _| !names.contains(&name.as_str()));
@@ -697,6 +722,56 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
         }
         _ => false,
     }
+}
+
+/// Whether `successor` is exactly the daemon's prepared resume of the stranded
+/// retained Claude card `source`: the same conversation, launch and account
+/// under a new allocation with no ownership proof yet. This shape is
+/// no authority by itself; only an authenticated `ChatPrepareResume` answer on
+/// the same daemon stream may produce one.
+pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    let valid = |id: &String| uuid::Uuid::parse_str(id).is_ok();
+    // A pane whose actor never reported its conversation resumes the one the
+    // daemon proved that actor confirmed, or, when it confirmed none, starts
+    // one: either way nothing else of its launch changes.
+    let launch = if source.has_unnamed_retained_claude_actor()
+        && successor.launch.session_id.as_ref().is_none_or(valid)
+    {
+        Launch {
+            session_id: None,
+            ..successor.launch.clone()
+        }
+    } else {
+        successor.launch.clone()
+    };
+    matches!(
+        source.native_continuity,
+        NativeContinuity::RetainedClaudeActor { protocol: 2 }
+    ) && source.has_valid_native_continuity()
+        && source.launch.provider == Provider::Claude
+        && (source.launch.session_id.as_ref().is_some_and(valid)
+            || source.has_unnamed_retained_claude_actor())
+        && successor.id != source.id
+        && launch == source.launch
+        && successor.proof.is_none()
+        && successor.terminal.is_none()
+        && successor.owned_codex_listener.is_none()
+        && successor.native_continuity == NativeContinuity::ReconnectOnly
+}
+
+/// Whether `started` is the daemon's started form of a prepared resume
+/// successor of `source`: started under a complete ownership proof, on the
+/// exact saved conversation, with only the continuity it learned on install.
+pub fn is_retained_resume_commit(source: &Session, started: &Session) -> bool {
+    let mut prepared = started.clone();
+    prepared.proof = None;
+    prepared.native_continuity = NativeContinuity::ReconnectOnly;
+    is_retained_resume_successor(source, &prepared)
+        && started
+            .proof
+            .as_ref()
+            .is_some_and(crate::model::HostSessionProof::is_complete)
+        && started.has_valid_native_continuity()
 }
 
 /// A formerly hosted pane may never have observed its first provider identity.
@@ -1512,6 +1587,41 @@ pub struct TextCopySources {
     pub conversation_revision: u64,
     pub conversation: Vec<Option<TextCopySource>>,
     pub children: std::collections::BTreeMap<String, Vec<Option<TextCopySource>>>,
+}
+
+impl Command {
+    /// Whether the command gives the provider work: a turn, a reply to its
+    /// question, or a queued or provider command it runs.
+    ///
+    /// Exhaustive on purpose, so that a new command has to be classified.
+    pub fn gives_work(&self) -> bool {
+        match self {
+            Self::ResumeAfterLogin { .. }
+            | Self::Prompt { .. }
+            | Self::Answer { .. }
+            | Self::Compact
+            | Self::Slash { .. }
+            | Self::StartQueued { .. }
+            | Self::Branch { .. } => true,
+            Self::Interrupt
+            | Self::StopSubagent { .. }
+            | Self::SetModel { .. }
+            | Self::SetFastMode { .. }
+            | Self::SetPermissionMode { .. }
+            | Self::RefreshPermissions
+            | Self::UpdatePermissionSettings { .. }
+            | Self::DismissPermissionDenial { .. }
+            | Self::Refresh
+            | Self::LoadEarlier
+            | Self::RemoveQueued { .. }
+            | Self::SetInterruptMode { .. }
+            | Self::ListBranches
+            | Self::LoadLater
+            | Self::LoadFileChanges { .. }
+            | Self::LoadFileChangePatches { .. }
+            | Self::ReadTextCopy { .. } => false,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -2896,6 +3006,91 @@ mod tests {
         assert!(project_session.launch.recipe.arguments.is_empty());
     }
 
+    /// Moving a conversation between the system Claude login, whose home
+    /// is left unset, and a linked one is an account recovery both ways.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn moving_between_an_unset_and_a_linked_home_is_an_account_recovery() {
+        let user = |name: &str| (name == "HOME").then(|| "/home/a".to_owned());
+        let system = crate::account::Account::system(Provider::Claude);
+        let linked = crate::account::Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(7),
+            "/home/a/.claude-work".into(),
+        );
+        let mut source = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        system
+            .bind_home_in(&mut source.launch.recipe, &user)
+            .unwrap();
+        assert!(
+            source
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR")
+        );
+        let moved = |from: &Session, to: &crate::account::Account| {
+            let mut replacement = from.clone();
+            replacement.id = crate::model::TerminalId::new();
+            replacement.proof = None;
+            replacement.terminal = None;
+            to.bind_home_in(&mut replacement.launch.recipe, &user)
+                .unwrap();
+            replacement
+        };
+        let on_linked = moved(&source, &linked);
+        assert!(is_account_recovery(&source, &on_linked));
+        assert!(is_account_recovery(&on_linked, &moved(&on_linked, &system)));
+        // Staying on the same home changes no account.
+        assert!(!is_account_recovery(&source, &moved(&source, &system)));
+    }
+
+    /// A conversation on the system login exports the home its sign-in
+    /// does, and its probe reads: none unless cagents was started with one,
+    /// so the CLI keeps one record of who the login is, in `~/.claude.json`.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn a_system_conversation_exports_the_home_its_probe_reads() {
+        let system = crate::account::Account::system(Provider::Claude);
+        let session = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from),
+            system.launch_home()
+        );
+        assert_eq!(system.probe_environment(), None);
+        // Left unset rather than out, so a daemon started with its own
+        // `CLAUDE_CONFIG_DIR` does not hand it on.
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR"),
+            system.launch_home().is_none()
+        );
+        if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            assert_eq!(system.launch_home(), None);
+        }
+    }
+
     #[test]
     #[cfg(any(feature = "host", feature = "ui"))]
     fn claude_default_permissions_use_the_launch_home_and_account_settings_layer() {
@@ -3256,16 +3451,8 @@ pub(crate) fn fresh_session(
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
-        && let (Some(variable), Some(home)) = (
-            crate::account::home_variable(provider),
-            account.resolved_home(),
-        )
     {
-        let home = home
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
-        recipe.environment.insert(variable.to_owned(), home);
+        account.bind_home(&mut recipe)?;
     }
     recipe
         .environment

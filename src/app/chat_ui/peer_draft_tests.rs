@@ -240,6 +240,7 @@ fn a_window_starting_the_draft_itself_keeps_its_own_start() {
             recovery: None,
             upgrade_committed: false,
             upgrade_admission: None,
+            resume_committed: false,
         }),
     );
 
@@ -1020,4 +1021,41 @@ fn the_question_ends_when_the_other_window_replaces_the_conversation() {
     drop(peer.app.update(Message::ConfirmChatClose));
     assert!(!peer.app.chat_close_asked(peer.card));
     assert!(card_open(&peer));
+}
+
+/// A question asked beside a close under way could end up under that close's
+/// own dialog, so it waits for it. With nothing to ask, the chat needn't wait.
+#[test]
+fn a_working_chat_asks_only_after_the_close_ahead_of_it() {
+    let mut app = crate::app::tests::context_inspector_test_app(false);
+    let mut chat = |thread, busy| {
+        let card = super::tests::live_chat_for_provider(&mut app, Provider::Claude, Some(thread));
+        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+            panic!("expected a chat runtime");
+        };
+        let handle = runtime.handle().unwrap();
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.ready = true;
+        snapshot.busy = busy;
+        handle.publish_snapshot_for_test(snapshot);
+        card
+    };
+    let ahead = chat("ahead-thread", false);
+    let working = chat("working-thread", true);
+    let idle = chat("idle-thread", false);
+    app.chrome_ui.closing_group.push(ahead);
+
+    drop(app.update(Message::CloseCard(working)));
+    assert!(!app.chat_close_dialog_visible());
+    assert!(app.pane_close_owned(working));
+    assert_eq!(app.queued_card_closes.len(), 1);
+
+    drop(app.update(Message::CloseCard(idle)));
+    assert_eq!(app.queued_card_closes.len(), 1);
+    assert!(!app.chat_close_asked(idle));
+
+    app.chrome_ui.closing_group.clear();
+    drop(app.next_queued_card_close());
+    assert!(app.chat_close_asked(working));
+    assert!(!app.chat_close_owned(working));
 }

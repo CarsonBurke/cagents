@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Show who holds a shared lock and whether it is doing anything. Read-only."""
 import glob
 import os
@@ -12,7 +12,7 @@ LEGITIMATE = {"cargo", "cargo-gate", "flock", "kwin_wayland", "native-evidence",
 # Run as `sh PATH`, or longer than a kernel process name.
 SCRIPTS = {
     "build-disk-guard", "cagents-cargo-gate", "cargo-gate", "cargo-gate-command.py",
-    "native-evidence",
+    "native-evidence", "prune-build-dirs",
 }
 SAMPLE_SECONDS = 1.0
 
@@ -180,7 +180,8 @@ def main(arguments):
         print("a lock was taken.")
         return 0
     locks = arguments or default_locks()
-    holders, waiters, takers = scan({os.path.realpath(lock) for lock in locks})
+    # Others too: a holder waiting behind one of them looks idle here.
+    holders, waiters, takers = scan({os.path.realpath(lock) for lock in [*locks, *default_locks()]})
     recorded = hidden_lockers()
     before, _ = cpu_ticks()
     time.sleep(SAMPLE_SECONDS)
@@ -205,6 +206,10 @@ def main(arguments):
             print(f"  holder {hidden}, recorded by /proc/locks for this inode; its descriptors aren't readable here")
         family = set().union(*(subtree(pid, parents) for pid in held)) if held else set()
         idle = not any(after.get(p, 0) > before.get(p, 0) for p in family)
+        behind = sorted(other for other, pids in waiters.items() if other != path and pids & family)
+        # The head of a gate's queue waits for a slot by design.
+        if behind and not lock.endswith(".queue"):
+            print(f"  note: this holder is waiting for {' and '.join(behind)}, keeping this lock meanwhile.")
         if held and not any(looks_legitimate(p) for p in family):
             # A taker that has gone proves nothing: `exec 9>LOCK; flock 9` leaves a
             # healthy shell holding the lock of a process that has exited.
@@ -228,7 +233,7 @@ def main(arguments):
                 "whose it may be; ask the owner before acting on it."
             )
         # The head of a gate's queue is idle by design while it waits for a slot.
-        elif held and idle and not lock.endswith(".queue"):
+        elif held and idle and not behind and not lock.endswith(".queue"):
             print(
                 "  note: nothing holding this used CPU during the one-second sample. Run this "
                 "again to see whether that lasts."

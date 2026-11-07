@@ -296,6 +296,8 @@ enum NoticeKey {
     SurfaceVisibility,
     /// Committing this exact project/worktree/path identity.
     GitCommit(ActiveWorktreeKey),
+    /// Saving this chat's return to a terminal.
+    ChatReturn(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -590,6 +592,20 @@ impl SaveHealthState {
             .iter()
             .any(|write| write.subject.is_window_state())
     }
+}
+
+fn terminal_handoff_pending_notice(error: String) -> TransientNotice {
+    TransientNotice::error(format!(
+        "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
+    ))
+}
+
+fn chat_return_unsaved_notice(card: CardId) -> TransientNotice {
+    TransientNotice::error("Return to terminal is not saved")
+        .with_details(
+            "The terminal keeps running in this pane, but the change is not saved. If saving does not recover, close the pane: that ends the terminal and clears this notice.",
+        )
+        .with_key(NoticeKey::ChatReturn(card))
 }
 
 impl TransientNotice {
@@ -4421,6 +4437,7 @@ pub enum Message {
     StartupWindowOpened(window::Id),
     StartupReported(Result<(), String>),
     VerifyStartupPanes,
+    StartupStateInspected(startup_gate::Inspection),
     StartupPanesSaved(Result<SettingsSaved, String>, Result<(), String>),
     UiUpdate(instance::UiUpdateRequest),
     UiUpdateWatchdog(u64),
@@ -5360,14 +5377,26 @@ pub struct Cagents {
     automation_close_generation: u64,
     terminal_close: Option<terminal_close::CloseIntent>,
     queued_card_closes: VecDeque<terminal_close::QueuedCardClose>,
+    /// The ended pane whose terminal the daemon is being asked to release.
+    completed_release: Option<CardId>,
+    close_queue_advancing: bool,
+    /// The pending removal whose commit has been delivered, so anything still
+    /// holding it is one of the closes the commit started.
+    close_commit_delivered: Option<CardId>,
     terminal_close_attempts: HashSet<TerminalId>,
     terminal_close_generation: u64,
     closed_terminal_cards: HashSet<CardId>,
+    /// Closing panes whose terminal the daemon proved gone, which reopening
+    /// must not start again.
+    proven_gone_cards: HashSet<CardId>,
     uncertain_terminal_proofs: HashMap<CardId, HostSessionProof>,
     terminal_recovery_attempts: HashSet<TerminalId>,
     /// Restored ended terminals whose final screen the daemon was asked for.
     retained_outputs: HashMap<TerminalId, terminal_end_ui::RetainedOutput>,
     pending_terminal_handoffs: HashMap<TerminalId, TerminalSession>,
+    /// The handoffs above that a user's return to terminal started, with their
+    /// cards, until a flush has saved them. Others are ordinary terminal starts.
+    unsaved_chat_returns: HashMap<TerminalId, CardId>,
     terminal_handoff_commit_inflight: bool,
     worktree_operations:
         HashMap<crate::model::OperationId, worktree_operations::ActiveWorktreeOperation>,
@@ -5910,7 +5939,7 @@ impl Cagents {
                             }
                         }
                     }
-                    let hosted=hosted.ok_or("This shared terminal is disconnected; another client must restore its hosted session")?;
+                    let hosted=hosted.ok_or("This terminal isn't connected. Use Retry or Close on its pane.")?;
                     let proof = client.proof().clone();
                     (daemon_recovery::RecoveredTerminal { session: hosted.session,
                         expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
@@ -6295,13 +6324,8 @@ impl Cagents {
                     .iter()
                     .map(|name| (*name).to_owned()),
             );
-            if let (Some(variable), Some(home)) =
-                (account::home_variable(provider), account.resolved_home())
-            {
-                launch
-                    .environment
-                    .insert(variable.to_owned(), home.display().to_string());
-            }
+            // A home that is not a path the recipe can record stays unbound.
+            let _ = account.bind_home(&mut launch);
         }
         self.add_terminal_recipe(launch)
     }
@@ -7748,6 +7772,7 @@ impl Cagents {
             state.residency = residency;
         }
         self.closed_terminal_cards.remove(&card);
+        self.proven_gone_cards.remove(&card);
         self.cards.insert(card, CardRuntime::Loading);
         self.card_chrome.remove(&card);
         let saved = self.shared_window_snapshot();
@@ -7756,6 +7781,7 @@ impl Cagents {
         }
         self.pending_terminal_handoffs
             .insert(session.id, session.clone());
+        self.unsaved_chat_returns.insert(session.id, card);
         let commit = self.commit_terminal_handoffs();
         let attach = self.start_terminal(
             card,
@@ -7764,6 +7790,14 @@ impl Cagents {
             false,
         );
         Task::batch([commit, attach])
+    }
+
+    /// The open card of a return to terminal that no flush has saved yet.
+    fn unsaved_chat_return(&self) -> Option<CardId> {
+        self.unsaved_chat_returns.values().copied().find(|&card| {
+            self.card_state(card)
+                .is_some_and(|state| state.existence.is_open())
+        })
     }
 
     /// The flush is ordered after conversion snapshots. Never release daemon
@@ -10343,14 +10377,17 @@ impl Cagents {
                                 crate::ui_controls::button::primary(retry_label)
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
-                                    .on_press(
-                                        if cfg!(not(feature = "integrated-browser"))
-                                            && browser_session.is_some()
-                                        {
-                                            Message::OpenBrowserInSystem(id)
-                                        } else {
-                                            Message::RetryCard(id)
-                                        },
+                                    // Retry does nothing once Close owns the pane.
+                                    .on_press_maybe(
+                                        (!self.terminal_close_in_progress(id)).then_some(
+                                            if cfg!(not(feature = "integrated-browser"))
+                                                && browser_session.is_some()
+                                            {
+                                                Message::OpenBrowserInSystem(id)
+                                            } else {
+                                                Message::RetryCard(id)
+                                            },
+                                        ),
                                     )
                                     .into(),
                             ] };
@@ -10369,11 +10406,18 @@ impl Cagents {
                                 );
                             }
                             controls.push(
-                                crate::ui_controls::button::secondary("Close")
+                                {
+                                    let closing = self.terminal_close_in_progress(id);
+                                    crate::ui_controls::button::secondary(if closing {
+                                        "Checking…"
+                                    } else {
+                                        "Close"
+                                    })
                                     .id(card_control_id(id, "failed.close"))
                                     .name(format!("Close {}", labels.type_label))
-                                    .on_press(Message::CloseCard(id))
-                                    .into(),
+                                    .on_press_maybe((!closing).then_some(Message::CloseCard(id)))
+                                    .into()
+                                },
                             );
                             controls
                         })
@@ -11116,10 +11160,9 @@ impl Cagents {
             return Task::none();
         };
         if self.folder_scope(&key)
-            && matches!(
-                self.context_tab,
-                ContextTab::Changes | ContextTab::PullRequest
-            )
+            && (self.context_tab == ContextTab::Changes
+                || (self.context_tab == ContextTab::PullRequest
+                    && !self.conversation_lists_pull_requests()))
         {
             self.context_tab = ContextTab::Files;
         }
@@ -12387,7 +12430,7 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ NoticeKey::ChatAttach(card))
+                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
                     if self
                         .card_state(*card)
                         .is_none_or(|state| !state.existence.is_open()) =>
@@ -13273,7 +13316,7 @@ impl Cagents {
         let Some(card) = cards.pop_front() else {
             return match intent {
                 DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-                DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+                DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
                 DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
             };
         };
@@ -13292,6 +13335,68 @@ impl Cagents {
         });
         iced::widget::operation::focus(dirty_close_control_id(card, focused))
             .map(cosmic::Action::App)
+    }
+
+    fn commit_requested_close(&mut self, id: CardId) -> Task<Message> {
+        if self
+            .card_state(id)
+            .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
+            || self.chat_has_parked_runtime(id)
+        {
+            return self.begin_chat_close(id);
+        }
+        if self
+            .card_state(id)
+            .is_none_or(|card| !card.existence.is_open())
+        {
+            return Task::none();
+        }
+        if self.pending_terminal_spawn(id) {
+            return self.begin_card_close(id);
+        }
+        if terminal_continuity(self.card_state(id))
+            .and_then(TerminalContinuity::live_proof)
+            .is_some()
+            && !self.closed_terminal_cards.contains(&id)
+        {
+            return self.begin_card_close(id);
+        }
+        match self.commit_card_removal(id, None) {
+            Some(task) => task,
+            None => {
+                // Refused after all: the pane stays, and the closes queued
+                // behind it move on.
+                self.abandon_removal(id);
+                self.next_queued_card_close()
+            }
+        }
+    }
+
+    fn report_notice(&mut self, notice: TransientNotice) {
+        if crate::daemon_health::replaces_notice(&notice.message)
+            || notice
+                .details
+                .as_deref()
+                .is_some_and(crate::daemon_health::replaces_notice)
+        {
+            // The banner speaks for this outcome now, so an earlier report
+            // under the same key would only be giving an outdated reason.
+            if let Some(key) = notice.key {
+                self.notices.resolve(key);
+            }
+        } else {
+            let details = notice.details.as_deref();
+            match notice.severity {
+                NoticeSeverity::Error => {
+                    tracing::error!(message = %notice.message, details, "application notice")
+                }
+                NoticeSeverity::Warning => {
+                    tracing::warn!(message = %notice.message, details, "application notice")
+                }
+                NoticeSeverity::Success => {}
+            }
+            self.notices.record(notice);
+        }
     }
 
     fn close_pane_group(&mut self) -> Task<Message> {
@@ -13334,7 +13439,9 @@ impl Cagents {
         }
         match close.intent {
             DirtyCloseIntent::PaneGroup => self.close_pane_group(),
-            DirtyCloseIntent::Card(card) => cosmic::task::message(Message::CloseCard(card)),
+            // Called rather than sent: a queued pane could start meanwhile and
+            // leave this close, the one the reader just asked for, turned away.
+            DirtyCloseIntent::Card(card) => self.update(Message::CloseCard(card)),
             DirtyCloseIntent::Application(_) => self.exit_after_language_servers(),
         }
     }
@@ -14496,13 +14603,18 @@ impl Application for Cagents {
             automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
+            close_queue_advancing: false,
+            close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
+            completed_release: None,
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
+            proven_gone_cards: HashSet::new(),
             uncertain_terminal_proofs: HashMap::new(),
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),
             pending_terminal_handoffs: HashMap::new(),
+            unsaved_chat_returns: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
@@ -14757,6 +14869,13 @@ impl Application for Cagents {
         // Freeze user input, not lifecycle completions. Dropping a completed
         // save/Git/spawn result would strand that operation if another window vetoed.
         if self.update_prepared && user_message_blocked_during_update(&message) {
+            // Nothing else would ever deliver this removal.
+            if let Message::CommitClose(card) = message {
+                self.abandon_removal(card);
+                self.status = Some(TransientNotice::warning(
+                    "An update is being prepared, so the pane was kept. Close it again if the update doesn't go ahead.",
+                ));
+            }
             return Task::none();
         }
         if self.modal_is_open() {
@@ -14837,10 +14956,15 @@ impl Application for Cagents {
             ),
             Message::TerminalHandoffsCommitted { result } => {
                 self.terminal_handoff_commit_inflight = false;
-                let failure = match result {
+                let notice = match result {
                     Ok(results) => {
                         let mut failures = Vec::new();
                         for (terminal, result) in results {
+                            // The flush came first, so these are saved even
+                            // when the daemon has yet to take the receipt.
+                            if let Some(card) = self.unsaved_chat_returns.remove(&terminal.id) {
+                                self.resolve_notice(NoticeKey::ChatReturn(card));
+                            }
                             if self.pending_terminal_handoffs.get(&terminal.id) != Some(&terminal) {
                                 continue;
                             }
@@ -14852,18 +14976,22 @@ impl Application for Cagents {
                             }
                         }
                         failures.first().map(|(id, error)| {
-                            format!(
+                            terminal_handoff_pending_notice(format!(
                                 "{} terminal(s) remain pending; terminal {id}: {error}",
                                 failures.len()
-                            )
+                            ))
                         })
                     }
-                    Err(error) => Some(error),
+                    Err(error) => Some(match self.unsaved_chat_return() {
+                        Some(card) => {
+                            tracing::warn!(%error, "could not save a return to terminal");
+                            chat_return_unsaved_notice(card)
+                        }
+                        None => terminal_handoff_pending_notice(error),
+                    }),
                 };
-                if let Some(error) = failure {
-                    self.status = Some(TransientNotice::error(format!(
-                        "Terminal handoff acknowledgement is pending; it will retry after saving recovers or the window refreshes: {error}"
-                    )));
+                if let Some(notice) = notice {
+                    self.status = Some(notice);
                     Task::none()
                 } else {
                     self.commit_terminal_handoffs()
@@ -16382,6 +16510,9 @@ impl Application for Cagents {
                 if self.core.main_window_id() != Some(window) {
                     return Task::none();
                 }
+                // The workspace is on screen: a daemon startup notice has
+                // nothing left to explain.
+                instance::dismiss_startup_wait_notice();
                 let report = self.begin_startup_gate();
                 // window::run silently drops callbacks for windows that have not
                 // opened yet. Initialize only after iced acknowledges this one.
@@ -16391,6 +16522,7 @@ impl Application for Cagents {
                 report
             }
             Message::VerifyStartupPanes => self.verify_startup_gate(),
+            Message::StartupStateInspected(state) => self.startup_state_inspected(state),
             Message::StartupPanesSaved(settings, saved) => {
                 self.startup_panes_saved(settings, saved)
             }
@@ -16765,30 +16897,13 @@ impl Application for Cagents {
             Message::CancelRepositoryClose => self.cancel_dirty_close(),
             Message::CommitClose(id) => {
                 if self
-                    .card_state(id)
-                    .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
-                    || self.chat_has_parked_runtime(id)
+                    .workspace
+                    .pending_close()
+                    .is_some_and(|pending| pending.unmounting == id)
                 {
-                    return self.begin_chat_close(id);
+                    self.close_commit_delivered = Some(id);
                 }
-                if self
-                    .card_state(id)
-                    .is_none_or(|card| !card.existence.is_open())
-                {
-                    return Task::none();
-                }
-                if self.pending_terminal_spawn(id) {
-                    return self.begin_card_close(id);
-                }
-                if terminal_continuity(self.card_state(id))
-                    .and_then(TerminalContinuity::live_proof)
-                    .is_some()
-                    && !self.closed_terminal_cards.contains(&id)
-                {
-                    return self.begin_card_close(id);
-                }
-                self.commit_card_removal(id, None)
-                    .unwrap_or_else(Task::none)
+                self.commit_requested_close(id)
             }
             Message::Viewport { generation, event } => {
                 // Native callbacks already queued by an unmounted worktree
@@ -17848,7 +17963,9 @@ impl Application for Cagents {
             }
             Message::SelectContextTab(tab) => {
                 if self.active_folder_scope()
-                    && matches!(tab, ContextTab::Changes | ContextTab::PullRequest)
+                    && (tab == ContextTab::Changes
+                        || (tab == ContextTab::PullRequest
+                            && !self.conversation_lists_pull_requests()))
                 {
                     return Task::none();
                 }
@@ -18260,7 +18377,11 @@ impl Application for Cagents {
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
         self.reconcile_terminal_review_owner();
-        let task = Task::batch([task, self.flush_settings_on_blur()]);
+        let task = Task::batch([
+            task,
+            self.flush_settings_on_blur(),
+            self.settle_close_queue(),
+        ]);
         if projection == Projection::Full {
             self.sync_worktree_protections();
         }
@@ -18268,30 +18389,7 @@ impl Application for Cagents {
         // The transport wording the health banner replaces may sit in either
         // part of a notice: a reworded one keeps the raw reason as detail.
         if let Some(notice) = self.status.take() {
-            if crate::daemon_health::replaces_notice(&notice.message)
-                || notice
-                    .details
-                    .as_deref()
-                    .is_some_and(crate::daemon_health::replaces_notice)
-            {
-                // The banner speaks for this outcome now, so an earlier report
-                // under the same key would only be giving an outdated reason.
-                if let Some(key) = notice.key {
-                    self.notices.resolve(key);
-                }
-            } else {
-                let details = notice.details.as_deref();
-                match notice.severity {
-                    NoticeSeverity::Error => {
-                        tracing::error!(message = %notice.message, details, "application notice")
-                    }
-                    NoticeSeverity::Warning => {
-                        tracing::warn!(message = %notice.message, details, "application notice")
-                    }
-                    NoticeSeverity::Success => {}
-                }
-                self.notices.record(notice);
-            }
+            self.report_notice(notice);
         }
         self.resolve_notices_for_closed_cards();
         self.sync_notice_countdown();
@@ -18390,6 +18488,7 @@ impl Application for Cagents {
             self.account_subscription(),
             self.automation_subscription(),
             self.work_subscription(),
+            self.conversation_pull_request_subscription(),
             self.channel_work_subscription(),
             self.automation_approval_subscription(),
             self.document_tone_subscription(),
@@ -20378,6 +20477,77 @@ mod tests {
         });
         assert!(!app.pending_terminal_handoffs.contains_key(&refused.id));
         assert_eq!(app.pending_terminal_handoffs.len(), 2);
+    }
+
+    #[test]
+    fn only_an_unsaved_return_to_terminal_is_reported_as_one() {
+        const UNSAVED: &str = "Return to terminal is not saved";
+        let flush_failed = || Message::TerminalHandoffsCommitted {
+            result: Err("session flush: refused".into()),
+        };
+        let reports = |app: &Cagents| {
+            app.notices
+                .entries
+                .iter()
+                .filter(|entry| entry.notice.message == UNSAVED)
+                .count()
+        };
+
+        // Every started terminal waits here too, and it returned from nothing.
+        let mut app = context_inspector_test_app(false);
+        let card = terminal_card_state();
+        let CardKind::Terminal(terminal) = card.kind.clone() else {
+            unreachable!()
+        };
+        Arc::make_mut(&mut app.durable).cards.push(card.clone());
+        app.pending_terminal_handoffs
+            .insert(terminal.id, terminal.clone());
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 0);
+        assert!(
+            app.notices
+                .entries
+                .iter()
+                .any(|entry| entry.notice.message.contains("session flush: refused"))
+        );
+
+        // The report names no pane or storage detail, and is withdrawn as soon
+        // as a flush saves the return, even if the daemon refuses the receipt.
+        app.unsaved_chat_returns.insert(terminal.id, card.id);
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 1);
+        let details = app
+            .notices
+            .entries
+            .iter()
+            .find(|entry| entry.notice.message == UNSAVED)
+            .and_then(|entry| entry.notice.details.clone())
+            .unwrap();
+        assert!(!details.contains("flush") && !details.contains(&card.id.to_string()));
+        let _ = app.update(Message::TerminalHandoffsCommitted {
+            result: Ok(vec![(terminal.clone(), Err("receipt refused".into()))]),
+        });
+        assert_eq!(reports(&app), 0);
+        assert!(app.unsaved_chat_returns.is_empty());
+
+        // Closing the pane ends what the report was about.
+        app.unsaved_chat_returns.insert(terminal.id, card.id);
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 1);
+        Arc::make_mut(&mut app.durable)
+            .cards
+            .iter_mut()
+            .find(|state| state.id == card.id)
+            .unwrap()
+            .existence = Existence::Closed {
+            tombstone: crate::model::Tombstone {
+                operation_id: None,
+                closed_at_unix_ms: 1,
+                reason: Some("closed by user".into()),
+            },
+        };
+        let _ = app.update(flush_failed());
+        assert_eq!(reports(&app), 0);
     }
 
     #[test]
@@ -23303,17 +23473,14 @@ mod tests {
             .insert(card, CardRuntime::Repository(Box::new(runtime)));
 
         let _ = app.update(Message::CloseCard(card));
-        let close = app.update(Message::DiscardAndCloseRepository(card));
+        drop(app.update(Message::DiscardAndCloseRepository(card)));
 
         assert!(app.dirty_repository_close.is_none());
         assert!(matches!(
             app.cards.get(&card),
             Some(CardRuntime::Repository(runtime)) if !runtime.blocks_navigation()
         ));
-        assert!(matches!(
-            task_app_message(close),
-            Message::CloseCard(candidate) if candidate == card
-        ));
+        assert!(app.pane_close_owned(card));
     }
 
     #[test]
@@ -30264,6 +30431,7 @@ mod tests {
             terminal_recovery_attempts: HashSet::new(),
             retained_outputs: HashMap::new(),
             pending_terminal_handoffs: HashMap::new(),
+            unsaved_chat_returns: HashMap::new(),
             terminal_handoff_commit_inflight: false,
             settings_write_blocked: true,
             notices: NoticeLog::default(),
@@ -30314,9 +30482,13 @@ mod tests {
             automation_close_generation: 0,
             terminal_close: None,
             queued_card_closes: VecDeque::new(),
+            close_queue_advancing: false,
+            close_commit_delivered: None,
             terminal_close_attempts: HashSet::new(),
+            completed_release: None,
             terminal_close_generation: 0,
             closed_terminal_cards: HashSet::new(),
+            proven_gone_cards: HashSet::new(),
             worktree_operations: HashMap::new(),
             pending_panel_open: None,
             deferred_navigation: VecDeque::new(),

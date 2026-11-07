@@ -262,6 +262,46 @@ class LockHolders(unittest.TestCase):
         self.wait_for(self.holds, "holder")
         self.assertNotIn("note:", self.report())
 
+    def test_a_holder_waiting_for_another_lock_says_which(self):
+        other = self.root / "other.lock"
+        other.touch()
+        self.start("flock", str(other), "sleep", "60")
+        original = self.lock
+        self.lock = other
+        self.wait_for(self.holds, "other holder")
+        self.lock = original
+        self.start("flock", "--close", str(self.lock), "flock", str(other), "true")
+        self.wait_for(self.holds, "holder")
+        environment = os.environ | {"CAGENTS_BUILD_LOCK": str(other)}
+        def report():
+            return subprocess.run(
+                [sys.executable, "-I", "-B", str(TOOL), str(self.lock)],
+                capture_output=True, text=True, timeout=30, env=environment,
+            ).stdout
+        self.wait_for(lambda: "waiting for" in report(), "the note")
+        text = report()
+        self.assertIn(f"waiting for {other},", text)
+        self.assertNotIn("nothing holding this used CPU", text)
+
+    def test_a_gates_queue_head_waiting_for_a_slot_gets_no_note(self):
+        other = self.root / "slot.lock"
+        other.touch()
+        self.start("flock", str(other), "sleep", "60")
+        original = self.lock
+        self.lock = other
+        self.wait_for(self.holds, "slot holder")
+        self.lock = self.root / "gate.lock.queue"
+        self.lock.touch()
+        queue = self.lock
+        self.start("flock", "--close", str(queue), "flock", str(other), "true")
+        self.wait_for(self.holds, "queue head")
+        self.lock = original
+        report = subprocess.run(
+            [sys.executable, "-I", "-B", str(TOOL), str(queue)], capture_output=True, text=True,
+            timeout=30, env=os.environ | {"CAGENTS_BUILD_LOCK": str(other)},
+        ).stdout
+        self.assertNotIn(f"waiting for {other}", report)
+
     def test_a_queued_request_is_not_taken_for_a_hidden_holder(self):
         loader = importlib.machinery.SourceFileLoader("lock_holders_tool", str(TOOL))
         spec = importlib.util.spec_from_loader(loader.name, loader)
@@ -280,7 +320,8 @@ class LockHolders(unittest.TestCase):
         self.assertNotIn("note:", self.report())
 
     def test_each_kind_of_session_or_build_counts_without_a_warning(self):
-        for name in ("kwin_wayland", "niri", "native-evidence", "rustc", "cagents-cargo-gate", "build-disk-guard"):
+        for name in ("kwin_wayland", "niri", "native-evidence", "rustc", "cagents-cargo-gate", "build-disk-guard",
+                     "prune-build-dirs"):
             with self.subTest(name=name):
                 program = self.root / name
                 program.write_text(f'#!/bin/sh\nexec 9>>"{self.lock}"\nflock 9\nsleep 60 9>&- &\nwait\n')

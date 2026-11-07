@@ -306,7 +306,10 @@ fn pull_request_for(
     Some(convert(pull_request, contains))
 }
 
-fn convert(pull_request: &crate::github::PullRequest, contains_local_head: bool) -> PullRequest {
+pub(super) fn convert(
+    pull_request: &crate::github::PullRequest,
+    contains_local_head: bool,
+) -> PullRequest {
     let state = match pull_request.state.0.as_str() {
         "OPEN" => PullRequestState::Open,
         "MERGED" => PullRequestState::Merged,

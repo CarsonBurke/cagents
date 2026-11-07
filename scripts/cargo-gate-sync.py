@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Install origin/main's Cargo gate when main has changed it since the
 installed one.
 
@@ -33,7 +33,7 @@ INSTALLER = "scripts/install-cargo-gate"
 GATE_FILES = ["scripts/cargo-gate", "scripts/cargo-gate-command.py", "scripts/cargo-gate-sync.py",
               "scripts/cargo-gate-rustc-guard",
               "scripts/cargo-offload", "scripts/seed-build-dir", "scripts/build-disk-guard",
-              INSTALLER]
+              "scripts/prune-build-dirs", INSTALLER]
 
 
 def git(*arguments):

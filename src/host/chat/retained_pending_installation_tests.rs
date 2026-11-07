@@ -4,6 +4,9 @@ use std::{fs, path::Path};
 
 #[test]
 fn pending_uninstalled_adoption_publishes_one_retained_authority_tuple() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const CHILD: &str = "CAGENTS_PENDING_INSTALLATION_TEST";
     if std::env::var_os(CHILD).is_none() {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
@@ -23,6 +26,7 @@ fn pending_uninstalled_adoption_publishes_one_retained_authority_tuple() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &exact, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(CHILD, "1")
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",

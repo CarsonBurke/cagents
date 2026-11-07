@@ -1,13 +1,13 @@
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Condvar, Mutex},
+    sync::{Arc, Condvar, Mutex, OnceLock},
 };
 
 use crate::{
     model::{HostSessionProof, TerminalId},
     terminal_ipc::{
-        PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerEnvelopeRef,
-        ServerMessage, ServerResponse,
+        OlderClient, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope,
+        ServerEnvelopeRef, ServerMessage, ServerResponse,
     },
 };
 
@@ -49,6 +49,22 @@ impl Outbound {
             proof: Arc::clone(proof),
             message,
         }
+    }
+
+    /// This message as `client` receives it: in its envelope version, with a
+    /// reply it cannot decode replaced by a refusal. A notification it cannot
+    /// decode is withheld.
+    fn for_older(mut self, client: OlderClient) -> Option<Self> {
+        if !client.admits_message(&self.message) {
+            self.request_id?;
+            tracing::debug!(
+                protocol = client.protocol,
+                "refusing a reply an older protocol client cannot decode"
+            );
+            self.message = ServerMessage::Error(client.refusal());
+        }
+        self.version = client.protocol;
+        Some(self)
     }
 
     pub(crate) fn wire(&self) -> ServerEnvelopeRef<'_> {
@@ -191,6 +207,9 @@ pub(crate) struct DeliveryQueue {
     capacity: usize,
     state: Mutex<QueueState>,
     available: Condvar,
+    /// Set when the client opened the connection at an older protocol that
+    /// this daemon serves; every frame it is sent is then adapted to it.
+    older: OnceLock<OlderClient>,
 }
 
 impl DeliveryQueue {
@@ -207,7 +226,16 @@ impl DeliveryQueue {
                 aborted: false,
             }),
             available: Condvar::new(),
+            older: OnceLock::new(),
         }
+    }
+
+    /// Speaks `client`'s protocol for the rest of this connection. The
+    /// connection's first frame decides this. Frames are adapted as they are
+    /// sent, so only one sent before that frame arrives, such as a shutdown
+    /// notice, goes out in this protocol's version.
+    pub(crate) fn speak_older(&self, client: OlderClient) {
+        let _ = self.older.set(client);
     }
 
     /// Enqueues a message without allowing a slow client to apply backpressure
@@ -347,7 +375,13 @@ impl DeliveryQueue {
                 return None;
             }
             if let Some(message) = state.dequeue() {
-                return Some(message);
+                match self.older.get() {
+                    None => return Some(message),
+                    Some(client) => match message.for_older(*client) {
+                        Some(message) => return Some(message),
+                        None => continue,
+                    },
+                }
             }
             if state.close_after_drain {
                 return None;
@@ -431,6 +465,60 @@ mod tests {
             board: Box::new(board(revision)),
         };
         envelope
+    }
+
+    #[test]
+    fn an_older_client_receives_its_version_and_nothing_it_cannot_decode() {
+        // Knows the first seven messages (through Error) and the first two
+        // replies (Connected, Listed).
+        let older = crate::terminal_ipc::OlderClient::knowing(7, 7, 2);
+        let queue = DeliveryQueue::new(1, 16);
+        queue.speak_older(older);
+        let reply = |request_id, response| {
+            let mut envelope = redraw(TerminalId::new(), 0);
+            envelope.request_id = Some(request_id);
+            envelope.message = ServerMessage::Response { response };
+            envelope
+        };
+        queue
+            .push(reply(
+                1,
+                ServerResponse::Listed {
+                    terminals: Vec::new(),
+                },
+            ))
+            .unwrap();
+        queue.push(reply(2, ServerResponse::Detached)).unwrap();
+        let mut unknown = redraw(TerminalId::new(), 0);
+        unknown.message = ServerMessage::ChatChanged {
+            chat_id: TerminalId::new(),
+        };
+        queue.push(unknown).unwrap();
+        queue.push(redraw(TerminalId::new(), 9)).unwrap();
+        queue.close_after_drain();
+
+        let delivered: Vec<_> = std::iter::from_fn(|| queue.pop()).collect();
+        assert!(delivered.iter().all(|message| message.version == 7));
+        assert_eq!(
+            delivered.len(),
+            3,
+            "the undecodable notification is withheld"
+        );
+        assert!(matches!(
+            delivered[0].message,
+            ServerMessage::Response {
+                response: ServerResponse::Listed { .. }
+            }
+        ));
+        assert_eq!(delivered[1].request_id, Some(2));
+        assert!(matches!(
+            &delivered[1].message,
+            ServerMessage::Error(error) if error.code == ProtocolErrorCode::UnsupportedVersion
+        ));
+        assert!(matches!(
+            delivered[2].message,
+            ServerMessage::Redraw { generation: 9, .. }
+        ));
     }
 
     #[test]

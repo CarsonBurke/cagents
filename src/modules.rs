@@ -101,6 +101,8 @@ pub mod process;
 pub mod project_location;
 #[cfg(feature = "ui")]
 pub mod pull_request_review;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod pull_request_signals;
 pub mod recovery_authority;
 #[cfg(feature = "ui")]
 pub mod reorder;
@@ -128,6 +130,9 @@ pub mod tab_history;
 #[cfg(feature = "ui")]
 pub mod tab_strip;
 pub mod terminal;
+#[cfg(all(test, any(feature = "host", feature = "ui")))]
+pub(crate) mod test_tracing;
+pub(crate) mod transcript_cache;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod transcript_location;
 #[cfg(feature = "host")]

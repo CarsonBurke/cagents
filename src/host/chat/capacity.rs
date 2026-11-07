@@ -204,6 +204,7 @@ impl Drop for Reservation {
         if state.chat_spawning.get(&self.source.id) == Some(&self.source) {
             state.chat_spawning.remove(&self.source.id);
             state.inventory_generation += 1;
+            crate::daemon::wake();
         }
     }
 }
@@ -388,8 +389,14 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        // The reader publishes its read-only reason and its exit as separate
+        // events of one frame, and a snapshot can fall between them. Release
+        // inspection requires both, so wait for the last.
         let deadline = Instant::now() + Duration::from_secs(5);
-        while handle.snapshot(None).unwrap().read_only_reason.is_none() {
+        while !handle
+            .snapshot(None)
+            .is_some_and(|snapshot| snapshot.read_only_reason.is_some() && snapshot.exited)
+        {
             assert!(
                 Instant::now() < deadline,
                 "history initialization did not complete"
@@ -1086,13 +1093,8 @@ exit 0
         let (_directory, source, handle) = history_reader(&host, false);
         let proof = inspect(&host, source.id).unwrap().proof;
         let verified_registry = host.lock().unwrap().execution_registry.take().unwrap();
-        let blocked = inspect(&host, source.id).unwrap();
-        assert!(
-            blocked
-                .release_blocked
-                .unwrap()
-                .contains("registry is unavailable")
-        );
+        let blocked = inspect(&host, source.id).unwrap().release_blocked.unwrap();
+        assert!(blocked.contains("registry is unavailable"), "{blocked}");
         assert!(release(&host, &proof, false).is_err());
         assert!(
             !handle.is_completed(),

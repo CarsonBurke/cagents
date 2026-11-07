@@ -29,6 +29,8 @@ mod handle;
 pub use handle::Handle;
 #[cfg(test)]
 pub(crate) use handle::RetainedInputOutcome;
+/// Process evidence only, without the reader lease: no retirement authority.
+pub(crate) use retained_actor::execution_exit::abandoned as retained_actor_abandoned;
 pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
@@ -233,6 +235,24 @@ enum NativeOwnership {
         crate::daemon::holder_registry::Process,
     ),
 }
+/// Why the provider actor did not queue a command.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum QueueRefusal {
+    /// The actor has finished or is shutting down.
+    Closed,
+    /// Its command queue is full for now.
+    Full,
+}
+impl From<QueueRefusal> for String {
+    fn from(refusal: QueueRefusal) -> Self {
+        match refusal {
+            QueueRefusal::Closed => "Provider actor is no longer accepting commands",
+            QueueRefusal::Full => "Chat command queue is full",
+        }
+        .into()
+    }
+}
+
 impl LocalHandle {
     #[cfg(test)]
     pub(crate) fn start(
@@ -651,6 +671,13 @@ impl LocalHandle {
                 }
                 actor.publish_activity();
                 completed.store(native_closed && direct_closed, Ordering::Release);
+                if native_closed && direct_closed {
+                    // Completion can leave a detached daemon with no other
+                    // event. Publish once after the ownership flag, even when
+                    // its hidden observation was already consumed. Reuse the
+                    // existing helper-compatible metadata notification.
+                    actor.observe_next.store(true, Ordering::Release);
+                }
                 actor.observe_update();
                 if actor.visible.load(Ordering::Acquire) {
                     (actor.notify)(Update::Presentation);
@@ -716,18 +743,21 @@ impl LocalHandle {
     pub(super) fn enqueue_actor(
         &self,
         command: ActorCommand,
-    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, String> {
+    ) -> Result<crossbeam_channel::Receiver<Result<(), String>>, QueueRefusal> {
         if self.is_completed()
             || self.0.draining.load(Ordering::Acquire)
             || self.0.stop.load(Ordering::Acquire)
         {
-            return Err("Provider actor is no longer accepting commands".into());
+            return Err(QueueRefusal::Closed);
         }
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
             .try_send((command, reply))
-            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+            .map_err(|error| match error {
+                crossbeam_channel::TrySendError::Full(_) => QueueRefusal::Full,
+                crossbeam_channel::TrySendError::Disconnected(_) => QueueRefusal::Closed,
+            })?;
         self.wake();
         Ok(response)
     }
@@ -1219,6 +1249,10 @@ impl LocalHandle {
             .unwrap_or_else(|p| p.into_inner())
             .session_id
             .clone()
+    }
+    /// Whether the provider answered its initialize handshake.
+    pub(crate) fn is_ready(&self) -> bool {
+        self.0.state.lock().unwrap_or_else(|p| p.into_inner()).ready
     }
     /// Identity received from the provider, not the speculative launch selector.
     pub(crate) fn confirmed_session_id(&self) -> Option<String> {
@@ -2137,12 +2171,18 @@ impl Actor {
                         Err(error) => interrupt_error = error,
                     }
                 }
-                if self.pending.is_empty()
-                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
-                {
+                // A result that arrives before the interrupt's acknowledgement
+                // settles the turn, but only that acknowledgement says whether
+                // it was cancelled. Returning before it drops the outcome.
+                let settled = self.pending.is_empty()
+                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+                if settled && !self.adapter.outcome_pending() {
                     return Ok(());
                 }
                 if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
+                    if settled {
+                        return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
+                    }
                     return Err(format!(
                         "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
                     ));
@@ -5793,6 +5833,111 @@ mod tests {
         assert_eq!(state.error, None);
     }
 
+    fn codex_child_name_adapter(directory: &std::path::Path) -> Box<dyn Adapter> {
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Codex,
+            session_id: Some("parent-exact".into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "codex".into(),
+                arguments: Vec::new(),
+                working_directory: directory.into(),
+                environment: BTreeMap::from([(
+                    "CODEX_HOME".into(),
+                    directory.to_str().unwrap().into(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Build an owned-listener spec without creating a process or socket.
+        super::super::protocol::codex::create_with_listener(&launch, directory.join("unused.sock"))
+            .unwrap()
+            .1
+    }
+
+    #[test]
+    fn codex_child_name_survives_sparse_metadata_and_takes_a_genuine_rename() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = codex_child_name_adapter(directory.path());
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let hello = adapter.initialize().unwrap();
+        let initialized = adapter
+            .receive(json!({"id":hello.writes[0]["id"],"result":{
+                "codexHome":directory.path().to_str().unwrap(),"userAgent":"codex-child-name-fixture"
+            }}))
+            .unwrap();
+        let attach = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "thread/resume")
+            .unwrap();
+        let attached = adapter
+            .receive(json!({"id":attach["id"],"result":{
+                "thread":{"id":"parent-exact","status":{"type":"idle"}},
+                "initialTurnsPage":{"data":[],"nextCursor":null}
+            }}))
+            .unwrap();
+        let skills = initialized
+            .writes
+            .iter()
+            .find(|frame| frame["method"] == "skills/list")
+            .unwrap();
+        let ready = adapter
+            .receive(json!({"id":skills["id"],"result":{"data":[]}}))
+            .unwrap();
+        assert!(ready.events.contains(&Event::Ready(true)));
+        for event in attached.events.into_iter().chain(ready.events) {
+            apply_event(&mut state, &mut indices, event);
+        }
+        let mut publish = |thread: Value| {
+            let mut thread = thread;
+            thread["parentThreadId"] = json!("parent-exact");
+            let step = adapter
+                .receive(json!({"method":"thread/started","params":{"thread":thread}}))
+                .unwrap();
+            for event in step.events {
+                apply_event(&mut state, &mut indices, event);
+            }
+            state
+                .subagents
+                .iter()
+                .map(|agent| (agent.id.clone(), agent.kind.clone()))
+                .collect::<Vec<_>>()
+        };
+        let names = |pairs: &[(&str, &str)]| {
+            pairs
+                .iter()
+                .map(|(id, name)| (id.to_string(), name.to_string()))
+                .collect::<Vec<_>>()
+        };
+        // A role is not a name: the unnamed child stays unnamed for the tabs
+        // to label, rather than showing "worker" or a provider default.
+        assert_eq!(
+            publish(json!({"id":"unnamed","agentRole":"worker"})),
+            names(&[("unnamed", "")])
+        );
+        assert_eq!(
+            publish(json!({"id":"child","agentNickname":" Scout ","agentRole":"worker"})),
+            names(&[("unnamed", ""), ("child", "Scout")])
+        );
+        for sparse in [
+            json!({"id":"child","agentRole":"explorer"}),
+            json!({"id":"child","agentNickname":null}),
+            json!({"id":"child","agentNickname":" \t\n"}),
+        ] {
+            assert_eq!(
+                publish(sparse),
+                names(&[("unnamed", ""), ("child", "Scout")]),
+                "sparse metadata keeps the known name"
+            );
+        }
+        assert_eq!(
+            publish(json!({"id":"child","agentNickname":"Pilot"})),
+            names(&[("unnamed", ""), ("child", "Pilot")]),
+            "a genuine new nickname replaces the old one"
+        );
+    }
+
     #[test]
     fn child_metadata_survives_sparse_updates_and_completion_clears_waiting() {
         let mut state = Snapshot::default();
@@ -7573,6 +7718,82 @@ mod tests {
         assert!(!snapshot.ready);
         assert!(snapshot.error.is_none(), "{snapshot:?}");
         assert!(handle.failure().is_none());
+    }
+
+    // Closing a busy turn sends Claude an interrupt. When the turn's result was
+    // already on its way, it arrives before the interrupt's acknowledgement,
+    // and only that acknowledgement decides whether the turn was cancelled.
+    // Close must not return in between, or the settled turn has no outcome.
+    #[test]
+    fn claude_close_keeps_a_settled_turn_outcome_until_its_interrupt_is_acknowledged() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            r#"#!/usr/bin/python3
+import json, sys, time
+def send(value): print(json.dumps(value), flush=True)
+session = next(argument.split('=', 1)[1] for argument in sys.argv[1:]
+               if argument.startswith('--session-id='))
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame.get('type') == 'user':
+        send({'type': 'system', 'subtype': 'init', 'session_id': session})
+        send(dict(frame, session_id=session))
+        send({'type': 'assistant', 'uuid': 'answer', 'session_id': session,
+              'message': {'id': 'answer', 'role': 'assistant',
+                          'content': [{'type': 'text', 'text': 'working'}]}})
+    elif frame.get('type') == 'control_request':
+        if frame['request'].get('subtype') == 'interrupt':
+            send({'type': 'result', 'uuid': 'final', 'subtype': 'success', 'is_error': False,
+                  'session_id': session, 'usage': {'input_tokens': 1, 'output_tokens': 1}})
+            time.sleep(0.5)
+        send({'type': 'control_response', 'response': {'subtype': 'success',
+              'request_id': frame['request_id'], 'response': {}}})
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AttentionContext { evidence, .. } = update {
+                let _ = send.send(evidence);
+            }
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "A turn that settles as it is closed".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        until(&handle, |snapshot| {
+            snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == "working")
+                })
+        });
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+        let outcomes: Vec<_> = receive.try_iter().map(|evidence| evidence.kind).collect();
+        assert_eq!(outcomes, vec![crate::notifications::Kind::Cancelled]);
     }
 
     #[test]

@@ -55,10 +55,13 @@ pub(in crate::host) fn isolated(name: &str) -> Option<tempfile::TempDir> {
     }
     install_claude(&root.join("bin/claude"));
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-    // Keep the caller's delegation inherited unchanged, without inspecting or
-    // copying its value. Every other environment input is fixture-owned.
+    // Keep the caller's delegation and optional matched helper inherited
+    // unchanged. Retained mode still requires its separate explicit opt-in;
+    // ordinary service fixtures continue using the local transport.
     for (name, _) in std::env::vars_os() {
-        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV) {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && name != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+        {
             command.env_remove(name);
         }
     }
@@ -2176,8 +2179,8 @@ fn committed_native_dispatch_is_idempotent_and_children_have_real_scoped_authori
 }
 
 #[test]
-fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery() {
-    if isolated("graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery")
+fn graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_process() {
+    if isolated("graceful_daemon_restart_keeps_delegated_agents_that_close_without_their_process")
         .is_some()
     {
         return;
@@ -2202,6 +2205,17 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
 
     super::super::finish_chat_shutdown(&host).unwrap();
     assert!(!host.lock().unwrap().chats[&source.id()].handle.owns_work());
+    // The stop ends the process, not the agent: it stays listed and its card
+    // can resume, but the stopped process can no longer act for it.
+    {
+        let registry = registry(&host).unwrap();
+        let registry = registry.lock().unwrap();
+        let stopped = registry.agent(agent.id).unwrap();
+        assert!(!stopped.closed);
+        assert_eq!(stopped.session.as_ref(), Some(&source));
+        assert!(registry.agent_process_ended(agent.id).unwrap());
+    }
+    assert!(origin(&host, &token).is_err());
     drop(host);
     let mut state = HostState::new(HostSessionProof {
         host_session_id: HostSessionId::new("restarted-execution-fixture"),
@@ -2210,8 +2224,41 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
     });
     state.install_model(Registry::at(&path).unwrap());
     let restarted = Arc::new(crate::host::state::HostLock::new(state));
-    // The close command remains idempotent even though the old actor is gone
-    // and any UI resume would carry the new daemon's proof.
+    assert_eq!(
+        registry(&restarted)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agents(None)
+            .unwrap()
+            .len(),
+        1
+    );
+    // Work for the stopped agent is never sent to a process that is gone; it
+    // fails with a way forward instead.
+    let refused = submit(
+        &restarted,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(agent.id),
+            prompt: "Never reaches the stopped provider".into(),
+            idempotency_key: "after-stop".into(),
+        },
+    )
+    .unwrap();
+    let refused = settled(&restarted, refused.run.id);
+    assert_eq!(refused.state, State::Failed, "{refused:?}");
+    assert!(
+        refused
+            .result
+            .diagnostic
+            .as_deref()
+            .is_some_and(|text| text.contains("reopen its conversation")),
+        "{refused:?}"
+    );
+    // Closing needs no teardown proof from the gone actor: the stop recorded
+    // that its process ended.
     assert!(
         close(&restarted, &Authority::default(), agent.id)
             .unwrap()
@@ -2227,9 +2274,12 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
             .is_empty()
     );
     assert_eq!(
-        status(&restarted, &Authority::default(), agent.id)
+        registry(&restarted)
             .unwrap()
-            .1
+            .lock()
+            .unwrap()
+            .agent_run(accepted.run.id)
+            .unwrap()
             .state,
         State::Succeeded
     );
@@ -2246,8 +2296,8 @@ fn graceful_daemon_restart_retires_completed_delegated_agents_before_ui_recovery
 }
 
 #[test]
-fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved() {
-    if isolated("failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_saved")
+fn failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved() {
+    if isolated("failed_shutdown_stop_keeps_process_authority_until_the_stop_can_be_saved")
         .is_some()
     {
         return;
@@ -2256,7 +2306,7 @@ fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_sav
     let accepted = submit(&host, &Authority::default(), request).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let fault = rusqlite::Connection::open(path).unwrap();
-    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF closed ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
+    fault.execute_batch("CREATE TRIGGER refuse_shutdown_retirement BEFORE UPDATE OF record ON agents BEGIN SELECT RAISE(FAIL, 'fixture retirement unavailable'); END;").unwrap();
     assert!(
         super::super::finish_chat_shutdown(&host)
             .unwrap_err()
@@ -2279,10 +2329,26 @@ fn failed_shutdown_retirement_preserves_the_agent_until_exact_cleanup_can_be_sav
             .unwrap()
             .is_some()
     );
+    assert!(
+        !registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_process_ended(accepted.agent.id)
+            .unwrap()
+    );
     fault
         .execute_batch("DROP TRIGGER refuse_shutdown_retirement")
         .unwrap();
     super::super::finish_chat_shutdown(&host).unwrap();
+    assert!(
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_process_ended(accepted.agent.id)
+            .unwrap()
+    );
     assert!(
         close(&host, &Authority::default(), accepted.agent.id)
             .unwrap()
@@ -2431,7 +2497,7 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     );
     super::super::finish_chat_shutdown(&host).unwrap();
     assert!(
-        registry(&host)
+        !registry(&host)
             .unwrap()
             .lock()
             .unwrap()
@@ -2450,6 +2516,214 @@ fn fresh_codex_execution_uses_owned_listener_and_correlated_provider_result() {
     );
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
     assert_eq!(server.join().unwrap(), 1);
+}
+
+/// An unverified Codex (ReconnectOnly) agent is not carried through an update:
+/// the successor daemon relaunches its server and resumes the saved thread.
+/// The agent must then follow its relaunched conversation instead of refusing
+/// every prompt as an unavailable conversation, through successive updates.
+#[test]
+fn updated_codex_agent_answers_through_its_relaunched_server() {
+    if isolated("updated_codex_agent_answers_through_its_relaunched_server").is_some() {
+        return;
+    }
+    use serde_json::{Value, json};
+    const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    let program = root.join("bin/codex");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let Destination::New(spec) = &mut request.destination else {
+        unreachable!()
+    };
+    spec.provider = Provider::Codex;
+    // Each server the daemon launches: its methods in order and its prompts.
+    let server_root = root.clone();
+    let server = std::thread::spawn(move || {
+        let mut served = Vec::new();
+        for launch in 1..=3 {
+            let deadline = Instant::now() + Duration::from_secs(20);
+            let socket = loop {
+                let launches =
+                    std::fs::read_to_string(server_root.join("codex-launches")).unwrap_or_default();
+                if launches.lines().count() >= launch
+                    && let Ok(arguments) =
+                        std::fs::read_to_string(server_root.join("codex-arguments"))
+                    && let Some(socket) = arguments
+                        .lines()
+                        .find_map(|arg| arg.strip_prefix("unix://"))
+                {
+                    break std::path::PathBuf::from(socket);
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Codex server {launch} was not launched"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            // The stand-in, not the stopped stub, owned the previous socket.
+            let _ = std::fs::remove_file(&socket);
+            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        assert!(
+                            Instant::now() < deadline,
+                            "adapter did not join Codex server {launch}"
+                        );
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("{error}"),
+                }
+            };
+            stream.set_nonblocking(false).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(20)))
+                .unwrap();
+            let mut websocket = tungstenite::accept(stream).unwrap();
+            let mut methods = Vec::new();
+            let mut prompts = 0;
+            loop {
+                let message = match websocket.read() {
+                    Ok(message) if message.is_close() => break,
+                    Ok(message) => message,
+                    Err(_) => break,
+                };
+                let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+                let Some(id) = frame.get("id") else { continue };
+                let method = frame["method"].as_str().unwrap().to_owned();
+                methods.push(method.clone());
+                let thread =
+                    json!({"id":THREAD,"canAcceptDirectInput":true,"status":{"type":"idle"}});
+                let result = match method.as_str() {
+                    // A version outside VERIFIED_CODEX_VERSIONS, as in production.
+                    "initialize" => {
+                        json!({"userAgent":"codex/0.166.0", "codexHome":server_root.join("home/.codex")})
+                    }
+                    "thread/start" => json!({"thread":thread,"model":"fixture-model"}),
+                    "thread/resume" => {
+                        assert_eq!(frame["params"]["threadId"], THREAD);
+                        json!({"thread":thread,"model":"fixture-model"})
+                    }
+                    "model/list" | "skills/list" => json!({"data":[]}),
+                    "thread/queue/list" | "thread/list" | "thread/turns/list" => {
+                        json!({"data":[],"nextCursor":null})
+                    }
+                    "turn/start" => {
+                        prompts += 1;
+                        json!({"turn":{"id":format!("turn-{launch}")}})
+                    }
+                    "thread/read" => json!({"thread":{"id":THREAD,"turns":[]}}),
+                    method => panic!("unexpected Codex request {method}"),
+                };
+                if websocket
+                    .send(tungstenite::Message::Text(
+                        json!({"id":id,"result":result}).to_string().into(),
+                    ))
+                    .is_err()
+                {
+                    break;
+                }
+                if method == "turn/start" {
+                    let answer = format!("CODEX_SERVER_{launch}_ANSWER");
+                    websocket.send(tungstenite::Message::Text(json!({"method":"turn/completed","params":{"threadId":THREAD,"turn":{"id":format!("turn-{launch}"),"status":"completed","items":[{"id":format!("answer-{launch}"),"type":"agentMessage","text":answer}]}}}).to_string().into())).unwrap();
+                }
+            }
+            served.push((methods, prompts));
+        }
+        served
+    });
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    let run = settled(&host, accepted.run.id);
+    assert_eq!(run.state, State::Succeeded, "{run:?}");
+    assert_eq!(run.result.text, "CODEX_SERVER_1_ANSWER");
+    let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+    let Some(HostedSession::Chat(issued)) = agent.session else {
+        panic!("Codex agent has no hosted conversation")
+    };
+    assert_eq!(
+        host.lock().unwrap().chats[&issued.id]
+            .handle
+            .native_continuity(),
+        chat::NativeContinuity::ReconnectOnly
+    );
+    // The previous daemon prepares its checkpoint and stops; its successor
+    // restores the checkpoint from the same registry.
+    let update = |host: SharedHost, incarnation: &str| {
+        let control_gate = host.lock().unwrap().control_gate.clone();
+        let control = control_gate.write().unwrap();
+        let capability = host
+            .lock()
+            .unwrap()
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        crate::host::state::prepare_upgrade(&host, capability, false).unwrap();
+        drop(control);
+        let (shutdown, _) = host.lock().unwrap().graceful_shutdown();
+        super::super::finish_chat_shutdown(&host).unwrap();
+        for terminal in shutdown {
+            let _ = terminal.shutdown();
+        }
+        drop(host);
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new(format!("{incarnation}-execution-fixture")),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: HostIncarnation::new(incarnation),
+        };
+        let mut state = HostState::new(proof.clone());
+        state.install_model(Registry::at(&path).unwrap());
+        let successor = Arc::new(crate::host::state::HostLock::new(state));
+        assert!(
+            crate::host::state::restore_upgrade(&successor)
+                .unwrap()
+                .is_empty()
+        );
+        (successor, proof)
+    };
+    let mut host = host;
+    for (launch, incarnation) in [(2, "first-update"), (3, "second-update")] {
+        let (successor, proof) = update(host, incarnation);
+        host = successor;
+        let (agent, _) = status(&host, &Authority::default(), accepted.agent.id).unwrap();
+        let Some(HostedSession::Chat(relaunched)) = agent.session else {
+            panic!("the updated agent lost its hosted conversation")
+        };
+        assert_eq!(relaunched.id, issued.id);
+        assert_eq!(relaunched.proof.as_ref(), Some(&proof));
+        let followup = submit(
+            &host,
+            &Authority::default(),
+            Submit {
+                name: None,
+                destination: Destination::Existing(accepted.agent.id),
+                prompt: format!("after the {incarnation}"),
+                idempotency_key: incarnation.into(),
+            },
+        )
+        .unwrap();
+        let after = settled(&host, followup.run.id);
+        assert_eq!(after.state, State::Succeeded, "{incarnation}: {after:?}");
+        assert_eq!(after.result.text, format!("CODEX_SERVER_{launch}_ANSWER"));
+    }
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+    let served = server.join().unwrap();
+    assert_eq!(served[0].1, 1);
+    for (methods, prompts) in &served[1..] {
+        assert!(
+            methods.iter().any(|method| method == "thread/resume")
+                && !methods.iter().any(|method| method == "thread/start"),
+            "each relaunched server must resume the saved thread: {methods:?}"
+        );
+        assert_eq!(*prompts, 1, "each follow-up reached its server once");
+    }
 }
 
 #[test]

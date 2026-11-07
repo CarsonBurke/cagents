@@ -195,7 +195,31 @@ use crate::{
 /// compatibility: replace the matched daemon before sending the new budgets.
 /// Version 127 combines both contracts in the matched set. Version 126 is
 /// reserved for the separate native Goal integration and is not adopted here.
-pub const PROTOCOL_VERSION: u16 = 127;
+/// Version 128 appends the startup-state inspection request and its response.
+/// A reopened window sends it to the daemon an update just started, so a
+/// same-numbered older daemon that would drop the undecodable frame must be
+/// refused at connection instead. Version 128 was published by the install
+/// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
+/// daemons are update sources this release inspects and replaces, not peers.
+/// Version 129 is this release's matched set with the same extension.
+/// Version 151 appends a conversation's inferred pull requests: the
+/// `WatchConversationPullRequests` request, its `work::Response` and the
+/// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
+/// and are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 151;
+/// The install candidate line's protocol. Every message an update exchanges
+/// with its daemon (Connect, the upgrade preview and preparation, and the
+/// inspector's frozen and saved-history requests) has this release's
+/// encoding, so an update may speak it as a source with this release's
+/// client. Its daemons and windows are never peers. Its CLI, which chats
+/// carried across an update keep running, is served as an [`OlderClient`]:
+/// the one wire difference, the device account `Restore` operation this
+/// release appended, is a request that CLI cannot send.
+pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+
+mod older_clients;
+pub use older_clients::{OlderClient, is_cli_peer, older_client};
+
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -549,6 +573,17 @@ pub enum ClientRequest {
         authority: crate::agent_execution::Authority,
         request: crate::channel_work_api::Request,
     },
+    /// Whether startup recovery finished, is still awaiting original owners,
+    /// or kept them after a failure. Answered during recovery, unlike every
+    /// request that recovery refuses with the same `TerminalUnavailable`.
+    StartupState,
+    /// Subscribes this connection to the pull requests one conversation
+    /// worked on or mentioned and returns them, as
+    /// [`crate::work::Response::WatchingConversation`]. Each later change
+    /// arrives as [`ServerMessage::ConversationPullRequests`].
+    WatchConversationPullRequests {
+        conversation: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -764,6 +799,14 @@ pub enum ServerMessage {
         revision: u64,
         board: Box<crate::work::Board>,
     },
+    /// A conversation's pull requests after a change, delivered only to a
+    /// connection that subscribed with
+    /// [`ClientRequest::WatchConversationPullRequests`].
+    ConversationPullRequests {
+        conversation: TerminalId,
+        revision: u64,
+        pull_requests: Box<crate::work::ConversationPullRequests>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -883,6 +926,20 @@ pub enum ServerResponse {
     },
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
+    StartupState(StartupState),
+}
+
+/// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StartupState {
+    /// Startup finished; ordinary requests are admitted.
+    Ready,
+    /// Adopted original owners whose startup outcome is still pending.
+    Restoring { awaiting: u64 },
+    /// Startup failed and kept original ownership. This does not resolve by
+    /// waiting: only inspection and explicit Close are admitted.
+    Retained { detail: String },
 }
 
 /// Maximum compact inventory rows in one capacity response.

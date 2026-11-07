@@ -64,7 +64,7 @@ fn discovery_error(error: UpdateError) -> crate::control::ControlError {
 fn discovered_version(bytes: &[u8]) -> Result<u16, UpdateError> {
     let (version, _) = postcard::take_from_bytes::<u16>(bytes)
         .map_err(|_| invalid("Malformed source version header"))?;
-    if !matches!(version, 77 | 119 | crate::terminal_ipc::PROTOCOL_VERSION) {
+    if !super::is_qualified_source(version) {
         return Err(invalid(
             "Source protocol has no qualified upgrade coordinator",
         ));
@@ -536,13 +536,18 @@ mod tests {
     fn source_version_header_precedes_old_error_dto_and_rejects_unknown_versions() {
         // A version-mismatch reply from the immutable source may contain an
         // error variant/layout the new normal client cannot decode at all.
-        for version in [77u16, 119, crate::terminal_ipc::PROTOCOL_VERSION] {
+        for version in [
+            77u16,
+            119,
+            crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
+            crate::terminal_ipc::PROTOCOL_VERSION,
+        ] {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
             bytes.extend_from_slice(&[255, 255, 255, 255, 255]);
             assert_eq!(discovered_version(&bytes).unwrap(), version);
             assert!(postcard::from_bytes::<ServerEnvelope>(&bytes).is_err());
         }
-        for version in [0u16, 68, 78, u16::MAX] {
+        for version in [0u16, 68, 78, 127, u16::MAX] {
             if version != crate::terminal_ipc::PROTOCOL_VERSION {
                 assert!(discovered_version(&postcard::to_stdvec(&version).unwrap()).is_err());
             }
@@ -739,6 +744,201 @@ mod tests {
         } else {
             assert!(client.prepare_confirmed_upgrade(observed, false).is_err());
         }
+        drop(client);
+        worker.join().unwrap();
+    }
+
+    /// The candidate line (128) is spoken with this release's types, so the
+    /// messages an update exchanges with it must keep the variant positions
+    /// that line published. Moving one would silently mis-decode its replies.
+    #[test]
+    fn update_messages_keep_the_candidate_lines_variant_positions() {
+        let tag = |bytes: Vec<u8>| bytes[0];
+        let requests = [
+            (
+                ClientRequest::Connect {
+                    expected_host: None,
+                    resume: Vec::new(),
+                },
+                0,
+            ),
+            (ClientRequest::List, 1),
+            (ClientRequest::ChatList, 29),
+            (
+                ClientRequest::UpgradeImpact {
+                    policy: impact::Policy::WhenIdle,
+                },
+                36,
+            ),
+            (
+                ClientRequest::PrepareConfirmedUpgrade {
+                    impact: impact(),
+                    relaunch_agents: false,
+                },
+                37,
+            ),
+        ];
+        for (request, expected) in requests {
+            assert_eq!(tag(postcard::to_stdvec(&request).unwrap()), expected);
+        }
+        let responses = [
+            (
+                ServerResponse::Connected {
+                    proof: proof(),
+                    resumed: Vec::new(),
+                },
+                0,
+            ),
+            (
+                ServerResponse::Listed {
+                    terminals: Vec::new(),
+                },
+                1,
+            ),
+            (
+                ServerResponse::ChatListed {
+                    sessions: Vec::new(),
+                },
+                13,
+            ),
+            (ServerResponse::UpgradeImpact(impact()), 9),
+            (
+                ServerResponse::UpgradePrepared {
+                    terminals: 1,
+                    chats: 1,
+                },
+                17,
+            ),
+        ];
+        for (response, expected) in responses {
+            assert_eq!(tag(postcard::to_stdvec(&response).unwrap()), expected);
+        }
+    }
+
+    /// The install candidate line's daemon (128) is reached through discovery
+    /// and then this release's client speaking 128, through the preview and
+    /// the confirmed preparation, and its update is this release's to run.
+    #[cfg(feature = "host")]
+    #[test]
+    fn authenticated_candidate_line_source_previews_and_prepares_at_its_own_protocol() {
+        use std::os::unix::net::UnixListener;
+        let protocol = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("cagentsd.sock");
+        let paths = crate::daemon::RuntimePaths {
+            directory: directory.path().to_owned(),
+            socket: socket.clone(),
+            lock: directory.path().join("cagentsd.lock"),
+        };
+        let mut pinned = proof();
+        pinned.boot_id = crate::daemon::read_boot_id().unwrap();
+        let expected_proof = pinned.clone();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &pinned).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut expected = impact();
+        expected.capability.proof = pinned.clone();
+        expected.policy = impact::Policy::WhenIdle;
+        expected.sessions[0].disposition = impact::Disposition::Resumes;
+        expected.sessions[0].interrupted_subagents.clear();
+        let answer = expected.clone();
+        let reviewed = expected.clone();
+        let worker = std::thread::spawn(move || {
+            let deadline = || Instant::now() + Duration::from_secs(2);
+            let (mut discovery, _) = listener.accept().unwrap();
+            let request: ClientEnvelope =
+                postcard::from_bytes(&read(&mut discovery, deadline()).unwrap()).unwrap();
+            assert_eq!(request.version, crate::terminal_ipc::PROTOCOL_VERSION);
+            // The source refuses the newer number; only its header is read.
+            let mut refusal = postcard::to_stdvec(&protocol).unwrap();
+            refusal.extend_from_slice(&[255, 255, 255]);
+            write(&mut discovery, &refusal, deadline()).unwrap();
+            drop(discovery);
+            let (mut stream, _) = listener.accept().unwrap();
+            let reply = |stream: &mut UnixStream, request_id: u64, response: ServerResponse| {
+                let envelope = ServerEnvelope {
+                    version: protocol,
+                    request_id: Some(request_id),
+                    proof: pinned.clone(),
+                    message: ServerMessage::Response { response },
+                };
+                write(stream, &postcard::to_stdvec(&envelope).unwrap(), deadline()).unwrap();
+            };
+            let connect: ClientEnvelope =
+                postcard::from_bytes(&read(&mut stream, deadline()).unwrap()).unwrap();
+            assert_eq!(connect.version, protocol);
+            assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+            reply(
+                &mut stream,
+                connect.request_id,
+                ServerResponse::Connected {
+                    proof: pinned.clone(),
+                    resumed: Vec::new(),
+                },
+            );
+            let preview: ClientEnvelope =
+                postcard::from_bytes(&read(&mut stream, deadline()).unwrap()).unwrap();
+            assert_eq!(preview.version, protocol);
+            assert_eq!(preview.proof.as_ref(), Some(&pinned));
+            assert!(matches!(
+                preview.request,
+                ClientRequest::UpgradeImpact {
+                    policy: impact::Policy::WhenIdle
+                }
+            ));
+            reply(
+                &mut stream,
+                preview.request_id,
+                ServerResponse::UpgradeImpact(answer),
+            );
+            let prepare: ClientEnvelope =
+                postcard::from_bytes(&read(&mut stream, deadline()).unwrap()).unwrap();
+            assert_eq!(prepare.version, protocol);
+            match prepare.request {
+                ClientRequest::PrepareConfirmedUpgrade {
+                    impact,
+                    relaunch_agents,
+                } => {
+                    assert_eq!(impact, reviewed);
+                    assert!(!relaunch_agents);
+                }
+                _ => panic!("unexpected preparation request"),
+            }
+            reply(
+                &mut stream,
+                prepare.request_id,
+                ServerResponse::UpgradePrepared {
+                    terminals: 1,
+                    chats: 1,
+                },
+            );
+        });
+        let mut client = super::super::Client::connect(&socket).unwrap();
+        assert_eq!(client.protocol(), protocol);
+        assert_eq!(client.proof(), &expected_proof);
+        let layout = |version: &str| crate::update::InstallLayout {
+            prefix: "/owned/install".into(),
+            version_root: Path::new("/owned/install/versions").join(version),
+            version: version.into(),
+        };
+        let current = layout("new");
+        let previous = layout("old");
+        assert_eq!(
+            super::super::super::installed_update_worker(
+                &current,
+                &current.version_root,
+                Some(&previous),
+                client.protocol(),
+                Some(client.proof()),
+            )
+            .unwrap(),
+            "new"
+        );
+        let observed = client.upgrade_impact(impact::Policy::WhenIdle).unwrap();
+        assert_eq!(observed, expected);
+        assert_eq!(
+            client.prepare_confirmed_upgrade(observed, false).unwrap(),
+            (1, 1)
+        );
         drop(client);
         worker.join().unwrap();
     }

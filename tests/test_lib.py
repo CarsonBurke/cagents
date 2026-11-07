@@ -35,7 +35,7 @@ program = Path(sys.argv[0]).name
 cargo = program == "cargo"
 phase = ("metadata" if cargo and sys.argv[1:2] == ["metadata"] else
     "compiler" if cargo else "disk" if program == "df" else
-    "prune" if program == "prune-cargo-build-dirs" else
+    "prune" if program == "prune-build-dirs" else
     "list-ignored" if "--ignored" in sys.argv else
     "list-all" if "--list" in sys.argv else "test")
 
@@ -78,7 +78,9 @@ if config.get("hold") == phase:
 if phase == "metadata":
     if config.get("metadata_exit"):
         raise SystemExit(config["metadata_exit"])
-    metadata = dict(target_directory=str(root / "owned-target"))
+    metadata = {}
+    if not config.get("metadata_omit_target_directory"):
+        metadata["target_directory"] = str(root / "owned-target")
     if not config.get("metadata_omit_build_directory"):
         metadata["build_directory"] = config.get("metadata_build_directory", str(root / "owned-build"))
     print(json.dumps(metadata, separators=(",", ":")))
@@ -224,7 +226,7 @@ class TestLib(unittest.TestCase):
         return [event for event in events if phase is None or event["phase"] == phase]
 
     def clear(self):
-        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune"):
+        for name in ("events.jsonl", "release", "pruned", "slot.lock.prune", "slot.lock.prune.done"):
             (self.root / name).unlink(missing_ok=True)
         for path in self.root.glob("*.ready"):
             path.unlink()
@@ -250,13 +252,18 @@ class TestLib(unittest.TestCase):
         self.assertEqual(self.events("test"), [])
 
     def disk_policy(self):
-        # Neither a real disk query nor an installed host pruner can be used.
-        for name in ("df", "prune-cargo-build-dirs"):
-            path = self.root / "bin" / name
+        # Neither a real disk query nor the real pruner beside the guard can
+        # be used, and the pruner's schedule would add runs of its own.
+        for path in (self.root / "bin/df", self.root / "scripts/prune-build-dirs"):
             path.write_text(TOOL)
             path.chmod(0o700)
         environment = self.env.copy()
         environment.pop("CAGENTS_BUILD_FREE_FLOOR_GIB")
+        environment["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "0"
+        environment["CAGENTS_BUILD_PRUNE_STATE"] = str(self.root / "pruner")
+        # A complete run just now: below the floor the guard starts no
+        # background one, whose events would interleave with these.
+        (self.root / "pruner.scheduled").touch()
         return environment
 
     def assert_one_build_then_direct_harness(self):
@@ -312,8 +319,12 @@ class TestLib(unittest.TestCase):
                 events = self.events()
                 self.assertEqual([event["phase"] for event in events], ["metadata", "disk", "prune", "disk"])
                 self.assertTrue(all(not event["held"] for event in events), events)
+                pruner = str(self.root / "pruner")
                 self.assertEqual(self.events("prune")[0]["arguments"],
-                                 ["--apply", "--orphan-grace", "0", "--max-idle", "36500"])
+                                 ["--apply", "--max-idle", "7", "--lock", pruner + ".lock",
+                                  "--log", pruner + ".tsv", "--stamp", pruner + ".scheduled",
+                                  "--keep", str(self.root / "owned-build"),
+                                  "--orphan-hours", "0", "--budget", "300", "--wait"])
                 self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])
                 self.assertFalse(Path(str(self.lock) + ".queue").exists(), "guard must refuse before admission")
                 self.assert_no_test()
@@ -324,17 +335,18 @@ class TestLib(unittest.TestCase):
         self.configure(size_gib=100, free_gib=4, after_prune_free_gib=5)
         result = self.invoke("cli", "module::one", env=environment)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("reclaiming removed worktrees", result.stderr)
+        self.assertIn("reclaiming unused build directories", result.stderr)
         self.assertNotIn("refusing to build", result.stderr)
         self.assertEqual([event["phase"] for event in self.events()[:5]],
                          ["metadata", "disk", "prune", "disk", "compiler"])
         self.assertTrue(self.events("compiler")[0]["held"])
         self.assert_one_build_then_direct_harness()
 
-    def test_failed_empty_or_target_only_metadata_bypasses_disk_guard(self):
+    def test_failed_or_pathless_metadata_bypasses_disk_guard(self):
         environment = self.disk_policy()
-        for config in ({"metadata_exit": 37}, {"metadata_build_directory": ""},
-                       {"metadata_omit_build_directory": True}):
+        for config in ({"metadata_exit": 37},
+                       {"metadata_build_directory": "", "metadata_omit_target_directory": True},
+                       {"metadata_omit_build_directory": True, "metadata_omit_target_directory": True}):
             with self.subTest(config=config):
                 self.clear()
                 # The fake disk would refuse this build if the guard ran.
@@ -346,6 +358,23 @@ class TestLib(unittest.TestCase):
                 self.assertEqual([event["phase"] for event in self.events()[:2]], ["metadata", "compiler"])
                 self.assertTrue(self.events("compiler")[0]["held"])
                 self.assert_one_build_then_direct_harness()
+
+    def test_disk_guard_uses_the_build_directory_else_the_target(self):
+        environment = self.disk_policy()
+        for name in ("owned-build", "owned-target"):
+            (self.root / name).mkdir()
+        for config, guarded in (({}, "owned-build"),
+                                ({"metadata_build_directory": ""}, "owned-target"),
+                                ({"metadata_omit_build_directory": True}, "owned-target")):
+            with self.subTest(config=config):
+                self.clear()
+                # The fake disk refuses, so the path it was asked about is the guarded one.
+                self.configure(size_gib=100, free_gib=0, **config)
+                result = self.invoke("cli", "module::one", env=environment)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertEqual(self.events("disk")[0]["arguments"],
+                                 ["-Pk", "--", str(self.root / guarded)])
+                self.assertEqual(self.events("compiler"), [])
 
     def test_artifact_must_be_unique_matching_absolute_and_runnable(self):
         for variant in ("missing", "duplicate", "wrong-manifest", "wrong-name", "wrong-kind",

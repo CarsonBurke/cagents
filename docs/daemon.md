@@ -28,6 +28,27 @@ handshake rejects incompatible clients without terminating their PTYs.
 Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
 together.
 
+A session carried across an update keeps running the `cagents` CLI it was
+launched with. The daemon still serves that CLI when its protocol is listed as
+an older client: currently protocol 128, the 0.1.3+local.c68275e94 line. Only
+a peer running the `cagents` executable is served this way, and not one
+running `cagents daemon bridge`, which relays a remote device's window. An
+older window or daemon is still refused at its handshake, which is how a stale window learns
+that an update superseded it. The daemon answers that CLI in its protocol's
+version. It refuses requests to stop, update or hand off the daemon, and requests whose
+reply the CLI couldn't read. It withholds notifications the CLI couldn't read.
+Each protocol's postcard wire format is recorded under
+`tests/fixtures/wire-formats/`. A test checks that every listed older protocol
+encodes the same way, except for what is refused or withheld. It checks
+encoding, not meaning, and not JSON carried as text inside a message.
+
+When a daemon takes the runtime lease, it points `bin` in its runtime
+directory at its own matched CLI. That runtime directory is
+`$XDG_RUNTIME_DIR/cagents` in production, or the development instance's
+directory. The sessions it launches find `cagents` there first, so a later
+update gives them the new daemon's CLI. A daemon without a matched CLI removes
+the link instead.
+
 Each window holds an exclusive slot lease and its own session database, and a
 shared compatibility fence excludes older single-window UIs. Startup rejects an
 older running UI or Debian peer package that predates the lease marker; upgrade
@@ -97,6 +118,10 @@ cagents daemon stop --confirm
   valid for 60 seconds; inventory changes require a new one.
 - A successful stop means **termination requested**, not that every PTY has
   exited. Plain `daemon stop` without these flags is a force stop.
+- Stopping the daemon ends each agent's provider process and any turn in
+  progress, but does not close the agent. The agent keeps its ID, and its card
+  stays in its channel, where its saved conversation can be resumed. A turn
+  the stop cut short is never resent. Only closing an agent removes it.
 - `terminal spawn` without a command starts the default shell described in
   [Configuration](configuration.md#default-shell); `--cwd` sets its directory.
 - Inside a hosted session, `terminal write` and `close` reach only the
@@ -484,6 +509,23 @@ belongs to the exact kernel lease owner, process lifetime, boot, and executable;
 it does not depend on the installation pathname. Compatible windows can
 reconnect to a matched daemon, including development builds in their separate
 runtime namespace.
+
+A daemon that takes the fence itself declares it as an admission until its
+listener is ready, and so does a worktree removal that briefly checks the
+running windows. A window opened meanwhile waits for that admission instead of
+reporting an update, then opens normally. If the wait passes two seconds it
+shows a **Starting cagents** notice, which closes when the workspace opens;
+launches that wait together share one notice. A
+daemon that dies during admission releases the waiting window at once, and
+that window starts a daemon itself. The wait is bounded by the daemon's own
+startup allowance plus ten seconds; past that, the window reports that the
+daemon is still starting and offers **Retry**. An exclusive holder without the
+declaration is treated as an update: the reviewed update coordinator, an
+installer's inherited guard, a daemon admitted under one of those, and builds
+that predate the declaration. An update that takes the fence while a window
+is waiting therefore still opens the update progress window. A standalone
+editor does not wait: while a daemon is starting it opens without its folders
+and says they cannot be opened safely yet.
 
 An incompatible window, or an older window without this capability, refuses
 startup before socket or daemon state changes. Close that window through the

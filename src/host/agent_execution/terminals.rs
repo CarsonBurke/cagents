@@ -31,6 +31,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         R::Connect { .. }
         | R::Authenticate { .. }
         | R::BuildInfo
+        | R::StartupState
         | R::List
         | R::WatchTerminals
         | R::WatchWorkspaceModel
@@ -105,6 +106,7 @@ fn access(request: &ClientRequest) -> Access<'_> {
         | R::ChatReturnTerminal { .. }
         | R::ChatCommitTerminal { .. }
         | R::ChatPrepareResume { .. }
+        | R::WatchConversationPullRequests { .. }
         | R::Work(crate::work::Request::Pin { .. } | crate::work::Request::Remove(_)) => {
             Access::Refused
         }

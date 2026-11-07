@@ -480,6 +480,7 @@ struct PublishedState {
     retained_holder: Mutex<Option<holder::Holder>>,
     holder_identity: OnceLock<super::holder::Record>,
     launch_directory: OnceLock<(holder::LaunchDirectoryPin, File)>,
+    original_holder_process: OnceLock<Arc<File>>,
     original_holder_role: OnceLock<crate::daemon::holder_registry::OriginalRole>,
     // The source descriptors pin both identities through terminal retirement;
     // numeric inode receipts alone cannot distinguish later inode reuse.
@@ -577,6 +578,7 @@ impl PublishedState {
             retained_holder: Mutex::new(None),
             holder_identity: OnceLock::new(),
             launch_directory: OnceLock::new(),
+            original_holder_process: OnceLock::new(),
             original_holder_role: OnceLock::new(),
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
@@ -930,6 +932,15 @@ impl Drop for HandleInner {
 #[derive(Clone)]
 pub struct TerminalHandle {
     inner: Arc<HandleInner>,
+}
+
+/// Retirement observes actual join and the exact original holder's exit.
+/// Completion or transfer to the child reaper alone is not a release receipt.
+pub(crate) enum TerminalRetirement {
+    Pending,
+    WaitingForHolder(Arc<File>),
+    Released,
+    Retained(String),
 }
 
 /// Callback identity without retaining the worker through its own wake closure.
@@ -1501,6 +1512,75 @@ impl TerminalHandle {
     }
     pub(crate) fn same_worker(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) fn begin_completed_retirement(&self) -> Result<(), &'static str> {
+        if !self.is_completed() {
+            return Err("The original terminal has not completed");
+        }
+        self.request_shutdown();
+        // The already-joined fast path need not enqueue another lane task.
+        crate::daemon::wake();
+        Ok(())
+    }
+
+    pub(crate) fn completed_retirement(
+        &self,
+        source: &TerminalSession,
+        proof: &crate::model::HostSessionProof,
+    ) -> TerminalRetirement {
+        match self.inner.worker.retirement_ready() {
+            Err(error) => return TerminalRetirement::Retained(error.into()),
+            Ok(false) => return TerminalRetirement::Pending,
+            Ok(true) => {}
+        }
+        if !self.is_completed() {
+            return TerminalRetirement::Retained(
+                "Original terminal cleanup remains unconfirmed".into(),
+            );
+        }
+        let Some(original) = self.inner.published.original_holder_process.get() else {
+            return TerminalRetirement::Retained(
+                "Original holder process evidence is unavailable".into(),
+            );
+        };
+        let mut event = libc::pollfd {
+            fd: original.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // The held pidfd cannot observe a reused numeric PID. Keep it alive
+        // through the daemon's wait when an adopted or fsyncing holder remains.
+        match unsafe { libc::poll(&mut event, 1, 0) } {
+            0 => TerminalRetirement::WaitingForHolder(Arc::clone(original)),
+            n if n < 0
+                && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted =>
+            {
+                TerminalRetirement::WaitingForHolder(Arc::clone(original))
+            }
+            n if n > 0
+                && event.revents & libc::POLLIN != 0
+                && event.revents & (libc::POLLNVAL | libc::POLLERR) == 0 =>
+            {
+                if let Some(record) = self.holder_identity() {
+                    match super::holder::cleanup::confirmed_with_role(
+                        source,
+                        record,
+                        proof,
+                        self.inner.published.original_holder_role.get(),
+                    ) {
+                        Ok(true) => TerminalRetirement::Released,
+                        Ok(false) => TerminalRetirement::Retained(
+                            "The exact original holder cleanup receipt is unavailable".into(),
+                        ),
+                        Err(error) => TerminalRetirement::Retained(error),
+                    }
+                } else {
+                    TerminalRetirement::Released
+                }
+            }
+            _ => TerminalRetirement::Retained("Original holder exit could not be observed".into()),
+        }
     }
 
     pub(crate) fn downgrade(&self) -> WeakTerminalHandle {
@@ -2757,13 +2837,28 @@ impl Worker {
             command.env_remove(name);
         }
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
+        match crate::instance::development_instance() {
+            Some(instance) => command.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance),
+            None => command.env_remove(crate::instance::DEVELOPMENT_INSTANCE_ENV),
+        };
         // A cagents process started in this terminal must not take the
         // account selected for it for the system account.
-        match crate::account::registry::selection_marker(|name| {
-            command.get_env(name)?.to_str().map(str::to_owned)
-        }) {
-            Some(marker) => command.env(crate::account::SELECTION_MARKER, marker),
-            None => command.env_remove(crate::account::SELECTION_MARKER),
+        let home_of = |name: &str| command.get_env(name)?.to_str().map(str::to_owned);
+        let selection = crate::account::registry::selection_marker(home_of);
+        // It must keep the Claude home the reader started cagents with,
+        // though, rather than take it for the default earlier cagents
+        // exported to every launch.
+        let system = crate::account::system_home_marker(home_of, selection.as_deref(), |name| {
+            std::env::var(name).ok()
+        });
+        for (marker, value) in [
+            (crate::account::SELECTION_MARKER, selection),
+            (crate::account::SYSTEM_HOME_MARKER, system),
+        ] {
+            match value {
+                Some(value) => command.env(marker, value),
+                None => command.env_remove(marker),
+            }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
         if let Some(token) = config.agent_authority.token() {
@@ -2907,6 +3002,10 @@ impl Worker {
             KeyEncoder::new().map_err(|error| format!("create key encoder: {error}"))?;
         let mouse_encoder =
             MouseEncoder::new().map_err(|error| format!("create mouse encoder: {error}"))?;
+        let original_holder_process = held
+            .holder
+            .original_process_descriptor()
+            .map_err(|error| format!("retain original holder observation: {error}"))?;
         // Install only an already-held exact root identity, and allocate its
         // CLOEXEC clone before adoption commit can transfer replay custody.
         let launch_directory = held
@@ -2921,6 +3020,9 @@ impl Worker {
             .transpose()?;
         // Replay transfer and reader activation remain in commit_start, after
         // the complete original Worker has moved outside the panic guard.
+        if let Some(original) = original_holder_process {
+            let _ = published.original_holder_process.set(Arc::new(original));
+        }
         if let Some(role) = held.holder.original_role() {
             let _ = published.original_holder_role.set(role.clone());
         }
@@ -6111,6 +6213,342 @@ mod tests {
 
     use super::*;
 
+    fn isolated_retirement_worker_case() -> bool {
+        use std::os::unix::ffi::OsStringExt;
+        const CHILD: &str = "CAGENTS_TERMINAL_RETIREMENT_TEST_CHILD";
+        let name = thread::current().name().unwrap().to_owned();
+        if std::env::var(CHILD).as_deref() == Ok(name.as_str()) {
+            return false;
+        }
+        let private = tempfile::Builder::new().prefix("tr-").tempdir().unwrap();
+        fs::set_permissions(private.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let output = private.path().join("child.log");
+        let log = File::create(&output).unwrap();
+        // This exact child inherits HOME and opaque caller authority unchanged.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+            .env(CHILD, &name)
+            .env("TMPDIR", private.path())
+            .env("XDG_RUNTIME_DIR", private.path())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(40);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                // Remove only the owned fault before failure-only child cleanup,
+                // so a holder already processing ReleaseProved can still finish.
+                if let Ok(bytes) = fs::read(private.path().join("release-obstruction")) {
+                    let fault = PathBuf::from(std::ffi::OsString::from_vec(bytes));
+                    if fault.starts_with(private.path()) {
+                        let _ = fs::remove_dir(fault);
+                    }
+                }
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "retirement child timed out; evidence: {}",
+                    private.keep().display()
+                );
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let log = fs::read_to_string(output).unwrap();
+        print!("{log}");
+        assert!(
+            status.success(),
+            "retirement child failed ({status}); evidence: {}",
+            private.keep().display()
+        );
+        assert!(log.contains(&name) && log.contains("1 passed; 0 failed"));
+        true
+    }
+
+    fn retirement_test_proof() -> crate::model::HostSessionProof {
+        crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new(uuid::Uuid::new_v4().to_string()),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new(uuid::Uuid::new_v4().to_string()),
+        }
+    }
+
+    fn wait_for_retirement_fact(mut ready: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready() {
+            assert!(
+                Instant::now() < deadline,
+                "original retirement fact did not settle"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn completed_retirement_waits_for_actual_tls_join() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let (handle, release, entered) = TerminalHandle::spawn_with_blocked_tls_for_test();
+        entered.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(handle.is_completed());
+        assert!(!handle.worker_joined_for_test());
+        let source = shell_session("exit 0");
+        let proof = retirement_test_proof();
+        let before = Instant::now();
+        handle.begin_completed_retirement().unwrap();
+        assert!(
+            before.elapsed() < Duration::from_secs(1),
+            "retirement request waited for TLS"
+        );
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Pending
+        ));
+        assert!(
+            !handle.worker_joined_for_test(),
+            "completion publication is not OS join"
+        );
+        drop(release); // also releases the real destructor if an assertion unwinds
+        wait_for_retirement_fact(|| handle.inner.worker.native_settled_for_test());
+        assert!(handle.worker_joined_for_test());
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Retained(_)
+            ),
+            "holderless TLS fixture cannot manufacture native exit evidence"
+        );
+    }
+
+    #[test]
+    fn late_completed_retirement_reuses_naturally_settled_original_worker() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        let source = shell_session("printf 'natural-retirement-result'; exit 7");
+        let handle =
+            TerminalHandle::spawn(source.clone(), TerminalConfig::default(), |_| {}).unwrap();
+        let worker = Arc::clone(&handle.inner.worker);
+        wait_for_retirement_fact(|| handle.is_completed() && worker.native_settled_for_test());
+        assert!(handle.worker_joined_for_test());
+        assert_eq!(TerminalHandle::reserved_worker_joins_for_test(), 0);
+        assert!(
+            !handle
+                .inner
+                .published
+                .shutdown_requested
+                .load(Ordering::Acquire)
+        );
+        assert!(handle.snapshot().lines.iter().any(|row| {
+            row.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("natural-retirement-result")
+        }));
+        let original = handle
+            .inner
+            .published
+            .original_holder_process
+            .get()
+            .unwrap();
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        let proof = retirement_test_proof();
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Pending
+            ),
+            "natural join does not request release"
+        );
+        handle.begin_completed_retirement().unwrap();
+        assert!(Arc::ptr_eq(&worker, &handle.inner.worker));
+        assert_eq!(
+            TerminalHandle::reserved_worker_joins_for_test(),
+            0,
+            "late request must not acquire a new cleanup ticket"
+        );
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        handle.begin_completed_retirement().unwrap();
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        assert!(handle.worker_joined_for_test());
+    }
+
+    #[test]
+    fn completed_retirement_waits_for_exact_holder_exit_and_authenticated_receipt() {
+        if isolated_retirement_worker_case() {
+            return;
+        }
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let proof = retirement_test_proof();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut source = shell_session("printf 'registered-retirement-result'; exit 0");
+        source.continuity = crate::model::TerminalContinuity::DetachedSameBoot {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let recovery = crate::terminal::holder::Recovery {
+            source: source.clone(),
+            previous_sources: Vec::new(),
+            relaunches: Vec::new(),
+            options: crate::terminal::TerminalSpawnOptions::default(),
+            execution_environment: None,
+            execution_recipe: None,
+        };
+        let handle = TerminalHandle::spawn(
+            source.clone(),
+            TerminalConfig {
+                holder_recovery: Some(recovery),
+                ..TerminalConfig::default()
+            },
+            |_| {},
+        )
+        .unwrap();
+        wait_for_retirement_fact(|| handle.is_completed() && handle.worker_joined_for_test());
+        let record = handle.holder_identity().unwrap().clone();
+        assert!(record.holder.is_current());
+        assert!(
+            !record.root.is_current(),
+            "actual original PTY root must already be reaped"
+        );
+        let original = Arc::clone(
+            handle
+                .inner
+                .published
+                .original_holder_process
+                .get()
+                .unwrap(),
+        );
+        let flags = unsafe { libc::fcntl(original.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        let receipt = paths.directory.join("holders").join(format!(
+            "{}-{}-{}.closed",
+            record.terminal, record.holder.pid, record.holder.start
+        ));
+        // Exercise the existing real holder's durable-receipt retry, not a fake
+        // publication flag or a substitute JoinOwner. Its exclusive destination
+        // is deliberately a directory until after the original release attempt.
+        fs::create_dir(&receipt).unwrap();
+        struct ReleaseObstruction(PathBuf);
+        impl Drop for ReleaseObstruction {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir(&self.0);
+            }
+        }
+        let obstruction = ReleaseObstruction(receipt.clone());
+        let fault_marker = std::env::temp_dir().join("release-obstruction");
+        fs::write(&fault_marker, receipt.as_os_str().as_bytes()).unwrap();
+        handle.begin_completed_retirement().unwrap();
+        wait_for_retirement_fact(|| handle.inner.worker.native_settled_for_test());
+        assert!(handle.worker_joined_for_test());
+        assert_eq!(TerminalHandle::reserved_worker_joins_for_test(), 0);
+        assert!(
+            record.holder.is_current(),
+            "receipt fault must retain the same live holder"
+        );
+        assert!(
+            crate::daemon::child_reaper::has_outstanding_ownership(),
+            "original holder Child custody must survive transfer out of JoinOwner"
+        );
+        match handle.completed_retirement(&source, &proof) {
+            TerminalRetirement::WaitingForHolder(waiting) => {
+                assert!(
+                    Arc::ptr_eq(&waiting, &original),
+                    "wait must use the held original descriptor"
+                );
+                assert_eq!(waiting.as_raw_fd(), original.as_raw_fd());
+                let mut event = libc::pollfd {
+                    fd: waiting.as_raw_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(
+                    unsafe { libc::poll(&mut event, 1, 0) },
+                    0,
+                    "original holder must still be alive"
+                );
+            }
+            _ => panic!("join/release transfer falsely certified original holder exit"),
+        }
+        drop(obstruction);
+        fs::remove_file(fault_marker).unwrap();
+        wait_for_retirement_fact(|| {
+            let mut event = libc::pollfd {
+                fd: original.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            (unsafe { libc::poll(&mut event, 1, 0) }) > 0 && event.revents & libc::POLLIN != 0
+        });
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        wait_for_retirement_fact(|| {
+            !record.holder.is_current() && !crate::daemon::child_reaper::has_outstanding_ownership()
+        });
+        let exact_bytes = fs::read(&receipt).unwrap();
+        let saved = receipt.with_extension("closed.saved");
+        fs::rename(&receipt, &saved).unwrap();
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Retained(_)
+            ),
+            "exit alone is not the registered receipt"
+        );
+        let mut wrong: serde_json::Value = serde_json::from_slice(&exact_bytes).unwrap();
+        wrong["sources"] = serde_json::json!([vec![0u8; 32]]);
+        let mut bad_receipt = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&receipt)
+            .unwrap();
+        bad_receipt
+            .write_all(&serde_json::to_vec(&wrong).unwrap())
+            .unwrap();
+        bad_receipt.sync_all().unwrap();
+        drop(bad_receipt);
+        assert!(
+            matches!(
+                handle.completed_retirement(&source, &proof),
+                TerminalRetirement::Retained(_)
+            ),
+            "a different source digest cannot certify this registered owner"
+        );
+        fs::remove_file(&receipt).unwrap();
+        fs::rename(saved, &receipt).unwrap(); // restore actual untouched holder-written inode
+        assert_eq!(fs::read(&receipt).unwrap(), exact_bytes);
+        assert!(matches!(
+            handle.completed_retirement(&source, &proof),
+            TerminalRetirement::Released
+        ));
+        let mut wrong_source = source.clone();
+        wrong_source
+            .launch
+            .arguments
+            .push("different-source".into());
+        assert!(matches!(
+            handle.completed_retirement(&wrong_source, &proof),
+            TerminalRetirement::Retained(_)
+        ));
+        assert_eq!(handle.holder_identity(), Some(&record));
+    }
+
     #[test]
     fn fallback_process_title_uses_launch_when_foreground_is_unavailable() {
         let mut launch = LaunchRecipe::shell(PathBuf::from("/repo/alpha")).unwrap();
@@ -8900,6 +9338,9 @@ mod tests {
                 assert!(std::process::Command::new(std::env::current_exe().unwrap())
                     .args(["--exact", "terminal::worker::tests::removed_managed_home_cannot_relaunch_from_final_pty_environment", "--nocapture"])
                     .env_clear().env(CHILD, mode).env("HOME", directory.path())
+                    // The child names its storage as this process does.
+                    .envs(std::env::var_os(crate::instance::DEVELOPMENT_INSTANCE_ENV)
+                        .map(|instance| (crate::instance::DEVELOPMENT_INSTANCE_ENV, instance)))
                     .env("XDG_DATA_HOME", directory.path().join("data"))
                     .env("PATH", "/usr/bin:/bin")
                     .env("CODEX_HOME", directory.path().join("data").join(crate::instance::storage_name()).join("accounts/codex/12345678-1234-4234-8234-123456789abc"))
@@ -8984,6 +9425,75 @@ mod tests {
             }
             worker.run();
             std::fs::remove_file(directory.path().join("isolated")).unwrap();
+        }
+    }
+
+    /// A shell in a development instance runs `cagents` against that
+    /// instance's daemon, whatever environment it was handed; outside one it
+    /// never inherits a stale instance.
+    #[test]
+    fn terminals_keep_their_development_instance_and_only_theirs() {
+        const CHILD: &str = "CAGENTS_TERMINAL_INSTANCE_TEST";
+        const NAME: &str = "probe";
+        let test =
+            "terminal::worker::tests::terminals_keep_their_development_instance_and_only_theirs";
+        let Some(expected) = std::env::var_os(CHILD) else {
+            let directory = tempfile::tempdir().unwrap();
+            for instance in [Some(NAME), None] {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", test, "--nocapture"])
+                    .env_clear()
+                    .env(CHILD, instance.unwrap_or("unset"))
+                    .env("HOME", directory.path())
+                    .env("PATH", "/usr/bin:/bin")
+                    .envs(std::env::var_os("TMPDIR").map(|tmp| ("TMPDIR", tmp)));
+                if let Some(instance) = instance {
+                    child.env(crate::instance::DEVELOPMENT_INSTANCE_ENV, instance);
+                }
+                assert!(child.status().unwrap().success(), "{instance:?}");
+            }
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        for returned in [false, true] {
+            let mut recipe = env_recipe(BTreeMap::new());
+            recipe.working_directory = directory.path().into();
+            recipe.arguments = vec![
+                "-c".into(),
+                "printf %s \"${CAGENTS_DEVELOPMENT_INSTANCE-unset}\" > seen.tmp && mv seen.tmp seen"
+                    .into(),
+            ];
+            // An environment handed back from a chat may carry another value.
+            let config = TerminalConfig {
+                execution_environment: returned.then(|| {
+                    crate::terminal_ipc::ChatExecutionEnvironment(BTreeMap::from([
+                        ("PATH".into(), "/usr/bin:/bin".into()),
+                        (
+                            crate::instance::DEVELOPMENT_INSTANCE_ENV.into(),
+                            "stale".into(),
+                        ),
+                    ]))
+                }),
+                ..TerminalConfig::default()
+            };
+            let (worker, _) = capture_worker_with(recipe, config);
+            let seen = directory.path().join("seen");
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !seen.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the shell never reported"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            worker.run();
+            assert_eq!(
+                std::fs::read_to_string(&seen).unwrap(),
+                expected.to_str().unwrap(),
+                "returned: {returned}"
+            );
+            std::fs::remove_file(&seen).unwrap();
         }
     }
 

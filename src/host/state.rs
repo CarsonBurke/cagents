@@ -1,6 +1,8 @@
 #[cfg(all(test, target_os = "linux"))]
 mod paired_upgrade_tests;
 mod presentation;
+mod retention;
+pub(super) use retention::Retirement;
 mod setup_restore;
 pub(super) use presentation::snapshot as client_snapshot;
 use std::{
@@ -23,7 +25,7 @@ use crate::{
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},
     terminal_ipc::{
         PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
-        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight,
+        ShutdownCapability, ShutdownOperation, ShutdownOutcome, ShutdownPreflight, StartupState,
         TerminalDescriptor, TerminalSnapshot, TerminalSpawnOptions, TerminalVisibility,
         WireTerminalEvent,
     },
@@ -74,6 +76,7 @@ pub(crate) struct TerminalRecord {
     upgrade_relaunches: Vec<crate::terminal_ipc::UpgradeRelaunch>,
     running: bool,
     completion_observed: bool,
+    completed_at: Option<Instant>,
     last_exit: Option<TerminalExit>,
     event_sequence: u64,
     events: VecDeque<(u64, WireTerminalEvent)>,
@@ -253,6 +256,7 @@ pub(crate) struct HostState {
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
+    pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
     /// Actual parent-owned records installed before an adoption commit. They
     /// remain listed and explicitly closeable if confirmation is unavailable.
@@ -263,7 +267,7 @@ pub(crate) struct HostState {
     /// permission to replay any recipe.
     retained_startup_checkpoint: Option<crate::upgrade::handoff::Checkpoint>,
     #[cfg(test)]
-    test_fail_startup_commit: Option<TerminalId>,
+    pub(super) test_fail_startup_commit: Option<TerminalId>,
     #[cfg(test)]
     test_checkpoint_failure_at: Option<(TerminalId, PathBuf)>,
     /// Covers the interval before a login's live TerminalRecord exists.
@@ -281,6 +285,8 @@ pub(crate) struct HostState {
     /// would invite every window to re-seed on every connection. A failure is
     /// reported instead, and terminals keep working meanwhile.
     model: Option<super::model::Registry>,
+    /// Layout persistence and hydration never borrow the global terminal lock.
+    pub(super) workspace_registry: Option<Arc<Mutex<super::model::Registry>>>,
     pub(super) execution_registry: Option<Arc<Mutex<super::model::Registry>>>,
     /// Connections that authenticated as an agent session, and its lineage.
     pub(super) agent_clients: BTreeMap<ClientId, crate::agent_execution::Lineage>,
@@ -298,6 +304,11 @@ pub(crate) struct HostState {
     /// provider to become ready, before the prompt was submitted.
     pub(super) execution_gates:
         BTreeMap<crate::model::AgentId, Weak<Mutex<Option<super::agent_execution::Undelivered>>>>,
+    /// Resume successors that took over their agent when they started and
+    /// have been given no work since. Ending one gives the agent back stopped,
+    /// for the next resume to take over, rather than retiring it: until then
+    /// the successor is only a reopening its card may still give up.
+    pub(super) idle_adoptions: BTreeSet<TerminalId>,
     pub(super) execution_startups: BTreeMap<
         crate::model::AgentId,
         (
@@ -423,6 +434,7 @@ impl HostState {
             worktree_removals: Default::default(),
             proof: Arc::new(proof),
             terminals: BTreeMap::new(),
+            terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),
             startup_custody: BTreeSet::new(),
             startup_recovery: None,
@@ -435,6 +447,7 @@ impl HostState {
             clients: BTreeMap::new(),
             watchers: BTreeSet::new(),
             model: None,
+            workspace_registry: None,
             execution_registry: None,
             agent_clients: BTreeMap::new(),
             automations: None,
@@ -442,6 +455,7 @@ impl HostState {
             mailbox: None,
             mailbox_seal: None,
             execution_gates: BTreeMap::new(),
+            idle_adoptions: BTreeSet::new(),
             execution_startups: BTreeMap::new(),
             model_watchers: BTreeSet::new(),
             client_pids: BTreeMap::new(),
@@ -551,6 +565,13 @@ impl HostState {
                 None
             }
         };
+        self.workspace_registry = match registry.execution_connection() {
+            Ok(connection) => Some(Arc::new(Mutex::new(connection))),
+            Err(error) => {
+                tracing::error!(%error, "cannot open the workspace model writer");
+                None
+            }
+        };
         self.model = Some(registry);
     }
 
@@ -598,6 +619,24 @@ impl HostState {
         }
         self.notification_watchers.insert(client, presence);
         activation
+    }
+
+    /// The sessions this publication adds to its window's live claim.
+    pub(super) fn notification_sessions_unclaimed(
+        &self,
+        presence: &crate::notifications::Presence,
+    ) -> Vec<TerminalId> {
+        presence
+            .sessions
+            .iter()
+            .filter(|session| {
+                !self.notification_watchers.values().any(|current| {
+                    current.destination() == presence.destination()
+                        && current.sessions.contains(session)
+                })
+            })
+            .copied()
+            .collect()
     }
 
     pub(super) fn notification_presence(&mut self, presence: crate::notifications::Presence) {
@@ -690,11 +729,16 @@ impl HostState {
         destination
     }
 
+    pub(super) fn subscribe_model(&mut self, client_id: ClientId) {
+        self.model_watchers.insert(client_id);
+    }
+
     /// Subscribes `client_id` to shared-model edges and returns the model.
     ///
     /// Both happen under one lock, so an edit applied between subscribing and
     /// reading cannot fall into a gap: a client either sees it in the model it
     /// is handed or receives it as an edge afterwards, never neither.
+    #[cfg(test)]
     pub(crate) fn watch_model(
         &mut self,
         client_id: ClientId,
@@ -704,6 +748,7 @@ impl HostState {
         Ok(model)
     }
 
+    #[cfg(test)]
     pub(crate) fn read_model(&self) -> Result<WorkspaceModel, ProtocolError> {
         self.model
             .as_ref()
@@ -718,40 +763,10 @@ impl HostState {
         origin: ClientId,
         edit: ModelEdit,
     ) -> Result<WorkspaceModel, ProtocolError> {
+        self.ensure_view_retention_available(&edit)?;
         let edit = edit
             .canonicalized()
             .map_err(|error| ProtocolError::new(ProtocolErrorCode::InvalidRequest, error, false))?;
-        if let ModelEdit::ChangeView {
-            scope,
-            expected_revision,
-            operation,
-            change,
-        } = &edit
-        {
-            let registry = self.registry()?;
-            let seen = registry
-                .view_operation_seen(*operation)
-                .map_err(model_unavailable)?;
-            if !seen {
-                if let Some(reason) = registry
-                    .view_change_refusal(scope, change)
-                    .map_err(model_unavailable)?
-                {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::InvalidRequest,
-                        reason,
-                        false,
-                    ));
-                }
-                if registry.view_revision(scope).map_err(model_unavailable)? != *expected_revision {
-                    return Err(ProtocolError::new(
-                        ProtocolErrorCode::ViewConflict,
-                        "The workspace view changed; rebase this pane mutation on the current revision",
-                        true,
-                    ));
-                }
-            }
-        }
         if let ModelEdit::SuggestConversationTitle {
             id,
             card,
@@ -778,9 +793,9 @@ impl HostState {
             {
                 return Err(invalid());
             }
-            // Model mutations serialize under this HostLock. Read only resident
-            // metadata, not Store, snapshot/history or files. A later B edit
-            // cannot overtake this A admission; a delayed A sees B's current name.
+            // The request holds workspace writer admission as well as this
+            // resident identity guard. Read only current metadata, not Store,
+            // history or files; later edits cannot overtake this admission.
             let (session, current_title) =
                 actual.handle.conversation_title().map_err(|reason| {
                     let busy = reason == crate::chat::runtime::TitleUnavailable::Busy;
@@ -811,31 +826,9 @@ impl HostState {
                 _ => return Err(invalid()),
             }
         }
-        let registry = self.registry()?;
-        let applied = registry.apply(&edit).map_err(|error| {
-            if error == super::model::Registry::VIEW_SOURCE_CONFLICT {
-                return ProtocolError::new(ProtocolErrorCode::ViewConflict, error, true);
-            }
-            // An execution writer can close a view after the preflight read.
-            // apply has rolled back; inspect authoritative membership again
-            // rather than making the client retry a permanently invalid edit.
-            if let ModelEdit::ChangeView { scope, change, .. } = &edit {
-                match registry.view_change_refusal(scope, change) {
-                    Ok(Some(reason)) => {
-                        return ProtocolError::new(
-                            ProtocolErrorCode::InvalidRequest,
-                            reason,
-                            false,
-                        );
-                    }
-                    Err(storage) => return model_unavailable(storage),
-                    Ok(None) => {}
-                }
-            }
-            model_unavailable(error)
-        })?;
+        let applied = super::workspace::apply(self.registry()?, &edit)?;
         if applied.changed {
-            self.announce_model_edit(origin, applied.model.sequence, &edit);
+            self.announce_model_edit(origin, applied.sequence, &edit);
         }
         Ok(applied.model)
     }
@@ -949,6 +942,7 @@ impl HostState {
         client_id: ClientId,
         terminal_id: TerminalId,
     ) -> Result<TerminalDescriptor, ProtocolError> {
+        self.ensure_retention_available(&[terminal_id])?;
         let record = self
             .terminals
             .get(&terminal_id)
@@ -1343,7 +1337,7 @@ impl HostState {
             .any(|id| *id != predecessor && self.is_live(id))
     }
 
-    fn is_live(&self, id: &TerminalId) -> bool {
+    pub(super) fn is_live(&self, id: &TerminalId) -> bool {
         self.terminals
             .get(id)
             .is_some_and(|record| record.running || !record.handle.is_completed())
@@ -1443,6 +1437,7 @@ impl HostState {
                 upgrade_relaunches: Vec::new(),
                 running: true,
                 completion_observed: false,
+                completed_at: None,
                 last_exit: None,
                 event_sequence: 0,
                 events: VecDeque::new(),
@@ -1828,6 +1823,9 @@ impl HostState {
         if self.shutting_down {
             return Err("Daemon is already shutting down".into());
         }
+        if !self.terminal_retirements.is_empty() {
+            return Err("Terminal retirement is not confirmed; retry after cleanup settles or explicitly close the retained result".into());
+        }
         if capability.proof != *self.proof {
             return Err("Daemon changed; obtain a new upgrade preflight".into());
         }
@@ -1958,6 +1956,11 @@ impl HostState {
         self.ordinary_exit_cleanup_pending
     }
 
+    pub(super) fn terminal_close_admission_open(&self) -> bool {
+        !self.ordinary_exit_registration_closed
+            && (!self.shutting_down || self.ordinary_exit_cleanup_pending)
+    }
+
     /// Called only after the exit caller holds the core's sealed absence
     /// proof. Includes clients registered during the pending cleanup interval.
     pub(super) fn close_ordinary_exit_registration(&mut self) -> Vec<Arc<DeliveryQueue>> {
@@ -1993,7 +1996,9 @@ impl HostState {
     }
 
     pub(super) fn ordinary_exit_cleanup_blocked(&self) -> bool {
-        self.startup_blocks_shutdown() || !self.checked_close_replies.is_empty()
+        self.startup_blocks_shutdown()
+            || !self.checked_close_replies.is_empty()
+            || !self.terminal_retirements.is_empty()
     }
 
     pub(super) fn startup_recovery(&self) -> Option<&str> {
@@ -2001,6 +2006,20 @@ impl HostState {
             (!self.startup_custody.is_empty())
                 .then_some("Original terminal ownership is awaiting its startup outcome")
         })
+    }
+
+    /// A retained failure outranks custody still awaiting its outcome: it is
+    /// never cleared, so waiting on the remaining custody cannot finish startup.
+    pub(super) fn startup_state(&self) -> StartupState {
+        match &self.startup_recovery {
+            Some(detail) => StartupState::Retained {
+                detail: detail.clone(),
+            },
+            None if self.startup_custody.is_empty() => StartupState::Ready,
+            None => StartupState::Restoring {
+                awaiting: self.startup_custody.len() as u64,
+            },
+        }
     }
 
     pub(super) fn retain_startup_recovery(&mut self, message: String) {
@@ -2991,6 +3010,71 @@ fn restore_terminal_execution_authority(
     Ok(())
 }
 
+/// An agent row names the exact descriptor its provider was issued, and
+/// dispatch refuses any other. A relaunched provider has a new descriptor under
+/// the same ID, so move the agent, its console and its delegated authority to
+/// it. Only the previous daemons' checkpointed sources are lineage. The agent
+/// recorded one either as issued or after its provider confirmed the
+/// conversation, and before any console was paired with it: a console is
+/// recorded beside the agent's session, not in it.
+///
+/// A refusal leaves the agent on its previous descriptor, so its next prompt is
+/// refused rather than delivered to an unproved process. It does not fail the
+/// restore: the conversation itself was relaunched and confirmed, and windows
+/// still resolve it through the upgrade aliases.
+fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+    let (registry, successor, sources) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(registry), Some(record), Some(sources)) = (
+            state.execution_registry.clone(),
+            state.chats.get(&id),
+            state.upgrade_chats.get(&id),
+        ) else {
+            return;
+        };
+        (registry, record.session.clone(), sources.clone())
+    };
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(reason) = adopt_relaunched_agent(&mut registry, &sources, successor) {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
+fn adopt_relaunched_agent(
+    registry: &mut super::model::Registry,
+    sources: &[crate::upgrade::handoff::ChatSource],
+    successor: crate::chat::Session,
+) -> Result<bool, String> {
+    use crate::agent_execution::HostedSession;
+    let mut retained = Vec::new();
+    for saved in sources {
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        for issued in [saved.source.clone(), confirmed] {
+            if issued.terminal.is_some() {
+                let mut unpaired = issued.clone();
+                unpaired.terminal = None;
+                retained.push(HostedSession::Chat(unpaired));
+            }
+            retained.push(HostedSession::Chat(issued));
+        }
+    }
+    // This daemon issued the provider's capability as it started, before a
+    // relaunched paired view replaced the descriptor's terminal.
+    if let Some(HostedSession::Chat(started)) =
+        registry.retained_agent_authority_source(successor.id)?
+        && started.proof == successor.proof
+        && (crate::chat::Session {
+            terminal: successor.terminal.clone(),
+            ..started.clone()
+        }) == successor
+    {
+        retained.push(HostedSession::Chat(started));
+    }
+    registry.adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
+}
+
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
@@ -3436,6 +3520,14 @@ fn restore_upgrade_from(
             store.path.display()
         ));
     }
+    // Only now is every relaunched provider kept. Moving an agent earlier
+    // would leave it on a descriptor that a failed restore then closes, which
+    // a replay of this checkpoint could no longer recognize.
+    for chat in &checkpoint.chats {
+        if ChatRestore::of(chat) != ChatRestore::Retained {
+            restore_relaunched_execution_authority(host, chat.source.id);
+        }
+    }
     let finalized = if interrupted_setups {
         store.archive_interrupted_setup().map(|evidence| {
             tracing::warn!(evidence = %evidence.display(),
@@ -3843,83 +3935,6 @@ pub(crate) fn spawn_terminal(
     spawn_terminal_with_environment(shared, client_id, session, options, None)
 }
 
-fn finish_pending_terminal(state: &mut HostState, terminal_id: TerminalId) {
-    // Finish a durable automatic-terminal reservation only after its exact
-    // worker exists. A client lost before this point can resume the intent.
-    let session = state.terminals[&terminal_id].session.clone();
-    if let Some(registry) = state.model.as_mut() {
-        if let Ok(model) = registry.model() {
-            for view in model.views {
-                for before in view.panes {
-                    if before.pending_terminal_start
-                        && matches!(&before.kind,crate::model::CardKind::Terminal(terminal) if terminal.id==terminal_id)
-                    {
-                        let mut pane = before.clone();
-                        pane.pending_terminal_start = false;
-                        pane.kind = crate::model::CardKind::Terminal(session.clone());
-                        let edit = ModelEdit::ChangeView {
-                            scope: view.scope.clone(),
-                            expected_revision: view.revision,
-                            operation: uuid::Uuid::new_v4(),
-                            change: crate::workspace_model::views::Change::Update { before, pane },
-                        };
-                        match registry.apply(&edit) {
-                            Ok(applied) if applied.changed => {
-                                let sequence = applied.model.sequence;
-                                for watcher in &state.model_watchers {
-                                    if let Some(delivery) = state.clients.get(watcher) {
-                                        let _ = delivery.push(Outbound::broadcast(
-                                            &state.proof,
-                                            ServerMessage::WorkspaceModelEdited {
-                                                sequence,
-                                                edit: edit.clone(),
-                                            },
-                                        ));
-                                    }
-                                }
-                            }
-                            Ok(_) => {}
-                            Err(error) => {
-                                tracing::warn!(%terminal_id,%error,"could not finish automatic terminal reservation")
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Reads only the daemon's accepted reservation, never a client's launch recipe.
-fn pending_terminal_session(
-    state: &HostState,
-    pane: crate::model::CardId,
-    terminal_id: TerminalId,
-    require_pending: bool,
-) -> Result<TerminalSession, ProtocolError> {
-    let model = state
-        .model
-        .as_ref()
-        .ok_or_else(|| model_unavailable("registry is unavailable".into()))?
-        .model()
-        .map_err(model_unavailable)?;
-    model
-        .views
-        .into_iter()
-        .flat_map(|view| view.panes)
-        .find_map(|candidate| {
-            if candidate.id == pane && (!require_pending || candidate.pending_terminal_start) {
-                if let crate::model::CardKind::Terminal(session) = candidate.kind {
-                    if session.id == terminal_id {
-                        return Some(session);
-                    }
-                }
-            }
-            None
-        })
-        .ok_or_else(|| not_found(terminal_id))
-}
-
 pub(super) fn spawn_pending_terminal(
     shared: &SharedHost,
     client_id: ClientId,
@@ -3928,8 +3943,9 @@ pub(super) fn spawn_pending_terminal(
     options: TerminalSpawnOptions,
 ) -> Result<TerminalDescriptor, ProtocolError> {
     let session = {
-        let state = shared.lock().unwrap_or_else(|p| p.into_inner());
-        pending_terminal_session(&state, pane, terminal_id, false)?
+        let writer = super::workspace::writer(shared)?;
+        let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+        super::workspace::pending_terminal(&registry, pane, terminal_id)?.session
     };
     start_terminal_view_owned(
         shared,
@@ -4185,21 +4201,38 @@ fn start_terminal_view_owned_reserved(
     let terminal_id = session.id;
     let native_handoff = execution_environment.is_some();
     let retained_environment = execution_environment.clone();
+    // Adoption already inspected this holder's issued source. Keep that exact
+    // receipt alias in the independently installed owner, including when the
+    // startup commit fails; the relaunch projection has no ownership proof.
+    let install_session = previous
+        .as_ref()
+        .map_or_else(|| session.clone(), |previous| previous.source.clone());
+    // Pane reservations are read on the workspace writer, which is always
+    // locked before HostState and never while holding it.
+    let pending_writer = pending_pane
+        .map(|_| super::workspace::writer(shared))
+        .transpose()?;
     let holder_recovery = {
+        let registry = pending_writer
+            .as_ref()
+            .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+        let reservation = registry
+            .as_deref()
+            .zip(pending_pane)
+            .map(|(registry, pane)| super::workspace::pending_terminal(registry, pane, terminal_id))
+            .transpose()?;
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(pane) = pending_pane {
+        if let Some(reservation) = reservation {
             // Completion is idempotent across clients, but an actor alone is
             // insufficient: its authoritative pane must still name it.
             if state.terminals.contains_key(&terminal_id) {
-                pending_terminal_session(&state, pane, terminal_id, false)?;
                 let descriptor = state.attach(client_id, terminal_id)?;
                 let handle = state.terminals[&terminal_id].handle.clone();
                 return Ok((descriptor, handle));
             }
-            let accepted = pending_terminal_session(&state, pane, terminal_id, true)?;
-            if accepted.launch != session.launch {
+            if !reservation.accepts(&session) {
                 return Err(not_found(terminal_id));
             }
         }
@@ -4257,6 +4290,12 @@ fn start_terminal_view_owned_reserved(
             }
         })
     };
+    // Fresh holders receive this exact daemon-issued source. Retain it after
+    // successful startup instead of the caller's proofless relaunch projection.
+    // Adoption keeps its independently installed previous source above.
+    let registered_session = holder_recovery
+        .as_ref()
+        .map_or_else(|| session.clone(), |recovery| recovery.source.clone());
 
     let agent_authority = if paired {
         match super::agent_execution::registry(shared) {
@@ -4352,7 +4391,6 @@ fn start_terminal_view_owned_reserved(
     };
     let wake_redraw = Arc::clone(&redraw);
     let adopting = config.adoption.is_some();
-    let install_session = session.clone();
     let install_options = options.clone();
     let install_environment = retained_environment.clone();
     let install_execution = execution_recipe.clone();
@@ -4456,7 +4494,25 @@ fn start_terminal_view_owned_reserved(
         .set_output_observer(move |sequence| broadcast_output(&output_host, terminal_id, sequence));
 
     let redraw_handle = handle.clone();
-    let descriptor = {
+    // Hold writer admission from this check through the completion save.
+    let mut pending_registry = pending_writer
+        .as_ref()
+        .map(|writer| writer.lock().unwrap_or_else(|p| p.into_inner()));
+    let reservation = pending_registry
+        .as_deref()
+        .zip(pending_pane)
+        .map(|(registry, pane)| {
+            super::workspace::pending_terminal(registry, pane, terminal_id).and_then(
+                |reservation| {
+                    if reservation.accepts(&session) {
+                        Ok(reservation)
+                    } else {
+                        Err(not_found(terminal_id))
+                    }
+                },
+            )
+        });
+    let (descriptor, completion) = {
         let mut state = shared
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -4470,16 +4526,9 @@ fn start_terminal_view_owned_reserved(
                 false,
             ));
         }
-        if let Some(pane) = pending_pane {
-            let validation =
-                pending_terminal_session(&state, pane, terminal_id, true).and_then(|accepted| {
-                    if accepted.launch == session.launch {
-                        Ok(())
-                    } else {
-                        Err(not_found(terminal_id))
-                    }
-                });
-            if let Err(error) = validation {
+        let reservation = match reservation.transpose() {
+            Ok(reservation) => reservation,
+            Err(error) => {
                 if adopting {
                     state.retain_startup_recovery(format!(
                         "Adopted terminal {terminal_id} lost its pane reservation after commit: {}",
@@ -4489,6 +4538,7 @@ fn start_terminal_view_owned_reserved(
                 }
                 state.cancel_spawn(terminal_id);
                 drop(state);
+                drop(pending_registry);
                 // The reservation was withdrawn while the worker was starting.
                 // Shut down only this unpublished worker, never an actor
                 // already attached by another client.
@@ -4496,7 +4546,7 @@ fn start_terminal_view_owned_reserved(
                 drop(handle);
                 return Err(error);
             }
-        }
+        };
         let issued_hint = execution_recipe
             .as_ref()
             .map(|_| session.resume_hint.clone());
@@ -4531,7 +4581,7 @@ fn start_terminal_view_owned_reserved(
         } else {
             state.finish_spawn_with_execution(
                 client_id,
-                session,
+                registered_session,
                 handle,
                 options.initially_visible,
                 execution_recipe.clone(),
@@ -4547,9 +4597,9 @@ fn start_terminal_view_owned_reserved(
                 .resume_hint = hint.clone();
             descriptor.session.resume_hint = hint;
         }
-        if descriptor.is_ok() && pending_pane.is_some() {
-            finish_pending_terminal(&mut state, terminal_id);
-        }
+        let completion = reservation
+            .filter(|_| descriptor.is_ok())
+            .map(|reservation| (reservation, state.terminals[&terminal_id].session.clone()));
         if descriptor.is_ok() {
             state
                 .terminals
@@ -4568,8 +4618,14 @@ fn start_terminal_view_owned_reserved(
             // terminal connection after checkpointing the returned live proof.
             state.subscriptions.detach(client_id, terminal_id);
         }
-        descriptor
+        (descriptor, completion)
     };
+    if let (Some(registry), Some((reservation, session))) =
+        (pending_registry.as_deref_mut(), completion)
+    {
+        super::workspace::complete_terminal(shared, registry, reservation, session);
+    }
+    drop(pending_registry);
     let descriptor = match descriptor {
         Ok(descriptor) => descriptor,
         Err(error) => {
@@ -5004,6 +5060,8 @@ mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
 #[cfg(test)]
+mod relaunch_lineage_tests;
+#[cfg(test)]
 mod retained_child_shutdown_tests;
 #[cfg(test)]
 mod strict_upgrade_tests;
@@ -5023,6 +5081,46 @@ pub(super) mod tests {
 
     fn test_host() -> HostState {
         test_host_with_incarnation("test-incarnation")
+    }
+
+    #[test]
+    fn startup_state_is_answered_while_startup_recovery_refuses_other_requests() {
+        use crate::terminal_ipc::{ClientRequest, ServerResponse};
+        let host = Arc::new(HostLock::new(test_host()));
+        let inspect =
+            || match crate::host::client::process_request(&host, 0, ClientRequest::StartupState)
+                .unwrap()
+                .0
+            {
+                ServerResponse::StartupState(state) => state,
+                response => panic!("unexpected startup state response: {response:?}"),
+            };
+        let refused = || {
+            crate::host::client::process_request(&host, 0, ClientRequest::BuildInfo)
+                .unwrap_err()
+                .code
+        };
+        assert_eq!(inspect(), StartupState::Ready);
+
+        let custody = TerminalId::new();
+        host.lock().unwrap().startup_custody.insert(custody);
+        assert_eq!(inspect(), StartupState::Restoring { awaiting: 1 });
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
+
+        let detail = "Upgrade restore retained original ownership: fixture restore failed";
+        host.lock().unwrap().retain_startup_recovery(detail.into());
+        let retained = StartupState::Retained {
+            detail: detail.into(),
+        };
+        assert_eq!(inspect(), retained);
+        // Custody settling afterwards does not end a retained recovery, and a
+        // later failure does not replace the original reason.
+        host.lock().unwrap().startup_custody.remove(&custody);
+        host.lock()
+            .unwrap()
+            .retain_startup_recovery("a later failure".into());
+        assert_eq!(inspect(), retained);
+        assert_eq!(refused(), ProtocolErrorCode::TerminalUnavailable);
     }
 
     #[test]
@@ -6443,6 +6541,94 @@ for line in sys.stdin:
     }
 
     #[test]
+    pub(super) fn restore_does_not_relaunch_beside_a_process_in_the_saved_unit() {
+        if !upgrade_fixture_in_fresh_process() {
+            return;
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let host = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let capability = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .shutdown_preflight(Instant::now())
+            .unwrap()
+            .capability;
+        prepare_upgrade_with(&host, capability, || Ok(store)).unwrap();
+        finish_upgrade(&host).unwrap();
+
+        let store = crate::upgrade::handoff::Store::open(directory.path()).unwrap();
+        let mut checkpoint = store.load().unwrap().unwrap();
+        let conversation = "aaaaaaaa-1111-4222-8333-444444444444";
+        let mut recipe = crate::model::LaunchRecipe::shell(directory.path().to_owned()).unwrap();
+        recipe.program = "claude".into();
+        recipe.arguments = vec!["--resume".into(), conversation.into()];
+        let mut launch = recipe.clone();
+        launch.program = "/usr/bin/systemd-run".into();
+        launch.arguments = vec![
+            "--user".into(),
+            "--scope".into(),
+            "--unit=saved-unit".into(),
+            "claude".into(),
+            "--resume".into(),
+            conversation.into(),
+        ];
+        checkpoint
+            .terminals
+            .push(crate::upgrade::handoff::Terminal {
+                source: TerminalSession {
+                    owned_codex_listener: None,
+                    recovery_origin: None,
+                    predecessor: None,
+                    id: TerminalId::new(),
+                    launch,
+                    transcript_path: None,
+                    resume_hint: crate::model::agent_recovery::hint_from_launch(&recipe),
+                    continuity: TerminalContinuity::DetachedSameBoot {
+                        host_session_id: checkpoint.proof.host_session_id.clone(),
+                        boot_id: checkpoint.proof.boot_id.clone(),
+                        host_incarnation: checkpoint.proof.host_incarnation.clone(),
+                    },
+                },
+                previous_sources: Vec::new(),
+                relaunches: Vec::new(),
+                recipe,
+                options: TerminalSpawnOptions::default(),
+            });
+        store.save(&checkpoint).unwrap();
+
+        // Its environment was cleared, so only the unit ties it to the terminal.
+        let process = directory.path().join("proc/43");
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), "43 (sleep) S 1").unwrap();
+        fs::write(process.join("cmdline"), b"sleep\01800\0").unwrap();
+        fs::write(process.join("environ"), b"").unwrap();
+        fs::write(
+            process.join("cgroup"),
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/saved-unit.scope\n",
+        )
+        .unwrap();
+
+        let replacement = Arc::new(crate::host::state::HostLock::new(test_host()));
+        let refusal =
+            restore_upgrade_from(&replacement, store, &directory.path().join("proc"), None)
+                .unwrap_err();
+        assert!(
+            refusal.contains("may still have a live process (43)"),
+            "{refusal}"
+        );
+        assert!(refusal.contains("saved-unit"), "{refusal}");
+        assert!(
+            replacement
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .terminals
+                .is_empty(),
+            "nothing may relaunch beside it"
+        );
+    }
+
+    #[test]
     pub(super) fn committed_upgrade_fences_control_and_retains_checkpoint_until_close() {
         if !upgrade_fixture_in_fresh_process() {
             return;
@@ -6730,6 +6916,12 @@ for line in sys.stdin:
                 let state = failed.lock().unwrap();
                 assert_eq!(state.terminals.len(), 1);
                 assert_eq!(state.startup_recovery(), Some(failure.as_str()));
+                assert_eq!(
+                    state.startup_state(),
+                    StartupState::Retained {
+                        detail: failure.clone()
+                    }
+                );
                 let descriptor = state.descriptor(0, source.id).unwrap();
                 assert_eq!(descriptor.upgrade_sources, vec![carried_source]);
                 assert_eq!(descriptor.session.launch, source.launch);

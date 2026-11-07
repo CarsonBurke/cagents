@@ -772,26 +772,26 @@ fn child_picker_filters_full_names_and_keeps_order_during_status_changes() {
     ];
     let mut picker = child_navigation::Picker::new(&children);
     let order: Vec<_> = picker
-        .rows(&children)
+        .rows(&children, &Default::default())
         .iter()
         .map(|child| child.id.clone())
         .collect();
     children[1].status = ToolStatus::Failed;
     assert_eq!(
         picker
-            .rows(&children)
+            .rows(&children, &Default::default())
             .iter()
             .map(|child| child.id.clone())
             .collect::<Vec<_>>(),
         order
     );
     picker.query = "working".into();
-    assert_eq!(picker.rows(&children).len(), 1);
+    assert_eq!(picker.rows(&children, &Default::default()).len(), 1);
     picker.query.clear();
     picker.filter = child_navigation::Filter::Attention;
-    assert_eq!(picker.rows(&children).len(), 2);
+    assert_eq!(picker.rows(&children, &Default::default()).len(), 2);
     picker.filter = child_navigation::Filter::Working;
-    assert!(picker.rows(&children).is_empty());
+    assert!(picker.rows(&children, &Default::default()).is_empty());
 }
 
 #[test]
@@ -872,16 +872,11 @@ fn narrow_child_navigation_stays_bounded_with_a_thousand_long_names() {
                         .child_picker
                         .as_ref()
                         .unwrap()
-                        .rows(&runtime.snapshot.subagents)
+                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
                         .into_iter()
                         .take(24)
                         .map(|child| {
-                            format!(
-                                "{} · {} · {}",
-                                Runtime::native_child_name(child),
-                                Runtime::native_child_status(child),
-                                child.id
-                            )
+                            Runtime::child_choice_name(child, &runtime.child_label(child, 80))
                         })
                         .collect::<Vec<_>>();
                     actual.sort();
@@ -1019,16 +1014,9 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
                 "covered transcript actions must be absent from AX"
             );
             let expected: Vec<_> = picker
-                .rows(&live.snapshot.subagents)
+                .rows(&live.snapshot.subagents, &live.child_ordinals)
                 .into_iter()
-                .map(|child| {
-                    format!(
-                        "{} · {} · {}",
-                        Runtime::native_child_name(child),
-                        Runtime::native_child_status(child),
-                        child.id
-                    )
-                })
+                .map(|child| Runtime::child_choice_name(child, &live.child_label(child, 80)))
                 .collect();
             let actual: Vec<_> = current
                 .iter()
@@ -1060,7 +1048,7 @@ fn child_chooser_actions_preserve_reader_and_cover_transcript_until_closed() {
     assert!(
         !empty
             .iter()
-            .any(|label| label.starts_with("Choose subagent:"))
+            .any(|label| label.starts_with("Search and filter subagents:"))
     );
     drop(app.handle_chat_ui(Action::SubagentPicker(target, false)));
     assert!(runtime(&app, target).child_picker.is_none());
@@ -1924,6 +1912,12 @@ fn hidden_diagnostic_metadata_releases_exact_source_and_restores_disclosure_on_r
     assert!(runtime.failure_ui.incidents.is_empty());
     assert!(runtime.failure_preview(&key).is_none());
     assert!(runtime.failure_ui.expanded.contains(&key));
+    // The client's publication retires the item on its own worker, which the
+    // presentation barrier does not cover.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while weak.upgrade().is_some() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
     assert!(
         weak.upgrade().is_none(),
         "diagnostic metadata must not retain the hidden original item"

@@ -12,6 +12,7 @@ mod delivery;
 pub(crate) mod descriptor_limit;
 #[cfg(all(test, target_os = "linux"))]
 mod exit_drain_tests;
+mod lifecycle;
 mod lock;
 mod model;
 mod notifications;
@@ -22,6 +23,7 @@ mod service;
 mod shutdown_tests;
 mod state;
 mod work;
+mod workspace;
 mod worktree_removal;
 
 use std::{
@@ -243,6 +245,14 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     };
     let paths = RuntimePaths::discover()?;
     let _lease = HostLease::acquire(&paths, &proof)?;
+    // Before anything is launched or adopted: sessions launched through this
+    // entry by an earlier daemon now run the CLI that speaks this protocol.
+    if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
+        tracing::warn!(
+            %error,
+            "sessions will name this version's CLI directory, which a later update does not follow"
+        );
+    }
     let mut initial = HostState::new(proof);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
@@ -416,6 +426,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     let mut ordinary_exit_drain: Option<crate::daemon::child_reaper::ExitDrain> = None;
     let mut ordinary_cleanup_started = false;
     let mut sealed_deliveries = None;
+    let mut lifecycle = lifecycle::Lifecycle::new();
     tracing::info!(
         instance = crate::instance::NAME,
         socket = %paths.socket.display(),
@@ -477,6 +488,20 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             continue;
         }
 
+        let deadline =
+            lifecycle.maintain(&host, client_capacity.active.load(Ordering::Acquire) != 0);
+        if ordinary_exit_drain.is_none()
+            && host
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_shutting_down()
+        {
+            #[cfg(all(test, target_os = "linux"))]
+            exit_drain_tests::lifecycle_retention_tests::observe_lifecycle_idle_shutdown();
+            // Lifecycle idle uses the same begin/seal path as requested exit.
+            // A pending drain must keep accepting inspection and checked Close.
+            continue;
+        }
         let fatal = match listener.accept() {
             Ok((stream, _address)) => {
                 match daemon::peer_uid(&stream) {
@@ -514,10 +539,11 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
                 None
             }
             // Nothing is pending. Park until a peer connects, a client thread
-            // exits, or a signal arrives; an idle daemon blocks here indefinitely
-            // instead of waking on a timer.
+            // exits, a holder exits, a signal arrives, or a real retention/development
+            // idle deadline expires. There is no periodic polling timer.
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                daemon::wait_for_activity(&listener).err()
+                daemon::wait_for_activity_until(&listener, deadline, lifecycle.waiting_holders())
+                    .err()
             }
             Err(error) if error.kind() == io::ErrorKind::Interrupted => None,
             Err(error) => Some(error),
@@ -696,8 +722,10 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
                     // Closing the provider leaves its retained helper alive
                     // until final outcomes are durably committed and ACKed.
                     // Preserve that ownership on failure, before retiring the
-                    // delegated session record below.
-                    chat::retained_actor::finish_close(host, &chat, &session)
+                    // delegated session record below. A paired CLI view closes
+                    // first, with the proof its resume requires.
+                    chat::retained_actor::close_paired_view(host, session.id)
+                        .and_then(|()| chat::retained_actor::finish_close(host, &chat, &session))
                 } else {
                     Ok(())
                 }
@@ -705,11 +733,12 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         };
         match closed {
             Ok(()) if !upgrading => {
-                // Ordinary shutdown proved this exact provider stopped. Retire
-                // its delegated record before a new daemon can resume the UI
-                // descriptor with another proof; absence alone cannot do this.
-                if let Err(error) = agent_execution::retired(host, &session) {
-                    tracing::warn!(%error, "delegated provider retirement was not saved");
+                // Ordinary shutdown proved this exact provider stopped. End its
+                // delegated authority and runs before a new daemon can resume
+                // the UI descriptor with another proof; absence alone cannot do
+                // this. The agent, pane and channel stay so it resumes in place.
+                if let Err(error) = agent_execution::stopped(host, &session) {
+                    tracing::warn!(%error, "delegated provider stop was not saved");
                     if result.is_ok() {
                         result = Err(error);
                     }

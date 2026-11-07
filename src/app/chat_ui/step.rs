@@ -427,7 +427,7 @@ impl Runtime {
         // conversation's own names rather than reprinting its command.
         let coordinated = cached.coordination.as_deref();
         let (verb, label) = match coordinated {
-            Some(coordinated) => coordinated.line(&|id| self.agent_name(id)),
+            Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
             None => (
                 turn::step_verb(&item.content).to_owned(),
                 turn::step_label(&item.content).to_owned(),
@@ -487,7 +487,9 @@ impl Runtime {
                 preview.push(design::caption(description.to_owned()).into());
             }
         }
-        preview.extend(cached.preview.tail_view());
+        if !coordinated.is_some_and(|coordinated| coordinated.reading.output_is_agent_states()) {
+            preview.extend(cached.preview.tail_view());
+        }
         line.push(
             widget::column::with_children(preview)
                 .spacing(GAP_XS)
@@ -592,9 +594,16 @@ impl Runtime {
                     ));
                 }
             }
-            ItemContent::Changes { changes, .. } => {
+            ItemContent::Changes { changes, status } => {
                 if changes.is_empty() {
-                    rows.push(design::caption("No file changes were reported.").into());
+                    rows.push(
+                        design::caption(if *status == ToolStatus::Running {
+                            "The edit is still being written."
+                        } else {
+                            "No file changes were reported."
+                        })
+                        .into(),
+                    );
                 }
                 for (index, change) in changes.iter().enumerate() {
                     rows.push(change_view(change));

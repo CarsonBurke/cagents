@@ -120,11 +120,39 @@ turn, and reopen the saved chat; compare the completed and restored content.
 The fixture represents a reproducible payload path, not a captured user
 conversation or evidence about the provider's answer prose.
 
+For subagent tab checks, create `fixture-subagents` before spawning the agent
+(`touch "$fixture_root/home/.claude/fixture-subagents"`). Each turn starts
+five Agent calls before its answer: Scout keeps working in the background,
+Planner waits on a rate limit in the background, Builder fails, and two
+unnamed Explore agents finish. The tabs beside Conversation must read Scout,
+Planner, Builder, Explore and Explore 2, in that order, each with its state's
+mark; hovering a tab shows its state and task. A selected agent's Stop ends
+just that agent.
+
+Select Builder and focus its tab. The first turn stays busy, so stop it
+before sending another prompt: because Stop also ends Scout and Planner, the
+first press only asks, and a second press within a few seconds confirms.
+The fixture then reports both as stopped. The next prompt starts five more
+agents, numbered after the first ones (Scout 2, Planner 2, Builder 2,
+Explore 3 and Explore 4), and Builder keeps its number, the selection and the
+keyboard focus while the strip re-sorts. The scene covers Claude's Agent
+calls only; it does not exercise Codex nicknames.
+
 For a chosen set of tool calls, write `fixture-tools.jsonl`: one call per
 line, as `{"name":"Bash","input":{"command":"cargo test","description":"Run
 the tests"},"result":"error[E0308]: mismatched types","is_error":true}`.
 Every turn emits each call and its result in order, before its answer, and
 records them in the synthetic history like the other behaviors.
+
+To replay a provider stream exactly, write `fixture-frames.jsonl`: one
+stream-json frame per line, emitted in order on every turn before its answer.
+`@TURN@` in any string becomes the turn number, so IDs stay unique across
+turns. Assistant and user frames are recorded in the synthetic history; system
+frames, such as a background task's `task_started` and `task_notification`,
+are live only, as they are from Claude Code. A frame with `"_history": true` is
+only recorded, the way Claude Code records a queued notification as a
+`queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
+state can be captured.
 
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native

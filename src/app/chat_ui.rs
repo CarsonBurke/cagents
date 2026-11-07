@@ -191,6 +191,33 @@ impl std::fmt::Debug for Ready {
     }
 }
 
+impl Ready {
+    /// Turns a started reply into a retryable failure, returning the actor the
+    /// start produced so the caller decides what becomes of it.
+    fn fail(&self, message: String) -> Option<Arc<ClientHandle>> {
+        let mut reply = self.0.lock().ok()?;
+        let started = reply.take().and_then(Result::ok);
+        *reply = Some(Err(chat::StartFailure::retry(message)));
+        started
+    }
+}
+
+/// Waits for the session writer's answer to a card rebind.
+async fn rebind_receipt(
+    receipt: Result<std::sync::mpsc::Receiver<Result<(), String>>, String>,
+) -> Result<(), String> {
+    let receipt = receipt?;
+    tokio::task::spawn_blocking(move || {
+        receipt
+            .recv()
+            .map_err(|error| format!("Session writer disconnected: {error}"))
+            .and_then(|result| result)
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result)
+}
+
 #[derive(Debug, Clone)]
 pub enum CopyPart {
     Text,
@@ -242,6 +269,7 @@ pub enum Action {
     Ready(Target, Ready),
     AccountCommitted(Target, Ready, Result<(), String>),
     UpgradeCommitted(Target, Ready, Result<(), String>),
+    ResumeCommitted(Target, Ready, Result<(), String>),
     RetainedCopyCommitted(CardId, Result<(), String>),
     /// The result of giving up a conversation's daemon actor after its card
     /// stopped holding it: a closed card, an abandoned start, or a start that
@@ -289,6 +317,11 @@ pub enum Action {
         Result<Vec<Attachment>, String>,
     ),
     Submit(Target, PromptMode),
+    /// A press of one of the composer's send controls. It submits like
+    /// [`Action::Submit`], then returns the keyboard to the draft: the control
+    /// shows only while there is a draft, so the one just pressed is gone
+    /// once the draft is sent, and its focus would otherwise go with it.
+    SubmitControl(Target, PromptMode),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
     HistoryOlder(Target),
@@ -463,7 +496,6 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
-    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -497,6 +529,7 @@ impl Action {
                 | Self::FlowReady(..)
                 | Self::AccountCommitted(..)
                 | Self::UpgradeCommitted(..)
+                | Self::ResumeCommitted(..)
                 | Self::RetainedCopyCommitted(..)
                 | Self::Wake(..)
                 | Self::UpdatesAcknowledged(..)
@@ -609,6 +642,9 @@ struct Attempt {
     session: chat::Session,
     recovery: Option<AccountRecovery>,
     upgrade_committed: bool,
+    /// Whether the daemon-prepared successor of a stranded retained card has
+    /// been saved in that card's place.
+    resume_committed: bool,
     /// Exact authoritative target; only authenticated upgrade resolution may bind its draft.
     upgrade_admission: Option<chat::Session>,
 }
@@ -2306,6 +2342,10 @@ pub(super) struct Runtime {
     observed_scroll: scroll::Observations,
     scroll_memory: scroll::Memory,
     child_picker: Option<child_navigation::Picker>,
+    /// The child whose tab holds keyboard focus. The tab strip reports it, so
+    /// the next frame keeps that tab mounted wherever its state sorts it.
+    child_tab_focus: std::rc::Rc<std::cell::RefCell<Option<String>>>,
+    child_ordinals: child_navigation::Ordinals,
     /// The ids of items the reader was asked something after.
     ///
     /// A question or an approval request is the agent handing control back, so
@@ -2366,7 +2406,6 @@ pub(super) struct Runtime {
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
-    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -3287,6 +3326,8 @@ impl Runtime {
             observed_scroll: Default::default(),
             scroll_memory: Default::default(),
             child_picker: None,
+            child_tab_focus: Default::default(),
+            child_ordinals: Default::default(),
             asked_after: HashSet::new(),
             asked: HashSet::new(),
             opened: HashMap::new(),
@@ -3319,7 +3360,6 @@ impl Runtime {
             failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
-            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -3378,6 +3418,7 @@ impl Runtime {
         self.unplaced_failures.clear();
         self.failure_ui = failure::State::default();
         self.child_picker = None;
+        self.child_tab_focus.borrow_mut().take();
         self.listed_models = 0;
         self.earlier_asked = None;
         self.later_asked = None;
@@ -3493,6 +3534,17 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    /// The current confirmed connection's owner, without issuing a request.
+    pub(super) fn startup_host_proof(&self) -> Option<crate::model::HostSessionProof> {
+        if self.disconnected {
+            return None;
+        }
+        self.handle()
+            .filter(|handle| handle.is_connected())
+            .and_then(|handle| handle.proof())
+            .filter(|proof| proof.is_complete())
+    }
+
     /// Readiness for the updater's saved-pane gate; no provider is launched here.
     pub(super) fn restored_pane_ready(&self) -> Result<bool, String> {
         if self.is_draft() {
@@ -4498,6 +4550,9 @@ impl Runtime {
         mut snapshot: Arc<Snapshot>,
         source_clock: Option<chat::client::SourceClock>,
     ) {
+        // Hidden publications number new children too, so a child keeps the
+        // number it first appeared with for as long as it stays listed.
+        self.child_ordinals.observe(&snapshot.subagents);
         if !self.visible.load(Ordering::Relaxed) {
             self.release_transcript_presentation();
             Arc::make_mut(&mut snapshot).evict_transcript();
@@ -5438,6 +5493,39 @@ fn retire_conversation(
     handle: Option<Arc<ClientHandle>>,
     session: Option<chat::Session>,
 ) -> Result<(), String> {
+    end_conversation(handle, session, super::channel_ui::close_sessions)
+}
+
+/// Closes a conversation the reader closed, like [`retire_conversation`],
+/// and also retires the agent still bound to it after a daemon stop. Giving
+/// up a failed start must not do that, so only an explicit Close comes here.
+///
+/// A reopened conversation that was given no work yet leaves its agent
+/// stopped when its process closes, as a reopening its card gave up would; so
+/// a live conversation's agent is retired by its session once it has closed.
+fn close_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+) -> Result<(), String> {
+    let live = handle.is_some();
+    end_conversation(
+        handle,
+        session.clone(),
+        super::channel_ui::close_sessions_retiring_agents,
+    )?;
+    match session {
+        Some(session) if live => {
+            super::channel_ui::close_sessions_retiring_agents(vec![CardKind::Chat(session)])
+        }
+        _ => Ok(()),
+    }
+}
+
+fn end_conversation(
+    handle: Option<Arc<ClientHandle>>,
+    session: Option<chat::Session>,
+    close: fn(Vec<CardKind>) -> Result<(), String>,
+) -> Result<(), String> {
     let refused = match handle.map(|handle| handle.close()) {
         Some(Ok(())) => return Ok(()),
         Some(Err(error)) => Some(error),
@@ -5446,12 +5534,10 @@ fn retire_conversation(
     let Some(session) = session else {
         return refused.map_or(Ok(()), Err);
     };
-    super::channel_ui::close_sessions(vec![CardKind::Chat(session)]).map_err(
-        |error| match refused {
-            Some(refused) => format!("{refused}; {error}"),
-            None => error,
-        },
-    )
+    close(vec![CardKind::Chat(session)]).map_err(|error| match refused {
+        Some(refused) => format!("{refused}; {error}"),
+        None => error,
+    })
 }
 
 /// The CLI the daemon still runs for a Codex thread, if any.
@@ -6512,9 +6598,7 @@ impl Cagents {
         replacement.id = TerminalId::new();
         replacement.proof = None;
         replacement.terminal = None;
-        let variable = account::home_variable(account.provider).unwrap();
         let names = account::credential_overrides(account.provider);
-        replacement.launch.recipe.environment.remove(variable);
         replacement
             .launch
             .recipe
@@ -6531,15 +6615,8 @@ impl Cagents {
                 .iter()
                 .map(|name| (*name).to_owned()),
         );
-        if let Some(home) = account.resolved_home() {
-            let Some(home) = home.to_str() else {
-                return Task::none();
-            };
-            replacement
-                .launch
-                .recipe
-                .environment
-                .insert(variable.into(), home.into());
+        if account.bind_home(&mut replacement.launch.recipe).is_err() {
+            return Task::none();
         }
         if !chat::is_account_recovery(&source, &replacement) {
             return Task::none();
@@ -6552,6 +6629,7 @@ impl Cagents {
                 intent: chat::Intent::Restore,
                 session: replacement.clone(),
                 upgrade_committed: false,
+                resume_committed: false,
                 upgrade_admission: None,
                 recovery: Some(AccountRecovery {
                     source: source.clone(),
@@ -6784,7 +6862,6 @@ impl Cagents {
             runtime.account_picker = false;
             runtime.reasoning_picker = false;
             runtime.permission_picker = false;
-            runtime.footer_picker = false;
             runtime.snapshot = Arc::new(fresh);
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
@@ -7279,13 +7356,11 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
-            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
-        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -8218,7 +8293,7 @@ impl Cagents {
             return cosmic::task::future(async move {
                 let saved = session.clone();
                 let result =
-                    tokio::task::spawn_blocking(move || retire_conversation(handle, Some(saved)))
+                    tokio::task::spawn_blocking(move || close_conversation(handle, Some(saved)))
                         .await
                         .map_err(|error| error.to_string())
                         .and_then(|result| result);
@@ -8231,7 +8306,7 @@ impl Cagents {
         let retire = if pending {
             Task::none()
         } else {
-            self.retire_chat(card, handle, Some(session))
+            self.end_chat(card, handle, Some(session), close_conversation)
         };
         Task::batch([retire, remove])
     }
@@ -8243,10 +8318,20 @@ impl Cagents {
         handle: Option<Arc<ClientHandle>>,
         session: Option<chat::Session>,
     ) -> Task<Message> {
+        self.end_chat(card, handle, session, retire_conversation)
+    }
+
+    fn end_chat(
+        &mut self,
+        card: CardId,
+        handle: Option<Arc<ClientHandle>>,
+        session: Option<chat::Session>,
+        end: fn(Option<Arc<ClientHandle>>, Option<chat::Session>) -> Result<(), String>,
+    ) -> Task<Message> {
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
         cosmic::task::future(async move {
-            let result = tokio::task::spawn_blocking(move || retire_conversation(handle, session))
+            let result = tokio::task::spawn_blocking(move || end(handle, session))
                 .await
                 .map_err(|error| error.to_string())
                 .and_then(|result| result);
@@ -8347,6 +8432,17 @@ impl Cagents {
             }
             None => None,
         };
+        // The chat's close ran beside the pane holding the only removal. It
+        // waits for its turn; a replacement isn't a close, and reports.
+        if replacement.is_none()
+            && self
+                .workspace
+                .pending_close()
+                .is_some_and(|pending| pending.unmounting != card)
+        {
+            self.queue_card_close(card, false);
+            return None;
+        }
         self.reserve_chat_removal(card)?;
         self.commit_card_removal(card, replacement)
     }
@@ -8496,6 +8592,7 @@ impl Cagents {
                 session: session.clone(),
                 recovery: None,
                 upgrade_committed: false,
+                resume_committed: false,
                 upgrade_admission: upgrade_admission.clone(),
             }),
         );
@@ -9148,7 +9245,7 @@ impl Cagents {
             } else if !snapshot.models.is_empty() || waited >= MODEL_PATIENCE {
                 queued.model = None;
                 runtime.note(format!(
-                    "This conversation does not offer {model}, so the message went to its default model."
+                    "This conversation does not offer {model}, so this message will use its default model."
                 ));
                 self.forget_chat_model(provider, &model);
             } else {
@@ -9209,12 +9306,27 @@ impl Cagents {
             }
             (QueuedStep::Model, Err(error)) => {
                 let model = queued.model.take().map(|(model, _)| model);
-                runtime.note(format!(
-                    "{} could not be chosen ({error}), so the message went to the default model.",
-                    model.as_deref().unwrap_or("The model")
-                ));
-                if let Some(model) = model {
-                    self.forget_chat_model(provider, &model);
+                let name = model.as_deref().unwrap_or("the model");
+                match chat::failure::DeliveryOutcome::parse(&error) {
+                    // Claude did not take the request; the model itself may
+                    // be fine, so it stays on offer.
+                    // Whether the message itself is sent is reported apart.
+                    Some(outcome) if outcome.unknown => runtime.note(format!(
+                        "Claude hasn't confirmed the switch to {name} yet, so this message might not use it."
+                    )),
+                    Some(_) => runtime.note(format!(
+                        "Claude didn't take the switch to {name}, so this message won't use it."
+                    )),
+                    None => {
+                        tracing::warn!(%error, "a queued model choice was refused");
+                        runtime.note(format!(
+                            "{} couldn't be chosen, so this message won't use it.",
+                            model.as_deref().unwrap_or("The model")
+                        ));
+                        if let Some(model) = model {
+                            self.forget_chat_model(provider, &model);
+                        }
+                    }
                 }
                 None
             }
@@ -9242,7 +9354,11 @@ impl Cagents {
             .take()
             .map(|queued| (queued.source.text().to_owned(), queued.attachments));
         let _ = runtime.present();
-        if let Some(error) = error {
+        // A delivery report about a message that arrived anyway says
+        // nothing more the reader can act on.
+        if let Some(error) = error
+            && chat::failure::DeliveryOutcome::parse(&error).is_none()
+        {
             runtime.note(format!(
                 "The first message arrived, but its sending reported: {error}"
             ));
@@ -9543,7 +9659,6 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
-            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
@@ -9843,7 +9958,6 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -10048,12 +10162,44 @@ impl Cagents {
                             attempt.upgrade_committed = true;
                         }
                     }
-                    Err(error) => {
-                        if let Ok(mut reply) = ready.0.lock() {
-                            *reply = Some(Err(chat::StartFailure::retry(format!(
-                                "The upgraded conversation was not saved: {error}. Its saved identity is retained; retry to reconnect."
-                            ))));
+                    Err(failure) => {
+                        // The upgraded actor keeps the card's own chat ID, so
+                        // it is the conversation the card still names: it is
+                        // let go, not closed, and a retry reconnects to it.
+                        drop(ready.fail(format!(
+                            "The upgraded conversation was not saved: {failure}. Its saved identity is retained; retry to reconnect."
+                        )));
+                    }
+                }
+                return self.update(Message::ChatUi(Action::Ready(target, ready)));
+            }
+            Action::ResumeCommitted(target, ready, result) => {
+                match result {
+                    Ok(()) => {
+                        if let Some(Phase::Starting(attempt)) =
+                            self.chat_ui.phases.get_mut(&target.card)
+                            && attempt.target == target
+                        {
+                            attempt.resume_committed = true;
                         }
+                    }
+                    Err(failure) => {
+                        // The successor runs under a new chat ID that the card
+                        // may not name, so it is closed rather than left running
+                        // beside the conversation the card still names. Nothing
+                        // was sent to it, so closing it loses nothing; were the
+                        // rebind in fact committed, the card reopens the closed
+                        // successor from its saved history.
+                        let started = ready.fail(format!(
+                            "The reopened conversation was not saved: {failure}. Its saved identity is retained; retry to reopen it."
+                        ));
+                        let retire = started.map_or_else(Task::none, |handle| {
+                            self.retire_chat(target.card, Some(handle), None)
+                        });
+                        return Task::batch([
+                            retire,
+                            self.update(Message::ChatUi(Action::Ready(target, ready))),
+                        ]);
                     }
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
@@ -10069,12 +10215,12 @@ impl Cagents {
                             recovery.committed = true;
                         }
                     }
-                    Err(error) => {
-                        if let Ok(mut reply) = ready.0.lock() {
-                            *reply = Some(Err(chat::StartFailure::retry(format!(
-                                "The account change was not saved: {error}. The original conversation is retained."
-                            ))));
-                        }
+                    Err(failure) => {
+                        // The failed start then closes the replacement by its
+                        // chat ID, as for any account recovery that failed.
+                        drop(ready.fail(format!(
+                            "The account change was not saved: {failure}. The original conversation is retained."
+                        )));
                     }
                 }
                 return self.update(Message::ChatUi(Action::Ready(target, ready)));
@@ -10110,6 +10256,11 @@ impl Cagents {
                     .ok()
                     .and_then(|handle| handle.upgrade_recovery())
                     .map(|(source, _)| source);
+                let resumed_source = result
+                    .as_ref()
+                    .ok()
+                    .and_then(|handle| handle.resumed_from())
+                    .cloned();
                 if !self.card_state(target.card).is_some_and(|card| {
                     card.existence.is_open()
                         && match &card.kind {
@@ -10119,6 +10270,7 @@ impl Cagents {
                                         account_source
                                             .as_ref()
                                             .or(upgrade_source)
+                                            .or(resumed_source.as_ref())
                                             .map_or(session.id == attempt.session.id, |source| {
                                                 session == source
                                             })
@@ -10227,21 +10379,47 @@ impl Cagents {
                                     .insert(target.card, Phase::Starting(attempt));
                                 let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
                                 return cosmic::task::future(async move {
-                                    let result = match receipt {
-                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
-                                            receipt
-                                                .recv()
-                                                .map_err(|error| {
-                                                    format!("Session writer disconnected: {error}")
-                                                })
-                                                .and_then(|result| result)
-                                        })
-                                        .await
-                                        .map_err(|error| error.to_string())
-                                        .and_then(|result| result),
-                                        Err(error) => Err(error),
-                                    };
+                                    let result = rebind_receipt(receipt).await;
                                     Message::ChatUi(Action::UpgradeCommitted(target, ready, result))
+                                });
+                            }
+                        }
+                        if let Some(source) = &resumed_source {
+                            let replacement = handle.session();
+                            if account_source.is_some()
+                                || source != &attempt.session
+                                || !chat::is_retained_resume_commit(source, &replacement)
+                                // A successor started on a saved conversation
+                                // names it in its first snapshot; one that the
+                                // daemon proved has none starts its own.
+                                || replacement.launch.session_id.as_ref().is_some_and(|id| {
+                                    handle.snapshot().session_id.as_ref() != Some(id)
+                                })
+                            {
+                                self.status = Some(TransientNotice::error(
+                                    "The reopened conversation did not match the saved one. Its saved identity is retained.",
+                                ));
+                                return self.retire_chat(target.card, Some(handle), None);
+                            }
+                            if !attempt.resume_committed {
+                                let receipt = self
+                                    .session
+                                    .as_ref()
+                                    .ok_or_else(|| "Session storage is unavailable".to_owned())
+                                    .and_then(|writer| {
+                                        writer.rebind_chat_resume(
+                                            target.card,
+                                            source.clone(),
+                                            replacement,
+                                        )
+                                    });
+                                self.chat_ui
+                                    .phases
+                                    .insert(target.card, Phase::Starting(attempt));
+                                let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
+                                return cosmic::task::future(async move {
+                                    let result = rebind_receipt(receipt).await;
+                                    Message::ChatUi(Action::ResumeCommitted(target, ready, result))
                                 });
                             }
                         }
@@ -10277,20 +10455,7 @@ impl Cagents {
                                     });
                                 let ready = Ready(Arc::new(Mutex::new(Some(Ok(handle)))));
                                 return cosmic::task::future(async move {
-                                    let result = match receipt {
-                                        Ok(receipt) => tokio::task::spawn_blocking(move || {
-                                            receipt
-                                                .recv()
-                                                .map_err(|error| {
-                                                    format!("Session writer disconnected: {error}")
-                                                })
-                                                .and_then(|result| result)
-                                        })
-                                        .await
-                                        .map_err(|error| error.to_string())
-                                        .and_then(|result| result),
-                                        Err(error) => Err(error),
-                                    };
+                                    let result = rebind_receipt(receipt).await;
                                     Message::ChatUi(Action::AccountCommitted(target, ready, result))
                                 });
                             }
@@ -10377,7 +10542,10 @@ impl Cagents {
                         }
                         self.chat_ui.explicit_starts.remove(&target.card);
                         self.resolve_notice(NoticeKey::ChatAttach(target.card));
-                        if account_source.is_some() || attempt.upgrade_admission.is_some() {
+                        if account_source.is_some()
+                            || resumed_source.is_some()
+                            || attempt.upgrade_admission.is_some()
+                        {
                             // Shared projection may already hold the canonical
                             // descriptor. Still save the confirmed draft and
                             // removal of its pending marker after the receipt.
@@ -11219,6 +11387,25 @@ impl Cagents {
                     }
                 }
             }
+            Action::SubmitControl(target, mode) => {
+                let submitted = self.handle_chat_ui(Action::Submit(target, mode));
+                // A picker the draft named, `/permissions` or `/resume`, takes
+                // the keyboard itself.
+                // Starting a draft can replace its runtime, so the card, not
+                // the generation, names the composer that keeps the keyboard.
+                let composer = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) => !runtime.permission_picker,
+                    _ => false,
+                };
+                if self.resume_ui.open || !composer {
+                    return submitted;
+                }
+                return Task::batch([
+                    submitted,
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::Submit(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -11456,23 +11643,12 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
-            Action::FooterPicker(target, open) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.footer_picker = open;
-                    runtime.model_picker = None;
-                    runtime.reasoning_picker = false;
-                    runtime.account_picker = false;
-                    runtime.permission_picker = false;
-                    runtime.composer_actions = false;
-                }
-            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
-                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -11532,7 +11708,6 @@ impl Cagents {
                     runtime.history_attachment_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -12163,7 +12338,7 @@ impl Cagents {
                     && let Some(picker) = runtime.child_picker.as_mut()
                 {
                     let last = picker
-                        .rows(&runtime.snapshot.subagents)
+                        .rows(&runtime.snapshot.subagents, &runtime.child_ordinals)
                         .len()
                         .saturating_sub(1)
                         / 24;
@@ -12800,7 +12975,6 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
-                runtime.footer_picker = false;
                 runtime.composer_actions = false;
                 if !runtime
                     .snapshot
@@ -13220,7 +13394,6 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
-                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -13246,7 +13419,6 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                 }
             }
         }
@@ -14729,6 +14901,41 @@ mod tests {
             .collect()
     }
 
+    /// The send controls show only beside a draft, so the one a keyboard
+    /// user pressed is gone once the draft is sent. Its press hands the
+    /// keyboard back to the composer rather than to nothing, unless the draft
+    /// named a picker that takes the keyboard itself.
+    #[test]
+    fn a_pressed_send_control_returns_the_keyboard_to_the_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("send-control"));
+        let composer = card_control_id(card, "chat-composer");
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.queue = false;
+        snapshot.capabilities.permission_modes = vec!["manual".into(), "auto".into()];
+        runtime.replace_draft(text_editor::Content::with_text("next task"));
+        let target = runtime.target;
+        let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Queue));
+        assert_eq!(chat_runtime(&app, card).followups[0].text, "next task");
+        assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
+        assert_eq!(task_focuses(task, &composer), (true, false));
+
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("/permissions"));
+        let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Queue));
+        assert!(chat_runtime(&app, card).permission_picker);
+        assert!(
+            !task_focuses(task, &composer).0,
+            "the permissions picker keeps the keyboard it was opened with"
+        );
+    }
+
     #[test]
     fn a_busy_provider_without_native_queue_keeps_a_followup_editable() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -15026,7 +15233,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn new_chat_pins_selected_home_credential_policy_and_system_inherits() {
+    fn new_chat_pins_selected_home_credential_policy_and_system_resolves_the_default() {
         for provider in Account::PROVIDERS {
             for account in [
                 Account::system(provider),
@@ -15041,11 +15248,26 @@ mod tests {
                     false,
                 )
                 .unwrap();
-                let expected = account
+                let mut expected: std::collections::BTreeSet<String> = account
                     .credential_overrides()
                     .iter()
                     .map(|name| (*name).to_owned())
                     .collect();
+                // The system Claude login resolves the CLI's default home
+                // rather than one the spawning process inherited.
+                if account.is_system()
+                    && provider == Provider::Claude
+                    && account.launch_home().is_none()
+                {
+                    expected.insert("CLAUDE_CONFIG_DIR".to_owned());
+                    assert!(
+                        !session
+                            .launch
+                            .recipe
+                            .environment
+                            .contains_key("CLAUDE_CONFIG_DIR")
+                    );
+                }
                 assert_eq!(session.launch.recipe.unset_environment, expected);
                 for name in account.credential_overrides() {
                     assert!(!session.launch.recipe.environment.contains_key(*name));
@@ -15791,10 +16013,13 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.disconnected = true;
         runtime.error = Some("Upgrade replacement changed configuration".into());
+        let reason = app.startup_pane_check().unwrap_err();
+        let title = app.card_display_title(app.card_state(card).unwrap());
         assert!(
-            app.startup_pane_check()
-                .unwrap_err()
-                .contains(&card.to_string())
+            reason.starts_with(&format!(
+                "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+            )),
+            "{reason}"
         );
         assert_eq!(chat_runtime(&app, card).composer.text().trim(), "Draft 99");
         app.chat_runtime_mut(target).unwrap().disconnected = false;
@@ -15820,10 +16045,13 @@ mod tests {
                 card,
                 CardRuntime::Failed("Fixture terminal failed to attach".into()),
             );
+            let reason = app.startup_pane_check().unwrap_err();
+            let title = app.card_display_title(app.card_state(card).unwrap());
             assert!(
-                app.startup_pane_check()
-                    .unwrap_err()
-                    .contains(&card.to_string())
+                reason.starts_with(&format!(
+                    "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+                )),
+                "{program}: {reason}"
             );
             app.cards.remove(&card);
             assert_eq!(
@@ -21981,6 +22209,146 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).attachments, attachments);
     }
 
+    /// A stranded retained card is rebound to its started successor only once
+    /// the store has it; until then, and when the store refuses it or the card
+    /// closes meanwhile, the card names its source and the successor is
+    /// closed rather than left running beside it.
+    #[test]
+    fn a_resumed_successor_replaces_its_card_only_after_the_store_commits_it() {
+        for outcome in ["committed", "refused", "closed"] {
+            let directory = tempfile::tempdir().unwrap();
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (writer, _) = crate::session::SessionRuntime::open(
+                directory.path().join("state.sqlite3"),
+                crate::model::BootId::new("boot-test"),
+            )
+            .unwrap();
+            app.session = Some(writer);
+            let mut source = chat::fresh_session(
+                Provider::Claude,
+                TerminalId::new(),
+                directory.path().into(),
+                &crate::account::Account::system(Provider::Claude),
+            )
+            .unwrap();
+            source.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
+            source.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "old-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "old-incarnation".into(),
+            });
+            source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            drop(app.insert_chat_card(source.clone(), None, None));
+            let card = app.workspace.focused().unwrap();
+            app.persist();
+            let store = app.session.as_ref().unwrap().operation_store();
+            let stored = |app: &Cagents| {
+                app.session
+                    .as_ref()
+                    .unwrap()
+                    .flush(Duration::from_secs(10))
+                    .unwrap();
+                store.load_card(card, None).unwrap().unwrap()
+            };
+            assert_eq!(stored(&app).kind, CardKind::Chat(source.clone()));
+            let mut successor = source.clone();
+            successor.id = TerminalId::new();
+            successor.proof = Some(crate::model::HostSessionProof {
+                host_session_id: "fixture-host".into(),
+                boot_id: "fixture-boot".into(),
+                host_incarnation: "fixture-incarnation".into(),
+            });
+            let handle = Arc::new(ClientHandle::fixture_resumed(
+                source.clone(),
+                successor.clone(),
+                Snapshot {
+                    ready: true,
+                    session_id: successor.launch.session_id.clone(),
+                    native_continuity: successor.native_continuity.clone(),
+                    ..Snapshot::default()
+                },
+            ));
+            if outcome == "refused" {
+                // Another writer re-pointed the card first.
+                let mut competing = source.clone();
+                competing.id = TerminalId::new();
+                competing.proof = successor.proof.clone();
+                store.rebind_chat_resume(card, &source, &competing).unwrap();
+            }
+            let target = chat_runtime_attempt(&app, card);
+            let task = app.update(Message::ChatUi(Action::Ready(
+                target,
+                Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+            )));
+            assert!(app.chat_start_pending(card), "the commit is awaited");
+            assert_eq!(
+                app.card_state(card).unwrap().kind,
+                CardKind::Chat(source.clone()),
+                "the card names its source until the store has the successor"
+            );
+            if outcome == "closed" {
+                close_chat(&mut app, card);
+            }
+            let reply = resume_commit_reply(task);
+            let committed = matches!(
+                &reply,
+                Message::ChatUi(Action::ResumeCommitted(_, _, Ok(())))
+            );
+            assert_eq!(committed, outcome != "refused", "{outcome}");
+            let _ = app.update(reply);
+            match outcome {
+                "committed" => {
+                    assert_eq!(
+                        app.card_state(card).unwrap().kind,
+                        CardKind::Chat(successor.clone())
+                    );
+                    assert_eq!(stored(&app).kind, CardKind::Chat(successor.clone()));
+                    assert!(app.chat_ui.retiring.iter().all(|t| t.card != card));
+                }
+                "refused" => {
+                    assert_eq!(
+                        app.card_state(card).unwrap().kind,
+                        CardKind::Chat(source.clone())
+                    );
+                    assert!(matches!(
+                        app.cards.get(&card),
+                        Some(CardRuntime::Failed(_)) | Some(CardRuntime::Chat(_))
+                    ));
+                    retired(&mut app, card);
+                }
+                _ => {
+                    assert!(!stored(&app).existence.is_open());
+                    assert!(!app.cards.contains_key(&card));
+                    retired(&mut app, card);
+                }
+            }
+        }
+    }
+
+    fn resume_commit_reply(task: Task<Message>) -> Message {
+        use cosmic::iced::futures::StreamExt;
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                tokio::time::timeout(Duration::from_secs(10), async {
+                    let mut stream = cosmic::iced::runtime::task::into_stream(task).unwrap();
+                    while let Some(action) = stream.next().await {
+                        if let cosmic::iced::runtime::Action::Output(cosmic::Action::App(
+                            message @ Message::ChatUi(Action::ResumeCommitted(..)),
+                        )) = action
+                        {
+                            return message;
+                        }
+                    }
+                    panic!("resume commit produced no acknowledgment");
+                })
+                .await
+                .expect("session writer did not acknowledge the resume within 10 seconds")
+            })
+    }
+
     #[test]
     fn retained_chat_close_and_channel_move_do_not_overtake_each_other() {
         use crate::{
@@ -23594,6 +23962,12 @@ mod tests {
         saved.session.launch.recipe.program = "claude".into();
         saved.session.launch.recipe.arguments.clear();
         saved.session.launch.recipe.working_directory = project.path().join("removed");
+        // It ran before it was closed, so it carries that start's proof.
+        saved.session.proof = Some(crate::model::HostSessionProof {
+            host_session_id: "saved-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "saved-incarnation".into(),
+        });
         let provider_id = saved.session.launch.session_id.clone();
         let _ = app.resume_saved_conversation(saved);
         let reopened = app.workspace.focused().unwrap();
@@ -23855,6 +24229,219 @@ mod tests {
         app.notices.entries.clear();
         app.status = None;
         close_chat(&mut app, card);
+    }
+
+    /// A saved terminal, as a pane restored from an earlier daemon has one.
+    fn saved_terminal_pane(app: &mut Cagents) -> CardId {
+        let mut state = crate::app::tests::terminal_card_state();
+        let card = state.id;
+        let CardKind::Terminal(session) = &mut state.kind else {
+            unreachable!();
+        };
+        session.continuity = TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("earlier-host"),
+            boot_id: crate::model::BootId::new("earlier-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("earlier-incarnation"),
+        };
+        Arc::make_mut(&mut app.durable).cards.push(state);
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        card
+    }
+
+    /// Answers the close `card` is waiting on: its terminal is proven gone.
+    fn settle_proven_gone(app: &mut Cagents, card: CardId) {
+        let intent = app
+            .terminal_close
+            .clone()
+            .expect("this pane's close is running");
+        assert_eq!(intent.card, card);
+        let _ = app.update(Message::TerminalCloseFinished {
+            card,
+            terminal: intent.terminal,
+            proof: intent.proof,
+            generation: intent.generation,
+            outcome: crate::app::terminal_close::CloseOutcome::NotHosted,
+        });
+        let _ = app.update(Message::CommitClose(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+    }
+
+    /// "Close other panes" with a retained chat first: the chat holds the
+    /// workspace's only removal, and its close can fail with nothing left to
+    /// tell the panes behind it.
+    #[test]
+    fn a_failed_retained_chat_close_does_not_strand_the_panes_behind_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let first = saved_terminal_pane(&mut app);
+        let second = saved_terminal_pane(&mut app);
+        app.chrome_ui.closing_group = vec![card, first, second];
+        drop(app.close_pane_group());
+        assert_eq!(app.workspace.pending_close().unwrap().unmounting, card);
+        let _ = app.update(Message::CommitClose(card));
+        let target = app.chat_ui.phases[&card].target();
+        let saved = app.chat_return_session(card).unwrap();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved,
+            Err("cleanup remains unconfirmed".into()),
+        )));
+
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(
+            app.workspace.pending_close(),
+            None,
+            "a chat that stays gives up its removal"
+        );
+        settle_proven_gone(&mut app, first);
+        settle_proven_gone(&mut app, second);
+        assert!(!app.terminal_close_in_progress(second));
+
+        app.notices.entries.clear();
+        app.status = None;
+        close_chat(&mut app, card);
+    }
+
+    /// A chat's close runs beside other closes and only needs the workspace's
+    /// removal at the end, when another pane could be holding it.
+    #[test]
+    fn a_chat_finishing_during_another_removal_waits_its_turn() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chat = failed_chat(&mut app);
+        let pane = saved_terminal_pane(&mut app);
+        app.workspace.request_close(pane).unwrap();
+        let _ = app.update(Message::CloseCard(chat));
+        let finish = |app: &mut Cagents| {
+            let target = app.chat_ui.phases[&chat].target();
+            let saved = app.chat_return_session(chat).unwrap();
+            let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+                target,
+                saved,
+                Ok(()),
+            )));
+        };
+        finish(&mut app);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        assert!(app.card_state(chat).unwrap().existence.is_open());
+        assert!(app.terminal_close_in_progress(chat));
+
+        let _ = app.workspace.cancel_close(pane);
+        let _ = app.update(Message::DismissStatus);
+        finish(&mut app);
+        assert!(!app.card_state(chat).unwrap().existence.is_open());
+    }
+
+    /// A slow chat close takes as long as its daemon takes to answer. Nothing
+    /// about it is a reason to hold up a terminal in another pane.
+    #[test]
+    fn a_chat_closing_does_not_hold_up_another_panes_close() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chat = failed_chat(&mut app);
+        let pane = saved_terminal_pane(&mut app);
+        let _ = app.update(Message::CloseCard(chat));
+        assert!(app.chat_close_owned(chat));
+        assert!(app.pane_close_owned(chat));
+        let _ = app.update(Message::CloseCard(pane));
+        assert_eq!(
+            app.terminal_close.as_ref().map(|intent| intent.card),
+            Some(pane)
+        );
+    }
+
+    /// A chat runs its close beside the queue, so taking its turn and staying open
+    /// while it closes isn't being turned away.
+    #[test]
+    fn a_queued_chat_that_starts_closing_is_not_reported_as_kept() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let chat = failed_chat(&mut app);
+        app.queue_card_close(chat, false);
+        let _ = app.next_queued_card_close();
+        assert!(app.chat_close_owned(chat));
+        assert!(app.status.is_none(), "{:?}", errors(&app));
+    }
+
+    /// Close during a return has to be remembered then. Queued, it would come
+    /// too late to stop the return starting a terminal in the chat's place.
+    #[test]
+    fn a_chat_closed_during_its_return_beside_another_removal_starts_no_terminal() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let pane = saved_terminal_pane(&mut app);
+        let _ = app.update(Message::ChatUi(Action::Switch(card)));
+        let target = local_return(&app).0;
+        app.workspace.request_close(pane).unwrap();
+        let _ = app.update(Message::CloseCard(card));
+        assert!(matches!(
+            app.chat_ui.phases.get(&card),
+            Some(Phase::Returning {
+                close_requested: true,
+                ..
+            })
+        ));
+        let cards = app.durable.cards.len();
+        let _ = app.update(Message::ChatUi(Action::ReturnedLocally(target, Ok(()))));
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        let _ = app.workspace.cancel_close(pane);
+        let _ = app.update(Message::DismissStatus);
+        assert!(
+            app.chat_close_owned(card),
+            "its close runs on its turn: {:?}",
+            errors(&app)
+        );
+        assert_eq!(app.durable.cards.len(), cards, "no terminal took its place");
+    }
+
+    /// The workspace removes one pane at a time, so a second pane that isn't a
+    /// terminal waits for its turn rather than being refused.
+    #[test]
+    fn panes_closed_together_each_get_their_turn() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let first = failed_chat(&mut app);
+        let second = failed_chat(&mut app);
+        app.chrome_ui.closing_group = vec![first, second];
+        drop(app.close_pane_group());
+        let _ = app.update(Message::DismissStatus);
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+        assert!(app.terminal_close_in_progress(second));
+
+        let _ = app.update(Message::CommitClose(first));
+        let target = app.chat_ui.phases[&first].target();
+        let saved = app.chat_return_session(first).unwrap();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved,
+            Ok(()),
+        )));
+        assert!(!app.card_state(first).unwrap().existence.is_open());
+
+        let target = app.chat_ui.phases[&second].target();
+        let saved = app.chat_return_session(second).unwrap();
+        let _ = app.update(Message::ChatUi(Action::RetainedCloseFinished(
+            target,
+            saved,
+            Ok(()),
+        )));
+        assert!(!app.card_state(second).unwrap().existence.is_open());
+        assert!(errors(&app).is_empty(), "{:?}", errors(&app));
+    }
+
+    /// Commit can find the pane has become something it mustn't remove. The
+    /// removal it was holding has to go back, or no other pane can ever close.
+    #[test]
+    fn a_chat_close_turned_away_at_commit_gives_up_its_removal() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = failed_chat(&mut app);
+        let other = saved_terminal_pane(&mut app);
+        app.chrome_ui.closing_group = vec![card];
+        drop(app.close_pane_group());
+        assert!(app.workspace.pending_close().is_some());
+        app.mark_pane_moving(card);
+        let _ = app.update(Message::CommitClose(card));
+        assert_eq!(app.workspace.pending_close(), None);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+
+        let _ = app.update(Message::CloseCard(other));
+        settle_proven_gone(&mut app, other);
     }
 
     #[test]
@@ -24214,10 +24801,73 @@ mod tests {
             runtime
                 .failures
                 .iter()
-                .any(|note| note.text.contains("does not offer gpt-b")),
+                .any(|note| note.text
+                    == "This conversation does not offer gpt-b, so this message will use its default model."),
             "{:?}",
             runtime.failures
         );
+    }
+
+    /// A model switch that Claude did not take, or has not confirmed, says
+    /// so, and the model stays remembered: delivery failed, not the model.
+    #[test]
+    fn an_undelivered_model_switch_is_reported_and_the_model_kept() {
+        for (outcome, said) in [
+            (
+                chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+                "hasn't confirmed the switch to gpt-b yet, so this message might not use it",
+            ),
+            (
+                chat::failure::delivery::UNCONFIRMED_INPUT,
+                "didn't take the switch to gpt-b, so this message won't use it",
+            ),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let listed = vec![fixture_model("gpt-a", &[]), fixture_model("gpt-b", &[])];
+            let card = queued_on(&mut app, "gpt-b", listed);
+            assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+            let remembered = app.chat_ui.last_models.get(&Provider::Codex).cloned();
+            assert!(remembered.is_some());
+            settle(&mut app, card, Err(outcome.into()));
+            assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+            let notes = &chat_runtime(&app, card).failures;
+            assert!(
+                notes.iter().any(|note| note.text.contains(said)),
+                "{notes:?}"
+            );
+            assert!(
+                notes.iter().all(|note| !note.text.contains(outcome)),
+                "{notes:?}"
+            );
+            assert_eq!(
+                app.chat_ui.last_models.get(&Provider::Codex).cloned(),
+                remembered
+            );
+        }
+        // Any other refusal gives the model up, and its reason goes to the
+        // log rather than the transcript.
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let listed = vec![fixture_model("gpt-a", &[]), fixture_model("gpt-b", &[])];
+        let card = queued_on(&mut app, "gpt-b", listed);
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Model));
+        settle(
+            &mut app,
+            card,
+            Err("model gpt-b requires another plan".into()),
+        );
+        assert_eq!(pending_step(&app, card), Some(QueuedStep::Prompt));
+        let notes = &chat_runtime(&app, card).failures;
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.text == "gpt-b couldn't be chosen, so this message won't use it."),
+            "{notes:?}"
+        );
+        assert!(
+            notes.iter().all(|note| !note.text.contains("another plan")),
+            "{notes:?}"
+        );
+        assert!(!app.chat_ui.last_models.contains_key(&Provider::Codex));
     }
 
     /// A conversation that has not listed its models yet is given time to,
@@ -25104,6 +25754,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
             );
@@ -25162,6 +25813,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     }),
                 );
@@ -26537,6 +27189,7 @@ mod tests {
                 >= 512 * 1024
         );
         let old_item = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
+        let client_retired = handle.observe_snapshot_retirement_for_test();
         runtime.replace_draft(text_editor::Content::with_text("unsent reader draft"));
         runtime.find = Some("kept query".into());
         runtime.expanded.insert("scratch-owner".into());
@@ -26547,6 +27200,11 @@ mod tests {
         // A live hidden presentation releases the graph and its parser scratch;
         // a draft has no provider transcript to suspend.
         assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
+        // The client's publication still holds the old body until it retires
+        // on its own worker, which the presentation barrier does not cover.
+        client_retired
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the hidden client's exact publication must retire");
         assert!(old_item.upgrade().is_none());
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
@@ -27740,6 +28398,7 @@ mod tests {
                         email: Some(email),
                         organization: None,
                         plan: None,
+                        disputed_by: None,
                     }),
                     catalog: None,
                     snapshot: account::UsageSnapshot::state(account::UsageStatus::Ok, "", now),
@@ -29562,6 +30221,7 @@ mod tests {
                         submit: None,
                     }),
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
                 "return" => Phase::Returning {
@@ -29579,6 +30239,7 @@ mod tests {
                         session: other,
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     })
                 }
@@ -29886,6 +30547,7 @@ mod tests {
                     session: source.clone(),
                     recovery: None,
                     upgrade_committed: false,
+                    resume_committed: false,
                     upgrade_admission: None,
                 }),
             );
@@ -29964,6 +30626,7 @@ mod tests {
                         session: source.clone(),
                         recovery: None,
                         upgrade_committed: false,
+                        resume_committed: false,
                         upgrade_admission: None,
                     }),
                 );
@@ -30130,6 +30793,9 @@ mod tests {
                 .cache
                 .get("tool")
                 .map(|cached| cached.revision);
+            // The previous iteration's shaping slot is released on the
+            // retirement worker; a dispatch that overtakes it is only deferred.
+            preparation::retirement_barrier();
             let reply = executor.block_on(async {
                 let task = app.handle_chat_action(action);
                 let mut outputs =

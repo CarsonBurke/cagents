@@ -33,12 +33,12 @@ impl Cagents {
         if self.chat_close_asked(card) {
             return Some(Task::none());
         }
-        if self.chat_close_dialog_visible() {
-            self.queued_card_closes
-                .push_back(terminal_close::QueuedCardClose {
-                    card,
-                    unasked: false,
-                });
+        // A question asked beside a close under way could end up under that
+        // close's own dialog. A chat with nothing to ask doesn't have to wait.
+        if self.chat_close_dialog_visible()
+            || (self.chat_working_session(card).is_some() && self.another_close_under_way(card))
+        {
+            self.queue_card_close(card, false);
             return Some(Task::none());
         }
         self.ask_before_chat_close(card)
@@ -117,9 +117,7 @@ impl Cagents {
             .filter(|card| self.workspace.order().any(|id| id == *card))
             .unwrap_or(intent.card);
         let _ = self.workspace.focus(card);
-        iced::widget::operation::focus(self.card_keyboard_focus(card))
-            .map(cosmic::Action::App)
-            .chain(self.next_queued_card_close())
+        iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
     }
 
     pub(super) fn confirm_chat_close(&mut self) -> Task<Message> {
@@ -127,12 +125,11 @@ impl Cagents {
         let Some(intent) = self.finish_chat_close_question() else {
             return Task::none();
         };
-        let close = if current {
+        if current {
             self.begin_chat_close(intent.card)
         } else {
             Task::none()
-        };
-        close.chain(self.next_queued_card_close())
+        }
     }
 
     pub(super) fn cycle_chat_close_focus(&mut self) -> Task<Message> {

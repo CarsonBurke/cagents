@@ -287,7 +287,7 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![119, ipc::PROTOCOL_VERSION].contains(&self.protocol)
+        if ![119, ipc::CANDIDATE_LINE_PROTOCOL, ipc::PROTOCOL_VERSION].contains(&self.protocol)
             || !source.is_saved_claude_history()
         {
             return Err("Saved history has no qualified read-only inspection API".into());
@@ -385,7 +385,18 @@ impl Client {
 // appended Work board request) preserve this subset, including the existing
 // continuity enum discriminants.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].contains(&protocol)
+    // The install candidate line speaks this release's wire under its own number.
+    [
+        99,
+        100,
+        101,
+        102,
+        103,
+        119,
+        ipc::CANDIDATE_LINE_PROTOCOL,
+        ipc::PROTOCOL_VERSION,
+    ]
+    .contains(&protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -556,7 +567,17 @@ mod tests {
     use super::*;
 
     fn source_protocols() -> std::collections::BTreeSet<u16> {
-        [99, 100, 101, 102, 103, 119, ipc::PROTOCOL_VERSION].into()
+        [
+            99,
+            100,
+            101,
+            102,
+            103,
+            119,
+            ipc::CANDIDATE_LINE_PROTOCOL,
+            ipc::PROTOCOL_VERSION,
+        ]
+        .into()
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {
@@ -787,8 +808,10 @@ mod tests {
         for protocol in source_protocols() {
             assert!(supports_protocol(protocol));
             // Frozen postcard envelope with request 7, proof s/b/i and an empty
-            // ChatListed response. The only version-specific byte is first.
-            let payload = [protocol as u8, 1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0];
+            // ChatListed response. Only the leading version varint varies; from
+            // 128 it takes two bytes.
+            let mut payload = postcard::to_allocvec(&protocol).unwrap();
+            payload.extend([1, 7, 1, b's', 1, b'b', 1, b'i', 0, 13, 0]);
             let mut frame = (payload.len() as u32).to_be_bytes().to_vec();
             frame.extend(payload);
             let envelope = read_response(&mut frame.as_slice()).unwrap();
