@@ -303,9 +303,22 @@ enum Open {
 ///
 /// `coordinated` reads what an item did to work with other agents: a message
 /// or a launch is drawn as a card among the prose rather than as a step.
+#[cfg(test)]
 pub(super) fn group<'c, T: Borrow<Item>>(
     items: &[T],
     asked_after: &HashSet<String>,
+    coordinated: impl Fn(&Item) -> Option<&'c Coordinated>,
+) -> Vec<Turn> {
+    group_with_prompt_boundary(items, asked_after, |_, _| false, coordinated)
+}
+
+/// Retained notices live outside `items`. Their prompt boundary keeps later
+/// submissions from joining a failed prompt that has no assistant activity.
+/// Parts of the same decoder message can still share that prompt.
+pub(super) fn group_with_prompt_boundary<'c, T: Borrow<Item>>(
+    items: &[T],
+    asked_after: &HashSet<String>,
+    starts_prompt: impl Fn(&[usize], &Item) -> bool,
     coordinated: impl Fn(&Item) -> Option<&'c Coordinated>,
 ) -> Vec<Turn> {
     let mut turns: Vec<Turn> = Vec::new();
@@ -321,7 +334,11 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         // attributed to it and not to whatever was running when it landed.
         if item.role == Role::User && !item.content.is_step() {
             match turns.last_mut() {
-                Some(turn) if state == Open::Taking && turn.awaiting_activity() => {
+                Some(turn)
+                    if state == Open::Taking
+                        && turn.awaiting_activity()
+                        && !starts_prompt(&turn.prompt, item) =>
+                {
                     turn.prompt.push(index);
                     turn.spans(item);
                 }

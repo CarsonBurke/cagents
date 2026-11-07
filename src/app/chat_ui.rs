@@ -72,6 +72,8 @@ mod clipboard_image;
 mod closed_draft;
 mod completion;
 mod coordination;
+#[cfg(test)]
+mod diagnostic_chronology_tests;
 mod failure;
 mod find;
 mod find_navigation;
@@ -3431,6 +3433,34 @@ impl Runtime {
         failure::prompt_anchor(self.session.launch.provider, &snapshot.items)
             .or_else(|| turns.last().map(|turn| turn.key.as_str()))
     }
+    fn transcript_turns(&self, snapshot: &Snapshot) -> Vec<turn::Turn> {
+        let provider = self.session.launch.provider;
+        turn::group_with_prompt_boundary(
+            &snapshot.items,
+            &self.asked_after,
+            |prompt, incoming| {
+                if self.failures.is_empty() {
+                    return false;
+                }
+                prompt
+                    .iter()
+                    .rev()
+                    .filter_map(|index| snapshot.items.get(*index))
+                    .find(|item| !matches!(item.content, ItemContent::Delivery { .. }))
+                    .is_some_and(|item| {
+                        self.failures.iter().any(|note| {
+                            failure::same_prompt(provider, note.message.as_deref(), Some(&item.id))
+                                && !failure::same_prompt(
+                                    provider,
+                                    note.message.as_deref(),
+                                    Some(&incoming.id),
+                                )
+                        })
+                    })
+            },
+            |item| self.cache.get(&item.id)?.coordination.as_deref(),
+        )
+    }
     /// Records a notice in the transcript, after the message it concerns.
     fn note(&mut self, notice: String) {
         if self.snapshot.has_later {
@@ -4485,9 +4515,7 @@ impl Runtime {
         prepared.install(cached, managed, expanded);
         self.resume_preparation();
         if regroup && self.selected_subagent.is_none() {
-            let turns = turn::group(&self.snapshot.items, &self.asked_after, |item| {
-                self.cache.get(&item.id)?.coordination.as_deref()
-            });
+            let turns = self.transcript_turns(&self.snapshot);
             carry_step_disclosures(
                 &mut self.opened,
                 &mut self.find_disclosure,
@@ -4899,14 +4927,9 @@ impl Runtime {
             }
         }
         self.source_clock = source_clock;
-        let cache = &self.cache;
         let turns = (grouping_dirty
             || !turn::same_structure(&self.snapshot.items, &snapshot.items))
-        .then(|| {
-            turn::group(&snapshot.items, &self.asked_after, |item| {
-                cache.get(&item.id)?.coordination.as_deref()
-            })
-        });
+        .then(|| self.transcript_turns(&snapshot));
         if let Some(turns) = &turns {
             carry_step_disclosures(
                 &mut self.opened,
