@@ -297,6 +297,8 @@ enum NoticeKey {
     GitCommit(ActiveWorktreeKey),
     /// Saving this chat's return to a terminal.
     ChatReturn(CardId),
+    /// Starting or restoring the terminal in this card.
+    TerminalStart(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -5917,9 +5919,7 @@ impl Cagents {
                     let mut client = crate::control::ControlClient::connect(&socket).map_err(|error| error.to_string())?;
                     // A reserved start has nothing to find yet, and completing
                     // it attaches to the terminal another client got to first.
-                    let mut hosted = if reserved { None } else {
-                        client.list().map_err(|error| error.to_string())?.into_iter().find(|hosted|hosted.session.id==session.id)
-                    };
+                    let mut hosted = None;
                     if reserved {
                         for _ in 0..100 {
                             match client.complete_pending_terminal(card,session.id,crate::terminal_ipc::TerminalSpawnOptions::from(config.clone())) {
@@ -5933,8 +5933,23 @@ impl Cagents {
                             }
                         }
                     }
-                    let hosted=hosted.ok_or("This terminal isn't connected. Use Retry or Close on its pane.")?;
                     let proof = client.proof().clone();
+                    let hosted = if reserved {
+                        hosted.ok_or("This terminal isn't connected. Use Retry or Close on its pane.")?
+                    } else {
+                        let terminals = daemon_recovery::inventory_proving_absence(
+                            &session,
+                            &mut client,
+                            |client| client.list().map_err(|error| error.to_string()),
+                            |client| {
+                                client
+                                    .daemon_version()
+                                    .map(drop)
+                                    .map_err(|error| error.to_string())
+                            },
+                        )?;
+                        daemon_recovery::hosted_or_missing(&session, &proof, terminals)?
+                    };
                     (daemon_recovery::RecoveredTerminal { session: hosted.session,
                         expected_host: Some(proof.clone()), attach_completed: false, recovery_lease: None },
                         TerminalStartMode::Attach(proof))
@@ -6069,6 +6084,7 @@ impl Cagents {
         let mut tasks = Vec::new();
         match result {
             Ok(started) => {
+                self.resolve_notice(NoticeKey::TerminalStart(card));
                 if let Some(proof) = started.session.continuity.live_proof() {
                     // A replacement daemon cannot own the previous
                     // daemon's in-memory receipts.
@@ -6177,7 +6193,11 @@ impl Cagents {
             }
             Err(error) => {
                 self.fail_runtime(card, error.clone());
-                self.status = Some(TransientNotice::error(error));
+                let notice = self.missing_terminal_notice(card).map(str::to_owned);
+                self.status = Some(
+                    TransientNotice::error(notice.unwrap_or(error))
+                        .with_key(NoticeKey::TerminalStart(card)),
+                );
                 tasks.push(cosmic::task::message(Message::LifecycleSweep));
             }
         }
@@ -8504,7 +8524,7 @@ impl Cagents {
         };
         let succeeded = result.is_ok();
         let result = result.map_err(|message| RuntimeError {
-            code: "runtime_hydration_failed".into(),
+            code: terminal_failure::runtime_error_code(&message, "runtime_hydration_failed").into(),
             message,
         });
         if !self.lifecycle.hydration_finished(card, epoch, result) {
@@ -8534,7 +8554,7 @@ impl Cagents {
         };
         let residency = Residency::Failed {
             typed_error: RuntimeError {
-                code: "runtime_failed".into(),
+                code: terminal_failure::runtime_error_code(&message, "runtime_failed").into(),
                 message,
             },
             retryable: true,
@@ -10368,7 +10388,11 @@ impl Cagents {
                             {
                                 Vec::new()
                             } else { vec![
-                                crate::ui_controls::button::primary(retry_label)
+                                (if self.terminal_retry_is_blocked(id) {
+                                    crate::ui_controls::button::secondary(retry_label)
+                                } else {
+                                    crate::ui_controls::button::primary(retry_label)
+                                })
                                     .id(card_control_id(id, "retry"))
                                     .name(format!("{retry_label} {}", labels.type_label))
                                     // Retry does nothing once Close owns the pane.
@@ -12424,10 +12448,13 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
-                    if self
-                        .card_state(*card)
-                        .is_none_or(|state| !state.existence.is_open()) =>
+                Some(
+                    key @ (NoticeKey::ChatAttach(card)
+                    | NoticeKey::ChatReturn(card)
+                    | NoticeKey::TerminalStart(card)),
+                ) if self
+                    .card_state(*card)
+                    .is_none_or(|state| !state.existence.is_open()) =>
                 {
                     Some(key.clone())
                 }

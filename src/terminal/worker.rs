@@ -5895,6 +5895,12 @@ impl TranscriptWriter {
                         }
                         TranscriptMessage::Shutdown => break,
                     }
+                    // A killed host never reaches the final flush, and its
+                    // transcript is what a person has left. A busy channel
+                    // still coalesces, and this thread is off the PTY path.
+                    if receiver.is_empty() && writer.flush().is_err() {
+                        break;
+                    }
                 }
                 let _ = writer.flush();
             })
@@ -8986,6 +8992,22 @@ mod tests {
             fs::metadata(&path).unwrap().permissions().mode() & 0o777,
             0o600
         );
+    }
+
+    #[test]
+    fn transcript_output_reaches_disk_without_an_orderly_finish() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("transcripts");
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("terminal.log");
+        let writer = TranscriptWriter::start(path.clone(), TerminalId::new(), 8, 1 << 20).unwrap();
+        writer.send(b"output before the crash\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while fs::read(&path).unwrap() != b"output before the crash\n" {
+            assert!(Instant::now() < deadline, "the output stayed in memory");
+            thread::sleep(Duration::from_millis(5));
+        }
+        writer.finish();
     }
 
     #[test]
