@@ -216,11 +216,11 @@ impl ProviderScope {
     }
 
     /// End the commands a divided scope's provider left: call once the
-    /// provider is gone. A memory kill of the provider's leaf spares its
-    /// command leaves, and a command in a process group of its own outlives
-    /// the provider's group signal, so it would run on, holding its memory,
-    /// while the chat reads it as stopped. An undivided scope is left to
-    /// systemd, as before.
+    /// provider was force-stopped. A memory kill of the provider's leaf
+    /// spares its command leaves, and a command in a process group of its own
+    /// outlives the provider's group signal, so it would run on, holding its
+    /// memory, while the chat reads it as stopped. An undivided scope is left
+    /// to systemd, as before.
     pub(crate) fn end(&mut self) -> io::Result<()> {
         // Stop moving processes before the scope ends under the sweeper.
         self.sweeper = None;

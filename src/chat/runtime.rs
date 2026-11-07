@@ -1770,6 +1770,9 @@ struct ChildGuard {
     directory: Option<Arc<std::fs::File>>,
     /// The provider's cgroup scope, when the OS user manager provided one.
     scope: Option<crate::daemon::process_scope::ProviderScope>,
+    /// Whether the provider had been force-stopped, settled by the first
+    /// teardown: a retry must not take cagents' own `SIGKILL` for one.
+    force_stopped: Option<bool>,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
 }
@@ -1856,6 +1859,7 @@ impl ChildGuard {
             child,
             identity,
             terminated: false,
+            force_stopped: None,
             directory: None,
             scope: None,
             _registration: registration,
@@ -1921,7 +1925,15 @@ impl ChildGuard {
         }
         // ECHILD or another observation failure does not establish authority
         // over the old numeric group. Refuse before any signal in that case.
-        self.observed_exit_status()?;
+        let ended = self.observed_exit_status()?;
+        // Something outside cagents force-stopped the provider, such as the
+        // system for memory: a closed or finished chat is not, whether or
+        // not it ignores the signals below.
+        let force_stopped = *self.force_stopped.get_or_insert_with(|| {
+            ended.is_some_and(|status| {
+                std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL)
+            })
+        });
         let pid = self.child.id() as i32;
         let signal_group = |signal| {
             // SAFETY: the sole-reaper guard keeps our leader unreaped until
@@ -1947,8 +1959,12 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
-        // Commands in process groups of their own outlive that signal.
-        if let Some(scope) = self.scope.as_mut()
+        // Commands in process groups of their own outlive that signal. A
+        // force-stopped provider's would hold memory the system needed, with
+        // no agent left to use them, so they end with it. Otherwise they
+        // outlive the chat, as a process the agent detached asked to.
+        if force_stopped
+            && let Some(scope) = self.scope.as_mut()
             && let Err(error) = scope.end()
         {
             tracing::warn!(%error, "commands the provider left could not be ended");
@@ -9167,7 +9183,8 @@ for line in sys.stdin:
             })
         };
         assert!(!ended(inner));
-        // Ending the provider ends what it left, as nothing else would.
+        // The force-stopped provider's teardown ends what it left, as
+        // nothing else would.
         provider.terminate().unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while !ended(inner) {
@@ -9176,6 +9193,77 @@ for line in sys.stdin:
                 "a command outlived the provider that started it"
             );
             std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A process the agent detached, such as a dev server, outlives a chat
+    /// the user closes and a provider that finishes, as it asked to: only a
+    /// force-stopped provider's leftovers are ended.
+    #[test]
+    fn a_detached_command_outlives_a_closed_or_finished_provider() {
+        use std::io::{BufRead, Write};
+        fn ended(pid: u32) -> bool {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ").unwrap().1.starts_with('Z')
+            })
+        }
+        for (case, before, after) in [
+            ("closed", "", ""),
+            // cagents' own escalation to SIGKILL is not a forced stop.
+            ("closed while ignoring SIGTERM", "trap '' TERM; ", ""),
+            ("finished", "", "; exit 0"),
+        ] {
+            let spec = ProcessSpec {
+                stdout_noise: None,
+                execution: None,
+                messages: None,
+                transport: TransportSpec::JsonLines,
+                program: "/bin/sh".into(),
+                arguments: vec![
+                    "-c".into(),
+                    // The command reports its PID once it has left the
+                    // provider's process group, which teardown signals.
+                    format!(
+                        "read go; {before}setsid sh -c 'echo $$; exec sleep 300' & read done{after}"
+                    ),
+                ],
+                working_directory: std::env::current_dir().unwrap(),
+                environment: Default::default(),
+                unset_environment: Default::default(),
+            };
+            let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
+                .unwrap()
+                .unwrap();
+            if !provider
+                .scope
+                .as_ref()
+                .is_some_and(|scope| scope.keeps_commands_apart())
+            {
+                eprintln!("command cgroups unqualified: no delegated provider scope here");
+                provider.terminate().unwrap();
+                return;
+            }
+            let mut stdin = provider.child.stdin.take().unwrap();
+            writeln!(stdin, "go").unwrap();
+            let mut line = String::new();
+            let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
+            stdout.read_line(&mut line).unwrap();
+            let detached: u32 = line.trim().parse().unwrap();
+            if case == "finished" {
+                writeln!(stdin, "done").unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while provider.observed_exit_status().unwrap().is_none() {
+                    assert!(Instant::now() < deadline, "the provider never finished");
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+            provider.terminate().unwrap();
+            // Give a scope kill, were there one, time to land.
+            std::thread::sleep(Duration::from_millis(200));
+            let survived = !ended(detached);
+            // SAFETY: a plain signal to the test's own detached command.
+            unsafe { libc::kill(detached as i32, libc::SIGKILL) };
+            assert!(survived, "a detached command ended with a {case} provider");
         }
     }
 
