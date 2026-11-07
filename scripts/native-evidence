@@ -141,6 +141,18 @@ zig_executable() (
     cd -- "$1"
     local zig_command
     zig_command=${CAGENTS_ZIG:-$(command -v zig)} || exit 1
+    # Under a moved HOME or XDG_DATA_HOME a mise shim re-executes itself without
+    # end. As in scripts/run-development, go to the pinned installation directly.
+    if [[ $zig_command == */shims/zig && -L $zig_command && $(readlink "$zig_command") == ?(*/)mise ]]; then
+        local pinned data
+        pinned=$(sed -n 's/^[[:space:]]*zig[[:space:]]*=[[:space:]]*"\([^"]*\)".*$/\1/p' mise.toml 2>/dev/null | head -n 1) || true
+        if [ -n "$pinned" ]; then
+            data=${MISE_DATA_DIR:-${zig_command%/shims/zig}}
+            zig_command=$data/installs/zig/$pinned/zig
+            [ -x "$zig_command" ] || zig_command=$data/installs/zig/$pinned/bin/zig
+            [ -x "$zig_command" ] || die "pinned Zig $pinned is not installed in $data; set CAGENTS_ZIG"
+        fi
+    fi
     "$zig_command" env | sed -n \
         -e 's/^[[:space:]]*"zig_exe":[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p' \
         -e 's/^[[:space:]]*\.zig_exe[[:space:]]*=[[:space:]]*"\([^"]*\)",\{0,1\}[[:space:]]*$/\1/p'

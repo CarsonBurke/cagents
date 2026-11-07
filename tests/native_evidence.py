@@ -319,6 +319,34 @@ class Evidence(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pins Zig 0.0.1", result.stderr)
 
+    def zig_behind_a_shim(self, checkout: Path) -> Path:
+        """mise's layout, whose shim would loop under a moved HOME: this stand-in fails instead."""
+        (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
+        data = self.root / "elsewhere" / "mise"
+        (data / "shims").mkdir(parents=True)
+        write_executable(data / "mise", "#!/bin/sh\nexit 99\n", self.logs)
+        (data / "shims" / "zig").symlink_to(data / "mise")
+        return data
+
+    def test_build_goes_past_a_mise_shim_to_the_pinned_zig(self) -> None:
+        checkout = self.checkout("shimmed")
+        data = self.zig_behind_a_shim(checkout)
+        install = data / "installs" / "zig" / "0.15.2"
+        install.mkdir(parents=True)
+        (install / "zig").symlink_to(self.root / "zig-install" / "zig")
+        path = os.pathsep.join([str(data / "shims"), self.env["PATH"]])
+        self.run_tool("build", "after", str(checkout), extra={"PATH": path})
+        self.assertNotIn(str(data / "shims"),
+                         (self.task / "target-after" / "evidence-source").read_text())
+
+    def test_build_says_when_the_pinned_zig_is_not_installed(self) -> None:
+        checkout = self.checkout("shimmed")
+        data = self.zig_behind_a_shim(checkout)
+        path = os.pathsep.join([str(data / "shims"), self.env["PATH"]])
+        result = self.run_tool("build", "after", str(checkout), check=False, extra={"PATH": path})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pinned Zig 0.15.2 is not installed", result.stderr)
+
     def test_build_holds_only_a_build_slot_and_sets_a_private_target(self) -> None:
         self.built()
         target = self.task / "target-after"
