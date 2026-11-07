@@ -53,7 +53,8 @@ struct Comparison<'a> {
     older: &'a Shapes,
     current: &'a Shapes,
     /// Enums whose later variants the connection withholds, by short name
-    /// (`ServerMessage`), with the older client's variant count.
+    /// (`ServerMessage`) or full path (`cagents::work::Response`), with the
+    /// older client's variant count.
     gated: Vec<(&'static str, usize)>,
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,

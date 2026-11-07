@@ -269,9 +269,10 @@ jobs:
           git diff --cached --exit-code
 
   older-clients:
-    # The proof that older CLIs can be served must hold for what main becomes,
-    # not only for this head: a protocol bump merging beside it leaves them
-    # unproven. The default checkout of a pull request is its merge result.
+    # The claim that older CLIs are proven must hold for the merge, not only
+    # for this head: a protocol bump merging beside it leaves them unproven.
+    # The default checkout of a pull request is its merge result as of the
+    # latest pull request event.
     name: Older clients proven at the merged protocol
     runs-on: ubuntu-24.04
     timeout-minutes: 5
@@ -287,9 +288,5 @@ jobs:
       - name: Check older client proofs
         run: |
           git rev-parse HEAD
-          if [ ! -e scripts/check-older-clients ] && [ ! -e tests/check_older_clients.py ]; then
-            printf '%s\n' 'Not applicable: older client proofs (source and fixture both absent)'
-            exit 0
-          fi
           python3 -I -B tests/check_older_clients.py -v
           python3 -I -B scripts/check-older-clients
