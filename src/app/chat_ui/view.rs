@@ -1469,20 +1469,19 @@ impl Runtime {
                 )
             })
             .count();
-        let active = self
-            .error
-            .as_deref()
-            .into_iter()
-            .chain(snapshot.error.as_deref())
-            .find_map(|message| {
-                chat::failure::Failure::parse(self.session.launch.provider, message)
-            });
-        let failure_label = active.map(|failure| match failure.kind {
-            chat::failure::FailureKind::AccountLimit => "Account limit reached",
-            chat::failure::FailureKind::Authentication => "Sign-in required",
-            chat::failure::FailureKind::Capacity => "Provider at capacity",
-            chat::failure::FailureKind::Connection => "Connection interrupted",
-            chat::failure::FailureKind::Interrupted => "Interrupted",
+        let active = self.reported_errors().find_map(|message| {
+            chat::failure::Failure::parse(self.session.launch.provider, message)
+        });
+        let failure_label = active.and_then(|failure| match failure.kind {
+            chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
+            chat::failure::FailureKind::Authentication => Some("Sign-in required"),
+            chat::failure::FailureKind::Capacity => Some("Provider at capacity"),
+            chat::failure::FailureKind::Connection => Some("Connection interrupted"),
+            chat::failure::FailureKind::Interrupted => Some("Interrupted"),
+            chat::failure::FailureKind::OutOfMemory => Some("Stopped: out of memory"),
+            // The agent carried on; its notice is in the transcript.
+            chat::failure::FailureKind::CommandOutOfMemory => None,
+            chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
         });
         let mut parts = Vec::new();
         if let Some(label) = failure_label {
@@ -1610,15 +1609,23 @@ impl Runtime {
         // the closed card says what happened.
         if ended == "Finished"
             && self
-                .error
-                .iter()
-                .chain(&self.snapshot.error)
+                .reported_errors()
                 .any(|error| !self.expected_remote_close_error(error))
         {
             "Finished with error"
         } else {
             ended
         }
+    }
+
+    /// The errors this conversation reports as its state: its own and its
+    /// provider's, leaving out notices of things the agent carried on past.
+    pub(super) fn reported_errors(&self) -> impl Iterator<Item = &str> {
+        self.error
+            .as_deref()
+            .into_iter()
+            .chain(self.snapshot.error.as_deref())
+            .filter(|message| !chat::failure::is_notice(message))
     }
 
     pub(super) fn conversation_status_base(&self, transitioning: bool) -> (Option<Icon>, &str) {
@@ -1680,7 +1687,7 @@ impl Runtime {
                 }),
                 label,
             )
-        } else if self.error.is_some() || snapshot.error.is_some() {
+        } else if self.reported_errors().next().is_some() {
             (Some(Icon::Warning), "Error")
         } else if self.is_draft() {
             (None, "Draft")
@@ -7331,6 +7338,41 @@ mod tests {
         );
         runtime.disconnected = true;
         assert_eq!(runtime.conversation_status(false).1, "Disconnected");
+    }
+
+    #[test]
+    fn a_stopped_command_is_a_notice_rather_than_the_conversation_state() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let notice = format!(
+            "{} systemd-oomd ended it; the agent is still running.",
+            chat::failure::COMMAND_OUT_OF_MEMORY
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.detail = "Running command".into();
+        let working = runtime.conversation_status(false);
+        Arc::make_mut(&mut runtime.snapshot).error = Some(notice);
+        assert_eq!(
+            runtime.conversation_status(false),
+            working,
+            "the agent carries on, so its status still says what it is doing"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = false;
+        snapshot.detail.clear();
+        snapshot.finished_at = Some(42);
+        assert_eq!(runtime.conversation_status(false).1, "Finished");
+        Arc::make_mut(&mut runtime.snapshot).finished_at = None;
+        assert_eq!(runtime.conversation_status(false).1, "Ready");
+        // The agent itself stopping is still the conversation's state.
+        Arc::make_mut(&mut runtime.snapshot).error = Some(format!(
+            "{} systemd-oomd ended it.",
+            chat::failure::PROVIDER_OUT_OF_MEMORY
+        ));
+        assert_eq!(
+            runtime.conversation_status(false),
+            (Some(Icon::Warning), "Stopped: out of memory".into())
+        );
     }
 
     #[test]

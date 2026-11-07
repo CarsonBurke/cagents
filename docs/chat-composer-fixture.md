@@ -166,6 +166,15 @@ only recorded, the way Claude Code records a queued notification as a
 `queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
 state can be captured.
 
+To run a real command, write it as the first line of
+`home/.claude/fixture-run-command`, such as `sleep 6001`. Every turn then runs
+it as a Bash call in a child of the provider, as Claude's Bash tool does, and
+waits for it before answering, reporting its output and exit code. Use this to
+check where a provider's commands run and what happens when one is stopped:
+from `scripts/native-evidence env`, find the command's cgroup in
+`/proc/PID/cgroup`, then stop it as systemd-oomd does, by setting
+`user.oomd_ooms` on the cgroup and writing `1` to its `cgroup.kill`.
+
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native
 launches drop `CAGENTS_*` variables, so the fixture reads the image from its

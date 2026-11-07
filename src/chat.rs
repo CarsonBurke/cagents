@@ -1803,8 +1803,8 @@ pub enum ToolStatus {
     Succeeded,
     Failed,
     Denied,
-    /// Ended before it finished because it was asked to stop: cancelled by
-    /// the user, or interrupted with the work that started it.
+    /// Ended before it finished: cancelled by the user, interrupted with the
+    /// work that started it, or cut short because its provider stopped.
     Stopped,
 }
 
@@ -2147,6 +2147,18 @@ impl ItemContent {
             Self::Command { status, .. }
             | Self::Changes { status, .. }
             | Self::Tool { status, .. } => Some(*status),
+            Self::Text { .. }
+            | Self::WebSearch { .. }
+            | Self::Image { .. }
+            | Self::Delivery { .. } => None,
+        }
+    }
+
+    pub fn status_mut(&mut self) -> Option<&mut ToolStatus> {
+        match self {
+            Self::Command { status, .. }
+            | Self::Changes { status, .. }
+            | Self::Tool { status, .. } => Some(status),
             Self::Text { .. }
             | Self::WebSearch { .. }
             | Self::Image { .. }
