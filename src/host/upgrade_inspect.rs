@@ -543,12 +543,11 @@ impl ExecutionEvidence {
 
 /// Whether any process of this user names a Codex pane's listener directory
 /// in its arguments, or a socket is still bound at one of `sockets`. A
-/// process between `execve` and publishing its new arguments briefly shows
-/// none; it is read again for a bounded moment. One that still shows none is
-/// evidence of absence only when its last thread is a zombie or exiting (a
-/// PID-namespace init waiting in `do_exit`, or one blocked closing files after
-/// releasing its memory), which can no longer write anything. A zombie group
-/// leader whose other threads still run shows no arguments either.
+/// process shows no arguments once its group leader has released its memory,
+/// and between `execve` and publishing its new ones. It is evidence of
+/// absence only when none of its threads can run again (see
+/// [`threads_ended`]); one that still could is read again for a bounded
+/// moment, then proves nothing.
 fn codex_listener_survives(
     processes: &Path,
     pane: crate::model::TerminalId,
@@ -570,39 +569,19 @@ fn codex_listener_survives_with(
     let marker = format!("cagents-codex-{pane}");
     let marker = marker.as_bytes();
     let uid = crate::daemon::current_uid().to_string();
-    let unavailable = |error: &std::io::Error| {
-        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
-    };
-    // The arguments a process shows, or None once it has exited.
+    // The arguments a process shows, or None once it can no longer run.
     let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
         let deadline = Instant::now() + settle;
         loop {
             let argv = match std::fs::read(path.join("cmdline")) {
                 Ok(argv) => argv,
-                Err(error) if unavailable(&error) => return Ok(None),
+                Err(error) if gone(&error) => return Ok(None),
                 Err(error) => return Err(format!("Cannot inspect a process: {error}")),
             };
             if !argv.is_empty() {
                 return Ok(Some(argv));
             }
-            let stat = match std::fs::read(path.join("stat")) {
-                Ok(stat) => stat,
-                Err(error) if unavailable(&error) => return Ok(None),
-                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
-            };
-            // Fields after the command name begin at state (3): flags is
-            // field 9 and the thread count field 20.
-            let stat = String::from_utf8_lossy(&stat);
-            let fields = stat
-                .rsplit_once(')')
-                .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let exiting = fields
-                .get(6)
-                .and_then(|flags| flags.parse::<u64>().ok())
-                .is_some_and(|flags| flags & 0x4 != 0);
-            let ended = matches!(fields.first(), Some(&"Z" | &"X")) || exiting;
-            if ended && fields.get(17) == Some(&"1") {
+            if threads_ended(path)? {
                 return Ok(None);
             }
             if Instant::now() >= deadline {
@@ -627,7 +606,7 @@ fn codex_listener_survives_with(
         // root for a process that made itself non-dumpable.
         let status = match std::fs::read_to_string(path.join("status")) {
             Ok(status) => status,
-            Err(error) if unavailable(&error) => continue,
+            Err(error) if gone(&error) => continue,
             Err(error) => return Err(format!("Cannot inspect a process: {error}")),
         };
         let effective = status
@@ -657,6 +636,67 @@ fn codex_listener_survives_with(
         })
     }))
 }
+
+/// A process or thread that has been reaped.
+fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// Whether no thread of a process can run again, so it can write nothing:
+/// each is a zombie, exiting (`PF_EXITING`), or has `SIGKILL` pending. A group
+/// exit sends that to every other thread before they run again, and the last
+/// one out tears down the shared memory, which takes a while for a large
+/// process under load. A zombie group leader whose other threads still run
+/// can yet `execve`.
+fn threads_ended(process: &Path) -> Result<bool, String> {
+    let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
+    let threads = match std::fs::read_dir(process.join("task")) {
+        Ok(threads) => threads,
+        Err(error) if gone(&error) => return Ok(true),
+        Err(error) => return Err(unreadable(error)),
+    };
+    for thread in threads {
+        let thread = thread.map_err(unreadable)?.path();
+        let stat = match std::fs::read_to_string(thread.join("stat")) {
+            Ok(stat) => stat,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(unreadable(error)),
+        };
+        // Fields after the command name begin at state (3); flags is field 9.
+        let fields = stat
+            .rsplit_once(')')
+            .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let Some(flags) = fields.get(6).and_then(|flags| flags.parse::<u64>().ok()) else {
+            return Ok(false);
+        };
+        if matches!(fields[0], "Z" | "X") || flags & PF_EXITING != 0 {
+            continue;
+        }
+        let status = match std::fs::read_to_string(thread.join("status")) {
+            Ok(status) => status,
+            Err(error) if gone(&error) => continue,
+            Err(error) => return Err(unreadable(error)),
+        };
+        let killed = status
+            .lines()
+            .filter_map(|line| {
+                line.strip_prefix("SigPnd:")
+                    .or_else(|| line.strip_prefix("ShdPnd:"))
+            })
+            .any(|mask| {
+                u64::from_str_radix(mask.trim(), 16)
+                    .is_ok_and(|mask| mask & 1 << (libc::SIGKILL - 1) != 0)
+            });
+        if !killed {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// `PF_EXITING`, set once a thread enters `do_exit`.
+const PF_EXITING: u64 = 0x4;
 
 /// The census owners whose retirement the store records, read like the census.
 fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
@@ -1410,9 +1450,10 @@ mod tests {
         absent.processes = root.path().join("absent");
         assert_eq!(absent.classify(&card), SavedExecution::Unproved);
         // A process that has not published its arguments might be the
-        // server. One whose last thread is a zombie, or exiting (PF_EXITING,
-        // like a PID-namespace init waiting in do_exit), can write nothing; a
-        // zombie group leader or exiting thread with live threads still can.
+        // server, unless none of its threads can run again: each is a zombie,
+        // exiting (PF_EXITING, like a PID-namespace init waiting in do_exit)
+        // or has SIGKILL pending, as a group exit leaves the threads behind
+        // a zombie leader. A zombie leader with a live thread can still exec.
         let processes = tempfile::tempdir_in("/var/tmp").unwrap();
         std::fs::create_dir_all(processes.path().join("net")).unwrap();
         std::fs::write(
@@ -1428,32 +1469,89 @@ mod tests {
         std::fs::write(process.join("status"), user(uid)).unwrap();
         let mut table = evidence(holders.path(), Vec::new());
         table.processes = processes.path().into();
-        let stat = |state: char, flags: u64, threads: u32| {
-            format!(
-                "4242 (a) b) {state} 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 1"
+        let thread = |tid: u32, state: char, flags: u64, pending: (u64, u64)| {
+            let thread = process.join("task").join(tid.to_string());
+            std::fs::create_dir_all(&thread).unwrap();
+            std::fs::write(
+                thread.join("stat"),
+                format!("{tid} (a) b) {state} 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 1"),
             )
+            .unwrap();
+            std::fs::write(
+                thread.join("status"),
+                format!(
+                    "Name:\ta\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n",
+                    pending.0, pending.1
+                ),
+            )
+            .unwrap();
         };
-        for (state, flags, threads, expected) in [
-            ('Z', 0, 1, SavedExecution::Ended),
-            ('X', 0, 1, SavedExecution::Ended),
-            ('D', 0x4, 1, SavedExecution::Ended),
-            ('Z', 0, 2, SavedExecution::Unproved),
-            ('D', 0x4, 2, SavedExecution::Unproved),
-            ('R', 0, 1, SavedExecution::Unproved),
+        let kill = 1 << (libc::SIGKILL - 1);
+        let term = 1 << (libc::SIGTERM - 1);
+        for (leader, other, expected) in [
+            (('Z', 0, (0, 0)), None, SavedExecution::Ended),
+            (('X', 0, (0, 0)), None, SavedExecution::Ended),
+            (('D', 0x4, (0, 0)), None, SavedExecution::Ended),
+            (('R', 0, (kill, 0)), None, SavedExecution::Ended),
+            (('R', 0, (0, kill)), None, SavedExecution::Ended),
+            (
+                ('Z', 0x4, (0, 0)),
+                Some(('R', 0x4, (0, 0))),
+                SavedExecution::Ended,
+            ),
+            (
+                ('Z', 0x4, (0, 0)),
+                Some(('S', 0, (kill, 0))),
+                SavedExecution::Ended,
+            ),
+            (
+                ('Z', 0x4, (0, 0)),
+                Some(('Z', 0, (0, 0))),
+                SavedExecution::Ended,
+            ),
+            (
+                ('Z', 0, (0, 0)),
+                Some(('S', 0, (0, 0))),
+                SavedExecution::Unproved,
+            ),
+            (
+                ('Z', 0, (0, 0)),
+                Some(('S', 0, (term, term))),
+                SavedExecution::Unproved,
+            ),
+            (
+                ('D', 0x4, (0, 0)),
+                Some(('R', 0, (0, 0))),
+                SavedExecution::Unproved,
+            ),
+            (('R', 0, (0, 0)), None, SavedExecution::Unproved),
+            (('D', 0, (0, 0)), None, SavedExecution::Unproved),
         ] {
-            std::fs::write(process.join("stat"), stat(state, flags, threads)).unwrap();
-            assert_eq!(
-                table.classify(&card),
-                expected,
-                "{state} {flags:#x} {threads}"
-            );
+            let _ = std::fs::remove_dir_all(process.join("task"));
+            thread(4242, leader.0, leader.1, leader.2);
+            if let Some(other) = other {
+                thread(4243, other.0, other.1, other.2);
+            }
+            assert_eq!(table.classify(&card), expected, "{leader:?} {other:?}");
         }
+        // A thread already reaped is gone; the group is gone with its last one.
+        std::fs::remove_dir_all(process.join("task")).unwrap();
+        thread(4243, 'Z', 0, (0, 0));
+        std::fs::create_dir_all(process.join("task/4242")).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        std::fs::remove_dir_all(process.join("task")).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
         // A truncated status line proves nothing.
-        std::fs::write(process.join("stat"), b"4242 (codex) Z 1 4242 4242").unwrap();
+        thread(4242, 'Z', 0, (0, 0));
+        std::fs::write(
+            process.join("task/4242/stat"),
+            b"4242 (codex) Z 1 4242 4242",
+        )
+        .unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Unproved);
         // The effective user decides, not the owner of the process directory,
         // which is root for a non-dumpable process of this user.
-        std::fs::write(process.join("stat"), stat('R', 0, 1)).unwrap();
+        thread(4242, 'R', 0, (0, 0));
         std::fs::write(process.join("status"), user(uid.wrapping_add(1))).unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Ended);
         std::fs::write(process.join("status"), b"Name:\tcodex\n").unwrap();
