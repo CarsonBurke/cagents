@@ -807,6 +807,7 @@ exit 83
         for name in ("CAGENTS_DEVELOPMENT_INSTANCE", "CAGENTS_DEVELOPMENT_HOSTED_BY"):
             environment.pop(name, None)
         environment.update(variable.split("=", 1) for variable in daemon_environment)
+        environment = {name: value for name, value in environment.items() if value is not None}
         # The trailing command keeps the shell from replacing itself.
         command = [str(daemon), "-c", '"$@"; exit $?', "sh", str(self.runner), *arguments]
         if inner_environment is not None:
@@ -901,6 +902,25 @@ exit 1
         record = launched.split("CAGENTS_DEVELOPMENT_HOSTED_BY=", 1)[1].splitlines()
         for line in ("cagents", "cagents-development", "cagents-development-parent", "first", "second"):
             self.assertIn(f"{elsewhere}/{line}", record)
+        self.assertNotIn("warning:", result.stderr)
+
+    def test_a_hosted_launch_warns_of_a_host_it_cant_read(self):
+        self.fake_cargo_reports_its_guard()
+        app_environment = self.root / "app-environment"
+        elsewhere = self.root / "elsewhere"
+        for hosted in (True, False):
+            with self.subTest(hosted=hosted):
+                changes = {} if hosted else {"CAGENTS_AGENT_AUTHORITY": None}
+                result = self.below_daemon(
+                    ["--browserless"], [f"XDG_RUNTIME_DIR={elsewhere}"],
+                    ["XDG_RUNTIME_DIR=relative"], APP_ENV=str(app_environment), **changes)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual("can't all be told" in result.stderr, hosted, result.stderr)
+                launched = app_environment.read_text()
+                app_environment.unlink()
+                record = launched.split("CAGENTS_DEVELOPMENT_HOSTED_BY=", 1)[1].splitlines()
+                self.assertIn(f"{elsewhere}/cagents", record)
+                self.assertNotIn("?", record)
 
     def test_nested_only_refuses_the_callers_desktop_before_building(self):
         session_runtime = self.root / "nh-fixture"

@@ -311,9 +311,9 @@ record, and no runner session to stop, so the listing names their process ID;
 `kill PID` ends such a daemon and its jobs. The listing says when a daemon hosts
 the session that runs it, or one that started it, or is the login session's own
 development daemon, instead of offering a stop command. In a cagents session
-whose hosts can't be told, it offers none. It finds development
-daemons by the instance lock they hold, so it also lists those built outside a
-checkout's `target/`.
+whose hosts can't be told, it offers none. It finds development daemons by the
+instance lock they hold, so it also lists those built outside a checkout's
+`target/`.
 
 An instance keeps running when the session that started it ends, so that
 another agent or a person can go on using it. Stop it when you're done, and
