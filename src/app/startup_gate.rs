@@ -35,7 +35,7 @@ const LAUNCHER_MARGIN: Duration = Duration::from_secs(5);
 /// The longest report sent to the launcher. Its limit on one line is 4 KiB
 /// (`MAX_UI_LAUNCH_HANDSHAKE_BYTES`), past which it closes the window; this
 /// leaves room for the line's prefix.
-const MAX_REPORT_BYTES: usize = 4096 - 128;
+const MAX_REPORT_BYTES: usize = crate::control::MAX_UI_LAUNCH_HANDSHAKE_BYTES - 128;
 const DETAILS_LABEL: &str = " Details: ";
 
 #[derive(Default)]
@@ -157,6 +157,10 @@ impl State {
             reported: true,
             ..Self::fixture_opened()
         }
+    }
+
+    pub(super) fn retained(&self) -> bool {
+        self.retained
     }
 
     /// Whether the gate accepted a daemon answer, is saving, and has reported.
@@ -401,10 +405,10 @@ impl Cagents {
     /// different things: a failed pane offers a retry, a held one says what it
     /// waits for, and an out-of-step one is already working.
     fn startup_unsettled_sentences(&self, failures: &[CardId], out_of_step: &[CardId]) -> String {
-        let (held, failed): (Vec<_>, Vec<_>) = failures
+        let (needs_registry, failed): (Vec<_>, Vec<_>) = failures
             .iter()
             .copied()
-            .partition(|card| self.startup_pane_held(*card));
+            .partition(|card| self.startup_pane_needs_registry(*card));
         let mut sentences = Vec::new();
         if !failed.is_empty() {
             let them = pronoun(failed.len());
@@ -414,13 +418,29 @@ impl Cagents {
                 self.startup_pane_names(&failed),
             ));
         }
-        sentences.extend(self.startup_held_sentences(&held));
+        if self.shared_views.registry_unavailable {
+            if !needs_registry.is_empty() {
+                sentences.push(format!(
+                    "{} cannot reopen while the shared workspace is unavailable: {}.",
+                    saved_panes(needs_registry.len()),
+                    self.startup_pane_names(&needs_registry),
+                ));
+            }
+        } else {
+            sentences.extend(self.startup_held_sentences(&needs_registry));
+        }
         if !out_of_step.is_empty() {
             let them = pronoun(out_of_step.len());
             sentences.push(format!(
                 "{} reconnected and can be used in this window, but the shared workspace lists {them} under a different terminal service: {}.",
                 saved_panes(out_of_step.len()),
                 self.startup_pane_names(out_of_step),
+            ));
+        }
+        if self.shared_views.registry_unavailable {
+            sentences.push(format!(
+                "The shared workspace could not be restored because {}.",
+                crate::workspace_model::REGISTRY_UNAVAILABLE
             ));
         }
         sentences.join(" ")
@@ -462,15 +482,21 @@ impl Cagents {
         sentences
     }
 
-    /// Whether `card` is only waiting for the registry: a shared chat it has
-    /// not admitted, or a terminal whose start is held for it with no attempt
-    /// under way.
-    pub(in crate::app) fn startup_pane_held(&self, card: CardId) -> bool {
+    /// Whether `card` can do nothing until the registry answers: a shared chat
+    /// it has not admitted, or a terminal whose start is held for it with no
+    /// attempt under way.
+    fn startup_pane_needs_registry(&self, card: CardId) -> bool {
         self.chat_awaiting_admission(card)
             || (matches!(self.cards.get(&card), Some(CardRuntime::Loading) | None)
                 && !self.terminal_start_in_flight(card)
                 && !self.terminal_retry_pending(card)
                 && self.terminal_start_held(card, false))
+    }
+
+    /// Whether `card` is waiting for a registry that may yet answer, rather
+    /// than one the daemon has said it cannot give.
+    pub(in crate::app) fn startup_pane_held(&self, card: CardId) -> bool {
+        !self.shared_views.registry_unavailable && self.startup_pane_needs_registry(card)
     }
 
     /// The panes still waiting when the time ran out: `lapsed` for those with
@@ -490,6 +516,9 @@ impl Cagents {
             ));
         }
         sentences.extend(self.startup_held_sentences(&held));
+        if attempting.is_empty() {
+            sentences.push("This window remains available.".to_owned());
+        }
         sentences.join(" ")
     }
 
@@ -1171,7 +1200,7 @@ fn terminal_surface_ready(
 /// The report for a view this window shows that was never admitted.
 fn views_incomplete(hold: &str) -> String {
     format!(
-        "recovery-incomplete: this window's shared workspace did not finish restoring: {hold}. Its saved panes are connected, and nothing is needed from you now; the workspace catches up on its own once it is ready. This window stays available."
+        "recovery-incomplete: this window's shared workspace did not finish restoring: {hold}. Nothing was closed or restarted, and this window stays available. The update has not been verified."
     )
 }
 
@@ -1218,7 +1247,7 @@ pub(super) fn held_terminal_caption(reason: Option<&str>) -> String {
 
 /// What an opened terminal shows once the daemon has kept its original owners:
 /// waiting would not bring it back, so it points at the notice's steps.
-const RETAINED_TERMINAL_CAPTION: &str = "This terminal's process is still running, but it cannot reconnect until the terminal service restarts. Nothing was closed or restarted. The notice in this window has the steps.";
+const RETAINED_TERMINAL_CAPTION: &str = "This terminal cannot reconnect until the terminal service restarts. Nothing was closed or restarted. The notice in this window has the steps.";
 
 fn reason_sentence(reason: &str) -> String {
     let reason = reason.trim_end_matches('.');
@@ -1283,6 +1312,77 @@ fn inspect_existing_daemon(
 /// What the window says when the daemon kept its original owners after a
 /// failed restore; the daemon's own reason goes beneath it as details.
 const RETAINED_NOTICE: &str = "Saved sessions could not be fully restored after the update. Their original processes are still running and nothing was closed or deleted. Until the terminal service restarts, it cannot start new terminals or chats or accept input in existing ones. To start new work, let these sessions finish or close them, then run `cagents daemon stop` and reopen cagents. The update has not been verified.";
+
+/// How the retained report begins, in every build that has written one.
+const RETAINED_LEAD: &str =
+    "the terminal service could not reconnect saved sessions after the update";
+
+/// A failed update's job as someone reads it. The updater that wrote the
+/// message is the build updated from, which may list each window's handshake
+/// report in turn, so this is decided here rather than where it is written.
+pub(super) struct UpdateFailure {
+    /// Fits a control's label.
+    pub(super) summary: String,
+    pub(super) notice: TransientNotice,
+    /// Says what this window's own retained report already says.
+    pub(super) retained: bool,
+}
+
+pub(super) fn update_failure(message: &str) -> UpdateFailure {
+    let grouped = group_window_reports(message);
+    if grouped.to_lowercase().contains(RETAINED_LEAD) {
+        return UpdateFailure {
+            summary: "saved sessions could not be fully restored".to_owned(),
+            notice: TransientNotice::error(RETAINED_NOTICE).with_details(grouped),
+            retained: true,
+        };
+    }
+    let (text, details) = match grouped.split_once(DETAILS_LABEL) {
+        Some((text, details)) => (text, Some(details.trim_end_matches('.'))),
+        None => (grouped.as_str(), None),
+    };
+    let notice = TransientNotice::error(text);
+    let notice = match details {
+        Some(details) => notice.with_details(details),
+        None => notice,
+    };
+    UpdateFailure {
+        summary: text.trim_end_matches('.').to_owned(),
+        notice,
+        retained: false,
+    }
+}
+
+/// Parses `primary: report; window-2: report` and reads it the way the current
+/// updater writes it. Anything else, a report's own semicolons included, is
+/// left alone apart from a leading handshake prefix.
+fn group_window_reports(message: &str) -> String {
+    let is_slot = |slot: &str| {
+        slot == "primary"
+            || slot
+                .strip_prefix("window-")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    };
+    let mut reports: Vec<(&str, String)> = Vec::new();
+    for piece in message.split("; ") {
+        match piece.split_once(": ") {
+            Some((slot, report)) if is_slot(slot) => reports.push((slot, report.to_owned())),
+            _ => match reports.last_mut() {
+                Some((_, report)) => {
+                    report.push_str("; ");
+                    report.push_str(piece);
+                }
+                None => {
+                    return message
+                        .strip_prefix(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX)
+                        .unwrap_or(message)
+                        .to_owned();
+                }
+            },
+        }
+    }
+    instance::relaunch_failure(reports.len(), &reports)
+}
 
 /// The daemon's reason on one line, bounded to fit the launcher's handshake.
 fn bounded_detail(detail: &str) -> String {

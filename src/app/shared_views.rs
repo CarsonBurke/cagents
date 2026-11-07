@@ -455,6 +455,7 @@ impl Cagents {
         if self.shared_registry_connecting() {
             return Task::none();
         }
+        self.retire_startup_registry_waits();
         // An unopened terminal is not asking to start, so it can wait until
         // the view that may yet list it has been admitted.
         let views_settled =

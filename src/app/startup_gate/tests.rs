@@ -1454,3 +1454,91 @@ fn a_budget_report_also_names_panes_that_failed() {
 fn an_empty_window_waits_out_most_of_the_launchers_allowance() {
     assert_eq!(launcher_budget(0), Duration::from_secs(25));
 }
+
+/// The registry store being unavailable is not something to wait out: a chat
+/// must not be told it reopens on its own, and the report must say why.
+#[test]
+fn a_chat_with_the_store_unavailable_is_not_told_it_reopens_on_its_own() {
+    let (mut app, _) = waiting(1);
+    let chat = connected_chat(&mut app);
+    let CardKind::Chat(session) = app.card_state(chat).unwrap().kind.clone() else {
+        unreachable!()
+    };
+    app.await_shared_chat_admission(chat, session);
+    app.shared_views.registry_unavailable = true;
+    assert!(!app.startup_pane_held(chat));
+    let report = app.startup_incomplete(&[chat], &[], None);
+    assert!(
+        report.contains("cannot reopen while the shared workspace is unavailable"),
+        "{report}"
+    );
+    assert!(
+        report.contains(crate::workspace_model::REGISTRY_UNAVAILABLE),
+        "{report}"
+    );
+    assert!(!report.contains("on its own"), "{report}");
+    assert!(!report.contains("Open it"), "{report}");
+}
+
+/// What an updater from before relaunch grouping writes, in a stopped update.
+const OLDER_RETAINED_JOB: &str = "primary: recovery-incomplete: the terminal service could not reconnect saved sessions after the update: Upgrade restore retained original ownership: terminal dimensions or scrollback are outside supported bounds; checkpoint retained at /home/someone/.local/state/daemon-upgrade.json. Their original processes were kept and nothing was closed or deleted; this window remains available. The update has not been verified.; window-2: recovery-incomplete: the terminal service could not reconnect saved sessions after the update: Upgrade restore retained original ownership: terminal dimensions or scrollback are outside supported bounds; checkpoint retained at /home/someone/.local/state/daemon-upgrade.json. Their original processes were kept and nothing was closed or deleted; this window remains available. The update has not been verified.";
+
+#[test]
+fn a_stopped_update_leads_with_its_steps_whichever_build_wrote_it() {
+    let current = OLDER_RETAINED_JOB.split("; window-2: ").next().unwrap();
+    let current = current
+        .strip_prefix("primary: recovery-incomplete: the")
+        .map(|rest| format!("The{rest}"))
+        .unwrap();
+    for message in [OLDER_RETAINED_JOB, current.as_str()] {
+        let failure = update_failure(message);
+        assert!(failure.retained);
+        assert_eq!(failure.notice.message, RETAINED_NOTICE);
+        assert!(failure.notice.message.contains("cagents daemon stop"));
+        assert!(!failure.summary.contains('/'), "{}", failure.summary);
+        let details = failure.notice.details.as_deref().unwrap();
+        assert!(details.contains("checkpoint retained at"), "{details}");
+        assert!(!details.contains("recovery-incomplete"), "{details}");
+        assert!(!details.contains("window-2"), "{details}");
+    }
+}
+
+#[test]
+fn a_failed_update_reads_without_window_slots_or_the_handshake_prefix() {
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry. Details: refused; try later.";
+    let failure = update_failure(&format!("primary: {report}; window-2: {report}"));
+    assert!(!failure.retained);
+    assert_eq!(
+        failure.notice.message,
+        "1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry."
+    );
+    assert_eq!(
+        failure.notice.details.as_deref(),
+        Some("refused; try later")
+    );
+
+    let different = update_failure(&format!("primary: {report}; window-2: no display"));
+    assert!(
+        different.notice.message.starts_with("primary: "),
+        "{}",
+        different.notice.message
+    );
+    assert!(
+        different.notice.message.contains("window-2: No display")
+            || different
+                .notice
+                .details
+                .as_deref()
+                .is_some_and(|d| d.contains("window-2: No display"))
+    );
+
+    let other = update_failure("installed daemon startup failed; see the log");
+    assert_eq!(
+        other.notice.message,
+        "installed daemon startup failed; see the log"
+    );
+    assert_eq!(
+        other.summary,
+        "installed daemon startup failed; see the log"
+    );
+}

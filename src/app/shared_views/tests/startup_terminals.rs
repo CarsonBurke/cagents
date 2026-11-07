@@ -1845,11 +1845,22 @@ fn show_cached(window: &mut Window) {
 fn a_reported_held_terminal_reconnects_when_opened_after_the_registry_answers() {
     let mut window = reopened_window(false);
     let card = reported_held_terminal(&mut window);
+    assert_eq!(
+        window.app.startup_terminal_tab_status(card),
+        Some(Some(("Waiting for the shared workspace", true))),
+        "waiting needs nothing done, so it carries no warning"
+    );
     admit(&mut window);
     assert!(!window.app.startup_pane_held(card));
     assert!(
         !window.app.terminal_start_in_flight(card),
         "an unopened pane waits to be opened once the gate has reported"
+    );
+    assert!(!window.app.startup_terminal_gave_up(card));
+    assert_eq!(
+        window.app.startup_terminal_tab_status(card),
+        Some(None),
+        "the tab reads neither as failed nor as starting while opening it works"
     );
     show_cached(&mut window);
     assert!(window.app.terminal_start_in_flight(card));
@@ -1882,10 +1893,10 @@ fn an_opened_held_terminal_reconnects_when_the_registry_answers() {
     assert_eq!(window.app.startup_terminal_latest(card), None);
 }
 
-/// A view held for a managed agent, with every pane connected, names no pane.
-/// The report's promise is that this needs nothing and clears by itself.
+/// A view held for a managed agent, with no pane to name, says only what is
+/// known: nothing shows that it clears by itself.
 #[test]
-fn a_view_held_for_a_managed_agent_says_it_catches_up_and_does() {
+fn a_view_held_for_a_managed_agent_promises_nothing_about_clearing() {
     let directory = tempfile::tempdir().unwrap();
     let mut window = reopened_window(false);
     admit(&mut window);
@@ -1905,14 +1916,11 @@ fn a_view_held_for_a_managed_agent_says_it_catches_up_and_does() {
         "{report}"
     );
     assert!(
-        report.contains(
-            "Its saved panes are connected, and nothing is needed from you now; the workspace catches up on its own once it is ready."
-        ),
+        report.contains("The update has not been verified."),
         "{report}"
     );
-
-    admit(&mut window);
-    assert_eq!(window.app.startup_pane_check(), Ok(true));
+    assert!(!report.contains("connected"), "{report}");
+    assert!(!report.contains("on its own"), "{report}");
 }
 
 /// A daemon that kept its original owners will not answer until it restarts,
@@ -1951,5 +1959,26 @@ fn a_held_terminal_under_a_retained_restore_does_not_promise_to_reconnect() {
     assert!(
         !caption.contains("once the shared workspace is ready"),
         "{caption}"
+    );
+}
+
+/// A record made after the registry answered is a real failure, and an answer
+/// to a later edit must not clear it.
+#[test]
+fn a_failure_once_the_registry_has_answered_outlives_later_model_updates() {
+    let mut window = reopened_window(false);
+    let card = window.cached.id;
+    let source = session(&window.cached);
+    admit(&mut window);
+    window.app.startup_gate = crate::app::startup_gate::State::fixture_reported();
+    window
+        .app
+        .startup_attach_failed(card, source.id, REFUSAL.into());
+    assert!(window.app.startup_terminal_gave_up(card));
+    admit(&mut window);
+    assert!(window.app.startup_terminal_gave_up(card));
+    assert_eq!(
+        window.app.startup_terminal_tab_status(card),
+        Some(Some(("Reconnect unavailable", false)))
     );
 }

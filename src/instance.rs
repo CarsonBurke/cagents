@@ -1256,7 +1256,7 @@ impl UiUpdateGuard {
 /// What the update reports when windows did not reopen cleanly. Someone reads
 /// this: the launcher's handshake prefix goes, and windows stopped by the same
 /// thing share one sentence instead of repeating it per window.
-fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
+pub(crate) fn relaunch_failure(windows: usize, errors: &[(&str, String)]) -> String {
     let mut groups: Vec<(Vec<&str>, String)> = Vec::new();
     for (slot, error) in errors {
         let text = error

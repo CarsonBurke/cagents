@@ -3216,8 +3216,8 @@ impl Cagents {
             _ if self.pane_transfer_pending(id) => Some(("Moving to channel", true)),
             _ if self.chat_start_pending(id) => Some(("Updating conversation", true)),
             _ if self.saved_terminal_current(id).is_some() => self.saved_terminal_status(id),
-            Some(CardRuntime::Loading) if self.startup_terminal_gave_up(id) => {
-                Some((self.startup_gave_up_title(id), false))
+            Some(CardRuntime::Loading) if self.startup_terminal_tab_status(id).is_some() => {
+                self.startup_terminal_tab_status(id).flatten()
             }
             None | Some(CardRuntime::Loading) => Some((labels.starting, true)),
             Some(CardRuntime::Failed(_)) => Some(("Unavailable", false)),

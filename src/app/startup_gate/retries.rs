@@ -23,6 +23,9 @@ pub(in crate::app) struct Retries {
     attempts: HashMap<CardId, Record>,
     /// Conditions seen on the latest check, dropped once one no longer holds.
     observed: HashMap<CardId, Record>,
+    /// Panes whose latest record was made while they could do nothing until
+    /// the registry answered, so it says nothing once it has.
+    awaiting_registry: HashSet<CardId>,
 }
 
 struct Record {
@@ -156,6 +159,7 @@ impl Cagents {
     ) {
         if self.startup_gate.opened.is_some() && self.saved_terminal_of(card) == Some(terminal) {
             tracing::warn!(?card, %terminal, %reason, "startup terminal stays detached");
+            self.startup_note_registry_wait(card);
             let retries = &mut self.startup_gate.retries;
             note(&mut retries.attempts, card, terminal, reason);
         } else {
@@ -174,6 +178,9 @@ impl Cagents {
         reason: &str,
         detail: &str,
     ) {
+        if self.startup_terminal(card) == Some(terminal) {
+            self.startup_note_registry_wait(card);
+        }
         if self.startup_terminal(card) == Some(terminal)
             && note(
                 &mut self.startup_gate.retries.observed,
@@ -183,6 +190,32 @@ impl Cagents {
             )
         {
             tracing::debug!(?card, %terminal, %reason, detail, "startup terminal is not settled");
+        }
+    }
+
+    fn startup_note_registry_wait(&mut self, card: CardId) {
+        if self.startup_pane_needs_registry(card) {
+            self.startup_gate.retries.awaiting_registry.insert(card);
+        } else {
+            self.startup_gate.retries.awaiting_registry.remove(&card);
+        }
+    }
+
+    /// Once the gate has reported, nothing checks its records again. One made
+    /// while a pane waited for the registry is stale when the registry
+    /// answers, and would have the tab read as failed while opening it works.
+    pub(in crate::app) fn retire_startup_registry_waits(&mut self) {
+        if !self.startup_gate.reported {
+            return;
+        }
+        let waits = std::mem::take(&mut self.startup_gate.retries.awaiting_registry);
+        for card in waits {
+            if self.startup_pane_needs_registry(card) {
+                self.startup_gate.retries.awaiting_registry.insert(card);
+            } else {
+                self.startup_gate.retries.attempts.remove(&card);
+                self.startup_gate.retries.observed.remove(&card);
+            }
         }
     }
 
@@ -202,6 +235,29 @@ impl Cagents {
         self.startup_gate.reported
             && !self.terminal_start_in_flight(card)
             && self.startup_gate.retries.latest(card).is_some()
+    }
+
+    /// What the tab of a loading terminal shows once the gate has reported, if
+    /// the gate has a say: the label, and whether it is still under way. One
+    /// that is waiting needs nothing done, and one left unopened with nothing
+    /// holding it attaches when opened, so neither carries a warning.
+    pub(in crate::app) fn startup_terminal_tab_status(
+        &self,
+        card: CardId,
+    ) -> Option<Option<(&'static str, bool)>> {
+        if self.startup_terminal_gave_up(card) {
+            let waiting = self.startup_pane_held(card) && !self.startup_gate.retained;
+            return Some(Some((self.startup_gave_up_title(card), waiting)));
+        }
+        let unopened = self
+            .card_state(card)
+            .is_some_and(|state| !matches!(state.residency, Residency::Hydrating { .. }));
+        (self.startup_gate.reported
+            && unopened
+            && matches!(self.saved_terminal_of(card), Some(_))
+            && !self.terminal_start_in_flight(card)
+            && !self.startup_pane_needs_registry(card))
+        .then_some(None)
     }
 
     /// The tab and pane title of a terminal that gave up: one held for the
