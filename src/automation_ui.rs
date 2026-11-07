@@ -2638,7 +2638,7 @@ impl State {
                     }
                     if !self.history.is_empty() {
                         content = content.push(crate::design::caption(format!(
-                            "Up to {} settled history entries per automation. Settled history of removed automations expires after {} days; active or unresolved work is retained. Older settled details may be unavailable.",
+                            "Keeps up to {} finished entries per automation, and a removed automation's finished entries for {} days. Runs still waiting or in progress stay until they finish. Details of older runs may be unavailable.",
                             crate::automations::HISTORY_RETAINED_ROWS,
                             crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
                         )));
@@ -3435,14 +3435,13 @@ fn timestamp(milliseconds: u64) -> String {
 fn firing_state_label(firing: &Firing) -> String {
     let state = state_label(firing.state);
     match &firing.skipped_occurrences {
+        Some(skipped) if skipped.count == 1 => format!(
+            "{state} · 1 occurrence · {}",
+            timestamp(skipped.last_occurrence_ms),
+        ),
         Some(skipped) => format!(
-            "{state} · {} {} · {} – {}",
+            "{state} · {} occurrences · {} – {}",
             skipped.count,
-            if skipped.count == 1 {
-                "occurrence"
-            } else {
-                "occurrences"
-            },
             timestamp(skipped.first_occurrence_ms),
             timestamp(skipped.last_occurrence_ms),
         ),
@@ -3814,13 +3813,9 @@ mod tests {
             assert_eq!(state.history[0].id, firing.id);
             assert_eq!(state.history_next, Some(cursor.clone()));
             let expected_state = match count {
+                Some(1) => format!("Skipped · 1 occurrence · {}", timestamp(last)),
                 Some(count) => format!(
-                    "Skipped · {count} {} · {} – {}",
-                    if count == 1 {
-                        "occurrence"
-                    } else {
-                        "occurrences"
-                    },
+                    "Skipped · {count} occurrences · {} – {}",
                     timestamp(60_000),
                     timestamp(last),
                 ),
@@ -3837,7 +3832,7 @@ mod tests {
                 let history = Outline::of(&state, width, 700.0);
                 history.text(&row);
                 history.text(&format!(
-                    "Up to {} settled history entries per automation. Settled history of removed automations expires after {} days; active or unresolved work is retained. Older settled details may be unavailable.",
+                    "Keeps up to {} finished entries per automation, and a removed automation's finished entries for {} days. Runs still waiting or in progress stay until they finish. Details of older runs may be unavailable.",
                     crate::automations::HISTORY_RETAINED_ROWS,
                     crate::automations::REMOVED_HISTORY_RETENTION_DAYS,
                 ));
