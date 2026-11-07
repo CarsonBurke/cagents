@@ -206,16 +206,23 @@ use crate::{
 /// `WatchConversationPullRequests` request, its `work::Response` and the
 /// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
 /// and are not adopted here.
-/// Version 152 appends the transcript read and its reply, a channel directory
+/// Version 155 appends the transcript read and its reply, a channel directory
 /// scope, and a directory entry's exited state, failure and last activity.
-pub const PROTOCOL_VERSION: u16 = 152;
+/// Versions 152 to 154 are claimed by parallel branches and are not adopted.
+pub const PROTOCOL_VERSION: u16 = 155;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
 /// encoding, so an update may speak it as a source with this release's
-/// client. Other parts differ, such as device account operations, so it is
-/// never an ordinary peer.
+/// client. Its daemons and windows are never peers. Its CLI, which chats
+/// carried across an update keep running, is served as an [`OlderClient`]:
+/// the one wire difference, the device account `Restore` operation this
+/// release appended, is a request that CLI cannot send.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+
+mod older_clients;
+pub use older_clients::{OlderClient, is_cli_peer, older_client};
+
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.

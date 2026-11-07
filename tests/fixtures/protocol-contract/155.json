@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "protocol": 152,
+  "protocol": 155,
   "items": {
     "src/agent.rs::Provider": ["#", "[", "derive", "(", "Serialize", ",", "Deserialize", ")", "]", "pub", "enum", "Provider", "{", "Omp", ",", "Claude", ",", "Codex", ",", "}"],
     "src/agent_execution.rs::Reply": ["#", "[", "derive", "(", "Serialize", ",", "Deserialize", ")", "]", "pub", "enum", "Reply", "{", "Accepted", "(", "Accepted", ")", ",", "Status", "{", "agent", ":", "Agent", ",", "run", ":", "Run", ",", "}", ",", "Listed", "(", "Vec", "<", "Summary", ">", ")", ",", "Closed", "(", "Agent", ")", ",", "Console", "(", "Option", "<", "ConsoleView", ">", ")", ",", "Directory", "(", "directory", ":", ":", "Directory", ")", ",", "AccountInfo", "(", "crate", ":", ":", "account", ":", ":", "info", ":", ":", "Report", ")", ",", "Requests", "(", "Vec", "<", "chat", ":", ":", "Request", ">", ")", ",", "Sent", "(", "mailbox", ":", ":", "Sent", ")", ",", "Inbox", "(", "Vec", "<", "mailbox", ":", ":", "Message", ">", ")", ",", "InboxAcknowledged", ",", "Transcript", "(", "transcript", ":", ":", "Page", ")", ",", "}"],
