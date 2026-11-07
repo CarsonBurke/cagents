@@ -15,8 +15,12 @@ fi
 
 session=aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa
 resumed=
+# The app's account check starts the provider without keeping a session. It
+# is not a conversation, so the launch and stop switches leave it alone.
+probe=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
+        --no-session-persistence) probe=true ;;
         --session-id) shift; session=$1 ;;
         --session-id=*) session=${1#*=} ;;
         --resume) shift; session=$1; resumed=$1 ;;
@@ -45,7 +49,7 @@ fi
 # Optional launch record: while fixture-launches exists, each provider start
 # appends the conversation it resumed, or `new`, so a check can tell a
 # resume of the same conversation from a second start.
-if [ -f "$config/fixture-launches" ]; then
+if [ "$probe" = false ] && [ -f "$config/fixture-launches" ]; then
     printf '%s\n' "${resumed:-new}" >> "$config/fixture-launches"
 fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
@@ -332,7 +336,7 @@ while IFS= read -r frame; do
                 # out of memory: the next prompt gets the start of an answer,
                 # then the provider kills itself with SIGKILL. The switch is
                 # consumed first, so a resumed provider answers normally.
-                if [ -e "$config/fixture-stop-on-prompt" ]; then
+                if [ "$probe" = false ] && [ -e "$config/fixture-stop-on-prompt" ]; then
                     rm -f "$config/fixture-stop-on-prompt"
                     emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("fixture-stopping-"+$turn),message:{id:("fixture-stopping-"+$turn),role:"assistant",content:[{type:"text",text:"Starting the full evaluation run now; this step needs a lot of memory."}]}}')"
                     kill -KILL $$
