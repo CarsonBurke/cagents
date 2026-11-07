@@ -1192,10 +1192,15 @@ fn empty_transcript_text(saved_history: bool, loading: bool) -> &'static str {
     }
 }
 
+/// Below this pane width a saved transcript's caption and Resume action stack.
+const RESUME_STACK_WIDTH: f32 = 600.0;
+
 /// What a saved transcript's reader is told beside its Resume action. The
-/// uncertainty is only claimed from the newest page of the transcript.
-fn saved_history_caption(snapshot: &chat::Snapshot) -> std::borrow::Cow<'_, str> {
-    let uncertain = !snapshot.history_loading
+/// uncertainty is only claimed from the newest page of the transcript, which a
+/// hidden pane has released, so `showing` says whether its items can be judged.
+fn saved_history_caption(snapshot: &chat::Snapshot, showing: bool) -> std::borrow::Cow<'_, str> {
+    let uncertain = showing
+        && !snapshot.history_loading
         && !snapshot.has_later
         && chat::last_turn_uncertain(&snapshot.items);
     if let Some(reason) = snapshot
@@ -2606,7 +2611,7 @@ impl Runtime {
                 } else if snapshot.exited && self.session.owns_codex_listener() {
                     "Chat attachment ended. The retained provider may still be running; your draft is retained.".into()
                 } else if saved_history {
-                    saved_history_caption(snapshot)
+                    saved_history_caption(snapshot, self.visible.load(Ordering::Relaxed))
                 } else if snapshot.exited {
                     snapshot.read_only_reason.as_deref().unwrap_or(
                         "Agent process exited. The transcript and draft are retained.",
@@ -2640,12 +2645,18 @@ impl Runtime {
                     Action::StartFresh(target.card),
                 ));
             }
-            content.push(
+            // Resume keeps its full label, so a narrow pane gives the sentence
+            // its own line instead of leaving it a word per line beside it.
+            content.push(if saved_history && content_width < RESUME_STACK_WIDTH {
+                widget::column::with_children(controls)
+                    .spacing(space::S)
+                    .into()
+            } else {
                 widget::row::with_children(controls)
                     .spacing(space::S)
                     .align_y(Alignment::Center)
-                    .into(),
-            );
+                    .into()
+            });
         }
         if let Some((url, instructions)) = &snapshot.open_url {
             content.push(
@@ -6400,6 +6411,15 @@ mod tests {
         items: Vec<Arc<chat::Item>>,
         loading: bool,
     ) -> (Vec<String>, Vec<Message>) {
+        let (texts, messages) = saved_history_pane_at(items, loading, 900.0);
+        (texts.into_iter().map(|(text, _)| text).collect(), messages)
+    }
+
+    fn saved_history_pane_at(
+        items: Vec<Arc<chat::Item>>,
+        loading: bool,
+        width: f32,
+    ) -> (Vec<(String, iced::Rectangle)>, Vec<Message>) {
         use iced::advanced::{
             Layout, Shell, clipboard, layout, mouse,
             widget::{Operation, Tree},
@@ -6446,7 +6466,7 @@ mod tests {
             false,
             true,
             &shortcuts,
-            900.0,
+            width,
             Place {
                 name: "Fixture".into(),
                 channel: None,
@@ -6457,7 +6477,7 @@ mod tests {
             vec![],
         );
         let mut tree = Tree::new(element.as_widget());
-        let viewport = iced::Rectangle::with_size(iced::Size::new(900.0, 1000.0));
+        let viewport = iced::Rectangle::with_size(iced::Size::new(width, 1000.0));
         let node = element.as_widget_mut().layout(
             &mut tree,
             &renderer,
@@ -6492,10 +6512,78 @@ mod tests {
                 );
             }
         }
-        (
-            texts.0.into_iter().map(|(text, _)| text).collect(),
-            messages,
-        )
+        (texts.0, messages)
+    }
+
+    #[test]
+    fn a_narrow_saved_pane_keeps_a_readable_caption_and_a_reachable_resume() {
+        let question = Arc::new(chat::Item {
+            id: "question".into(),
+            role: chat::Role::User,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: "Saved question".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        });
+        let answer = Arc::new(chat::Item {
+            id: "answer".into(),
+            role: chat::Role::Assistant,
+            at: None,
+            started_at: None,
+            content: ItemContent::Text {
+                text: "Saved answer".into(),
+                thinking: false,
+                phase: chat::Phase::Final,
+            },
+        });
+        let bounds = |texts: &[(String, iced::Rectangle)], wanted: &str| {
+            texts
+                .iter()
+                .find(|(text, _)| text == wanted)
+                .unwrap_or_else(|| panic!("{wanted} missing from {texts:?}"))
+                .1
+        };
+        let items = vec![question, answer];
+        let (narrow, presses) = saved_history_pane_at(items.clone(), false, 340.0);
+        let caption = bounds(&narrow, "READ_ONLY_REASON");
+        let resume = bounds(&narrow, "Resume conversation");
+        assert!(
+            resume.y >= caption.y + caption.height,
+            "{caption:?} {resume:?}"
+        );
+        assert!(resume.x + resume.width <= 340.0, "{resume:?}");
+        assert!(
+            presses
+                .iter()
+                .any(|message| matches!(message, Message::ChatUi(Action::ResumeSaved(_)))),
+            "{presses:?}"
+        );
+
+        let (wide, _) = saved_history_pane_at(items, false, 900.0);
+        let caption = bounds(&wide, "READ_ONLY_REASON");
+        let resume = bounds(&wide, "Resume conversation");
+        assert!(
+            resume.x >= caption.x + caption.width,
+            "{caption:?} {resume:?}"
+        );
+    }
+
+    #[test]
+    fn a_hidden_saved_pane_claims_nothing_about_a_transcript_it_released() {
+        let snapshot = Snapshot {
+            read_only_reason: Some(format!("{} Fixture detail.", chat::LOST_PROVIDER_REASON)),
+            ..Default::default()
+        };
+        assert!(
+            saved_history_caption(&snapshot, true).contains("may not have finished"),
+            "an empty transcript on show has nothing to read"
+        );
+        let hidden = saved_history_caption(&snapshot, false);
+        assert!(!hidden.contains("may not have finished"), "{hidden}");
+        assert!(hidden.contains("Fixture detail"), "{hidden}");
     }
 
     #[test]
@@ -6517,14 +6605,14 @@ mod tests {
             items: vec![question],
             ..Default::default()
         };
-        let caption = saved_history_caption(&snapshot);
+        let caption = saved_history_caption(&snapshot, true);
         assert!(caption.contains("Fixture detail"), "{caption}");
         assert!(caption.contains("may not have finished"), "{caption}");
         let plain = Snapshot {
             read_only_reason: Some("Other".into()),
             ..snapshot.clone()
         };
-        let caption = saved_history_caption(&plain);
+        let caption = saved_history_caption(&plain, true);
         assert!(
             caption.contains("messages waiting from other agents"),
             "{caption}"
