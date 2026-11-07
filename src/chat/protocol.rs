@@ -348,6 +348,12 @@ pub trait Adapter: Send {
     fn initialization_pending(&self) -> bool {
         false
     }
+    /// Whether a settled turn's outcome still waits on a provider reply, such
+    /// as the acknowledgement of an interrupt sent before its result arrived.
+    /// Closing keeps reading the provider until that reply decides it.
+    fn outcome_pending(&self) -> bool {
+        false
+    }
     fn command(&mut self, command: Command) -> Result<Step, String>;
     /// Whether this exact pending answer refuses work. Providers with opaque
     /// action IDs must inspect their retained decision, never its UI label.

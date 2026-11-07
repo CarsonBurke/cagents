@@ -615,7 +615,7 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
             .unwrap()
             .is_some()
         {
-            assert!(!owner.owner().root.is_current() && !owner.owner().holder.is_current());
+            assert!(!owner.owner().root.is_current() && owner.owner().holder.reaped());
         }
     }
     client.close().unwrap();
@@ -1013,5 +1013,5 @@ fn installed_startup_with_uncommitted_attention_adopts_before_cleanup_retry() {
             .is_some()
     );
     super::native_cleanup::close_retained(&host, &session).unwrap();
-    assert!(!owner.root.is_current() && !owner.holder.is_current());
+    assert!(!owner.root.is_current() && owner.holder.reaped());
 }
