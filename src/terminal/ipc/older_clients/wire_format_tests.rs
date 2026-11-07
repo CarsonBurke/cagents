@@ -1,0 +1,462 @@
+//! The recorded postcard wire format of each protocol, and the proof that an
+//! older client this daemon serves reads and writes it as this one does.
+//!
+//! `tests/fixtures/wire-formats/<protocol>.json` holds the shape of every type
+//! reachable from the client and server envelopes, as [`Shapes::trace`] finds
+//! it. After a protocol bump, record the new protocol by running
+//! `this_protocols_wire_format_is_recorded` with `CAGENTS_RECORD_WIRE_FORMAT=1`,
+//! and keep the older files. Protocol 128 was recorded by running this
+//! tracer in a 0.1.3+local.c68275e94 checkout.
+
+use std::{collections::BTreeSet, path::PathBuf};
+
+use super::{
+    wire_shape::{Container, Fields, Shape, Shapes},
+    *,
+};
+use crate::terminal_ipc::{ClientEnvelope, ServerEnvelope};
+
+const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
+
+/// By full name, because other enums are also called `Response`.
+const WORK_RESPONSE: &str = "cagents::work::Response";
+
+/// Fields appended to a struct that ends the frame, which an older client stops
+/// reading before. Each is named, so nothing else gets this allowance by accident.
+const APPENDED_AT_FRAME_END: &[&str] =
+    &["ServerEnvelope.message::response.response::agent::Directory.saved_transcripts"];
+
+fn fixture(protocol: u16) -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/wire-formats")
+        .join(format!("{protocol}.json"))
+}
+
+fn recorded(protocol: u16) -> Shapes {
+    let path = fixture(protocol);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{}: {error}", path.display()));
+    serde_json::from_str(&text).unwrap_or_else(|error| panic!("{}: {error}", path.display()))
+}
+
+fn traced() -> Shapes {
+    Shapes::trace::<ClientEnvelope, ServerEnvelope>().unwrap_or_else(|error| panic!("{error}"))
+}
+
+/// Which side encodes a position.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum Direction {
+    /// The older side encodes; this side may have appended enum variants.
+    Request,
+    /// This side encodes; both sides must agree exactly, apart from fields
+    /// named in `appended_at_frame_end`.
+    Reply,
+}
+
+/// Compares positions by shape, field and variant names. Container names are
+/// not compared: postcard never encodes them, and types move between modules.
+struct Comparison<'a> {
+    older: &'a Shapes,
+    current: &'a Shapes,
+    /// Enums whose later variants the connection withholds, by short name
+    /// (`ServerMessage`), with the older client's variant count.
+    gated: Vec<(&'static str, usize)>,
+    appended_at_frame_end: &'a [&'a str],
+    visited: BTreeSet<(Direction, bool, String, String)>,
+    differences: Vec<String>,
+}
+
+fn short(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
+impl Comparison<'_> {
+    fn differ(&mut self, path: &str, what: String) {
+        self.differences.push(format!("{path}: {what}"));
+    }
+
+    fn container(
+        &mut self,
+        direction: Direction,
+        older: &str,
+        current: &str,
+        path: &str,
+        at_end: bool,
+    ) {
+        if !self
+            .visited
+            .insert((direction, at_end, older.to_owned(), current.to_owned()))
+        {
+            return;
+        }
+        let (Some(old), Some(new)) = (
+            self.older.containers.get(older),
+            self.current.containers.get(current),
+        ) else {
+            return self.differ(path, format!("{older} or {current} was not recorded"));
+        };
+        match (old, new) {
+            (Container::UnitStruct, Container::UnitStruct) => {}
+            (Container::Newtype(old), Container::Newtype(new)) => {
+                self.shape(direction, old, new, path, at_end);
+            }
+            (Container::TupleStruct(old), Container::TupleStruct(new)) => {
+                self.shapes(direction, old, new, path, at_end);
+            }
+            (Container::Struct(old), Container::Struct(new)) => {
+                self.named(direction, old, new, path, at_end);
+            }
+            (Container::Enum(old), Container::Enum(new)) => {
+                let gate = self
+                    .gated
+                    .iter()
+                    .find(|(name, _)| *name == short(current) || *name == current)
+                    .map(|(_, count)| *count);
+                if let Some(count) = gate
+                    && old.len() != count
+                {
+                    self.differ(path, format!("the older client has {} variants", old.len()));
+                }
+                for (index, (name, fields)) in old.iter().enumerate() {
+                    let path = format!("{path}::{name}");
+                    let Some((next, next_fields)) = new.get(index) else {
+                        self.differ(&path, "variant removed".into());
+                        continue;
+                    };
+                    if name != next {
+                        self.differ(&path, format!("variant {index} is now {next}"));
+                    }
+                    match (fields, next_fields) {
+                        (Some(old), Some(new)) => {
+                            self.fields(direction, old, new, &path, at_end);
+                        }
+                        _ => self.differ(&path, "variant was not traced".into()),
+                    }
+                }
+                if new.len() > old.len() && direction == Direction::Reply && gate.is_none() {
+                    self.differ(
+                        path,
+                        "appended variants the older client cannot decode".into(),
+                    );
+                }
+            }
+            _ => self.differ(path, "container kind changed".into()),
+        }
+    }
+
+    fn fields(
+        &mut self,
+        direction: Direction,
+        old: &Fields,
+        new: &Fields,
+        path: &str,
+        at_end: bool,
+    ) {
+        match (old, new) {
+            (Fields::Unit, Fields::Unit) => {}
+            (Fields::Newtype(old), Fields::Newtype(new)) => {
+                self.shape(direction, old, new, path, at_end);
+            }
+            (Fields::Tuple(old), Fields::Tuple(new)) => {
+                self.shapes(direction, old, new, path, at_end);
+            }
+            (Fields::Struct(old), Fields::Struct(new)) => {
+                self.named(direction, old, new, path, at_end);
+            }
+            _ => self.differ(path, "variant kind changed".into()),
+        }
+    }
+
+    fn named(
+        &mut self,
+        direction: Direction,
+        old: &[(String, Shape)],
+        new: &[(String, Shape)],
+        path: &str,
+        at_end: bool,
+    ) {
+        let appended = new.get(old.len()..).unwrap_or_default();
+        let readable = at_end
+            && direction == Direction::Reply
+            && new.len() > old.len()
+            && appended.iter().all(|(name, _)| {
+                self.appended_at_frame_end
+                    .contains(&format!("{path}.{name}").as_str())
+            });
+        if old.len() != new.len() && !readable {
+            return self.differ(path, format!("{} fields, now {}", old.len(), new.len()));
+        }
+        for (index, ((name, old_shape), (next, new_shape))) in old.iter().zip(new).enumerate() {
+            let path = format!("{path}.{name}");
+            if name != next {
+                self.differ(&path, format!("field is now {next}"));
+            }
+            let last = at_end && appended.is_empty() && index + 1 == old.len();
+            self.shape(direction, old_shape, new_shape, &path, last);
+        }
+    }
+
+    fn shapes(
+        &mut self,
+        direction: Direction,
+        old: &[Shape],
+        new: &[Shape],
+        path: &str,
+        at_end: bool,
+    ) {
+        if old.len() != new.len() {
+            return self.differ(path, format!("{} elements, now {}", old.len(), new.len()));
+        }
+        for (index, (old_shape, new_shape)) in old.iter().zip(new).enumerate() {
+            let last = at_end && index + 1 == old.len();
+            self.shape(
+                direction,
+                old_shape,
+                new_shape,
+                &format!("{path}.{index}"),
+                last,
+            );
+        }
+    }
+
+    /// `at_end` says nothing follows this position in the frame.
+    fn shape(&mut self, direction: Direction, old: &Shape, new: &Shape, path: &str, at_end: bool) {
+        match (old, new) {
+            (Shape::Container(old), Shape::Container(new)) => {
+                self.container(direction, old, new, path, at_end);
+            }
+            (Shape::Option(old), Shape::Option(new)) => {
+                self.shape(direction, old, new, path, at_end);
+            }
+            (Shape::Seq(old), Shape::Seq(new)) => self.shape(direction, old, new, path, false),
+            (Shape::Map(old_key, old_value), Shape::Map(new_key, new_value)) => {
+                self.shape(direction, old_key, new_key, &format!("{path}[key]"), false);
+                self.shape(
+                    direction,
+                    old_value,
+                    new_value,
+                    &format!("{path}[value]"),
+                    false,
+                );
+            }
+            (Shape::Tuple(old), Shape::Tuple(new)) => {
+                self.shapes(direction, old, new, path, at_end);
+            }
+            (Shape::Unknown, _) | (_, Shape::Unknown) => {
+                self.differ(path, "not traced".into());
+            }
+            (old, new) if old == new => {}
+            (old, new) => self.differ(path, format!("{old:?} is now {new:?}")),
+        }
+    }
+}
+
+fn differences(
+    older: &Shapes,
+    current: &Shapes,
+    gated: Vec<(&'static str, usize)>,
+    appended_at_frame_end: &[&str],
+) -> Vec<String> {
+    let mut comparison = Comparison {
+        older,
+        current,
+        gated,
+        appended_at_frame_end,
+        visited: BTreeSet::new(),
+        differences: Vec::new(),
+    };
+    comparison.shape(
+        Direction::Request,
+        &older.client,
+        &current.client,
+        "ClientEnvelope",
+        false,
+    );
+    comparison.shape(
+        Direction::Reply,
+        &older.server,
+        &current.server,
+        "ServerEnvelope",
+        true,
+    );
+    comparison.differences
+}
+
+fn variant_count(shapes: &Shapes, name: &str) -> u32 {
+    let mut enums = shapes
+        .containers
+        .iter()
+        .filter(|(key, _)| short(key) == name || key.as_str() == name)
+        .filter_map(|(_, container)| match container {
+            Container::Enum(variants) => Some(variants.len() as u32),
+            _ => None,
+        });
+    let count = enums
+        .next()
+        .unwrap_or_else(|| panic!("{name} was not recorded"));
+    assert!(enums.next().is_none(), "more than one {name} was recorded");
+    count
+}
+
+#[test]
+fn this_protocols_wire_format_is_recorded() {
+    let current = traced();
+    if std::env::var_os(RECORD).is_some() {
+        // Written to the checkout the test ran in, and printed for a build
+        // host whose checkout is a copy.
+        let path = fixture(PROTOCOL_VERSION);
+        let text = serde_json::to_string_pretty(&current).unwrap() + "\n";
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &text).unwrap();
+        println!("{RECORD} {}\n{text}{RECORD} end", path.display());
+        return;
+    }
+    let recorded = recorded(PROTOCOL_VERSION);
+    let mut changed = differences(&recorded, &current, Vec::new(), &[]);
+    changed.extend(differences(&current, &recorded, Vec::new(), &[]));
+    assert!(
+        changed.is_empty(),
+        "the wire format differs from protocol {PROTOCOL_VERSION}'s recording. Postcard is \
+         positional, so bump PROTOCOL_VERSION, record the new protocol with {RECORD}=1, and \
+         prove or retire each OlderClient:\n{}",
+        changed.join("\n")
+    );
+}
+
+#[test]
+fn every_older_client_is_proven_against_its_recorded_format() {
+    let current = traced();
+    for client in OLDER_CLIENTS {
+        assert_eq!(
+            client.proven_at, PROTOCOL_VERSION,
+            "protocol {} clients were proven compatible with protocol {}, not {PROTOCOL_VERSION}. \
+             After a bump, check that its requests still mean what they did, then update \
+             `proven_at`, or remove it from OLDER_CLIENTS.",
+            client.protocol, client.proven_at
+        );
+        let older = recorded(client.protocol);
+        assert_eq!(
+            (
+                client.client_requests,
+                client.server_messages,
+                client.server_responses,
+                client.work_responses
+            ),
+            (
+                variant_count(&older, "ClientRequest"),
+                variant_count(&older, "ServerMessage"),
+                variant_count(&older, "ServerResponse"),
+                variant_count(&older, WORK_RESPONSE),
+            ),
+            "protocol {}'s variant counts",
+            client.protocol
+        );
+        let differences = differences(
+            &older,
+            &current,
+            vec![
+                ("ServerMessage", client.server_messages as usize),
+                ("ServerResponse", client.server_responses as usize),
+                (WORK_RESPONSE, client.work_responses as usize),
+            ],
+            APPENDED_AT_FRAME_END,
+        );
+        assert!(
+            differences.is_empty(),
+            "protocol {} clients would misread this daemon. Adapt or refuse what changed for \
+             them, or remove them from OLDER_CLIENTS:\n{}",
+            client.protocol,
+            differences.join("\n")
+        );
+    }
+}
+
+mod frame_end {
+    use serde::Deserialize;
+
+    use super::*;
+
+    #[derive(Deserialize)]
+    struct Client;
+
+    #[derive(Deserialize)]
+    struct Tail {
+        #[allow(dead_code)]
+        kept: u8,
+    }
+
+    #[derive(Deserialize)]
+    struct TailWithExtra {
+        #[allow(dead_code)]
+        kept: u8,
+        #[allow(dead_code)]
+        extra: u8,
+    }
+
+    /// `Inner` as the last thing in the frame.
+    #[derive(Deserialize)]
+    struct Ending<Inner> {
+        #[allow(dead_code)]
+        first: u8,
+        #[allow(dead_code)]
+        tail: Inner,
+    }
+
+    /// `Inner` with another field after it.
+    #[derive(Deserialize)]
+    struct Middle<Inner> {
+        #[allow(dead_code)]
+        tail: Inner,
+        #[allow(dead_code)]
+        after: u8,
+    }
+
+    /// `Inner` in a list, with more elements after it.
+    #[derive(Deserialize)]
+    struct Listed<Inner> {
+        #[allow(dead_code)]
+        tail: Vec<Inner>,
+    }
+
+    fn compare<Older, Current>(appended: &[&str]) -> Vec<String>
+    where
+        Older: for<'de> Deserialize<'de>,
+        Current: for<'de> Deserialize<'de>,
+    {
+        differences(
+            &Shapes::trace::<Client, Older>().unwrap(),
+            &Shapes::trace::<Client, Current>().unwrap(),
+            Vec::new(),
+            appended,
+        )
+    }
+
+    #[test]
+    fn a_named_field_appended_where_the_frame_ends_is_readable() {
+        assert_eq!(
+            compare::<Ending<Tail>, Ending<TailWithExtra>>(&["ServerEnvelope.tail.extra"]),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn an_unnamed_field_appended_where_the_frame_ends_is_a_difference() {
+        assert!(!compare::<Ending<Tail>, Ending<TailWithExtra>>(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_field_appended_before_more_of_the_frame_is_a_difference() {
+        assert!(
+            !compare::<Middle<Tail>, Middle<TailWithExtra>>(&["ServerEnvelope.tail.extra"])
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn a_field_appended_to_a_list_element_is_a_difference() {
+        assert!(
+            !compare::<Listed<Tail>, Listed<TailWithExtra>>(&["ServerEnvelope.tail.extra"])
+                .is_empty()
+        );
+    }
+}
