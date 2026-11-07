@@ -2843,11 +2843,22 @@ impl Worker {
         };
         // A cagents process started in this terminal must not take the
         // account selected for it for the system account.
-        match crate::account::registry::selection_marker(|name| {
-            command.get_env(name)?.to_str().map(str::to_owned)
-        }) {
-            Some(marker) => command.env(crate::account::SELECTION_MARKER, marker),
-            None => command.env_remove(crate::account::SELECTION_MARKER),
+        let home_of = |name: &str| command.get_env(name)?.to_str().map(str::to_owned);
+        let selection = crate::account::registry::selection_marker(home_of);
+        // It must keep the Claude home the reader started cagents with,
+        // though, rather than take it for the default earlier cagents
+        // exported to every launch.
+        let system = crate::account::system_home_marker(home_of, selection.as_deref(), |name| {
+            std::env::var(name).ok()
+        });
+        for (marker, value) in [
+            (crate::account::SELECTION_MARKER, selection),
+            (crate::account::SYSTEM_HOME_MARKER, system),
+        ] {
+            match value {
+                Some(value) => command.env(marker, value),
+                None => command.env_remove(marker),
+            }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
         if let Some(token) = config.agent_authority.token() {
@@ -5657,7 +5668,7 @@ fn terminal_environment(command: &mut CommandBuilder) {
     command.env("TERM", "xterm-256color");
     command.env("COLORTERM", "truecolor");
     command.env("TERM_PROGRAM", "cagents");
-    command.env("TERM_PROGRAM_VERSION", crate::VERSION);
+    command.env("TERM_PROGRAM_VERSION", crate::version());
 }
 
 fn pty_size(size: TerminalSize) -> PtySize {
@@ -9210,7 +9221,7 @@ mod tests {
         assert_eq!(command.get_env("TERM_PROGRAM"), Some(OsStr::new("cagents")));
         assert_eq!(
             command.get_env("TERM_PROGRAM_VERSION"),
-            Some(OsStr::new(crate::VERSION))
+            Some(OsStr::new(crate::version()))
         );
         // The test below proves the scrub removes names; this one proves
         // `command_from_recipe` still calls it. Only markers this host

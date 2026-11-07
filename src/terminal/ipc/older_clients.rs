@@ -30,11 +30,12 @@ use serde::{
 
 use super::{
     CANDIDATE_LINE_PROTOCOL, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
-    ServerMessage,
+    ServerMessage, ServerResponse,
 };
 
-/// What an older protocol's client can decode, as variant counts of the
-/// three top-level enums. Later variants exist only in newer protocols.
+/// What an older protocol's client can decode, as variant counts of the three
+/// top-level enums and of the work and agent replies nested in one of them.
+/// Later variants exist only in newer protocols.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OlderClient {
     pub protocol: u16,
@@ -44,16 +45,22 @@ pub struct OlderClient {
     client_requests: u32,
     server_messages: u32,
     server_responses: u32,
+    work_responses: u32,
+    /// Variants of `agent_execution::Reply`. A later one answers only an
+    /// operation the older client cannot encode.
+    agent_replies: u32,
 }
 
 /// The install candidate line, 0.1.3+local.c68275e94. Its chats are carried
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 129,
+    proven_at: 155,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
+    work_responses: 6,
+    agent_replies: 11,
 };
 
 const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
@@ -81,6 +88,8 @@ impl OlderClient {
             client_requests: u32::MAX,
             server_messages,
             server_responses,
+            work_responses: u32::MAX,
+            agent_replies: u32::MAX,
         }
     }
 
@@ -101,7 +110,16 @@ impl OlderClient {
         }
         match message {
             ServerMessage::Response { response } => {
-                variant_index(response).is_some_and(|index| index < self.server_responses)
+                let nested = match response {
+                    ServerResponse::Work(work) => {
+                        variant_index(work).is_some_and(|index| index < self.work_responses)
+                    }
+                    ServerResponse::Agent(reply) => {
+                        variant_index(reply).is_some_and(|index| index < self.agent_replies)
+                    }
+                    _ => true,
+                };
+                nested && variant_index(response).is_some_and(|index| index < self.server_responses)
             }
             _ => true,
         }
@@ -370,6 +388,50 @@ mod tests {
     }
 
     #[test]
+    fn a_work_reply_after_the_older_protocol_is_refused() {
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = |response| ServerMessage::Response {
+            response: ServerResponse::Work(response),
+        };
+        assert!(client.admits_message(&reply(crate::work::Response::Snapshots(Vec::new()))));
+        assert!(
+            !client.admits_message(&reply(crate::work::Response::WatchingConversation {
+                revision: 0,
+                pull_requests: Box::new(crate::work::ConversationPullRequests {
+                    generated_at_unix_ms: 0,
+                    repository: None,
+                    pull_requests: Vec::new(),
+                    transcript: crate::work::TranscriptCoverage::Complete,
+                    forge_error: None,
+                }),
+            }))
+        );
+    }
+
+    #[test]
+    fn an_agent_reply_after_the_older_protocol_is_refused() {
+        use crate::agent_execution::{
+            Reply,
+            directory::{Directory, Members, Scope},
+        };
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = |reply| ServerMessage::Response {
+            response: ServerResponse::Agent(reply),
+        };
+        assert!(client.admits_message(&reply(Reply::Directory(Directory {
+            caller: None,
+            scope: Scope::All,
+            sessions: Vec::new(),
+        }))));
+        assert!(client.admits_message(&reply(Reply::InboxAcknowledged)));
+        assert!(!client.admits_message(&reply(Reply::Members(Members {
+            channel: crate::model::ChannelId::new(),
+            caller: None,
+            sessions: Vec::new(),
+        }))));
+    }
+
+    #[test]
     fn variants_after_the_older_protocols_are_refused_or_withheld() {
         let detached = variant_index(&ServerResponse::Detached).unwrap();
         let list = variant_index(&ClientRequest::List).unwrap();
@@ -379,6 +441,8 @@ mod tests {
             client_requests: list,
             server_messages: 1,
             server_responses: detached,
+            work_responses: u32::MAX,
+            agent_replies: u32::MAX,
         };
         assert!(!client.admits_request(&ClientRequest::List));
         assert!(client.admits_request(&ClientRequest::Connect {

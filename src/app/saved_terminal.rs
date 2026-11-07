@@ -816,11 +816,13 @@ impl Cagents {
             crate::ui_controls::button::primary(if pending { "Checking…" } else { "Reconnect" })
                 .id(control_id("reconnect"))
                 .name("Reconnect saved terminal");
-        let reconnect = if pending || !allows_command(&entry.authority, Command::Reconnect) {
-            reconnect
-        } else {
-            reconnect.on_press(action(Command::Reconnect))
-        };
+        let closing = self.terminal_close_in_progress(card);
+        let reconnect =
+            if pending || closing || !allows_command(&entry.authority, Command::Reconnect) {
+                reconnect
+            } else {
+                reconnect.on_press(action(Command::Reconnect))
+            };
         let mut controls = vec![reconnect.into()];
         if dormant {
             let label = if entry.source.agent_resume_recipe().is_some() {
@@ -832,7 +834,9 @@ impl Cagents {
                 crate::ui_controls::button::secondary(label)
                     .id(control_id("relaunch"))
                     .name("Explicitly relaunch the saved terminal")
-                    .on_press_maybe(relaunch_available.then(|| action(Command::Relaunch)))
+                    .on_press_maybe(
+                        (relaunch_available && !closing).then(|| action(Command::Relaunch)),
+                    )
                     .into(),
             );
         }
@@ -853,11 +857,11 @@ impl Cagents {
                         .then(|| action(Command::NewTerminal)),
                 )
                 .into(),
-            crate::ui_controls::button::secondary("Close")
+            crate::ui_controls::button::secondary(if closing { "Checking…" } else { "Close" })
                 .id(control_id("close"))
                 .name("Close saved terminal pane")
                 .on_press_maybe(
-                    allows_command(&entry.authority, Command::Close)
+                    (!closing && allows_command(&entry.authority, Command::Close))
                         .then(|| action(Command::Close)),
                 )
                 .into(),

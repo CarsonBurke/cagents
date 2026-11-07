@@ -273,16 +273,7 @@ pub(super) fn diagnostic_item(provider: Provider, item: &chat::Item) -> bool {
 }
 
 fn fallback_summary(text: &str) -> String {
-    let first = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim();
-    if first.starts_with(['{', '[']) || first.starts_with("API Error:") {
-        "Request failed".to_owned()
-    } else {
-        Runtime::short_description(first, 160)
-    }
+    Runtime::short_description(chat::failure::headline(text), 160)
 }
 
 fn diagnostic_key(text: &str) -> String {

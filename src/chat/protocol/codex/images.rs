@@ -18,11 +18,7 @@ pub(super) fn tool_result(
         content: ItemContent::Tool {
             name,
             input,
-            output: if result.is_null() {
-                String::new()
-            } else {
-                output.to_string()
-            },
+            output: readable(&output),
             status,
         },
     }];
@@ -38,6 +34,54 @@ pub(super) fn tool_result(
         },
     }));
     items
+}
+
+/// What a tool returned, as its detail shows it. MCP and dynamic tools
+/// return content parts, nearly always text, and a reader wants the text
+/// rather than the parts it was carried in; anything else is shown as the
+/// JSON it is, laid out to be read.
+pub(super) fn readable(result: &Value) -> String {
+    fn text(parts: &[Value]) -> Option<String> {
+        let texts = parts
+            .iter()
+            .map(|part| part["text"].as_str())
+            .collect::<Option<Vec<_>>>()?;
+        Some(texts.join("\n\n"))
+    }
+    match result {
+        Value::Null => String::new(),
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => text(parts).unwrap_or_else(|| pretty(result)),
+        Value::Object(object) => match object.get("content").and_then(Value::as_array) {
+            // A result whose content says nothing may still carry its
+            // answer as structured content.
+            Some(parts) if parts.is_empty() => object
+                .get("structuredContent")
+                .filter(|value| !value.is_null())
+                .map(pretty)
+                .unwrap_or_default(),
+            Some(parts) => match text(parts) {
+                // Structured content that says more than the text, rather
+                // than the same JSON the text already serializes, follows it.
+                Some(text) => match object.get("structuredContent").filter(|v| !v.is_null()) {
+                    Some(structured)
+                        if serde_json::from_str::<Value>(&text).ok().as_ref()
+                            != Some(structured) =>
+                    {
+                        format!("{text}\n\n{}", pretty(structured))
+                    }
+                    _ => text,
+                },
+                None => pretty(result),
+            },
+            None => pretty(result),
+        },
+        _ => result.to_string(),
+    }
+}
+
+fn pretty(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
 }
 
 fn without_images(value: &Value, images: &mut Vec<String>) -> Value {

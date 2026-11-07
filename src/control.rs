@@ -40,7 +40,9 @@ mod sessions;
 mod terminal_list;
 #[cfg(test)]
 mod terminal_start_authority_tests;
+mod transcript;
 pub use sessions::SessionsArgs;
+pub use transcript::TranscriptArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
@@ -108,7 +110,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[derive(Debug, Parser)]
 #[command(
     name = "cagents",
-    version = crate::VERSION,
+    version = crate::version(),
     about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear and accounts"
 )]
 pub struct Cli {
@@ -138,16 +140,19 @@ pub enum TopCommand {
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
-    /// Show this session, its parent and agents, and peers in the same checkout.
+    /// Show this session, its parent and agents, and peers in its channel or checkout.
     Whoami,
     /// Inspect account plan allowances and the calling session’s context.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// List live agent sessions in this project, whoever started them.
+    /// List live agent sessions in this project, whoever started them, or everyone in your channel with --channel.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
+    /// Read a session's conversation, newest last: messages, tool calls and compactions.
+    #[command(visible_alias = "history")]
+    Transcript(TranscriptArgs),
     /// Inspect native resident capacity and explicitly release completed handles.
     Chat {
         #[command(subcommand)]
@@ -2669,6 +2674,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Chat { .. }
         | TopCommand::Whoami
         | TopCommand::Sessions(_)
+        | TopCommand::Transcript(_)
         | TopCommand::Send(_)
         | TopCommand::Ask(_)
         | TopCommand::Reply(_)
@@ -2750,6 +2756,7 @@ fn execute_with_model_context(
         TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
+        TopCommand::Transcript(arguments) => transcript::read(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
         TopCommand::Reply(arguments) => messages::reply(arguments),
@@ -3267,7 +3274,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 "running": running,
                 "socket": socket,
                 "daemon_version": daemon_version,
-                "cli_version": crate::VERSION
+                "cli_version": crate::version()
             });
             let mut human = if running {
                 format!(
@@ -3275,10 +3282,14 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     instance::NAME,
                     daemon_version.as_deref().unwrap_or("starting"),
                     socket.display(),
-                    crate::VERSION
+                    crate::version()
                 )
             } else {
-                format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
+                format!(
+                    "{} daemon stopped; cli {}",
+                    instance::NAME,
+                    crate::version()
+                )
             };
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;

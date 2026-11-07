@@ -63,6 +63,7 @@ impl Registered {
             email: self.email.clone(),
             organization: self.organization.clone(),
             plan: None,
+            disputed_by: None,
         }
     }
 
@@ -108,6 +109,10 @@ pub struct Registry {
     /// order; an older snapshot must never replace a newer account choice.
     #[serde(default)]
     revision: u64,
+    /// When the file this copy was read from or written to was last
+    /// written, which no file records of itself.
+    #[serde(skip)]
+    written: Written,
     /// The account each provider starts new conversations on, by provider
     /// executable name: `"system"` or a registered account's key. A provider
     /// with no entry, or an entry naming an account that is gone, uses its
@@ -137,6 +142,49 @@ pub struct Registry {
     /// leaves them alone even when they hold a working login.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     released: Vec<Uuid>,
+}
+
+/// When an accounts file was last written, as its modification time says.
+/// Two copies of the registry are the same registry whenever they were read,
+/// so it is not compared.
+#[derive(Debug, Clone, Copy, Default)]
+struct Written(Option<std::time::SystemTime>);
+
+impl PartialEq for Written {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
+}
+
+impl Eq for Written {}
+
+impl Written {
+    fn of(file: &std::fs::File) -> Self {
+        Self(
+            file.metadata()
+                .and_then(|metadata| metadata.modified())
+                .ok(),
+        )
+    }
+}
+
+/// Whether a window holding `current` takes `incoming`, a copy of the
+/// accounts file whose answer may have arrived out of order.
+///
+/// A copy with a lower revision is older, and never replaces a newer
+/// choice - unless the file it was read from was written after the one the
+/// window holds. Then the file was replaced: deleted and written from
+/// scratch, or restored by hand, at revisions that say nothing about the
+/// file before it, and what is on disk now is what every other window and
+/// command sees. A clock set back can make a later write look earlier, but
+/// not lower its revision, so either one being later is enough.
+pub fn supersedes(incoming: &Registry, current: &Registry) -> bool {
+    incoming.revision >= current.revision
+        || incoming
+            .written
+            .0
+            .zip(current.written.0)
+            .is_some_and(|(incoming, current)| incoming > current)
 }
 
 const SYSTEM: &str = "system";
@@ -1420,7 +1468,7 @@ impl Store {
                 .revision
                 .checked_add(1)
                 .ok_or_else(|| io::Error::other("accounts revision exhausted"))?;
-            write(&self.directory, &path, &registry)?;
+            registry.written = write(&self.directory, &path, &registry)?;
         }
         Ok((registry, result))
     }
@@ -1448,10 +1496,14 @@ fn read(path: &Path) -> io::Result<Registry> {
     Read::by_ref(&mut file)
         .take(MAX_BYTES)
         .read_to_string(&mut text)?;
-    toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    let mut registry: Registry =
+        toml::from_str(&text).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    registry.written = Written::of(&file);
+    Ok(registry)
 }
 
-fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
+/// Replaces the file at `path` with `registry`, and says when it was written.
+fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<Written> {
     let mut document = toml::to_string_pretty(registry).map_err(io::Error::other)?;
     if !document.ends_with('\n') {
         document.push('\n');
@@ -1470,8 +1522,8 @@ fn write(directory: &Path, path: &Path, registry: &Registry) -> io::Result<()> {
     temporary.as_file().sync_all()?;
     // The rename replaces whatever is at `path` - a link included - rather
     // than writing through it.
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
+    let file = temporary.persist(path).map_err(|error| error.error)?;
+    Ok(Written::of(&file))
 }
 
 /// A provider written as its executable name, which is what a reader
@@ -1499,6 +1551,46 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
+
+    #[test]
+    fn a_copy_supersedes_by_revision_or_by_a_later_file() {
+        let copy = |revision: u64, written: Option<u64>| {
+            let mut registry: Registry = toml::from_str(&format!("revision = {revision}")).unwrap();
+            registry.written =
+                Written(written.map(|seconds| {
+                    std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds)
+                }));
+            registry
+        };
+        // One file's copies are ordered by its revisions.
+        assert!(supersedes(&copy(5, Some(20)), &copy(4, Some(10))));
+        assert!(supersedes(&copy(5, Some(10)), &copy(5, Some(10))));
+        assert!(!supersedes(&copy(4, Some(10)), &copy(5, Some(20))));
+        // A file written from scratch after the one held replaces it.
+        assert!(supersedes(&copy(1, Some(30)), &copy(5, Some(20))));
+        // A clock set back cannot hold back a later revision.
+        assert!(supersedes(&copy(6, Some(5)), &copy(5, Some(20))));
+        // Without both write times, only revisions can say.
+        assert!(!supersedes(&copy(1, None), &copy(5, Some(20))));
+        assert!(!supersedes(&copy(1, Some(30)), &copy(5, None)));
+        // The write time is no part of what the registry holds.
+        assert_eq!(copy(5, Some(10)), copy(5, None));
+    }
+
+    #[test]
+    fn a_read_or_written_registry_knows_when_its_file_was_written() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::at(directory.path());
+        assert_eq!(store.load().unwrap().written.0, None);
+        let (written, ()) = store
+            .update(|registry| {
+                registry.set_label(&Account::system(Provider::Codex), Some("A".into()))
+            })
+            .unwrap();
+        let modified = fs::metadata(store.path()).unwrap().modified().unwrap();
+        assert_eq!(written.written.0, Some(modified));
+        assert_eq!(store.load().unwrap().written.0, Some(modified));
+    }
 
     fn account_recipe(home: &Path) -> crate::model::LaunchRecipe {
         let mut recipe = crate::model::LaunchRecipe::shell("/".into()).unwrap();
@@ -1792,6 +1884,7 @@ mod tests {
                         email: Some("selected@example.test".into()),
                         organization: Some("Fixture organization".into()),
                         plan: None,
+                        disputed_by: None,
                     },
                 );
                 registry.set_default(&account);
@@ -2093,6 +2186,7 @@ mod tests {
             email: Some(email.into()),
             organization: organization.map(str::to_owned),
             plan: None,
+            disputed_by: None,
         };
         let mut registry = Registry::default();
         let added = managed(Provider::Claude, "work@example.com");
@@ -2377,6 +2471,7 @@ mod tests {
             email: Some(email.into()),
             organization: None,
             plan: None,
+            disputed_by: None,
         }
     }
 

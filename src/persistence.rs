@@ -6321,7 +6321,7 @@ mod tests {
             let digest = format!("{:x}", Sha256::digest(fs::read(&path).unwrap()));
             let manifest = serde_json::json!({
                 "head": head, "schema_version": CURRENT_SCHEMA_VERSION,
-                "producer_version": crate::VERSION,
+                "producer_version": crate::version(),
                 "boot_id": proof.boot_id, "workspace_id": state.id,
                 "retained_card_id": state.cards[1].id, "ordinary_card_id": state.cards[2].id,
                 "retained_draft": RETAINED_UI_DRAFT,
