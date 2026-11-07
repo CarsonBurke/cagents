@@ -805,17 +805,20 @@ class Evidence(unittest.TestCase):
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
 
     def test_a_sessions_builds_never_start_the_pruner(self) -> None:
-        # Its runner's builds replay what `build` made, which ran the disk
-        # guard. A guard in the session would start the account's pruner,
-        # under the fixture's HOME, while the app is being captured.
+        # Its runner's builds replay what `build` made. Their disk guard would
+        # otherwise start the account's pruner, under the fixture's HOME,
+        # while the app is being captured; a command given as
+        # CAGENTS_BUILD_PRUNE replaces it, and the guard still refuses a
+        # build below the floor.
         self.built()
-        self.run_tool("start", "after", extra={"CAGENTS_BUILD_FREE_FLOOR_GIB": "7"})
+        self.run_tool("start", "after")
         for _ in range(100):
             if (self.logs / "runner-env").exists():
                 break
             time.sleep(0.05)
-        self.assertIn("CAGENTS_BUILD_FREE_FLOOR_GIB=0\n", (self.logs / "runner-env").read_text())
-        self.assertIn("CAGENTS_BUILD_FREE_FLOOR_GIB=0\n", self.run_tool("cli", "print-env").stdout)
+        runner = (self.logs / "runner-env").read_text()
+        self.assertIn("CAGENTS_BUILD_PRUNE=true\n", runner)
+        self.assertNotIn("CAGENTS_BUILD_FREE_FLOOR_GIB=", runner)
         self.run_tool("stop")
 
     def killed_supervisor_processes(self, signal: int, extra: dict | None = None) -> None:

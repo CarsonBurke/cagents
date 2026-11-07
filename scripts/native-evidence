@@ -339,9 +339,6 @@ fixture_env() {
             passed+=("$name=${!name}")
         fi
     done
-    # The disk guard is off: the session's builds only replay what `build`
-    # made, and here it would start the pruner beside the app being
-    # captured, under this private HOME.
     env -i "${passed[@]}" \
         HOME="$fixture/home" XDG_RUNTIME_DIR="$runtime" \
         XDG_DATA_HOME="$fixture/data" XDG_CONFIG_HOME="$fixture/config" \
@@ -349,7 +346,6 @@ fixture_env() {
         CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
         CARGO_TARGET_DIR="$target" CAGENTS_ZIG="$zig" \
         CAGENTS_EVIDENCE_FIXTURE="$fixture" \
-        CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         PATH="$session_path$fixture/bin:$cargo_bin:${zig%/*}:/usr/local/bin:/usr/bin" \
         "$@"
 }
@@ -672,9 +668,12 @@ run_app() {
     session_path=$state/session-bin:
     # The runner still calls scripts/cargo-gate, which must not join the shared queue.
     # Its builds replay the recorded ones through the session's cargo, here.
+    # Their disk guard starts no pruner, which would search this private
+    # HOME beside the app being captured; it still refuses a build when the
+    # disk is below its floor.
     local status=0
     fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
-        CAGENTS_BUILD_REMOTE=local \
+        CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_PRUNE=true \
         scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
