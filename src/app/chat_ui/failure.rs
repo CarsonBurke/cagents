@@ -672,8 +672,9 @@ impl State {
                     continue;
                 }
                 // Only a detail containing the exact latest proven error, or
-                // reporting the same account limit with the same reset, may
-                // join that historical incident. No inference from quoted text.
+                // reporting the same account limit with the same reset while
+                // that error is still the child's last item, may join that
+                // historical incident. No inference from quoted text.
                 let same_limit = |body: &str| {
                     Failure::parse(provider, &child.detail)
                         .zip(Failure::parse(provider, body))
@@ -683,8 +684,10 @@ impl State {
                                 && detail.key == latest.key
                         })
                 };
-                let context = if let Some((context, body, _)) = latest
-                    && (child.detail.ends_with(body) || same_limit(body))
+                let context = if let Some((context, body, id)) = latest
+                    && (child.detail.ends_with(body)
+                        || (child.items.last().is_some_and(|last| last.id == id)
+                            && same_limit(body)))
                 {
                     context
                 } else if Failure::parse(provider, &child.detail)
@@ -2086,6 +2089,30 @@ mod tests {
             assert_notices(&mut runtime, "parent error", true, true);
             publish_error(&mut runtime, &handle, limit);
             assert_notices(&mut runtime, "turn error", true, true);
+
+            // A status reporting the limit after later child work is a new report,
+            // not the earlier error, so it does not join that error's notice.
+            if background {
+                publish(&mut runtime, &handle, |next| {
+                    next.subagents = vec![child(
+                        chat::ToolStatus::Failed,
+                        &terminated,
+                        vec![
+                            provider_error(provider, "child-limit:0", limit),
+                            text("resumed", chat::Role::Assistant, "Resumed child work"),
+                        ],
+                    )];
+                });
+                let joined = runtime.failure_ui.incidents.iter().any(|incident| {
+                    incident.sources.contains(&Source::ChildItem(
+                        "agent-explore".into(),
+                        "child-limit:0".into(),
+                    )) && incident
+                        .sources
+                        .contains(&Source::ChildDetail("agent-explore".into()))
+                });
+                assert!(!joined, "a later status does not join an earlier error");
+            }
 
             // Reopening the parent's history keeps its single notice.
             let snapshot = handle.snapshot();
