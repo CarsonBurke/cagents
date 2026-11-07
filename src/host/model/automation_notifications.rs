@@ -428,6 +428,7 @@ mod tests {
                 run: None,
                 skip: None,
                 diagnostic: None,
+                skipped_occurrences: None,
             };
             tx.execute("INSERT OR IGNORE INTO automation_firings(id,automation,revision,occurrence_key,record,created_ms,state,run_id)
                 VALUES(?1,?2,?3,?4,?5,?6,'interrupted',NULL)",

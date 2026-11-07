@@ -206,7 +206,12 @@ use crate::{
 /// `WatchConversationPullRequests` request, its `work::Response` and the
 /// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
 /// and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 151;
+/// Version 155 appends two agent operations and their replies: the transcript
+/// read and the channel member listing. Versions 152 to 154 are reserved for
+/// parallel branches and are not adopted.
+/// Version 156 appends the exact skipped-occurrence count and range to Firing.
+/// An older client is refused the replies holding one.
+pub const PROTOCOL_VERSION: u16 = 156;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's

@@ -273,16 +273,7 @@ pub(super) fn diagnostic_item(provider: Provider, item: &chat::Item) -> bool {
 }
 
 fn fallback_summary(text: &str) -> String {
-    let first = text
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .unwrap_or_default()
-        .trim();
-    if first.starts_with(['{', '[']) || first.starts_with("API Error:") {
-        "Request failed".to_owned()
-    } else {
-        Runtime::short_description(first, 160)
-    }
+    Runtime::short_description(chat::failure::headline(text), 160)
 }
 
 fn diagnostic_key(text: &str) -> String {
@@ -680,10 +671,23 @@ impl State {
                     incident.sources.push(Source::ChildDetail(child.id.clone()));
                     continue;
                 }
-                // Only a detail containing the exact latest proven error may
-                // join that historical incident. No inference from quoted text.
-                let context = if let Some((context, body, _)) = latest
-                    && child.detail.ends_with(body)
+                // Only a detail containing the exact latest proven error, or
+                // reporting the same account limit with the same reset while
+                // that error is still the child's last item, may join that
+                // historical incident. No inference from quoted text.
+                let same_limit = |body: &str| {
+                    Failure::parse(provider, &child.detail)
+                        .zip(Failure::parse(provider, body))
+                        .is_some_and(|(detail, latest)| {
+                            detail.kind == FailureKind::AccountLimit
+                                && detail.reset.is_some()
+                                && detail.key == latest.key
+                        })
+                };
+                let context = if let Some((context, body, id)) = latest
+                    && (child.detail.ends_with(body)
+                        || (child.items.last().is_some_and(|last| last.id == id)
+                            && same_limit(body)))
                 {
                     context
                 } else if Failure::parse(provider, &child.detail)
@@ -1961,6 +1965,163 @@ mod tests {
             ])];
         });
         assert_eq!(runtime.failure_ui.incidents.len(), 2);
+    }
+
+    /// Claude reports one weekly limit three ways when a foreground subagent
+    /// hits it: the failed Agent call's result, the parent's own error reply,
+    /// and the turn's error. The reader sees one notice with the reset time,
+    /// and the subagent's own transcript keeps its one notice. A background
+    /// subagent's call has already returned, so its failure stays with the
+    /// subagent until the parent itself fails.
+    #[test]
+    fn a_subagent_hitting_the_weekly_limit_shows_one_notice_with_the_reset() {
+        let provider = Provider::Claude;
+        let limit = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
+        let terminated = format!(
+            "Agent terminated early due to an API error: {limit} (error type rate_limit, \
+             HTTP 429, request id req_synthetic, model sent to the API: claude-opus-5-5)"
+        );
+        let summary = "Claude weekly limit reached · resets Nov 8, 8am (America/Vancouver)";
+        let message = "55555555-5555-4555-8555-555555555555";
+        for background in [false, true] {
+            let call = |status| {
+                let mut call = text("agent-explore", chat::Role::Assistant, "");
+                call.content = ItemContent::Tool {
+                    name: "Agent".into(),
+                    input: "How accounts store credentials".into(),
+                    output: match status {
+                        chat::ToolStatus::Failed => terminated.clone(),
+                        chat::ToolStatus::Succeeded => "Async agent launched successfully.".into(),
+                        _ => String::new(),
+                    },
+                    status,
+                };
+                call
+            };
+            let child = |status, detail: &str, items: Vec<chat::Item>| chat::Subagent {
+                id: "agent-explore".into(),
+                kind: "Explore".into(),
+                description: "How accounts store credentials".into(),
+                model: None,
+                status,
+                waiting: false,
+                detail: detail.into(),
+                background,
+                items: items.into_iter().map(Arc::new).collect(),
+            };
+            // Each transcript, the parent's and the subagent's, shows the limit
+            // at most once, and the parent's is drawn in the conversation.
+            let assert_notices = |runtime: &mut Runtime, stage: &str, parent: bool, child: bool| {
+                let stage = format!("{stage} (background: {background})");
+                let incidents = &runtime.failure_ui.incidents;
+                for incident in incidents {
+                    assert_eq!(incident.summary, summary, "{stage}");
+                    assert_eq!(incident.kind, Some(FailureKind::AccountLimit), "{stage}");
+                }
+                let count = |scope: Option<&str>| {
+                    incidents
+                        .iter()
+                        .filter(|incident| incident.child_scope.as_deref() == scope)
+                        .count()
+                };
+                assert_eq!(count(None), usize::from(parent), "{stage}: parent notices");
+                assert_eq!(
+                    count(Some("agent-explore")),
+                    usize::from(child),
+                    "{stage}: subagent notices"
+                );
+                assert_eq!(
+                    incidents.len(),
+                    usize::from(parent) + usize::from(child),
+                    "{stage}"
+                );
+                if let Some(key) = incidents
+                    .iter()
+                    .find(|incident| incident.child_scope.is_none())
+                    .map(|incident| incident.key.clone())
+                {
+                    assert!(notice_visible(runtime, &key), "{stage}");
+                }
+            };
+
+            let (mut runtime, handle) = live_fixture(
+                provider,
+                vec![
+                    text(&part(provider, message, 0), chat::Role::User, "Find it"),
+                    call(if background {
+                        chat::ToolStatus::Succeeded
+                    } else {
+                        chat::ToolStatus::Running
+                    }),
+                ],
+            );
+            assert!(runtime.failure_ui.incidents.is_empty());
+
+            // The subagent's own error arrives while its call is still running.
+            publish(&mut runtime, &handle, |next| {
+                next.subagents = vec![child(
+                    chat::ToolStatus::Running,
+                    "",
+                    vec![provider_error(provider, "child-limit:0", limit)],
+                )];
+            });
+            assert_notices(&mut runtime, "child error", false, true);
+
+            // A foreground call fails with Claude's wrapper around the same
+            // limit; a background subagent's failure reaches only its record.
+            publish(&mut runtime, &handle, |next| {
+                if !background {
+                    next.items[1] = Arc::new(call(chat::ToolStatus::Failed));
+                }
+                next.subagents = vec![child(
+                    chat::ToolStatus::Failed,
+                    &terminated,
+                    vec![provider_error(provider, "child-limit:0", limit)],
+                )];
+            });
+            assert_notices(&mut runtime, "failed subagent", !background, true);
+
+            // The parent then replies with the bare limit and the turn fails.
+            publish(&mut runtime, &handle, |next| {
+                next.items
+                    .push(Arc::new(provider_error(provider, "parent-limit:0", limit)));
+            });
+            assert_notices(&mut runtime, "parent error", true, true);
+            publish_error(&mut runtime, &handle, limit);
+            assert_notices(&mut runtime, "turn error", true, true);
+
+            // A status reporting the limit after later child work is a new report,
+            // not the earlier error, so it does not join that error's notice.
+            if background {
+                publish(&mut runtime, &handle, |next| {
+                    next.subagents = vec![child(
+                        chat::ToolStatus::Failed,
+                        &terminated,
+                        vec![
+                            provider_error(provider, "child-limit:0", limit),
+                            text("resumed", chat::Role::Assistant, "Resumed child work"),
+                        ],
+                    )];
+                });
+                let joined = runtime.failure_ui.incidents.iter().any(|incident| {
+                    incident.sources.contains(&Source::ChildItem(
+                        "agent-explore".into(),
+                        "child-limit:0".into(),
+                    )) && incident
+                        .sources
+                        .contains(&Source::ChildDetail("agent-explore".into()))
+                });
+                assert!(!joined, "a later status does not join an earlier error");
+            }
+
+            // Reopening the parent's history keeps its single notice.
+            let snapshot = handle.snapshot();
+            let (mut restored, _) = live_fixture(
+                provider,
+                snapshot.items.iter().map(|item| (**item).clone()).collect(),
+            );
+            assert_notices(&mut restored, "history", true, false);
+        }
     }
 
     #[test]

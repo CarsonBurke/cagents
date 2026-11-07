@@ -76,12 +76,18 @@ VALUED = {
 # sometimes.
 PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir", "--out-dir"}
 # Settings naming a path that only this repository's scripts read, never a
-# build or its tests; they stay here.
-SCRIPT_SETTINGS = {"CAGENTS_ZIG"}
+# build or its tests; they stay here. A development instance's daemon gives
+# CAGENTS_DEVELOPMENT_HOSTED_BY, runtime directories on this host, to the
+# terminals and agents it hosts.
+SCRIPT_SETTINGS = {"CAGENTS_ZIG", "CAGENTS_DEVELOPMENT_HOSTED_BY"}
 RUN_MARKER = "cargo-offload-run "
 # What `--hold` gives the command it runs: the build host, the slot it holds
 # there and the checkout it holds it for, and a lock it keeps while it does.
 HELD = "CAGENTS_BUILD_OFFLOAD_HELD"
+# Set beside CAGENTS_BUILD_METADATA, whose value it then owns: an empty one is
+# no metadata, and build.rs leaves the checkout alone. Its own value never
+# changes between commits, so watching it costs build.rs no reruns.
+SUPPLIED = "CAGENTS_BUILD_METADATA_SUPPLIED"
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
 
@@ -319,9 +325,11 @@ def inside(path, root):
 
 def build_metadata(root, version, environment):
     """The version stamp build.rs would give this checkout, which the build
-    host's copy, having no Git history, cannot work out itself."""
+    host's copy, having no Git history, cannot work out itself. A value the
+    caller sets is kept, unless a gate set it: then it is the stamp of
+    whatever that gate built, which a process it started has inherited."""
     given = environment.get("CAGENTS_BUILD_METADATA", "").strip()
-    if given:
+    if given and environment.get(SUPPLIED) != "1":
         return given
 
     def git(*arguments):
@@ -339,6 +347,40 @@ def build_metadata(root, version, environment):
     if f"v{version}" in tags and not dirty:
         return None
     return f"local.{sha}.dirty" if dirty else f"local.{sha}"
+
+
+def checkout_stamp(arguments, environment):
+    """The stamp for a build here of the workspace these Cargo arguments name,
+    or None outside a Cargo workspace in a Git checkout, where build.rs
+    decides."""
+    manifest = []
+    for index, argument in enumerate(arguments):
+        if argument == "--":
+            break
+        if argument == "--manifest-path" and index + 1 < len(arguments):
+            manifest = ["--manifest-path", arguments[index + 1]]
+        elif argument.startswith("--manifest-path="):
+            manifest = [argument]
+    try:
+        metadata = subprocess.run(
+            [real_cargo(environment), "metadata", "--format-version", "1", "--no-deps",
+             *manifest], capture_output=True, text=True, env=environment)
+        if metadata.returncode:
+            return None
+        workspace = json.loads(metadata.stdout)
+        root = os.path.realpath(workspace["workspace_root"])
+        package = next((package for package in workspace["packages"]
+                        if os.path.dirname(os.path.realpath(package["manifest_path"])) == root),
+                       None)
+        top = subprocess.run(["git", "-C", root, "rev-parse", "--show-toplevel"],
+                             capture_output=True, text=True,
+                             env=dict(environment, GIT_OPTIONAL_LOCKS="0"))
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+    if package is None or top.returncode:
+        return None
+    return build_metadata(os.path.realpath(top.stdout.strip()), package["version"],
+                          environment) or ""
 
 
 def uncommitted(top, workspace, environment):
@@ -1930,6 +1972,7 @@ class Offload:
         stamp = build_metadata(top, root["version"] if root else "", self.environment)
         if stamp:
             environment["CAGENTS_BUILD_METADATA"] = stamp
+        environment[SUPPLIED] = "1"
 
         def mapped():
             # Longest first, so the target directory wins over the checkout
@@ -2344,6 +2387,16 @@ def main(arguments):
     # FALL_BACK having built nothing. Nothing this starts inherits it.
     decided = os.environ.pop("CAGENTS_BUILD_OFFLOAD_HOST", "")
     environment = dict(os.environ)
+    if arguments[:1] == ["--stamp"]:
+        # The version stamp for a build here of the workspace the Cargo
+        # arguments that follow name, which the gate passes to Cargo as a
+        # build host's offload would: a line, empty for none. Status 1
+        # outside a Cargo workspace in a Git checkout.
+        stamp = checkout_stamp(arguments[1:], environment)
+        if stamp is None:
+            return 1
+        print(stamp)
+        return 0
     # Only `local` builds here; an empty setting is no setting.
     host = decided or environment.get("CAGENTS_BUILD_REMOTE") or "fw16"
     here = not decided and (host == "local" or is_this_host(host))

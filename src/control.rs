@@ -40,7 +40,9 @@ mod sessions;
 mod terminal_list;
 #[cfg(test)]
 mod terminal_start_authority_tests;
+mod transcript;
 pub use sessions::SessionsArgs;
+pub use transcript::TranscriptArgs;
 mod messages;
 pub use messages::{Arrival, AskArgs, InboxArgs, ReplyArgs, SendArgs};
 mod linear;
@@ -108,7 +110,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[derive(Debug, Parser)]
 #[command(
     name = "cagents",
-    version = crate::VERSION,
+    version = crate::version(),
     about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear and accounts"
 )]
 pub struct Cli {
@@ -138,16 +140,19 @@ pub enum TopCommand {
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
-    /// Show this session, its parent and agents, and peers in the same checkout.
+    /// Show this session, its parent and agents, and peers in its channel or checkout.
     Whoami,
     /// Inspect account plan allowances and the calling session’s context.
     Account {
         #[command(subcommand)]
         command: AccountCommand,
     },
-    /// List live agent sessions in this project, whoever started them.
+    /// List live agent sessions in this project, whoever started them, or everyone in your channel with --channel.
     #[command(visible_alias = "ls")]
     Sessions(SessionsArgs),
+    /// Read a session's conversation, newest last: messages, tool calls and compactions.
+    #[command(visible_alias = "history")]
+    Transcript(TranscriptArgs),
     /// Inspect native resident capacity and explicitly release completed handles.
     Chat {
         #[command(subcommand)]
@@ -538,6 +543,16 @@ pub enum ControlError {
     IncrementalSnapshot,
     #[error("shutdown request rejected: {0:?}")]
     ShutdownRejected(ShutdownOutcome),
+}
+
+impl ControlError {
+    /// The daemon's own sentence for a person; every other failure as it stands.
+    pub fn reason(self) -> String {
+        match self {
+            Self::Remote { message, .. } => message,
+            other => other.to_string(),
+        }
+    }
 }
 
 /// Ends a [`ControlClient`]'s connection from another thread.
@@ -2399,7 +2414,18 @@ where
     // actors. Refuse before staged-owner routing, SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
-    let user_only_message = match &cli.command {
+    let hosted = std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some();
+    let local =
+        cli.device.as_deref().is_none_or(|name| name == "local") && !crate::device::is_remote();
+    let user_only_message: Option<std::borrow::Cow<'static, str>> = match &cli.command {
+        // A development daemon with a runtime of its own, such as a runner
+        // instance, is the caller's to stop unless it hosts the caller or a
+        // session above it. Production builds keep refusing.
+        TopCommand::Daemon {
+            command: DaemonCommand::StopForRebuild { .. },
+        } if hosted && local => {
+            crate::daemon::hosting::stop_refusal().map(|refusal| refusal.message().into())
+        }
         TopCommand::Daemon {
             command:
                 DaemonCommand::Bridge
@@ -2410,23 +2436,19 @@ where
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
                 | DaemonCommand::StopForRebuild { .. },
-        } => Some(
-            "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
-        ),
+        } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
         TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
-            Some("Installation and window restart commands require your own terminal")
+            Some("Installation and window restart commands require your own terminal".into())
         }
         TopCommand::Account {
             command:
                 AccountCommand::Link { .. }
                 | AccountCommand::Default { .. }
                 | AccountCommand::Remove { .. },
-        } => Some("Account changes require your own terminal"),
+        } => Some("Account changes require your own terminal".into()),
         _ => None,
     };
-    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
-        && let Some(message) = user_only_message
-    {
+    if hosted && let Some(message) = user_only_message {
         emit_error(
             cli.json,
             &AppError::new(
@@ -2669,6 +2691,7 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
         | TopCommand::Chat { .. }
         | TopCommand::Whoami
         | TopCommand::Sessions(_)
+        | TopCommand::Transcript(_)
         | TopCommand::Send(_)
         | TopCommand::Ask(_)
         | TopCommand::Reply(_)
@@ -2750,6 +2773,7 @@ fn execute_with_model_context(
         TopCommand::Account { command } => accounts::execute(command),
         TopCommand::Chat { command } => chat::execute(command),
         TopCommand::Sessions(arguments) => sessions::list(arguments),
+        TopCommand::Transcript(arguments) => transcript::read(arguments),
         TopCommand::Send(arguments) => messages::send(arguments),
         TopCommand::Ask(arguments) => messages::ask(arguments),
         TopCommand::Reply(arguments) => messages::reply(arguments),
@@ -3267,7 +3291,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 "running": running,
                 "socket": socket,
                 "daemon_version": daemon_version,
-                "cli_version": crate::VERSION
+                "cli_version": crate::version()
             });
             let mut human = if running {
                 format!(
@@ -3275,10 +3299,14 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     instance::NAME,
                     daemon_version.as_deref().unwrap_or("starting"),
                     socket.display(),
-                    crate::VERSION
+                    crate::version()
                 )
             } else {
-                format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
+                format!(
+                    "{} daemon stopped; cli {}",
+                    instance::NAME,
+                    crate::version()
+                )
             };
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;
@@ -4530,6 +4558,151 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    use super::ControlError;
+
+    #[test]
+    fn a_daemon_refusal_reaches_a_person_as_its_own_sentence() {
+        let refusal = ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+            message: "This run's details are no longer available.".into(),
+            retryable: false,
+        };
+        assert_eq!(
+            refusal.reason(),
+            "This run's details are no longer available."
+        );
+        let other = ControlError::Connect(std::io::Error::other("refused"));
+        assert_eq!(other.reason(), "could not connect to the daemon: refused");
+    }
+
+    /// A hosted session stops a development daemon with a runtime of its own,
+    /// as `scripts/run-development --stop-instance` does, unless that daemon
+    /// hosts it. The daemon here is a process holding the instance's lock.
+    #[test]
+    fn hosted_stop_for_rebuild_ends_only_a_development_daemon_that_does_not_host_it() {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+        const CHILD: &str = "CAGENTS_TEST_HOSTED_STOP_FOR_REBUILD";
+        let name = thread::current().name().unwrap().to_owned();
+        // A production build refuses every hosted stop; see the test above.
+        if !crate::instance::IS_DEVELOPMENT {
+            return;
+        }
+        struct Daemon(std::process::Child);
+        impl Drop for Daemon {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let Some(host) = std::env::var_os(CHILD) else {
+            for host in ["elsewhere", "itself"] {
+                let directory = tempfile::Builder::new().prefix("hs-").tempdir().unwrap();
+                for leaf in ["home", "runtime"] {
+                    let path = directory.path().join(leaf);
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let runtime = directory.path().join("runtime/cagents-development");
+                std::fs::create_dir(&runtime).unwrap();
+                let lock = runtime.join("cagentsd.lock");
+                std::fs::write(&lock, "").unwrap();
+                let mut daemon = Daemon(
+                    Command::new("/bin/sh")
+                        .args(["-c", "exec 9>>\"$1\" && flock -x 9 && exec sleep 60", "sh"])
+                        .arg(&lock)
+                        .spawn()
+                        .unwrap(),
+                );
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Command::new("flock")
+                    .args(["-n", "-x"])
+                    .arg(&lock)
+                    .arg("true")
+                    .status()
+                    .unwrap()
+                    .success()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture daemon never took its lock"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                std::fs::write(&lock, format!("{{\"pid\":{}}}", daemon.0.id())).unwrap();
+                let out = directory.path().join("stdout");
+                let err = directory.path().join("stderr");
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .env_clear()
+                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .current_dir(directory.path())
+                    .env(CHILD, host)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", directory.path().join("home"))
+                    .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                    .env(crate::agent_execution::AUTHORITY_ENV, "inert-fixture-role")
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::File::create(&out).unwrap())
+                    .stderr(std::fs::File::create(&err).unwrap())
+                    .status()
+                    .unwrap();
+                let stdout = std::fs::read_to_string(out).unwrap();
+                let stderr = std::fs::read_to_string(err).unwrap();
+                assert!(status.success(), "{host}: {stdout}\n{stderr}");
+                assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
+                assert_eq!(
+                    stderr.contains("This development daemon hosts this session"),
+                    host == "itself",
+                    "{stderr}"
+                );
+                assert!(
+                    !stdout.contains("inert-fixture-role")
+                        && !stderr.contains("inert-fixture-role")
+                );
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let ended = loop {
+                    if let Some(status) = daemon.0.try_wait().unwrap() {
+                        break Some(status);
+                    }
+                    if host == "itself" || Instant::now() >= deadline {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                };
+                if host == "elsewhere" {
+                    assert_eq!(
+                        ended.and_then(|status| status.signal()),
+                        Some(libc::SIGTERM)
+                    );
+                } else {
+                    assert!(ended.is_none(), "the hosting daemon was stopped");
+                }
+            }
+            return;
+        };
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let tree = std::env::current_dir().unwrap().join("proc");
+        let host_runtime = if host == "itself" {
+            runtime
+        } else {
+            PathBuf::from("/fixture/production-runtime")
+        };
+        crate::daemon::hosting::fake_process_tree(&tree, &host_runtime, None);
+        *crate::daemon::hosting::TEST_PROC_ROOT.lock().unwrap() = Some(tree);
+        let argv = [
+            "cagents",
+            "--json",
+            "daemon",
+            "stop-for-rebuild",
+            "--including-subagents",
+        ];
+        if host == "itself" {
+            assert_eq!(run_from(argv), ExitCode::FAILURE);
+        } else {
+            assert_eq!(run_from(argv), ExitCode::SUCCESS);
+        }
+    }
+
     #[test]
     fn hosted_daemon_lifecycle_refuses_before_routing_and_user_framing_stays_usable() {
         use std::os::unix::{
@@ -4630,6 +4803,17 @@ mod tests {
             return;
         };
         let case = case.to_str().unwrap();
+        // This fixture's own daemon hosts it, so a development build refuses
+        // to stop it as it does any lifecycle command.
+        if case != "user" {
+            let tree = std::env::current_dir().unwrap().join("proc");
+            crate::daemon::hosting::fake_process_tree(
+                &tree,
+                &PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()),
+                None,
+            );
+            *crate::daemon::hosting::TEST_PROC_ROOT.lock().unwrap() = Some(tree);
+        }
         let socket = daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();

@@ -139,6 +139,7 @@ scripts/run-development                 # with the embedded browser
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
 | `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
+| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -252,6 +253,71 @@ with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains
 for its next launch; delete `~/.local/share/cagents-development-NAME` and its
 config and state siblings to discard it.
+
+#### Stopping instances from a cagents session
+
+An agent in a terminal or chat that cagents hosts can stop and replace the
+instances it starts: `--stop-instance NAME` and `--instance NAME --fresh-daemon`
+work there as they do in your own terminal, with the session's
+`CAGENTS_AGENT_AUTHORITY` left in place. The CLI's
+`daemon stop-for-rebuild`, which both use, decides from the process tree:
+
+- It stops a development daemon with a runtime directory of its own: any
+  `--instance`, or the unnamed one inside a harness session or a fixture's
+  private `XDG_RUNTIME_DIR`.
+- It refuses the daemon that hosts the session, or one hosting a session it
+  descends from, since stopping that would end them. Every process a daemon
+  hosts runs below one of the daemon's own processes, so this holds for hosts
+  of any version and after a daemon restart. `niri-harness` detaches an
+  instance from the session that started it, so the runner records the
+  runtime directories of the daemons hosting that session in
+  `CAGENTS_DEVELOPMENT_HOSTED_BY` for every app it starts, and the check reads
+  it from each daemon above the caller. A session in instance B, started from
+  a session in instance A, can't stop A either.
+- It refuses when it can't tell: no daemon above the hosted caller, or one
+  whose environment it can't read.
+- It refuses the unnamed development daemon in the login runtime
+  (`/run/user/UID/cagents-development`), which belongs to the person at the
+  computer, and every production daemon. A production CLI still refuses all
+  lifecycle commands from a hosted session.
+
+Other lifecycle commands, such as `daemon stop` and `daemon upgrade`, remain
+refused in every hosted session. Stopping an instance also ends whatever else
+runs in its harness session, so the runner refuses `--stop-instance` and
+`--fresh-daemon` for an instance whose daemon hosts the caller, or a session it
+descends from, before it asks the CLI. Like the CLI, it refuses a hosted caller
+whose hosts it can't tell.
+
+#### Finding and stopping instances
+
+`scripts/run-development --list-instances` lists every development daemon
+running on this computer, whoever started it:
+
+```text
+pr2064, pid 1118559, running 02:17:40
+  checkout:   /home/me/cagents/.worktrees/pr2064
+  runtime:    /run/user/1000/nh-MwPpz5r1
+  started by: claude (pid 2417058), which has ended, in a cagents session
+  stop:       scripts/run-development --stop-instance pr2064
+```
+
+The checkout is marked `(removed)` when its worktree is gone, and `executable
+rebuilt since` when the daemon runs an executable that a later build replaced.
+`started by` comes from a record `--instance` keeps in the session's runtime
+directory: for a hosted caller, the process its cagents session runs, such as
+the agent's provider; otherwise the shell that ran the runner. An instance whose
+starter has ended is usually safe to stop. Daemons started another way have no
+record, and no runner session to stop, so the listing names their process ID;
+`kill PID` ends such a daemon and its jobs. The listing says when a daemon hosts
+the session that runs it, or one that started it, or is the login session's own
+development daemon, instead of offering a stop command. In a cagents session
+whose hosts can't be told, it offers none. It finds development daemons by the
+instance lock they hold, so it also lists those built outside a checkout's
+`target/`.
+
+An instance keeps running when the session that started it ends, so that
+another agent or a person can go on using it. Stop it when you're done, and
+check `--list-instances` for instances left behind.
 
 Instances started from one checkout run that checkout's executables, so start
 them all in the same lane: all `--browserless` or all integrated. The two lanes
@@ -707,16 +773,34 @@ It never touches:
 
 What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
-The build script that stamps `--version` reruns only when the stamp could
-change, because each rerun recompiles `cagents`. It watches this checkout's
-`HEAD` and `HEAD` reflog. While the checkout is clean it also watches the
-compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`,
-`fixtures`, `tests/fixtures`, the manifest, lockfile, toolchain, Cargo
-configuration and build script), and while it is dirty, the index, which
-restoring or stashing rewrites. It reads `git status` without refreshing the
-index, and it does not watch the shared `packed-refs`, which pruning or
-deleting any branch rewrites. An edit outside those sources, or undoing an edit
-by hand, updates the `.dirty` suffix at the next rerun.
+Each executable states its version with `cagents::stamp_version!()`, invoked
+once as an item at its root; the library answers `cagents::version()` from
+that. The macro stamps from a constructor that runs before `main` and before
+the holders' own constructors, which serve in place of `main`.
+The stamp is read where the macro expands, so a new commit or a move to another
+build slot relinks the executables and leaves the library compiled. Never read
+`CAGENTS_BUILD_METADATA` or `CAGENTS_CHECKOUT_METADATA` in the library or in
+`build.rs`: Cargo would recompile the whole library for each new stamp. A
+process that never stamps, such as a unit test, reports
+`<version>+unstamped`.
+
+The gate works out the stamp for each Cargo command once it has a slot, here
+or for the build host, and passes it with `CAGENTS_BUILD_METADATA_SUPPLIED=1`,
+so `build.rs` leaves the checkout alone. A program a local `run` or `test`
+starts gets the caller's stamp back through a Cargo runner, unless Cargo
+already has a runner configured, so a bare Cargo it starts reads its own
+checkout. Gated and bare Cargo commands sharing one build directory, such as
+an editor's `cargo check` beside gated builds on the same host, rerun
+`build.rs` and recompile `cagents` each time they alternate. Without the gate, `build.rs` reads the checkout's
+Git state and reruns, recompiling `cagents`, only when the stamp could change.
+It watches this checkout's `HEAD` and `HEAD` reflog. While the checkout is
+clean it also watches the compiled sources (`src`, `crates`, `vendor`,
+`assets`, `packaging`, `fixtures`, `tests/fixtures`, the manifest, lockfile,
+toolchain, Cargo configuration and build script), and while it is dirty, the
+index, which restoring or stashing rewrites. It reads `git status` without
+refreshing the index, and it does not watch the shared `packed-refs`, which
+pruning or deleting any branch rewrites. An edit outside those sources, or
+undoing an edit by hand, updates the `.dirty` suffix at the next rerun.
 
 Worktrees that do share a build directory stay correct. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can
