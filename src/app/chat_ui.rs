@@ -317,6 +317,11 @@ pub enum Action {
         Result<Vec<Attachment>, String>,
     ),
     Submit(Target, PromptMode),
+    /// A press of one of the composer's send controls. It submits like
+    /// [`Action::Submit`], then returns the keyboard to the draft: the control
+    /// shows only while there is a draft, so the one just pressed is gone
+    /// once the draft is sent, and its focus would otherwise go with it.
+    SubmitControl(Target, PromptMode),
     /// Recalls the message sent before the one the composer shows, or the
     /// unsent draft again once the recall has walked forward past the newest.
     HistoryOlder(Target),
@@ -491,7 +496,6 @@ pub enum Action {
     ModelPicker(Target, bool),
     ReasoningPicker(Target, bool),
     PermissionPicker(Target, bool),
-    FooterPicker(Target, bool),
     ModelQuery(Target, String),
 }
 
@@ -2397,7 +2401,6 @@ pub(super) struct Runtime {
     failure_ui: failure::State,
     reasoning_picker: bool,
     permission_picker: bool,
-    footer_picker: bool,
     permissions_form: permissions::Form,
     /// Whether the account choice is open.
     account_picker: bool,
@@ -3352,7 +3355,6 @@ impl Runtime {
             failure_ui: failure::State::default(),
             reasoning_picker: false,
             permission_picker: false,
-            footer_picker: false,
             permissions_form: permissions::Form::default(),
             account_picker: false,
             picker_focus: 0,
@@ -3527,6 +3529,17 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    /// The current confirmed connection's owner, without issuing a request.
+    pub(super) fn startup_host_proof(&self) -> Option<crate::model::HostSessionProof> {
+        if self.disconnected {
+            return None;
+        }
+        self.handle()
+            .filter(|handle| handle.is_connected())
+            .and_then(|handle| handle.proof())
+            .filter(|proof| proof.is_complete())
+    }
+
     /// Readiness for the updater's saved-pane gate; no provider is launched here.
     pub(super) fn restored_pane_ready(&self) -> Result<bool, String> {
         if self.is_draft() {
@@ -6832,7 +6845,6 @@ impl Cagents {
             runtime.account_picker = false;
             runtime.reasoning_picker = false;
             runtime.permission_picker = false;
-            runtime.footer_picker = false;
             runtime.snapshot = Arc::new(fresh);
         } else if rehomed {
             Arc::make_mut(&mut runtime.snapshot).skills.clear();
@@ -7249,13 +7261,11 @@ impl Cagents {
         let open = runtime.model_picker.take().is_some()
             || runtime.reasoning_picker
             || runtime.permission_picker
-            || runtime.footer_picker
             || runtime.account_picker
             || runtime.composer_actions
             || runtime.branch_picker;
         runtime.reasoning_picker = false;
         runtime.permission_picker = false;
-        runtime.footer_picker = false;
         runtime.account_picker = false;
         runtime.composer_actions = false;
         runtime.branch_picker = false;
@@ -9466,7 +9476,6 @@ impl Cagents {
         let restore = match &action {
             Action::AccountPicker(target, false)
             | Action::PermissionPicker(target, false)
-            | Action::FooterPicker(target, false)
             | Action::ModelPicker(target, false)
             | Action::SelectSubagent(target, _)
             | Action::ChooseAccount(target, _)
@@ -9748,7 +9757,6 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.reasoning_picker = false;
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                 }
             }
             Action::DispatchQueued(target) => {
@@ -11178,6 +11186,25 @@ impl Cagents {
                     }
                 }
             }
+            Action::SubmitControl(target, mode) => {
+                let submitted = self.handle_chat_ui(Action::Submit(target, mode));
+                // A picker the draft named, `/permissions` or `/resume`, takes
+                // the keyboard itself.
+                // Starting a draft can replace its runtime, so the card, not
+                // the generation, names the composer that keeps the keyboard.
+                let composer = match self.cards.get(&target.card) {
+                    Some(CardRuntime::Chat(runtime)) => !runtime.permission_picker,
+                    _ => false,
+                };
+                if self.resume_ui.open || !composer {
+                    return submitted;
+                }
+                return Task::batch([
+                    submitted,
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-composer"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::Submit(target, mode) => {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
@@ -11414,23 +11441,12 @@ impl Cagents {
                     runtime.recall(true);
                 }
             }
-            Action::FooterPicker(target, open) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.footer_picker = open;
-                    runtime.model_picker = None;
-                    runtime.reasoning_picker = false;
-                    runtime.account_picker = false;
-                    runtime.permission_picker = false;
-                    runtime.composer_actions = false;
-                }
-            }
             Action::PermissionPicker(target, open) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
                     runtime.composer_actions = false;
                     runtime.branch_picker = false;
                     runtime.picker_keyboard = false;
                     runtime.permission_picker = open;
-                    runtime.footer_picker = false;
                     if open {
                         runtime.model_picker = None;
                         runtime.reasoning_picker = false;
@@ -11490,7 +11506,6 @@ impl Cagents {
                     runtime.history_attachment_stash = None;
                     runtime.replace_draft(text_editor::Content::with_text(&draft));
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                     return iced::widget::operation::focus(card_control_id(
                         target.card,
                         "chat-composer",
@@ -12758,7 +12773,6 @@ impl Cagents {
                     return Task::none();
                 };
                 runtime.permission_picker = false;
-                runtime.footer_picker = false;
                 runtime.composer_actions = false;
                 if !runtime
                     .snapshot
@@ -13178,7 +13192,6 @@ impl Cagents {
                 runtime.reasoning_picker = false;
                 runtime.account_picker = false;
                 runtime.permission_picker = false;
-                runtime.footer_picker = false;
                 if open {
                     // The field takes focus with the popup, so opening the
                     // picker and naming a model are one gesture.
@@ -13204,7 +13217,6 @@ impl Cagents {
                     runtime.model_picker = None;
                     runtime.account_picker = false;
                     runtime.permission_picker = false;
-                    runtime.footer_picker = false;
                 }
             }
         }
@@ -14687,6 +14699,41 @@ mod tests {
             .collect()
     }
 
+    /// The send controls show only beside a draft, so the one a keyboard
+    /// user pressed is gone once the draft is sent. Its press hands the
+    /// keyboard back to the composer rather than to nothing, unless the draft
+    /// named a picker that takes the keyboard itself.
+    #[test]
+    fn a_pressed_send_control_returns_the_keyboard_to_the_composer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("send-control"));
+        let composer = card_control_id(card, "chat-composer");
+        let runtime = match app.cards.get_mut(&card).unwrap() {
+            CardRuntime::Chat(runtime) => runtime,
+            _ => unreachable!(),
+        };
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.busy = true;
+        snapshot.capabilities.queue = false;
+        snapshot.capabilities.permission_modes = vec!["manual".into(), "auto".into()];
+        runtime.replace_draft(text_editor::Content::with_text("next task"));
+        let target = runtime.target;
+        let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Queue));
+        assert_eq!(chat_runtime(&app, card).followups[0].text, "next task");
+        assert!(chat_runtime(&app, card).composer.text().trim().is_empty());
+        assert_eq!(task_focuses(task, &composer), (true, false));
+
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("/permissions"));
+        let task = app.handle_chat_ui(Action::SubmitControl(target, PromptMode::Queue));
+        assert!(chat_runtime(&app, card).permission_picker);
+        assert!(
+            !task_focuses(task, &composer).0,
+            "the permissions picker keeps the keyboard it was opened with"
+        );
+    }
+
     #[test]
     fn a_busy_provider_without_native_queue_keeps_a_followup_editable() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -15749,10 +15796,13 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.disconnected = true;
         runtime.error = Some("Upgrade replacement changed configuration".into());
+        let reason = app.startup_pane_check().unwrap_err();
+        let title = app.card_display_title(app.card_state(card).unwrap());
         assert!(
-            app.startup_pane_check()
-                .unwrap_err()
-                .contains(&card.to_string())
+            reason.starts_with(&format!(
+                "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+            )),
+            "{reason}"
         );
         assert_eq!(chat_runtime(&app, card).composer.text().trim(), "Draft 99");
         app.chat_runtime_mut(target).unwrap().disconnected = false;
@@ -15778,10 +15828,13 @@ mod tests {
                 card,
                 CardRuntime::Failed("Fixture terminal failed to attach".into()),
             );
+            let reason = app.startup_pane_check().unwrap_err();
+            let title = app.card_display_title(app.card_state(card).unwrap());
             assert!(
-                app.startup_pane_check()
-                    .unwrap_err()
-                    .contains(&card.to_string())
+                reason.starts_with(&format!(
+                    "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+                )),
+                "{program}: {reason}"
             );
             app.cards.remove(&card);
             assert_eq!(

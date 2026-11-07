@@ -1242,6 +1242,18 @@ fn raw_scan_inner(
                     kind: chat::DeliveryKind::Report,
                     ..
                 } => matched,
+                // A long notice heading leads the body it folds into, so a
+                // match there must open the body too.
+                ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Notice,
+                    summary,
+                    body,
+                    ..
+                } => matches_checked(
+                    &literal_content::notice_parts(summary, body).1,
+                    &pattern,
+                    current,
+                )?,
                 ItemContent::Delivery { body, .. } => matches_checked(body, &pattern, current)?,
                 _ => false,
             };
@@ -2567,6 +2579,53 @@ mod tests {
             vec![2]
         );
         assert_eq!(groups[0].1[0].source.as_ptr(), Arc::as_ptr(&item));
+    }
+    #[test]
+    fn find_opens_a_notice_whose_match_folded_from_its_heading_into_its_body() {
+        let notice = |summary: String| {
+            Arc::new(chat::Item {
+                id: "notice".into(),
+                role: chat::Role::User,
+                content: ItemContent::Delivery {
+                    kind: chat::DeliveryKind::Notice,
+                    from: String::new(),
+                    sender: "b1".into(),
+                    summary,
+                    body: String::new(),
+                },
+                at: None,
+                started_at: None,
+            })
+        };
+        let heredoc = format!(
+            "cat > sampler.py <<'EOF'\n{}NEEDLE = 1\nEOF",
+            "x = 0\n".repeat(40)
+        );
+        for (summary, expand) in [
+            (heredoc, true),
+            (format!("{}NEEDLE", "word ".repeat(40)), true),
+            ("Background command \"NEEDLE\" completed".into(), false),
+        ] {
+            let item = notice(summary);
+            let input = RawInput {
+                query: "NEEDLE".into(),
+                provider: Provider::Claude,
+                metadata: metadata_capacity(),
+                groups: vec![(
+                    "group".into(),
+                    vec![RawItem {
+                        item,
+                        raw_disclosure: false,
+                        tools: Vec::new(),
+                    }],
+                )],
+            };
+            let (groups, _, _, _) = raw_scan(&input, "NEEDLE", &|| true).unwrap();
+            assert_eq!(
+                groups[0].1[0].expand, expand,
+                "a match shown only in the folded body opens it"
+            );
+        }
     }
     #[test]
     fn retained_flow_draw_paints_late_async_find_marks_without_element_rebuild() {
