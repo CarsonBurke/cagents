@@ -7,12 +7,14 @@ Agents build in many places: worktree `target/`s, `CARGO_TARGET_DIR`s under
 them, and together they fill the disk that every build shares. This finds
 build output by what it holds rather than by where it is: Cargo writes
 `.rustc_info.json` at the root of every target directory and a `.fingerprint`
-directory in each profile, which nothing else does.
+directory in each profile, which nothing else does. scripts/native-evidence
+marks its task directories with `.native-evidence`, and their `target-before`
+and `target-after` hold only what its builds made.
 
 A target directory is removed only when, at the time of removal:
 - no entry anywhere inside it was written or changed within --max-idle days,
   or, for a mirrored build directory whose workspace no longer exists,
-  --orphan-hours;
+  --orphan-hours, or, for a native-evidence task's, --evidence-hours;
 - every Cargo profile lock in it is free; and
 - no process has its working directory, root, executable, an open file or a
   mapping inside it.
@@ -53,6 +55,9 @@ HOME = Path.home()
 MIRROR = Path("/var/tmp/cargo-build")
 LOCK_NAMES = (".cargo-lock", ".cargo-artifact-lock", ".cargo-build-lock")
 PRUNED = re.compile(r"^\.(?P<name>.+)\.cagents-pruned-(?P<pid>\d+)$")
+# What scripts/native-evidence names a task's builds, beside this marker.
+EVIDENCE_TARGET = re.compile(r"^target-(before|after)$")
+EVIDENCE_TASK = ".native-evidence"
 
 
 def default_roots() -> list[Path]:
@@ -78,6 +83,18 @@ def is_build_output(path: Path, names: set[str]) -> bool:
         return True
     return "CACHEDIR.TAG" in names and any(
         directory(path / name / ".fingerprint") for name in names if not name.startswith("."))
+
+
+def evidence_target(path: Path, names: set[str] | None = None) -> bool:
+    """A native-evidence task's build: its executables and the source they
+    came from, which its next build makes again. The task's fixtures, logs
+    and screenshots beside it are not build output, and a checkout never is."""
+    if not EVIDENCE_TARGET.match(path.name) or {".git", "Cargo.toml"} & (names or set()):
+        return False
+    try:
+        return stat.S_ISREG((path.parent / EVIDENCE_TASK).lstat().st_mode)
+    except OSError:
+        return False
 
 
 def directory(path: Path) -> bool:
@@ -137,7 +154,8 @@ def find(roots: list[Path], excluded: list[Path], depth: int, mirror: Path):
                 continue
             names = {entry.name for entry in entries}
             if directory_ != root and (PRUNED.match(directory_.name)
-                                       or is_build_output(directory_, names)):
+                                       or is_build_output(directory_, names)
+                                       or evidence_target(directory_, names)):
                 if directory_ not in seen:
                     seen.add(directory_)
                     yield directory_
@@ -323,6 +341,9 @@ def main() -> int:
     parser.add_argument("--orphan-hours", type=nonnegative, default=6.0, metavar="HOURS",
                         help="remove mirrored build directories of removed "
                              "workspaces unwritten this long (default 6)")
+    parser.add_argument("--evidence-hours", type=nonnegative, default=12.0, metavar="HOURS",
+                        help="remove native-evidence tasks' builds unwritten and unused "
+                             "this long (default 12)")
     parser.add_argument("--root", action="append", type=Path, default=[], metavar="DIR",
                         help="also search DIR; repeatable")
     parser.add_argument("--keep", action="append", type=Path, default=[], metavar="DIR",
@@ -407,6 +428,7 @@ def main() -> int:
     now = time.time()
     idle_cutoff = now - arguments.max_idle * 86400
     orphan_cutoff = now - arguments.orphan_hours * 3600
+    evidence_cutoff = now - arguments.evidence_hours * 3600
     removed = kept = 0
     freed = 0
     failed = complete = False
@@ -423,6 +445,10 @@ def main() -> int:
             if alive(int(leftover["pid"])):
                 continue
             reason, cutoff = "interrupted removal", now
+        elif evidence_target(directory):
+            # Its task's next build makes it again.
+            reason = f"native-evidence build, unwritten for {arguments.evidence_hours:g} hours"
+            cutoff = max(idle_cutoff, evidence_cutoff)
         elif main_checkout(directory, arguments.mirror):
             days = arguments.max_idle * MAIN_CHECKOUT_IDLE_FACTOR
             reason, cutoff = f"main checkout's, unwritten for {days:g} days", now - days * 86400
