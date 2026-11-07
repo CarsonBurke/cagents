@@ -10835,15 +10835,25 @@ mod tests {
             "the strip stays one line tall"
         );
         // The strip is a button around the row of its parts; the last of
-        // them is the duration.
+        // them pairs the summary with the duration that follows it.
         let layout = Layout::new(&node);
         let line = layout
             .children()
             .next()
             .and_then(|button| button.children().next())
             .expect("the strip's row");
-        let duration = line.children().last().unwrap().bounds();
+        let pair = line.children().last().unwrap();
+        let summary = pair.children().next().unwrap().bounds();
+        let duration = pair.children().last().unwrap().bounds();
         assert!(duration.width > 0.0);
+        // The summary was shaped wider than the pane and cut to the room the
+        // duration leaves it, rather than measured as nothing.
+        assert!(
+            summary.width > 150.0,
+            "the summary is {} wide",
+            summary.width
+        );
+        assert!(summary.x + summary.width < duration.x);
         assert!(
             duration.x + duration.width <= 320.0,
             "the duration ends at {} in a 320 pane",
