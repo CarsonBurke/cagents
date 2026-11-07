@@ -1,0 +1,71 @@
+#!/usr/bin/python3
+"""Check that every older client the daemon serves was proven at this protocol.
+
+The daemon serves listed older-protocol CLIs (src/terminal/ipc/older_clients.rs)
+on the strength of a wire-format proof against tests/fixtures/wire-formats/.
+The Rust test `every_older_client_is_proven_against_its_recorded_format` makes
+that proof, but CI does not run Rust tests. A protocol bump that merges beside a
+change to the older clients can leave them unproven, so this runs on the merge
+result: PROTOCOL_VERSION must have a recording, which must be the latest, and
+every literal `proven_at` must name it. It checks the claim, not the proof: a
+re-proof still needs the Rust test.
+"""
+
+import argparse
+import re
+import sys
+from pathlib import Path
+
+IPC = Path("src/terminal/ipc.rs")
+OLDER_CLIENTS = Path("src/terminal/ipc/older_clients.rs")
+RECORDINGS = Path("tests/fixtures/wire-formats")
+
+
+def problems(root: Path) -> list[str]:
+    ipc = (root / IPC).read_text()
+    version = re.search(r"^pub const PROTOCOL_VERSION: u16 = (\d+);$", ipc, re.MULTILINE)
+    if version is None:
+        return [f"{IPC}: PROTOCOL_VERSION not found"]
+    protocol = int(version.group(1))
+    older = root / OLDER_CLIENTS
+    if not older.is_file():
+        # Moving the list must move this check with it, not switch it off.
+        return [f"{OLDER_CLIENTS} not found: point this check at the older client list"]
+    found = []
+    recordings = sorted(
+        int(path.stem) for path in (root / RECORDINGS).glob("*.json") if path.stem.isdigit()
+    )
+    if protocol not in recordings:
+        found.append(
+            f"{RECORDINGS}/{protocol}.json is missing: record protocol {protocol} with "
+            "CAGENTS_RECORD_WIRE_FORMAT=1 (see wire_format_tests.rs)"
+        )
+    elif recordings[-1] != protocol:
+        found.append(
+            f"{RECORDINGS}/{recordings[-1]}.json is newer than PROTOCOL_VERSION {protocol}"
+        )
+    proven = [int(value) for value in re.findall(r"\bproven_at: (\d+),", older.read_text())]
+    if not proven:
+        found.append(f"{OLDER_CLIENTS}: no literal proven_at found")
+    for value in proven:
+        if value != protocol:
+            found.append(
+                f"{OLDER_CLIENTS}: an older client was proven at protocol {value}, not "
+                f"{protocol}. Re-prove it against {RECORDINGS}/{protocol}.json, or remove it."
+            )
+    return found
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    parser.add_argument("--root", type=Path, default=Path("."))
+    found = problems(parser.parse_args().root)
+    for problem in found:
+        print(problem, file=sys.stderr)
+    if not found:
+        print("Older clients are proven at this protocol")
+    return 1 if found else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

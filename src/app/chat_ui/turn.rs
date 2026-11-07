@@ -473,7 +473,10 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
                 target(*action, label)
             }
         }
-        ItemContent::Changes { changes, .. } => match changes.as_slice() {
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
+            // An edit whose input is still arriving: what it changes, and so
+            // whether it adds or edits a file, is not known yet.
+            [] if *status == ToolStatus::Running => "Preparing an edit",
             [single] => single.path.as_str(),
             _ => "File changes",
         },
@@ -558,7 +561,8 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
             chat::CommandAction::List => "Listed",
             chat::CommandAction::Run => "Ran",
         },
-        ItemContent::Changes { changes, .. } => match changes.as_slice() {
+        ItemContent::Changes { changes, status } => match changes.as_slice() {
+            [] if *status == ToolStatus::Running => "",
             [single] => match single.kind {
                 chat::ChangeKind::Added => "Added",
                 chat::ChangeKind::Deleted => "Deleted",
@@ -588,6 +592,9 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     let mut edited = std::collections::BTreeSet::new();
     let (mut ran, mut read, mut searched, mut listed, mut web, mut called, mut viewed) =
         (0, 0, 0, 0, 0, 0, 0);
+    // An edit whose input is still arriving names no file yet, and a
+    // summary that left it out would hide a step that is still working.
+    let mut preparing = 0;
     let mut coordinating = 0;
     for placed in steps {
         let item = items.get(placed.index)?.borrow();
@@ -596,6 +603,11 @@ fn summarize_steps<'c, T: Borrow<Item>>(
             continue;
         }
         match &item.content {
+            ItemContent::Changes { changes, status }
+                if changes.is_empty() && *status == ToolStatus::Running =>
+            {
+                preparing += 1
+            }
             ItemContent::Changes { changes, .. } => {
                 edited.extend(changes.iter().map(|change| change.path.as_str()));
             }
@@ -618,6 +630,12 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     let mut parts = Vec::new();
     if !edited.is_empty() {
         parts.push(format!("edited {}", counted(edited.len(), "file", "files")));
+    }
+    if preparing > 0 {
+        parts.push(match preparing {
+            1 => "preparing an edit".to_owned(),
+            count => format!("preparing {count} edits"),
+        });
     }
     if ran > 0 {
         parts.push(format!("ran {}", counted(ran, "command", "commands")));
@@ -1468,5 +1486,51 @@ mod tests {
         };
         assert_eq!(step_label(&content), "src/app.rs");
         assert_eq!(step_verb(&content), "Renamed");
+    }
+
+    /// An edit whose input is still arriving has not said whether it adds or
+    /// edits a file, so its row names neither rather than guessing one and
+    /// changing its mind.
+    #[test]
+    fn an_edit_not_yet_described_does_not_guess_its_verb() {
+        let content = ItemContent::Changes {
+            changes: Vec::new(),
+            status: ToolStatus::Running,
+        };
+        assert_eq!(step_verb(&content), "");
+        assert_eq!(step_label(&content), "Preparing an edit");
+        // One that ended without describing a change was never being prepared.
+        for status in [ToolStatus::Succeeded, ToolStatus::Failed] {
+            let content = ItemContent::Changes {
+                changes: Vec::new(),
+                status,
+            };
+            assert_ne!(step_label(&content), "Preparing an edit");
+        }
+    }
+
+    /// A group still preparing an edit says so, rather than summarizing only
+    /// the steps that have finished describing themselves.
+    #[test]
+    fn a_group_counts_an_edit_still_being_prepared() {
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            command("c1", ToolStatus::Failed),
+            Item {
+                id: "e1".into(),
+                role: Role::Assistant,
+                content: ItemContent::Changes {
+                    changes: Vec::new(),
+                    status: ToolStatus::Running,
+                },
+                started_at: None,
+                at: None,
+            },
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(
+            turns[0].summary,
+            "Preparing an edit, ran a command · working"
+        );
     }
 }
