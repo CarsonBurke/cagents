@@ -49,10 +49,11 @@ class OlderClientProof(unittest.TestCase):
         (problem,) = checker.problems(self.tree(151, [151], [151, 152]))
         self.assertIn("152.json is newer", problem)
 
-    def test_a_tree_without_older_clients_is_not_checked(self):
-        root = self.tree(151, [129], [])
+    def test_a_moved_older_client_list_fails(self):
+        root = self.tree(151, [151], [151])
         (root / "src/terminal/ipc/older_clients.rs").unlink()
-        self.assertEqual(checker.problems(root), [])
+        (problem,) = checker.problems(root)
+        self.assertIn("older_clients.rs not found", problem)
 
 
 if __name__ == "__main__":

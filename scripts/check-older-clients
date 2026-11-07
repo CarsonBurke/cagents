@@ -4,10 +4,11 @@
 The daemon serves listed older-protocol CLIs (src/terminal/ipc/older_clients.rs)
 on the strength of a wire-format proof against tests/fixtures/wire-formats/.
 The Rust test `every_older_client_is_proven_against_its_recorded_format` makes
-that proof, but nothing runs it at merge. A protocol bump that merges beside a
+that proof, but CI does not run Rust tests. A protocol bump that merges beside a
 change to the older clients can leave them unproven, so this runs on the merge
 result: PROTOCOL_VERSION must have a recording, which must be the latest, and
-every literal `proven_at` must name it.
+every literal `proven_at` must name it. It checks the claim, not the proof: a
+re-proof still needs the Rust test.
 """
 
 import argparse
@@ -27,8 +28,9 @@ def problems(root: Path) -> list[str]:
         return [f"{IPC}: PROTOCOL_VERSION not found"]
     protocol = int(version.group(1))
     older = root / OLDER_CLIENTS
-    if not older.exists():
-        return []
+    if not older.is_file():
+        # Moving the list must move this check with it, not switch it off.
+        return [f"{OLDER_CLIENTS} not found: point this check at the older client list"]
     found = []
     recordings = sorted(
         int(path.stem) for path in (root / RECORDINGS).glob("*.json") if path.stem.isdigit()
