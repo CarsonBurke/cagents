@@ -439,6 +439,8 @@ impl LocalHandle {
         let (wake, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         nonblocking(&wake)?;
         nonblocking(&reader)?;
+        // Optional: without it a stopped command is reported at the next wake.
+        let scope_wake = wake.try_clone().ok();
         let (commands, incoming) = crossbeam_channel::bounded(64);
         let state = Arc::new(Mutex::new(Snapshot {
             session_id,
@@ -502,6 +504,7 @@ impl LocalHandle {
                     child: None,
                     native_holder,
                     reconnect_only_reported: false,
+                    command_stops: 0,
                     expected_native_peer,
                     native_peer: None,
                     preserve_native: preserve_native.clone(),
@@ -553,7 +556,7 @@ impl LocalHandle {
                         let child = if actor.native_holder.is_some() {
                             Ok(None)
                         } else {
-                            spawn_provider(&spec, &actor.stop)
+                            spawn_provider(&spec, &actor.stop, scope_wake)
                         };
                         let child = child.and_then(|child| {
                             if let Some(child) = &child {
@@ -656,6 +659,19 @@ impl LocalHandle {
                 } else {
                     true
                 };
+                // Nothing reports the end of a step the provider left running.
+                // A preserved holder's provider is still running its steps.
+                if !preserve_holder {
+                    if let Err(error) = actor
+                        .store
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .stop_running_steps()
+                    {
+                        tracing::warn!(%error, "steps left running could not be marked stopped");
+                    }
+                    stop_snapshot_steps(&mut actor.state.lock().unwrap_or_else(|p| p.into_inner()));
+                }
                 actor.apply(Event::Exited { code });
                 let usage = actor
                     .state
@@ -1650,7 +1666,13 @@ impl super::protocol::LaunchCleanup for LocalHandle {
     }
 }
 
-fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildGuard>, String> {
+/// `wake` is written when the provider's scope reports a command stopped for
+/// memory, so the actor can say so.
+fn spawn_provider(
+    spec: &ProcessSpec,
+    stop: &AtomicBool,
+    wake: Option<UnixStream>,
+) -> Result<Option<ChildGuard>, String> {
     if matches!(
         spec.transport,
         TransportSpec::History | TransportSpec::UnixWebSocket { .. }
@@ -1728,8 +1750,11 @@ fn spawn_provider(spec: &ProcessSpec, stop: &AtomicBool) -> Result<Option<ChildG
     // Scope enrollment happens before this child is handed to the actor and
     // therefore before any prompt/tool request. Keep the original Child, pipes,
     // process group and account lease: systemd only relocates its cgroup.
-    if let Err(error) = crate::daemon::process_scope::enroll_process(child.child.id()) {
-        tracing::warn!(%error, provider = %spec.program, "provider scope isolation unavailable; using existing launch fallback");
+    match crate::daemon::process_scope::enroll_provider(child.child.id(), wake) {
+        Ok(scope) => child.scope = scope,
+        Err(error) => {
+            tracing::warn!(%error, provider = %spec.program, "provider scope isolation unavailable; using existing launch fallback");
+        }
     }
     crate::daemon::process_scope::warn_if_shared(child.child.id(), child.child.id());
     crate::daemon::process_scope::warn_if_bootstrap_shared(child.child.id());
@@ -1743,6 +1768,8 @@ struct ChildGuard {
     identity: OwnedFd,
     terminated: bool,
     directory: Option<Arc<std::fs::File>>,
+    /// The provider's cgroup scope, when the OS user manager provided one.
+    scope: Option<crate::daemon::process_scope::ProviderScope>,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
 }
@@ -1830,6 +1857,7 @@ impl ChildGuard {
             identity,
             terminated: false,
             directory: None,
+            scope: None,
             _registration: registration,
         })
     }
@@ -1919,6 +1947,12 @@ impl ChildGuard {
         // Signal any remaining original group members while the exited
         // leader still pins the ID, then perform the sole final reap.
         signal_group(libc::SIGKILL)?;
+        // Commands in process groups of their own outlive that signal.
+        if let Some(scope) = self.scope.as_mut()
+            && let Err(error) = scope.end()
+        {
+            tracing::warn!(%error, "commands the provider left could not be ended");
+        }
         self.child.wait()?;
         self.terminated = true;
         Ok(())
@@ -1956,6 +1990,8 @@ struct Actor {
     native_holder: Option<super::native_holder::Holder>,
     /// Whether this conversation's lack of durable continuity was logged.
     reconnect_only_reported: bool,
+    /// Commands memory exhaustion stopped while this actor ran.
+    command_stops: usize,
     expected_native_peer: Option<crate::daemon::holder_registry::Process>,
     native_peer: Option<crate::daemon::holder_registry::Process>,
     preserve_native: Arc<AtomicBool>,
@@ -2002,6 +2038,80 @@ struct Actor {
 /// Each valid frame earns a fresh `IO_TIMEOUT`, up to `STARTUP_LIMIT` overall.
 fn startup_expired(started: Instant, last_progress: Instant, now: Instant) -> bool {
     now.duration_since(last_progress) > IO_TIMEOUT || now.duration_since(started) > STARTUP_LIMIT
+}
+
+/// A provider that exited without being asked to, naming memory exhaustion
+/// when the provider's cgroup shows the system ended it for that.
+fn exit_report(child: &ChildGuard, status: std::process::ExitStatus) -> String {
+    use crate::daemon::process_scope::Killer;
+    use std::os::unix::process::ExitStatusExt;
+    let exited = format!("{}{status}", super::failure::PROVIDER_EXITED);
+    let Some(scope) = child.scope.as_ref() else {
+        return exited;
+    };
+    let killer = (status.signal() == Some(libc::SIGKILL))
+        .then(|| scope.provider_killer())
+        .flatten();
+    let out_of_memory = super::failure::PROVIDER_OUT_OF_MEMORY;
+    match killer {
+        // A shared cgroup is killed whole.
+        Some(Killer::Oomd) if scope.keeps_commands_apart() => {
+            format!("{out_of_memory} systemd-oomd ended it. {exited}")
+        }
+        Some(Killer::Oomd) => format!(
+            "{out_of_memory} systemd-oomd ended it and the commands it was running. {exited}"
+        ),
+        Some(Killer::Kernel) => {
+            format!("{out_of_memory} The kernel's out-of-memory killer ended it. {exited}")
+        }
+        None => exited,
+    }
+}
+
+/// One notice for the commands memory exhaustion stopped since the last
+/// check. `earlier` were stopped before them since the agent started: a retried
+/// command stopped again still gets a notice of its own.
+fn command_stop_report(
+    stops: &[crate::daemon::process_scope::CommandStop],
+    earlier: usize,
+) -> String {
+    use crate::daemon::process_scope::Killer;
+    let mut killers = Vec::new();
+    for stop in stops {
+        let by = match stop.killer {
+            Killer::Oomd => "systemd-oomd",
+            Killer::Kernel => "the kernel's out-of-memory killer",
+        };
+        if !killers.contains(&by) {
+            killers.push(by);
+        }
+    }
+    // It opens a sentence; systemd-oomd keeps its own lower case.
+    let by = killers.join(" and ");
+    let by = match by.strip_prefix("the ") {
+        Some(rest) => format!("The {rest}"),
+        None => by,
+    };
+    let what = match stops.len() {
+        1 => "it".to_owned(),
+        count => format!("{count} commands"),
+    };
+    let processes = match stops.iter().map(|stop| stop.processes).sum::<Option<u64>>() {
+        Some(1) => " (1 process)".to_owned(),
+        Some(count) => format!(" ({count} processes)"),
+        None => String::new(),
+    };
+    let mut report = format!(
+        "{} {by} ended {what}{processes}; the agent is still running.",
+        super::failure::COMMAND_OUT_OF_MEMORY
+    );
+    if earlier > 0 {
+        report.push_str(&format!(
+            " Commands stopped for memory since the agent started: {}.",
+            earlier + stops.len()
+        ));
+    }
+    report
 }
 
 /// Append the most recent skipped stdout line, which often names the real cause.
@@ -2298,10 +2408,11 @@ impl Actor {
                         // A clean exit still lost any input it never read.
                         return stdin_closed.map_or(Ok(()), Err);
                     }
-                    return Err(with_ignored_output(
-                        &format!("Provider exited with {status}"),
-                        &last_ignored,
-                    ));
+                    let report = exit_report(
+                        self.child.as_ref().ok_or("Provider process unavailable")?,
+                        status,
+                    );
+                    return Err(with_ignored_output(&report, &last_ignored));
                 }
                 return Err(with_ignored_output(
                     "Provider closed its protocol stream; process terminated to avoid an unobservable writer",
@@ -2392,6 +2503,7 @@ impl Actor {
             if fds[0].revents != 0 {
                 while self.wake.read(&mut buffer).is_ok_and(|n| n != 0) {}
             }
+            self.report_command_stops();
             if fds[3].revents != 0 {
                 if let Some(line) = self.pending.front() {
                     match stdin.write(&line[self.offset..]) {
@@ -2427,6 +2539,10 @@ impl Actor {
                     Ok(n) => {
                         reserve_frame(&mut self.output, n)?;
                         self.output.extend_from_slice(&buffer[..n]);
+                        // Output often announces a command: move it soon.
+                        if let Some(scope) = self.child.as_ref().and_then(|c| c.scope.as_ref()) {
+                            scope.poke();
+                        }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
                     Err(e) => return Err(format!("Provider stdout: {e}")),
@@ -2449,6 +2565,24 @@ impl Actor {
             }
         }
     }
+    /// Say so when the system stopped one of the provider's commands
+    /// because memory ran out. The provider is still running.
+    fn report_command_stops(&mut self) {
+        let stops = match self.child.as_ref().and_then(|child| child.scope.as_ref()) {
+            Some(scope) => scope.take_command_stops(),
+            None => return,
+        };
+        if stops.is_empty() {
+            return;
+        }
+        let message = command_stop_report(&stops, self.command_stops);
+        self.command_stops += stops.len();
+        self.apply(Event::Error {
+            message,
+            fatal: false,
+        });
+    }
+
     fn drain_commands(&mut self, closing: bool) -> Result<(), String> {
         for _ in 0..64 {
             // Backpressure applies to queued bytes, not to the mere existence of a
@@ -3782,6 +3916,35 @@ fn apply_projected_event(
     child_text_copy::finish(state, child_copy_update);
 }
 
+/// Marks the steps still running as stopped, copying only those items.
+/// Nothing a provider that ended was doing outlives it; a step it left
+/// running would otherwise read as still working.
+fn stop_snapshot_steps(state: &mut Snapshot) {
+    stop_running_steps(&mut state.items);
+    for agent in &mut state.subagents {
+        if agent.status == ToolStatus::Running {
+            agent.status = ToolStatus::Stopped;
+            agent.waiting = false;
+        }
+        stop_running_steps(&mut agent.items);
+    }
+}
+
+fn stop_running_steps(items: &mut [Arc<Item>]) {
+    let now = observed_at();
+    for item in items {
+        if item.content.status() == Some(ToolStatus::Running) {
+            let item = Arc::make_mut(item);
+            if let Some(status) = item.content.status_mut() {
+                *status = ToolStatus::Stopped;
+                // It ended now, so its duration runs to the provider's exit.
+                item.started_at = item.started_at.or(item.at);
+                item.at = now;
+            }
+        }
+    }
+}
+
 /// Running task identities authorize interruption and idle waits. Retiring
 /// presentation history must never retire that ownership evidence. Keep only
 /// the newest 32 rich child transcripts, with older active entries remaining
@@ -4947,6 +5110,102 @@ mod tests {
         assert!(state.prompt_suggestion.is_none());
         apply_event(&mut state, &mut indices, suggestion());
         assert!(state.prompt_suggestion.is_none());
+    }
+
+    #[test]
+    fn each_check_that_finds_stopped_commands_gives_a_new_notice() {
+        use crate::daemon::process_scope::{CommandStop, Killer};
+        let oomd = |processes| CommandStop {
+            killer: Killer::Oomd,
+            processes,
+        };
+        let first = command_stop_report(&[oomd(Some(3))], 0);
+        assert_eq!(
+            first,
+            format!(
+                "{} systemd-oomd ended it (3 processes); the agent is still running.",
+                super::super::failure::COMMAND_OUT_OF_MEMORY
+            )
+        );
+        // The agent retries the command and it is stopped the same way.
+        let again = command_stop_report(&[oomd(Some(3))], 1);
+        assert_ne!(again, first, "the card for a repeat must be a new one");
+        assert!(again.ends_with("since the agent started: 2."), "{again}");
+
+        let both = command_stop_report(
+            &[
+                oomd(Some(1)),
+                CommandStop {
+                    killer: Killer::Kernel,
+                    processes: None,
+                },
+            ],
+            0,
+        );
+        assert!(
+            both.contains(
+                "systemd-oomd and the kernel's out-of-memory killer ended 2 commands; the agent"
+            ),
+            "{both}"
+        );
+        for report in [first, again, both] {
+            assert!(super::super::failure::is_notice(&report), "{report}");
+        }
+    }
+
+    #[test]
+    fn steps_left_running_by_an_ended_provider_read_as_stopped() {
+        let mut state = Snapshot::default();
+        let mut indices = BTreeMap::new();
+        let tool = |id: &str, status| Item {
+            started_at: None,
+            id: id.into(),
+            role: crate::chat::Role::Assistant,
+            content: ItemContent::Tool {
+                name: "Bash".into(),
+                input: "sleep 6001".into(),
+                output: String::new(),
+                status,
+            },
+            at: None,
+        };
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("running", ToolStatus::Running)),
+        );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("done", ToolStatus::Succeeded)),
+        );
+        let finished = Arc::clone(&state.items[1]);
+        let agent = subagent(&mut state, "scout");
+        agent.waiting = true;
+        agent
+            .items
+            .push(Arc::new(tool("child", ToolStatus::Running)));
+        subagent(&mut state, "builder").status = ToolStatus::Failed;
+        stop_snapshot_steps(&mut state);
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        let statuses: Vec<_> = state
+            .items
+            .iter()
+            .map(|item| item.content.status())
+            .collect();
+        assert_eq!(
+            statuses,
+            [Some(ToolStatus::Stopped), Some(ToolStatus::Succeeded)]
+        );
+        assert!(
+            Arc::ptr_eq(&finished, &state.items[1]),
+            "settled items are not copied"
+        );
+        let scout = &state.subagents[0];
+        assert_eq!(scout.status, ToolStatus::Stopped);
+        assert!(!scout.waiting);
+        assert_eq!(scout.items[0].content.status(), Some(ToolStatus::Stopped));
+        assert_eq!(state.subagents[1].status, ToolStatus::Failed);
     }
 
     #[test]
@@ -6401,7 +6660,7 @@ mod tests {
             environment: BTreeMap::new(),
             unset_environment: Default::default(),
         };
-        assert!(spawn_provider(&spec, &AtomicBool::new(false)).is_err());
+        assert!(spawn_provider(&spec, &AtomicBool::new(false), None).is_err());
     }
 
     struct Echo;
@@ -8650,7 +8909,7 @@ for line in sys.stdin:
             environment: Default::default(),
             unset_environment: Default::default(),
         };
-        let mut provider = spawn_provider(&spec, &AtomicBool::new(false))
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), None)
             .unwrap()
             .unwrap();
         let pid = provider.child.id();
@@ -8670,6 +8929,254 @@ for line in sys.stdin:
             .unwrap();
         assert_eq!(reply, "scope transport preserved\n");
         provider.terminate().unwrap();
+    }
+
+    /// The commands a direct provider starts leave its cgroup, so a memory
+    /// kill of one ends that command alone and the conversation says so; a
+    /// memory kill of the provider itself is named as one when it exits.
+    /// The kills are made the way systemd-oomd makes them: it marks the
+    /// cgroup, then kills every process in it.
+    #[test]
+    fn a_memory_kill_of_a_command_spares_its_provider_and_is_reported() {
+        use std::io::{BufRead, Read, Write};
+        use std::os::unix::process::ExitStatusExt;
+        fn cgroup(pid: u32) -> String {
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .unwrap()
+                .lines()
+                .find_map(|line| line.strip_prefix("0::"))
+                .unwrap()
+                .to_owned()
+        }
+        fn parent(pid: u32) -> u32 {
+            let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+            let after = stat.rsplit_once(") ").unwrap().1;
+            after.split_whitespace().nth(1).unwrap().parse().unwrap()
+        }
+        fn mark_and_kill(leaf: &str) {
+            let path = std::path::Path::new("/sys/fs/cgroup").join(leaf.trim_start_matches('/'));
+            for (name, value) in [("user.oomd_ooms", "1"), ("user.oomd_kill", "1")] {
+                let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
+                let name = std::ffi::CString::new(name).unwrap();
+                // SAFETY: NUL-terminated path and name and a live value buffer.
+                let set = unsafe {
+                    libc::setxattr(
+                        path.as_ptr(),
+                        name.as_ptr(),
+                        value.as_ptr().cast(),
+                        value.len(),
+                        0,
+                    )
+                };
+                assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+            }
+            std::fs::write(path.join("cgroup.kill"), "1").unwrap();
+        }
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: None,
+            messages: None,
+            transport: TransportSpec::JsonLines,
+            program: "/bin/sh".into(),
+            // A one-process command, and a shell running a command of its
+            // own, as an agent's Bash tool does. That one leaves the
+            // provider's process group, as a tool may start its commands.
+            arguments: vec![
+                "-c".into(),
+                "read go; sleep 300 & echo $!; sh -c 'setsid sleep 300 & echo $!; wait' & echo $!; read done"
+                    .into(),
+            ],
+            working_directory: std::env::current_dir().unwrap(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let (wake, mut woken) = UnixStream::pair().unwrap();
+        let mut provider = spawn_provider(&spec, &AtomicBool::new(false), Some(wake))
+            .unwrap()
+            .unwrap();
+        let root = provider.child.id();
+        let Some(scope) = provider
+            .scope
+            .as_ref()
+            .filter(|scope| scope.keeps_commands_apart())
+        else {
+            eprintln!("command cgroups unqualified: no delegated provider scope here");
+            provider.terminate().unwrap();
+            return;
+        };
+        let provider_leaf = cgroup(root);
+        assert!(provider_leaf.ends_with("/provider"), "{provider_leaf}");
+        let scope_path = provider_leaf.trim_end_matches("/provider").to_owned();
+        let unit = scope_path.rsplit('/').next().unwrap();
+        let policy = std::process::Command::new("systemctl")
+            .args(["--user", "show", "-P", "OOMPolicy", unit])
+            .output()
+            .unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&policy.stdout).trim(),
+            "continue",
+            "a memory kill in one leaf must not stop the provider's scope"
+        );
+        // Commands start only after the split, as a provider's do.
+        writeln!(provider.child.stdin.as_mut().unwrap(), "go").unwrap();
+        let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
+        let mut pids = Vec::new();
+        for _ in 0..3 {
+            let mut line = String::new();
+            stdout.read_line(&mut line).unwrap();
+            pids.push(line.trim().parse::<u32>().unwrap());
+        }
+        let is_shell =
+            |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap() == "sh\n";
+        let find = |wanted: &dyn Fn(u32) -> bool| {
+            *pids
+                .iter()
+                .find(|pid| wanted(**pid))
+                .unwrap_or_else(|| panic!("unexpected command tree: {pids:?}"))
+        };
+        let alone = find(&|pid| parent(pid) == root && !is_shell(pid));
+        let shell = find(&|pid| parent(pid) == root && is_shell(pid));
+        let inner = find(&|pid| parent(pid) == shell);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while [alone, shell, inner]
+            .iter()
+            .any(|pid| cgroup(*pid) == provider_leaf)
+        {
+            assert!(
+                Instant::now() < deadline,
+                "commands stayed in the provider's cgroup"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let alone_leaf = cgroup(alone);
+        let shell_leaf = cgroup(shell);
+        for leaf in [&alone_leaf, &shell_leaf] {
+            let name = leaf.strip_prefix(&format!("{scope_path}/")).unwrap();
+            assert!(name.starts_with("command-"), "{leaf}");
+        }
+        assert_ne!(alone_leaf, shell_leaf, "each command has its own cgroup");
+        assert_eq!(
+            cgroup(inner),
+            shell_leaf,
+            "a command's own commands stay with it"
+        );
+        assert_eq!(cgroup(root), provider_leaf, "the provider stays alone");
+
+        mark_and_kill(&alone_leaf);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stops = loop {
+            let stops = scope.take_command_stops();
+            if !stops.is_empty() {
+                break stops;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the stopped command was never reported"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            stops,
+            vec![crate::daemon::process_scope::CommandStop {
+                killer: crate::daemon::process_scope::Killer::Oomd,
+                processes: Some(1),
+            }]
+        );
+        let mut byte = [0];
+        woken
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        woken.read_exact(&mut byte).unwrap();
+        let report = command_stop_report(&stops, 0);
+        assert!(
+            report.starts_with(super::super::failure::COMMAND_OUT_OF_MEMORY),
+            "{report}"
+        );
+        assert!(
+            provider.child.try_wait().unwrap().is_none(),
+            "the provider kept running"
+        );
+        assert_eq!(cgroup(inner), shell_leaf, "the other command kept running");
+
+        // The kernel's OOM killer ends one process of a command, not all of
+        // it: here a process over a small limit on the shell's leaf, which
+        // it joins before it allocates.
+        let leaf_path =
+            std::path::Path::new("/sys/fs/cgroup").join(shell_leaf.trim_start_matches('/'));
+        std::fs::write(leaf_path.join("memory.swap.max"), "0").unwrap();
+        std::fs::write(leaf_path.join("memory.max"), "32M").unwrap();
+        let mut hog = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-I",
+                "-c",
+                "import sys; sys.stdin.read(1); b = bytearray(256 << 20)",
+            ])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        std::fs::write(leaf_path.join("cgroup.procs"), hog.id().to_string()).unwrap();
+        hog.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert_eq!(hog.wait().unwrap().signal(), Some(libc::SIGKILL));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let stops = loop {
+            let stops = scope.take_command_stops();
+            if !stops.is_empty() {
+                break stops;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the kernel's kill was never reported"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        };
+        assert_eq!(
+            stops,
+            vec![crate::daemon::process_scope::CommandStop {
+                killer: crate::daemon::process_scope::Killer::Kernel,
+                processes: Some(1),
+            }],
+            "reported while the rest of the command runs on"
+        );
+        assert_eq!(cgroup(inner), shell_leaf);
+
+        // The provider's own leaf, and with it the provider.
+        mark_and_kill(&provider_leaf);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let status = loop {
+            if let Some(status) = provider.observed_exit_status().unwrap() {
+                break status;
+            }
+            assert!(Instant::now() < deadline, "the provider outlived its kill");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        let report = exit_report(&provider, status);
+        assert!(
+            report.starts_with(super::super::failure::PROVIDER_OUT_OF_MEMORY),
+            "{report}"
+        );
+        assert!(
+            report.ends_with("Provider exited with signal: 9 (SIGKILL)"),
+            "{report}"
+        );
+        // The command in a session of its own outlived the provider's kill.
+        assert_eq!(cgroup(inner), shell_leaf);
+        let ended = |pid: u32| {
+            std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |stat| {
+                stat.rsplit_once(") ").unwrap().1.starts_with('Z')
+            })
+        };
+        assert!(!ended(inner));
+        // Ending the provider ends what it left, as nothing else would.
+        provider.terminate().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ended(inner) {
+            assert!(
+                Instant::now() < deadline,
+                "a command outlived the provider that started it"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     #[test]
