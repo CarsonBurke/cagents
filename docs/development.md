@@ -139,6 +139,7 @@ scripts/run-development                 # with the embedded browser
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
 | `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
+| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -252,6 +253,57 @@ with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains
 for its next launch; delete `~/.local/share/cagents-development-NAME` and its
 config and state siblings to discard it.
+
+#### Stopping instances from a cagents session
+
+An agent in a terminal or chat that cagents hosts can stop and replace the
+instances it starts: `--stop-instance NAME` and `--instance NAME --fresh-daemon`
+work there as they do in your own terminal, with the session's
+`CAGENTS_AGENT_AUTHORITY` left in place. The CLI's
+`daemon stop-for-rebuild`, which both use, decides from the process tree:
+
+- It stops a development daemon with a runtime directory of its own: any
+  `--instance`, or the unnamed one inside a harness session or a fixture's
+  private `XDG_RUNTIME_DIR`.
+- It refuses the daemon that hosts the session, or one hosting a session it
+  descends from, since stopping that would end them. Every process a daemon
+  hosts runs below one of the daemon's own processes, so this holds for hosts
+  of any version and after a daemon restart.
+- It refuses the unnamed development daemon in the login runtime
+  (`/run/user/UID/cagents-development`), which belongs to the person at the
+  computer, and every production daemon. A production CLI still refuses all
+  lifecycle commands from a hosted session.
+
+Other lifecycle commands, such as `daemon stop` and `daemon upgrade`, remain
+refused in every hosted session.
+
+#### Finding and stopping instances
+
+`scripts/run-development --list-instances` lists every development daemon
+running on this computer, whoever started it:
+
+```text
+pr2064, pid 1118559, running 02:17:40
+  checkout:   /home/me/cagents/.worktrees/pr2064
+  runtime:    /run/user/1000/nh-MwPpz5r1
+  started by: claude (pid 2417058), which has ended, in a cagents session
+  stop:       scripts/run-development --stop-instance pr2064
+```
+
+The checkout is marked `(removed)` when its worktree is gone, and `executable
+rebuilt since` when the daemon runs an executable that a later build replaced.
+`started by` comes from a record `--instance` keeps in the session's runtime
+directory: for a hosted caller, the process its cagents session runs, such as
+the agent's provider; otherwise the shell that ran the runner. An instance whose
+starter has ended is usually safe to stop. Daemons started another way have no
+record, and no runner session to stop, so the listing names their process ID;
+`kill PID` ends such a daemon and its jobs. The listing says when a daemon hosts
+the session that runs it, or is the login session's own development daemon,
+instead of offering a stop command.
+
+An instance keeps running when the session that started it ends, so that
+another agent or a person can go on using it. Stop it when you're done, and
+check `--list-instances` for instances left behind.
 
 Instances started from one checkout run that checkout's executables, so start
 them all in the same lane: all `--browserless` or all integrated. The two lanes
