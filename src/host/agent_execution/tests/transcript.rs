@@ -169,7 +169,7 @@ fn transcript_reads_a_sessions_saved_conversation_compactly_and_pages_back() {
     for (handle, expected) in [
         ("abc", "at least 4"),
         ("ffffffff", "No session"),
-        ("parent", "no live parent"),
+        ("parent", "no parent"),
     ] {
         let error = read(&host, &Authority::default(), query(handle, None, 1)).unwrap_err();
         assert!(error.contains(expected), "{handle}: {error}");
@@ -270,6 +270,22 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
         named.sessions[0].title.as_deref(),
         Some("Login"),
         "a member is not named after its channel"
+    );
+    // Nor, in a wider listing, is a session in the caller's own channel.
+    let wider = directory(&host, &authority, Scope::All).unwrap();
+    assert_ne!(
+        wider.caller.as_ref().unwrap().title.as_deref(),
+        Some("Login")
+    );
+    assert_eq!(
+        directory(&host, &Authority::default(), Scope::All)
+            .unwrap()
+            .sessions
+            .iter()
+            .find(|entry| entry.id == session)
+            .and_then(|entry| entry.title.as_deref()),
+        Some("Login"),
+        "outside the channel, its title still hints at its work"
     );
 
     // A provider that exits, as at a usage limit, stays listed and readable

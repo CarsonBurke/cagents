@@ -157,16 +157,26 @@ pub(super) fn read_members(
     };
 
     let scopes = session_scopes(&model);
+    let view_scope = |id: TerminalId| {
+        scopes
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| delegations.get(&id).map(|(_, scope)| scope.clone()))
+    };
+    let channel_of = |scope: &Option<crate::agent_execution::Placement>| match scope {
+        Some(crate::agent_execution::Placement::Channel(id)) => Some(*id),
+        _ => None,
+    };
+    let caller_channel = caller.and_then(|caller| channel_of(&view_scope(caller)));
     let mut me = None;
     let mut sessions = Vec::new();
     for live in live {
         let (worktree, project) = place_cached(&live.directory);
-        let (delegation, delegated_scope) = delegations.get(&live.id).cloned().unzip();
-        let view_scope = scopes.get(&live.id).cloned().unwrap_or(delegated_scope);
-        let channel = match &view_scope {
-            Some(crate::agent_execution::Placement::Channel(id)) => Some(*id),
-            _ => None,
-        };
+        let delegation = delegations
+            .get(&live.id)
+            .map(|(delegation, _)| delegation.clone());
+        let view_scope = view_scope(live.id);
+        let channel = channel_of(&view_scope);
         let relation = if Some(live.id) == caller {
             Relation::Myself
         } else if Some(lineage(live.id)) == parent {
@@ -192,10 +202,12 @@ pub(super) fn read_members(
                 .and_then(|id| model.channel(id))
                 .map(|channel| channel.repository.clone()),
             provider: live.provider,
-            // Channel metadata supplies a fallback when the provider has no title.
+            // Channel metadata supplies a fallback when the provider has no
+            // title, except where it would name the caller's own channel, or
+            // every member of one alike.
             title: live.title.or_else(|| {
                 channel
-                    .filter(|_| !members)
+                    .filter(|channel| !members && Some(*channel) != caller_channel)
                     .and_then(|channel| model.channel(channel))
                     .map(|channel| channel.title.clone())
             }),
@@ -235,7 +247,10 @@ pub(super) fn read_members(
         Scope::Channel(channel) => {
             let channel = channel
                 .or_else(|| me.as_ref().and_then(|me: &Entry| me.channel))
-                .ok_or("This caller is not in a channel; name one with --channel CHANNEL")?;
+                .ok_or(
+                    "This caller is not in a channel; name one with --channel CHANNEL, \
+                     from `cagents channel list`",
+                )?;
             sessions.retain(|entry| entry.channel == Some(channel));
             Scope::Channel(Some(channel))
         }

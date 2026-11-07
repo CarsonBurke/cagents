@@ -155,20 +155,20 @@ cagents transcript 7c0f --tools --full --json
 ```
 
 ```text
-Session 7c0fba49-2f0e-4b8e-9d0a-1c2b3d4e5f60 (claude, exited) "Fix flaky login test", active 12 min ago
-Failed: You've hit your usage limit
+Session 7c0fba49-2f0e-4b8e-9d0a-1c2b3d4e5f60 (claude, exited), active 12 min ago
+Failed: Claude usage limit reached · resets 3pm
 Earlier: cagents transcript 7c0f --before 3f2a1b7c-0d9e-4c8b-a7f6-5e4d3c2b1a00
 
 [user]
-The login test fails one run in ten; find out why.
+  The login test fails one run in ten; find out why.
 
 [tools] Run ×9, Read ×4, Edit ×2; edited tests/login.rs, src/auth.rs
 
 [assistant]
-The session cookie expires during the retry loop. I extended its lifetime in the fixture and ...
+  The session cookie expires during the retry loop. I extended its lifetime in the fixture and ...
 ```
 
-A page holds the last `--limit` messages (10 by default, at most 200): user messages, assistant text, messages delivered by other sessions and reports from subagents. Notices between them, including Claude's compaction summaries and Codex's compaction markers, come along. Each run of consecutive tool calls folds into one line with counts, failures and edited paths; `--tools` lists every call with clipped output instead. Messages are clipped to 2,000 bytes and notices to 600, with the omitted size shown; `--full` keeps them whole, except that a Codex command's output is kept to 64 KiB. The page lists oldest first, so the newest message is last. Its `Earlier:` line gives the command for the previous page, with the same options. `--json` returns the session's directory entry, the entries with their IDs and the `earlier` cursor. A forked Codex thread includes the history it replays from its parent; Codex's own instructions and environment context are left out. Reasoning never appears, and tool output appears only with `--tools`. A provider CLI in a terminal is read from the conversation it is resuming or was last seen in. Omp conversations cannot be read yet.
+A page holds the last `--limit` messages (10 by default, at most 200): user messages, assistant text, messages delivered by other sessions and reports from subagents. Notices between them, including Claude's compaction summaries and Codex's compaction markers, come along. Each run of consecutive tool calls folds into one line with counts, failures and edited paths; `--tools` lists every call with clipped output instead. Messages are clipped to 2,000 bytes and notices to 600, with the omitted size shown; `--full` keeps them whole, except that a Codex command's output is kept to 64 KiB. The page lists oldest first, so the newest message is last. Each entry's text is indented under its label, so text that quotes another transcript cannot read as an entry. A failure is summarized in one line. A listing of one channel, and a transcript's heading, show only a session's own title, never its channel's. Its `Earlier:` line gives the command for the previous page, with the same options. `--json` returns the session's directory entry, the entries with their IDs and the `earlier` cursor. A forked Codex thread includes the history it replays from its parent; Codex's own instructions and environment context are left out. Reasoning never appears, and tool output appears only with `--tools`. A provider CLI in a terminal is read from the conversation it is resuming or was last seen in. Omp conversations cannot be read yet.
 
 ## Messages between sessions
 

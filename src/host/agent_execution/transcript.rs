@@ -102,7 +102,10 @@ fn resolve(
         let mut parents = chosen.into_iter();
         return match (parents.next(), parents.next()) {
             (Some(parent), None) => Ok(parent.clone()),
-            (None, _) => Err("This caller has no live parent session".into()),
+            (None, _) if listing.caller.is_none() => {
+                Err("Not running inside a cagents session, so there is no parent".into())
+            }
+            (None, _) => Err("This session has no parent session".into()),
             (Some(_), Some(_)) => Err("The parent lineage has more than one session".into()),
         };
     }
