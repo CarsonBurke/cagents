@@ -3023,7 +3023,6 @@ fn restore_terminal_execution_authority(
 /// restore: the conversation itself was relaunched and confirmed, and windows
 /// still resolve it through the upgrade aliases.
 fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
-    use crate::agent_execution::HostedSession;
     let (registry, successor, sources) = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let (Some(registry), Some(record), Some(sources)) = (
@@ -3035,8 +3034,21 @@ fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
         };
         (registry, record.session.clone(), sources.clone())
     };
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(reason) = adopt_relaunched_agent(&mut registry, &sources, successor) {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
+fn adopt_relaunched_agent(
+    registry: &mut super::model::Registry,
+    sources: &[crate::upgrade::handoff::ChatSource],
+    successor: crate::chat::Session,
+) -> Result<bool, String> {
+    use crate::agent_execution::HostedSession;
     let mut retained = Vec::new();
-    for saved in &sources {
+    for saved in sources {
         let mut confirmed = saved.source.clone();
         confirmed.launch.session_id = saved.launch.session_id.clone();
         for issued in [saved.source.clone(), confirmed] {
@@ -3048,14 +3060,19 @@ fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
             retained.push(HostedSession::Chat(issued));
         }
     }
-    if let Err(reason) = registry
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
+    // This daemon issued the provider's capability as it started, before a
+    // relaunched paired view replaced the descriptor's terminal.
+    if let Some(HostedSession::Chat(started)) =
+        registry.retained_agent_authority_source(successor.id)?
+        && started.proof == successor.proof
+        && (crate::chat::Session {
+            terminal: successor.terminal.clone(),
+            ..started.clone()
+        }) == successor
     {
-        tracing::warn!(session = %id, %reason,
-            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+        retained.push(HostedSession::Chat(started));
     }
+    registry.adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
 }
 
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
@@ -5042,6 +5059,8 @@ mod bounded_input_upgrade_tests;
 mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
+#[cfg(test)]
+mod relaunch_lineage_tests;
 #[cfg(test)]
 mod retained_child_shutdown_tests;
 #[cfg(test)]
