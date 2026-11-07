@@ -213,7 +213,7 @@ impl Registry {
 pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> std::path::PathBuf {
     use std::os::unix::fs::OpenOptionsExt;
 
-    assert!([3, 9, 10, 12, 15, 16, 20].contains(&version));
+    assert!([3, 9, 10, 12, 15, 16, 20, 21].contains(&version));
     assert_eq!(
         source
             .db

@@ -61,7 +61,14 @@ pub(super) fn reconcile(
     }
     let socket = ensure_daemon_ready().map_err(|error| error.to_string())?;
     let id = session.id;
-    reconcile_at(session, explicit_retry, &socket, Path::new("/proc")).inspect_err(|error| {
+    reconcile_with(
+        session,
+        explicit_retry,
+        &socket,
+        Path::new("/proc"),
+        holder_of_kind,
+    )
+    .inspect_err(|error| {
         tracing::warn!(terminal = %id, explicit_retry, %error, "terminal recovery refused");
     })
 }
@@ -72,14 +79,18 @@ pub(super) fn inspect_saved_at(
     session: TerminalSession,
     socket: &Path,
 ) -> Result<RecoveredTerminal, String> {
-    reconcile_at(session, false, socket, Path::new("/proc"))
+    reconcile_with(session, false, socket, Path::new("/proc"), holder_of_kind)
 }
 
-fn reconcile_at(
+fn reconcile_with(
     session: TerminalSession,
     explicit_retry: bool,
     socket: &Path,
     proc_root: &Path,
+    holder: impl Fn(
+        crate::model::TerminalId,
+        crate::daemon::holder_registry::Kind,
+    ) -> Result<Option<i32>, String>,
 ) -> Result<RecoveredTerminal, String> {
     let expected = session
         .continuity
@@ -249,7 +260,48 @@ fn reconcile_at(
     {
         return Err("the saved agent conversation is already hosted by another terminal; preserving the live session".into());
     }
-    ensure_no_surviving_process(&session, owner, proc_root)?;
+    // A holder doesn't carry the terminal's markers, so the scan below can't see
+    // one. Only a terminal the daemon saw exit keeps a holder with nothing running
+    // in it, there to keep the output. A terminal handed over lists without an
+    // exit and may still be running. A native provider can outlive its terminal.
+    use crate::daemon::holder_registry::Kind;
+    for terminal in [session.id, replacement_id] {
+        let exited = terminals.iter().any(|listed| {
+            listed.session.id == terminal
+                && matches!(
+                    listed.session.continuity,
+                    crate::model::TerminalContinuity::RelaunchAvailable {
+                        last_exit: Some(_),
+                        ..
+                    }
+                )
+        });
+        for kind in [Kind::Terminal, Kind::Native] {
+            if exited && kind == Kind::Terminal {
+                continue;
+            }
+            if let Some(pid) = holder(terminal, kind).map_err(|error| {
+                tracing::warn!(%error, %terminal, "could not read the holder record for Retry");
+                unfinished_check_refusal()
+            })? {
+                return Err(format!(
+                    "This terminal may still be running in process {pid}, which the daemon isn't showing, {NOTHING_STARTED}: a second copy would run beside it. If you no longer need what it was running, stop that process, then use Retry or Close again. Otherwise leave the pane in place."
+                ));
+            }
+        }
+    }
+    if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root)
+        .map_err(|error| {
+            tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Retry");
+            unfinished_check_refusal()
+        })?
+    {
+        return Err(survivor_refusal(
+            &survivor,
+            NOTHING_STARTED,
+            "use Retry or Close again",
+        ));
+    }
     // Recheck the lease after process inspection. If discovery raced replacement,
     // do not authorize a launch against either incarnation.
     if crate::daemon::replacement_owner(socket, &proof)
@@ -285,6 +337,259 @@ fn reconcile_at(
         expected_host: Some(proof),
         recovery_lease,
     })
+}
+
+/// Decides whether Close may retire a saved pane whose terminal is gone, without
+/// starting, attaching to or stopping anything. `Err` is the reason to show the
+/// person, and always means the pane stays: unknown is not dead.
+pub(super) fn prove_not_hosted(session: &TerminalSession) -> Result<(), String> {
+    // A remote or agent-scoped window sees neither this daemon's lease nor the
+    // processes behind it, so nothing it can read here would prove an absence.
+    if crate::device::is_remote()
+        || crate::agent_execution::Authority::from_environment()
+            .token()
+            .is_some()
+    {
+        return Err(
+            "This window can't check whether the terminal is still running, so the pane was kept. Close it from a local Cagents window."
+                .into(),
+        );
+    }
+    let socket = crate::terminal::ipc::daemon_socket_path().map_err(|_| UNREACHABLE)?;
+    prove_not_hosted_at(session, &socket, Path::new("/proc"), registered_holder)
+}
+
+const UNREACHABLE: &str = "Cagents can't reach its daemon, so this terminal may still be running. The pane was kept. Close it again once the daemon is back.";
+const STILL_HOSTED: &str = "The daemon still has this terminal, so the pane was kept. Use Retry or Reconnect on the pane to use it.";
+const CONTINUED: &str = "A running terminal continues this one, so the pane was kept. Use Retry or Reconnect on the pane if it offers them, or stop that terminal and close the pane again.";
+/// Retry holds the lease through attachment, so waiting longer than this would
+/// leave the pane looking unresponsive to a click on Close.
+const LEASE_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(50)
+} else {
+    Duration::from_secs(5)
+};
+
+fn holder_of_kind(
+    terminal: crate::model::TerminalId,
+    kind: crate::daemon::holder_registry::Kind,
+) -> Result<Option<i32>, String> {
+    crate::daemon::holder_registry::holding_process(terminal, kind)
+        .map_err(|error| error.to_string())
+}
+
+/// A holder that this daemon didn't adopt is alive, and unlisted, by design.
+fn registered_holder(terminal: crate::model::TerminalId) -> Result<Option<i32>, String> {
+    use crate::daemon::holder_registry::Kind;
+    for kind in [Kind::Terminal, Kind::Native] {
+        if let Some(pid) = holder_of_kind(terminal, kind)? {
+            return Ok(Some(pid));
+        }
+    }
+    Ok(None)
+}
+
+/// Retry refuses too, so it isn't a way out of this one.
+fn unadopted_refusal(pid: i32) -> String {
+    format!(
+        "This terminal may still be running in process {pid}, which the daemon isn't showing, so the pane was kept. Retry can't reach that process. If you no longer need what it was running, stop it, then close the pane again. Otherwise leave the pane in place."
+    )
+}
+
+fn prove_not_hosted_at(
+    session: &TerminalSession,
+    socket: &Path,
+    proc_root: &Path,
+    holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
+) -> Result<(), String> {
+    session
+        .continuity
+        .live_proof()
+        .filter(HostSessionProof::is_complete)
+        .ok_or("This pane's saved identity is incomplete, so Cagents can't confirm its terminal has stopped. The pane was kept, and there's no way to close it yet.")?;
+    // Retry holds this from discovery through attachment, so an absence read
+    // here cannot be a replacement another window is starting.
+    let _lease = crate::daemon::RecoveryLease::acquire(socket, LEASE_WAIT).map_err(|error| {
+        match error {
+            crate::daemon::PlatformError::Io(error)
+                if error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                "Another terminal is being recovered, so the pane was kept. Close it again in a moment."
+            }
+            _ => UNREACHABLE,
+        }
+    })?;
+    let mut client = ControlClient::connect(socket).map_err(|_| UNREACHABLE)?;
+    let current = client.proof().clone();
+    if !current.is_complete() {
+        return Err(UNREACHABLE.into());
+    }
+    // A daemon stuck in startup recovery still answers inventory reads, and that
+    // inventory can be partial. This request is refused until it admits work.
+    client.daemon_version().map_err(|_| UNREACHABLE)?;
+    let terminals = client.list().map_err(|_| UNREACHABLE)?;
+    let chats = client.list_chats().map_err(|_| UNREACHABLE)?;
+    let model = client.read_workspace_model().map_err(|_| UNREACHABLE)?;
+    if terminals
+        .iter()
+        .any(|hosted| hosted.session.id == session.id)
+    {
+        return Err(STILL_HOSTED.into());
+    }
+    let origin = session.recovery_origin.unwrap_or(session.id);
+    if terminals.iter().any(|hosted| {
+        hosted
+            .upgrade_sources
+            .iter()
+            .any(|source| source.id == session.id)
+            || (hosted.session.recovery_origin == Some(origin)
+                && hosted.session.continuity.can_resume_live(&current))
+    }) {
+        return Err(CONTINUED.into());
+    }
+    if chats.iter().any(|chat| {
+        chat.id == session.id
+            || chat
+                .terminal
+                .as_ref()
+                .is_some_and(|terminal| terminal.id == session.id)
+    }) {
+        return Err("A conversation still uses this terminal, so the pane was kept. Close that conversation, then close this pane.".into());
+    }
+    // Removing the pane would leave an open agent with no way to show it.
+    if let Some(agent) = model
+        .agents
+        .iter()
+        .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
+    {
+        return Err(open_agent_refusal(agent, &chats));
+    }
+    // Authenticate the answer: reaching a socket that reports another identity
+    // is not evidence that the daemon holding the runtime's lease answered.
+    let owner = crate::daemon::replacement_owner(socket, &current).map_err(|_| UNREACHABLE)?;
+    let cannot_confirm = || {
+        "Cagents can't confirm this terminal has stopped, so the pane was kept. Try Close again in a moment. If this keeps happening, leave the pane in place.".to_owned()
+    };
+    if let Some(pid) = holder(session.id).map_err(|error| {
+        tracing::warn!(%error, terminal = %session.id, "could not read the holder record for Close");
+        cannot_confirm()
+    })? {
+        return Err(unadopted_refusal(pid));
+    }
+    // Check even when the saved boot is over. No process outlives its boot, but
+    // a replacement started on this one carries the saved terminal's lineage
+    // and stays unlisted if its daemon failed to adopt it.
+    if let Some(survivor) = crate::upgrade::surviving_process(session, owner, proc_root)
+        .map_err(|error| {
+            tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Close");
+            cannot_confirm()
+        })?
+    {
+        return Err(survivor_refusal(
+            &survivor,
+            "so the pane was kept",
+            "close the pane again",
+        ));
+    }
+    if crate::daemon::replacement_owner(socket, &current).map_err(|_| UNREACHABLE)? != owner {
+        return Err(UNREACHABLE.into());
+    }
+    Ok(())
+}
+
+const NOTHING_STARTED: &str = "so nothing was started";
+
+fn unfinished_check_refusal() -> String {
+    format!(
+        "Cagents couldn't check every running process, {NOTHING_STARTED}: this terminal may still be running. Try Retry again in a moment. If this keeps happening, leave the pane in place."
+    )
+}
+
+/// A refusal written for the reader. Any other start error is a raw backend
+/// string, which a failed pane doesn't show or copy.
+pub(super) fn is_retry_refusal(error: &str) -> bool {
+    error.contains(NOTHING_STARTED)
+}
+
+fn survivor_refusal(
+    survivor: &crate::upgrade::SurvivingProcess,
+    outcome: &str,
+    next: &str,
+) -> String {
+    use crate::upgrade::SurvivorLink;
+    let process = match &survivor.name {
+        Some(name) => format!("{name} (PID {})", survivor.pid),
+        None => format!("A process (PID {})", survivor.pid),
+    };
+    match &survivor.link {
+        SurvivorLink::Lineage => format!(
+            "{process}, started by this terminal, is still running, {outcome}. Stop it, then {next}."
+        ),
+        SurvivorLink::Conversation => format!(
+            "{process} is still running this terminal's conversation, {outcome}. Stop it, then {next}."
+        ),
+        SurvivorLink::Unit(unit) => format!(
+            "{process} is running in {unit}, the systemd unit this terminal was launched in, {outcome}. If it came from this terminal, stop it, then {next}. Otherwise the pane stays until that process exits."
+        ),
+    }
+}
+
+/// Never names a route the daemon is certain to refuse.
+fn open_agent_refusal(
+    agent: &crate::agent_execution::Agent,
+    hosted: &[crate::chat::Session],
+) -> String {
+    use crate::agent_execution::Origin;
+    if !agent_close_can_release(agent, hosted) {
+        return "An open agent still uses this terminal and Cagents can't confirm it has stopped, so the pane was kept. There's no way to close this pane yet.".into();
+    }
+    // The daemon only lets an agent's owner close it, and a person's shell owns
+    // only the agents a person started.
+    match agent.origin {
+        Origin::User => format!(
+            "An open agent still uses this terminal, so the pane was kept. Close the agent first with `cagents agent close {}`, then close the pane again.",
+            agent.id
+        ),
+        Origin::Child { .. } | Origin::Automation { .. } => "An open agent started by another session or automation still uses this terminal, so the pane was kept. Only what started it can close it. Close this pane again after that.".into(),
+    }
+}
+
+/// Whether the daemon has anything to stop this agent's session with. A launch
+/// still pending isn't visible from here, so `None` can be optimistic.
+fn agent_close_can_release(
+    agent: &crate::agent_execution::Agent,
+    hosted: &[crate::chat::Session],
+) -> bool {
+    use crate::agent_execution::HostedSession;
+    match &agent.session {
+        None => true,
+        Some(HostedSession::Terminal(_)) => false,
+        Some(HostedSession::Chat(session)) => {
+            session.closes_without_hosted_actor() || hosted.iter().any(|chat| chat.id == session.id)
+        }
+    }
+}
+
+fn agent_uses_terminal(
+    agent: &crate::agent_execution::Agent,
+    terminal: crate::model::TerminalId,
+) -> bool {
+    use crate::agent_execution::HostedSession;
+    agent
+        .console
+        .as_ref()
+        .is_some_and(|console| console.id == terminal)
+        || match &agent.session {
+            Some(HostedSession::Terminal(session)) => session.id == terminal,
+            Some(HostedSession::Chat(chat)) => {
+                chat.id == terminal
+                    || chat
+                        .terminal
+                        .as_ref()
+                        .is_some_and(|source| source.id == terminal)
+            }
+            None => false,
+        }
 }
 
 fn recovery_terminal_id(
@@ -367,6 +672,29 @@ mod tests {
         file
     }
 
+    /// A recovery that returns before the connection a test expected must fail
+    /// that test, not leave it waiting on the listener.
+    fn accept_within(listener: &UnixListener) -> std::os::unix::net::UnixStream {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        listener.set_nonblocking(true).unwrap();
+        loop {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false).unwrap();
+                    return stream;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "recovery never made the connection this test expected"
+                    );
+                    thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(error) => panic!("{error}"),
+            }
+        }
+    }
+
     fn discovery(
         socket: &Path,
         proof: HostSessionProof,
@@ -375,7 +703,7 @@ mod tests {
     ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
+            let mut stream = accept_within(&listener);
             stream
                 .set_read_timeout(Some(std::time::Duration::from_secs(5)))
                 .unwrap();
@@ -417,7 +745,7 @@ mod tests {
             // this connection. A newly returned plan must use a fresh handle.
             assert_eq!(read_frame::<ClientEnvelope>(&mut stream).unwrap(), None);
             for _ in 0..probes {
-                listener.accept().unwrap();
+                accept_within(&listener);
             }
         })
     }
@@ -817,6 +1145,233 @@ mod tests {
         assert_eq!(recovered.expected_host, Some(replacement_proof));
     }
 
+    /// Close points away from Retry here because Retry would start a second
+    /// copy beside the process it can't see.
+    #[test]
+    fn retry_starts_nothing_beside_a_live_holder() {
+        // The last is a replacement whose spawn reply was lost, with a holder of
+        // its own.
+        let cases: [fn(bool) -> Result<Option<i32>, String>; 3] = [
+            |original| Ok(original.then_some(4242)),
+            |original| {
+                if original {
+                    Err("the record can't be read".to_owned())
+                } else {
+                    Ok(None)
+                }
+            },
+            |original| Ok((!original).then_some(4242)),
+        ];
+        for holder in cases {
+            let directory = tempfile::tempdir().unwrap();
+            let socket = directory.path().join("daemon.sock");
+            let original = session(directory.path(), &proof("old"));
+            let id = original.id;
+            let replacement_proof = proof("replacement");
+            let _lease = lease(directory.path(), &replacement_proof);
+            let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+            let result =
+                reconcile_with(original, true, &socket, directory.path(), |terminal, _| {
+                    holder(terminal == id)
+                });
+            server.join().unwrap();
+            assert!(result.is_err());
+        }
+    }
+
+    /// A finished terminal's holder stays up to keep its output. The daemon lists
+    /// that terminal as ready to run again, so its holder isn't a hidden process.
+    #[test]
+    fn retry_restarts_a_finished_terminal_the_daemon_lists_despite_its_holder() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = exited(id, &original.launch);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 2);
+        let recovered = reconcile_with(
+            original,
+            true,
+            &socket,
+            directory.path(),
+            |terminal, kind| {
+                Ok(
+                    (terminal == id && kind == crate::daemon::holder_registry::Kind::Terminal)
+                        .then_some(4242),
+                )
+            },
+        );
+        // Checked first: a refusal never makes the probes the server waits for.
+        let recovered = recovered.unwrap();
+        server.join().unwrap();
+        assert_ne!(recovered.session.id, id);
+    }
+
+    /// A terminal handed over to another owner lists as ready to run again with
+    /// no recorded exit, while its process is still running.
+    #[test]
+    fn retry_refuses_beside_the_holder_of_a_terminal_with_no_recorded_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = TerminalDescriptor::relaunchable(id, original.launch.clone(), None);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 1);
+        let recovered = reconcile_with(original, true, &socket, directory.path(), |terminal, _| {
+            Ok((terminal == id).then_some(4242))
+        });
+        server.join().unwrap();
+        let Err(reason) = recovered else {
+            panic!("nothing should start beside the holder");
+        };
+        assert!(reason.contains("process 4242"), "{reason}");
+    }
+
+    /// An unreadable holder record is unknown, and its OS error isn't for the reader.
+    #[test]
+    fn retry_says_plainly_when_it_cannot_read_a_holder_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let original = session(directory.path(), &proof("old"));
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let recovered = reconcile_with(original, true, &socket, directory.path(), |_, _| {
+            Err("Permission denied (os error 13)".to_owned())
+        });
+        server.join().unwrap();
+        let Err(reason) = recovered else {
+            panic!("an unreadable record is not an absent one");
+        };
+        assert!(is_retry_refusal(&reason), "{reason}");
+        assert!(!reason.contains("os error"), "{reason}");
+    }
+
+    /// A completed terminal can still own a native provider, under the same ID.
+    #[test]
+    fn retry_refuses_beside_a_native_holder_of_a_terminal_that_exited() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = exited(id, &original.launch);
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 1);
+        let recovered = reconcile_with(
+            original,
+            true,
+            &socket,
+            directory.path(),
+            |terminal, kind| {
+                Ok(
+                    (terminal == id && kind == crate::daemon::holder_registry::Kind::Native)
+                        .then_some(4242),
+                )
+            },
+        );
+        server.join().unwrap();
+        let Err(reason) = recovered else {
+            panic!("nothing should start beside the holder");
+        };
+        assert!(reason.contains("process 4242"), "{reason}");
+    }
+
+    /// A terminal listed with no exit was handed over and may still be running in
+    /// its holder, so only a recorded exit lets Retry pass over that holder.
+    #[test]
+    fn retry_refuses_beside_the_holder_of_a_terminal_listed_without_an_exit() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let owner = proof("live");
+        let original = session(directory.path(), &owner);
+        let id = original.id;
+        let listed = TerminalDescriptor::relaunchable(id, original.launch.clone(), None);
+        assert!(matches!(
+            listed.session.continuity,
+            TerminalContinuity::RelaunchAvailable {
+                last_exit: None,
+                ..
+            }
+        ));
+        let _lease = lease(directory.path(), &owner);
+        let server = discovery(&socket, owner, vec![listed], 1);
+        let recovered = reconcile_with(
+            original,
+            true,
+            &socket,
+            directory.path(),
+            |terminal, kind| {
+                Ok(
+                    (terminal == id && kind == crate::daemon::holder_registry::Kind::Terminal)
+                        .then_some(4242),
+                )
+            },
+        );
+        server.join().unwrap();
+        let Err(reason) = recovered else {
+            panic!("nothing should start beside the holder");
+        };
+        assert!(reason.contains("process 4242"), "{reason}");
+    }
+
+    /// The refusal is shown on the pane, so it names the process to stop and not
+    /// the identifiers behind it.
+    #[test]
+    fn retry_refuses_beside_a_marked_process_in_words_a_reader_can_act_on() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let original = session(directory.path(), &proof("old"));
+        let id = original.id;
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), b"42 (sleep) S 1 42 42").unwrap();
+        fs::write(process.join("cmdline"), b"/bin/sleep\0").unwrap();
+        fs::write(
+            process.join("environ"),
+            format!("CAGENTS_TERMINAL_ID={id}\0"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(directory.path(), process.join("cwd")).unwrap();
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let error = reconcile_at(original, true, &socket, directory.path())
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert!(is_retry_refusal(&error), "{error}");
+        assert!(error.contains("PID 42"), "{error}");
+        assert!(!error.contains(&id.to_string()), "{error}");
+    }
+
+    /// A process that stays unreadable is unknown, and the reader gets words about
+    /// what to do, not the scan's own error.
+    #[test]
+    fn retry_says_plainly_when_it_cannot_check_every_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let original = session(directory.path(), &proof("old"));
+        let process = directory.path().join("42");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), b"42 (sleep) R 1 42 42").unwrap();
+        fs::write(process.join("cmdline"), b"").unwrap();
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let error = reconcile_at(original, true, &socket, directory.path())
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert!(is_retry_refusal(&error), "{error}");
+        assert!(!error.contains("cannot inspect"), "{error}");
+        assert!(!error.contains("42"), "{error}");
+    }
+
     #[test]
     fn explicit_retry_does_not_override_missing_daemon_ownership() {
         let directory = tempfile::tempdir().unwrap();
@@ -852,7 +1407,7 @@ mod tests {
             result
                 .err()
                 .unwrap()
-                .contains("cannot inspect process ancestry")
+                .contains("couldn't check every running process")
         );
     }
 
@@ -1046,5 +1601,689 @@ mod tests {
                 .unwrap_err()
                 .contains("agent session still has a live process (42)")
         );
+    }
+
+    /// What a Close proof sees. It only ever reads: Spawn, Attach, Input or any
+    /// close request panics here instead.
+    #[derive(Default)]
+    struct Inventory {
+        terminals: Vec<TerminalDescriptor>,
+        chats: Vec<crate::chat::Session>,
+        agents: Vec<crate::agent_execution::Agent>,
+        /// A daemon in startup recovery answers inventory reads but not this.
+        recovery_only: bool,
+        /// Owner authentication connects once before and once after the scan.
+        owner_probes: usize,
+    }
+
+    fn inventory(
+        socket: &Path,
+        proof: HostSessionProof,
+        inventory: Inventory,
+    ) -> thread::JoinHandle<()> {
+        let listener = UnixListener::bind(socket).unwrap();
+        thread::spawn(move || {
+            let mut stream = accept_within(&listener);
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            while let Some(request) = read_frame::<ClientEnvelope>(&mut stream).unwrap() {
+                let message = match request.request {
+                    ClientRequest::BuildInfo if inventory.recovery_only => {
+                        ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(
+                            crate::terminal::ipc::ProtocolErrorCode::TerminalUnavailable,
+                            "Startup recovery retained original ownership",
+                            false,
+                        ))
+                    }
+                    other => ServerMessage::Response {
+                        response: match other {
+                            ClientRequest::Connect { .. } => ServerResponse::Connected {
+                                proof: proof.clone(),
+                                resumed: Vec::new(),
+                            },
+                            ClientRequest::BuildInfo => ServerResponse::BuildInfo {
+                                version: "fixture".into(),
+                            },
+                            ClientRequest::List => ServerResponse::Listed {
+                                terminals: inventory.terminals.clone(),
+                            },
+                            ClientRequest::ChatList => ServerResponse::ChatListed {
+                                sessions: inventory.chats.clone(),
+                            },
+                            ClientRequest::ReadWorkspaceModel => ServerResponse::WorkspaceModel {
+                                model: crate::workspace_model::WorkspaceModel {
+                                    agents: inventory.agents.clone(),
+                                    ..Default::default()
+                                },
+                            },
+                            other => panic!("a Close proof sent {other:?}"),
+                        },
+                    },
+                };
+                write_frame(
+                    &mut stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            }
+            for _ in 0..inventory.owner_probes {
+                accept_within(&listener);
+            }
+        })
+    }
+
+    fn no_holder(_: crate::model::TerminalId) -> Result<Option<i32>, String> {
+        Ok(None)
+    }
+
+    fn reconcile_at(
+        session: TerminalSession,
+        explicit_retry: bool,
+        socket: &Path,
+        proc_root: &Path,
+    ) -> Result<RecoveredTerminal, String> {
+        reconcile_with(session, explicit_retry, socket, proc_root, |_, _| Ok(None))
+    }
+
+    fn other_boot(incarnation: &str) -> HostSessionProof {
+        HostSessionProof {
+            boot_id: crate::model::BootId::new("a-previous-boot"),
+            ..proof(incarnation)
+        }
+    }
+
+    fn exited(id: crate::model::TerminalId, launch: &LaunchRecipe) -> TerminalDescriptor {
+        let mut listed = TerminalDescriptor::relaunchable(id, launch.clone(), None);
+        listed.session.continuity = TerminalContinuity::RelaunchAvailable {
+            recipe: launch.clone(),
+            last_exit: Some(crate::model::TerminalExit {
+                code: Some(0),
+                signal: None,
+                occurred_at_unix_ms: 1,
+            }),
+        };
+        listed
+    }
+
+    fn descriptor(session: &TerminalSession) -> TerminalDescriptor {
+        let mut descriptor =
+            TerminalDescriptor::relaunchable(session.id, session.launch.clone(), None);
+        descriptor.session = session.clone();
+        descriptor
+    }
+
+    /// One process outside the daemon's tree that carries this marker.
+    fn process_with(proc_root: &Path, marker: String) {
+        let process = proc_root.join("4242");
+        fs::create_dir(&process).unwrap();
+        fs::write(process.join("stat"), "4242 (sh) S 1 4242 4242 0").unwrap();
+        fs::write(process.join("cmdline"), "sh\0").unwrap();
+        fs::write(process.join("environ"), format!("{marker}\0")).unwrap();
+    }
+
+    /// Serves `served`, and returns what a Close proof says about `saved`.
+    fn prove(
+        saved: &TerminalSession,
+        current: HostSessionProof,
+        served: Inventory,
+        proc_root: &Path,
+    ) -> Result<(), String> {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let _lease = lease(directory.path(), &current);
+        let server = inventory(&socket, current, served);
+        let result = prove_not_hosted_at(saved, &socket, proc_root, no_holder);
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn a_reboot_proves_an_unlisted_terminal_gone() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        let served = Inventory {
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("current"), served, directory.path()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_reboot_does_not_excuse_a_replacement_running_on_this_boot() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        // Started on this boot, then lost by a daemon that didn't adopt it.
+        process_with(
+            directory.path(),
+            format!("CAGENTS_RECOVERY_ORIGIN={}", saved.id),
+        );
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("4242"), "{refusal}");
+    }
+
+    #[test]
+    fn a_daemon_restart_on_the_same_boot_is_not_proof_while_a_process_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        // New session and incarnation IDs, the same kernel boot.
+        let saved = session(directory.path(), &proof("before-restart"));
+        process_with(
+            directory.path(),
+            format!("CAGENTS_TERMINAL_ID={}", saved.id),
+        );
+        let current = proof("after-restart");
+        assert_ne!(saved.continuity.live_proof().unwrap(), current);
+        assert_eq!(
+            saved.continuity.live_proof().unwrap().boot_id,
+            current.boot_id
+        );
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, current, served, directory.path()).unwrap_err();
+        assert!(refusal.contains("PID 4242"), "{refusal}");
+        assert!(refusal.contains("Stop it"), "{refusal}");
+        assert!(!refusal.contains(&saved.id.to_string()), "{refusal}");
+        assert!(!refusal.contains("automatic recovery"), "{refusal}");
+    }
+
+    /// The launch a recovery terminal saves: a named scope wrapping the provider.
+    fn in_named_scope(saved: &mut TerminalSession) {
+        saved.launch.program = "/usr/bin/systemd-run".into();
+        saved.launch.arguments = [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--unit=recovered-1",
+            "--slice=app.slice",
+            "env",
+            "claude",
+        ]
+        .map(String::from)
+        .into();
+    }
+
+    #[test]
+    fn a_process_in_the_saved_scope_is_not_proof_even_with_its_markers_cleared() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = session(directory.path(), &proof("before-restart"));
+        in_named_scope(&mut saved);
+        process_with(directory.path(), "PATH=/usr/bin".into());
+        fs::write(
+            directory.path().join("4242/cgroup"),
+            "0::/user.slice/app.slice/recovered-1.scope\n",
+        )
+        .unwrap();
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        fs::write(directory.path().join("4242/comm"), "claude\n").unwrap();
+        let refusal = prove(&saved, proof("after-restart"), served, directory.path()).unwrap_err();
+        assert!(refusal.starts_with("claude (PID 4242)"), "{refusal}");
+        // The unit name is the only link here, and another launch can reuse it.
+        assert!(refusal.contains("recovered-1"), "{refusal}");
+        assert!(
+            refusal.contains("If it came from this terminal"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_marked_process_in_the_saved_scope_is_named_as_this_terminals_own() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = session(directory.path(), &proof("before-restart"));
+        in_named_scope(&mut saved);
+        process_with(
+            directory.path(),
+            format!("CAGENTS_TERMINAL_ID={}", saved.id),
+        );
+        fs::write(
+            directory.path().join("4242/cgroup"),
+            "0::/user.slice/app.slice/recovered-1.scope\n",
+        )
+        .unwrap();
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("after-restart"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("started by this terminal"), "{refusal}");
+        assert!(!refusal.contains("If it came from"), "{refusal}");
+    }
+
+    #[test]
+    fn a_process_that_cannot_be_read_is_not_called_a_survivor() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("before-restart"));
+        process_with(directory.path(), "PATH=/usr/bin".into());
+        // An exec in progress briefly publishes no arguments.
+        fs::write(directory.path().join("4242/cmdline"), "").unwrap();
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("after-restart"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("was kept"), "{refusal}");
+        assert!(refusal.contains("in a moment"), "{refusal}");
+        assert!(!refusal.contains("Stop"), "{refusal}");
+    }
+
+    #[test]
+    fn a_process_in_another_scope_does_not_keep_a_scoped_pane() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut saved = session(directory.path(), &proof("before-restart"));
+        in_named_scope(&mut saved);
+        process_with(directory.path(), "PATH=/usr/bin".into());
+        fs::write(
+            directory.path().join("4242/cgroup"),
+            "0::/user.slice/app.slice/recovered-10.scope\n",
+        )
+        .unwrap();
+        let served = Inventory {
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("after-restart"), served, directory.path()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn a_daemon_restart_on_the_same_boot_proves_it_gone_once_nothing_survives() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("before-restart"));
+        let served = Inventory {
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("after-restart"), served, directory.path()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn an_unadopted_holder_is_not_proof_even_with_no_visible_marker() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let saved = session(directory.path(), &proof("before-restart"));
+        let current = proof("after-restart");
+        let boot = current.boot_id.clone();
+        let id = saved.id;
+        let _lease = lease(directory.path(), &current);
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let server = inventory(&socket, current, served);
+        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |terminal| {
+            assert_eq!(terminal, id);
+            Ok(Some(4242))
+        })
+        .unwrap_err();
+        server.join().unwrap();
+        assert_eq!(refusal, unadopted_refusal(4242));
+
+        // Unreadable holder evidence is unknown, not absent.
+        let socket = directory.path().join("unreadable.sock");
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let server = inventory(&socket, proof("after-restart"), served);
+        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |_| {
+            Err("unreadable".into())
+        })
+        .unwrap_err();
+        server.join().unwrap();
+        assert!(refusal.contains("can't confirm"), "{refusal}");
+    }
+
+    #[test]
+    fn a_daemon_in_startup_recovery_cannot_prove_an_absence() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        let served = Inventory {
+            recovery_only: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("current"), served, directory.path()),
+            Err(UNREACHABLE.into())
+        );
+    }
+
+    #[test]
+    fn the_same_daemon_forgetting_a_terminal_still_needs_no_surviving_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let owner = proof("same");
+        let saved = session(directory.path(), &owner);
+        process_with(
+            directory.path(),
+            format!("CAGENTS_TERMINAL_ID={}", saved.id),
+        );
+        let served = Inventory {
+            owner_probes: 1,
+            ..Default::default()
+        };
+        assert!(prove(&saved, owner, served, directory.path()).is_err());
+    }
+
+    #[test]
+    fn any_listed_identity_keeps_the_pane_whatever_proof_or_boot_it_reports() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        let served = Inventory {
+            terminals: vec![descriptor(&saved)],
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("current"), served, directory.path()),
+            Err(STILL_HOSTED.into())
+        );
+    }
+
+    #[test]
+    fn a_running_continuation_keeps_the_pane_across_a_reboot() {
+        let current = proof("current");
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+
+        let mut upgraded = session(directory.path(), &current);
+        upgraded.id = TerminalId::new();
+        let mut handed_off = descriptor(&upgraded);
+        handed_off.upgrade_sources = vec![saved.clone()];
+
+        let mut replaced = session(directory.path(), &current);
+        replaced.id = TerminalId::new();
+        replaced.recovery_origin = Some(saved.id);
+
+        for hosted in [handed_off, descriptor(&replaced)] {
+            let served = Inventory {
+                terminals: vec![hosted],
+                ..Default::default()
+            };
+            assert_eq!(
+                prove(&saved, current.clone(), served, directory.path()),
+                Err(CONTINUED.into())
+            );
+        }
+    }
+
+    #[test]
+    fn a_finished_descendant_does_not_keep_the_pane() {
+        let current = proof("current");
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        let mut replaced = session(directory.path(), &other_boot("older"));
+        replaced.id = TerminalId::new();
+        replaced.recovery_origin = Some(saved.id);
+        let served = Inventory {
+            terminals: vec![descriptor(&replaced)],
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(prove(&saved, current, served, directory.path()), Ok(()));
+    }
+
+    fn chat(
+        id: TerminalId,
+        launch: &LaunchRecipe,
+        terminal: Option<TerminalSession>,
+    ) -> crate::chat::Session {
+        crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Omp,
+                recipe: launch.clone(),
+                session_id: None,
+            },
+            proof: None,
+            terminal,
+        }
+    }
+
+    #[test]
+    fn a_conversation_using_the_terminal_keeps_the_pane_across_a_reboot() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        for chat in [
+            chat(saved.id, &saved.launch, None),
+            chat(TerminalId::new(), &saved.launch, Some(saved.clone())),
+        ] {
+            let served = Inventory {
+                chats: vec![chat],
+                ..Default::default()
+            };
+            let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+            assert!(refusal.contains("conversation"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn only_an_open_agent_using_the_terminal_keeps_the_pane() {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        let agent = |session, console, closed| Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/execution/.git".into(),
+                    directory: "/execution/cwd".into(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Channel(crate::model::ChannelId::new()),
+            session,
+            console,
+            created_ms: 1,
+            closed,
+        };
+        for open in [
+            agent(Some(HostedSession::Terminal(saved.clone())), None, false),
+            agent(None, Some(saved.clone()), false),
+            agent(
+                Some(HostedSession::Chat(chat(saved.id, &saved.launch, None))),
+                None,
+                false,
+            ),
+            agent(
+                Some(HostedSession::Chat(chat(
+                    TerminalId::new(),
+                    &saved.launch,
+                    Some(saved.clone()),
+                ))),
+                None,
+                false,
+            ),
+        ] {
+            let served = Inventory {
+                agents: vec![open],
+                ..Default::default()
+            };
+            let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+            assert!(refusal.contains("was kept"), "{refusal}");
+        }
+        let served = Inventory {
+            agents: vec![agent(
+                Some(HostedSession::Terminal(saved.clone())),
+                None,
+                true,
+            )],
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("current"), served, directory.path()),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn the_agent_refusal_names_the_close_command_only_when_it_can_work() {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        use crate::chat::NativeContinuity;
+        let launch = LaunchRecipe::shell("/execution/cwd".into()).unwrap();
+        let chat_with = |continuity| crate::chat::Session {
+            native_continuity: continuity,
+            ..chat(TerminalId::new(), &launch, None)
+        };
+        let agent = |session| Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/execution/.git".into(),
+                    directory: "/execution/cwd".into(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Channel(crate::model::ChannelId::new()),
+            session,
+            console: None,
+            created_ms: 1,
+            closed: false,
+        };
+        let lost = chat_with(NativeContinuity::RetainedClaudeActor { protocol: 2 });
+        assert!(!agent_close_can_release(
+            &agent(Some(HostedSession::Chat(lost.clone()))),
+            &[]
+        ));
+        assert!(agent_close_can_release(
+            &agent(Some(HostedSession::Chat(lost.clone()))),
+            std::slice::from_ref(&lost)
+        ));
+        assert!(!agent_close_can_release(
+            &agent(Some(HostedSession::Chat(chat_with(
+                NativeContinuity::ReconnectOnly
+            )))),
+            &[]
+        ));
+        assert!(agent_close_can_release(
+            &agent(Some(HostedSession::Chat(chat_with(
+                NativeContinuity::Durable {
+                    provider_version: "1".into()
+                }
+            )))),
+            &[]
+        ));
+        assert!(agent_close_can_release(&agent(None), &[]));
+
+        let command = |agent: &Agent| format!("cagents agent close {}", agent.id);
+        let own = agent(None);
+        assert!(open_agent_refusal(&own, &[]).contains(&command(&own)));
+        let lost_agent = agent(Some(HostedSession::Chat(lost)));
+        assert!(!open_agent_refusal(&lost_agent, &[]).contains(&command(&lost_agent)));
+        assert!(open_agent_refusal(&lost_agent, &[]).contains("no way to close"));
+        // The daemon refuses a shell closing an agent it doesn't own.
+        for origin in [
+            Origin::Child {
+                parent: crate::agent_execution::Lineage(TerminalId::new()),
+            },
+            Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+        ] {
+            let other = Agent {
+                origin,
+                ..agent(None)
+            };
+            let refusal = open_agent_refusal(&other, &[]);
+            assert!(!refusal.contains("cagents agent close"), "{refusal}");
+            assert!(refusal.contains("Only what started it"), "{refusal}");
+        }
+    }
+
+    #[test]
+    fn an_unreachable_daemon_is_not_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &other_boot("old"));
+        assert_eq!(
+            prove_not_hosted_at(
+                &saved,
+                &directory.path().join("daemon.sock"),
+                directory.path(),
+                no_holder,
+            ),
+            Err(UNREACHABLE.into())
+        );
+    }
+
+    #[test]
+    fn a_socket_that_does_not_hold_the_daemon_lease_is_not_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let saved = session(directory.path(), &other_boot("old"));
+        // Nothing holds cagentsd.lock, whatever this listener claims to be.
+        let server = inventory(&socket, proof("impostor"), Inventory::default());
+        assert_eq!(
+            prove_not_hosted_at(&saved, &socket, directory.path(), no_holder),
+            Err(UNREACHABLE.into())
+        );
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_recovery_in_progress_holds_the_proof_back_until_it_has_finished() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let saved = session(directory.path(), &other_boot("old"));
+        let _recovering = crate::daemon::RecoveryLease::acquire(&socket, Duration::ZERO).unwrap();
+        let refusal =
+            prove_not_hosted_at(&saved, &socket, directory.path(), no_holder).unwrap_err();
+        assert!(refusal.contains("being recovered"), "{refusal}");
+    }
+
+    #[test]
+    fn an_incomplete_saved_identity_is_not_proof() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut incomplete = other_boot("old");
+        incomplete.host_incarnation = HostIncarnation::new("");
+        let saved = session(directory.path(), &incomplete);
+        let refusal = prove_not_hosted_at(
+            &saved,
+            &directory.path().join("daemon.sock"),
+            directory.path(),
+            no_holder,
+        )
+        .unwrap_err();
+        assert!(refusal.contains("incomplete"), "{refusal}");
     }
 }

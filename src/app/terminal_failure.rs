@@ -55,6 +55,8 @@ pub(super) struct Details {
     worktree: Option<crate::model::WorktreeId>,
     exit: Option<crate::model::TerminalExit>,
     consequence: &'static str,
+    /// Why the last Retry started nothing, in place of what Retry would do.
+    retry_refusal: Option<String>,
 }
 fn known_failure(code: &str) -> (&'static str, &'static str) {
     match code {
@@ -132,12 +134,17 @@ impl Details {
             worktree: None,
             exit,
             consequence,
+            retry_refusal: None,
         }
     }
     fn copy_text(&self) -> String {
         let mut text = format!(
             "Code: {}\nMessage: {}\nTerminal: {}\nDirectory: {}\nRetry: {}",
-            self.code, self.message, self.terminal, self.cwd, self.consequence
+            self.code,
+            self.message,
+            self.terminal,
+            self.cwd,
+            self.retry_refusal.as_deref().unwrap_or(self.consequence)
         );
         if let Some(worktree) = self.worktree {
             text.push_str(&format!("\nWorktree: {worktree}"));
@@ -490,7 +497,14 @@ impl Cagents {
         if let Some(worktree) = details.worktree {
             rows.push(design::caption(format!("Worktree: {worktree}")).into());
         }
-        rows.push(design::caption(details.consequence).into());
+        rows.push(
+            design::caption(
+                details
+                    .retry_refusal
+                    .unwrap_or_else(|| details.consequence.to_owned()),
+            )
+            .into(),
+        );
         widget::column::with_children(rows)
             .spacing(space::XS)
             .into()
@@ -753,7 +767,23 @@ impl Cagents {
                 // Existing identity/close checks retire stale spawned handles
                 // and decrement the actual start count even after presentation
                 // was replaced or its card was closed.
-                self.terminal_started_for_operation(card, terminal, result, current_operation)
+                let refusal = result
+                    .as_ref()
+                    .err()
+                    .filter(|error| {
+                        current_operation && super::daemon_recovery::is_retry_refusal(error)
+                    })
+                    .cloned();
+                let task =
+                    self.terminal_started_for_operation(card, terminal, result, current_operation);
+                // A notice alone leaves the pane offering the Retry that just
+                // refused, with nothing on it to say why.
+                if let Some(CardRuntime::Failed(Failure::Terminal(details))) =
+                    self.cards.get_mut(&card)
+                {
+                    details.retry_refusal = refusal;
+                }
+                task
             }
         }
     }
@@ -992,6 +1022,35 @@ mod tests {
             "duplicate delivery cannot settle a new start"
         );
         drop(app.finish_terminal_start(card));
+    }
+    /// Retry that refuses has to say why where it was pressed, but a raw start
+    /// error stays out of the pane.
+    #[test]
+    fn a_refused_retry_says_why_on_the_pane_and_a_raw_error_does_not() {
+        for (error, shown) in [
+            ("Process 42 is running, so nothing was started.", true),
+            ("secret failed start", false),
+        ] {
+            let (mut app, card, _) = app_and_session();
+            drop(app.retry_card(card));
+            let attempt = app.terminal_failure.attempts[&card].clone();
+            let CardKind::Terminal(session) = &app.card_state(card).unwrap().kind else {
+                unreachable!()
+            };
+            let terminal = session.id;
+            drop(app.update_terminal_failure(Action::RetryFinished {
+                card,
+                operation: attempt.operation,
+                terminal,
+                result: Err(error.into()),
+            }));
+            let copied = app.terminal_details(card).unwrap().copy_text();
+            assert_eq!(copied.contains(error), shown, "{copied}");
+            assert_eq!(
+                app.terminal_details(card).unwrap().retry_refusal.is_some(),
+                shown
+            );
+        }
     }
     #[test]
     fn stale_retry_operation_with_same_identity_cannot_replace_newer_loading_surface() {

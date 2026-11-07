@@ -259,13 +259,19 @@ fn report_accounts(
 }
 
 fn apply(info: &mut AccountInfo, entry: Entry, now: u64) {
-    info.identity_conflict = info.registered_identity.as_ref().is_some_and(|registered| {
-        entry.identity.as_ref().is_some_and(|observed| {
-            registered.email.is_some()
-                && observed.email.is_some()
-                && !registered.same_login(observed)
-        })
-    });
+    // A login whose records disagree about who it is conflicts with itself.
+    let disputed = entry
+        .identity
+        .as_ref()
+        .is_some_and(|observed| observed.disputed_by.is_some());
+    info.identity_conflict = disputed
+        || info.registered_identity.as_ref().is_some_and(|registered| {
+            entry.identity.as_ref().is_some_and(|observed| {
+                registered.email.is_some()
+                    && observed.email.is_some()
+                    && !registered.claims_same_login(observed)
+            })
+        });
     info.observed_identity = entry.identity;
     info.set_usage(entry.snapshot, now);
 }

@@ -319,6 +319,11 @@ pub enum Intent {
     /// Put a saved card back on the conversation it was showing, by whichever
     /// route the live daemon still supports.
     Restore,
+    /// Start a new provider on the conversation of a card whose provider
+    /// exited, in place of the ended actor the daemon still holds. The daemon
+    /// retires that actor and proves it gone before the successor starts, and
+    /// nothing it held is resubmitted.
+    Resume,
 }
 
 /// A conversation that could not be put on screen, and the one thing left that
@@ -617,6 +622,15 @@ impl NativeContinuity {
     }
 }
 
+impl Session {
+    /// A holder or listener outside the daemon's actors can answer a close of
+    /// this session. Anything else has only a lost actor, which proves nothing.
+    pub fn closes_without_hosted_actor(&self) -> bool {
+        self.owned_codex_listener.is_some()
+            || matches!(self.native_continuity, NativeContinuity::Durable { .. })
+    }
+}
+
 /// Account recovery changes only account selection. It never changes the
 /// provider, conversation, executable, working directory, or launch options.
 /// Runtime identities and daemon-allocated listener paths may be refreshed.
@@ -653,6 +667,8 @@ pub fn is_account_recovery(source: &Session, replacement: &Session) -> bool {
     }
     for recipe in [&mut *original, &mut *candidate] {
         recipe.environment.remove(home);
+        // The system Claude login binds its home by leaving it unset.
+        recipe.unset_environment.remove(home);
         recipe
             .environment
             .retain(|name, _| !names.contains(&name.as_str()));
@@ -2154,7 +2170,27 @@ pub struct Item {
     pub at: Option<u64>,
 }
 
+/// A paged command's label or tool's name as the provider gave it.
+pub(crate) fn without_page_mark(label: &str) -> &str {
+    label
+        .rsplit_once(" (part ")
+        .filter(|(_, mark)| {
+            mark.strip_suffix(')')
+                .and_then(|mark| mark.split_once('/'))
+                .is_some_and(|(part, parts)| {
+                    part.parse::<usize>().is_ok() && parts.parse::<usize>().is_ok()
+                })
+        })
+        .map_or(label, |(label, _)| label)
+}
+
 impl Item {
+    /// Whether this is a later part of an item too long for one, which is still
+    /// a single thing the provider did or said.
+    pub(crate) fn continues_paged_item(&self) -> bool {
+        TranscriptPart::parse(&self.id).is_some()
+    }
+
     /// Bodies whose complete canonical bytes can be copied through the owned
     /// transcript source. Provider context uses the same field as ordinary
     /// prose; other deliveries retain their existing presentation copy rules.
@@ -2995,6 +3031,91 @@ mod tests {
         assert!(project_session.launch.recipe.arguments.is_empty());
     }
 
+    /// Moving a conversation between the system Claude login, whose home
+    /// is left unset, and a linked one is an account recovery both ways.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn moving_between_an_unset_and_a_linked_home_is_an_account_recovery() {
+        let user = |name: &str| (name == "HOME").then(|| "/home/a".to_owned());
+        let system = crate::account::Account::system(Provider::Claude);
+        let linked = crate::account::Account::linked(
+            Provider::Claude,
+            uuid::Uuid::from_u128(7),
+            "/home/a/.claude-work".into(),
+        );
+        let mut source = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+        system
+            .bind_home_in(&mut source.launch.recipe, &user)
+            .unwrap();
+        assert!(
+            source
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR")
+        );
+        let moved = |from: &Session, to: &crate::account::Account| {
+            let mut replacement = from.clone();
+            replacement.id = crate::model::TerminalId::new();
+            replacement.proof = None;
+            replacement.terminal = None;
+            to.bind_home_in(&mut replacement.launch.recipe, &user)
+                .unwrap();
+            replacement
+        };
+        let on_linked = moved(&source, &linked);
+        assert!(is_account_recovery(&source, &on_linked));
+        assert!(is_account_recovery(&on_linked, &moved(&on_linked, &system)));
+        // Staying on the same home changes no account.
+        assert!(!is_account_recovery(&source, &moved(&source, &system)));
+    }
+
+    /// A conversation on the system login exports the home its sign-in
+    /// does, and its probe reads: none unless cagents was started with one,
+    /// so the CLI keeps one record of who the login is, in `~/.claude.json`.
+    #[test]
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn a_system_conversation_exports_the_home_its_probe_reads() {
+        let system = crate::account::Account::system(Provider::Claude);
+        let session = fresh_session(
+            Provider::Claude,
+            crate::model::TerminalId::new(),
+            "/".into(),
+            &system,
+        )
+        .unwrap();
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .environment
+                .get("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from),
+            system.launch_home()
+        );
+        assert_eq!(system.probe_environment(), None);
+        // Left unset rather than out, so a daemon started with its own
+        // `CLAUDE_CONFIG_DIR` does not hand it on.
+        assert_eq!(
+            session
+                .launch
+                .recipe
+                .unset_environment
+                .contains("CLAUDE_CONFIG_DIR"),
+            system.launch_home().is_none()
+        );
+        if std::env::var_os("CLAUDE_CONFIG_DIR").is_none() {
+            assert_eq!(system.launch_home(), None);
+        }
+    }
+
     #[test]
     #[cfg(any(feature = "host", feature = "ui"))]
     fn claude_default_permissions_use_the_launch_home_and_account_settings_layer() {
@@ -3355,16 +3476,8 @@ pub(crate) fn fresh_session(
     if account.provider == provider
         && !(crate::device::is_remote()
             && matches!(account.home, crate::account::AccountHome::System))
-        && let (Some(variable), Some(home)) = (
-            crate::account::home_variable(provider),
-            account.resolved_home(),
-        )
     {
-        let home = home
-            .into_os_string()
-            .into_string()
-            .map_err(|_| "The account's home is not a path a conversation can record".to_owned())?;
-        recipe.environment.insert(variable.to_owned(), home);
+        account.bind_home(&mut recipe)?;
     }
     recipe
         .environment

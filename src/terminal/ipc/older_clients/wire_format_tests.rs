@@ -18,6 +18,11 @@ use crate::terminal_ipc::{ClientEnvelope, ServerEnvelope};
 
 const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 
+/// By full name, because other enums are also called `Response`.
+const WORK_RESPONSE: &str = "cagents::work::Response";
+const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
+const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
+
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/wire-formats")
@@ -50,8 +55,12 @@ struct Comparison<'a> {
     older: &'a Shapes,
     current: &'a Shapes,
     /// Enums whose later variants the connection withholds, by short name
-    /// (`ServerMessage`), with the older client's variant count.
+    /// (`ServerMessage`) or full path (`cagents::work::Response`), with the
+    /// older client's variant count.
     gated: Vec<(&'static str, usize)>,
+    /// Variants of the named enum that the connection refuses, so their
+    /// contents need not match. Their positions still must.
+    refused: Vec<(&'static str, &'static [&'static str])>,
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,
 }
@@ -93,7 +102,7 @@ impl Comparison<'_> {
                 let gate = self
                     .gated
                     .iter()
-                    .find(|(name, _)| *name == short(current))
+                    .find(|(name, _)| *name == short(current) || *name == current)
                     .map(|(_, count)| *count);
                 if let Some(count) = gate
                     && old.len() != count
@@ -108,6 +117,11 @@ impl Comparison<'_> {
                     };
                     if name != next {
                         self.differ(&path, format!("variant {index} is now {next}"));
+                    }
+                    if self.refused.iter().any(|(enum_name, variants)| {
+                        *enum_name == current && variants.contains(&name.as_str())
+                    }) {
+                        continue;
                     }
                     match (fields, next_fields) {
                         (Some(old), Some(new)) => self.fields(direction, old, new, &path),
@@ -185,11 +199,17 @@ impl Comparison<'_> {
     }
 }
 
-fn differences(older: &Shapes, current: &Shapes, gated: Vec<(&'static str, usize)>) -> Vec<String> {
+fn differences(
+    older: &Shapes,
+    current: &Shapes,
+    gated: Vec<(&'static str, usize)>,
+    refused: Vec<(&'static str, &'static [&'static str])>,
+) -> Vec<String> {
     let mut comparison = Comparison {
         older,
         current,
         gated,
+        refused,
         visited: BTreeSet::new(),
         differences: Vec::new(),
     };
@@ -212,7 +232,7 @@ fn variant_count(shapes: &Shapes, name: &str) -> u32 {
     let mut enums = shapes
         .containers
         .iter()
-        .filter(|(key, _)| short(key) == name)
+        .filter(|(key, _)| short(key) == name || key.as_str() == name)
         .filter_map(|(_, container)| match container {
             Container::Enum(variants) => Some(variants.len() as u32),
             _ => None,
@@ -238,8 +258,8 @@ fn this_protocols_wire_format_is_recorded() {
         return;
     }
     let recorded = recorded(PROTOCOL_VERSION);
-    let mut changed = differences(&recorded, &current, Vec::new());
-    changed.extend(differences(&current, &recorded, Vec::new()));
+    let mut changed = differences(&recorded, &current, Vec::new(), Vec::new());
+    changed.extend(differences(&current, &recorded, Vec::new(), Vec::new()));
     assert!(
         changed.is_empty(),
         "the wire format differs from protocol {PROTOCOL_VERSION}'s recording. Postcard is \
@@ -265,12 +285,16 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             (
                 client.client_requests,
                 client.server_messages,
-                client.server_responses
+                client.server_responses,
+                client.work_responses,
+                client.agent_replies
             ),
             (
                 variant_count(&older, "ClientRequest"),
                 variant_count(&older, "ServerMessage"),
                 variant_count(&older, "ServerResponse"),
+                variant_count(&older, WORK_RESPONSE),
+                variant_count(&older, AGENT_REPLY),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -281,7 +305,14 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             vec![
                 ("ServerMessage", client.server_messages as usize),
                 ("ServerResponse", client.server_responses as usize),
+                (WORK_RESPONSE, client.work_responses as usize),
+                (AGENT_REPLY, client.agent_replies as usize),
             ],
+            if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
+                vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]
+            } else {
+                Vec::new()
+            },
         );
         assert!(
             differences.is_empty(),

@@ -1,3 +1,5 @@
+cagents::stamp_version!();
+
 #[cfg(test)]
 cagents::refuse_filtered_test_run!();
 

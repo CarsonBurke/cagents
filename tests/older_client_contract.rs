@@ -9,6 +9,7 @@
 //! client runs as this test binary linked under that name.
 use cagents::{
     agent_execution::{Authority, Operation, Reply},
+    automations,
     model::HostSessionProof,
     terminal_ipc::{
         CANDIDATE_LINE_PROTOCOL, ClientEnvelope, ClientRequest, PROTOCOL_VERSION,
@@ -234,10 +235,34 @@ fn older_cli_session() {
         operation: ShutdownOperation::Preflight,
     });
     assert!(
-        unsupported_version(&refused)
-            .contains("Run the cagents CLI installed with the running daemon"),
+        unsupported_version(&refused).contains("Start a new session"),
         "{refused:?}"
     );
+
+    // A reply holding a Firing changed shape after this protocol. A run-now
+    // refused only at its reply would have started anyway.
+    for operation in [
+        automations::Request::RunNow {
+            id: uuid::Uuid::nil(),
+            execution_revision: 0,
+            request: uuid::Uuid::nil(),
+            confirmed: true,
+        },
+        automations::Request::History {
+            id: None,
+            before: None,
+            limit: 1,
+        },
+    ] {
+        let refused = older.request(ClientRequest::Automation {
+            authority: Authority::default(),
+            operation,
+        });
+        assert!(
+            unsupported_version(&refused).contains("Start a new session"),
+            "{refused:?}"
+        );
+    }
     assert!(matches!(
         older.request(ClientRequest::ChatList),
         ServerMessage::Response {

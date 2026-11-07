@@ -626,13 +626,29 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**Run history** includes runs from removed definitions. It pages through
-their original names, times, outcomes, and bounded results. Opening history does
-not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. A completion alert
-opens its run under **Automations**, with a trail back to the list, and
-survives provider cleanup. Removing a definition prevents future runs and
-retains its past runs.
+**Run history** pages through original names, times, outcomes, and bounded
+results. Consecutive scheduled skips with the same reason share one entry
+showing how many times the schedule was skipped and the first and last times, so
+a run waiting for you stays near the top instead of behind pages of skips. A
+manual request, a successful run, a different reason, or a change to what the
+automation runs starts another entry. A name-only edit keeps a group's original
+name. Time the daemon was not running is summarized without a count, because
+those times were never individually recorded.
+
+Each automation keeps up to 500 finished entries. Runs still in progress or
+needing your attention stay however old they are. A removed automation's
+finished entries are kept for 30 days and then deleted; its saved definition and
+agent sessions stay, so this limits history, not total storage. Opening an alert
+or entry whose details were already removed says they are no longer available.
+An old manual request ID still cannot run again when its details expire: retries
+report that the original request was recorded. Use a new request ID only for an
+intentional new run.
+
+Opening history does not start or attach a provider. **Open agent** explicitly
+opens a still-live session; retained completed sessions remain readable in
+history. A completion alert opens its run under **Automations**, with a trail
+back to the list, and survives provider cleanup. Removing a definition prevents
+future runs without bypassing active ownership or cleanup.
 
 The same operations are available without a window:
 
@@ -1006,18 +1022,44 @@ is also removed for provider/version compatibility.
 `CLAUDE_CONFIG_DIR` or `CODEX_HOME` as cagents was started with, otherwise
 `~/.claude` or `~/.codex`. A home cagents itself selected is never taken for it.
 Every cagents terminal and conversation exports its account's home, and one on
-a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`. A
-cagents window, daemon, or `cagents` command started from one - by you or by an
-agent - ignores a variable that still holds the listed home, or any path inside
-a cagents `accounts/<provider>/<id>` directory, when deciding the system
-default. A daemon started before this protection keeps its environment until it
-restarts.
+a managed or linked account also lists that home in `CAGENTS_ACCOUNT_HOMES`.
+The one exception is Claude's default home: unless cagents was started with
+`CLAUDE_CONFIG_DIR`, a terminal, conversation or sign-in on the System default
+Claude login leaves `CLAUDE_CONFIG_DIR` unset, as your own shell does, whichever
+cagents process starts it. Claude Code keeps who a login is in `~/.claude.json`,
+and an explicit `CLAUDE_CONFIG_DIR=~/.claude` moves that record to
+`~/.claude/.claude.json` instead, although history and credentials stay in
+`~/.claude` either way. If you set it yourself, cagents keeps it and uses that
+record too. Its terminals and conversations then list it in
+`CAGENTS_SYSTEM_HOMES`, so a cagents window, daemon or command started from
+them keeps it as well, provided the cagents daemon was started with the same
+setting; restart the daemon after changing it. Earlier versions of cagents
+exported it for every launch, so their conversations kept a second record;
+conversations saved then still resume with the setting they started with, and
+can rewrite that record.
+A cagents window, daemon, or `cagents` command started from a cagents terminal
+or conversation - by you or by an agent - ignores a variable that still holds
+the listed home, any path inside a cagents `accounts/<provider>/<id>`
+directory, or a `CLAUDE_CONFIG_DIR` naming `~/.claude` that an earlier version
+exported, when deciding the system default. A daemon started before this
+protection keeps its environment until it restarts.
 
 The Accounts pane flags a row whose home is not a login of its own: **Login
 changed** when a managed or linked home reports a different login than the one
 it was added with (the recorded login is kept; sign that account in again to
 accept the new one, or remove it), and **Same home** or **Same login** when two
 rows are the same directory or signed in to the same login.
+
+**Identity conflict** means a row's login is not known to be the one it names.
+On the System default Claude login, the two records described above name
+different logins: the row names one and lists the other beneath it, its figures
+may be either one's, and **Sign in again** settles it. Signing in again from
+your own terminal settles it as well when it changes the login `~/.claude.json`
+names. On another row, it reports the same login as a row whose records
+disagree, or as a row whose weekly limit resets at a different time, which one
+login's could not; **Sign in again** on a row whose limit differs settles which
+login it is. Neither row offers **Archive duplicate**, and neither prevents a
+new sign-in to that login.
 
 For an unchanged **Same login** row, its menu offers **Archive duplicate**.
 This hides the extra account from choices without signing out or deleting its

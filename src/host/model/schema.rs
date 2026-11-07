@@ -277,6 +277,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static NINETEEN: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -288,6 +289,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         19 => &NINETEEN,
         20 => &TWENTY,
         21 => &TWENTY_ONE,
+        22 => &TWENTY_TWO,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -778,6 +780,14 @@ mod tests {
             (15, "DROP TABLE native_actor_retirements;"),
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
+            (22, "DROP TABLE automation_precheck_history_cleanup;"),
+            (22, "DROP TABLE automation_retired_manual_requests;"),
+            (22, "DROP INDEX automation_removed_history;"),
+            (22, "DROP INDEX automation_firing_successors;"),
+            (
+                22,
+                "DROP INDEX automation_firing_successors; ALTER TABLE automation_firings DROP COLUMN previous_firing;",
+            ),
             (17, "DROP TABLE channel_work_operations;"),
             (17, "DROP TABLE channel_work_entries;"),
             (17, "DROP TABLE channel_work_homes;"),
@@ -860,7 +870,7 @@ mod tests {
 
     #[test]
     fn native_actor_schema_generations_preserve_existing_receipts_on_upgrade_and_reopen() {
-        for version in [13, 14, 15, 16, 17] {
+        for version in [13, 14, 15, 16, 17, 18] {
             let dir = fixture_dir();
             let path = dir.path().join("native-actor-generations.sqlite3");
             legacy(&path, version);
@@ -1047,7 +1057,7 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20 and run-attention21.
+            // This current opener also applies retention20, run-attention21 and history22.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1055,6 +1065,10 @@ mod tests {
                 "shared_terminal_retention_pins",
                 "shared_terminal_retention_by_terminal",
                 "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
+                "automation_removed_history",
+                "automation_firing_successors",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1067,6 +1081,8 @@ mod tests {
                 "terminal_retention_pins",
                 "shared_terminal_retention_pins",
                 "automation_run_attention",
+                "automation_precheck_history_cleanup",
+                "automation_retired_manual_requests",
             ] {
                 assert_eq!(
                     registry
@@ -1077,9 +1093,23 @@ mod tests {
                     0
                 );
             }
+            // History22 adds only this column to an existing table. SQLite writes
+            // it after the last column, ahead of the table constraints. Compare
+            // the exact original published DDL after removing those tokens.
+            let firing = inventory
+                .iter_mut()
+                .find(|object| object.1 == "automation_firings")
+                .unwrap();
+            let column = tokens(", previous_firing TEXT").unwrap();
+            let start = firing
+                .3
+                .windows(column.len())
+                .position(|tokens| tokens == column)
+                .unwrap();
+            firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes and retention objects may be added"
+                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
             );
             assert!(
                 registry
@@ -1407,7 +1437,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
