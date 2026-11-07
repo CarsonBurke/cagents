@@ -265,6 +265,25 @@ impl State {
     }
 }
 
+/// What to tell the reader when the daemon refuses a presence, if anything. A
+/// pane stays open while its terminal closes, and the presence every window
+/// publishes names each open pane, so the daemon refuses it until that terminal
+/// has gone. The retry publishes it again, and there's nothing for anyone to do.
+fn presence_refusal_notice(error: &crate::control::ControlError) -> Option<String> {
+    let settles_on_retry = matches!(
+        error,
+        crate::control::ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::TerminalUnavailable,
+            retryable: true,
+            ..
+        }
+    );
+    if settles_on_retry {
+        tracing::debug!(%error, "presence refused for now; publishing it again");
+    }
+    (!settles_on_retry).then(|| error.to_string())
+}
+
 fn connect() -> Result<ControlClient, String> {
     let socket = crate::terminal_ipc::daemon_socket_path().map_err(|error| error.to_string())?;
     ControlClient::connect(&socket).map_err(|error| error.to_string())
@@ -377,23 +396,23 @@ impl Cagents {
                         let requests =
                             std::mem::take(&mut *pending.lock().unwrap_or_else(|p| p.into_inner()));
                         let result = (|| {
-                            let mut client = connect()?;
+                            let mut client = connect().map_err(Some)?;
                             if let Some(presence) = requests.presence.clone() {
                                 client
                                     .notification_presence(presence)
-                                    .map_err(|error| error.to_string())?;
+                                    .map_err(|error| presence_refusal_notice(&error))?;
                             }
                             if requests.preferences.is_some() {
                                 client
                                     .notification_preferences(requests.preferences)
-                                    .map_err(|error| error.to_string())?;
+                                    .map_err(|error| Some(error.to_string()))?;
                             }
                             for id in &requests.acknowledged {
                                 client
                                     .acknowledge_notification(*id)
-                                    .map_err(|error| error.to_string())?;
+                                    .map_err(|error| Some(error.to_string()))?;
                             }
-                            Ok::<_, String>(())
+                            Ok::<_, Option<String>>(())
                         })();
                         if let Err(error) = result {
                             // Every command is idempotent. Retain it across a daemon
@@ -403,7 +422,9 @@ impl Cagents {
                             newer.preferences = newer.preferences.or(requests.preferences);
                             newer.acknowledged.extend(requests.acknowledged);
                             drop(newer);
-                            if last_error.as_ref() != Some(&error) {
+                            if let Some(error) = error
+                                && last_error.as_ref() != Some(&error)
+                            {
                                 last_error = Some(error.clone());
                                 let _ = sender.send_blocking(Action::Failed(error));
                             }
@@ -1371,6 +1392,26 @@ pub(super) fn card_session(card: &CardState) -> Option<TerminalId> {
 mod tests {
     use super::*;
     use crate::agent::Provider;
+
+    #[test]
+    fn a_terminal_mid_close_refusing_presence_raises_no_notice() {
+        use crate::control::ControlError;
+        use crate::terminal_ipc::ProtocolErrorCode;
+        let remote = |code, retryable| ControlError::Remote {
+            code,
+            message: "Terminal is completing retirement; retry when cleanup settles".into(),
+            retryable,
+        };
+        assert_eq!(
+            presence_refusal_notice(&remote(ProtocolErrorCode::TerminalUnavailable, true)),
+            None
+        );
+        assert!(
+            presence_refusal_notice(&remote(ProtocolErrorCode::TerminalUnavailable, false))
+                .is_some()
+        );
+        assert!(presence_refusal_notice(&remote(ProtocolErrorCode::Internal, true)).is_some());
+    }
 
     #[test]
     fn notification_preview_projection_reuses_text_and_retires_acknowledged_context() {

@@ -1129,12 +1129,7 @@ fn close(host: &SharedHost, authority: &Authority, id: AgentId) -> Result<Agent,
                                 return Err("Startup teardown remains unconfirmed; its exact cleanup owner was retained".into());
                             }
                         }
-                    } else if session.owned_codex_listener.is_some()
-                        || matches!(
-                            session.native_continuity,
-                            chat::NativeContinuity::Durable { .. }
-                        )
-                    {
+                    } else if session.closes_without_hosted_actor() {
                         // Missing history can prevent actor restoration while
                         // its authenticated provider holder is still alive.
                         // Only the holder's exact receipt releases ownership.
