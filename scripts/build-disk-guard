@@ -43,8 +43,8 @@ Environment:
                                 floor starts nothing new (default 300).
   CAGENTS_BUILD_PRUNE_ROOTS     Directories the default pruner searches,
                                 colon-separated, besides the main checkout;
-                                default: the account's ~/.cache and
-                                ~/.local/state, whatever HOME is, and /var/tmp.
+                                default: ~/.cache and ~/.local/state of the
+                                account's home and of HOME, and /var/tmp.
   CAGENTS_BUILD_PRUNE_STATE     Prefix of the pruner's schedule, lock, last
                                 output (.log) and removals (.tsv); default:
                                 /var/tmp/cagents-prune-build-dirs-UID.
