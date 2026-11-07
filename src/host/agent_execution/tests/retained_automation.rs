@@ -261,7 +261,7 @@ fn completed_retained_automation_retires_only_after_exact_idle_close() {
     );
     assert!(handle.is_completed());
     assert!(!identity.record.root.is_current());
-    assert!(!identity.record.holder.is_current());
+    assert!(identity.record.holder.reaped());
     let registry = registry(&host).unwrap();
     let registry = registry.lock().unwrap();
     assert!(registry.agent(accepted.agent.id).unwrap().closed);

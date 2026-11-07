@@ -4706,9 +4706,8 @@ IFS= read -r finish < finish
         assert_eq!(retired.source().id, source.id);
         // The retirement receipt can precede the startup reaper consuming the
         // original helper's zombie. Observe that exact incarnation disappearing.
-        completion_wait_until(|| !identity.record.holder.is_current());
         assert!(
-            !identity.record.holder.is_current(),
+            identity.record.holder.reaped(),
             "real helper was not retired"
         );
         host.lock().unwrap().chats.clear();

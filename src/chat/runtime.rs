@@ -2171,12 +2171,18 @@ impl Actor {
                         Err(error) => interrupt_error = error,
                     }
                 }
-                if self.pending.is_empty()
-                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy
-                {
+                // A result that arrives before the interrupt's acknowledgement
+                // settles the turn, but only that acknowledgement says whether
+                // it was cancelled. Returning before it drops the outcome.
+                let settled = self.pending.is_empty()
+                    && !self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
+                if settled && !self.adapter.outcome_pending() {
                     return Ok(());
                 }
                 if closing.is_some_and(|at: Instant| at.elapsed() > super::INTERRUPT_TIMEOUT) {
+                    if settled {
+                        return Err("The provider settled its turn but did not acknowledge the interruption within 30 seconds, so whether the turn was cancelled is unconfirmed".into());
+                    }
                     return Err(format!(
                         "Provider interruption was not confirmed within 30 seconds ({interrupt_error}); backend work may still be active. Inspect exact provider session before recovery"
                     ));
@@ -7712,6 +7718,82 @@ mod tests {
         assert!(!snapshot.ready);
         assert!(snapshot.error.is_none(), "{snapshot:?}");
         assert!(handle.failure().is_none());
+    }
+
+    // Closing a busy turn sends Claude an interrupt. When the turn's result was
+    // already on its way, it arrives before the interrupt's acknowledgement,
+    // and only that acknowledgement decides whether the turn was cancelled.
+    // Close must not return in between, or the settled turn has no outcome.
+    #[test]
+    fn claude_close_keeps_a_settled_turn_outcome_until_its_interrupt_is_acknowledged() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let provider = directory.path().join("claude");
+        std::fs::write(
+            &provider,
+            r#"#!/usr/bin/python3
+import json, sys, time
+def send(value): print(json.dumps(value), flush=True)
+session = next(argument.split('=', 1)[1] for argument in sys.argv[1:]
+               if argument.startswith('--session-id='))
+for line in sys.stdin:
+    frame = json.loads(line)
+    if frame.get('type') == 'user':
+        send({'type': 'system', 'subtype': 'init', 'session_id': session})
+        send(dict(frame, session_id=session))
+        send({'type': 'assistant', 'uuid': 'answer', 'session_id': session,
+              'message': {'id': 'answer', 'role': 'assistant',
+                          'content': [{'type': 'text', 'text': 'working'}]}})
+    elif frame.get('type') == 'control_request':
+        if frame['request'].get('subtype') == 'interrupt':
+            send({'type': 'result', 'uuid': 'final', 'subtype': 'success', 'is_error': False,
+                  'session_id': session, 'usage': {'input_tokens': 1, 'output_tokens': 1}})
+            time.sleep(0.5)
+        send({'type': 'control_response', 'response': {'subtype': 'success',
+              'request_id': frame['request_id'], 'response': {}}})
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&provider, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let launch = super::super::Launch {
+            provider: crate::agent::Provider::Claude,
+            recipe: crate::model::LaunchRecipe {
+                program: provider.to_string_lossy().into_owned(),
+                arguments: Vec::new(),
+                working_directory: directory.path().into(),
+                environment: BTreeMap::new(),
+                unset_environment: Default::default(),
+            },
+            session_id: None,
+        };
+        let (spec, mut adapter) = super::super::protocol::claude::create(&launch).unwrap();
+        let mut initial = adapter.initialize().unwrap();
+        let store = preflight(&spec, &mut initial).unwrap();
+        let (send, receive) = crossbeam_channel::unbounded();
+        let handle = LocalHandle::start(spec, adapter, initial, store, None, move |update| {
+            if let Update::AttentionContext { evidence, .. } = update {
+                let _ = send.send(evidence);
+            }
+        })
+        .unwrap();
+        until(&handle, |snapshot| snapshot.ready);
+        handle
+            .command(Command::Prompt {
+                text: "A turn that settles as it is closed".into(),
+                attachments: Vec::new(),
+                mode: super::super::PromptMode::Send,
+            })
+            .unwrap();
+        until(&handle, |snapshot| {
+            snapshot.busy
+                && snapshot.items.iter().any(|item| {
+                    matches!(&item.content, ItemContent::Text { text, .. } if text == "working")
+                })
+        });
+        handle.close().unwrap();
+        assert!(handle.failure().is_none());
+        let outcomes: Vec<_> = receive.try_iter().map(|evidence| evidence.kind).collect();
+        assert_eq!(outcomes, vec![crate::notifications::Kind::Cancelled]);
     }
 
     #[test]
