@@ -20,11 +20,14 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 
 /// By full name, because other enums are also called `Response`.
 const WORK_RESPONSE: &str = "cagents::work::Response";
+const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
 
 /// Fields appended to a struct that ends the frame, which an older client stops
 /// reading before. Each is named, so nothing else gets this allowance by accident.
-const APPENDED_AT_FRAME_END: &[&str] =
-    &["ServerEnvelope.message::response.response::agent::Directory.saved_transcripts"];
+const APPENDED_AT_FRAME_END: &[&str] = &[
+    "ServerEnvelope.message::response.response::agent::Directory.saved_transcripts",
+    "ServerEnvelope.message::response.response::agent::Members.saved_transcripts",
+];
 
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -341,13 +344,15 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 client.client_requests,
                 client.server_messages,
                 client.server_responses,
-                client.work_responses
+                client.work_responses,
+                client.agent_replies
             ),
             (
                 variant_count(&older, "ClientRequest"),
                 variant_count(&older, "ServerMessage"),
                 variant_count(&older, "ServerResponse"),
                 variant_count(&older, WORK_RESPONSE),
+                variant_count(&older, AGENT_REPLY),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -359,6 +364,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 ("ServerMessage", client.server_messages as usize),
                 ("ServerResponse", client.server_responses as usize),
                 (WORK_RESPONSE, client.work_responses as usize),
+                (AGENT_REPLY, client.agent_replies as usize),
             ],
             APPENDED_AT_FRAME_END,
         );
@@ -377,14 +383,16 @@ fn every_older_client_is_proven_against_its_recorded_format() {
 #[test]
 fn matched_sets_an_update_replaces_keep_their_messages() {
     let current = traced();
-    for protocol in [
-        crate::terminal_ipc::STARTUP_STATE_PROTOCOL,
-        crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
-    ] {
+    for protocol in crate::terminal_ipc::EARLIER_MATCHED_SETS {
         let older = recorded(protocol);
-        let gated = ["ServerMessage", "ServerResponse", WORK_RESPONSE]
-            .map(|name| (name, variant_count(&older, name) as usize))
-            .to_vec();
+        let gated = [
+            "ServerMessage",
+            "ServerResponse",
+            WORK_RESPONSE,
+            AGENT_REPLY,
+        ]
+        .map(|name| (name, variant_count(&older, name) as usize))
+        .to_vec();
         let differences = differences(&older, &current, gated, APPENDED_AT_FRAME_END);
         assert!(
             differences.is_empty(),

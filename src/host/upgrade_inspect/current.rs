@@ -287,16 +287,10 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![
-            119,
-            ipc::CANDIDATE_LINE_PROTOCOL,
-            ipc::STARTUP_STATE_PROTOCOL,
-            ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
-            ipc::PROTOCOL_VERSION,
-        ]
-        .contains(&self.protocol)
-            || !source.is_saved_claude_history()
-        {
+        let inspects_history = [119, ipc::CANDIDATE_LINE_PROTOCOL, ipc::PROTOCOL_VERSION]
+            .contains(&self.protocol)
+            || ipc::EARLIER_MATCHED_SETS.contains(&self.protocol);
+        if !inspects_history || !source.is_saved_claude_history() {
             return Err("Saved history has no qualified read-only inspection API".into());
         }
         let mut requested = source.clone();
@@ -401,11 +395,10 @@ pub(super) fn supports_protocol(protocol: u16) -> bool {
         103,
         119,
         ipc::CANDIDATE_LINE_PROTOCOL,
-        ipc::STARTUP_STATE_PROTOCOL,
-        ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
         ipc::PROTOCOL_VERSION,
     ]
     .contains(&protocol)
+        || ipc::EARLIER_MATCHED_SETS.contains(&protocol)
 }
 
 fn read_payload_with_limit(reader: &mut impl Read, limit: usize) -> Result<Vec<u8>, String> {
@@ -584,11 +577,11 @@ mod tests {
             103,
             119,
             ipc::CANDIDATE_LINE_PROTOCOL,
-            ipc::STARTUP_STATE_PROTOCOL,
-            ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
             ipc::PROTOCOL_VERSION,
         ]
-        .into()
+        .into_iter()
+        .chain(ipc::EARLIER_MATCHED_SETS)
+        .collect()
     }
 
     fn source_frame_version(frame: &[u8], protocol: u16) -> Vec<u8> {

@@ -206,10 +206,14 @@ use crate::{
 /// `WatchConversationPullRequests` request, its `work::Response` and the
 /// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
 /// and are not adopted here.
-/// Version 152 appends the saved-transcript list to the directory reply. A
-/// client of this version can't read that reply from an earlier daemon, while
-/// an earlier client stops reading before the list and is unaffected.
-pub const PROTOCOL_VERSION: u16 = 152;
+/// Version 155 appends two agent operations and their replies: the transcript
+/// read and the channel member listing. Versions 152 to 154 are reserved for
+/// parallel branches and are not adopted.
+/// Version 156 appends the saved-transcript list to the directory and member
+/// replies. A client of this version can't read those replies from an earlier
+/// daemon, while an earlier client stops reading before the list and is
+/// unaffected.
+pub const PROTOCOL_VERSION: u16 = 156;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -219,13 +223,11 @@ pub const PROTOCOL_VERSION: u16 = 152;
 /// the one wire difference, the device account `Restore` operation this
 /// release appended, is a request that CLI cannot send.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
-/// The matched set before the saved-transcript list. The directory reply is not
-/// among the messages an update exchanges, so an update speaks this source's
-/// protocol as it does the candidate line's.
-pub const STARTUP_STATE_PROTOCOL: u16 = 129;
-/// The matched set with inferred pull requests, also an update source: it only
-/// appended messages an update doesn't exchange.
-pub const INFERRED_PULL_REQUESTS_PROTOCOL: u16 = 151;
+/// The matched sets since the candidate line that remain update sources. Each
+/// only appended messages an update doesn't exchange, so an update speaks that
+/// source's protocol as it does the candidate line's. A protocol bump adds the
+/// number it replaces here.
+pub const EARLIER_MATCHED_SETS: [u16; 3] = [129, 151, 155];
 
 mod older_clients;
 #[cfg(test)]

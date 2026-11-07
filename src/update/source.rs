@@ -187,10 +187,11 @@ impl Client {
         protocol: u16,
     ) -> Result<Self, ControlError> {
         match protocol {
-            crate::terminal_ipc::PROTOCOL_VERSION
-            | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
-            | crate::terminal_ipc::STARTUP_STATE_PROTOCOL
-            | crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL => {
+            protocol
+                if protocol == crate::terminal_ipc::PROTOCOL_VERSION
+                    || protocol == crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+                    || crate::terminal_ipc::EARLIER_MATCHED_SETS.contains(&protocol) =>
+            {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -349,10 +350,8 @@ pub(super) fn is_qualified_source(protocol: u16) -> bool {
         protocol,
         77 | 119
             | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
-            | crate::terminal_ipc::STARTUP_STATE_PROTOCOL
-            | crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL
             | crate::terminal_ipc::PROTOCOL_VERSION
-    )
+    ) || crate::terminal_ipc::EARLIER_MATCHED_SETS.contains(&protocol)
 }
 
 /// Installed entry routing, not permission to decode or mutate an unknown
