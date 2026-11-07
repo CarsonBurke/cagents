@@ -910,8 +910,12 @@ impl Cagents {
                         self.update_ui.poll_retry = false;
                         self.update_ui.error = None;
                         if matches!(job.phase, UpdatePhase::Failed) {
-                            self.update_ui.error = Some(job.message.clone());
-                            self.status = Some(TransientNotice::error(job.message.clone()));
+                            let failure = startup_gate::update_failure(&job.message);
+                            self.update_ui.error = Some(failure.summary);
+                            // This window has already given the same steps.
+                            if !(failure.retained && self.startup_gate.retained()) {
+                                self.status = Some(failure.notice);
+                            }
                         }
                         // A review set aside returns by itself once nothing
                         // blocks the update, and never outlives its job.

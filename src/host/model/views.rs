@@ -599,22 +599,10 @@ pub(super) fn apply(
                     view.apply(change)?
                 }
                 Change::Update { before, pane } => {
-                    // Revision-only retries must not replay an old source over
-                    // a successor or undo host-owned start/location changes.
                     // Reject the whole edit before recording its operation ID;
                     // the client can refuse source intent and retry presentation
                     // separately against the authoritative pane.
-                    let source_changed = before.kind != pane.kind
-                        || before.pending_terminal_start != pane.pending_terminal_start
-                        || before.scope != pane.scope;
-                    if source_changed
-                        && !view.panes.iter().any(|current| {
-                            current.id == before.id
-                                && current.kind == before.kind
-                                && current.pending_terminal_start == before.pending_terminal_start
-                                && current.scope == before.scope
-                        })
-                    {
+                    if view.source_update_conflicts(before, pane) {
                         return Err(Registry::VIEW_SOURCE_CONFLICT.into());
                     }
                     if resource_owner(transaction, pane)?.is_some() {
@@ -1470,6 +1458,196 @@ mod tests {
             );
             assert_eq!(registry.model().unwrap(), before);
         }
+    }
+
+    #[test]
+    fn a_source_update_whose_result_already_holds_applies_its_presentation() {
+        let (mut registry, directory, channel, _) = setup();
+        let original = live_source_pane();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let mut attached = original.clone();
+        if let CardKind::Terminal(terminal) = &mut attached.kind {
+            terminal.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new("replacement"),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new("replacement"),
+            };
+        }
+        // Each window read the old record, and each reports the same attachment.
+        let mut peer = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: attached.clone(),
+            },
+        );
+        let mut writer = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        let first = edit(
+            &mut writer,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: attached.clone(),
+            },
+        );
+        writer.apply(&first).unwrap();
+        let mut titled = attached.clone();
+        titled.title = "independent title".into();
+        if let ModelEdit::ChangeView {
+            expected_revision,
+            change,
+            ..
+        } = &mut peer
+        {
+            *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+            *change = Change::Update {
+                before: original,
+                pane: titled.clone(),
+            };
+        }
+        registry.apply(&peer).unwrap();
+        assert_eq!(
+            read(&registry.db, &Scope::Channel(channel)).unwrap().panes,
+            vec![titled]
+        );
+    }
+
+    /// A pane under `live_source_pane`'s terminal, attached under another proof.
+    fn attached_under(original: &Pane, host: &str) -> Pane {
+        let mut attached = original.clone();
+        if let CardKind::Terminal(terminal) = &mut attached.kind {
+            terminal.continuity = crate::model::TerminalContinuity::Live {
+                host_session_id: crate::model::HostSessionId::new(host),
+                boot_id: crate::model::BootId::new("boot"),
+                host_incarnation: crate::model::HostIncarnation::new(host),
+            };
+        }
+        attached
+    }
+
+    /// Commits `advance` through another writer, then applies a stale client's
+    /// update from `original` to `requested`, read before that commit.
+    fn stale_update_after(
+        original: Pane,
+        requested: Pane,
+        advance: impl FnOnce(&mut Registry, ChannelId, &Pane),
+    ) -> (Result<(), String>, Vec<Pane>, Vec<crate::model::CardId>) {
+        let (mut registry, directory, channel, _) = setup();
+        seed(&mut registry, channel, vec![original.clone()]);
+        let mut stale = edit(
+            &mut registry,
+            channel,
+            Change::Update {
+                before: original.clone(),
+                pane: requested,
+            },
+        );
+        let mut writer = Registry::at(&directory.path().join("model.sqlite3")).unwrap();
+        advance(&mut writer, channel, &original);
+        if let ModelEdit::ChangeView {
+            expected_revision, ..
+        } = &mut stale
+        {
+            *expected_revision = registry.view_revision(&Scope::Channel(channel)).unwrap();
+        }
+        let result = registry.apply(&stale).map(|_| ());
+        let view = read(&registry.db, &Scope::Channel(channel)).unwrap();
+        (result, view.panes, view.retired)
+    }
+
+    #[test]
+    fn a_source_update_conflicts_unless_all_of_its_source_or_result_holds() {
+        let before = live_source_pane();
+        let result = attached_under(&before, "result");
+        let view = |current: Pane| crate::workspace_model::views::View {
+            panes: vec![current],
+            ..crate::workspace_model::views::View::empty(Scope::Channel(ChannelId::new()))
+        };
+        let conflicts = |current: Pane| view(current).source_update_conflicts(&before, &result);
+        assert!(!conflicts(before.clone()));
+        assert!(!conflicts(result.clone()));
+        assert!(conflicts(attached_under(&before, "another")));
+        for held in [&before, &result] {
+            let mut started = held.clone();
+            started.pending_terminal_start = !started.pending_terminal_start;
+            assert!(conflicts(started));
+            let mut moved = held.clone();
+            moved.scope = Some("/elsewhere".into());
+            assert!(conflicts(moved));
+        }
+        // Presentation alone never conflicts, whatever the record says now.
+        let mut titled = before.clone();
+        titled.title = "independent title".into();
+        assert!(
+            !view(attached_under(&before, "another")).source_update_conflicts(&before, &titled)
+        );
+    }
+
+    #[test]
+    fn a_stale_client_cannot_overwrite_a_newer_attachment() {
+        let original = live_source_pane();
+        let requested = attached_under(&original, "older");
+        let newer = attached_under(&original, "newer");
+        let committed = newer.clone();
+        let (result, panes, _) =
+            stale_update_after(original, requested, |writer, channel, base| {
+                let change = edit(
+                    writer,
+                    channel,
+                    Change::Update {
+                        before: base.clone(),
+                        pane: committed,
+                    },
+                );
+                writer.apply(&change).unwrap();
+            });
+        assert_eq!(result.unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+        assert_eq!(panes, vec![newer]);
+    }
+
+    #[test]
+    fn a_stale_client_cannot_revive_an_ended_terminal() {
+        let original = live_source_pane();
+        let requested = attached_under(&original, "attached");
+        // The terminal reached this proof and then ended, so the requested
+        // record is one the registry has already moved past.
+        let attached = requested.clone();
+        let mut ended = requested.clone();
+        if let CardKind::Terminal(terminal) = &mut ended.kind {
+            terminal.continuity = crate::model::TerminalContinuity::Exited {
+                last_exit: crate::model::TerminalExit {
+                    code: Some(0),
+                    signal: None,
+                    occurred_at_unix_ms: 1,
+                },
+            };
+        }
+        let committed = ended.clone();
+        let (result, panes, _) =
+            stale_update_after(original, requested, |writer, channel, base| {
+                for (before, pane) in [(base.clone(), attached.clone()), (attached, committed)] {
+                    let change = edit(writer, channel, Change::Update { before, pane });
+                    writer.apply(&change).unwrap();
+                }
+            });
+        assert_eq!(result.unwrap_err(), Registry::VIEW_SOURCE_CONFLICT);
+        assert_eq!(panes, vec![ended]);
+    }
+
+    #[test]
+    fn a_stale_client_cannot_bring_back_a_retired_terminal() {
+        let original = live_source_pane();
+        let id = original.id;
+        let requested = attached_under(&original, "attached");
+        let (result, panes, retired) =
+            stale_update_after(original, requested, |writer, channel, _| {
+                let change = edit(writer, channel, Change::Remove { id });
+                writer.apply(&change).unwrap();
+            });
+        assert!(result.is_err(), "a retired pane accepted an update");
+        assert!(panes.is_empty(), "the retired pane came back: {panes:?}");
+        assert!(retired.contains(&id));
     }
 
     #[test]
