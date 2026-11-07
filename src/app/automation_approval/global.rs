@@ -3,6 +3,8 @@
 use super::*;
 use crate::automations::{PROPOSAL_PAGE_SIZE, ProposalDelivery, ProposalSummary};
 
+const REFRESH_FAILED: &str = "Approval requests could not be refreshed. Retry when connected.";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Key {
     identity: uuid::Uuid,
@@ -233,6 +235,14 @@ impl Cagents {
         }
     }
 
+    /// The observer reports every failed reconnect. Only the first retires, so
+    /// an open review keeps its focus through an outage.
+    pub(in crate::app) fn global_proposal_watch_lost(&mut self) {
+        if self.automation_approval.global.connected {
+            self.retire_global_proposals();
+        }
+    }
+
     /// A workspace snapshot is a wake, not an atomic proposal snapshot.
     pub(in crate::app) fn refresh_global_proposals(&mut self) -> Task<Message> {
         let trigger = (self.workspace_model.identity, self.workspace_model.sequence);
@@ -303,12 +313,15 @@ impl Cagents {
                 // Reuse current UI User authority/read transport. Never start
                 // a daemon, manufacture a Child token or approve in this leaf.
                 let socket = crate::terminal::ipc::daemon_socket_path()
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|_| REFRESH_FAILED.to_owned())?;
                 let mut client = crate::control::ControlClient::connect(&socket)
-                    .map_err(|error| error.to_string())?;
+                    .map_err(|_| REFRESH_FAILED.to_owned())?;
                 client
                     .automation(authority, request)
-                    .map_err(crate::control::ControlError::reason)
+                    .map_err(|error| match error {
+                        error @ crate::control::ControlError::Remote { .. } => error.reason(),
+                        _ => REFRESH_FAILED.to_owned(),
+                    })
             })
             .await
             .map_err(|error| error.to_string())
@@ -555,11 +568,8 @@ impl Cagents {
                     (Read::Review { .. }, Err(_)) => {
                         self.automation_approval.error = Some("The request could not be refreshed. Choose Not now, then reopen it before deciding.".into());
                     }
-                    (_, Err(_)) => {
-                        self.automation_approval.global.error = Some(
-                            "Approval requests could not be refreshed. Retry when connected."
-                                .into(),
-                        );
+                    (_, Err(reason)) => {
+                        self.automation_approval.global.error = Some(reason.clone());
                     }
                     _ => {} // A stale/foreign reply never replaces a current page or consent.
                 }
@@ -591,8 +601,7 @@ impl Cagents {
             state.key = None;
             state.authorized = None;
             state.review_stale |= reviewing;
-            state.error =
-                Some("Approval requests could not be refreshed. Retry when connected.".into());
+            state.error = Some(REFRESH_FAILED.into());
             return;
         }
         let key = Key {

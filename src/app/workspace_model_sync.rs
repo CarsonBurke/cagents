@@ -609,7 +609,7 @@ impl Cagents {
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::ProposalWatchLost => {
-                self.retire_global_proposals();
+                self.global_proposal_watch_lost();
                 Task::none()
             }
             ModelUpdate::RetirementFailed { channel, error } => {

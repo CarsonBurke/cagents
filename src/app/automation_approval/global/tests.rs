@@ -727,6 +727,28 @@ fn same_clock_recovery_clears_transport_error_without_resetting_the_later_page()
 }
 
 #[test]
+fn only_the_first_failed_reconnect_retires_an_open_review() {
+    let mut app = app();
+    let lost = |app: &mut Cagents| {
+        drop(app.update(Message::WorkspaceModelObserved(
+            ModelUpdate::ProposalWatchLost,
+        )));
+    };
+    let before = app.automation_approval.generation;
+    lost(&mut app);
+    let retired = app.automation_approval.generation;
+    assert_ne!(retired, before);
+    assert!(!app.automation_approval.global.connected);
+
+    // The observer repeats this every reconnect delay during an outage.
+    let epoch = app.automation_approval.global.epoch;
+    lost(&mut app);
+    lost(&mut app);
+    assert_eq!(app.automation_approval.generation, retired);
+    assert_eq!(app.automation_approval.global.epoch, epoch);
+}
+
+#[test]
 fn a_scoped_discovery_refusal_shows_a_retry_and_offers_nothing_to_decide() {
     let mut app = app();
     let held = flight(&app);
@@ -736,7 +758,11 @@ fn a_scoped_discovery_refusal_shows_a_retry_and_offers_nothing_to_decide() {
         Err("synthetic scoped discovery refusal".into()),
     ));
     assert!(app.automation_approval.global.total.is_none());
-    assert!(app.automation_approval.global.error.is_some());
+    // The daemon's sentence says why; "retry when connected" would not help.
+    assert_eq!(
+        app.automation_approval.global.error.as_deref(),
+        Some("synthetic scoped discovery refusal"),
+    );
     assert!(app.global_proposal_banner().is_some());
 
     // Without a snapshot an Open only asks for one; it cannot reach a review.
