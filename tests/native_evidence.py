@@ -36,6 +36,16 @@ STUBS = {
             shift
         done
         export WAYLAND_DISPLAY=evidence DBUS_SESSION_BUS_ADDRESS=stub
+        over_limit() {
+            printf 'memory-capped: stopped the native evidence session because of the stub\\n' >&2
+            exit 137
+        }
+        [ "${STUB_OVER_LIMIT:-}" != at-start ] || over_limit
+        if [ "${STUB_OVER_LIMIT:-}" = later ]; then
+            $session &
+            until [ -e "$STUB_LOG/go-over" ]; do sleep 0.1; done
+            over_limit
+        fi
         $session
     """,
     "niri-harness": """
@@ -254,6 +264,38 @@ class Evidence(unittest.TestCase):
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
 
+    def test_a_session_has_a_memory_limit_made_before_its_private_environment(self):
+        source = (REPOSITORY / "scripts/native-evidence").read_text()
+        self.assertIn(
+            """setpriv --pdeathsig TERM "$tool_root/scripts/memory-capped" --name 'the native evidence session' env -u DISPLAY""",
+            source)
+
+    def test_a_session_over_its_limit_at_start_says_so(self):
+        self.built()
+        result = self.run_tool("start", "after", check=False, extra={"STUB_OVER_LIMIT": "at-start"})
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("memory-capped: stopped the native evidence session", result.stderr)
+        self.assertNotIn("the compositor exited", result.stderr)
+
+    def test_a_session_over_its_limit_later_says_so_to_whoever_comes_next(self):
+        self.built()
+        self.run_tool("start", "after", extra={"STUB_OVER_LIMIT": "later"})
+        (self.logs / "go-over").touch()
+        for _ in range(100):
+            if self.lock_is_free(self.native_lock):
+                break
+            time.sleep(0.2)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+        notice = "memory-capped: stopped the native evidence session"
+        self.assertIn(f"last session: {notice}", self.run_tool("status").stdout)
+        driven = self.run_tool("drive", "observe", check=False)
+        self.assertNotEqual(driven.returncode, 0)
+        self.assertIn(notice, driven.stderr)
+        # The next session starts clean.
+        self.run_tool("start", "after")
+        self.assertNotIn(notice, self.run_tool("status").stdout)
+        self.run_tool("stop")
+
     def test_inherited_authority_is_refused_and_never_removed(self) -> None:
         for name in AUTHORITY_NAMES:
             for value in ("", "token"):
@@ -278,6 +320,34 @@ class Evidence(unittest.TestCase):
         result = self.run_tool("build", "after", str(checkout), check=False)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("pins Zig 0.0.1", result.stderr)
+
+    def zig_behind_a_shim(self, checkout: Path) -> Path:
+        """mise's layout, whose shim would loop under a moved HOME: this stand-in fails instead."""
+        (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
+        data = self.root / "elsewhere" / "mise"
+        (data / "shims").mkdir(parents=True)
+        write_executable(data / "mise", "#!/bin/sh\nexit 99\n", self.logs)
+        (data / "shims" / "zig").symlink_to(data / "mise")
+        return data
+
+    def test_build_goes_past_a_mise_shim_to_the_pinned_zig(self) -> None:
+        checkout = self.checkout("shimmed")
+        data = self.zig_behind_a_shim(checkout)
+        install = data / "installs" / "zig" / "0.15.2"
+        install.mkdir(parents=True)
+        (install / "zig").symlink_to(self.root / "zig-install" / "zig")
+        path = os.pathsep.join([str(data / "shims"), self.env["PATH"]])
+        self.run_tool("build", "after", str(checkout), extra={"PATH": path})
+        self.assertNotIn(str(data / "shims"),
+                         (self.task / "target-after" / "evidence-source").read_text())
+
+    def test_build_says_when_the_pinned_zig_is_not_installed(self) -> None:
+        checkout = self.checkout("shimmed")
+        data = self.zig_behind_a_shim(checkout)
+        path = os.pathsep.join([str(data / "shims"), self.env["PATH"]])
+        result = self.run_tool("build", "after", str(checkout), check=False, extra={"PATH": path})
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("pinned Zig 0.15.2 is not installed", result.stderr)
 
     def test_build_holds_only_a_build_slot_and_sets_a_private_target(self) -> None:
         self.built()
@@ -734,9 +804,9 @@ class Evidence(unittest.TestCase):
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
 
-    def killed_supervisor_processes(self, signal: int) -> None:
+    def killed_supervisor_processes(self, signal: int, extra: dict | None = None) -> None:
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", extra=extra)
         for _ in range(100):
             if (self.logs / "runner").exists():
                 break
@@ -763,8 +833,25 @@ class Evidence(unittest.TestCase):
         self.assertEqual(self.fixture_process_count(), 0)
         self.assertIn("none", self.run_tool("status").stdout)
 
-    def test_stop_ends_what_a_killed_supervisor_left(self) -> None:
+    def test_a_killed_supervisor_takes_the_session_with_it_without_stop(self) -> None:
+        # Nothing else enforces --limit once the supervisor is gone. This needs
+        # the session's own scope, which an outer memory limit or no user manager
+        # rules out.
+        own_group = subprocess.run(
+            [str(REPOSITORY / "scripts/memory-capped"), "cat", "/proc/self/cgroup"],
+            env=self.env, capture_output=True, text=True, timeout=60).stdout
+        if "cagents-capped-" not in own_group:
+            self.skipTest("a session can't have a scope of its own here")
         self.killed_supervisor_processes(9)
+        for _ in range(100):
+            if self.fixture_process_count() == 0:
+                break
+            time.sleep(0.2)
+        self.assertEqual(self.fixture_process_count(), 0)
+
+    def test_stop_ends_what_a_killed_supervisor_left(self) -> None:
+        # With a limit, the session's scope goes with its supervisor and leaves nothing.
+        self.killed_supervisor_processes(9, extra={"CAGENTS_MEMORY_MAX": "0"})
         self.assertIn("lost", self.run_tool("status").stdout)
         self.assertIn("lost session", self.run_tool("stop").stdout)
         self.assertEqual(self.fixture_process_count(), 0)
