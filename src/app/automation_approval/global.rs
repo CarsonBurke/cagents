@@ -591,7 +591,8 @@ impl Cagents {
             state.key = None;
             state.authorized = None;
             state.review_stale |= reviewing;
-            state.error = Some("Approval requests could not be refreshed. Retry when connected.".into());
+            state.error =
+                Some("Approval requests could not be refreshed. Retry when connected.".into());
             return;
         }
         let key = Key {

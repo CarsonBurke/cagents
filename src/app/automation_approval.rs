@@ -155,11 +155,16 @@ impl Cagents {
                 let Some(key) = self.automation_approval.global.snapshot_key() else {
                     return self.update_global_proposals(global::Action::Refresh);
                 };
-                let Some(proposal) = self.automation_approval.available.take().filter(|proposal| {
-                    proposal.id == id
-                        && proposal.revision == revision
-                        && self.automation_approval.global.authorizes(proposal)
-                }) else {
+                let Some(proposal) = self
+                    .automation_approval
+                    .available
+                    .take()
+                    .filter(|proposal| {
+                        proposal.id == id
+                            && proposal.revision == revision
+                            && self.automation_approval.global.authorizes(proposal)
+                    })
+                else {
                     return self.update_global_proposals(global::Action::Open {
                         key,
                         id,
