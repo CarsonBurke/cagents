@@ -18,6 +18,9 @@ use crate::terminal_ipc::{ClientEnvelope, ServerEnvelope};
 
 const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 
+/// By full name, because other enums are also called `Response`.
+const WORK_RESPONSE: &str = "cagents::work::Response";
+
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/wire-formats")
@@ -50,7 +53,8 @@ struct Comparison<'a> {
     older: &'a Shapes,
     current: &'a Shapes,
     /// Enums whose later variants the connection withholds, by short name
-    /// (`ServerMessage`), with the older client's variant count.
+    /// (`ServerMessage`) or full path (`cagents::work::Response`), with the
+    /// older client's variant count.
     gated: Vec<(&'static str, usize)>,
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,
@@ -93,7 +97,7 @@ impl Comparison<'_> {
                 let gate = self
                     .gated
                     .iter()
-                    .find(|(name, _)| *name == short(current))
+                    .find(|(name, _)| *name == short(current) || *name == current)
                     .map(|(_, count)| *count);
                 if let Some(count) = gate
                     && old.len() != count
@@ -212,7 +216,7 @@ fn variant_count(shapes: &Shapes, name: &str) -> u32 {
     let mut enums = shapes
         .containers
         .iter()
-        .filter(|(key, _)| short(key) == name)
+        .filter(|(key, _)| short(key) == name || key.as_str() == name)
         .filter_map(|(_, container)| match container {
             Container::Enum(variants) => Some(variants.len() as u32),
             _ => None,
@@ -265,12 +269,14 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             (
                 client.client_requests,
                 client.server_messages,
-                client.server_responses
+                client.server_responses,
+                client.work_responses
             ),
             (
                 variant_count(&older, "ClientRequest"),
                 variant_count(&older, "ServerMessage"),
                 variant_count(&older, "ServerResponse"),
+                variant_count(&older, WORK_RESPONSE),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -281,6 +287,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             vec![
                 ("ServerMessage", client.server_messages as usize),
                 ("ServerResponse", client.server_responses as usize),
+                (WORK_RESPONSE, client.work_responses as usize),
             ],
         );
         assert!(
