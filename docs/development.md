@@ -1144,6 +1144,14 @@ refused so that the version names its exact source. If that version is already
 current, the build is skipped. After staging, older `+local` builds are removed,
 except the two most recent and any that a running process still uses.
 
+The script first fetches and checks what `HEAD` is, because a checkout nobody
+updated would install old code. It refuses a detached `HEAD` that is not the
+tip of `origin/main`, and a branch that is behind its upstream, and prints the
+command that updates the checkout, such as
+`git checkout main && git pull --ff-only`. Pass `--this-commit` to build that
+exact commit anyway, for example to install a known-good build again. Any other
+branch is built, and the script names it.
+
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).
 
