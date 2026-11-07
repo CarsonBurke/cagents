@@ -14,6 +14,7 @@ fn waiting(panes: usize) -> (Cagents, Vec<CardId>) {
         Arc::make_mut(&mut app.durable).cards.push(card);
     }
     app.startup_gate = State::fixture_opened();
+    app.startup_gate.budget = Some(launcher_budget(panes));
     // These pure gate fixtures record Pending without reserving an unpolled
     // inspection worker. Producer occupancy is exercised separately below.
     app.startup_gate.inspected = Some(Instant::now());
@@ -260,7 +261,7 @@ fn the_inventory_budget_still_caps_a_daemon_that_keeps_restoring() {
         &mut app,
         Ok(StartupState::Restoring { awaiting: 1 }),
     ));
-    elapse(&mut app, Duration::from_secs(59));
+    elapse(&mut app, launcher_budget(1) - Duration::from_secs(1));
     drop(deliver(
         &mut app,
         Ok(StartupState::Restoring { awaiting: 1 }),
@@ -971,13 +972,13 @@ fn settled_panes_wait_out_a_restore_until_the_inventory_cap() {
         Ok(StartupState::Restoring { awaiting: 1 }),
     ));
     // A restore still under way can end Retained; it is not a verdict,
-    // even past the bound a silent daemon gets and within the 30 s cap.
+    // even past the bound a silent daemon gets and within its budget.
     elapse(&mut app, SETTLED_ANSWER_BOUND + Duration::from_secs(1));
     drop(app.verify_startup_gate());
     assert!(!app.startup_gate.saving);
     assert_eq!(reported(&app), None);
-    // Settled panes leave only the base 30 s budget.
-    elapse(&mut app, Duration::from_secs(30));
+    // The budget fixed when the window opened does not shrink as panes settle.
+    elapse(&mut app, launcher_budget(2));
     drop(app.verify_startup_gate());
     let reason = reported(&app).expect("the cap bounds a restore");
     assert_readable(reason);
@@ -1090,8 +1091,7 @@ fn a_settled_answer_dropped_with_its_owner_is_not_silence() {
         &mut app,
         Ok(StartupState::Restoring { awaiting: 1 }),
     ));
-    // Past the bound a silent daemon gets, within the 30 s cap this window
-    // has once the chat closes.
+    // Past the bound a silent daemon gets, within this window's budget.
     elapse(&mut app, SETTLED_ANSWER_BOUND + Duration::from_secs(1));
     drop(app.verify_startup_gate());
     assert!(!app.startup_gate.saving);
@@ -1109,7 +1109,7 @@ fn a_settled_answer_dropped_with_its_owner_is_not_silence() {
     assert!(!app.startup_gate.saving, "a dropped Restoring is not Ready");
     assert_eq!(reported(&app), None);
     // The cap still bounds the wait for a current answer.
-    elapse(&mut app, Duration::from_secs(60));
+    elapse(&mut app, launcher_budget(2));
     drop(app.verify_startup_gate());
     let reason = reported(&app).expect("the cap bounds the wait");
     assert_readable(reason);
@@ -1296,5 +1296,249 @@ fn a_saved_chat_that_never_gets_a_runtime_is_named_once_the_daemon_is_ready() {
             "1 saved pane made no progress reconnecting for 90 seconds: \u{201c}Relaunched Codex\u{201d}. It stays"
         ),
         "{reason}"
+    );
+}
+
+/// Panes are refused while the daemon restores, so only the time after it
+/// finishes counts toward reporting one, and a slow restore is not a failure.
+#[test]
+fn a_pane_refused_while_the_daemon_restores_is_not_counted_against_it() {
+    let (mut app, cards) = waiting(1);
+    let terminal = match &app.card_state(cards[0]).unwrap().kind {
+        CardKind::Terminal(session) => session.id,
+        _ => unreachable!(),
+    };
+    app.startup_attach_failed(cards[0], terminal, "restoring".into());
+    let answer = inspection(&mut app, Ok(StartupState::Restoring { awaiting: 1 }));
+    app.startup_gate.retries.expire_window();
+    drop(app.startup_state_inspected(answer));
+    assert!(!app.startup_gate.reported, "{:?}", reported(&app));
+    assert_eq!(app.startup_pane_check(), Ok(false));
+
+    app.startup_attach_failed(cards[0], terminal, "refused for good".into());
+    let answer = inspection(&mut app, Ok(StartupState::Ready));
+    drop(app.startup_state_inspected(answer));
+    app.startup_gate.retries.expire_window();
+    assert!(
+        app.startup_pane_check().is_err(),
+        "time after the restore counts"
+    );
+}
+
+fn card_with_title(app: &mut Cagents, card: CardId, title: &str) {
+    app.card_state_mut(card).unwrap().title = title.to_owned();
+}
+
+/// Opening a failed pane offers a retry, and opening a held one only says what
+/// it waits for, so a report that names both says so of each.
+#[test]
+fn a_report_tells_held_panes_from_failed_ones() {
+    let (mut app, cards) = waiting(2);
+    card_with_title(&mut app, cards[0], "Failed");
+    card_with_title(&mut app, cards[1], "Held");
+    app.cards.insert(cards[0], CardRuntime::Completed);
+    app.shared_views.attached.insert(cards[1]);
+    app.workspace_model.identity = crate::workspace_model::NO_REGISTRY.to_owned();
+    assert!(app.startup_pane_held(cards[1]));
+    assert!(!app.startup_pane_held(cards[0]));
+
+    let report = app.startup_incomplete(&cards, &[], None);
+    assert!(
+        report.contains(
+            "1 saved pane could not reconnect: \u{201c}Failed\u{201d}. Open it to see why and retry."
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "1 saved pane is waiting for the shared workspace: \u{201c}Held\u{201d}. Nothing is needed from you now; once the workspace is ready, it reconnects when you open it."
+        ),
+        "{report}"
+    );
+
+    let held = app.startup_incomplete(&cards[1..], &[], None);
+    assert!(!held.contains("retry"), "{held}");
+}
+
+/// A report that runs out of time still says what a held pane waits for, and
+/// keeps the pane with an attempt under way apart from it.
+#[test]
+fn a_budget_report_gives_held_panes_their_next_step() {
+    let (mut app, cards) = waiting(2);
+    card_with_title(&mut app, cards[0], "Attaching");
+    card_with_title(&mut app, cards[1], "Held");
+    app.workspace_model.identity = crate::workspace_model::NO_REGISTRY.to_owned();
+    app.shared_views.attached.extend(cards.iter().copied());
+    app.begin_terminal_start(cards[0]);
+    assert!(!app.startup_pane_held(cards[0]));
+    assert!(app.startup_pane_held(cards[1]));
+
+    let pending = app.startup_pending().unwrap().unwrap();
+    let report = app.reconnecting_reason(&pending);
+    assert!(
+        report.contains("1 saved pane did not reconnect in time: \u{201c}Attaching\u{201d}."),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "1 saved pane is waiting for the shared workspace: \u{201c}Held\u{201d}. Nothing is needed from you now; once the workspace is ready, it reconnects when you open it."
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("The update has not been verified."),
+        "{report}"
+    );
+}
+
+/// A shared chat the registry has not admitted opens to its saved draft, with
+/// no retry to offer.
+#[test]
+fn a_chat_awaiting_admission_is_held() {
+    let (mut app, _) = waiting(1);
+    let chat = connected_chat(&mut app);
+    let CardKind::Chat(session) = app.card_state(chat).unwrap().kind.clone() else {
+        unreachable!()
+    };
+    assert!(!app.startup_pane_held(chat));
+    app.await_shared_chat_admission(chat, session);
+    assert!(app.chat_awaiting_admission(chat));
+    assert!(app.startup_pane_held(chat));
+    let report = app.startup_incomplete(&[chat], &[], None);
+    assert!(
+        report.contains(
+            "It reopens on its own once the workspace is ready; until then, opening it shows any unsent text."
+        ),
+        "{report}"
+    );
+    assert!(!report.contains("retry"), "{report}");
+}
+
+/// Past its limit the launcher closes the window, so a report at its longest
+/// is cut rather than sent whole.
+#[test]
+fn the_longest_report_fits_what_the_launcher_accepts() {
+    let (mut app, cards) = waiting(16);
+    for card in &cards {
+        card_with_title(&mut app, *card, &"\u{1F980}".repeat(100));
+    }
+    let detail = "\u{1F980}".repeat(1000);
+    let report = app.startup_incomplete(&cards[..8], &cards[8..], Some(&detail));
+    assert!(report.len() > 4096, "not its longest: {}", report.len());
+    let bounded = bounded_report(report);
+    assert!(bounded.len() <= MAX_REPORT_BYTES, "{}", bounded.len());
+    assert!(bounded.starts_with(instance::UI_LAUNCH_RECOVERY_INCOMPLETE_PREFIX));
+}
+
+/// A pane that has already failed stays named when another is still waiting
+/// as the budget runs out.
+#[test]
+fn a_budget_report_also_names_panes_that_failed() {
+    let (mut app, cards) = waiting(2);
+    card_with_title(&mut app, cards[0], "Failed");
+    card_with_title(&mut app, cards[1], "Waiting");
+    app.cards.insert(cards[0], CardRuntime::Completed);
+    let pending = app
+        .startup_pending()
+        .unwrap()
+        .expect("one is still waiting");
+    let report = app.reconnecting_reason(&pending);
+    assert!(report.contains("\u{201c}Waiting\u{201d}"), "{report}");
+    assert!(report.contains("\u{201c}Failed\u{201d}"), "{report}");
+    assert!(report.contains("Open it to see why and retry"), "{report}");
+}
+
+/// A daemon restoring for most of the launcher's own allowance is not failed
+/// by a window with no panes of its own.
+#[test]
+fn an_empty_window_waits_out_most_of_the_launchers_allowance() {
+    assert_eq!(launcher_budget(0), Duration::from_secs(25));
+}
+
+/// The registry store being unavailable is not something to wait out: a chat
+/// must not be told it reopens on its own, and the report must say why.
+#[test]
+fn a_chat_with_the_store_unavailable_is_not_told_it_reopens_on_its_own() {
+    let (mut app, _) = waiting(1);
+    let chat = connected_chat(&mut app);
+    let CardKind::Chat(session) = app.card_state(chat).unwrap().kind.clone() else {
+        unreachable!()
+    };
+    app.await_shared_chat_admission(chat, session);
+    app.shared_views.registry_unavailable = true;
+    assert!(!app.startup_pane_held(chat));
+    let report = app.startup_incomplete(&[chat], &[], None);
+    assert!(
+        report.contains("cannot reopen while the shared workspace is unavailable"),
+        "{report}"
+    );
+    assert!(
+        report.contains(crate::workspace_model::REGISTRY_UNAVAILABLE),
+        "{report}"
+    );
+    assert!(!report.contains("on its own"), "{report}");
+    assert!(!report.contains("Open it"), "{report}");
+}
+
+/// What an updater from before relaunch grouping writes, in a stopped update.
+const OLDER_RETAINED_JOB: &str = "primary: recovery-incomplete: the terminal service could not reconnect saved sessions after the update: Upgrade restore retained original ownership: terminal dimensions or scrollback are outside supported bounds; checkpoint retained at /home/someone/.local/state/daemon-upgrade.json. Their original processes were kept and nothing was closed or deleted; this window remains available. The update has not been verified.; window-2: recovery-incomplete: the terminal service could not reconnect saved sessions after the update: Upgrade restore retained original ownership: terminal dimensions or scrollback are outside supported bounds; checkpoint retained at /home/someone/.local/state/daemon-upgrade.json. Their original processes were kept and nothing was closed or deleted; this window remains available. The update has not been verified.";
+
+#[test]
+fn a_stopped_update_leads_with_its_steps_whichever_build_wrote_it() {
+    let current = OLDER_RETAINED_JOB.split("; window-2: ").next().unwrap();
+    let current = current
+        .strip_prefix("primary: recovery-incomplete: the")
+        .map(|rest| format!("The{rest}"))
+        .unwrap();
+    for message in [OLDER_RETAINED_JOB, current.as_str()] {
+        let failure = update_failure(message);
+        assert!(failure.retained);
+        assert_eq!(failure.notice.message, RETAINED_NOTICE);
+        assert!(failure.notice.message.contains("cagents daemon stop"));
+        assert!(!failure.summary.contains('/'), "{}", failure.summary);
+        let details = failure.notice.details.as_deref().unwrap();
+        assert!(details.contains("checkpoint retained at"), "{details}");
+        assert!(!details.contains("recovery-incomplete"), "{details}");
+        assert!(!details.contains("window-2"), "{details}");
+    }
+}
+
+#[test]
+fn a_failed_update_reads_without_window_slots_or_the_handshake_prefix() {
+    let report = "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry. Details: refused; try later.";
+    let failure = update_failure(&format!("primary: {report}; window-2: {report}"));
+    assert!(!failure.retained);
+    assert_eq!(
+        failure.notice.message,
+        "1 saved pane could not reconnect: \u{201c}A\u{201d}. Open it to see why and retry."
+    );
+    assert_eq!(
+        failure.notice.details.as_deref(),
+        Some("refused; try later")
+    );
+
+    let different = update_failure(&format!("primary: {report}; window-2: no display"));
+    assert!(
+        different.notice.message.starts_with("primary: "),
+        "{}",
+        different.notice.message
+    );
+    assert!(
+        different.notice.message.contains("window-2: No display")
+            || different
+                .notice
+                .details
+                .as_deref()
+                .is_some_and(|d| d.contains("window-2: No display"))
+    );
+
+    let other = update_failure("installed daemon startup failed; see the log");
+    assert_eq!(
+        other.notice.message,
+        "installed daemon startup failed; see the log"
+    );
+    assert_eq!(
+        other.summary,
+        "installed daemon startup failed; see the log"
     );
 }
