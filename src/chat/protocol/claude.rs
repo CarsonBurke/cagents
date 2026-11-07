@@ -1648,6 +1648,18 @@ impl Claude {
                             started_at: None,
                             at: None,
                         };
+                        // A replayed background command whose acknowledgement
+                        // the history lacks still ended as its recorded
+                        // notification says; the acknowledgement, when it
+                        // follows, settles it the same way.
+                        let mut item = item;
+                        if history
+                            && block["input"]["run_in_background"].as_bool() == Some(true)
+                            && matches!(item.content, ItemContent::Command { .. })
+                            && let Some(outcome) = self.history_outcomes.get(&tool_id)
+                        {
+                            outcome.settle(&mut item.content);
+                        }
                         // Replayed assistant envelopes must not reset a completed tool result.
                         if !self.completed_tool(child, &item.id) {
                             self.remember_tool_input(child, &tool_id, &block["input"])?;
@@ -1947,9 +1959,16 @@ impl Claude {
     /// that call starts or resumes a subagent. An Agent's task is its
     /// subagent, and a resumed agent's task names the `SendMessage` that
     /// resumed it: both report on the agent, not on work the call started.
+    ///
+    /// A background command the tool cache let go of while it ran is still
+    /// its call.
     fn task_call(&self, tool: &str) -> Option<ScopedId> {
         let mut calls = self.tools.keys().filter(|key| key.id == tool);
-        let call = calls.next()?;
+        let Some(call) = calls.next() else {
+            let mut evicted = self.evicted_launches.keys().filter(|key| key.id == tool);
+            let call = evicted.next()?;
+            return evicted.next().is_none().then(|| call.clone());
+        };
         (calls.next().is_none()
             && !matches!(
                 &self.tools[call].content,
@@ -2000,18 +2019,15 @@ impl Claude {
     /// come.
     fn settle_task_call(&mut self, tool: &str, outcome: TaskOutcome, step: &mut Step) {
         self.remember_outcome(tool, outcome.clone());
-        let found = match self.task_call(tool) {
-            Some(key) => self.tools.get(&key).cloned().map(|item| (key, item)),
-            None => {
-                // A launch the tool cache let go of while it ran.
-                let mut evicted = self.evicted_launches.keys().filter(|key| key.id == tool);
-                match (evicted.next().cloned(), evicted.next()) {
-                    (Some(key), None) => self.evicted_launches.remove(&key).map(|item| (key, item)),
-                    _ => None,
-                }
-            }
+        let Some(key) = self.task_call(tool) else {
+            return;
         };
-        let Some((key, mut item)) = found else {
+        let Some(mut item) = self
+            .tools
+            .get(&key)
+            .or_else(|| self.evicted_launches.get(&key))
+            .cloned()
+        else {
             return;
         };
         self.launches.retain(|known| known != &key);
@@ -12458,6 +12474,9 @@ mod tests {
             json!({"type":"assistant","uuid":"bash-call","parentUuid":"agent-result","sessionId":session,"message":{"id":"bash-message","content":[{"type":"tool_use","id":"bash-early","name":"Bash","input":{"command":"make","run_in_background":true}}]}}),
             json!({"type":"user","uuid":"bash-result","parentUuid":"bash-call","sessionId":session,"toolUseResult":{"backgroundTaskId":"t-bash-early"},"message":{"content":[{"type":"tool_result","tool_use_id":"bash-early","content":"Command running in background with ID: t-bash-early."}]}}),
             json!({"type":"queue-operation","operation":"enqueue","sessionId":session,"content":notification("bash-early", "failed", "Background command \"make\" failed with exit code 2")}),
+            // A launch whose acknowledgement the history lacks.
+            json!({"type":"assistant","uuid":"unacked-call","parentUuid":"bash-result","sessionId":session,"message":{"id":"unacked-message","content":[{"type":"tool_use","id":"bash-unacked","name":"Bash","input":{"command":"make check","run_in_background":true}}]}}),
+            json!({"type":"queue-operation","operation":"enqueue","sessionId":session,"content":notification("bash-unacked", "failed", "Background command \"make check\" failed with exit code 4")}),
             // More later notifications than any bounded window would keep.
             json!({"type":"queue-operation","operation":"enqueue","sessionId":session,"content":(0..MAX_TOOLS + 8)
                 .map(|n| notification(&format!("other-{n}"), "completed", "done"))
@@ -12536,6 +12555,21 @@ mod tests {
             "{:?}",
             shown_command(&replayed, "child-bash")
         );
+        assert!(
+            matches!(
+                shown_command(&replayed, "bash-unacked"),
+                Some((
+                    None,
+                    ItemContent::Command {
+                        status: ToolStatus::Failed,
+                        exit_code: Some(4),
+                        ..
+                    }
+                ))
+            ),
+            "{:?}",
+            shown_command(&replayed, "bash-unacked")
+        );
         for (tool, ended, code) in [
             ("child-queued", ToolStatus::Failed, 3),
             ("child-attached", ToolStatus::Succeeded, 0),
@@ -12563,7 +12597,10 @@ mod tests {
             adapter.receive(json!({"type":"assistant","uuid":format!("read-{n}"),"message":{"id":format!("read-message-{n}"),"content":[{"type":"tool_use","id":format!("read-{n}"),"name":"Read","input":{"file_path":"/x"}}]}})).unwrap();
         }
         assert!(!adapter.tools.contains_key(&ScopedId::new(None, "bash")));
+        let started = adapter.receive(json!({"type":"system","subtype":"task_started","task_id":"b1","tool_use_id":"bash","task_type":"local_bash","description":"Run tests"})).unwrap();
+        assert!(task_rows(&started).is_empty());
         let notified = adapter.receive(json!({"type":"system","subtype":"task_notification","task_id":"b1","tool_use_id":"bash","status":"failed","summary":"Background command \"Run tests\" failed with exit code 101","uuid":"n"})).unwrap();
+        assert!(task_rows(&notified).is_empty());
         assert!(
             matches!(
                 shown_command(&notified, "bash"),
@@ -12580,6 +12617,30 @@ mod tests {
             shown_command(&notified, "bash")
         );
         assert!(adapter.launches.is_empty() && adapter.evicted_launches.is_empty());
+
+        // The notification the model receives settles it the same way.
+        let mut adapter = Claude::default();
+        adapter.receive(json!({"type":"assistant","uuid":"call","message":{"id":"m","content":[{"type":"tool_use","id":"bash","name":"Bash","input":{"command":"cargo test","run_in_background":true}}]}})).unwrap();
+        adapter.receive(json!({"type":"user","uuid":"launch","tool_use_result":{"backgroundTaskId":"b1"},"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"bash","content":"Command running in background with ID: b1."}]}})).unwrap();
+        for n in 0..MAX_TOOLS + 8 {
+            adapter.receive(json!({"type":"assistant","uuid":format!("read-{n}"),"message":{"id":format!("read-message-{n}"),"content":[{"type":"tool_use","id":format!("read-{n}"),"name":"Read","input":{"file_path":"/x"}}]}})).unwrap();
+        }
+        let delivered = adapter.receive(json!({"type":"user","uuid":"delivered","origin":{"kind":"task-notification"},"message":{"role":"user","content":"<task-notification>\n<task-id>b1</task-id>\n<tool-use-id>bash</tool-use-id>\n<status>failed</status>\n<summary>Background command \"cargo test\" failed with exit code 101</summary>\n</task-notification>"}})).unwrap();
+        assert!(
+            matches!(
+                shown_command(&delivered, "bash"),
+                Some((
+                    None,
+                    ItemContent::Command {
+                        status: ToolStatus::Failed,
+                        exit_code: Some(101),
+                        ..
+                    }
+                ))
+            ),
+            "{:?}",
+            shown_command(&delivered, "bash")
+        );
     }
 
     /// A timeout can move a foreground command to the background, and the
