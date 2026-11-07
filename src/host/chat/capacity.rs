@@ -961,7 +961,12 @@ exit 0
             assert_eq!(witness.source(), &source);
             assert_eq!(witness.replacement(), &expected);
             let snapshot = restored.snapshot();
-            assert!(snapshot.read_only_reason.is_some());
+            assert_eq!(
+                snapshot.read_only_reason.as_deref(),
+                Some(
+                    "This conversation stopped when the computer restarted. It's read-only until you resume it. Resuming doesn't resend anything."
+                ),
+            );
             assert!(snapshot.items.iter().any(|item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text.contains("lost holder question"))));
             assert_eq!(chat::last_turn_uncertain(&snapshot.items), uncertain);
             assert!(!marker.exists(), "opening history started no provider");
@@ -2944,6 +2949,17 @@ pub(super) fn restore_saved_history(
     client: ClientId,
     session: Session,
 ) -> Result<ServerResponse, ProtocolError> {
+    open_saved_history(host, client, session, None)
+}
+
+/// `lost_reason` says why this reader exists when its holder was just found
+/// lost. Later restarts reopen the reader as ordinary saved history.
+fn open_saved_history(
+    host: &SharedHost,
+    client: ClientId,
+    session: Session,
+    lost_reason: Option<String>,
+) -> Result<ServerResponse, ProtocolError> {
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         validate_proof(session.proof.as_ref(), state.proof())?;
@@ -2980,6 +2996,7 @@ pub(super) fn restore_saved_history(
             session.clone(),
         ))
         .map_err(unavailable)?
+        .or(lost_reason)
     {
         for event in &mut initial.events {
             if let chat::Event::ReadOnlyHistory { reason } = event {
@@ -3112,7 +3129,11 @@ pub(super) fn lost_holder_history(
         None => {
             super::retained_resume::ensure_prior_boot_account(host, &reader)
                 .map_err(unavailable)?;
-            restore_saved_history(host, 0, reader.clone())?;
+            let reason = format!(
+                "{} It's read-only until you resume it. Resuming doesn't resend anything.",
+                chat::LOST_PROVIDER_REASON
+            );
+            open_saved_history(host, 0, reader.clone(), Some(reason))?;
             Ok(Some(reader))
         }
     }

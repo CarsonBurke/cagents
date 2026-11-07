@@ -2336,7 +2336,7 @@ impl Adapter for Claude {
         if self.history_only {
             self.observe_title(&mut step);
             let reason = if self.forced_history {
-                "Saved conversation history is read-only; no provider was started.".to_owned()
+                "This saved conversation isn't running. It's read-only until you resume it.".to_owned()
             } else {
                 format!(
                     "The saved working directory {} is unavailable. Conversation history is read-only.",
@@ -2363,7 +2363,7 @@ impl Adapter for Claude {
                 Command::Refresh => return Ok(Step::default()),
                 _ => {
                     return Err(
-                        "This saved conversation is read-only; no provider was started".into(),
+                        "This saved conversation is read-only until you resume it.".into(),
                     );
                 }
             }

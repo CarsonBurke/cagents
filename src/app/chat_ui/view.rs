@@ -1215,7 +1215,7 @@ fn saved_history_caption(snapshot: &chat::Snapshot) -> std::borrow::Cow<'_, str>
         snapshot
             .read_only_reason
             .as_deref()
-            .unwrap_or("Saved conversation history is read-only; no provider was started.")
+            .unwrap_or("This saved conversation isn't running. It's read-only until you resume it.")
             .into()
     }
 }
