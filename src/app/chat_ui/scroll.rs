@@ -1589,7 +1589,15 @@ impl Widget<Message, cosmic::Theme, cosmic::Renderer> for Anchored<'_> {
                 &mut virtual_viewport,
             );
             if !virtual_viewport.changed {
+                let was_revealing = state.revealing;
                 state.revealing &= self.restoration_pending;
+                if was_revealing
+                    && !state.revealing
+                    && let Some(target) = self.target
+                {
+                    tracing::trace!(target: "cagents::pane_open", stage = "transcript_reader_ready",
+                        card = ?target.card, target_generation = target.generation, child = self.subagent.is_some());
+                }
                 state.needs_layout = false;
                 break;
             }
