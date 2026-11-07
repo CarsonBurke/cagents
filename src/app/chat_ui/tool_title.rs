@@ -61,46 +61,124 @@ impl Title {
 }
 
 /// The members of a tool's input that a row can be titled from. Anything
-/// else, such as the content of a file being written, is skipped unread.
+/// else, such as the content of a file being written, is skipped unread. A
+/// member of an unexpected type is passed over on its own, so a tool whose
+/// `query` is a list still keeps the `path` beside it.
 #[derive(Default, serde::Deserialize)]
 #[serde(default)]
 struct Fields<'a> {
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     skill: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     url: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     query: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     subject: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     file_path: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     notebook_path: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     path: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     pattern: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     description: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     command: Option<Cow<'a, str>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "text")]
     to: Option<Cow<'a, str>>,
+    #[serde(deserialize_with = "lenient")]
     todos: Option<Vec<Todo>>,
-    #[serde(borrow)]
+    #[serde(borrow, deserialize_with = "lenient")]
     questions: Option<Vec<Question<'a>>>,
+}
+
+/// A member that is a string, or nothing when it is any other value. The
+/// value is read in place, so a string without escapes is borrowed and
+/// anything else is skipped without being kept.
+fn text<'de: 'a, 'a, D>(deserializer: D) -> Result<Option<Cow<'a, str>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::{IgnoredAny, MapAccess, SeqAccess, Visitor};
+    struct Text;
+    impl<'de> Visitor<'de> for Text {
+        type Value = Option<Cow<'de, str>>;
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("any value")
+        }
+        fn visit_borrowed_str<E>(self, value: &'de str) -> Result<Self::Value, E> {
+            Ok(Some(Cow::Borrowed(value)))
+        }
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E> {
+            Ok(Some(Cow::Owned(value.to_owned())))
+        }
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E> {
+            Ok(Some(Cow::Owned(value)))
+        }
+        fn visit_bool<E>(self, _: bool) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_i64<E>(self, _: i64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_u64<E>(self, _: u64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_f64<E>(self, _: f64) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_unit<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_none<E>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+        fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Self::Value, A::Error> {
+            while seq.next_element::<IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+            while map.next_entry::<IgnoredAny, IgnoredAny>()?.is_some() {}
+            Ok(None)
+        }
+    }
+    deserializer.deserialize_any(Text)
+}
+
+/// A member read as `T`, or nothing when it has another shape. Unlike
+/// [`text`], this holds the member while trying it, so it is kept to the
+/// small lists a title reads.
+fn lenient<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    #[derive(serde::Deserialize)]
+    #[serde(untagged, bound = "T: serde::Deserialize<'de>")]
+    enum Member<T> {
+        Read(T),
+        Other(serde::de::IgnoredAny),
+    }
+    Ok(
+        match <Member<T> as serde::Deserialize>::deserialize(deserializer)? {
+            Member::Read(value) => Some(value),
+            Member::Other(_) => None,
+        },
+    )
 }
 
 #[derive(serde::Deserialize)]
 struct Todo {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient")]
     status: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
 struct Question<'a> {
-    #[serde(borrow, default)]
+    #[serde(borrow, default, deserialize_with = "text")]
     question: Option<Cow<'a, str>>,
 }
 
@@ -234,6 +312,18 @@ fn after_verb(label: String) -> String {
         .unwrap_or(label)
 }
 
+/// The duration of a pause as Codex names it, "Wait 5s" or "Wait 1m 5s".
+fn codex_wait(name: &str) -> Option<&str> {
+    let duration = name.strip_prefix("Wait ")?;
+    duration
+        .split(' ')
+        .all(|part| {
+            part.strip_suffix(['s', 'm'])
+                .is_some_and(|count| !count.is_empty() && count.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .then_some(duration)
+}
+
 /// How a plan's items stand, as "2 of 5 done".
 fn plan_progress(todos: &[Todo]) -> String {
     let done = todos
@@ -306,12 +396,39 @@ impl Title {
         let fields = parsed.unwrap_or_default();
         let owned =
             |value: &Option<Cow<'_, str>>| value.as_deref().and_then(short).map(str::to_owned);
-        let named = |verb: Verb, label: Option<String>| Title {
-            verb: verb.said(status),
-            label: label.unwrap_or_default(),
-            target: String::new(),
+        // A verb that leads into what it acted on ("Searched the web for")
+        // stands alone when the input does not say what that was.
+        let named = |verb: Verb, label: Option<String>| {
+            let said = verb.said(status);
+            match label.filter(|label| !label.is_empty()) {
+                Some(label) => Title {
+                    verb: said,
+                    label,
+                    target: String::new(),
+                },
+                None => Title {
+                    verb: said.strip_suffix(" for").unwrap_or(said),
+                    ..Title::default()
+                },
+            }
         };
+        // Codex reports its own pauses by how long they last, as "Wait 5s".
+        if let Some(duration) = codex_wait(name) {
+            return named(
+                verb("Waiting", "Waited", "Tried to wait"),
+                Some(duration.to_owned()),
+            );
+        }
         match name {
+            // Codex replacing a long conversation's context with a summary.
+            "Compact context" => named(
+                verb(
+                    "Compacting the context",
+                    "Compacted the context",
+                    "Tried to compact the context",
+                ),
+                None,
+            ),
             "Skill" => named(
                 verb("Using skill", "Used skill", "Tried to use skill"),
                 owned(&fields.skill),
@@ -882,6 +999,96 @@ mod tests {
         assert_eq!(target(&"word ".repeat(200)).target, "");
         for nothing in ["", "  ", "null", "{}", "[]", "{\"partial\": \"x"] {
             assert_eq!(target(nothing).target, "", "{nothing:?}");
+        }
+    }
+
+    /// A member of an unexpected type is passed over on its own: the rest of
+    /// the input still titles the row.
+    #[test]
+    fn an_unexpected_member_leaves_the_others_readable() {
+        let done = ToolStatus::Succeeded;
+        let title = Title::of(
+            "find_symbol",
+            &json!({"path":"src/app.rs","query":["x","y"],"limit":5}).to_string(),
+            done,
+        );
+        assert_eq!(title.target, "src/app.rs");
+        assert_eq!(
+            row(
+                "Read",
+                json!({"file_path":"src/lib.rs","offset":{"line":3}}),
+                done
+            ),
+            "Read src/lib.rs"
+        );
+        assert_eq!(
+            row(
+                "TodoWrite",
+                json!({"todos":[{"status":"completed"},{"status":7}]}),
+                done
+            ),
+            "Updated the plan 1 of 2 done"
+        );
+        assert_eq!(
+            row("AskUserQuestion", json!({"questions":"Which one?"}), done),
+            "Asked"
+        );
+        assert_eq!(
+            row("Skill", json!({"skill":"tab\tescaped","args":null}), done),
+            "Used skill tab\tescaped"
+        );
+    }
+
+    /// A verb that leads into its target stands alone when the input names
+    /// none, rather than ending on "for".
+    #[test]
+    fn a_missing_target_leaves_a_complete_phrase() {
+        for (name, status, expected) in [
+            ("WebSearch", ToolStatus::Succeeded, "Searched the web"),
+            ("WebSearch", ToolStatus::Running, "Searching the web"),
+            ("WebSearch", ToolStatus::Failed, "Tried to search the web"),
+            ("Grep", ToolStatus::Succeeded, "Searched"),
+            ("ToolSearch", ToolStatus::Succeeded, "Looked up tools"),
+        ] {
+            for input in [json!({}), json!({"query":""}), json!(null)] {
+                assert_eq!(row(name, input.clone(), status), expected, "{name} {input}");
+            }
+        }
+    }
+
+    /// Codex's own pauses and context compaction read as what happened, not
+    /// as a tool that was used.
+    #[test]
+    fn codex_pauses_and_compaction_say_what_happened() {
+        for (name, status, expected) in [
+            ("Wait 5s", ToolStatus::Running, "Waiting 5s"),
+            ("Wait 5s", ToolStatus::Succeeded, "Waited 5s"),
+            ("Wait 1m 5s", ToolStatus::Succeeded, "Waited 1m 5s"),
+            ("Wait 5s", ToolStatus::Stopped, "Tried to wait 5s"),
+            (
+                "Compact context",
+                ToolStatus::Running,
+                "Compacting the context",
+            ),
+            (
+                "Compact context",
+                ToolStatus::Succeeded,
+                "Compacted the context",
+            ),
+            (
+                "Compact context",
+                ToolStatus::Failed,
+                "Tried to compact the context",
+            ),
+            // Not a duration, so not a pause Codex reported.
+            (
+                "Wait for review",
+                ToolStatus::Succeeded,
+                "Used wait for review",
+            ),
+            ("Wait 5", ToolStatus::Succeeded, "Used wait 5"),
+        ] {
+            assert_eq!(Title::of(name, "", status).line(), expected, "{name}");
         }
     }
 }

@@ -59,7 +59,9 @@ where
 /// row, the line that names the step, rather than on the whole header, whose
 /// later lines are previews of its output. The first row is the band of the
 /// first line of each element in the header's row: its icons, its verb, and
-/// the first line of the column beside them.
+/// the first line of the column beside them. No line in a header is taller
+/// than body text's, so a command that wraps onto a second line, laid out as
+/// one element, adds only its first line to the band.
 fn first_row_offset(header: &core::layout::Node, height: f32) -> f32 {
     // Through the wrappers, a button and its padding, to the row itself.
     let mut row = header;
@@ -74,7 +76,9 @@ fn first_row_offset(header: &core::layout::Node, height: f32) -> f32 {
         .map(|element| {
             let first = element.children().first();
             let top = offset + element.bounds().y + first.map_or(0.0, |first| first.bounds().y);
-            let height = first.map_or(element.bounds().height, |first| first.bounds().height);
+            let height = first
+                .map_or(element.bounds().height, |first| first.bounds().height)
+                .min(crate::design::LINE_BODY);
             (top, top + height)
         })
         .reduce(|(top, bottom), (t, b)| (top.min(t), bottom.max(b)));
@@ -811,14 +815,19 @@ mod tests {
     /// A header whose name is followed by a preview of its output keeps its
     /// actions on the name's line, open or closed, rather than centred
     /// between the name and the preview, so opening a row does not move them.
+    /// A command that wraps onto a second line, one element however many
+    /// lines it takes, keeps them on its first line as well.
     #[test]
     fn actions_sit_on_a_two_line_headers_first_line() {
-        // A row's header: its glyph beside the name over a taller preview.
-        let header = || -> Test<'static> {
+        let line = crate::design::LINE_BODY;
+        // A row's header: its glyph beside a name `lines` tall over a taller
+        // preview.
+        let header = |lines: f32| -> Test<'static> {
             cosmic::widget::button::custom(
                 iced::widget::row![
                     fixed(14.0, 14.0),
-                    iced::widget::column![fixed(100.0, 20.0), fixed(100.0, 40.0)].spacing(4.0),
+                    iced::widget::column![fixed(100.0, line * lines), fixed(100.0, 40.0)]
+                        .spacing(4.0),
                 ]
                 .spacing(8.0),
             )
@@ -835,20 +844,27 @@ mod tests {
                 &Limits::new(Size::ZERO, Size::new(520.0, 1000.0)),
             )
         };
-        let open = lay_out(beside_first(
-            header(),
-            fixed(24.0, 20.0),
-            fixed(100.0, 50.0),
-            4.0,
-        ));
-        let [header_bounds, actions, _] = parts(&open);
-        assert_eq!(header_bounds.height, 4.0 + 20.0 + 4.0 + 40.0 + 4.0);
-        // The name's line spans 4..24 within the header's padding.
-        assert_eq!(actions.y, 4.0);
-        let closed = lay_out(view(header(), fixed(24.0, 20.0), 4.0));
-        let mut children = Layout::new(&closed).children().map(|child| child.bounds());
-        let (_, closed_actions) = (children.next().unwrap(), children.next().unwrap());
-        assert_eq!(closed_actions.y, actions.y);
+        // The name's first line spans 4..4 + line within the header's padding.
+        let on_first_line = 4.0 + (line - 20.0) / 2.0;
+        for lines in [1.0, 2.0] {
+            let open = lay_out(beside_first(
+                header(lines),
+                fixed(24.0, 20.0),
+                fixed(100.0, 50.0),
+                4.0,
+            ));
+            let [header_bounds, actions, _] = parts(&open);
+            assert_eq!(
+                header_bounds.height,
+                4.0 + line * lines + 4.0 + 40.0 + 4.0,
+                "{lines}"
+            );
+            assert_eq!(actions.y, on_first_line, "{lines}");
+            let closed = lay_out(view(header(lines), fixed(24.0, 20.0), 4.0));
+            let mut children = Layout::new(&closed).children().map(|child| child.bounds());
+            let (_, closed_actions) = (children.next().unwrap(), children.next().unwrap());
+            assert_eq!(closed_actions.y, actions.y, "{lines}");
+        }
     }
 
     /// Where the actions are too wide to share a narrow row, they move under

@@ -630,6 +630,9 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
             _ => verb("Editing", "Edited", "Tried to edit"),
         }
         .said(*status),
+        // A search reported before its query, as Codex can, says only that
+        // it searched rather than leaving "for" without what followed it.
+        ItemContent::WebSearch { query, .. } if query.trim().is_empty() => "Searched the web",
         ItemContent::WebSearch { .. } => "Searched the web for",
         ItemContent::Tool { .. } => "",
         ItemContent::Image { .. } => "Viewed",
@@ -1683,6 +1686,13 @@ mod tests {
         assert_eq!(step_verb(&edit(ToolStatus::Running)), "Editing");
         assert_eq!(step_verb(&edit(ToolStatus::Succeeded)), "Edited");
         assert_eq!(step_verb(&edit(ToolStatus::Denied)), "Tried to edit");
+        // A search reported before its query ends on what it did, not "for".
+        let search = |query: &str| ItemContent::WebSearch {
+            query: query.into(),
+            results: Vec::new(),
+        };
+        assert_eq!(step_verb(&search(" ")), "Searched the web");
+        assert_eq!(step_verb(&search("iced")), "Searched the web for");
     }
 
     /// Tool rows say what each call did, and the group counts them as tools
