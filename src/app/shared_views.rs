@@ -1893,21 +1893,30 @@ impl Cagents {
     /// Why `card` cannot change what its session runs as, when another pane
     /// holds that session.
     pub(super) fn session_held_elsewhere_reason(&self, card: CardId) -> Option<String> {
-        let (view, _) = self.pane_holding_card_session(card, &[])?;
-        Some(format!(
-            "This conversation is now in {}. Switch views from there.",
-            self.scope_display_name(&view.scope)
-        ))
+        self.session_held_elsewhere_directions(card, "Switch views from there.")
     }
 
     /// Why `card` cannot start a provider on its session, when another pane
     /// holds that session: starting one retires the actor that pane shows.
     pub(super) fn session_held_elsewhere_start_refusal(&self, card: CardId) -> Option<String> {
+        self.session_held_elsewhere_directions(card, "Resume it from there.")
+    }
+
+    /// Where `card`'s session has gone, and how to reach it. A card still held
+    /// here also keeps the destination from showing the session in this window,
+    /// so sending the reader there has to come after what releases the card.
+    fn session_held_elsewhere_directions(&self, card: CardId, there: &str) -> Option<String> {
         let (view, _) = self.pane_holding_card_session(card, &[])?;
-        Some(format!(
-            "This conversation is now in {}. Resume it from there.",
-            self.scope_display_name(&view.scope)
-        ))
+        let place = self.scope_display_name(&view.scope);
+        Some(if self.chat_closed_elsewhere_here(card) {
+            format!("This conversation is also in {place}. Close this card first. {there}")
+        } else if self.shared_views.blocked_aliases.contains_key(&card) {
+            format!(
+                "This conversation moves to {place} once what's waiting here is finished or cleared. {there}"
+            )
+        } else {
+            format!("This conversation is now in {place}. {there}")
+        })
     }
 
     /// What going without `card` leaves behind, when another pane holds its session.

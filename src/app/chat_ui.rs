@@ -5263,7 +5263,9 @@ impl Runtime {
     /// it and a returning runtime restores it, so typing a single character no
     /// longer makes the card impossible to leave. Managed image receipts are
     /// stashed alongside it. Legacy path-only attachments and half-entered
-    /// request answers still need this runtime.
+    /// request answers still need this runtime, except answers to a provider
+    /// that has exited: nothing can take them, and the card no longer lets the
+    /// reader change them, so holding a card for them would never end.
     pub(super) fn transition_blocker(&self) -> Option<&'static str> {
         if self.attachment_chooser_pending.is_some() {
             Some("Finish or cancel the file chooser before leaving the chat.")
@@ -5287,10 +5289,11 @@ impl Runtime {
             })
         {
             Some("Send or remove the attached files before leaving the chat.")
-        } else if self
-            .answers
-            .values()
-            .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
+        } else if !self.snapshot.exited
+            && self
+                .answers
+                .values()
+                .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
         {
             Some("Submit or clear the answer you started before leaving the chat.")
         } else {
@@ -22281,6 +22284,45 @@ mod tests {
 
         drop(app.begin_chat_close(card));
         assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("still typing")
+        );
+    }
+
+    /// A chosen answer holds the card only while a provider could take it. Once
+    /// the provider exits the card can neither submit nor change the answer, so
+    /// holding on would leave the conversation on a card that may not resume it
+    /// and away from the pane that may.
+    #[test]
+    fn an_answer_stops_holding_an_attached_session_here_when_its_provider_exits() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        write(&mut app, card, "still typing");
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.answers.insert(
+                ("request".into(), "question".into()),
+                vec!["chosen answer".into()],
+            );
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.card_state(held)
+                .is_none_or(|state| !state.existence.is_open())
+        );
+        let refusal = app.session_held_elsewhere_start_refusal(card).unwrap();
+        assert!(
+            refusal.contains("once what's waiting here is finished or cleared"),
+            "the destination does not show it yet: {refusal}"
+        );
+
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            Arc::make_mut(&mut runtime.snapshot).exited = true;
+        }
+        let _ = app.update(Message::ChatUi(Action::Tick));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.card_state(held).unwrap().existence.is_open());
         assert_eq!(
             app.chat_ui.drafts.get(&held).map(String::as_str),
             Some("still typing")
