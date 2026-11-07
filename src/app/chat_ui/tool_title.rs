@@ -212,6 +212,28 @@ fn readable(name: &str) -> String {
     })
 }
 
+/// A name given as a sentence-case phrase, as Codex names "Image
+/// generation", continues the verb before it: "Used image generation". A
+/// name whose first word is not a plain capitalized word, an acronym or an
+/// integration's "Linear: get issue", keeps its letters.
+fn after_verb(label: String) -> String {
+    let first = label.split_whitespace().next().unwrap_or_default();
+    let mut letters = first.chars();
+    let phrase = label.contains(char::is_whitespace)
+        && !label.contains(':')
+        && letters.next().is_some_and(char::is_uppercase)
+        && letters.clone().next().is_some()
+        && letters.all(char::is_lowercase);
+    if !phrase {
+        return label;
+    }
+    let mut chars = label.chars();
+    chars
+        .next()
+        .map(|initial| initial.to_lowercase().chain(chars).collect())
+        .unwrap_or(label)
+}
+
 /// How a plan's items stand, as "2 of 5 done".
 fn plan_progress(todos: &[Todo]) -> String {
     let done = todos
@@ -279,7 +301,9 @@ impl Title {
     pub(super) fn of(name: &str, input: &str, status: ToolStatus) -> Self {
         #[cfg(test)]
         READS.with(|reads| reads.set(reads.get() + 1));
-        let fields = fields(input).unwrap_or_default();
+        let parsed = fields(input);
+        let structured = parsed.is_some();
+        let fields = parsed.unwrap_or_default();
         let owned =
             |value: &Option<Cow<'_, str>>| value.as_deref().and_then(short).map(str::to_owned);
         let named = |verb: Verb, label: Option<String>| Title {
@@ -471,8 +495,14 @@ impl Title {
             // the one short target its input names.
             _ => Title {
                 verb: verb("Using", "Used", "Tried to use").said(status),
-                label: readable(name),
-                target: target(&fields),
+                // An integration's name is a proper name; only a plain
+                // phrase continues the verb.
+                label: integration(name).unwrap_or_else(|| after_verb(readable(name))),
+                target: if structured {
+                    target(&fields)
+                } else {
+                    plain(input)
+                },
             },
         }
     }
@@ -481,6 +511,31 @@ impl Title {
 /// The short target an unfamiliar tool's input names, shown under its name.
 /// A tool's arguments are not evidence of what it does, so only a field that
 /// names a target is shown; anything else stays in the call's detail.
+/// An input given as plain text rather than named fields, such as an image
+/// generator's prompt, when it is short enough to stand on a row as the
+/// named fields must be. Freeform text over several lines, such as a patch
+/// or a script, is detail for the open row; an empty or null input, or
+/// structured input that is not read (still streaming in, or too large),
+/// says nothing.
+fn plain(input: &str) -> String {
+    let text = input.trim();
+    if text.is_empty() || text == "null" || text.starts_with(['{', '[']) {
+        return String::new();
+    }
+    if text.starts_with('"') {
+        // A string short enough for a row is at most six bytes a character
+        // once escaped, so a longer one is not decoded only to be dropped.
+        if text.len() > TARGET_LIMIT * 6 + 2 {
+            return String::new();
+        }
+        return match serde_json::from_str::<String>(text) {
+            Ok(decoded) => short(&decoded).unwrap_or_default().to_owned(),
+            Err(_) => String::new(),
+        };
+    }
+    short(text).unwrap_or_default().to_owned()
+}
+
 fn target(fields: &Fields<'_>) -> String {
     [
         &fields.file_path,
@@ -770,7 +825,8 @@ mod tests {
             ),
             (json!({"query":"first\nsecond"}).to_string(), ""),
             (r#"{"prompt":"Internal framing"#.to_owned(), ""),
-            ("plain prose".to_owned(), ""),
+            ("plain prose".to_owned(), "plain prose"),
+            ("*** Begin Patch\n*** Update File: a.rs".to_owned(), ""),
         ] {
             let title = Title::of("fixture", &input, ToolStatus::Succeeded);
             assert_eq!(title.target, expected, "{input}");
@@ -794,5 +850,38 @@ mod tests {
             Title::of("Write", &partial, ToolStatus::Running).line(),
             "Writing"
         );
+    }
+
+    /// A tool whose input is one short line of plain text, such as an image
+    /// generator given a prompt, shows it beneath its name; freeform text
+    /// over several lines, and an empty or null input, show nothing rather
+    /// than a placeholder.
+    #[test]
+    fn a_plain_text_input_is_shown_and_an_empty_one_is_not() {
+        // As Codex reports an image generation: a named phrase with its
+        // prompt as plain text.
+        let image = Title::of(
+            "Image generation",
+            "A fox reading tool rows",
+            ToolStatus::Running,
+        );
+        assert_eq!(image.line(), "Using image generation");
+        assert_eq!(image.target, "A fox reading tool rows");
+        assert_eq!(Title::unread("Image generation").label, "Image generation");
+        for kept in ["GPU Profile", "Linear: get issue", "A"] {
+            assert_eq!(after_verb(kept.to_owned()), kept);
+        }
+        let target = |input: &str| Title::of("image_generation", input, ToolStatus::Succeeded);
+        let title = target("A fox reading tool rows");
+        assert_eq!(title.line(), "Used image generation");
+        assert_eq!(title.target, "A fox reading tool rows");
+        assert_eq!(target("\"A fox in the rain\"").target, "A fox in the rain");
+        for freeform in ["\"A fox\\nin the rain\"", "First line\nsecond line"] {
+            assert_eq!(target(freeform).target, "", "{freeform:?}");
+        }
+        assert_eq!(target(&"word ".repeat(200)).target, "");
+        for nothing in ["", "  ", "null", "{}", "[]", "{\"partial\": \"x"] {
+            assert_eq!(target(nothing).target, "", "{nothing:?}");
+        }
     }
 }
