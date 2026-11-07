@@ -200,9 +200,8 @@ impl Client {
                 let peer = Peer::observe(&stream, socket).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
-                // These sources differ from this release only by their number,
-                // by directory entries and, on the candidate line, by
-                // StartupState. The update uses neither.
+                // These sources differ from this release only by their number
+                // and by messages an update doesn't exchange.
                 let client =
                     ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
                 peer.verify(client.proof()).map_err(|error| {

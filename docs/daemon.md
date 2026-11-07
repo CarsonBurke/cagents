@@ -40,8 +40,10 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
-encoding, not meaning, and not JSON carried as text inside a message.
+encodes the same way, except for what is refused or withheld, and for a named
+field appended where a reply's frame ends, which an older client stops reading
+before. It checks encoding, not meaning, and not JSON carried as text inside a
+message.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
 directory at its own matched CLI. That runtime directory is

@@ -222,8 +222,8 @@ pub const PROTOCOL_VERSION: u16 = 157;
 /// encoding, so an update may speak it as a source with this release's
 /// client. Its daemons and windows are never peers. Its CLI, which chats
 /// carried across an update keep running, is served as an [`OlderClient`]:
-/// the one wire difference, the device account `Restore` operation this
-/// release appended, is a request that CLI cannot send.
+/// what has changed since is a request that CLI cannot send, a reply it is
+/// refused, or a list it stops reading before.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 /// The matched sets since the candidate line that remain update sources. Each
 /// only appended messages an update doesn't exchange, so an update speaks that

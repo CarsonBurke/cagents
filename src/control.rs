@@ -709,7 +709,7 @@ impl ControlClient {
 
     /// Handshake with an update source at its own protocol number. Only the
     /// update source client calls this, for a number whose wire is this
-    /// release's except for appended requests the update never sends.
+    /// release's except for messages the update never exchanges.
     pub(crate) fn from_stream_at_source_protocol(
         stream: UnixStream,
         deadline: Instant,
