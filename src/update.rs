@@ -247,7 +247,7 @@ impl Installation {
             return Err(unsupported_install());
         }
         // Source builds copied into an old release tree must not impersonate it.
-        if layout.version != crate::VERSION {
+        if layout.version != crate::version() {
             return Err(invalid(
                 "installed directory and running binary versions differ; reinstall manually",
             ));
@@ -659,7 +659,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
 
 fn running_installation() -> Result<Installation, UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
-    if layout.version != crate::VERSION {
+    if layout.version != crate::version() {
         return Err(unsupported_install());
     }
     Ok(Installation {
@@ -3215,14 +3215,14 @@ finally:
     fn installed_version_must_match_the_running_binary_including_build_metadata() {
         let root = tempfile::tempdir().unwrap();
         let root = root.path();
-        install_tree(root, &[crate::VERSION], crate::VERSION);
+        install_tree(root, &[crate::version()], crate::version());
         let executable = root
             .join("versions")
-            .join(crate::VERSION)
+            .join(crate::version())
             .join("bin/cagents-ui");
         assert_eq!(
             Installation::from_executable(&executable).unwrap().version,
-            crate::VERSION
+            crate::version()
         );
 
         let impostor = format!("{}+local.impostor", env!("CARGO_PKG_VERSION"));

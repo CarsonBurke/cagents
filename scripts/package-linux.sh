@@ -129,10 +129,13 @@ if [ "${CAGENTS_SKIP_BUILD:-0}" != 1 ]; then
     # The archive is named after the version's build metadata (the part after
     # `+`, e.g. `local.3d80e6d`), and the binaries inside it report the same
     # string from `--version`. A bare release version carries none, and an
-    # empty value tells build.rs to look at the checkout instead.
+    # empty value has the binaries take the checkout's metadata instead, so
+    # a dirty or untagged tree cannot pass for the release. A build gate's
+    # marker, inherited, would have build.rs skip the checkout.
     CAGENTS_BUILD_METADATA=${VERSION#*+}
     [ "$CAGENTS_BUILD_METADATA" != "$VERSION" ] || CAGENTS_BUILD_METADATA=
     export CAGENTS_BUILD_METADATA
+    unset CAGENTS_BUILD_METADATA_SUPPLIED
 
     build_target() {
         product=$1

@@ -36,6 +36,8 @@ struct OfflineAuthority {
     expected_historical_launch: LaunchRecipe,
 }
 
+cagents::stamp_version!();
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args_os().skip(1);
     let path = args

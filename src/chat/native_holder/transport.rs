@@ -681,7 +681,7 @@ pub(crate) fn adopt(
     if record.is_outdated() {
         tracing::warn!(terminal = %record.terminal, holder_pid = record.holder.pid,
             helper_version = ?record.build.as_ref().map(|build| &build.version),
-            daemon_version = crate::VERSION,
+            daemon_version = crate::version(),
             zombies = ?record.zombie_children().ok(),
             "adopting a native conversation running on an outdated helper");
     }
