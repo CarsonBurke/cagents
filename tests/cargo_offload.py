@@ -14,6 +14,7 @@ import contextlib
 import fcntl
 import json
 import os
+import pwd
 import resource
 from pathlib import Path
 import shlex
@@ -485,6 +486,48 @@ class ThisHost(unittest.TestCase):
                                  env=os.environ | {"CAGENTS_BUILD_REMOTE": ""})
         self.assertEqual((default.returncode, default.stdout), (0, "fw16\n"))
 
+
+    def test_the_build_host_builds_in_its_own_slots_only_when_asked(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        this = socket.gethostname()
+        def where(**settings):
+            result = subprocess.run([script, "--host"], capture_output=True, text=True,
+                                    env=os.environ | {"CAGENTS_BUILD_REMOTE": this} | settings)
+            return result.returncode, result.stdout
+        self.assertEqual(where(), (offload.FALL_BACK, ""))
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE_LOOPBACK="0"), (offload.FALL_BACK, ""))
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE_LOOPBACK="1"), (0, f"{this}\tloopback\n"))
+        # `local` still means this checkout's own build directory.
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE="local", CAGENTS_BUILD_REMOTE_LOOPBACK="1"),
+                         (offload.FALL_BACK, ""))
+        # Another host is reached as ever.
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE="192.0.2.1", CAGENTS_BUILD_REMOTE_LOOPBACK="1"),
+                         (0, "192.0.2.1\n"))
+
+    def test_a_loopback_runs_commands_and_copies_as_sshd_would(self):
+        build = offload.Offload("fw16", None, {}, loopback=True)
+        self.assertEqual(build.remote("exists", "/x")[:3],
+                         [sys.executable, str(ROOT / "scripts/cargo-offload"), "--loopback-shell"])
+        # There is no connection to share, or to end.
+        build.share_connection()
+        self.assertIsNone(build.control)
+        script = str(ROOT / "scripts/cargo-offload")
+        account = pwd.getpwuid(os.getuid())
+        caller = os.environ | {"CARGO_TARGET_DIR": "/caller/target", "CAGENTS_BUILD_LOCK": "/x"}
+        result = subprocess.run(
+            [script, "--loopback-shell", "-o", "BatchMode=yes", "-o", "ControlPath=/x/m", "fw16",
+             "pwd;", "env"],
+            capture_output=True, text=True, env=caller, cwd="/", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], account.pw_dir)
+        self.assertIn(f"HOME={account.pw_dir}", lines)
+        # Nothing of the caller's build reaches the slot.
+        self.assertFalse([line for line in lines if line.startswith(("CARGO_TARGET_DIR=", "CAGENTS_BUILD_"))])
+        # A control command acts on no connection, and runs nothing.
+        ended = subprocess.run([script, "--loopback-shell", "-O", "exit", "fw16"],
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual((ended.returncode, ended.stdout), (0, ""))
 
     def test_this_hosts_names_and_addresses_build_here(self):
         self.assertTrue(offload.is_this_host(socket.gethostname()))
