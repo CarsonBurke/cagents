@@ -1326,7 +1326,10 @@ impl State {
                     ) {
                         self.list_status = ListStatus::Failed(error.clone());
                     }
-                    self.set_error(error, pending.command());
+                    // No poll retries a run the person asked for and could not
+                    // open, so a poll's success must not erase why it did not.
+                    let opening_run = matches!(pending, Pending::Run) && self.run.is_none();
+                    self.set_error(error, pending.command() || opening_run);
                 }
                 Ok(Response::Listed(rows)) => {
                     self.list_status = ListStatus::Loaded;
@@ -7428,6 +7431,36 @@ mod tests {
             }
             assert!(state.error.is_none(), "{surface} read recovered");
         }
+    }
+
+    #[test]
+    fn a_run_that_could_not_open_says_why_until_the_next_choice() {
+        let refusal = "This run's details are no longer available.";
+        let owner = automation();
+        let mut state = State {
+            rows: vec![owner.summary(None)],
+            selected: Some(owner),
+            ..Default::default()
+        };
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Run(Uuid::new_v4()))
+        else {
+            panic!("choosing a row reads its run");
+        };
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err(refusal.into())),
+        });
+        let Some(Effect::Request { sequence, .. }) = state.update(Action::Tick) else {
+            panic!("polling continues beside the failed read");
+        };
+        assert_eq!(state.error.as_deref(), Some(refusal));
+        state.update(Action::Received {
+            sequence,
+            result: std::sync::Arc::new(Err("A poll that also failed".into())),
+        });
+        assert_eq!(state.error.as_deref(), Some(refusal));
+        state.update(Action::Browse);
+        assert!(state.error.is_none());
     }
 
     #[test]

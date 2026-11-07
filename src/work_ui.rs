@@ -849,49 +849,15 @@ impl State {
             ));
         }
         if let Some(pull_request) = &item.pull_request {
-            let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
-                (PullRequestState::Open, true) => ("Draft", design::muted_color),
-                (PullRequestState::Open, false) => ("Open", design::success_color),
-                (PullRequestState::Merged, _) => ("Merged", design::accent_color),
-                (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
-            };
-            facts.push(badge(label, Tone::Themed(tone)));
-            if pull_request.state == PullRequestState::Open {
-                if let Some((label, tone)) = pull_request.checks.and_then(|checks| {
-                    checks.outcome().map(|outcome| -> (String, Toned) {
-                        match outcome {
-                            CheckOutcome::Passing => {
-                                (format!("✓ {}", checks.passed), design::success_color)
-                            }
-                            CheckOutcome::Pending => (
-                                format!("● {} running", checks.pending),
-                                design::warning_color,
-                            ),
-                            CheckOutcome::Failing => (
-                                format!("✕ {} failing", checks.failed),
-                                design::destructive_color,
-                            ),
-                        }
-                    })
-                }) {
-                    facts.push(badge(label, Tone::Themed(tone)));
-                }
-                if let Some(review) = pull_request.review {
-                    let (label, tone): (&str, Toned) = match review {
-                        Review::Approved => ("Approved", design::success_color),
-                        Review::ChangesRequested => {
-                            ("Changes requested", design::destructive_color)
-                        }
-                        Review::Required => ("Review required", design::muted_color),
-                    };
-                    facts.push(badge(label, Tone::Themed(tone)));
-                }
-                if !pull_request.contains_local_head && item.worktree.is_some() {
-                    facts.push(crate::interaction::tooltip(
-                        badge("Unpushed", Tone::Themed(design::warning_color)),
-                        "The worktree has commits the pull request does not",
-                    ));
-                }
+            facts.extend(pull_request_badges(pull_request));
+            if pull_request.state == PullRequestState::Open
+                && !pull_request.contains_local_head
+                && item.worktree.is_some()
+            {
+                facts.push(crate::interaction::tooltip(
+                    badge("Unpushed", Tone::Themed(design::warning_color)),
+                    "The worktree has commits the pull request does not",
+                ));
             }
         }
         if let Some(ticket) = &item.linear
@@ -1209,19 +1175,70 @@ fn status_glyph<'a>(item: &Item) -> Element<'a, Action> {
         return glyph(Icon::AgentWaiting, design::warning_color);
     }
     match &item.pull_request {
-        Some(pull_request) => match pull_request.state {
-            PullRequestState::Merged => glyph(Icon::MergedPullRequest, merged_color),
-            PullRequestState::Closed => glyph(Icon::ClosedPullRequest, design::destructive_color),
-            PullRequestState::Open if pull_request.draft => {
-                glyph(Icon::PullRequest, design::muted_color)
-            }
-            PullRequestState::Open => glyph(Icon::PullRequest, design::success_color),
-        },
+        Some(pull_request) => pull_request_glyph(pull_request),
         None => glyph(Icon::Branch, design::muted_color),
     }
 }
 
-fn glyph<'a>(icon: Icon, tone: Toned) -> Element<'a, Action> {
+/// A pull request's state as its leading glyph: open, draft, merged or closed.
+pub(crate) fn pull_request_glyph<'a, Message: 'a>(
+    pull_request: &crate::work::PullRequest,
+) -> Element<'a, Message> {
+    match pull_request.state {
+        PullRequestState::Merged => glyph(Icon::MergedPullRequest, merged_color),
+        PullRequestState::Closed => glyph(Icon::ClosedPullRequest, design::destructive_color),
+        PullRequestState::Open if pull_request.draft => {
+            glyph(Icon::PullRequest, design::muted_color)
+        }
+        PullRequestState::Open => glyph(Icon::PullRequest, design::success_color),
+    }
+}
+
+/// What is true of a pull request now: its state, then, while it is open,
+/// its checks and review.
+pub(crate) fn pull_request_badges<'a, Message: 'a>(
+    pull_request: &crate::work::PullRequest,
+) -> Vec<Element<'a, Message>> {
+    let mut badges = Vec::new();
+    let (label, tone): (&str, Toned) = match (pull_request.state, pull_request.draft) {
+        (PullRequestState::Open, true) => ("Draft", design::muted_color),
+        (PullRequestState::Open, false) => ("Open", design::success_color),
+        (PullRequestState::Merged, _) => ("Merged", design::accent_color),
+        (PullRequestState::Closed, _) => ("Closed", design::destructive_color),
+    };
+    badges.push(badge(label, Tone::Themed(tone)));
+    if pull_request.state != PullRequestState::Open {
+        return badges;
+    }
+    if let Some((label, tone)) = pull_request.checks.and_then(|checks| {
+        checks.outcome().map(|outcome| -> (String, Toned) {
+            match outcome {
+                CheckOutcome::Passing => (format!("✓ {}", checks.passed), design::success_color),
+                CheckOutcome::Pending => (
+                    format!("● {} running", checks.pending),
+                    design::warning_color,
+                ),
+                CheckOutcome::Failing => (
+                    format!("✕ {} failing", checks.failed),
+                    design::destructive_color,
+                ),
+            }
+        })
+    }) {
+        badges.push(badge(label, Tone::Themed(tone)));
+    }
+    if let Some(review) = pull_request.review {
+        let (label, tone): (&str, Toned) = match review {
+            Review::Approved => ("Approved", design::success_color),
+            Review::ChangesRequested => ("Changes requested", design::destructive_color),
+            Review::Required => ("Review required", design::muted_color),
+        };
+        badges.push(badge(label, Tone::Themed(tone)));
+    }
+    badges
+}
+
+fn glyph<'a, Message: 'a>(icon: Icon, tone: Toned) -> Element<'a, Message> {
     widget::icon(icon.handle())
         .size(design::ROW_ICON_SIZE)
         .class(cosmic::theme::Svg::Custom(std::rc::Rc::new(move |theme| {

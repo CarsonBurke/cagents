@@ -80,8 +80,7 @@ class HotRunner(unittest.TestCase):
                 self.assertIsNone(hot.main())
                 state.prerequisites.assert_called_once_with()
                 self.assertEqual([call[0] for call in state.calls], ["build", "build", "metadata", "stage", "stage"])
-                identity = "development" if browserless else "development,full"
-                for call, name, features in zip(state.calls, ("cagents", "cagentsd"), (identity, identity + ",host")):
+                for call, name, features in zip(state.calls, ("cagents", "cagentsd"), ("development", "development,host")):
                     command = self.assert_locked_sandbox(call[1], state.root)
                     self.assertEqual(command, [
                         "cargo", "build", "--locked", "--profile", "dev-runtime",
@@ -141,7 +140,7 @@ class HotRunner(unittest.TestCase):
                     self.assertEqual(command, [
                         "cargo", "build", "--locked", "--profile", "dev-runtime",
                         "--target", "x86_64-unknown-linux-gnu", "--no-default-features",
-                        "--features", "development,full" + (",host" if name == "cagentsd" else ""),
+                        "--features", "development" + (",host" if name == "cagentsd" else ""),
                         "--bin", name, "--message-format", "json-render-diagnostics",
                     ])
                 state.metadata.assert_called_once_with(["rustc", "-vV"], text=True)

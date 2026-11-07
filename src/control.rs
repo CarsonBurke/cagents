@@ -540,6 +540,16 @@ pub enum ControlError {
     ShutdownRejected(ShutdownOutcome),
 }
 
+impl ControlError {
+    /// The daemon's own sentence for a person; every other failure as it stands.
+    pub fn reason(self) -> String {
+        match self {
+            Self::Remote { message, .. } => message,
+            other => other.to_string(),
+        }
+    }
+}
+
 /// Ends a [`ControlClient`]'s connection from another thread.
 pub struct Hangup(UnixStream);
 
@@ -570,6 +580,7 @@ pub struct ControlClient {
     /// The newest Work board pushed while a correlated response was pending.
     /// Each carries the whole board, so only the newest matters.
     observed_work: Option<(u64, Box<crate::work::Board>)>,
+    observed_conversation: Option<(u64, Box<crate::work::ConversationPullRequests>)>,
     /// Native chats this connection is attached to, whose change and activity
     /// notifications the daemon interleaves with responses.
     ///
@@ -744,6 +755,7 @@ impl ControlClient {
             observed_model: VecDeque::new(),
             observed_notifications: VecDeque::new(),
             observed_work: None,
+            observed_conversation: None,
             attached_chats: BTreeSet::new(),
             terminal_streams: BTreeSet::new(),
         })
@@ -1849,6 +1861,19 @@ impl ControlClient {
                     self.observed_work = Some((revision, board));
                 }
             }
+            ServerMessage::ConversationPullRequests {
+                revision,
+                pull_requests,
+                ..
+            } => {
+                if self
+                    .observed_conversation
+                    .as_ref()
+                    .is_none_or(|(observed, _)| *observed < revision)
+                {
+                    self.observed_conversation = Some((revision, pull_requests));
+                }
+            }
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
@@ -2074,6 +2099,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::NotificationsChanged
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
+        | ServerMessage::ConversationPullRequests { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -2097,6 +2123,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
+        ServerMessage::ConversationPullRequests { .. } => "conversation_pull_requests",
     }
 }
 
@@ -4513,6 +4540,23 @@ fn emit_error(json_output: bool, error: &AppError) {
 
 #[cfg(test)]
 mod tests {
+    use super::ControlError;
+
+    #[test]
+    fn a_daemon_refusal_reaches_a_person_as_its_own_sentence() {
+        let refusal = ControlError::Remote {
+            code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
+            message: "This run's details are no longer available.".into(),
+            retryable: false,
+        };
+        assert_eq!(
+            refusal.reason(),
+            "This run's details are no longer available."
+        );
+        let other = ControlError::Connect(std::io::Error::other("refused"));
+        assert_eq!(other.reason(), "could not connect to the daemon: refused");
+    }
+
     #[test]
     fn hosted_daemon_lifecycle_refuses_before_routing_and_user_framing_stays_usable() {
         use std::os::unix::{
