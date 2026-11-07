@@ -214,6 +214,7 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
     let accepted = submit(&host, &Authority::default(), request.clone()).unwrap();
     assert_eq!(settled(&host, accepted.run.id).state, State::Succeeded);
     let channel = ChannelId::new();
+    let other = ChannelId::new();
     let (session, authority) = {
         let owned = registry(&host).unwrap();
         let mut model = owned.lock().unwrap();
@@ -226,6 +227,14 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
                 id: channel,
                 repository: project.clone(),
                 title: "Login".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        model
+            .apply(&ModelEdit::CreateChannel {
+                id: other,
+                repository: project.clone(),
+                title: "Other".into(),
                 title_source: Default::default(),
             })
             .unwrap();
@@ -263,6 +272,11 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
     let me = mine.caller.as_ref().unwrap();
     assert_eq!(me.session.id, session);
     assert!(me.active_at.is_some(), "the saved conversation's time");
+    // Another channel lists only its own members, never the caller.
+    let elsewhere = members(&host, &authority, Some(other)).unwrap();
+    assert_eq!(elsewhere.channel, other);
+    assert_eq!(elsewhere.caller, None);
+    assert!(elsewhere.sessions.is_empty(), "{elsewhere:?}");
     let named = members(&host, &Authority::default(), Some(channel)).unwrap();
     assert_eq!(
         named

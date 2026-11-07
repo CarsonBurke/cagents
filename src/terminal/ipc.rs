@@ -207,7 +207,7 @@ use crate::{
 /// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
 /// and are not adopted here.
 /// Version 155 appends two agent operations and their replies: the transcript
-/// read and the channel member listing. Versions 152 to 154 are claimed by
+/// read and the channel member listing. Versions 152 to 154 are reserved for
 /// parallel branches and are not adopted.
 pub const PROTOCOL_VERSION: u16 = 155;
 /// The install candidate line's protocol. Every message an update exchanges

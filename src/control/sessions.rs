@@ -108,21 +108,39 @@ fn members(channel: Option<ChannelId>) -> Result<CommandOutput, AppError> {
         Reply::Members(members) => Some(members),
         _ => None,
     })?;
+    let human = members_human(&members, now_ms());
     let Members {
         channel,
         caller,
         sessions,
     } = &members;
-    // Every row shares the channel the footer names, so none is marked.
-    let mut human = list_human(caller.iter().chain(sessions).map(Row::from), None, now_ms());
-    human.push_str(&format!(
-        "\n(channel {channel}; read a conversation with `cagents transcript SESSION`)"
-    ));
     Ok(CommandOutput {
         command: "sessions",
         data: json!({ "channel": channel, "me": caller, "sessions": sessions }),
         human,
     })
+}
+
+fn members_human(members: &Members, now: u64) -> String {
+    let Members {
+        channel,
+        caller,
+        sessions,
+    } = members;
+    if caller.is_none() && sessions.is_empty() {
+        return format!("No sessions in channel {channel}");
+    }
+    // Every row shares the channel the footer names, so none is marked.
+    let mut human = list_human(caller.iter().chain(sessions).map(Row::from), None, now);
+    let whose = if caller.is_some() {
+        "your channel"
+    } else {
+        "channel"
+    };
+    human.push_str(&format!(
+        "\n({whose} {channel}; read a conversation with `cagents transcript SESSION`)"
+    ));
+    human
 }
 
 /// One listed session, with what a member view adds to it.
@@ -266,7 +284,7 @@ fn request<T>(
     let reply = client
         .agent(Authority::from_environment(), operation)
         .map_err(protocol_error)?;
-    expected(reply).ok_or_else(|| AppError::new("sessions", "Unexpected directory response"))
+    expected(reply).ok_or_else(|| AppError::new("sessions", "Unexpected reply from the daemon"))
 }
 
 #[cfg(test)]
@@ -305,6 +323,54 @@ mod tests {
             relation: Relation::Child,
             lineage: Lineage("00000000-0000-4000-8000-000000000003".parse().unwrap()),
         }
+    }
+
+    #[test]
+    fn a_channel_lists_how_each_member_ended_and_when_it_last_worked() {
+        let mut session = entry();
+        session.relation = Relation::Peer;
+        session.delegation = None;
+        session.view_scope = None;
+        session.title = None;
+        let channel = "00000000-0000-4000-8000-0000000000c1".parse().unwrap();
+        let exited = Member {
+            session,
+            exited: true,
+            failure: Some("Claude usage limit reached · resets 3pm".into()),
+            active_at: Some(0),
+        };
+        let mut members = Members {
+            channel,
+            caller: None,
+            sessions: vec![exited],
+        };
+        let human = members_human(&members, 12 * 60_000);
+        let row = human.lines().nth(1).unwrap();
+        assert!(row.contains(" exited "), "{row}");
+        assert!(row.contains("; active 12 min ago"), "{row}");
+        assert!(
+            row.ends_with("; failed: Claude usage limit reached · resets 3pm"),
+            "{row}"
+        );
+        assert!(!row.contains("my channel"), "{row}");
+        assert!(
+            human.ends_with(&format!(
+                "\n(channel {channel}; read a conversation with `cagents transcript SESSION`)"
+            )),
+            "{human}"
+        );
+
+        let mut me = members.sessions[0].clone();
+        me.session.relation = Relation::Myself;
+        members.caller = Some(me);
+        assert!(members_human(&members, 0).contains(&format!("\n(your channel {channel};")));
+
+        members.caller = None;
+        members.sessions.clear();
+        assert_eq!(
+            members_human(&members, 0),
+            format!("No sessions in channel {channel}")
+        );
     }
 
     #[test]
