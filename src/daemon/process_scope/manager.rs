@@ -17,8 +17,11 @@ use serde_json::Value;
 
 use super::{POLL, Refused, manager_runtime, workload::cgroup_path};
 
-/// Bounds a collection's calls, and settling a request given up on.
+/// Bounds each per-unit call of a collection, and settling a request given
+/// up on.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Bounds a collection's listing of every session scope, which a manager
+/// with thousands loaded answers slowly.
 const LISTING_TIMEOUT: Duration = Duration::from_secs(30);
 pub(super) const SCOPES: &str = "cagents-session-*.scope";
 
