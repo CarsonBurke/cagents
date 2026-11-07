@@ -514,6 +514,8 @@ pub enum Operation {
     AcknowledgeInbox(mailbox::Receipt),
     /// Read a page of a session's conversation. Grants no control.
     Transcript(transcript::Query),
+    /// List the sessions in this channel, or in the caller's own when absent.
+    Members(Option<crate::model::ChannelId>),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -579,6 +581,7 @@ pub enum Reply {
     Inbox(Vec<mailbox::Message>),
     InboxAcknowledged,
     Transcript(transcript::Page),
+    Members(directory::Members),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

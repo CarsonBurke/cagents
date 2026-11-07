@@ -1264,6 +1264,9 @@ pub(super) fn process(
         Operation::Transcript(query) => {
             transcript::read(host, &authority, query).map(Reply::Transcript)
         }
+        Operation::Members(channel) => {
+            directory::channel(host, &authority, channel).map(Reply::Members)
+        }
     }
 }
 

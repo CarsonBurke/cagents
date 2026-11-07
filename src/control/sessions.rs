@@ -1,8 +1,9 @@
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    directory::{Directory, Entry, Relation, Scope},
+    directory::{Directory, Entry, Member, Members, Relation, Scope},
 };
+use crate::model::ChannelId;
 
 #[derive(Debug, clap::Args)]
 pub struct SessionsArgs {
@@ -25,7 +26,7 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     let channel = directory.caller.as_ref().and_then(|me| me.channel);
     let now = now_ms();
     let mut human = match &directory.caller {
-        Some(me) => list_human(std::iter::once(me), channel, now),
+        Some(me) => list_human(std::iter::once(me).map(Row::from), channel, now),
         None => "Not running inside a cagents session".to_owned(),
     };
     let peers: Vec<_> = directory
@@ -40,7 +41,11 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
         .collect();
     if !peers.is_empty() {
         human.push_str("\n\nRelated sessions:\n");
-        human.push_str(&list_human(peers.iter().copied(), channel, now));
+        human.push_str(&list_human(
+            peers.iter().copied().map(Row::from),
+            channel,
+            now,
+        ));
     }
     if channel.is_some() {
         human.push_str(
@@ -55,44 +60,99 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
 }
 
 pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
-    let scope =
-        if arguments.all {
-            Scope::All
-        } else if let Some(channel) = arguments.channel {
-            Scope::Channel(if channel.is_empty() {
+    if let Some(channel) = arguments.channel {
+        let channel =
+            if channel.is_empty() {
                 None
             } else {
                 Some(channel.parse().map_err(|_| {
                     AppError::new("target", format!("{channel} is not a channel UUID"))
                 })?)
-            })
-        } else if let Some(project) = arguments.project {
-            Scope::Project(super::project_argument(project)?)
-        } else {
-            Scope::Containing(current_directory()?)
-        };
+            };
+        return members(channel);
+    }
+    let scope = if arguments.all {
+        Scope::All
+    } else if let Some(project) = arguments.project {
+        Scope::Project(super::project_argument(project)?)
+    } else {
+        Scope::Containing(current_directory()?)
+    };
     let directory = read(scope)?;
     let channel = directory.caller.as_ref().and_then(|me| me.channel);
     let mut human = list_human(
-        directory.caller.iter().chain(directory.sessions.iter()),
+        directory
+            .caller
+            .iter()
+            .chain(directory.sessions.iter())
+            .map(Row::from),
         channel,
         now_ms(),
     );
-    match &directory.scope {
-        Scope::Project(project) => human.push_str(&format!(
+    if let Scope::Project(project) = &directory.scope {
+        human.push_str(&format!(
             "\n(project {}; --all for every project, --channel for yours)",
             super::format::plain(&project.display().to_string())
-        )),
-        Scope::Channel(Some(channel)) => human.push_str(&format!(
-            "\n(channel {channel}; read a conversation with `cagents transcript SESSION`)"
-        )),
-        _ => {}
+        ));
     }
     Ok(CommandOutput {
         command: "sessions",
         data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": directory.sessions }),
         human,
     })
+}
+
+/// Everyone in a channel, with how recently each worked and how it ended.
+fn members(channel: Option<ChannelId>) -> Result<CommandOutput, AppError> {
+    let members = request(Operation::Members(channel), |reply| match reply {
+        Reply::Members(members) => Some(members),
+        _ => None,
+    })?;
+    let Members {
+        channel,
+        caller,
+        sessions,
+    } = &members;
+    // Every row shares the channel the footer names, so none is marked.
+    let mut human = list_human(caller.iter().chain(sessions).map(Row::from), None, now_ms());
+    human.push_str(&format!(
+        "\n(channel {channel}; read a conversation with `cagents transcript SESSION`)"
+    ));
+    Ok(CommandOutput {
+        command: "sessions",
+        data: json!({ "channel": channel, "me": caller, "sessions": sessions }),
+        human,
+    })
+}
+
+/// One listed session, with what a member view adds to it.
+pub(super) struct Row<'a> {
+    entry: &'a Entry,
+    exited: bool,
+    failure: Option<&'a str>,
+    active_at: Option<u64>,
+}
+
+impl<'a> From<&'a Entry> for Row<'a> {
+    fn from(entry: &'a Entry) -> Self {
+        Self {
+            entry,
+            exited: false,
+            failure: None,
+            active_at: None,
+        }
+    }
+}
+
+impl<'a> From<&'a Member> for Row<'a> {
+    fn from(member: &'a Member) -> Self {
+        Self {
+            entry: &member.session,
+            exited: member.exited,
+            failure: member.failure.as_deref(),
+            active_at: member.active_at,
+        }
+    }
 }
 
 pub(super) fn now_ms() -> u64 {
@@ -103,7 +163,7 @@ pub(super) fn now_ms() -> u64 {
 
 /// `channel` is the caller's, so a session sharing it is marked.
 pub(super) fn list_human<'a>(
-    entries: impl IntoIterator<Item = &'a Entry>,
+    rows: impl IntoIterator<Item = Row<'a>>,
     channel: Option<crate::model::ChannelId>,
     now: u64,
 ) -> String {
@@ -111,9 +171,9 @@ pub(super) fn list_human<'a>(
     use crate::agent_execution::directory::Owner;
     super::format::table(
         ["SESSION", "PROVIDER", "STATE", "CONTEXT"],
-        entries
-            .into_iter()
-            .map(|entry| {
+        rows.into_iter()
+            .map(|row| {
+                let entry = row.entry;
                 let mut context = Vec::new();
                 if let Some(project) = &entry.project_name {
                     context.push(format!("[{project}]"));
@@ -151,17 +211,17 @@ pub(super) fn list_human<'a>(
                         context.push(format!("latest run {}", super::agents::state_label(state)));
                     }
                 }
-                if let Some(at) = entry.active_at {
+                if let Some(at) = row.active_at {
                     context.push(format!("active {}", super::format::relative_time(at, now)));
                 }
-                if let Some(failure) = &entry.failure {
+                if let Some(failure) = row.failure {
                     context.push(format!("failed: {failure}"));
                 }
                 [
                     entry.id.to_string(),
                     entry.provider.map_or("shell", |p| p.executable()).into(),
                     match entry.state {
-                        _ if entry.exited => "exited",
+                        _ if row.exited => "exited",
                         ActivityState::Unknown => "unknown",
                         ActivityState::Idle => "idle",
                         ActivityState::Working => "working",
@@ -190,16 +250,23 @@ fn current_directory() -> Result<PathBuf, AppError> {
 }
 
 fn read(scope: Scope) -> Result<Directory, AppError> {
+    request(Operation::Directory(scope), |reply| match reply {
+        Reply::Directory(directory) => Some(directory),
+        _ => None,
+    })
+}
+
+fn request<T>(
+    operation: Operation,
+    expected: impl FnOnce(Reply) -> Option<T>,
+) -> Result<T, AppError> {
     let socket = control_daemon_socket()?;
     let mut client =
         ControlClient::connect(&socket).map_err(|e| AppError::new("daemon_connection", e))?;
-    match client
-        .agent(Authority::from_environment(), Operation::Directory(scope))
-        .map_err(protocol_error)?
-    {
-        Reply::Directory(directory) => Ok(directory),
-        _ => Err(AppError::new("sessions", "Unexpected directory response")),
-    }
+    let reply = client
+        .agent(Authority::from_environment(), operation)
+        .map_err(protocol_error)?;
+    expected(reply).ok_or_else(|| AppError::new("sessions", "Unexpected directory response"))
 }
 
 #[cfg(test)]
@@ -237,9 +304,6 @@ mod tests {
             }),
             relation: Relation::Child,
             lineage: Lineage("00000000-0000-4000-8000-000000000003".parse().unwrap()),
-            exited: false,
-            failure: None,
-            active_at: None,
         }
     }
 
@@ -247,7 +311,7 @@ mod tests {
     fn readable_session_rows_keep_original_identity_and_delegation_context() {
         let entry = entry();
         let before = serde_json::to_value(&entry).unwrap();
-        let human = list_human(std::iter::once(&entry), None, 0);
+        let human = list_human(std::iter::once(Row::from(&entry)), None, 0);
         assert_eq!(human.lines().count(), 2);
         assert_eq!(
             human
@@ -281,10 +345,7 @@ mod tests {
 
     #[test]
     fn readable_sessions_empty_and_plain_shell_rows_are_explicit() {
-        assert_eq!(
-            list_human(std::iter::empty::<&Entry>(), None, 0),
-            "No live sessions"
-        );
+        assert_eq!(list_human(std::iter::empty(), None, 0), "No live sessions");
         let mut entry = entry();
         entry.provider = None;
         entry.surface = Surface::Terminal;
@@ -299,7 +360,7 @@ mod tests {
         entry.view_scope = None;
         entry.lineage = Lineage(entry.id);
         assert_eq!(
-            list_human(std::iter::once(&entry), None, 0),
+            list_human(std::iter::once(Row::from(&entry)), None, 0),
             "SESSION                               PROVIDER  STATE    CONTEXT\n00000000-0000-4000-8000-000000000001  shell     unknown  me"
         );
     }

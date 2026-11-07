@@ -2573,9 +2573,6 @@ mod tests {
             delegation: None,
             relation: Relation::Myself,
             lineage: crate::agent_execution::Lineage(crate::model::TerminalId::new()),
-            exited: false,
-            failure: None,
-            active_at: None,
         };
         let repository = std::path::Path::new("/repo");
         assert_eq!(

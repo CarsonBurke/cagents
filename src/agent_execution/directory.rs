@@ -27,9 +27,6 @@ pub enum Scope {
     /// its name.
     Project(PathBuf),
     All,
-    /// Sessions placed in this channel, or in the caller's own when absent,
-    /// including chats whose provider has exited.
-    Channel(Option<crate::model::ChannelId>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -107,17 +104,6 @@ pub struct Entry {
     pub relation: Relation,
     /// Stable across this session's relaunches and recoveries.
     pub lineage: super::Lineage,
-    /// The provider has exited. Its conversation stays readable with
-    /// `cagents transcript` until the session is closed.
-    #[serde(default)]
-    pub exited: bool,
-    /// The provider's last reported failure, such as a usage limit.
-    #[serde(default)]
-    pub failure: Option<String>,
-    /// Unix milliseconds of the conversation's last saved provider history,
-    /// reported in channel listings.
-    #[serde(default)]
-    pub active_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -131,6 +117,33 @@ pub struct Directory {
     pub sessions: Vec<Entry>,
 }
 
+/// A session as a channel listing or transcript reports it: its directory
+/// entry, and what someone picking up its work needs first.
+///
+/// Kept apart from [`Entry`], whose layout older `cagents` CLIs carried across
+/// an update still decode.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Member {
+    pub session: Entry,
+    /// The provider has exited. Its conversation stays readable with
+    /// `cagents transcript` until the session is closed.
+    pub exited: bool,
+    /// The provider's last reported failure, such as a usage limit, in one line.
+    pub failure: Option<String>,
+    /// Unix milliseconds of the conversation's last saved provider history.
+    pub active_at: Option<u64>,
+}
+
+/// The sessions placed in one channel, including chats whose provider exited.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Members {
+    pub channel: crate::model::ChannelId,
+    /// The calling session, when it is in this channel.
+    pub caller: Option<Member>,
+    /// Every other member, most recently active first.
+    pub sessions: Vec<Member>,
+}
+
 impl Entry {
     /// One line for people and agents scanning a list. IDs are printed whole
     /// because they are what every other command takes.
@@ -139,7 +152,6 @@ impl Entry {
             .provider
             .map_or("shell", |provider| provider.executable());
         let state = match self.state {
-            _ if self.exited => "exited",
             ActivityState::Unknown => "unknown",
             ActivityState::Idle => "idle",
             ActivityState::Working => "working",

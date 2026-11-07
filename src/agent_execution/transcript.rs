@@ -45,8 +45,8 @@ pub struct Query {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Page {
-    /// The session as `cagents sessions` lists it.
-    pub session: super::directory::Entry,
+    /// The session as `cagents sessions --channel` lists it.
+    pub session: super::directory::Member,
     /// Oldest first, ending at the newest entry or just before `before`.
     pub entries: Vec<Entry>,
     /// Pass as `before` to read the entries preceding this page. Absent when

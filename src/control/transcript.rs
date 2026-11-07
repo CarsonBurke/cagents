@@ -3,7 +3,7 @@
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    directory::Entry as Session,
+    directory::Member,
     transcript::{Content, DEFAULT_LIMIT, Entry, MAX_LIMIT, Page, Query, Text, ToolRun},
 };
 use crate::chat::{DeliveryKind, ToolStatus};
@@ -100,11 +100,12 @@ fn human(page: &Page, query: &Query, now: u64) -> String {
     out
 }
 
-fn heading(session: &Session, now: u64) -> String {
+fn heading(member: &Member, now: u64) -> String {
+    let session = &member.session;
     let provider = session
         .provider
         .map_or("shell", |provider| provider.executable());
-    let state = if session.exited {
+    let state = if member.exited {
         "exited"
     } else {
         match session.state {
@@ -118,10 +119,10 @@ fn heading(session: &Session, now: u64) -> String {
     if let Some(title) = session.title.as_deref().filter(|title| !title.is_empty()) {
         line.push_str(&format!(" \"{}\"", format::plain(title)));
     }
-    if let Some(at) = session.active_at {
+    if let Some(at) = member.active_at {
         line.push_str(&format!(", active {}", format::relative_time(at, now)));
     }
-    if let Some(failure) = &session.failure {
+    if let Some(failure) = &member.failure {
         line.push_str(&format!("\nFailed: {}", format::plain(failure)));
     }
     line
@@ -246,11 +247,14 @@ const INDENT: &str = "  ";
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent_execution::transcript::{Tool, ToolCount};
+    use crate::agent_execution::{
+        directory::Entry as Session,
+        transcript::{Tool, ToolCount},
+    };
 
-    fn session() -> Session {
+    fn session() -> Member {
         let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
-        Session {
+        let session = Session {
             id,
             surface: crate::agent_execution::directory::Surface::Chat,
             provider: Some(crate::agent::Provider::Codex),
@@ -266,6 +270,9 @@ mod tests {
             delegation: None,
             relation: crate::agent_execution::directory::Relation::Peer,
             lineage: crate::agent_execution::Lineage(id),
+        };
+        Member {
+            session,
             exited: true,
             failure: Some("You've hit your usage limit".into()),
             active_at: Some(60_000),
@@ -401,7 +408,7 @@ mod tests {
         session.exited = false;
         session.failure = None;
         session.active_at = None;
-        session.title = None;
+        session.session.title = None;
         let mut page = Page {
             session,
             entries: vec![],

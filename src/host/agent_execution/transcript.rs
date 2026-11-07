@@ -10,7 +10,7 @@ use crate::{
     agent::Provider,
     agent_execution::{
         Authority,
-        directory::{Entry, Relation, Scope},
+        directory::{Member, Relation, Scope},
         transcript::{Builder, MAX_LIMIT, Page, Query},
     },
     chat::{self, Item, Launch},
@@ -27,9 +27,9 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
     if query.limit == 0 || query.limit > MAX_LIMIT {
         return Err(format!("A page holds between 1 and {MAX_LIMIT} messages"));
     }
-    let listing = directory::read_members(host, authority, Scope::All, true)?;
+    let listing = directory::list(host, authority, directory::Wanted::Scope(Scope::All), true)?;
     let mut session = resolve(&listing, &query.session)?;
-    let source = source(host, session.id, true)?;
+    let source = source(host, session.session.id, true)?;
     session.active_at = source.modified();
     let recognizer = host
         .lock()
@@ -82,21 +82,18 @@ pub(super) fn read(host: &SharedHost, authority: &Authority, query: Query) -> Re
 
 /// The one session `handle` names, as `cagents send` resolves a recipient:
 /// `parent`, or a prefix of a session ID, lineage or delegated agent ID.
-fn resolve(
-    listing: &crate::agent_execution::directory::Directory,
-    handle: &str,
-) -> Result<Entry, String> {
-    let entries = || listing.caller.iter().chain(&listing.sessions);
+fn resolve(listing: &directory::Listing, handle: &str) -> Result<Member, String> {
     if handle == "parent" {
         // A parent relaunched in its card leaves the exited original listed
         // beside it; the live one is the parent now.
-        let parents: Vec<&Entry> = entries()
-            .filter(|entry| entry.relation == Relation::Parent)
+        let parents: Vec<&Member> = listing
+            .members()
+            .filter(|member| member.session.relation == Relation::Parent)
             .collect();
-        let live: Vec<&Entry> = parents
+        let live: Vec<&Member> = parents
             .iter()
             .copied()
-            .filter(|entry| !entry.exited)
+            .filter(|member| !member.exited)
             .collect();
         let chosen = if live.is_empty() { parents } else { live };
         let mut parents = chosen.into_iter();
@@ -116,9 +113,10 @@ fn resolve(
         ));
     }
     let matches = |id: &dyn std::fmt::Display| id.to_string().starts_with(&handle);
-    let found: Vec<&Entry> = entries()
-        .filter(|entry| entry.provider.is_some())
-        .filter(|entry| {
+    let found: Vec<&Member> = listing
+        .members()
+        .filter(|member| member.session.provider.is_some())
+        .filter(|Member { session: entry, .. }| {
             matches(&entry.id)
                 || matches(&entry.lineage)
                 || entry
@@ -129,19 +127,23 @@ fn resolve(
         .collect();
     // A relaunched session shares its lineage with the exited one it
     // replaced; a session ID names one exactly, otherwise the live one wins.
-    let by_id: Vec<&Entry> = found
+    let by_id: Vec<&Member> = found
         .iter()
         .copied()
-        .filter(|entry| matches(&entry.id))
+        .filter(|member| matches(&member.session.id))
         .collect();
-    let live: Vec<&Entry> = found
+    let live: Vec<&Member> = found
         .iter()
         .copied()
-        .filter(|entry| !entry.exited)
+        .filter(|member| !member.exited)
         .collect();
     match (found.as_slice(), by_id.as_slice(), live.as_slice()) {
         ([only], _, _) | (_, [only], _) => Ok((*only).clone()),
-        (many, _, [only]) if many.iter().all(|entry| entry.lineage == only.lineage) => {
+        (many, _, [only])
+            if many
+                .iter()
+                .all(|member| member.session.lineage == only.session.lineage) =>
+        {
             Ok((**only).clone())
         }
         ([], _, _) => Err(format!(
@@ -335,12 +337,12 @@ mod tests {
     use super::*;
     use crate::agent_execution::{
         Lineage,
-        directory::{Directory, Surface},
+        directory::{Entry, Surface},
         transcript::Content,
     };
 
-    fn entry(id: &str, lineage: &str, relation: Relation, exited: bool) -> Entry {
-        Entry {
+    fn member(id: &str, lineage: &str, relation: Relation, exited: bool) -> Member {
+        let session = Entry {
             id: id.parse().unwrap(),
             surface: Surface::Chat,
             provider: Some(Provider::Claude),
@@ -356,6 +358,9 @@ mod tests {
             delegation: None,
             relation,
             lineage: Lineage(lineage.parse().unwrap()),
+        };
+        Member {
+            session,
             exited,
             failure: None,
             active_at: None,
@@ -366,22 +371,22 @@ mod tests {
     const RELAUNCH: &str = "22222222-0000-4000-8000-000000000002";
     const OTHER: &str = "33333333-0000-4000-8000-000000000003";
 
-    fn listing(sessions: Vec<Entry>) -> Directory {
-        Directory {
+    fn listing(sessions: Vec<Member>) -> directory::Listing {
+        directory::Listing {
             caller: None,
-            scope: Scope::All,
             sessions,
+            served: directory::Wanted::Scope(Scope::All),
         }
     }
 
     #[test]
     fn handles_name_one_session_and_a_relaunch_supersedes_its_exited_original() {
         let relaunched = listing(vec![
-            entry(ORIGINAL, ORIGINAL, Relation::Parent, true),
-            entry(RELAUNCH, ORIGINAL, Relation::Parent, false),
-            entry(OTHER, OTHER, Relation::Peer, false),
+            member(ORIGINAL, ORIGINAL, Relation::Parent, true),
+            member(RELAUNCH, ORIGINAL, Relation::Parent, false),
+            member(OTHER, OTHER, Relation::Peer, false),
         ]);
-        let id = |handle| resolve(&relaunched, handle).map(|entry| entry.id.to_string());
+        let id = |handle| resolve(&relaunched, handle).map(|member| member.session.id.to_string());
         assert_eq!(id("parent").unwrap(), RELAUNCH);
         assert_eq!(id("2222").unwrap(), RELAUNCH);
         assert_eq!(id("3333").unwrap(), OTHER);
@@ -390,15 +395,19 @@ mod tests {
         assert!(id("111").unwrap_err().contains("at least 4"));
         assert!(id("4444").unwrap_err().contains("cagents ls --channel"));
 
-        let exited_only = listing(vec![entry(ORIGINAL, ORIGINAL, Relation::Parent, true)]);
+        let exited_only = listing(vec![member(ORIGINAL, ORIGINAL, Relation::Parent, true)]);
         assert_eq!(
-            resolve(&exited_only, "parent").unwrap().id.to_string(),
+            resolve(&exited_only, "parent")
+                .unwrap()
+                .session
+                .id
+                .to_string(),
             ORIGINAL,
             "an exited parent is still readable"
         );
         let twins = listing(vec![
-            entry(ORIGINAL, OTHER, Relation::Peer, false),
-            entry(RELAUNCH, OTHER, Relation::Peer, false),
+            member(ORIGINAL, OTHER, Relation::Peer, false),
+            member(RELAUNCH, OTHER, Relation::Peer, false),
         ]);
         assert!(
             resolve(&twins, "3333")

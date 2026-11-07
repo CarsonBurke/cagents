@@ -2,10 +2,10 @@
 use super::*;
 use crate::agent_execution::{
     Placement,
-    directory::{Directory, Scope},
+    directory::{Directory, Members, Scope},
     transcript::{Content, Page, Query},
 };
-use crate::model::TerminalId;
+use crate::model::{ChannelId, TerminalId};
 use serde_json::json;
 use std::io::Write;
 
@@ -22,6 +22,17 @@ fn query(session: &str, before: Option<&str>, limit: u16) -> Query {
 fn read(host: &SharedHost, authority: &Authority, query: Query) -> Result<Page, String> {
     match process(host, authority.clone(), Operation::Transcript(query))? {
         Reply::Transcript(page) => Ok(page),
+        reply => panic!("unexpected reply {reply:?}"),
+    }
+}
+
+fn members(
+    host: &SharedHost,
+    authority: &Authority,
+    channel: Option<ChannelId>,
+) -> Result<Members, String> {
+    match process(host, authority.clone(), Operation::Members(channel))? {
+        Reply::Members(members) => Ok(members),
         reply => panic!("unexpected reply {reply:?}"),
     }
 }
@@ -99,7 +110,7 @@ fn transcript_reads_a_sessions_saved_conversation_compactly_and_pages_back() {
     save_claude_transcript(&host, session, root);
 
     let page = read(&host, &Authority::default(), query(&handle[..8], None, 10)).unwrap();
-    assert_eq!(page.session.id, session);
+    assert_eq!(page.session.session.id, session);
     assert!(!page.session.exited);
     assert_eq!(page.earlier, None, "the whole conversation fits");
     let kinds: Vec<_> = page
@@ -191,7 +202,7 @@ fn transcript_reads_a_sessions_saved_conversation_compactly_and_pages_back() {
 #[test]
 fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
     use crate::{
-        model::{CardId, CardKind, ChannelId},
+        model::{CardId, CardKind},
         workspace_model::views::Pane,
     };
     if isolated("host::agent_execution::tests::transcript::channel_directory_lists_members_with_activity_including_an_exited_chat").is_some() {
@@ -242,32 +253,27 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
     save_claude_transcript(&host, session, root);
 
     // A caller outside every channel must name one.
-    let unplaced = directory(&host, &Authority::default(), Scope::Channel(None)).unwrap_err();
+    let unplaced = members(&host, &Authority::default(), None).unwrap_err();
     assert!(unplaced.contains("--channel"), "{unplaced}");
-    let unknown = directory(
-        &host,
-        &Authority::default(),
-        Scope::Channel(Some(ChannelId::new())),
-    )
-    .unwrap_err();
+    let unknown = members(&host, &Authority::default(), Some(ChannelId::new())).unwrap_err();
     assert!(unknown.contains("No channel"), "{unknown}");
 
-    let mine = directory(&host, &authority, Scope::Channel(None)).unwrap();
-    assert_eq!(mine.scope, Scope::Channel(Some(channel)));
+    let mine = members(&host, &authority, None).unwrap();
+    assert_eq!(mine.channel, channel);
     let me = mine.caller.as_ref().unwrap();
-    assert_eq!(me.id, session);
+    assert_eq!(me.session.id, session);
     assert!(me.active_at.is_some(), "the saved conversation's time");
-    let named = directory(&host, &Authority::default(), Scope::Channel(Some(channel))).unwrap();
+    let named = members(&host, &Authority::default(), Some(channel)).unwrap();
     assert_eq!(
         named
             .sessions
             .iter()
-            .map(|entry| entry.id)
+            .map(|member| member.session.id)
             .collect::<Vec<_>>(),
         vec![session]
     );
     assert_ne!(
-        named.sessions[0].title.as_deref(),
+        named.sessions[0].session.title.as_deref(),
         Some("Login"),
         "a member is not named after its channel"
     );
@@ -302,11 +308,11 @@ fn channel_directory_lists_members_with_activity_including_an_exited_chat() {
         assert!(Instant::now() < deadline, "the provider never exited");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let after = directory(&host, &Authority::default(), Scope::Channel(Some(channel))).unwrap();
+    let after = members(&host, &Authority::default(), Some(channel)).unwrap();
     let exited = after
         .sessions
         .iter()
-        .find(|entry| entry.id == session)
+        .find(|member| member.session.id == session)
         .expect("an exited chat stays in its channel's listing");
     assert!(exited.exited, "{exited:?}");
     let page = read(

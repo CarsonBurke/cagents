@@ -6,9 +6,11 @@ use crate::{
     agent::{ActivityState, Provider},
     agent_execution::{
         Authority, Lineage, Origin,
-        directory::{Delegation, Directory, Entry, Owner, Relation, Scope, Surface},
+        directory::{
+            Delegation, Directory, Entry, Member, Members, Owner, Relation, Scope, Surface,
+        },
     },
-    model::TerminalId,
+    model::{ChannelId, TerminalId},
     project_location::{Placement, place},
 };
 use std::{
@@ -32,40 +34,86 @@ pub(in crate::host) struct Live {
 /// A failure is context in a listing, not a diagnostic dump.
 const FAILURE_BYTES: usize = 300;
 
+/// Which sessions a listing returns.
+pub(super) enum Wanted {
+    Scope(Scope),
+    /// Members of this channel, or of the caller's own when absent.
+    Channel(Option<ChannelId>),
+}
+
+/// Sessions with the state a member view reports.
+pub(super) struct Listing {
+    pub(super) caller: Option<Member>,
+    pub(super) sessions: Vec<Member>,
+    /// What was served: a directory widened to `All`, or the caller's channel.
+    pub(super) served: Wanted,
+}
+
+impl Listing {
+    pub(super) fn members(&self) -> impl Iterator<Item = &Member> {
+        self.caller.iter().chain(&self.sessions)
+    }
+}
+
 pub(super) fn read(
     host: &SharedHost,
     authority: &Authority,
     scope: Scope,
 ) -> Result<Directory, String> {
-    let channel = matches!(scope, Scope::Channel(_));
-    let mut directory = read_members(host, authority, scope, channel)?;
-    if channel {
-        // How recently each session worked is what a reader picking up a
-        // channel's work needs first; it costs a file lookup per session, so
-        // only the small channel listing pays for it.
-        for entry in directory.caller.iter_mut().chain(&mut directory.sessions) {
-            entry.active_at = super::transcript::source(host, entry.id, false)
-                .ok()
-                .and_then(|source| source.modified());
-        }
-        // Whoever worked most recently is likeliest the one to pick up from.
-        directory
+    let listing = list(host, authority, Wanted::Scope(scope), false)?;
+    let Wanted::Scope(scope) = listing.served else {
+        unreachable!("a directory read serves a scope");
+    };
+    Ok(Directory {
+        caller: listing.caller.map(|member| member.session),
+        scope,
+        sessions: listing
             .sessions
-            .sort_by_key(|entry| std::cmp::Reverse(entry.active_at));
-    }
-    Ok(directory)
+            .into_iter()
+            .map(|member| member.session)
+            .collect(),
+    })
 }
 
-/// The directory. A view of individual members, as of one channel or one
-/// session's history, also includes chats whose provider exited, and names
-/// each session only by its own title: the channel's title, a fallback
-/// elsewhere, would label every member alike.
-pub(super) fn read_members(
+/// The sessions in a channel, including chats whose provider exited.
+pub(super) fn channel(
     host: &SharedHost,
     authority: &Authority,
-    scope: Scope,
+    channel: Option<ChannelId>,
+) -> Result<Members, String> {
+    let mut listing = list(host, authority, Wanted::Channel(channel), true)?;
+    let Wanted::Channel(Some(channel)) = listing.served else {
+        unreachable!("a channel read serves one channel");
+    };
+    // How recently each session worked is what a reader picking up a
+    // channel's work needs first; it costs a file lookup per session, so only
+    // the small channel listing pays for it.
+    for member in listing.caller.iter_mut().chain(&mut listing.sessions) {
+        member.active_at = super::transcript::source(host, member.session.id, false)
+            .ok()
+            .and_then(|source| source.modified());
+    }
+    // Whoever worked most recently is likeliest the one to pick up from.
+    listing
+        .sessions
+        .sort_by_key(|member| std::cmp::Reverse(member.active_at));
+    Ok(Members {
+        channel,
+        caller: listing.caller,
+        sessions: listing.sessions,
+    })
+}
+
+/// The listing behind every directory read. A view of individual members, as
+/// of one channel or one session's history, also includes chats whose
+/// provider exited, and names each session only by its own title: the
+/// channel's title, a fallback elsewhere, would label every member alike.
+pub(super) fn list(
+    host: &SharedHost,
+    authority: &Authority,
+    wanted: Wanted,
     members: bool,
-) -> Result<Directory, String> {
+) -> Result<Listing, String> {
     // Reading confers nothing, so a capability whose session has ended reads
     // as a caller outside cagents rather than failing the whole listing.
     let (caller_origin, caller) = caller(host, authority).unwrap_or((Origin::User, None));
@@ -129,20 +177,23 @@ pub(super) fn read_members(
             .or_insert_with(|| place(directory, &model));
         (placement.worktree.clone(), placement.project.clone())
     };
-    let (scope, wanted) = match scope {
-        Scope::All => (Scope::All, None),
-        Scope::Channel(Some(channel)) if model.channel(channel).is_none() => {
+    let (served, wanted) = match wanted {
+        Wanted::Channel(Some(channel)) if model.channel(channel).is_none() => {
             return Err(format!(
                 "No channel {channel}; list them with `cagents channel list`"
             ));
         }
         // Resolved against the caller's own entry below.
-        Scope::Channel(channel) => (Scope::Channel(channel), None),
-        Scope::Containing(directory) => match place_cached(&directory).1 {
-            Some(project) => (Scope::Project(project.clone()), Some(project)),
-            None => (Scope::All, None),
+        Wanted::Channel(channel) => (Wanted::Channel(channel), None),
+        Wanted::Scope(Scope::All) => (Wanted::Scope(Scope::All), None),
+        Wanted::Scope(Scope::Containing(directory)) => match place_cached(&directory).1 {
+            Some(project) => (
+                Wanted::Scope(Scope::Project(project.clone())),
+                Some(project),
+            ),
+            None => (Wanted::Scope(Scope::All), None),
         },
-        Scope::Project(path) => {
+        Wanted::Scope(Scope::Project(path)) => {
             let project = if model.project(&path).is_some() {
                 path
             } else if path.is_relative() {
@@ -152,7 +203,10 @@ pub(super) fn read_members(
                     .1
                     .ok_or_else(|| format!("No open project contains {}", path.display()))?
             };
-            (Scope::Project(project.clone()), Some(project))
+            (
+                Wanted::Scope(Scope::Project(project.clone())),
+                Some(project),
+            )
         }
     };
 
@@ -222,6 +276,9 @@ pub(super) fn read_members(
             delegation,
             relation,
             lineage: lineage(live.id),
+        };
+        let member = Member {
+            session: entry,
             exited: live.exited,
             failure: live.failure.map(|failure| {
                 let mut failure = match live.provider {
@@ -238,25 +295,31 @@ pub(super) fn read_members(
             active_at: None,
         };
         if relation == Relation::Myself {
-            me = Some(entry);
+            me = Some(member);
         } else {
-            sessions.push(entry);
+            sessions.push(member);
         }
     }
-    let scope = match scope {
-        Scope::Channel(channel) => {
+    let served = match served {
+        Wanted::Channel(channel) => {
             let channel = channel
-                .or_else(|| me.as_ref().and_then(|me: &Entry| me.channel))
+                .or_else(|| me.as_ref().and_then(|me: &Member| me.session.channel))
                 .ok_or(
                     "This caller is not in a channel; name one with --channel CHANNEL, \
                      from `cagents channel list`",
                 )?;
-            sessions.retain(|entry| entry.channel == Some(channel));
-            Scope::Channel(Some(channel))
+            sessions.retain(|member| member.session.channel == Some(channel));
+            if me
+                .as_ref()
+                .is_some_and(|me| me.session.channel != Some(channel))
+            {
+                me = None;
+            }
+            Wanted::Channel(Some(channel))
         }
-        scope => scope,
+        served => served,
     };
-    sessions.sort_by_cached_key(|entry| {
+    sessions.sort_by_cached_key(|Member { session: entry, .. }| {
         (
             match entry.relation {
                 Relation::Parent => 0,
@@ -276,10 +339,10 @@ pub(super) fn read_members(
             entry.title.clone(),
         )
     });
-    Ok(Directory {
+    Ok(Listing {
         caller: me,
-        scope,
         sessions,
+        served,
     })
 }
 
