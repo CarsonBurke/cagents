@@ -144,6 +144,16 @@ the tests"},"result":"error[E0308]: mismatched types","is_error":true}`.
 Every turn emits each call and its result in order, before its answer, and
 records them in the synthetic history like the other behaviors.
 
+To replay a provider stream exactly, write `fixture-frames.jsonl`: one
+stream-json frame per line, emitted in order on every turn before its answer.
+`@TURN@` in any string becomes the turn number, so IDs stay unique across
+turns. Assistant and user frames are recorded in the synthetic history; system
+frames, such as a background task's `task_started` and `task_notification`,
+are live only, as they are from Claude Code. A frame with `"_history": true` is
+only recorded, the way Claude Code records a queued notification as a
+`queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
+state can be captured.
+
 For image preview and viewer checks, copy a PNG to
 `"$fixture_root/home/fixture-image.png"` before spawning the agent. Native
 launches drop `CAGENTS_*` variables, so the fixture reads the image from its
