@@ -115,13 +115,21 @@ impl<'a> Failure<'a> {
         let kind = if let Some(kind) = structured_kind {
             kind
         } else if contains(&[
-            "you've hit your limit",
-            "you have hit your limit",
+            // Claude Code names the limit it hit: "You've hit your limit",
+            // "… your weekly limit", "… your Opus limit", "… your monthly
+            // spend limit". Every such message is an account limit.
+            "you've hit your ",
+            "you’ve hit your ",
+            "you have hit your ",
             "usage limit is reached",
             "usage limit reached",
             "session limit reached",
             "rate_limit_error",
             "claude: rate_limit",
+            // A subagent's API failure as Claude Code reports it to its
+            // parent: "… (error type rate_limit, HTTP 429, request id …)".
+            "error type rate_limit",
+            "usage_limit_reached",
             "insufficient_quota",
             "quota exceeded",
             "exceeded your current quota",
@@ -173,7 +181,10 @@ impl<'a> Failure<'a> {
             .flatten();
         let (mut summary, action) = match kind {
             FailureKind::AccountLimit => (
-                format!("{name} usage limit reached"),
+                format!(
+                    "{name} {} limit reached",
+                    limit_name(&signal).unwrap_or("usage")
+                ),
                 "Wait for the reported reset or choose another account.",
             ),
             FailureKind::Authentication => (
@@ -308,9 +319,28 @@ fn structured_kind(kind: &str) -> Option<FailureKind> {
     }
 }
 
+/// The limit a "You've hit your … limit" message names, such as "weekly"
+/// or "Opus", when it is a plain name of at most three words.
+fn limit_name(signal: &str) -> Option<&str> {
+    let lower = signal.to_ascii_lowercase();
+    let start = ["you've hit your ", "you’ve hit your ", "you have hit your "]
+        .into_iter()
+        .find_map(|marker| lower.find(marker).map(|at| at + marker.len()))?;
+    let rest = &signal[start..];
+    let name = &rest[..rest.to_ascii_lowercase().find(" limit")?];
+    (!name.is_empty()
+        && name.split(' ').count() <= 3
+        && name
+            .split(' ')
+            .all(|word| !word.is_empty() && word.chars().all(|c| c.is_ascii_alphabetic())))
+    .then_some(name)
+}
+
 /// Keep the actual provider message's reported clock/date/zone rather than
 /// guessing a local reset or parsing an HTTP code as account authority.
-/// Diagnostic tails are not part of the human reset label or its semantic key.
+/// Diagnostic tails are not part of the human reset label or its semantic key:
+/// a parenthesis after the reset is kept only when it names a time zone, so
+/// "(America/Vancouver) (error type rate_limit, HTTP 429, …)" keeps the zone.
 fn reported_reset(message: &str) -> Option<String> {
     let lower = message.to_ascii_lowercase();
     let (at, marker) = ["resets at ", "resets ", "reset at "]
@@ -318,7 +348,25 @@ fn reported_reset(message: &str) -> Option<String> {
         .filter_map(|marker| lower.find(marker).map(|at| (at, marker)))
         .min_by_key(|(at, _)| *at)?;
     let tail = &message[at + marker.len()..];
-    let line = tail.lines().next()?.split(" · ").next()?.trim();
+    let line = tail.lines().next()?.split(" · ").next()?;
+    let mut parts = line.split(" (");
+    let mut kept = parts.next()?.trim().to_owned();
+    for part in parts {
+        let Some(zone) = part.trim_end().strip_suffix(')') else {
+            break;
+        };
+        if zone.is_empty()
+            || !zone
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '/' | '_' | '+' | '-' | ':'))
+        {
+            break;
+        }
+        kept.push_str(" (");
+        kept.push_str(zone);
+        kept.push(')');
+    }
+    let line = kept.as_str();
     if line.is_empty()
         || line.chars().count() > 128
         || !line.chars().any(|c| c.is_ascii_digit())
@@ -545,6 +593,68 @@ mod tests {
             .unwrap()
             .key
         );
+    }
+
+    #[test]
+    fn a_named_limit_and_a_subagents_report_of_it_are_one_limit_with_its_reset() {
+        // As Claude Code 2.1.296 reported one weekly limit: the parent's own
+        // API error, and the failed Agent call of a subagent that hit it.
+        let parent = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
+        let agent = "Agent terminated early due to an API error: You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver) (error type rate_limit, HTTP 429, request id req_011, model sent to the API: claude-opus-5-5)";
+        let parent = Failure::parse(Provider::Claude, parent).unwrap();
+        let agent = Failure::parse(Provider::Claude, agent).unwrap();
+        for failure in [&parent, &agent] {
+            assert_eq!(failure.kind, FailureKind::AccountLimit);
+            assert_eq!(
+                failure.reset.as_deref(),
+                Some("Nov 8, 8am (America/Vancouver)")
+            );
+            assert_eq!(
+                failure.summary,
+                "Claude weekly limit reached · resets Nov 8, 8am (America/Vancouver)"
+            );
+        }
+        assert_eq!(parent.key, agent.key);
+        for (raw, summary) in [
+            (
+                "You’ve hit your Opus limit · resets 3pm",
+                "Claude Opus limit reached · resets 3pm",
+            ),
+            (
+                "You have hit your monthly spend limit · resets Dec 1",
+                "Claude monthly spend limit reached · resets Dec 1",
+            ),
+            (
+                "You've hit your channel's monthly spend limit.",
+                "Claude usage limit reached",
+            ),
+            (
+                "Agent terminated early due to an API error: Request rejected (error type rate_limit, HTTP 429)",
+                "Claude usage limit reached",
+            ),
+        ] {
+            let failure = Failure::parse(Provider::Claude, raw).unwrap();
+            assert_eq!(failure.kind, FailureKind::AccountLimit, "{raw}");
+            assert_eq!(failure.summary, summary, "{raw}");
+        }
+        // Only a time zone's parenthesis belongs to the reset.
+        for (raw, reset) in [
+            (
+                "You've hit your limit · resets 9:30pm (error type rate_limit)",
+                "9:30pm",
+            ),
+            (
+                "You've hit your limit · resets 9:30pm (UTC) (HTTP 429)",
+                "9:30pm (UTC)",
+            ),
+            (
+                "You've hit your limit · resets 9:30pm (Etc/GMT+8)",
+                "9:30pm (Etc/GMT+8)",
+            ),
+        ] {
+            let failure = Failure::parse(Provider::Claude, raw).unwrap();
+            assert_eq!(failure.reset.as_deref(), Some(reset), "{raw}");
+        }
     }
 
     #[test]
