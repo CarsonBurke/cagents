@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Offline Unix-WebSocket Codex peer for streaming escape-state validation.
 
 Requires a private CAGENTS_ESCAPE_FIXTURE_ROOT and CODEX_HOME beneath it. The
