@@ -2414,7 +2414,18 @@ where
     // actors. Refuse before staged-owner routing, SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
-    let user_only_message = match &cli.command {
+    let hosted = std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some();
+    let local =
+        cli.device.as_deref().is_none_or(|name| name == "local") && !crate::device::is_remote();
+    let user_only_message: Option<std::borrow::Cow<'static, str>> = match &cli.command {
+        // A development daemon with a runtime of its own, such as a runner
+        // instance, is the caller's to stop unless it hosts the caller or a
+        // session above it. Production builds keep refusing.
+        TopCommand::Daemon {
+            command: DaemonCommand::StopForRebuild { .. },
+        } if hosted && local => {
+            crate::daemon::hosting::stop_refusal().map(|refusal| refusal.message().into())
+        }
         TopCommand::Daemon {
             command:
                 DaemonCommand::Bridge
@@ -2425,23 +2436,19 @@ where
                 | DaemonCommand::Upgrade { .. }
                 | DaemonCommand::AbandonUpgrade { .. }
                 | DaemonCommand::StopForRebuild { .. },
-        } => Some(
-            "Daemon lifecycle commands require your own terminal; hosted sessions cannot start, stop or upgrade the daemon",
-        ),
+        } => Some(crate::daemon::hosting::LIFECYCLE_REFUSAL.into()),
         TopCommand::CoordinateInstall { .. } | TopCommand::RestartWindows { .. } => {
-            Some("Installation and window restart commands require your own terminal")
+            Some("Installation and window restart commands require your own terminal".into())
         }
         TopCommand::Account {
             command:
                 AccountCommand::Link { .. }
                 | AccountCommand::Default { .. }
                 | AccountCommand::Remove { .. },
-        } => Some("Account changes require your own terminal"),
+        } => Some("Account changes require your own terminal".into()),
         _ => None,
     };
-    if std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some()
-        && let Some(message) = user_only_message
-    {
+    if hosted && let Some(message) = user_only_message {
         emit_error(
             cli.json,
             &AppError::new(
@@ -4568,6 +4575,123 @@ mod tests {
         assert_eq!(other.reason(), "could not connect to the daemon: refused");
     }
 
+    /// A hosted session stops a development daemon with a runtime of its own,
+    /// as `scripts/run-development --stop-instance` does, unless that daemon
+    /// hosts it. The daemon here is a process holding the instance's lock.
+    #[test]
+    fn hosted_stop_for_rebuild_ends_only_a_development_daemon_that_does_not_host_it() {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+        const CHILD: &str = "CAGENTS_TEST_HOSTED_STOP_FOR_REBUILD";
+        let name = thread::current().name().unwrap().to_owned();
+        let Some(host) = std::env::var_os(CHILD) else {
+            for host in ["elsewhere", "itself"] {
+                let directory = tempfile::Builder::new().prefix("hs-").tempdir().unwrap();
+                for leaf in ["home", "runtime"] {
+                    let path = directory.path().join(leaf);
+                    std::fs::create_dir(&path).unwrap();
+                    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let runtime = directory.path().join("runtime/cagents-development");
+                std::fs::create_dir(&runtime).unwrap();
+                let lock = runtime.join("cagentsd.lock");
+                std::fs::write(&lock, "").unwrap();
+                let mut daemon = Command::new("/bin/sh")
+                    .args(["-c", "exec 9>>\"$1\" && flock -x 9 && exec sleep 60", "sh"])
+                    .arg(&lock)
+                    .spawn()
+                    .unwrap();
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while Command::new("flock")
+                    .args(["-n", "-x"])
+                    .arg(&lock)
+                    .arg("true")
+                    .status()
+                    .unwrap()
+                    .success()
+                {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture daemon never took its lock"
+                    );
+                    thread::sleep(Duration::from_millis(5));
+                }
+                std::fs::write(&lock, format!("{{\"pid\":{}}}", daemon.id())).unwrap();
+                let out = directory.path().join("stdout");
+                let err = directory.path().join("stderr");
+                let status = Command::new(std::env::current_exe().unwrap())
+                    .env_clear()
+                    .args(["--exact", &name, "--nocapture", "--test-threads=1"])
+                    .current_dir(directory.path())
+                    .env(CHILD, host)
+                    .env("PATH", "/usr/bin:/bin")
+                    .env("HOME", directory.path().join("home"))
+                    .env("XDG_RUNTIME_DIR", directory.path().join("runtime"))
+                    .env(crate::agent_execution::AUTHORITY_ENV, "inert-fixture-role")
+                    .stdin(Stdio::null())
+                    .stdout(std::fs::File::create(&out).unwrap())
+                    .stderr(std::fs::File::create(&err).unwrap())
+                    .status()
+                    .unwrap();
+                let stdout = std::fs::read_to_string(out).unwrap();
+                let stderr = std::fs::read_to_string(err).unwrap();
+                assert!(status.success(), "{host}: {stdout}\n{stderr}");
+                assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
+                assert_eq!(
+                    stderr.contains("This development daemon hosts this session"),
+                    host == "itself",
+                    "{stderr}"
+                );
+                assert!(
+                    !stdout.contains("inert-fixture-role")
+                        && !stderr.contains("inert-fixture-role")
+                );
+                let deadline = Instant::now() + Duration::from_secs(10);
+                let ended = loop {
+                    if let Some(status) = daemon.try_wait().unwrap() {
+                        break Some(status);
+                    }
+                    if host == "itself" || Instant::now() >= deadline {
+                        break None;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                };
+                if host == "elsewhere" {
+                    assert_eq!(
+                        ended.and_then(|status| status.signal()),
+                        Some(libc::SIGTERM)
+                    );
+                } else {
+                    assert!(ended.is_none(), "the hosting daemon was stopped");
+                    daemon.kill().unwrap();
+                    daemon.wait().unwrap();
+                }
+            }
+            return;
+        };
+        let runtime = PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap());
+        let tree = std::env::current_dir().unwrap().join("proc");
+        let host_runtime = if host == "itself" {
+            runtime
+        } else {
+            PathBuf::from("/fixture/production-runtime")
+        };
+        crate::daemon::hosting::fake_process_tree(&tree, std::process::id(), &host_runtime, None);
+        *crate::daemon::hosting::TEST_PROC_ROOT.lock().unwrap() = Some(tree);
+        let argv = [
+            "cagents",
+            "--json",
+            "daemon",
+            "stop-for-rebuild",
+            "--including-subagents",
+        ];
+        if host == "itself" {
+            assert_eq!(run_from(argv), ExitCode::FAILURE);
+        } else {
+            assert_eq!(run_from(argv), ExitCode::SUCCESS);
+        }
+    }
+
     #[test]
     fn hosted_daemon_lifecycle_refuses_before_routing_and_user_framing_stays_usable() {
         use std::os::unix::{
@@ -4668,6 +4792,18 @@ mod tests {
             return;
         };
         let case = case.to_str().unwrap();
+        // This fixture's own daemon hosts it, so a development build refuses
+        // to stop it as it does any lifecycle command.
+        if case != "user" {
+            let tree = std::env::current_dir().unwrap().join("proc");
+            crate::daemon::hosting::fake_process_tree(
+                &tree,
+                std::process::id(),
+                &PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap()),
+                None,
+            );
+            *crate::daemon::hosting::TEST_PROC_ROOT.lock().unwrap() = Some(tree);
+        }
         let socket = daemon_socket_path().unwrap();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
