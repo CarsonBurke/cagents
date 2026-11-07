@@ -244,6 +244,8 @@ class PruneBuildDirs(unittest.TestCase):
             self.addCleanup(process.kill)
             return process
         session = run("bash", str(script), "--task", str(task), "__session", "after")
+        # As a task named from its own working directory.
+        relative = run("bash", str(script), "--task", str(task.relative_to(self.root)), "start")
         # Another tool's --task, and another task's session, keep nothing.
         run("bash", str(unrelated), "--task", str(other.parent))
         run("bash", str(script), "--task", str(self.roots / "cev/elsewhere"), "__session")
@@ -255,6 +257,11 @@ class PruneBuildDirs(unittest.TestCase):
         self.assertFalse(other.exists())
         session.kill()
         session.wait()
+        self.settle()
+        output = self.prune("--evidence-hours", "0")
+        self.assertIn(f"keep {after}: process {relative.pid} uses it", output)
+        relative.kill()
+        relative.wait()
         self.prune("--evidence-hours", "0")
         self.assertFalse(after.exists())
         self.assertFalse(before.exists())

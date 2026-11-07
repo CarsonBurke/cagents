@@ -227,7 +227,7 @@ def held(locks: list[Path]):
             os.close(descriptor)
 
 
-def evidence_session(arguments: list[bytes], task: Path) -> bool:
+def evidence_session(arguments: list[bytes], task: Path, cwd: str = "/") -> bool:
     """Whether a command line is native-evidence working on task.
 
     Its session supervisor names the task. Sessions started by any version of
@@ -240,7 +240,8 @@ def evidence_session(arguments: list[bytes], task: Path) -> bool:
     for option, value in zip(arguments, arguments[1:]):
         if option == b"--task":
             with contextlib.suppress(OSError, ValueError):
-                if Path(os.fsdecode(value)).resolve() == task:
+                # A relative one is the process's, from its working directory.
+                if (Path(cwd) / os.fsdecode(value)).resolve() == task:
                     return True
     return False
 
@@ -263,7 +264,9 @@ def in_use(directory: Path, task: Path | None = None) -> int | None:
         base = f"/proc/{process}"
         if task is not None:
             with contextlib.suppress(OSError), open(f"{base}/cmdline", "rb") as cmdline:
-                if evidence_session(cmdline.read().split(b"\0"), task):
+                arguments = cmdline.read().split(b"\0")
+                if b"--task" in arguments and \
+                        evidence_session(arguments, task, os.readlink(f"{base}/cwd")):
                     return int(process)
         links = ["cwd", "root", "exe"]
         with contextlib.suppress(OSError):
