@@ -1595,6 +1595,12 @@ fn card_accessible_name(type_label: &str, title: &str, caption: &str, focused: b
 /// legible falls back to its card kind rather than blanking the header.
 fn normalize_restored_titles(state: &mut WorkspaceState) {
     for card in &mut state.cards {
+        // The Work board has one name, including in a snapshot saved before it
+        // had this one.
+        if matches!(card.kind, CardKind::Work) {
+            card.title = card_kind_labels(Some(&card.kind)).type_label.to_owned();
+            continue;
+        }
         card.title = normalize_card_name(&card.title)
             .unwrap_or_else(|| card_kind_labels(Some(&card.kind)).type_label.to_owned());
     }
@@ -1681,7 +1687,7 @@ fn card_kind_labels(kind: Option<&CardKind>) -> CardLabels {
             unavailable: "Automations unavailable",
         },
         Some(CardKind::Work) => CardLabels {
-            type_label: "Work",
+            type_label: "Work board",
             icon: Icon::Board,
             starting: "Loading the Work board…",
             unavailable: "Work board unavailable",
@@ -2805,7 +2811,7 @@ fn user_workspace_message_blocked_while_modal(message: &Message) -> bool {
         Message::AutomationUi(action) => !action.background() && !action.answers_draft_dialog(),
         Message::WorkUi(action) => !action.background(),
         Message::ChannelWork(action) => !action.background(),
-        Message::OpenChannelWork(_) | Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
+        Message::ChannelWorkEscape | Message::ChannelWorkNavigation(_) => true,
         Message::UpdateUi(update_ui::Action::Apply) => true,
         Message::PullRequestUi(action) => !action.allowed_while_modal(),
         Message::PullRequestReview { action, .. } => !action.allowed_while_modal(),
@@ -2937,7 +2943,6 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
                 ..
             }
             | Message::ToggleContextInspector
-            | Message::OpenChannelWork(_)
             | Message::ChannelWorkNavigation(_)
             | Message::Repository(RepositoryAction::NewTerminal { .. })
             | Message::Repository(RepositoryAction::MarkdownLink { .. })
@@ -4702,7 +4707,6 @@ pub enum Message {
     AutomationUi(crate::automation_ui::Action),
     WorkUi(crate::work_ui::Action),
     ChannelWork(crate::channel_work_ui::Action),
-    OpenChannelWork(ChannelId),
     ChannelWorkNavigation(channel_work::Navigation),
     ChannelWorkPoll,
     ChannelWorkEscape,
@@ -18023,7 +18027,6 @@ impl Application for Cagents {
             Message::AutomationUi(action) => self.update_automation_ui(action),
             Message::WorkUi(action) => self.update_work_ui(action),
             Message::ChannelWork(action) => self.update_channel_work(action),
-            Message::OpenChannelWork(channel) => self.open_channel_work(channel),
             Message::ChannelWorkNavigation(navigation) => self.channel_navigation(navigation),
             Message::ChannelWorkEscape => self.escape_channel_work(),
             Message::ChannelWorkPoll => self.channel_work.view.refresh().map_or_else(Task::none, |effect| self.channel_work_effect(effect)),
@@ -32531,6 +32534,25 @@ mod tests {
         // Nothing legible survived, so the card is named for its kind rather
         // than losing its header, its accessible name and the window title.
         assert_eq!(state.cards[2].title, "Repository");
+    }
+
+    #[test]
+    fn a_work_board_saved_under_its_old_title_restores_under_its_name() {
+        let mut state = WorkspaceState {
+            cards: vec![CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: "Work".into(),
+                width_fraction: 1.0,
+                existence: Existence::Open,
+                exposure: Exposure::Visible,
+                residency: Residency::Hot,
+                kind: CardKind::Work,
+            }],
+            ..WorkspaceState::default()
+        };
+        normalize_restored_titles(&mut state);
+        assert_eq!(state.cards[0].title, "Work board");
     }
 
     #[test]

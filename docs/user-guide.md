@@ -410,9 +410,11 @@ Created commit, and a failure to release it is reported rather than hidden.
 
 ## Channel work
 
-Open a channel and choose **Work** beside **Conversations** to see the PRs
-tracked in that channel. Return to **Conversations** to use its terminals and
-chats. Changing this view keeps those sessions running.
+Open a channel and choose **Work** in the header to see the PRs tracked in that
+channel. The channel's menu in the sidebar has the same view as **Channel work**.
+Choose **Work** again, use the view's close button or press `Escape` to return
+to the channel's terminals and chats, with the same pane focused. Those sessions
+keep running while Work is open.
 
 Use **Track PR…** to enter the forge host, repository and PR number, or type or
 paste a full PR URL into **Repository**. The URL stays editable while the host

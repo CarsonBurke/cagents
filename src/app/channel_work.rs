@@ -15,12 +15,15 @@ pub(super) enum Surface {
     Work,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) struct Navigation {
     pub(super) home: Home,
     pub(super) generation: uuid::Uuid,
     pub(super) workspace: u64,
     pub(super) surface: Surface,
+    /// Enter activated the entry, so focus stays on it when Work replaces it.
+    /// A pointer leaves focus alone, and a press it abandons publishes nothing.
+    pub(super) keep_focus: bool,
 }
 
 pub(super) struct State {
@@ -33,7 +36,6 @@ pub(super) struct State {
     pub(super) retiring: HashMap<crate::model::ChannelId, (u64, std::time::Instant)>,
     routes: HashMap<Home, Route>,
     main: bool,
-    title: String,
     generation: uuid::Uuid,
     restore_card: Option<CardId>,
     deferred: Option<Deferred>,
@@ -48,13 +50,18 @@ impl Default for State {
             retiring: HashMap::new(),
             routes: HashMap::new(),
             main: false,
-            title: String::new(),
             generation: uuid::Uuid::new_v4(),
             restore_card: None,
             deferred: None,
             navigation_view: None,
         }
     }
+}
+
+/// The header's Work entry, named per generation: a retained press or focus
+/// must not cross to the entry that replaces it.
+pub(super) fn channel_work_entry_id(generation: uuid::Uuid) -> widget::Id {
+    widget::Id::new(format!("command.channel-work.{generation}"))
 }
 
 enum Deferred {
@@ -106,33 +113,57 @@ impl Cagents {
         self.channel_work.main && self.channel_work.view.is_open()
     }
 
-    pub(super) fn channel_home(&self) -> Option<(Home, String)> {
+    pub(super) fn channel_home(&self) -> Option<Home> {
         if self.channel_work_is_main() {
-            return Some((
-                self.channel_work.view.home()?,
-                self.channel_work.title.clone(),
-            ));
+            return self.channel_work.view.home();
         }
         let channel = self.workspace_model.channel(self.durable.active_channel?)?;
-        Some((
-            Home {
-                registry: self.workspace_model.identity,
-                channel: channel.id,
-                creation_ordinal: channel.ordinal,
+        Some(Home {
+            registry: self.workspace_model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        })
+    }
+
+    /// What pressing the header's Work entry asks for right now, or nothing
+    /// outside a channel. It names a destination rather than "toggle" and is
+    /// captured with its owners, so a press queued before Work or the channel
+    /// changed cannot undo what replaced it.
+    pub(super) fn channel_work_entry_navigation(&self) -> Option<Navigation> {
+        Some(Navigation {
+            home: self.channel_home()?,
+            generation: self.channel_work.generation,
+            workspace: self.workspace_view_generation,
+            surface: if self.channel_work_is_main() {
+                Surface::Conversations
+            } else {
+                Surface::Work
             },
-            channel.title.clone(),
-        ))
+            keep_focus: false,
+        })
     }
 
     pub(super) fn channel_navigation(&mut self, navigation: Navigation) -> Task<Message> {
         if navigation.generation != self.channel_work.generation
             || navigation.workspace != self.workspace_view_generation
-            || self.channel_home().map(|value| value.0) != Some(navigation.home)
+            || self.channel_home() != Some(navigation.home)
         {
             return Task::none();
         }
         match navigation.surface {
-            Surface::Work => self.open_channel_work(navigation.home.channel),
+            Surface::Work => {
+                let open = self.open_channel_work(navigation.home.channel);
+                if !navigation.keep_focus {
+                    return open;
+                }
+                // Opening replaces the entry that held focus. Keep the keyboard
+                // on it, so a second Enter leaves the way the first one came.
+                let focus = iced::widget::operation::focus(channel_work_entry_id(
+                    self.channel_work.generation,
+                ))
+                .map(cosmic::Action::App);
+                Task::batch([open, focus])
+            }
             Surface::Conversations => {
                 if !self.channel_work_is_main() {
                     return Task::none();
@@ -143,10 +174,6 @@ impl Cagents {
                 self.update_channel_work(ui::Action::Close(owner))
             }
         }
-    }
-
-    pub(super) fn channel_home_generation(&self) -> uuid::Uuid {
-        self.channel_work.generation
     }
 
     pub(super) fn open_channel_work(&mut self, channel: ChannelId) -> Task<Message> {
@@ -177,13 +204,6 @@ impl Cagents {
             if !was_main {
                 self.channel_work.restore_card = self.workspace.focused();
                 self.channel_work.generation = uuid::Uuid::new_v4();
-                if let Some(current) = self.channel_work.view.home().and_then(|home| {
-                    self.workspace_model
-                        .channel(home.channel)
-                        .filter(|channel| channel.ordinal == home.creation_ordinal)
-                }) {
-                    self.channel_work.title = current.title.clone();
-                }
                 self.set_workspace_surfaces_visible(false);
             }
         }
@@ -626,8 +646,7 @@ impl Cagents {
                 })
                 .map(|channel| channel.title.clone());
             if let Some(title) = current {
-                self.channel_work.view.set_title(home, title.clone());
-                self.channel_work.title = title;
+                self.channel_work.view.set_title(home, title);
                 if changed_view {
                     let task = self.select_channel(home.channel);
                     self.channel_work.restore_card = self.workspace.focused();
@@ -2358,9 +2377,8 @@ mod tests {
                 // The actual header navigation and dirty Keep dialog also
                 // rebuild the outer frame. Execute their normal widget tasks
                 // against that frame, not a local copy of the form.
-                let (_, conversations) =
-                    labelled(&mut frame, &renderer, "Conversations for channel Original");
-                let navigation = click(&mut frame, &mut renderer, conversations.center());
+                let (_, entry) = labelled(&mut frame, &renderer, "Channel work for Original");
+                let navigation = click(&mut frame, &mut renderer, entry.center());
                 let [cosmic::Action::App(Message::ChannelWorkNavigation(destination))] =
                     navigation.as_slice()
                 else {
@@ -2447,6 +2465,7 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let home = captured();
         app.workspace_model = model(home);
+        app.workspace_model.channels[0].title = "Original".into();
         Arc::make_mut(&mut app.durable).active_channel = Some(home.channel);
         let Effect::Read { ticket, .. } =
             app.channel_work.view.open(home, "Original".into()).unwrap()
@@ -2466,7 +2485,6 @@ mod tests {
             }),
         });
         app.channel_work.main = true;
-        app.channel_work.title = "Original".into();
         app.channel_work.navigation_view = app.channel_work.view.owner();
         app.channel_work.routes.insert(
             home,
@@ -2660,7 +2678,6 @@ mod tests {
                 "{source} fetch must not select or refocus a channel"
             );
             assert_eq!(app.channel_work.view.owner(), Some(owner));
-            assert_eq!(app.channel_home().unwrap().1, "Renamed while reading");
             let labels = leaf_labels(&app, &mut renderer);
             assert!(labels.iter().any(|label| label == "Renamed while reading"));
             assert!(!labels.iter().any(|label| label == "Original"));
@@ -4162,6 +4179,14 @@ mod tests {
             !ids.contains_key(&context_inspector_toggle_id().to_string()),
             "main Work does not expose a toggle for the hidden Conversations inspector"
         );
+        mounted(app, cache, renderer, width)
+    }
+    fn mounted<'a>(
+        app: &'a Cagents,
+        cache: Cache,
+        renderer: &mut cosmic::Renderer,
+        width: f32,
+    ) -> Native<'a> {
         let mut ui = iced::runtime::UserInterface::build(
             app.view(),
             iced::Size::new(width, 600.0),
@@ -4293,6 +4318,428 @@ mod tests {
         }
     }
 
+    fn entry_node_selected(ui: &Native<'_>) -> Vec<bool> {
+        let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+        nodes
+            .root()
+            .iter()
+            .chain(nodes.children())
+            .filter(|node| {
+                node.node().role() == iced_accessibility::accesskit::Role::Button
+                    && node.node().label() == Some("Channel work for Original")
+            })
+            .map(|node| node.node().is_selected() == Some(true))
+            .collect()
+    }
+
+    fn entry_press(app: &Cagents, renderer: &mut cosmic::Renderer, width: f32) -> Message {
+        let mut ui = mounted(app, Cache::new(), renderer, width);
+        let area = bounds(&ui, "Channel work for Original");
+        assert!(
+            area.x >= 0.0 && area.x + area.width <= width + 0.1 && area.width > 0.0,
+            "the entry must stay on screen at {width}: {area:?}"
+        );
+        assert!(
+            area.width <= chrome_ui::CHANNEL_WORK_ENTRY_RESERVED_WIDTH,
+            "the header reserves room for the entry's whole width: {area:?}"
+        );
+        click(&mut ui, renderer, area.center())
+            .into_iter()
+            .find(|message| matches!(message, Message::ChannelWorkNavigation(_)))
+            .expect("the mounted entry publishes navigation")
+    }
+
+    #[test]
+    fn main_header_has_one_work_entry_that_opens_and_closes_work() {
+        for width in [300.0, 640.0, 900.0, 1600.0] {
+            let (mut app, home) = main_fixture();
+            app.window_width = width;
+            let mut renderer = super::super::tests::headless_renderer();
+            for retired in [
+                "Conversations for channel Original",
+                "Work for channel Original",
+                "Open current channel work",
+            ] {
+                let ui = native(&app, Cache::new(), &mut renderer, width);
+                assert!(!native_labels(&ui).iter().any(|label| label == retired));
+            }
+            let ui = native(&app, Cache::new(), &mut renderer, width);
+            assert_eq!(entry_node_selected(&ui), [true], "open Work at {width}");
+            let _ = ui.into_cache();
+
+            let close = entry_press(&app, &mut renderer, width);
+            drop(app.update(close));
+            assert!(!app.channel_work_is_main());
+            assert!(!app.channel_work.view.is_open());
+            let mut ui = mounted(&app, Cache::new(), &mut renderer, width);
+            assert_eq!(entry_node_selected(&ui), [false], "closed at {width}");
+            assert!(
+                !rendered_text(&mut ui, &renderer)
+                    .iter()
+                    .any(|text| text == "CHANNEL" || text == "Conversations"),
+                "the banner is gone"
+            );
+            let _ = ui.into_cache();
+
+            let open = entry_press(&app, &mut renderer, width);
+            drop(app.update(open));
+            assert!(app.channel_work_is_main());
+            assert_eq!(app.channel_work.view.home(), Some(home));
+        }
+    }
+
+    #[test]
+    fn work_entry_is_absent_outside_a_channel_and_returns_when_the_overlay_closes() {
+        let mut renderer = super::super::tests::headless_renderer();
+        let (mut app, home) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+
+        // The overlay's own header and scrim own that end of the bar; dismissing
+        // it is what brings the entry back, at a width where it was never docked.
+        app.window_width = 700.0;
+        let _ = app.update(Message::WindowResized(700.0, 600.0));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Fixture".into(),
+            "/project".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        drop(app.set_context_inspector_open(true));
+        app.context_inspector_transition = None;
+        assert!(app.context_inspector_is_overlay());
+        assert!(entry_node_selected(&mounted(&app, Cache::new(), &mut renderer, 700.0)).is_empty());
+        drop(app.set_context_inspector_open(false));
+        app.context_inspector_transition = None;
+        assert_eq!(
+            entry_node_selected(&mounted(&app, Cache::new(), &mut renderer, 700.0)),
+            [false]
+        );
+
+        assert_eq!(app.channel_work_entry_navigation().unwrap().home, home);
+        Arc::make_mut(&mut app.durable).active_channel = None;
+        assert!(app.channel_work_entry_navigation().is_none());
+        assert!(entry_node_selected(&mounted(&app, Cache::new(), &mut renderer, 700.0)).is_empty());
+    }
+
+    fn enter_key() -> iced::Event {
+        key(
+            keyboard::Key::Named(keyboard::key::Named::Enter),
+            keyboard::key::Code::Enter,
+            None,
+        )
+    }
+
+    /// Runs `open` and reports whether focus landed on the entry Work mounted.
+    fn entry_holds_focus_after(
+        app: &mut Cagents,
+        renderer: &mut cosmic::Renderer,
+        open: Message,
+    ) -> bool {
+        use iced::advanced::widget::{Operation, operation};
+        #[derive(Default)]
+        struct Focused(Vec<widget::Id>);
+        impl Operation for Focused {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn focusable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: iced::Rectangle,
+                state: &mut dyn operation::Focusable,
+            ) {
+                if state.is_focused() {
+                    self.0.extend(id.cloned());
+                }
+            }
+        }
+        let task = app.update(open);
+        assert!(app.channel_work_is_main());
+        let mut ui = native(app, Cache::new(), renderer, 900.0);
+        if let Some(mut stream) = iced::runtime::task::into_stream(task) {
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            while let Some(action) = executor.block_on(stream.next()) {
+                if let iced::runtime::Action::Widget(mut operation) = action {
+                    ui.operate(renderer, &mut operation);
+                }
+            }
+        }
+        let mut focused = Focused::default();
+        ui.operate(renderer, &mut focused);
+        let expected = channel_work_entry_id(app.channel_work.generation);
+        focused
+            .0
+            .iter()
+            .any(|id| iced_accessibility::IdEq::eq(id, &expected))
+    }
+
+    /// Focuses the closed entry the way Tab would and presses Enter on it.
+    fn enter_on_entry(
+        app: &Cagents,
+        ui: &mut Native<'_>,
+        renderer: &mut cosmic::Renderer,
+    ) -> Vec<Message> {
+        let navigation = app.channel_work_entry_navigation().unwrap();
+        ui.operate(
+            renderer,
+            &mut iced::advanced::widget::operation::focusable::focus::<()>(channel_work_entry_id(
+                navigation.generation,
+            )),
+        );
+        events(
+            ui,
+            renderer,
+            &[enter_key()],
+            iced::mouse::Cursor::Unavailable,
+        )
+    }
+
+    #[test]
+    fn enter_on_the_entry_keeps_keyboard_focus_and_a_click_leaves_it_alone() {
+        let mut renderer = super::super::tests::headless_renderer();
+
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let press = entry_press(&app, &mut renderer, 900.0);
+        assert!(!entry_holds_focus_after(&mut app, &mut renderer, press));
+
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let mut ui = mounted(&app, Cache::new(), &mut renderer, 900.0);
+        let messages = enter_on_entry(&app, &mut ui, &mut renderer);
+        let _ = ui.into_cache();
+        // Exactly one activation: the button under the wrapper must not also
+        // answer the Enter that the wrapper claimed.
+        let [enter @ Message::ChannelWorkNavigation(_)] =
+            <[Message; 1]>::try_from(messages).unwrap_or_else(|messages| panic!("{messages:?}"))
+        else {
+            unreachable!()
+        };
+        assert!(entry_holds_focus_after(&mut app, &mut renderer, enter));
+    }
+
+    #[test]
+    fn a_press_dragged_off_the_entry_does_not_change_the_next_enter() {
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = mounted(&app, Cache::new(), &mut renderer, 900.0);
+        let on_entry = bounds(&ui, "Channel work for Original").center();
+        let pressed = events(
+            &mut ui,
+            &mut renderer,
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: on_entry }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)),
+            ],
+            iced::mouse::Cursor::Available(on_entry),
+        );
+        let away = iced::Point::new(on_entry.x, on_entry.y + 300.0);
+        let released = events(
+            &mut ui,
+            &mut renderer,
+            &[
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position: away }),
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )),
+            ],
+            iced::mouse::Cursor::Available(away),
+        );
+        assert!(
+            pressed
+                .iter()
+                .chain(&released)
+                .all(|message| !matches!(message, Message::ChannelWorkNavigation(_))),
+            "an abandoned press must not navigate: {pressed:?} {released:?}"
+        );
+
+        let messages = enter_on_entry(&app, &mut ui, &mut renderer);
+        let _ = ui.into_cache();
+        let enter = messages
+            .into_iter()
+            .find(|message| matches!(message, Message::ChannelWorkNavigation(_)))
+            .expect("Enter activates the entry after the abandoned press");
+        assert!(entry_holds_focus_after(&mut app, &mut renderer, enter));
+    }
+
+    #[test]
+    fn a_click_on_the_entry_publishes_only_its_navigation() {
+        let (app, _) = main_fixture();
+        let mut renderer = super::super::tests::headless_renderer();
+        let mut ui = native(&app, Cache::new(), &mut renderer, 900.0);
+        let point = bounds(&ui, "Channel work for Original").center();
+        let messages = click(&mut ui, &mut renderer, point);
+        assert!(
+            matches!(messages.as_slice(), [Message::ChannelWorkNavigation(_)]),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn work_entry_is_named_for_the_channel_and_inert_under_a_modal() {
+        let (mut app, _) = main_fixture();
+        let mut renderer = super::super::tests::headless_renderer();
+        let ui = native(&app, Cache::new(), &mut renderer, 900.0);
+        assert!(
+            native_labels(&ui)
+                .iter()
+                .any(|name| name == "Channel work for Original")
+        );
+        let _ = ui.into_cache();
+
+        let home = app.channel_work.view.home().unwrap();
+        let assert_inert = |app: &Cagents, renderer: &mut cosmic::Renderer| {
+            let mut ui = native(app, Cache::new(), renderer, 900.0);
+            let point = bounds(&ui, "Channel work for Original").center();
+            let messages = click(&mut ui, renderer, point);
+            assert!(
+                !messages
+                    .iter()
+                    .any(|message| matches!(message, Message::ChannelWorkNavigation(_))),
+                "{messages:?}"
+            );
+            let nodes = ui.a11y_nodes(iced::mouse::Cursor::Unavailable);
+            assert!(
+                nodes
+                    .root()
+                    .iter()
+                    .chain(nodes.children())
+                    .any(
+                        |node| node.node().label() == Some("Channel work for Original")
+                            && node.node().is_disabled()
+                    ),
+                "the entry is exposed as disabled"
+            );
+        };
+
+        app.settings_reset_confirm = true;
+        assert!(app.modal_is_open());
+        assert_inert(&app, &mut renderer);
+        app.settings_reset_confirm = false;
+
+        // The rename surface is not a modal, yet the update loop drops this
+        // navigation behind it: the entry must not look available there.
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(crate::model::ProjectChannel {
+                id: home.channel,
+                project_id: crate::model::ProjectId::new(),
+                title: "Original".into(),
+                title_source: crate::model::ChannelTitleSource::Prompt,
+                ordinal: home.creation_ordinal,
+                shared: false,
+                cards: Vec::new(),
+                focused: None,
+            });
+        drop(
+            app.update(Message::ChromeUi(chrome_ui::Action::RenameChannel(
+                home.channel,
+            ))),
+        );
+        assert!(!app.modal_is_open() && app.chrome_ui.is_open());
+        assert_inert(&app, &mut renderer);
+        drop(app.update(Message::ChromeUi(chrome_ui::Action::RenameCancel)));
+
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == home.channel)
+            .unwrap()
+            .title
+            .clear();
+        let ui = native(&app, Cache::new(), &mut renderer, 900.0);
+        assert!(native_labels(&ui).iter().any(|name| name == "Channel work"));
+    }
+
+    /// The conversation view of a channel with `tabs` panes, in a viewport as
+    /// wide as the workspace column of a window of `width`.
+    fn conversations_with_tabs(tabs: usize, viewport: f32) -> Cagents {
+        let (mut app, _) = main_fixture();
+        let owner = app.channel_work.view.owner().unwrap();
+        drop(app.update_channel_work(ui::Action::Close(owner)));
+        let cards: Vec<_> = (0..tabs)
+            .map(|_| super::super::tests::terminal_card_state())
+            .collect();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.focused = cards.first().map(|card| card.id);
+        durable.cards = cards;
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(viewport);
+        drop(app.sync_chrome());
+        app
+    }
+
+    #[test]
+    fn work_entry_gives_up_its_label_before_the_tabs_turn_compact() {
+        let mut renderer = super::super::tests::headless_renderer();
+        // A tight workspace column: the label would squeeze these tabs.
+        let app = conversations_with_tabs(3, 632.0);
+        assert!(app.channel_work_entry_is_icon_only());
+        assert_eq!(
+            app.workspace_header_width(),
+            app.workspace_header_width_with(chrome_ui::CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH)
+        );
+        let ui = mounted(&app, Cache::new(), &mut renderer, 900.0);
+        let area = bounds(&ui, "Channel work for Original");
+        assert!(
+            area.width <= chrome_ui::CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH,
+            "{area:?}"
+        );
+        drop(ui);
+
+        // Opening Work keeps its form, so the control does not change under
+        // the pointer beyond the move the bar already makes.
+        let mut opened = conversations_with_tabs(3, 632.0);
+        let home = opened.channel_work_entry_navigation().unwrap().home;
+        drop(opened.open_channel_work(home.channel));
+        assert!(opened.channel_work_is_main());
+        assert!(opened.channel_work_entry_is_icon_only());
+
+        // Room for the tabs, or few enough of them, keeps the label.
+        for app in [
+            conversations_with_tabs(2, 1600.0),
+            conversations_with_tabs(1, 632.0),
+        ] {
+            assert!(!app.channel_work_entry_is_icon_only());
+            assert_eq!(
+                app.workspace_header_width(),
+                app.workspace_header_width_with(chrome_ui::CHANNEL_WORK_ENTRY_RESERVED_WIDTH)
+            );
+        }
+    }
+
+    #[test]
+    fn the_header_reserves_nothing_for_an_entry_the_overlay_unmounted() {
+        let mut app = conversations_with_tabs(2, 632.0);
+        let _ = app.update(Message::WindowResized(700.0, 600.0));
+        app.sidebar_model.projects.push(SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "Fixture".into(),
+            "/project".into(),
+            Vec::new(),
+            Vec::new(),
+        ));
+        drop(app.set_context_inspector_open(true));
+        app.context_inspector_transition = None;
+        assert!(app.context_inspector_is_overlay());
+        assert!(!app.channel_work_entry_is_mounted());
+        assert_eq!(
+            app.workspace_header_width(),
+            app.workspace_header_width_with(0.0)
+        );
+    }
+
     #[test]
     fn main_channel_header_retained_press_and_queued_navigation_cannot_survive_a_b_a() {
         for width in [300.0, 900.0] {
@@ -4300,23 +4747,26 @@ mod tests {
             app.window_width = width;
             let mut renderer = super::super::tests::headless_renderer();
             let mut ui = native(&app, Cache::new(), &mut renderer, width);
-            let area = bounds(&ui, "Conversations for channel Original");
+            let area = bounds(&ui, "Channel work for Original");
             assert!(area.width > 0.0 && area.x >= 0.0 && area.x + area.width <= width + 0.1);
             let point = area.center();
             let old_action = click(&mut ui, &mut renderer, point)
                 .into_iter()
                 .find(|message| matches!(message, Message::ChannelWorkNavigation(_)))
                 .unwrap();
+            let press = events(
+                &mut ui,
+                &mut renderer,
+                &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
+                    iced::mouse::Button::Left,
+                ))],
+                iced::mouse::Cursor::Available(point),
+            );
             assert!(
-                events(
-                    &mut ui,
-                    &mut renderer,
-                    &[iced::Event::Mouse(iced::mouse::Event::ButtonPressed(
-                        iced::mouse::Button::Left
-                    ))],
-                    iced::mouse::Cursor::Available(point)
-                )
-                .is_empty()
+                !press
+                    .iter()
+                    .any(|message| matches!(message, Message::ChannelWorkNavigation(_))),
+                "{press:?}"
             );
             let cache = ui.into_cache();
             let mut other = model(home).channels.remove(0);
@@ -4327,7 +4777,7 @@ mod tests {
             drop(app.open_channel_work(other.id));
             drop(app.open_channel_work(home.channel));
             let mut ui = native(&app, cache, &mut renderer, width);
-            let current = bounds(&ui, "Conversations for channel Work");
+            let current = bounds(&ui, "Channel work for Original");
             assert!(
                 current.contains(point),
                 "same physical control slot must exercise the owner replacement"

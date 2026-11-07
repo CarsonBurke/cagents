@@ -84,6 +84,26 @@ mod tests {
     }
 
     #[test]
+    fn a_focused_tab_keeps_its_close_button_down_to_its_minimum_width() {
+        let app = super::super::tests::context_inspector_test_app(true);
+        let id = app.workspace.focused().unwrap();
+        let close = app
+            .card_chrome
+            .get(&id)
+            .map_or_else(
+                || card_control_id(id, "close"),
+                |chrome| chrome.close_id.clone(),
+            )
+            .to_string();
+        let has_close = |width| {
+            let mut tab = app.column_header(id, true, width);
+            super::super::tests::widget_id_counts(&mut tab).contains_key(&close)
+        };
+        assert!(has_close(TAB_CLOSE_MIN_WIDTH));
+        assert!(!has_close(TAB_CLOSE_MIN_WIDTH - 1.0));
+    }
+
+    #[test]
     fn attention_popup_pages_unique_incidents_and_survives_an_empty_project_list() {
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.sidebar_model.projects.clear();
@@ -1694,6 +1714,16 @@ fn notice_dismiss_id(id: u64) -> String {
     format!("chrome.notices.dismiss.{id}")
 }
 
+/// What the header keeps clear of tabs for the entry and the gap beside it.
+pub(super) const CHANNEL_WORK_ENTRY_RESERVED_WIDTH: f32 = 82.0;
+pub(super) const CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH: f32 =
+    2.0 * space::S + design::ROW_ICON_SIZE as f32 + space::XXS;
+
+/// The narrowest tab that fits its insets, its icon and both of a
+/// focused tab's commands. Closing outranks the title here: the tooltip still
+/// names the pane.
+const TAB_CLOSE_MIN_WIDTH: f32 = 96.0;
+
 fn command<'a>(
     icon: impl Into<widget::icon::Handle>,
     label: impl Into<Cow<'a, str>>,
@@ -2688,7 +2718,19 @@ impl Cagents {
         .into()
     }
 
-    fn workspace_header_width(&self) -> f32 {
+    pub(super) fn workspace_header_width(&self) -> f32 {
+        let work = if !self.channel_work_entry_is_mounted() {
+            0.0
+        } else if self.channel_work_entry_is_icon_only() {
+            CHANNEL_WORK_ENTRY_ICON_ONLY_RESERVED_WIDTH
+        } else {
+            CHANNEL_WORK_ENTRY_RESERVED_WIDTH
+        };
+        self.workspace_header_width_with(work)
+    }
+
+    /// The header's room for everything but the tabs, given what `work` needs.
+    pub(super) fn workspace_header_width_with(&self, work: f32) -> f32 {
         let navigator = if should_show_card_navigator(self.workspace.cards().len()) {
             design::PANE_NAVIGATOR_RESERVED_WIDTH
         } else {
@@ -2728,7 +2770,7 @@ impl Cagents {
         } else {
             0.0
         };
-        let width = navigator + controls + update + notice + attention + 16.0;
+        let width = navigator + controls + update + notice + attention + work + 16.0;
         if self.workspace.viewport_width() > 0.0 {
             width.min(self.workspace.viewport_width())
         } else {
@@ -2737,8 +2779,12 @@ impl Cagents {
     }
 
     fn tab_strip_geometry(&self) -> (f32, f32) {
+        self.tab_strip_geometry_with(self.workspace_header_width())
+    }
+
+    fn tab_strip_geometry_with(&self, header_width: f32) -> (f32, f32) {
         let available = (self.workspace.viewport_width()
-            - self.workspace_header_width()
+            - header_width
             - design::PRIMARY_CONTROL_SIZE
             - space::XXS)
             .max(0.0);
@@ -2872,86 +2918,71 @@ impl Cagents {
                 !self.context_inspector_open,
             )
         };
-        let mut rows = vec![header];
-        if let Some(channel) = self.channel_home_bar() {
-            rows.push(channel);
-        }
-        rows.push(crate::design::horizontal_rule().into());
-        rows.push(content);
-        widget::column::with_children(rows)
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        widget::column::with_children(vec![
+            header,
+            crate::design::horizontal_rule().into(),
+            content,
+        ])
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
     }
 
-    fn channel_home_bar(&self) -> Option<Element<'_, Message>> {
-        let (home, title) = self.channel_home()?;
-        let generation = self.channel_home_generation();
-        let workspace = self.workspace_view_generation;
-        let work = self.channel_work_is_main();
-        let compact = self.window_width < 800.0;
-        let mut navigation = Vec::new();
-        for (label, surface, selected) in [
-            ("Conversations", channel_work::Surface::Conversations, !work),
-            ("Work", channel_work::Surface::Work, work),
-        ] {
-            let action = Message::ChannelWorkNavigation(channel_work::Navigation {
-                home,
-                generation,
-                workspace,
-                surface,
-            });
-            navigation.push(crate::ui_controls::owned(
-                (home, generation, workspace, surface),
-                crate::ui_controls::view_tab(
-                    crate::ui_controls::ViewTab {
-                        label: label.into(),
-                        description: format!("{label} for channel {title}").into(),
-                        count: None,
-                        selected,
-                        id: None,
-                        on_press: (!self.modal_is_open()).then_some(action),
-                    },
-                    compact,
-                    None,
-                ),
-            ));
-        }
-        let navigation = widget::row::with_children(navigation)
-            .spacing(space::XXS)
-            .align_y(Alignment::Center);
-        let identity = widget::column::with_children(vec![
-            design::caption("CHANNEL").into(),
-            design::heading(if title.is_empty() {
-                "Untitled channel".to_owned()
-            } else {
-                title
-            })
-            .width(Length::Fill)
-            .into(),
-        ])
-        .spacing(space::XXS)
-        .width(Length::Fill);
-        let content: Element<'_, Message> = if work {
-            // Work's fixed leaf header already displays the captured channel
-            // title. Do not repeat it or narrow it beside the navigation.
-            navigation.into()
-        } else if compact {
-            widget::column::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::XS)
-                .into()
+    /// `workflow_header` holds nothing while the overlay covers that end of
+    /// the bar, so the entry is not there to reserve room for.
+    pub(super) fn channel_work_entry_is_mounted(&self) -> bool {
+        !self.context_inspector_is_overlay() && self.channel_work_entry_navigation().is_some()
+    }
+
+    /// The entry drops its label once its label would turn the tabs compact.
+    /// Deciding from the labelled width keeps the answer from depending on
+    /// itself; opening Work does not change it, so the entry keeps its form.
+    pub(super) fn channel_work_entry_is_icon_only(&self) -> bool {
+        let header = self.workspace_header_width_with(CHANNEL_WORK_ENTRY_RESERVED_WIDTH);
+        self.tab_strip_geometry_with(header).1 < design::TAB_MIN_WIDTH
+    }
+
+    /// The one way into a channel's work from the main header, and back out.
+    fn channel_work_entry(&self) -> Option<Element<'_, Message>> {
+        let navigation = self.channel_work_entry_navigation()?;
+        let open = self.channel_work_is_main();
+        let title = self
+            .workspace_model
+            .channel(navigation.home.channel)
+            .filter(|channel| channel.ordinal == navigation.home.creation_ordinal)
+            .map_or("", |channel| channel.title.as_str());
+        let name = if title.is_empty() {
+            Cow::Borrowed("Channel work")
         } else {
-            widget::row::with_children(vec![identity.into(), navigation.into()])
-                .spacing(space::S)
-                .align_y(Alignment::Center)
-                .into()
+            Cow::Owned(format!("Channel work for {title}"))
         };
-        Some(
-            widget::container(content)
-                .padding([space::XS, space::S])
-                .width(Length::Fill)
-                .into(),
-        )
+        Some(crate::ui_controls::owned(
+            navigation,
+            crate::ui_controls::toggle_view_tab(crate::ui_controls::ToggleViewTab {
+                tab: crate::ui_controls::ViewTab {
+                    label: "Work".into(),
+                    description: name,
+                    count: None,
+                    selected: open,
+                    id: Some(channel_work::channel_work_entry_id(navigation.generation)),
+                    on_press: (!self.shell_inputs_blocked())
+                        .then_some(Message::ChannelWorkNavigation(navigation)),
+                },
+                icon: widget::icon(Icon::PullRequest.handle())
+                    .size(design::ROW_ICON_SIZE)
+                    .into(),
+                hint: if open {
+                    "Close channel work".into()
+                } else {
+                    "Channel work".into()
+                },
+                icon_only: self.channel_work_entry_is_icon_only(),
+                on_enter: Message::ChannelWorkNavigation(channel_work::Navigation {
+                    keep_focus: true,
+                    ..navigation
+                }),
+            }),
+        ))
     }
 
     pub(super) fn workflow_header(&self) -> Vec<Element<'_, Message>> {
@@ -3027,6 +3058,7 @@ impl Cagents {
         // put the two icons on opposite ends of the window.
         let panel_owns_shared_controls = self.context_inspector_visible();
         vec![
+            widget::row::with_children(self.channel_work_entry()).into(),
             widget::row::with_children(actions)
                 .spacing(space::XXS)
                 .align_y(Alignment::Center)
@@ -3262,7 +3294,7 @@ impl Cagents {
                 ready.then_some(Message::ChatUi(chat_ui::Action::Switch(id))),
             ));
         }
-        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= 112.0 {
+        if (focused || self.chrome_ui.hovered_tab == Some(id)) && width >= TAB_CLOSE_MIN_WIDTH {
             children.push(command(
                 Icon::Close,
                 {
@@ -3534,20 +3566,6 @@ impl Cagents {
         .align_y(Alignment::Center)
         .into();
         let heading = self.native_header(self.sidebar_toggle(), Some(end), true);
-        let tabs = widget::row::with_children(vec![
-            tabs.into(),
-            crate::ui_controls::button::secondary("Channel work")
-                .name("Open current channel work")
-                .on_press_maybe(
-                    self.durable
-                        .active_channel
-                        .filter(|_| !self.modal_is_open())
-                        .map(Message::OpenChannelWork),
-                )
-                .into(),
-        ])
-        .align_y(Alignment::Center)
-        .spacing(space::XS);
         let tabs = widget::container(tabs)
             .padding([0.0, space::S])
             .center_y(design::HEADER_CONTENT_HEIGHT)

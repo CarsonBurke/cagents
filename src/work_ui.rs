@@ -412,7 +412,7 @@ impl State {
             )));
         }
         let toolbar = widget::row::with_children(vec![
-            design::title("Work").into(),
+            design::title("Work board").into(),
             self.scope_picker(),
             widget::container(search)
                 .max_width(360)
