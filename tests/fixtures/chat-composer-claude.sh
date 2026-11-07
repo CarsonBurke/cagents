@@ -205,10 +205,15 @@ tools_turn() {
 # frames are also recorded in the synthetic history, as Claude records them;
 # system frames, such as a background task's lifecycle, are live only. A frame
 # with "_history": true is only recorded, as Claude records a queued
-# notification. A line {"_sleep": SECONDS} pauses, so a running state can be
-# observed.
+# notification. A frame with "_live": true is only emitted, as a subagent's
+# frames are, which Claude records in the subagent's own transcript. A line
+# {"_sleep": SECONDS} pauses, so a running state can be observed. A line
+# {"_end": true} ends the turn there: the frames supply its closing result,
+# such as a failed one, and the fixture adds no answer of its own.
 frames_file=$config/fixture-frames.jsonl
+frames_ended=0
 frames_turn() {
+    frames_ended=0
     while IFS= read -r spec; do
         [ -n "$spec" ] || continue
         delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
@@ -216,9 +221,17 @@ frames_turn() {
             sleep "$delay"
             continue
         fi
+        if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then
+            frames_ended=1
+            return
+        fi
         frame=$(printf '%s' "$spec" | jq -c --arg turn "$turn" 'walk(if type == "string" then gsub("@TURN@"; $turn) else . end)')
         if [ "$(printf '%s' "$frame" | jq -r '._history // false')" = true ]; then
             printf '%s' "$frame" | jq -c --arg session "$session" 'del(._history) + {sessionId:$session}' >> "$history"
+            continue
+        fi
+        if [ "$(printf '%s' "$frame" | jq -r '._live // false')" = true ]; then
+            printf '%s\n' "$frame" | jq -c 'del(._live)'
             continue
         fi
         case $(printf '%s' "$frame" | jq -r '.type') in
@@ -352,7 +365,10 @@ while IFS= read -r frame; do
                 if [ "$verbosity" = 1 ]; then verbosity_turn; fi
                 if [ "$subagents" = 1 ]; then subagents_turn; fi
                 if [ -f "$tools_file" ]; then tools_turn; fi
-                if [ -f "$frames_file" ]; then frames_turn; fi
+                if [ -f "$frames_file" ]; then
+                    frames_turn
+                    if [ "$frames_ended" = 1 ]; then continue; fi
+                fi
                 if [ -f "$fixture_image" ]; then image_turn; fi
                 # A Markdown file in the config directory can stand in for the
                 # answer, so rendering and long-transcript checks need no live
