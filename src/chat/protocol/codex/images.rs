@@ -60,7 +60,20 @@ pub(super) fn readable(result: &Value) -> String {
                 .filter(|value| !value.is_null())
                 .map(pretty)
                 .unwrap_or_default(),
-            Some(parts) => text(parts).unwrap_or_else(|| pretty(result)),
+            Some(parts) => match text(parts) {
+                // Structured content that says more than the text, rather
+                // than the same JSON the text already serializes, follows it.
+                Some(text) => match object.get("structuredContent").filter(|v| !v.is_null()) {
+                    Some(structured)
+                        if serde_json::from_str::<Value>(&text).ok().as_ref()
+                            != Some(structured) =>
+                    {
+                        format!("{text}\n\n{}", pretty(structured))
+                    }
+                    _ => text,
+                },
+                None => pretty(result),
+            },
             None => pretty(result),
         },
         _ => result.to_string(),

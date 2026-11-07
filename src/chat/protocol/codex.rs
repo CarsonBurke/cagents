@@ -474,6 +474,7 @@ fn create_inner(
             is_child: false,
             child_failure: None,
             child_buffer: BTreeMap::new(),
+            turn_diffs: BTreeMap::new(),
         }),
     ))
 }
@@ -634,6 +635,17 @@ struct Codex {
     /// Codex repeats in that turn's failed completion: one failure, one item.
     child_failure: Option<(String, String)>,
     child_buffer: BTreeMap<String, Vec<Value>>,
+    /// Each running turn's latest cumulative diff and the files its own
+    /// file-change items edited. The part of the diff no item shows, such as
+    /// a file a shell command rewrote, is shown as the turn's own change.
+    turn_diffs: BTreeMap<String, TurnDiff>,
+}
+
+#[derive(Default)]
+struct TurnDiff {
+    diff: String,
+    edited: std::collections::BTreeSet<String>,
+    shown: bool,
 }
 
 #[derive(Clone, Default)]
@@ -663,6 +675,56 @@ impl Drop for Codex {
     }
 }
 impl Codex {
+    /// The diff state of `turn`, kept for the few turns still running.
+    fn turn_diff(&mut self, turn: &str) -> &mut TurnDiff {
+        if !self.turn_diffs.contains_key(turn) && self.turn_diffs.len() >= 16 {
+            self.turn_diffs.pop_first();
+        }
+        self.turn_diffs.entry(turn.into()).or_default()
+    }
+
+    /// Show the files the turn changed that none of its file-change items
+    /// did, as one change row for the turn, or retract that row once items
+    /// account for all of them.
+    fn show_turn_diff(&mut self, turn: &str, step: &mut Step) {
+        let Some(state) = self.turn_diffs.get_mut(turn) else {
+            return;
+        };
+        let changes = turn_diff_changes(&state.diff)
+            .into_iter()
+            .filter(|change| {
+                let edited = |path: &str| {
+                    state.edited.iter().any(|edited| {
+                        edited == path
+                            || edited
+                                .strip_suffix(path)
+                                .is_some_and(|prefix| prefix.ends_with('/'))
+                    })
+                };
+                !edited(&change.path)
+                    && !matches!(&change.kind, ChangeKind::Renamed { from } if edited(from))
+            })
+            .collect::<Vec<_>>();
+        let id = format!("{turn}/diff");
+        if changes.is_empty() {
+            if std::mem::take(&mut state.shown) {
+                step.events.push(Event::ItemsRemoved { ids: vec![id] });
+            }
+            return;
+        }
+        state.shown = true;
+        step.events.push(Event::Item(Item {
+            id,
+            role: Role::Assistant,
+            content: ItemContent::Changes {
+                changes,
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        }));
+    }
+
     fn discover_child(
         &mut self,
         id: &str,
@@ -2819,6 +2881,10 @@ impl Adapter for Codex {
             "turn/started" | "turn/completed" => {
                 let turn = &params["turn"];
                 let turn_id = string(turn, "id")?;
+                // Its diff can no longer change, and its row says all of it.
+                if method == "turn/completed" {
+                    self.turn_diffs.remove(turn_id);
+                }
                 // A completed ID is current only when a start, active attach,
                 // or exact accepted request reply has established ownership.
                 let current =
@@ -3017,6 +3083,18 @@ impl Adapter for Codex {
                         windows.insert(id.to_owned(), window);
                     },
                 )?;
+                if params["item"]["type"] == "fileChange" {
+                    let turn = string(params, "turnId")?;
+                    let diff = self.turn_diff(turn);
+                    for change in params["item"]["changes"].as_array().into_iter().flatten() {
+                        for path in [&change["path"], &change["kind"]["move_path"]] {
+                            if let Some(path) = path.as_str() {
+                                diff.edited.insert(path.into());
+                            }
+                        }
+                    }
+                    self.show_turn_diff(turn, &mut step);
+                }
                 for item in parsed {
                     if done {
                         self.active_items.remove(&item.id);
@@ -3244,9 +3322,12 @@ impl Adapter for Codex {
                 step.events.push(session_notice(message));
             }
             // The turn's cumulative diff restates the file changes its own
-            // items already show, and the worktree's changes are the Changes
-            // panel's; a row for it repeated both under a tool's name.
-            "turn/diff/updated" => {}
+            // items show; only the files none of them edited are its own.
+            "turn/diff/updated" => {
+                let turn = string(params, "turnId")?;
+                self.turn_diff(turn).diff = string(params, "diff")?.into();
+                self.show_turn_diff(turn, &mut step);
+            }
             "turn/plan/updated" => step.events.push(Event::Plan {
                 steps: plan_steps(&params["plan"]),
             }),
@@ -3613,6 +3694,78 @@ fn file_changes(value: &Value) -> Result<Vec<FileChange>, String> {
     }
     Ok(changes)
 }
+/// The files a turn's cumulative diff changed, one per `diff --git` section,
+/// each with its own hunks.
+fn turn_diff_changes(diff: &str) -> Vec<FileChange> {
+    let mut sections = Vec::new();
+    let mut start = None;
+    let mut offset = 0;
+    for line in diff.split_inclusive('\n') {
+        if line.starts_with("diff --git ") {
+            if let Some(start) = start {
+                sections.push(&diff[start..offset]);
+            }
+            start = Some(offset);
+        }
+        offset += line.len();
+    }
+    if let Some(start) = start {
+        sections.push(&diff[start..]);
+    }
+    sections
+        .into_iter()
+        .filter_map(|section| {
+            let header_end = section.find("\n@@").map_or(section.len(), |at| at + 1);
+            let header = &section[..header_end];
+            let field = |prefix: &str| {
+                header
+                    .lines()
+                    .find_map(|line| line.strip_prefix(prefix))
+                    .map(str::trim_end)
+            };
+            let side = |prefix: &str, marker: &str| {
+                field(prefix)
+                    .filter(|path| *path != "/dev/null")
+                    .map(|path| path.strip_prefix(marker).unwrap_or(path).to_owned())
+            };
+            let old = side("--- ", "a/");
+            let new = side("+++ ", "b/");
+            let (path, kind) =
+                if let (Some(from), Some(to)) = (field("rename from "), field("rename to ")) {
+                    (to.to_owned(), ChangeKind::Renamed { from: from.into() })
+                } else if header.contains("\nnew file mode") {
+                    (new.or(old)?, ChangeKind::Added)
+                } else if header.contains("\ndeleted file mode") {
+                    (old.or(new)?, ChangeKind::Deleted)
+                } else {
+                    let path = new.or(old).or_else(|| {
+                        // A change with no hunks, such as a mode change or a
+                        // binary file, names its path only on its first line.
+                        let first = header.lines().next()?.strip_prefix("diff --git a/")?;
+                        first.split_once(" b/").map(|(_, path)| path.to_owned())
+                    })?;
+                    (path, ChangeKind::Updated)
+                };
+            let body = &section[header_end..];
+            Some(FileChange {
+                path,
+                kind,
+                // A change with no hunks keeps what its header says of it.
+                diff: if body.is_empty() {
+                    header
+                        .lines()
+                        .skip(1)
+                        .filter(|line| !line.starts_with("index "))
+                        .map(|line| format!("{line}\n"))
+                        .collect()
+                } else {
+                    body.into()
+                },
+            })
+        })
+        .collect()
+}
+
 /// The agents a collaboration call addressed, each with its state when Codex
 /// reported one. A call in progress, or one its turn cut short, names its
 /// receivers before it has their states, and the row still says whom it was
@@ -6033,6 +6186,7 @@ mod tests {
             is_child: false,
             child_failure: None,
             child_buffer: BTreeMap::new(),
+            turn_diffs: BTreeMap::new(),
         }
     }
 
@@ -8899,6 +9053,92 @@ mod tests {
             .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":"@@ -1 +1 @@\n-a\n+b\n"}}))
             .unwrap();
         assert!(diff.events.is_empty());
+    }
+
+    /// A tool result's structured content follows its text when it says
+    /// more than the text, and is not repeated when the text is that JSON.
+    #[test]
+    fn a_tool_result_keeps_structured_content_its_text_does_not_carry() {
+        let both = json!({"content":[{"type":"text","text":"Found two issues"}],
+            "structuredContent":{"issues":["ENG-1","ENG-2"]}});
+        assert_eq!(
+            images::readable(&both),
+            "Found two issues\n\n{\n  \"issues\": [\n    \"ENG-1\",\n    \"ENG-2\"\n  ]\n}"
+        );
+        let same = json!({"content":[{"type":"text","text":"{\"issues\":[\"ENG-1\"]}"}],
+            "structuredContent":{"issues":["ENG-1"]}});
+        assert_eq!(images::readable(&same), "{\"issues\":[\"ENG-1\"]}");
+    }
+
+    /// A turn's diff is its own change row only for the files none of its
+    /// file-change items edited, such as one a shell command rewrote, and
+    /// that row goes once items account for every file.
+    #[test]
+    fn a_turn_diff_shows_only_the_files_no_item_changed() {
+        let diff = "diff --git a/src/lib.rs b/src/lib.rs\nindex 1..2 100644\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n\
+diff --git a/README.md b/README.md\nindex 3..4 100644\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Title\n+More\n\
+diff --git a/new.txt b/new.txt\nnew file mode 100644\nindex 0..5\n--- /dev/null\n+++ b/new.txt\n@@ -0,0 +1 @@\n+hi\n\
+diff --git a/old.txt b/old.txt\ndeleted file mode 100644\nindex 6..0\n--- a/old.txt\n+++ /dev/null\n@@ -1 +0,0 @@\n-bye\n\
+diff --git a/a.txt b/b.txt\nsimilarity index 100%\nrename from a.txt\nrename to b.txt\n\
+diff --git a/run.sh b/run.sh\nold mode 100644\nnew mode 100755\n";
+        let changes = turn_diff_changes(diff);
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| (change.path.as_str(), change.kind.clone()))
+                .collect::<Vec<_>>(),
+            [
+                ("src/lib.rs", ChangeKind::Updated),
+                ("README.md", ChangeKind::Updated),
+                ("new.txt", ChangeKind::Added),
+                ("old.txt", ChangeKind::Deleted),
+                (
+                    "b.txt",
+                    ChangeKind::Renamed {
+                        from: "a.txt".into()
+                    }
+                ),
+                ("run.sh", ChangeKind::Updated),
+            ]
+        );
+        assert_eq!(changes[1].diff, "@@ -1 +1,2 @@\n # Title\n+More\n");
+        assert_eq!(changes[5].diff, "old mode 100644\nnew mode 100755\n");
+
+        let mut adapter = adapter();
+        let file_change = |path: &str| {
+            json!({"method":"item/completed","params":{"threadId":"thread-exact","turnId":"turn","item":
+                {"id":format!("edit-{path}"),"type":"fileChange","status":"completed","changes":[{"path":path,"kind":{"type":"update"},"diff":"@@ -1 +1 @@\n-a\n+b\n"}]}}})
+        };
+        adapter
+            .receive(file_change("/workspace/src/lib.rs"))
+            .unwrap();
+        let two = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n\
+diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2 @@\n # Title\n+More\n";
+        let shown = adapter
+            .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":two}}))
+            .unwrap();
+        assert!(
+            matches!(
+                &shown.events[..],
+                [Event::Item(Item { id, content: ItemContent::Changes { changes, status: ToolStatus::Succeeded }, .. })]
+                    if id == "turn/diff" && changes.len() == 1 && changes[0].path == "README.md"
+            ),
+            "{:?}",
+            shown.events
+        );
+        let covered = adapter
+            .receive(file_change("/workspace/README.md"))
+            .unwrap();
+        assert!(
+            covered
+                .events
+                .iter()
+                .any(|event| matches!(event, Event::ItemsRemoved { ids } if ids == &["turn/diff"]))
+        );
+        let unchanged = adapter
+            .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":two}}))
+            .unwrap();
+        assert!(unchanged.events.is_empty());
     }
 
     #[test]
