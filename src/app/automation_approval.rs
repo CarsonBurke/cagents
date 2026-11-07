@@ -158,12 +158,13 @@ impl Cagents {
                 let Some(proposal) = self
                     .automation_approval
                     .available
-                    .take()
+                    .as_ref()
                     .filter(|proposal| {
                         proposal.id == id
                             && proposal.revision == revision
                             && self.automation_approval.global.authorizes(proposal)
                     })
+                    .cloned()
                 else {
                     return self.update_global_proposals(global::Action::Open {
                         key,
@@ -171,6 +172,7 @@ impl Cagents {
                         revision,
                     });
                 };
+                self.automation_approval.available = None;
                 self.automation_approval.generation =
                     self.automation_approval.generation.wrapping_add(1);
                 self.automation_approval.proposal = Some(proposal);
