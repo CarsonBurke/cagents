@@ -292,18 +292,24 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
-    // Scopes an earlier enrollment left empty stay loaded in the user
-    // manager until it exits. Collecting them waits on the manager, so it
-    // runs beside startup.
+    // An empty session scope stays loaded in the user manager until it
+    // exits. Enrollment withdraws its own, but a manager too slow to answer
+    // can outlast that, and earlier versions left them too. Collecting them
+    // waits on the manager, so it runs beside the daemon.
     if let Err(error) = std::thread::Builder::new()
         .name("cagents-scope-collect".into())
-        .spawn(
-            || match crate::daemon::process_scope::collect_empty_scopes() {
-                Ok(0) => {}
-                Ok(stopped) => tracing::info!(stopped, "stopped empty session scopes"),
-                Err(error) => tracing::warn!(%error, "empty session scopes were not collected"),
-            },
-        )
+        .spawn(|| {
+            loop {
+                match crate::daemon::process_scope::collect_empty_scopes() {
+                    Ok(0) => {}
+                    Ok(stopped) => tracing::info!(stopped, "stopped empty session scopes"),
+                    Err(error) => {
+                        tracing::warn!(%error, "empty session scopes were not collected")
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(600));
+            }
+        })
     {
         tracing::warn!(%error, "empty session scopes were not collected");
     }

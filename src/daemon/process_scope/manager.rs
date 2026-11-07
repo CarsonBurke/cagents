@@ -19,10 +19,6 @@ use super::{POLL, Refused, manager_runtime, workload::cgroup_path};
 
 /// Bounds a collection's calls, and settling a request given up on.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
-/// How long a session scope must have been running before an empty one is
-/// collected. A scope is started with its processes, so one this old and
-/// empty can never hold any.
-const COLLECTABLE_AFTER: Duration = Duration::from_secs(60);
 pub(super) const SCOPES: &str = "cagents-session-*.scope";
 
 /// One `busctl --user` call through the bus broker, the route a scope
@@ -273,16 +269,15 @@ fn monotonic_now() -> Duration {
     Duration::new(now.tv_sec as u64, now.tv_nsec as u32)
 }
 
-/// Whether a running session scope is old enough to have been started with
-/// every process it will ever be given.
-pub(super) fn settled_long_enough(scope: &Scope, now: Duration) -> bool {
-    now.saturating_sub(Duration::from_micros(scope.active_since)) >= COLLECTABLE_AFTER
+/// Whether a session scope has been running for at least `age`.
+pub(super) fn running_for(scope: &Scope, age: Duration, now: Duration) -> bool {
+    now.saturating_sub(Duration::from_micros(scope.active_since)) >= age
 }
 
-/// Stop the running session scopes that hold no process, such as those an
-/// earlier enrollment left (#2414). Returns how many were stopped. A scope
-/// with a process, a queued job or a recent start is never stopped.
-pub(super) fn collect_empty_scopes() -> io::Result<usize> {
+/// Stop the session scopes that have run for at least `age` and hold no
+/// process, such as those an enrollment couldn't withdraw. Returns how many
+/// were stopped. A scope with a process or a queued job is never stopped.
+pub(super) fn collect_empty_scopes(age: Duration) -> io::Result<usize> {
     let call = || Instant::now() + CALL_TIMEOUT;
     let listing = manager(
         "ListUnitsByPatterns",
@@ -304,7 +299,7 @@ pub(super) fn collect_empty_scopes() -> io::Result<usize> {
         let Ok(current) = scope(path, call()) else {
             continue;
         };
-        if !settled_long_enough(&current, monotonic_now()) {
+        if !running_for(&current, age, monotonic_now()) {
             continue;
         }
         if settle(&current, || populated(&current.control_group))? == Settle::Stop
@@ -360,11 +355,11 @@ mod tests {
 
     #[test]
     fn a_recently_started_scope_is_not_collected() {
-        let started = scope("active", 0);
-        let mut later = started.clone();
-        later.active_since = 10_000_000;
-        assert!(!settled_long_enough(&later, Duration::from_secs(69)));
-        assert!(settled_long_enough(&later, Duration::from_secs(70)));
-        assert!(!settled_long_enough(&later, Duration::from_secs(1)));
+        let mut started = scope("active", 0);
+        started.active_since = 10_000_000;
+        let minute = Duration::from_secs(60);
+        assert!(!running_for(&started, minute, Duration::from_secs(69)));
+        assert!(running_for(&started, minute, Duration::from_secs(70)));
+        assert!(!running_for(&started, minute, Duration::from_secs(1)));
     }
 }

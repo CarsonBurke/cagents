@@ -412,16 +412,26 @@ fn enroll_proven_process(pid: u32, divide: bool) -> io::Result<Enrolled> {
     })
 }
 
-/// Stop the running session scopes that hold no process, such as those an
-/// earlier enrollment left behind. Returns how many were stopped; a scope
-/// with a process, a queued job or a recent start is left alone.
+/// How long a session scope must have run before an empty one is collected.
+/// A scope starts with its processes, so a minute leaves wide room for
+/// anything about systemd's start this code doesn't foresee.
+const COLLECTABLE_AFTER: Duration = Duration::from_secs(60);
+
+/// Stop the running session scopes that hold no process: those an enrollment
+/// couldn't withdraw, under a user manager too slow to answer in time, and
+/// those earlier versions left. Returns how many were stopped; a scope with a
+/// process, a queued job or a recent start is left alone.
 pub(crate) fn collect_empty_scopes() -> io::Result<usize> {
+    collect_empty_scopes_after(COLLECTABLE_AFTER)
+}
+
+fn collect_empty_scopes_after(age: Duration) -> io::Result<usize> {
     if !manager_available() {
         return Ok(0);
     }
     let mut stopped = 0;
     with_verified_manager(ManagerNamespace::connect(), || {
-        stopped = manager::collect_empty_scopes()?;
+        stopped = manager::collect_empty_scopes(age)?;
         Ok(())
     })?;
     Ok(stopped)
@@ -657,8 +667,9 @@ pub(crate) mod tests {
     }
 
     /// Many requests at once, for processes that exit while theirs may still
-    /// be queued: the conditions that left thousands of empty scopes.
-    /// Run by hand; it loads the user manager.
+    /// be queued: the conditions that left thousands of empty scopes. A
+    /// manager this loaded can outlast a withdrawal, so the collection that
+    /// backs it up runs too. Run by hand; it loads the user manager.
     #[test]
     #[ignore = "loads the OS user manager"]
     fn concurrent_requests_for_exiting_processes_leave_no_scope_running() {
@@ -695,6 +706,7 @@ pub(crate) mod tests {
         }
         // Give systemd time to stop scopes whose processes exited.
         thread::sleep(Duration::from_secs(5));
+        let collected = collect_empty_scopes_after(Duration::ZERO).unwrap();
         let state = Command::new("systemctl")
             .args(["--user", "show", "--property=ActiveState", "--value"])
             .args(&units)
@@ -705,7 +717,7 @@ pub(crate) mod tests {
             .filter(|state| *state == "active")
             .count();
         eprintln!(
-            "{} requests, {enrolled} enrolled, {running} left running",
+            "{} requests, {enrolled} enrolled, {collected} collected, {running} left running",
             units.len()
         );
         assert_eq!(running, 0);
