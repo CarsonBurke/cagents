@@ -1903,17 +1903,22 @@ mod tests {
             "one\r\ntwo\r\nthree\r\n",
             "one\r\ntwo\r\nthree\r\nfour",
             "single huge line",
+            &*"a single line too long to read at a glance ".repeat(20),
         ] {
             let cancelled = AtomicBool::new(false);
             let prepared =
                 prompt::Prepared::with_policy(body, prompt::PreviewPolicy::Notice, &cancelled)
                     .unwrap();
-            let long = body.lines().count() > view::NOTICE_LINES;
+            let long = body.lines().count() > view::NOTICE_LINES
+                || body.chars().count() > view::NOTICE_CHARS;
             let expected = if long {
                 body.lines()
                     .take(view::NOTICE_LINES)
                     .collect::<Vec<_>>()
                     .join("\n")
+                    .chars()
+                    .take(view::NOTICE_CHARS)
+                    .collect()
             } else {
                 body.to_owned()
             };
@@ -1960,6 +1965,77 @@ mod tests {
             worker
         );
         assert!(slots.try_acquire_owned().is_ok());
+    }
+
+    /// Claude Code names a command run without a description by the command
+    /// itself, and its task notification carries that name as the summary. A
+    /// subagent's 11 KB heredoc reached the parent conversation this way and
+    /// drew every line of it under a collapsed group.
+    #[test]
+    fn a_notice_named_by_a_whole_command_shows_one_line_and_a_bounded_body() {
+        let command = format!(
+            "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'\n{}EOF\npython3 /var/tmp/fw16-audit/sampler.py 2 10",
+            "def sample(path):\n    with open(path) as f:\n        return f.read()\n\n".repeat(160)
+        );
+        let one_line = format!("cargo test {}", "--features host ".repeat(200));
+        for (summary, body, heading, lead) in [
+            (
+                command.as_str(),
+                "",
+                "mkdir -p /var/tmp/fw16-audit && cat > /var/tmp/fw16-audit/sampler.py <<'EOF'",
+                command.split_once('\n').unwrap().1,
+            ),
+            (
+                one_line.as_str(),
+                "exit code 0",
+                &*format!(
+                    "{}…",
+                    one_line
+                        .chars()
+                        .take(view::NOTICE_HEADING_CHARS)
+                        .collect::<String>()
+                ),
+                one_line.trim(),
+            ),
+        ] {
+            let (mut runtime, _handle) = literal_runtime(ItemContent::Delivery {
+                kind: chat::DeliveryKind::Notice,
+                from: String::new(),
+                sender: "b1".into(),
+                summary: summary.into(),
+                body: body.into(),
+            });
+            let (_run, shared) = job(&runtime.preparation);
+            let output = std::thread::spawn(move || execute(shared, permit()).unwrap())
+                .join()
+                .unwrap();
+            let Some(literal_content::Prepared::Notice(notice)) = output.literal.as_ref() else {
+                panic!("notice payload")
+            };
+            assert_eq!(notice.summary.plain().as_ref(), heading);
+            let full = notice.body.full.plain();
+            assert!(full.starts_with(lead), "the whole name stays on demand");
+            assert!(full.ends_with(body));
+            assert!(notice.body.long, "a long name folds until it is opened");
+            let shown = notice.body.shown(false).plain();
+            assert!(shown.lines().count() <= view::NOTICE_LINES, "{shown}");
+            assert!(shown.chars().count() <= view::NOTICE_CHARS, "{shown}");
+            assert_eq!(notice.body.shown(true).plain(), full);
+            runtime.show(false);
+        }
+        for (summary, body) in [
+            (
+                "Background command \"Run tests\" completed (exit code 0)",
+                "",
+            ),
+            ("Monitor event: \"Build\"", "warning: unused import"),
+        ] {
+            let (heading, shown) = literal_content::notice_parts(summary, body);
+            assert_eq!((&*heading, &*shown), (summary, body));
+        }
+        let (heading, shown) = literal_content::notice_parts("Done\r\n\r\nexit 0\r\n", "log");
+        assert_eq!((&*heading, &*shown), ("Done", "exit 0\n\nlog"));
+        retirement_barrier();
     }
 
     #[test]

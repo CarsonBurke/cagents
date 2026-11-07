@@ -71,7 +71,7 @@ printf '%s\n' "$files" | while IFS=: read -r installed file; do
     cp -- "$source/$file" "$stage/$installed"
     chmod 755 -- "$stage/$installed"
     case $file in
-        *.py|cargo-offload|memory-capped|prune-build-dirs) python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
+        *.py|cargo-offload|memory-capped|prune-build-dirs) /usr/bin/python3 -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' "$stage/$installed" ;;
         *) sh -n "$stage/$installed" ;;
     esac
 done
@@ -111,7 +111,7 @@ fi
 
 # What was installed, file by file, from which commit of which repository,
 # and when.
-python3 - "$destination/cagents-cargo-gate.installation" "$source" "$stage" "$files" <<'PY'
+/usr/bin/python3 - "$destination/cagents-cargo-gate.installation" "$source" "$stage" "$files" <<'PY'
 import json, os, subprocess, sys, time
 record, source, stage, files = sys.argv[1:]
 def git(*arguments):
@@ -164,4 +164,4 @@ smoke "$destination/cagents-cargo-gate"
 find "$versions" -mindepth 1 -maxdepth 1 -type d -name 'v.*' ! -name "${stage##*/}" -mtime +7 \
     -exec rm -rf -- {} + 2>/dev/null || true
 printf '%s: installed %s/cagents-cargo-gate from %s\n' "$program" "$destination" \
-    "$(python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print((r.get("commit") or "this checkout")[:12])' "$destination/cagents-cargo-gate.installation")"
+    "$(/usr/bin/python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print((r.get("commit") or "this checkout")[:12])' "$destination/cagents-cargo-gate.installation")"

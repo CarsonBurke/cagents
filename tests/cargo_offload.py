@@ -850,6 +850,17 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 78, result.stderr)
         self.assertIn("`cargo install` may compile", result.stderr)
 
+    def test_a_build_on_a_host_with_shims_names_their_data_directory(self):
+        # A test there may move HOME, and a shim would then re-execute forever.
+        shims = self.host_home / ".local/share/mise/shims"
+        shims.mkdir(parents=True)
+        main = self.crate / "src/main.rs"
+        main.write_text('fn main() { println!("{}", env!("MISE_DATA_DIR")); }\n')
+        result = self.gate_run("build", "--bin", "probe", env=self.remote_env())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        printed = self.scope.run([self.crate / "target/debug/probe"], capture_output=True, text=True).stdout
+        self.assertEqual(printed.strip(), str(shims.parent))
+
     def test_cargo_in_an_exec_command_builds_there(self):
         result = self.gate_run(
             "exec", "sh", "-ec",
@@ -1657,6 +1668,90 @@ class RemoteRun(unittest.TestCase):
         agent.stdin.close()
         agent.stdout.close()
         return output.decode()
+
+    def phased_run(self, *, least=None):
+        """Runs a command shaped as `cargo test` is in the agent: a compile, a
+        test harness Cargo built into `deps`, then a compile again, as for
+        doctests. Returns the slot's claimed costs during each step, the costs
+        its host record named, and the build's own cost."""
+        build_cost = 9 * 2**30
+        with FixtureDirectory() as scope, tempfile.TemporaryDirectory() as host:
+            root = scope.name
+            base = Path(root, "slot-0")
+            (base / "src").mkdir(parents=True)
+            (base / "claim").write_text(json.dumps({"cost": build_cost, "pid": None,
+                                                    "build": "", "key": "key"}))
+            self.hold(root, 0)
+            # Stand-ins named as a compiler and as a harness are: copies of
+            # this Python, which, unlike a multi-call coreutils, keeps
+            # working under another name.
+            python = os.path.realpath(sys.executable)
+            tools = Path(host, "toolchain", "bin")
+            harnesses = Path(host, "target", "debug", "deps")
+            for directory in (tools, harnesses):
+                directory.mkdir(parents=True)
+            shutil.copy(python, tools / "rustc")
+            shutil.copy(python, harnesses / "cagents-0123456789abcdef")
+            steps = Path(host, "steps")
+            pause = "import sys, time; time.sleep(float(sys.argv[1]))"
+            command = ["sh", "-ec",
+                       f'"{tools}/rustc" -c "$0" 1.5; touch "{steps}.test"; '
+                       f'"{harnesses}/cagents-0123456789abcdef" -c "$0" 2; touch "{steps}.doc"; '
+                       f'"{tools}/rustc" -c "$0" 1.5', pause]
+            registry = Path(host, "registry")
+            settings = {"CAGENTS_OFFLOAD_PHASE_INTERVAL": "0.1",
+                        "CAGENTS_BUILD_REGISTRY": str(registry)}
+            if least is not None:
+                settings["CAGENTS_OFFLOAD_TEST_LEAST_BYTES"] = str(least)
+            agent = scope.popen(
+                [sys.executable, "-c", offload.REMOTE_AGENT, "run", str(base), ".", *command],
+                stdin=subprocess.PIPE, env=os.environ | settings)
+            # A relocatable Python finds its library by its own path, which
+            # its copies do not share.
+            request = {"environment": {"PYTHONHOME": sys.base_prefix}}
+            agent.stdin.write(json.dumps(request).encode() + b"\n")
+            agent.stdin.flush()
+            seen = {"build": set(), "test": set(), "doc": set()}
+            recorded = set()
+            while agent.poll() is None:
+                phase = ("doc" if Path(f"{steps}.doc").exists()
+                         else "test" if Path(f"{steps}.test").exists() else "build")
+                with contextlib.suppress(OSError, ValueError):
+                    seen[phase].add(json.loads((base / "claim").read_text())["cost"])
+                for record in records(registry) if registry.exists() else ():
+                    with contextlib.suppress(OSError, IndexError, ValueError):
+                        recorded.add(int(record.read_text().split()[1]) * 1024)
+                time.sleep(0.05)
+            self.assertEqual(agent.returncode, 0)
+            agent.stdin.close()
+            self.assertEqual(json.loads((base / "claim").read_text())["cost"], build_cost)
+            return seen, recorded, build_cost
+
+    def test_a_command_running_its_tests_is_priced_at_least_as_a_build_is(self):
+        # A remote `cargo test` runs its harnesses in the slot. Once it only
+        # tests, the compile's expected cost no longer applies: builds the
+        # host admits meanwhile may use that memory. Compiling again, as
+        # doctests do, prices it as a build again.
+        seen, recorded, build_cost = self.phased_run()
+        least = 2 * 2**30
+        self.assertEqual(seen["build"], {build_cost})
+        # Its harness holds far less than the least a build is priced at.
+        self.assertIn(least, seen["test"])
+        self.assertIn(build_cost, seen["doc"])
+        # Other slot families on the host read the same price.
+        self.assertEqual(recorded, {build_cost, least})
+
+    def test_a_command_running_its_tests_is_priced_by_what_they_hold(self):
+        # Without the floor, the price is what the command's processes hold:
+        # the agent, the shell and the harness, measured, not a set figure.
+        seen, recorded, build_cost = self.phased_run(least=1)
+        tested = seen["test"] - {build_cost}
+        self.assertTrue(tested, seen)
+        for price in tested:
+            self.assertGreater(price, 2**20)
+            self.assertLess(price, 2**30)
+        self.assertIn(build_cost, seen["doc"])
+        self.assertTrue(tested & recorded, (tested, recorded))
 
     def test_a_build_shares_the_hosts_cpus_with_the_builds_running_there(self):
         cpus = len(os.sched_getaffinity(0))

@@ -12,11 +12,13 @@ from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
 import sys
 import tempfile
+import textwrap
 import time
 import unittest
 import unittest.mock
@@ -260,6 +262,101 @@ class InstalledGateDeferral(unittest.TestCase):
         self.install(self.version + 1)
         self.assertEqual(self.run_gate(self.env | {"CAGENTS_BUILD_INSTALLED_GATE": ""}).stdout,
                          "checkout\n")
+
+
+class ThroughAMiseShim(unittest.TestCase):
+    """Under a moved HOME a mise shim finds itself on PATH and re-executes forever."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory(prefix="cagents-gate-shim-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        for name in ("cargo-gate", "cargo-gate-command.py"):
+            shutil.copy2(ROOT / "scripts" / name, checkout)
+        self.gate = checkout / "cargo-gate"
+        self.scratch = self.root / "scratch"
+        self.scratch.mkdir()
+        self.shims = self.root / "real/.local/share/mise/shims"
+        self.shims.mkdir(parents=True)
+        # Like mise: runs the real tool only if this is its data directory's shims.
+        mise = self.root / "mise"
+        mise.write_text(textwrap.dedent(f"""\
+            #!/bin/sh
+            data=${{MISE_DATA_DIR:-${{XDG_DATA_HOME:-$HOME/.local/share}}/mise}}
+            [ "$data/shims" = "{self.shims}" ] || exec "$0" "$@"
+            exec {shlex.quote(sys.executable)} "$@"
+        """))
+        mise.chmod(0o755)
+        (self.shims / "python3").symlink_to(mise)
+        self.env = os.environ | {
+            "HOME": str(self.scratch), "PATH": f"{self.shims}:{os.defpath}",
+            "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"), "CAGENTS_BUILD_REMOTE": "local",
+            "CAGENTS_BUILD_INSTALLED_GATE": ""}
+        for name in ("MISE_DATA_DIR", "XDG_DATA_HOME", "CAGENTS_BUILD_SLOT_HELD"):
+            self.env.pop(name, None)
+
+    def gate_runs(self, *command):
+        try:
+            return subprocess.run([str(self.gate), "exec", *command], env=self.env, cwd=self.root,
+                                  capture_output=True, text=True, timeout=30)
+        except subprocess.TimeoutExpired:
+            self.fail("the gate never finished: the shim kept re-executing itself")
+
+    def test_the_gate_finishes_under_a_moved_home(self):
+        result = self.gate_runs("echo", "finished")
+        self.assertEqual(result.stdout, "finished\n", result.stderr)
+
+    def test_what_moves_home_under_the_gate_can_still_use_the_shim(self):
+        self.env["HOME"] = str(self.root / "real")
+        result = self.gate_runs("sh", "-c", f'HOME={self.scratch} python3 -c "print(1)"')
+        self.assertEqual(result.stdout, "1\n", result.stderr)
+
+    def test_a_callers_data_directory_is_theirs(self):
+        self.env["HOME"] = str(self.root / "real")
+        theirs = str(self.root / "their-own-data")
+        self.env["MISE_DATA_DIR"] = theirs
+        result = self.gate_runs("sh", "-c", 'echo "$MISE_DATA_DIR"')
+        self.assertEqual(result.stdout.strip(), theirs, result.stderr)
+
+    def test_an_empty_data_directory_counts_as_unset(self):
+        # As it does to mise, which would keep re-executing.
+        self.env["HOME"] = str(self.root / "real")
+        self.env["MISE_DATA_DIR"] = ""
+        result = self.gate_runs("sh", "-c", f'HOME={self.scratch} python3 -c "print(1)"')
+        self.assertEqual(result.stdout, "1\n", result.stderr)
+
+
+class ScriptsNameTheirPython(unittest.TestCase):
+    """`python3` found on PATH can be a shim, which can re-execute forever or stop to ask."""
+
+    # What cargo-offload starts over SSH on the build host, under that host's own
+    # HOME: no moved HOME there, and its path to Python isn't this host's to name.
+    on_the_build_host = {
+        ("cargo-offload", 'return ["python3", "-c", BOOTSTRAP, encoded]'),
+        ("cargo-offload", 'RUNNER = ["python3", "-c",'),
+    }
+    bare = re.compile(r"(?<![\w/.-])python3?(?:\.\d+)?(?![\w.-])")
+
+    def test_no_script_finds_python_on_path(self):
+        found = []
+        for script in sorted((ROOT / "scripts").rglob("*")):
+            if not script.is_file():
+                continue
+            try:
+                lines = script.read_text().splitlines()
+            except UnicodeDecodeError:
+                continue
+            if lines and lines[0].startswith("#!") and "python" in lines[0] and not lines[0].startswith("#!/usr/bin/python3"):
+                found.append(f"{script.name}:1: {lines[0]}")
+            for number, line in enumerate(lines, 1):
+                text = line.strip()
+                if text.startswith("#") or (script.name, text) in self.on_the_build_host:
+                    continue
+                if self.bare.search(line):
+                    found.append(f"{script.name}:{number}: {text}")
+        self.assertEqual(found, [], "name /usr/bin/python3; see docs/development.md, Scripts and mise shims")
 
 
 class InstalledGateSync(unittest.TestCase):

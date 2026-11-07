@@ -511,7 +511,17 @@ builds counted include those the host's own gate admits in its shared
 families, through the registry described [above](#sharing-a-host-between-several-checkouts),
 where these slots record their builds in turn. A plain
 `cargo test` runs its tests there, in the slot, which stays leased until they
-end. One build's
+end. Cargo builds everything a test run needs before it runs any test, so the
+compile's expected peak stops applying once it only runs executables it built
+into a `deps` directory: from then on the slot is priced at the most its
+processes have held since its tests began, sampled every 2 s, and never below
+2 GiB. Builds the host admits meanwhile may take the memory the compile no
+longer reserves, while whatever the tests hold stays counted. Growth beyond
+that peak is not reserved, as the memory of tests the gate runs on this host
+is not; memory pressure then holds further builds back. Running a compiler or build
+script again, as doctests do, prices it as a build again. Without this, slots
+running only tests on fw16 reserved about 18 of its 26 GiB available, and
+queued builds waited beside idle slots. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
@@ -1188,6 +1198,30 @@ Published releases still come from `scripts/build-release-linux`; see
 | Compilation exhausts RAM or swap | Lower `CARGO_BUILD_JOBS`, use `--browserless`, and build through `scripts/cargo-gate` rather than starting builds side by side; see [resource usage](#build-and-test-resource-usage). |
 | A UI problem needs logs | Add `--debug --log-file /tmp/cagents-ui.log` and read the file after reproducing. |
 | New links do not open in browserless mode | Install `xdg-utils`, or use a desktop with a working portal. |
+
+## Scripts and mise shims
+
+A mise shim on `PATH` under a moved `HOME` or `XDG_DATA_HOME`, as in a fixture, finds
+itself and re-executes without end: no error, and the process keeps its pid and
+restarts forever, outliving a `timeout` on its parent. So scripts here name
+`/usr/bin/python3` rather than finding `python3` on `PATH`, and a host running them
+needs it there. `scripts/cargo-gate` also sets `MISE_DATA_DIR` from the shims directory
+on `PATH`, so what it runs can move `HOME` without that loop.
+
+Separately, a shim under a `mise.toml` that mise has not been told to trust stops at
+mise's trust prompt and waits for an answer whenever its stderr is a terminal, even with
+stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
+`scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
+for you, because trusting a checkout's configuration is your decision. Run `mise trust`
+in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
+such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
+only that file pins can fail at once with `No version is set for shim`.
+
+A harness of your own that moves `HOME` should take the shims off `PATH` and name the
+tools it needs by their real paths. mise keeps its trust list under `HOME`, so setting
+`MISE_DATA_DIR` stops the loop but not the prompt. Run it in a systemd scope with a time
+limit too, which stops everything it started.
 
 ## Standalone editor
 

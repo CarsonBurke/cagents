@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Run a gated Cargo command on the build host instead of this one.
 
 scripts/cargo-gate runs this before anything else. Rust compiles only on the
@@ -459,7 +459,7 @@ def real_cargo(environment):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 REMOTE_AGENT = r'''
-import fcntl, hashlib, json, os, resource, shutil, signal, stat, subprocess, sys, threading, time
+import fcntl, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -775,6 +775,101 @@ def register(slot, cost, pid, overdue=None):
                             f"{'overdue' if overdue else ''}\n")
     except OSError:
         pass
+
+
+def reprice(slot, cost):
+    """Prices the command running in `slot` at `cost` for builds deciding
+    from now on, in its claim and its host record, keeping the record's
+    start and overdue mark."""
+    claimed = read_claim(slot)
+    claimed["cost"] = cost
+    with open(os.path.join(slot, "claim.new"), "w") as file:
+        json.dump(claimed, file)
+    os.replace(os.path.join(slot, "claim.new"), os.path.join(slot, "claim"))
+    if not REGISTRY:
+        return
+    entry = registry_entry(slot)
+    try:
+        with open(entry) as file:
+            lines = file.read().splitlines()
+        pid = lines[0].split()[0]
+        lines[0] = f"{pid} {cost // 1024}"
+        write_record(entry, "\n".join(lines) + "\n")
+    except (OSError, IndexError):
+        pass
+
+
+# Programs that compile, link or drive a native build. While one runs in a
+# command's session, the command is building.
+COMPILER = re.compile(r"(?:.+-)?(?:rustc|rustdoc|cc|c\+\+|gcc|g\+\+|clang|clang\+\+|cc1|cc1plus"
+                      r"|cc1obj|collect2|ld|ld\.[a-z]+|lld|mold|as|ar|zig|cmake|make|gmake|ninja)"
+                      r"(?:-[0-9][0-9.]*)?")
+# How often a running command's phase is looked at, and the least a test run
+# is priced at. The variables are for tests standing in for the build host;
+# ssh does not pass them on.
+PHASE_INTERVAL = float(os.environ.get("CAGENTS_OFFLOAD_PHASE_INTERVAL") or 2)
+TEST_LEAST = int(os.environ.get("CAGENTS_OFFLOAD_TEST_LEAST_BYTES") or LEAST)
+
+
+def session_phase(session):
+    """"build" while a process in `session` compiles or runs a build script,
+    "test" while one instead runs an executable Cargo built into a `deps`
+    directory (a test harness, benchmark, or what they start beside it), and
+    None while neither does: Cargo between steps, or the command ending."""
+    testing = False
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as file:
+                fields = file.read().rsplit(")", 1)[1].split()
+            if int(fields[3]) != session:
+                continue
+            executable = os.readlink(f"/proc/{name}/exe")
+        except (OSError, ValueError, IndexError):
+            continue
+        executable = executable.removesuffix(" (deleted)")
+        directory, program = os.path.split(executable)
+        if COMPILER.fullmatch(program) or program.startswith(("build-script-", "build_script_")):
+            return "build"
+        if os.path.basename(directory) == "deps":
+            testing = True
+    return "test" if testing else None
+
+
+def price_by_phase(slot, cost, session):
+    """Prices the command in `slot`, whose processes form `session`, by its
+    phase. Cargo runs tests only once it has built everything they need, and
+    a test run needs what its tests hold, not what compiling them did: while
+    it tests, the command is priced at the most its processes have held
+    since its tests began, as sampled each pass, and never below the least
+    any build is priced at. Builds the host admits meanwhile then take memory
+    the compile no longer reserves, while what the tests do hold stays
+    counted, however much that is; growth beyond that peak is not reserved,
+    as tests run by the gate here are not, and the host's memory pressure
+    holds further builds back. When it compiles again, as doctests do, it is
+    priced as a build."""
+    priced, peak = cost, 0
+    while True:
+        time.sleep(PHASE_INTERVAL)
+        try:
+            phase = session_phase(session)
+            if phase == "test":
+                peak = max(peak, resident([os.getpid()]).get(os.getpid(), 0))
+                price = max(TEST_LEAST, peak)
+            elif phase == "build":
+                price = cost
+            else:
+                continue
+            # Small changes in what the tests hold are not worth rewriting for.
+            if price != priced and (price == cost or priced == cost
+                                    or abs(price - priced) >= 64 * 2**20):
+                reprice(slot, price)
+                priced = price
+        except Exception:
+            # Repricing never ends a command. A failed pass, such as a claim
+            # the full disk could not take, is tried again at the next.
+            continue
 
 
 def start_time(pid):
@@ -1213,6 +1308,8 @@ elif command == "run":
     shims = os.path.expanduser("~/.local/share/mise/shims")
     if os.path.isdir(shims):
         environment["PATH"] = shims + os.pathsep + environment.get("PATH", "")
+        # See the note at the top of scripts/cargo-gate: a test's fixture may move HOME.
+        environment.setdefault("MISE_DATA_DIR", os.path.dirname(shims))
     if request.get("directories") is not None:
         # Where this host's Cargo puts the build's results and intermediates,
         # which its own configuration may move out of the slot: the caller
@@ -1232,6 +1329,7 @@ elif command == "run":
         sys.stdout.flush()
     child = subprocess.Popen(arguments, env=environment, stdin=subprocess.DEVNULL,
                              start_new_session=True)
+    threading.Thread(target=price_by_phase, args=(base, cost, child.pid), daemon=True).start()
     def end(sent_first):
         """Signals the command's process group until it is gone: children
         that ignore an interrupt, as a shell's background jobs do, get a

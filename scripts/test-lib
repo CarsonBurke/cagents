@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Compile one isolated lib-test harness, then run selected tests without a slot."""
 
 import argparse

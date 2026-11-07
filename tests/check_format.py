@@ -107,6 +107,15 @@ sys.exit({status})
         self.addCleanup(directory_patch.stop)
         return helper, ["--edition", "2024", "--check", *INCLUDED]
 
+    def test_without_the_python_it_runs_rustfmt_still_checks(self):
+        # `python3` stays on PATH: the check is of the interpreter it would run.
+        self.script.write_text(self.script.read_text().replace("/usr/bin/python3", "/nonexistent/python3"))
+        log, env = self.mock_tools()
+        result = self.run_checker(env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        tools = [json.loads(line)[1] for line in log.read_text().splitlines()]
+        self.assertEqual(tools, ["cargo", "rustfmt"])
+
     def test_checks_both_routes_and_preserves_failures_and_diagnostics(self):
         for cargo_status, rustfmt_status in ((0, 0), (0, 1), (7, 0), (7, 2)):
             with self.subTest(cargo=cargo_status, rustfmt=rustfmt_status):
