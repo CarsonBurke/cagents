@@ -17,7 +17,7 @@ use serde_json::Value;
 
 use super::{POLL, Refused, manager_runtime, workload::cgroup_path};
 
-/// Bounds each call, and how long a request given up on is settled for.
+/// Bounds a collection's calls, and settling a request given up on.
 const CALL_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a session scope must have been running before an empty one is
 /// collected. A scope is started with its processes, so one this old and
@@ -26,13 +26,13 @@ const COLLECTABLE_AFTER: Duration = Duration::from_secs(60);
 pub(super) const SCOPES: &str = "cagents-session-*.scope";
 
 /// One `busctl --user` call through the bus broker, the route a scope
-/// request takes. A systemd error reply is [`Refused`].
-fn busctl(arguments: &[&str]) -> io::Result<Vec<Value>> {
+/// request takes, ended at `deadline`. A systemd error reply is [`Refused`].
+fn busctl(arguments: &[&str], deadline: Instant) -> io::Result<Vec<Value>> {
     let mut command = Command::new("busctl");
     command
         .env("XDG_RUNTIME_DIR", manager_runtime())
         .env_remove("DBUS_SESSION_BUS_ADDRESS")
-        // CALL_TIMEOUT bounds the call; busctl's own must not end it first.
+        // The deadline bounds the call; busctl's own must not end it first.
         .args(["--user", "--json=short", "--timeout=60s"])
         .args(arguments)
         .stdin(Stdio::null())
@@ -51,7 +51,6 @@ fn busctl(arguments: &[&str]) -> io::Result<Vec<Value>> {
         let mut output = String::new();
         stdout.read_to_string(&mut output).map(|_| output)
     });
-    let deadline = Instant::now() + CALL_TIMEOUT;
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -83,7 +82,12 @@ fn refused(error: &io::Error) -> bool {
     error.get_ref().is_some_and(|inner| inner.is::<Refused>())
 }
 
-fn manager(method: &str, signature: &str, arguments: &[&str]) -> io::Result<Vec<Value>> {
+fn manager(
+    method: &str,
+    signature: &str,
+    arguments: &[&str],
+    deadline: Instant,
+) -> io::Result<Vec<Value>> {
     let mut call = vec![
         "call",
         "org.freedesktop.systemd1",
@@ -93,7 +97,7 @@ fn manager(method: &str, signature: &str, arguments: &[&str]) -> io::Result<Vec<
         signature,
     ];
     call.extend_from_slice(arguments);
-    busctl(&call)
+    busctl(&call, deadline)
 }
 
 fn malformed() -> io::Error {
@@ -101,8 +105,8 @@ fn malformed() -> io::Error {
 }
 
 /// The unit's object path, or `None` when systemd has no such unit loaded.
-fn unit_path(unit: &str) -> io::Result<Option<String>> {
-    match manager("GetUnit", "s", &[unit]) {
+fn unit_path(unit: &str, deadline: Instant) -> io::Result<Option<String>> {
+    match manager("GetUnit", "s", &[unit], deadline) {
         Ok(reply) => reply
             .first()
             .and_then(|reply| reply["data"][0].as_str())
@@ -125,23 +129,29 @@ pub(super) struct Scope {
     pub(super) control_group: String,
 }
 
-fn scope(path: &str) -> io::Result<Scope> {
-    let unit = busctl(&[
-        "get-property",
-        "org.freedesktop.systemd1",
-        path,
-        "org.freedesktop.systemd1.Unit",
-        "ActiveState",
-        "Job",
-        "ActiveEnterTimestampMonotonic",
-    ])?;
-    let scope = busctl(&[
-        "get-property",
-        "org.freedesktop.systemd1",
-        path,
-        "org.freedesktop.systemd1.Scope",
-        "ControlGroup",
-    ])?;
+fn scope(path: &str, deadline: Instant) -> io::Result<Scope> {
+    let unit = busctl(
+        &[
+            "get-property",
+            "org.freedesktop.systemd1",
+            path,
+            "org.freedesktop.systemd1.Unit",
+            "ActiveState",
+            "Job",
+            "ActiveEnterTimestampMonotonic",
+        ],
+        deadline,
+    )?;
+    let scope = busctl(
+        &[
+            "get-property",
+            "org.freedesktop.systemd1",
+            path,
+            "org.freedesktop.systemd1.Scope",
+            "ControlGroup",
+        ],
+        deadline,
+    )?;
     let [active_state, job, active_since] = unit.as_slice() else {
         return Err(malformed());
     };
@@ -212,10 +222,10 @@ pub(super) fn withdraw(
 ) -> io::Result<Option<String>> {
     let deadline = Instant::now() + CALL_TIMEOUT;
     while Instant::now() < deadline {
-        let Some(path) = unit_path(unit)? else {
+        let Some(path) = unit_path(unit, deadline)? else {
             return Ok(None);
         };
-        let current = scope(&path)?;
+        let current = scope(&path, deadline)?;
         // A process systemd placed late is enrolled, whatever is empty.
         if current.job == 0
             && let Ok(membership) = membership()
@@ -227,7 +237,7 @@ pub(super) fn withdraw(
             Settle::Cancel(job) => {
                 // A job that has just run can't be cancelled; look again.
                 let job = job.to_string();
-                match manager("CancelJob", "u", &[&job]) {
+                match manager("CancelJob", "u", &[&job], deadline) {
                     Ok(_) => {}
                     Err(error) if refused(&error) => {}
                     Err(error) => return Err(error),
@@ -235,7 +245,7 @@ pub(super) fn withdraw(
             }
             Settle::Wait => thread::sleep(POLL),
             Settle::Stop => {
-                stop(unit)?;
+                stop(unit, deadline)?;
                 return Ok(None);
             }
             Settle::Leave => return Ok(None),
@@ -249,8 +259,8 @@ pub(super) fn withdraw(
 
 /// Stop a scope only if no job is queued for it: a stop never replaces a
 /// start that would attach a process.
-fn stop(unit: &str) -> io::Result<()> {
-    manager("StopUnit", "ss", &[unit, "fail"]).map(drop)
+fn stop(unit: &str, deadline: Instant) -> io::Result<()> {
+    manager("StopUnit", "ss", &[unit, "fail"], deadline).map(drop)
 }
 
 fn monotonic_now() -> Duration {
@@ -273,7 +283,13 @@ pub(super) fn settled_long_enough(scope: &Scope, now: Duration) -> bool {
 /// earlier enrollment left (#2414). Returns how many were stopped. A scope
 /// with a process, a queued job or a recent start is never stopped.
 pub(super) fn collect_empty_scopes() -> io::Result<usize> {
-    let listing = manager("ListUnitsByPatterns", "asas", &["1", "active", "1", SCOPES])?;
+    let call = || Instant::now() + CALL_TIMEOUT;
+    let listing = manager(
+        "ListUnitsByPatterns",
+        "asas",
+        &["1", "active", "1", SCOPES],
+        call(),
+    )?;
     let units = listing
         .first()
         .and_then(|reply| reply["data"][0].as_array())
@@ -285,14 +301,14 @@ pub(super) fn collect_empty_scopes() -> io::Result<usize> {
         else {
             continue;
         };
-        let Ok(current) = scope(path) else {
+        let Ok(current) = scope(path, call()) else {
             continue;
         };
         if !settled_long_enough(&current, monotonic_now()) {
             continue;
         }
         if settle(&current, || populated(&current.control_group))? == Settle::Stop
-            && stop(name).is_ok()
+            && stop(name, call()).is_ok()
         {
             stopped += 1;
         }
