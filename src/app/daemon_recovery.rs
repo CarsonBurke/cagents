@@ -544,11 +544,12 @@ fn open_agent_refusal(
     if !agent_close_can_release(agent, hosted, boot) {
         return "An open agent still uses this terminal and Cagents can't confirm it has stopped, so the pane was kept. There's no way to close this pane yet.".into();
     }
-    // The daemon only lets an agent's owner close it, and a person's shell owns
-    // only the agents a person started.
+    // The daemon only lets an agent's owner close it. A person's own shell owns
+    // the agents a person started, but a shell in a Cagents terminal counts as
+    // that terminal's session and is refused.
     match agent.origin {
         Origin::User => format!(
-            "An open agent still uses this terminal, so the pane was kept. Close the agent first with `cagents agent close {}`, then close the pane again.",
+            "An open agent still uses this terminal, so the pane was kept. Close the agent first by running `cagents agent close {}` in a terminal outside Cagents, then close the pane again.",
             agent.id
         ),
         Origin::Child { .. } | Origin::Automation { .. } => "An open agent started by another session or automation still uses this terminal, so the pane was kept. Only what started it can close it. Close this pane again after that.".into(),
@@ -2237,7 +2238,9 @@ mod tests {
             ..lost_session.clone()
         };
         let earlier = agent(Some(HostedSession::Chat(left_behind.clone())));
-        assert!(open_agent_refusal(&earlier, &[], &boot).contains(&command(&earlier)));
+        let named = open_agent_refusal(&earlier, &[], &boot);
+        assert!(named.contains(&command(&earlier)), "{named}");
+        assert!(named.contains("outside Cagents"), "{named}");
         // Not from this boot's own proof, or from one that isn't complete.
         let this_boot = crate::chat::Session {
             proof: Some(proof("old")),
