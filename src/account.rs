@@ -301,8 +301,9 @@ pub fn is_account_namespace(provider: Provider, path: &Path) -> bool {
 pub const SELECTION_MARKER: &str = "CAGENTS_ACCOUNT_HOMES";
 
 /// Carried by every terminal and conversation cagents starts on the system
-/// Claude login with a `CLAUDE_CONFIG_DIR` the reader started cagents with,
-/// as a `CLAUDE_CONFIG_DIR=path` line. It tells a cagents process started
+/// Claude login with a `CLAUDE_CONFIG_DIR` the reader started cagents with -
+/// the one the daemon that starts it was started with - as a
+/// `CLAUDE_CONFIG_DIR=path` line. It tells a cagents process started
 /// there that the home is the reader's own choice, which a launch by earlier
 /// cagents, exporting Claude's default for every system launch, could not
 /// (see [`inherited_selections`]).
