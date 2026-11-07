@@ -1521,7 +1521,19 @@ trace({'event':'marker-root','markerroot':str(root)})
 resumed=next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--resume=')), None)
 session=resumed or next((arg.split('=',1)[1] for arg in sys.argv[1:] if arg.startswith('--session-id=')), 'aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa')
 with (root/'launches').open('a') as log: log.write((resumed or 'new')+'\n')
-def send(value): print(json.dumps(value),flush=True)
+history=None
+if (root/'persist-history').exists():
+    # Claude's own record of the conversation, which a resumed start reads.
+    project=''.join(c if c.isascii() and c.isalnum() else '-' for c in os.getcwd())
+    history=pathlib.Path(os.environ['CLAUDE_CONFIG_DIR'])/'projects'/project/(session+'.jsonl')
+    history.parent.mkdir(parents=True,exist_ok=True)
+records=[json.loads(line) for line in history.read_text().splitlines()] if history is not None and history.exists() else []
+def send(value):
+    print(json.dumps(value),flush=True)
+    if history is not None and value.get('type') in ('user','assistant','result'):
+        record=dict(value,uuid=f'history-{len(records)}',sessionId=session,parentUuid=records[-1]['uuid'] if records else None)
+        records.append(record)
+        with history.open('a') as log: log.write(json.dumps(record)+'\n')
 for line in sys.stdin:
     frame=json.loads(line)
     request=frame.get('request')
@@ -4798,6 +4810,8 @@ fn exited_claude_card_resumes_its_conversation_once_in_the_same_daemon() {
         ] {
             fs::create_dir_all(root.join(path)).unwrap();
         }
+        // The provider keeps Claude's history, which the resumed start reads.
+        fs::write(root.join("persist-history"), "").unwrap();
         let test = thread::current().name().unwrap().to_owned();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
@@ -5051,6 +5065,19 @@ fn exited_claude_card_resumes_its_conversation_once_in_the_same_daemon() {
         lines("prompts").len(),
         2,
         "nothing the stopped actor held is sent again"
+    );
+    // The successor shows the conversation read back from its history.
+    resumed.set_visible(true);
+    wait_until(
+        || {
+            resumed.snapshot(None).is_some_and(|snapshot| {
+                snapshot
+                    .items
+                    .iter()
+                    .any(|item| item.role == chat::Role::User)
+            })
+        },
+        "the resumed conversation lost its transcript",
     );
     // The conversation continues in the successor.
     prompt(&resumed, "A follow-up after resuming");
