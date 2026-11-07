@@ -7,13 +7,17 @@ self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
 session_name=evidence
 native_lock=${CAGENTS_EVIDENCE_NATIVE_LOCK:-/var/tmp/cagents-fw16-native.lock}
-# Builds join the host's existing Cargo queue. Its lanes still take that lock
+# Builds go to the build host's shared slots, even from the build host itself:
+# a slot keeps the build output and reuses it for the next build, whichever
+# checkout that is, and only the executables come back to the task.
+export CAGENTS_BUILD_REMOTE_LOOPBACK=${CAGENTS_BUILD_REMOTE_LOOPBACK:-1}
+# With CAGENTS_BUILD_REMOTE=local, they build in the task's own target instead,
+# joining this host's existing Cargo queue. Its lanes still take that lock
 # directly, so one slot keeps these builds in line behind them.
 export CAGENTS_BUILD_LOCK=${CAGENTS_BUILD_LOCK:-/var/tmp/cagents-fw16-cargo.lock}
 export CAGENTS_BUILD_SLOTS=${CAGENTS_BUILD_SLOTS:-1}
 export CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS:-8}
-# A task's target isn't the checkout's build directory the gate would seed;
-# --seed-target picks its start.
+# A task's target isn't the checkout's build directory the gate would seed.
 export CAGENTS_BUILD_SEED=0
 # The session's own commands run below a compositor with a private HOME.
 real_home=${CAGENTS_EVIDENCE_REAL_HOME:-$HOME}
@@ -25,10 +29,11 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and synthetic provider.
 
-  build SIDE CHECKOUT [--seed-target DIR]
-                  Build the runner's three browserless executables in one
-                  scripts/cargo-gate slot. --seed-target makes a copy-on-write
-                  start for a new target from a finished one.
+  build SIDE CHECKOUT
+                  Build the runner's three browserless executables in one of
+                  the build host's shared slots, and keep them in the side's
+                  target. scripts/prune-build-dirs removes a target that no
+                  session or build has used for 12 hours.
   start SIDE [--width PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
                   Take the native lock and start a headless session. The lock is
                   released by stop, or after --limit seconds (default 2700).
@@ -164,20 +169,23 @@ refuse_running_side() {
 }
 
 cmd_build() {
-    local side=${1:-} checkout=${2:-} seed_target=
+    local side=${1:-} checkout=${2:-}
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
-            --seed-target) seed_target=${2:?--seed-target needs a directory}; shift 2 ;;
+            --seed-target)
+                # A slot already holds a nearby build; a copied target adds only disk.
+                : "${2:?--seed-target needs a directory}"
+                printf 'native-evidence: ignoring --seed-target, which builds in shared slots no longer need\n' >&2
+                shift 2
+                ;;
             *) die "unknown build option: $1" 2 ;;
         esac
     done
     refuse_running_side "$side"
     checkout=$(cd -- "$checkout" && pwd -P)
-    # The build runs from the checkout, so a relative seed is the caller's.
-    [ -z "$seed_target" ] || seed_target=$(realpath -m -- "$seed_target")
     git -C "$checkout" rev-parse --git-dir >/dev/null
     local target zig cargo_path
     target=$(target_of "$side")
@@ -201,25 +209,27 @@ cmd_build() {
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
     # builds alone can use it.
     (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
-        __build "$side" "$checkout" "$seed_target" "$zig" "${cargo_path%/*}")
+        __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+}
+
+# Marks a side's target as just used, so the pruner leaves it for its
+# --evidence-hours from now. Its absence is reported by what reads it.
+mark_used() {
+    touch -- "$(target_of "$1")/.native-evidence-used" 2>/dev/null || :
 }
 
 run_build() {
-    local side=$1 checkout=$2 seed_target=$3 zig=$4 cargo_bin=$5 target revision
+    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 target revision
     # A session may have started during the wait for this slot.
     refuse_running_side "$side"
     target=$(target_of "$side")
+    mkdir -p -- "$target"
+    # The pruner leaves a target that a process has open. Cargo doesn't get
+    # it: a compiler daemon that outlived the build would keep it forever.
+    exec 8<"$target"
     # From here until the build finishes, the target matches no recorded source:
-    # a seed's record names its own checkout, and a failed rebuild keeps stale output.
+    # a failed rebuild keeps stale output.
     rm -f -- "$target/evidence-source"
-    if [ -n "$seed_target" ] && [ ! -e "$target" ]; then
-        # A copy that fails midway must not look like a seeded target to anyone.
-        rm -rf -- "$target.partial"
-        cp -a --reflink=always -- "$seed_target" "$target.partial"
-        rm -f -- "$target.partial/evidence-source"
-        (cd -- "$checkout" && "$tool_root/scripts/seed-build-dir" --forget-local "$target.partial")
-        mv -- "$target.partial" "$target"
-    fi
     revision=$(source_state "$checkout")
     (
         cd -- "$checkout"
@@ -230,7 +240,7 @@ run_build() {
         local arguments
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
-            cargo build $arguments
+            cargo build $arguments 8<&-
         done < <(build_arguments)
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
@@ -424,6 +434,12 @@ wait_for_native_lock() {
 run_session() {
     local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6
     load_side "$side" "$state/source"
+    # Open for the whole session, even while it waits for the native lock, so
+    # the pruner leaves the target.
+    exec 8<"$target" 2>/dev/null || {
+        printf '%s has not been built; run: build %s %s\n' "$side" "$side" "$checkout" >"$state/failed"
+        return 1
+    }
     exec 9>"$native_lock"
     compositor=
     lock_waiter=
@@ -495,6 +511,8 @@ run_session() {
     [ -e "$state/ready" ] || [ -e "$state/failed" ] ||
         printf 'the compositor exited before the session was ready; see %s\n' "$logs/kwin-$side.log" >"$state/failed"
     end_session
+    # Unused from now on, as far as the pruner can tell.
+    mark_used "$side"
 }
 
 run_inner() {
@@ -621,6 +639,8 @@ cmd_start() {
         die 'width, lock wait and session limit must be whole numbers' 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     live_session && die 'a session is already running for this task; stop it first'
+    # Before anything reads it: the pruner leaves a target written meanwhile.
+    mark_used "$side"
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"
     rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env"
