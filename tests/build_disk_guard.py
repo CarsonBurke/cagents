@@ -158,10 +158,10 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual(len(lines), 2)
         (background,) = [line for line in lines if "--output" in line]
         self.assertNotIn("--budget", background)
-        self.assertIn("--orphan-hours 0", background)
+        self.assertIn("--orphan-hours 0 --evidence-hours 1", background)
         (call,) = [line for line in lines if "--output" not in line]
         self.assertIn("--apply --max-idle 7", call)
-        self.assertIn("--orphan-hours 0 --budget 300 --wait", call)
+        self.assertIn("--orphan-hours 0 --evidence-hours 1 --budget 300 --wait", call)
         self.assertIn(f"--stamp {self.root}/pruner.scheduled", call)
         self.assertIn(f"--keep {self.root}", call)
         self.assertIn(f"--root {checkout.resolve()} --keep-checkout {checkout.resolve()}", call)
@@ -221,7 +221,8 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("reclaiming unused build directories in the background", result.stderr)
         (call,) = self.calls(calls, 1)
-        self.assertIn("--orphan-hours 0", call)
+        # Running low, a native-evidence build goes after an hour unused.
+        self.assertIn("--orphan-hours 0 --evidence-hours 1", call)
         self.assertNotIn("--budget", call)
         self.assertIn(f"--output {self.root}/pruner.log", call)
         # Once it has searched everything, the next hour's builds start none.
@@ -280,7 +281,9 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual((result.returncode, result.stderr), (0, ""))
         (call,) = self.calls(calls, 1)
         self.assertIn("--apply --max-idle 3", call)
+        # The pruner's own grace periods, not those for running low.
         self.assertNotIn("--orphan-hours", call)
+        self.assertNotIn("--evidence-hours", call)
         # Once it has finished, and within the interval, no build starts another.
         stamp = self.root / "pruner.scheduled"
         self.assertEqual(self.guard(1, guard=guard).returncode, 0)

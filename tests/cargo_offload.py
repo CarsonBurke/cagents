@@ -14,6 +14,7 @@ import contextlib
 import fcntl
 import json
 import os
+import pwd
 import resource
 from pathlib import Path
 import shlex
@@ -432,7 +433,9 @@ class Settings(unittest.TestCase):
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER": "/t/cagentsd", "CAGENTS_LIVE_TESTS": "0",
             "CAGENTS_BUILD_LOCK": "/var/tmp/l", "TMPDIR": "/tmp/x", "CAGENTS_ZIG": "/z/zig",
             "CAGENTS_DEVELOPMENT_HOSTED_BY": "/run/user/1/cagents\n/run/user/1/nh-a/cagents-development-a",
-            "CAGENTS_FIXTURE": "~/f", "CAGENTS_API_KEY_FILE": "/k"}),
+            "CAGENTS_FIXTURE": "~/f", "CAGENTS_API_KEY_FILE": "/k",
+            "CAGENTS_EVIDENCE_TASK": "/home/u/.local/state/cev/task",
+            "CAGENTS_EVIDENCE_NATIVE_LOCK": "/var/tmp/native.lock"}),
             ["CAGENTS_FIXTURE", "CAGENTS_TEST_RETAINED_ACTOR_HELPER"])
 
 
@@ -485,6 +488,74 @@ class ThisHost(unittest.TestCase):
                                  env=os.environ | {"CAGENTS_BUILD_REMOTE": ""})
         self.assertEqual((default.returncode, default.stdout), (0, "fw16\n"))
 
+
+    def test_the_build_host_builds_in_its_own_slots_only_when_asked(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        this = socket.gethostname()
+        def where(**settings):
+            result = subprocess.run([script, "--host"], capture_output=True, text=True,
+                                    env=os.environ | {"CAGENTS_BUILD_REMOTE": this} | settings)
+            return result.returncode, result.stdout
+        self.assertEqual(where(), (offload.FALL_BACK, ""))
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE_LOOPBACK="0"), (offload.FALL_BACK, ""))
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE_LOOPBACK="1"), (0, f"{this}\tloopback\n"))
+        # `local` still means this checkout's own build directory.
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE="local", CAGENTS_BUILD_REMOTE_LOOPBACK="1"),
+                         (offload.FALL_BACK, ""))
+        # Another host is reached as ever.
+        self.assertEqual(where(CAGENTS_BUILD_REMOTE="192.0.2.1", CAGENTS_BUILD_REMOTE_LOOPBACK="1"),
+                         (0, "192.0.2.1\n"))
+
+    def test_a_loopback_runs_commands_and_copies_as_sshd_would(self):
+        build = offload.Offload("fw16", None, {}, loopback=True)
+        self.assertEqual(build.remote("exists", "/x")[:3],
+                         [sys.executable, str(ROOT / "scripts/cargo-offload"), "--loopback-shell"])
+        # There is no connection to share, or to end.
+        build.share_connection()
+        self.assertIsNone(build.control)
+        script = str(ROOT / "scripts/cargo-offload")
+        account = pwd.getpwuid(os.getuid())
+        # A plain shell, whose configuration cannot add anything.
+        caller = os.environ | {"CARGO_TARGET_DIR": "/caller/target", "CAGENTS_BUILD_LOCK": "/x",
+                               "CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL": "/bin/sh"}
+        result = subprocess.run(
+            [script, "--loopback-shell", "-o", "BatchMode=yes", "-o", "ControlPath=/x/m", "fw16",
+             "pwd;", "env"],
+            capture_output=True, text=True, env=caller, cwd="/", timeout=60)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = result.stdout.splitlines()
+        self.assertEqual(lines[0], account.pw_dir)
+        self.assertIn(f"HOME={account.pw_dir}", lines)
+        # Nothing of the caller's build reaches the slot.
+        self.assertFalse([line for line in lines if line.startswith(("CARGO_TARGET_DIR=", "CAGENTS_BUILD_"))])
+        # A control command acts on no connection, and runs nothing.
+        ended = subprocess.run([script, "--loopback-shell", "-O", "exit", "fw16"],
+                               capture_output=True, text=True, timeout=60)
+        self.assertEqual((ended.returncode, ended.stdout), (0, ""))
+
+    def test_a_loopback_that_is_killed_ends_its_command_as_a_dropped_connection_would(self):
+        script = str(ROOT / "scripts/cargo-offload")
+        with tempfile.TemporaryDirectory(prefix="cagents-loopback-") as root:
+            ended = Path(root) / "ended"
+            # Like the build host's agent: it ends what it started once its
+            # input closes. The shell waits for it rather than exec it, as fish does.
+            command = (f"python3 -c 'import sys; sys.stdin.read(); open(sys.argv[1], \"w\")' "
+                       f"{ended}; true")
+            loopback = subprocess.Popen(
+                [script, "--loopback-shell", "fw16", command], stdin=subprocess.PIPE,
+                env=os.environ | {"CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL": "/bin/sh"})
+            self.addCleanup(loopback.stdin.close)
+            time.sleep(1)
+            self.assertFalse(ended.exists())
+            # This process still holds the loopback's input open, as a caller
+            # whose stand-in for ssh was killed does.
+            loopback.kill()
+            loopback.wait(timeout=10)
+            for _ in range(100):
+                if ended.exists():
+                    break
+                time.sleep(0.1)
+            self.assertTrue(ended.exists())
 
     def test_this_hosts_names_and_addresses_build_here(self):
         self.assertTrue(offload.is_this_host(socket.gethostname()))
@@ -647,6 +718,47 @@ class StandInHost(unittest.TestCase):
         executable = self.crate / "target/debug/probe"
         self.assertEqual(self.scope.run([executable], capture_output=True, text=True).stdout, "probe\n")
         # Nothing was built here.
+        self.assertFalse((self.root / "local-build").exists())
+
+    def test_the_build_host_builds_in_its_own_slots_through_a_loopback(self):
+        # The host's login shell, standing in for this one's: its home holds
+        # the slots, and its own search path finds Cargo.
+        shell = self.root / "tools/host-shell"
+        settings = {
+            "HOME": self.host_home, "PATH": self.env["STAND_IN_HOST_PATH"],
+            "CARGO_HOME": self.env["CARGO_HOME"], "RUSTUP_HOME": self.env["RUSTUP_HOME"],
+            "CARGO_BUILD_BUILD_DIR": f"{self.host_home}/build{{workspace-root}}/target",
+            "CAGENTS_OFFLOAD_FIGURES": self.host_home / "figures",
+            "CAGENTS_OFFLOAD_TEMPORARY_ROOT": self.host_home / "cof", "CAGENTS_BUILD_REGISTRY": "",
+        }
+        shell.write_text("#!/bin/sh\n"
+                         f"cd {shlex.quote(str(self.host_home))}\n"
+                         "exec env -i " + " ".join(f"{name}={shlex.quote(str(value))}"
+                                                   for name, value in settings.items())
+                         + ' sh "$@"\n')
+        shell.chmod(0o755)
+        # Nothing may reach the host through ssh.
+        (self.root / "tools/ssh").unlink()
+        env = self.env | {"CAGENTS_BUILD_REMOTE": socket.gethostname(),
+                          "CAGENTS_BUILD_REMOTE_LOOPBACK": "1",
+                          "CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL": str(shell),
+                          "CARGO_TARGET_DIR": str(self.root / "evidence/target-after")}
+        slot = self.host_home / ".cache/cagents-offload/crate/slot-0/src"
+        result = self.gate_run("build", "--bin", "probe", env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((slot / "target/debug/probe").is_file())
+        # As native-evidence builds: one slot held for a script of builds.
+        result = self.gate_run("exec", "--hold", "sh", "-c", "cargo build --release --bin probe",
+                               env=env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((slot / "target/release/probe").is_file())
+        for profile in ("debug", "release"):
+            executable = self.root / "evidence/target-after" / profile / "probe"
+            self.assertEqual(self.scope.run([executable], capture_output=True, text=True).stdout,
+                             "probe\n")
+        # Only the executables came back; the build output stays in the slot.
+        self.assertEqual(sorted(path.name for path in (self.root / "evidence/target-after").rglob("*")
+                                if path.is_file()), ["probe", "probe"])
         self.assertFalse((self.root / "local-build").exists())
 
     def test_a_worktree_builds_its_own_sources_in_a_slot_another_built_newer_ones_in(self):
