@@ -850,6 +850,25 @@ impl WindowProtections {
 mod tests {
     use super::*;
 
+    /// A plain `File` holding a lock releases it only when every copy closes, and
+    /// a sibling test's fork holds a copy until its exec. That is inferred: the test
+    /// passed alone before this wait.
+    fn acquire_once_released(runtime: &Path, directory: &Path, exclusive: bool) -> Protection {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            match acquire(runtime, directory, exclusive) {
+                Ok(protection) => return protection,
+                Err(error)
+                    if error.kind() == io::ErrorKind::WouldBlock
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10))
+                }
+                Err(error) => panic!("could not protect {}: {error}", directory.display()),
+            }
+        }
+    }
+
     fn fixture_directory() -> tempfile::TempDir {
         // Positive fixtures need physical paths even when TMPDIR names a symlink.
         // Keep the TempDir guard; the lease API still rejects symlink components.
@@ -1437,8 +1456,8 @@ mod tests {
         assert!(acquire(runtime.path(), &moved, true).is_err());
         child.stdin.take().unwrap().write_all(b"retire\n").unwrap();
         assert!(child.wait().unwrap().success());
-        assert!(acquire(runtime.path(), &directory, true).is_ok());
-        assert!(acquire(runtime.path(), &moved, true).is_ok());
+        acquire_once_released(runtime.path(), &directory, true);
+        acquire_once_released(runtime.path(), &moved, true);
     }
 
     #[test]

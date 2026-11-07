@@ -15,7 +15,7 @@ const MODE: &str = "CAGENTS_CLAUDE_HOLDER_TEST";
 pub(super) fn retained_helper_executable() -> std::path::PathBuf {
     let executable = std::path::PathBuf::from(
         std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
-            .expect("real retained-actor fixtures require the same-head cagentsd executable"),
+            .expect("CAGENTS_TEST_RETAINED_ACTOR_HELPER must name this head's cagentsd; see the host test lane in docs/development.md"),
     );
     assert!(
         executable.is_absolute(),
