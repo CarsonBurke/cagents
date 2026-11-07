@@ -430,6 +430,8 @@ where
                                         monitor
                                             .or(event_loop.primary_monitor()),
                                         self.id.clone(),
+                                        #[cfg(target_os = "linux")]
+                                        winit::platform::wayland::ActiveEventLoopExtWayland::is_wayland(event_loop),
                                     )
                                     .with_visible(false);
 
@@ -440,9 +442,7 @@ where
                                         .with_canvas(self.canvas.take())
                                 };
 
-                                log::info!(
-                                    "Window attributes for id `{id:#?}`: {window_attributes:#?}"
-                                );
+                                log::info!("Creating window {id:?}");
 
                                 // On macOS, the `position` in `WindowAttributes` represents the "inner"
                                 // position of the window; while on other platforms it's the "outer" position.

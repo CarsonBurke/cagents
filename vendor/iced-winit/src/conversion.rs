@@ -55,6 +55,7 @@ pub fn window_attributes(
     scale_factor: f64,
     primary_monitor: Option<winit::monitor::MonitorHandle>,
     _id: Option<String>,
+    #[cfg(target_os = "linux")] is_wayland: bool,
 ) -> winit::window::WindowAttributes {
     let mut attributes = winit::window::WindowAttributes::default();
 
@@ -188,42 +189,55 @@ pub fn window_attributes(
 
     #[cfg(target_os = "linux")]
     {
+        attributes = linux_window_attributes(
+            attributes,
+            &settings.platform_specific,
+            is_wayland,
+            take_activation_token,
+        );
+    }
+
+    attributes
+}
+
+#[cfg(target_os = "linux")]
+fn linux_window_attributes(
+    attributes: winit::window::WindowAttributes,
+    settings: &window::settings::PlatformSpecific,
+    is_wayland: bool,
+    activation_token: impl FnOnce() -> Option<winit::window::ActivationToken>,
+) -> winit::window::WindowAttributes {
+    // Winit has one typed platform slot, so select the active backend before
+    // installing attributes. An X11 window must not consume the Wayland token.
+    if is_wayland {
+        use winit::platform::wayland::WindowAttributesWayland;
+
+        let mut wayland_attributes = WindowAttributesWayland::default()
+            .with_name(&settings.application_id, &settings.application_id);
+
+        if let Some(token) = activation_token() {
+            wayland_attributes =
+                wayland_attributes.with_activation_token(token);
+        }
+
+        attributes.with_platform_attributes(Box::new(wayland_attributes))
+    } else {
         #[cfg(feature = "x11")]
         {
             use winit::platform::x11::WindowAttributesX11;
 
-            attributes = attributes.with_platform_attributes(Box::new(
+            attributes.with_platform_attributes(Box::new(
                 WindowAttributesX11::default()
-                    .with_override_redirect(
-                        settings.platform_specific.override_redirect,
-                    )
+                    .with_override_redirect(settings.override_redirect)
                     .with_name(
-                        &settings.platform_specific.application_id,
-                        &settings.platform_specific.application_id,
+                        &settings.application_id,
+                        &settings.application_id,
                     ),
-            ));
+            ))
         }
-        #[cfg(target_os = "linux")]
-        {
-            use winit::platform::wayland::WindowAttributesWayland;
-
-            let mut wayland_attributes = WindowAttributesWayland::default()
-                .with_name(
-                    &settings.platform_specific.application_id,
-                    &settings.platform_specific.application_id,
-                );
-
-            if let Some(token) = take_activation_token() {
-                wayland_attributes =
-                    wayland_attributes.with_activation_token(token);
-            }
-
-            attributes = attributes
-                .with_platform_attributes(Box::new(wayland_attributes));
-        }
+        #[cfg(not(feature = "x11"))]
+        attributes
     }
-
-    attributes
 }
 
 /// Converts a winit window event into an iced event.
@@ -1672,6 +1686,109 @@ pub(crate) fn a11y(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(all(target_os = "linux", feature = "x11"))]
+    mod linux {
+        use std::cell::Cell;
+
+        use winit::platform::wayland::WindowAttributesWayland;
+        use winit::platform::x11::WindowAttributesX11;
+        use winit::window::{ActivationToken, WindowAttributes, WindowButtons};
+
+        fn common_attributes() -> WindowAttributes {
+            WindowAttributes::default()
+                .with_title("Owned Linux window fixture")
+                .with_surface_size(winit::dpi::LogicalSize::new(913.0, 527.0))
+                .with_min_surface_size(winit::dpi::LogicalSize::new(
+                    320.0, 240.0,
+                ))
+                .with_max_surface_size(winit::dpi::LogicalSize::new(
+                    1920.0, 1080.0,
+                ))
+                .with_position(winit::dpi::PhysicalPosition::new(21, 34))
+                .with_resizable(false)
+                .with_enabled_buttons(WindowButtons::CLOSE)
+                .with_decorations(false)
+                .with_transparent(true)
+                .with_blur(true)
+                .with_maximized(true)
+                .with_window_level(winit::window::WindowLevel::AlwaysOnTop)
+                .with_visible(false)
+        }
+
+        #[test]
+        fn x11_keeps_identity_and_override_redirect_without_consuming_a_token()
+        {
+            let common = common_attributes();
+            let settings = crate::core::window::settings::PlatformSpecific {
+                application_id: "dev.cagents.OwnedX11Fixture".into(),
+                override_redirect: true,
+                ..Default::default()
+            };
+            let calls = Cell::new(0);
+            let mut attributes = super::super::linux_window_attributes(
+                common.clone(),
+                &settings,
+                false,
+                || {
+                    calls.set(calls.get() + 1);
+                    Some(ActivationToken::from_raw(
+                        "unused-fixture-token".into(),
+                    ))
+                },
+            );
+            assert_eq!(calls.get(), 0);
+            let platform = attributes.platform.take().expect("X11 attributes");
+            assert!(platform.cast_ref::<WindowAttributesWayland>().is_none());
+            let x11 = platform
+                .cast_ref::<WindowAttributesX11>()
+                .expect("the X11 backend can consume the selected attributes");
+            let expected = WindowAttributesX11::default()
+                .with_name(&settings.application_id, &settings.application_id)
+                .with_override_redirect(true);
+            // Payload fields are private to winit-x11 at this pinned revision.
+            assert_eq!(format!("{x11:?}"), format!("{expected:?}"));
+            assert_eq!(format!("{attributes:?}"), format!("{common:?}"));
+        }
+
+        #[test]
+        fn wayland_keeps_identity_and_its_supplied_activation_token() {
+            let common = common_attributes();
+            let settings = crate::core::window::settings::PlatformSpecific {
+                application_id: "dev.cagents.OwnedWaylandFixture".into(),
+                override_redirect: true,
+                ..Default::default()
+            };
+            let calls = Cell::new(0);
+            let mut attributes = super::super::linux_window_attributes(
+                common.clone(),
+                &settings,
+                true,
+                || {
+                    calls.set(calls.get() + 1);
+                    Some(ActivationToken::from_raw(
+                        "owned-fixture-token".into(),
+                    ))
+                },
+            );
+            assert_eq!(calls.get(), 1);
+            let platform =
+                attributes.platform.take().expect("Wayland attributes");
+            assert!(platform.cast_ref::<WindowAttributesX11>().is_none());
+            let wayland =
+                platform.cast_ref::<WindowAttributesWayland>().expect(
+                    "the Wayland backend can consume the selected attributes",
+                );
+            let expected = WindowAttributesWayland::default()
+                .with_name(&settings.application_id, &settings.application_id)
+                .with_activation_token(ActivationToken::from_raw(
+                    "owned-fixture-token".into(),
+                ));
+            // Payload fields are private to winit-wayland at this pinned revision.
+            assert_eq!(format!("{wayland:?}"), format!("{expected:?}"));
+            assert_eq!(format!("{attributes:?}"), format!("{common:?}"));
+        }
+    }
+
     #[test]
     fn window_icon_uses_the_backend_rgba_provider_without_changing_pixels() {
         // X11 (and other native backends) downcast the provider to RgbaIcon;
