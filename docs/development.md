@@ -707,16 +707,34 @@ It never touches:
 
 What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
-The build script that stamps `--version` reruns only when the stamp could
-change, because each rerun recompiles `cagents`. It watches this checkout's
-`HEAD` and `HEAD` reflog. While the checkout is clean it also watches the
-compiled sources (`src`, `crates`, `vendor`, `assets`, `packaging`,
-`fixtures`, `tests/fixtures`, the manifest, lockfile, toolchain, Cargo
-configuration and build script), and while it is dirty, the index, which
-restoring or stashing rewrites. It reads `git status` without refreshing the
-index, and it does not watch the shared `packed-refs`, which pruning or
-deleting any branch rewrites. An edit outside those sources, or undoing an edit
-by hand, updates the `.dirty` suffix at the next rerun.
+Each executable states its version with `cagents::stamp_version!()`, invoked
+once as an item at its root; the library answers `cagents::version()` from
+that. The macro stamps from a constructor that runs before `main` and before
+the holders' own constructors, which serve in place of `main`.
+The stamp is read where the macro expands, so a new commit or a move to another
+build slot relinks the executables and leaves the library compiled. Never read
+`CAGENTS_BUILD_METADATA` or `CAGENTS_CHECKOUT_METADATA` in the library or in
+`build.rs`: Cargo would recompile the whole library for each new stamp. A
+process that never stamps, such as a unit test, reports
+`<version>+unstamped`.
+
+The gate works out the stamp for each Cargo command once it has a slot, here
+or for the build host, and passes it with `CAGENTS_BUILD_METADATA_SUPPLIED=1`,
+so `build.rs` leaves the checkout alone. A program a local `run` or `test`
+starts gets the caller's stamp back through a Cargo runner, unless Cargo
+already has a runner configured, so a bare Cargo it starts reads its own
+checkout. Gated and bare Cargo commands sharing one build directory, such as
+an editor's `cargo check` beside gated builds on the same host, rerun
+`build.rs` and recompile `cagents` each time they alternate. Without the gate, `build.rs` reads the checkout's
+Git state and reruns, recompiling `cagents`, only when the stamp could change.
+It watches this checkout's `HEAD` and `HEAD` reflog. While the checkout is
+clean it also watches the compiled sources (`src`, `crates`, `vendor`,
+`assets`, `packaging`, `fixtures`, `tests/fixtures`, the manifest, lockfile,
+toolchain, Cargo configuration and build script), and while it is dirty, the
+index, which restoring or stashing rewrites. It reads `git status` without
+refreshing the index, and it does not watch the shared `packed-refs`, which
+pruning or deleting any branch rewrites. An edit outside those sources, or
+undoing an edit by hand, updates the `.dirty` suffix at the next rerun.
 
 Worktrees that do share a build directory stay correct. Cargo makes path
 packages relocatable and compares source timestamps, so an older checkout can

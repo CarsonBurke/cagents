@@ -1,6 +1,6 @@
 fn command() -> clap::Command {
     clap::Command::new("cagentsd")
-        .version(cagents::VERSION)
+        .version(cagents::version())
         .about("Run the cagents terminal and conversation daemon. Prefer `cagents daemon start`.")
         .arg(
             clap::Arg::new("ceditor-notifications")
@@ -9,6 +9,8 @@ fn command() -> clap::Command {
                 .action(clap::ArgAction::SetTrue),
         )
 }
+
+cagents::stamp_version!();
 
 fn main() -> std::process::ExitCode {
     if let Some(result) = cagents::host::run_retained_actor_helper() {
@@ -58,7 +60,7 @@ fn main() -> std::process::ExitCode {
     // every user PTY leaves nothing to diagnose, and `RUST_LOG` is inert.
     cagents::instance::install_panic_hook("cagentsd");
     cagents::instance::install_tracing("cagentsd", "cagentsd=info,cagents=info,warn");
-    tracing::info!(version = cagents::VERSION, "starting cagentsd");
+    tracing::info!(version = cagents::version(), "starting cagentsd");
     match cagents::host::run(admission) {
         Ok(()) => {
             cagents::diagnostics::record(cagents::diagnostics::Event::Exit { success: true });

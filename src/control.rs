@@ -108,7 +108,7 @@ const MAX_WAIT_SECONDS: f64 = 24.0 * 60.0 * 60.0;
 #[derive(Debug, Parser)]
 #[command(
     name = "cagents",
-    version = crate::VERSION,
+    version = crate::version(),
     about = "Manage cagents agents, sessions, automations, projects, channels, terminals, messaging, Linear and accounts"
 )]
 pub struct Cli {
@@ -3267,7 +3267,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 "running": running,
                 "socket": socket,
                 "daemon_version": daemon_version,
-                "cli_version": crate::VERSION
+                "cli_version": crate::version()
             });
             let mut human = if running {
                 format!(
@@ -3275,10 +3275,14 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     instance::NAME,
                     daemon_version.as_deref().unwrap_or("starting"),
                     socket.display(),
-                    crate::VERSION
+                    crate::version()
                 )
             } else {
-                format!("{} daemon stopped; cli {}", instance::NAME, crate::VERSION)
+                format!(
+                    "{} daemon stopped; cli {}",
+                    instance::NAME,
+                    crate::version()
+                )
             };
             if let Some((attention, warning)) = upgrade_attention() {
                 data["upgrade_attention"] = attention;
