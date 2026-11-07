@@ -419,6 +419,19 @@ class Evidence(unittest.TestCase):
         self.assertIn("refusing to build", result.stderr)
         self.assertFalse((self.logs / "cargo").exists())
 
+    def test_a_build_on_another_host_leaves_this_disk_to_the_gate(self) -> None:
+        # Only its executables come back here, so a full disk here is no
+        # reason to refuse it; the build host's own runs guard its disk.
+        checkout = self.checkout()
+        started = time.monotonic()
+        result = self.run_tool("build", "after", str(checkout), check=False, extra={
+            "CAGENTS_BUILD_REMOTE": "build-host.invalid",
+            "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+            "CAGENTS_BUILD_FREE_FLOOR_GIB": "999999999", "CAGENTS_BUILD_PRUNE": "true"})
+        self.assertNotIn("refusing to build", result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 60)
+
     def test_its_builds_and_sessions_keep_their_target_from_the_pruner(self) -> None:
         self.built()
         target = self.task / "target-after"

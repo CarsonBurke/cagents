@@ -765,7 +765,7 @@ It recognizes build output by Cargo's own markers, not by name or place: a root 
 
 - nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees, or 12 hours for a native-evidence task's, 1 hour while running low;
 - every Cargo lock in it is free;
-- no process has its working directory, an open file, its executable or a mapping inside it.
+- no process has its working directory, an open file, its executable or a mapping inside it, and, for a native-evidence task's, no `native-evidence` process names the task with `--task`, as its session does from before it waits for the native lock.
 
 Under those locks it renames the directory aside, so a build that starts afterwards begins with an empty directory rather than a partly removed one. Still holding them, it puts the renamed copy back if a process opened it meanwhile, such as a build waiting for one of those locks; afterwards, if anything wrote to it. A directory holding a `.git` or `Cargo.toml` is a checkout and never counts as build output. A gated build marks its build directory as used before it waits for a slot, so another build's pruner doesn't take it meanwhile.
 
@@ -1210,13 +1210,15 @@ harness, it provides:
   `target-before` and `target-after` once the task has gone unused for 12
   hours, or 1 hour while the disk is low. `build`, `start` and the end of a
   session each count as use of both sides, and it never removes a target that
-  a build or session has open or whose executables are running. A side whose
+  a build or session has open or whose executables are running, nor either
+  side while any `native-evidence` process names the task, including a session
+  still waiting for the native lock. A side whose
   target went says so; build it again, which in a shared slot recompiles only
   what changed since that slot's last build. Screenshots, logs and the fixture
   stay. Tasks outside the pruner's roots, `~/.cache`, `~/.local/state` and
-  `/var/tmp`, are not searched. `build` also runs `scripts/build-disk-guard`,
-  as a gated build on this host does, so it starts the pruner on its schedule
-  and is refused when the disk is below its floor.
+  `/var/tmp`, are not searched. When it compiles on this host, `build` also
+  runs `scripts/build-disk-guard`, as a gated build here does, so it starts
+  the pruner on its schedule and is refused when the disk is below its floor.
 
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
 that authority, so a hosted agent shell cannot use it. Remove the task directory

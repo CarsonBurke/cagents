@@ -205,16 +205,33 @@ cmd_build() {
     [ ! -e "${zig%/*}/cargo" ] ||
         die "$zig has a cargo beside it, which a session would run while holding the native lock; set CAGENTS_ZIG to a Zig installed apart from Cargo"
     cargo_path=$(cd -- "$checkout" && rustup which cargo)
+    # The other side stays in use while this one builds, even if the guard
+    # below starts the pruner.
+    mark_used
     # Builds in shared slots skip the gate's disk guard, which starts the
     # pruner on its schedule and refuses a build when the disk is too full.
-    # The slots share this host's disk, so run it here.
-    (cd -- "$checkout" && "$tool_root/scripts/build-disk-guard" "$target") || exit
+    # When the slots are this host's, they share its disk, so run it here; a
+    # build on another host brings back only its executables.
+    if builds_here; then
+        (cd -- "$checkout" && "$tool_root/scripts/build-disk-guard" "$target") || exit
+    fi
     # Each of the three builds goes through the gate's `cargo`, into one slot
     # it holds for all three: on the build host, or with
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
     # builds alone can use it.
     (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
         __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+}
+
+# Whether this build compiles on this host: in its own slots, reached by
+# loopback, or in place. `cargo-offload --host` decides without waiting.
+builds_here() {
+    local where status=0
+    [ -x "$tool_root/scripts/cargo-offload" ] || return 0
+    where=$("$tool_root/scripts/cargo-offload" --host 2>/dev/null) || status=$?
+    [ "$status" -eq 75 ] && return 0
+    [ "$status" -eq 0 ] && case $where in *"$(printf '\t')loopback") return 0 ;; esac
+    return 1
 }
 
 # Marks both sides' targets as just used, so the pruner leaves them for its
