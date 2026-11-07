@@ -6,7 +6,7 @@ use crate::{
     model::{BootId, HostIncarnation, HostSessionId},
     terminal::ipc::{
         ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
-        ServerResponse, TerminalDescriptor, read_frame, write_frame,
+        ServerResponse, StartupState, TerminalDescriptor, read_frame, write_frame,
     },
     terminal_ipc::TerminalVisibility,
 };
@@ -1761,4 +1761,156 @@ fn a_hibernated_terminal_is_an_owner_the_gate_fences_on() {
         window.app.startup_connected_owners(),
         vec![(card, replacement_proof())]
     );
+}
+
+/// The fence on the daemon's answer: a terminal attached under a daemon that
+/// has since been replaced must not be vouched for by the new one, though it
+/// is hibernated and so shows a detached snapshot.
+#[test]
+fn a_ready_answer_under_another_proof_does_not_vouch_for_a_hibernated_terminal() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_window(false);
+    let card = window.cached.id;
+    admit(&mut window);
+    run_gate(&mut window, directory.path(), false);
+    assert_hibernated_attachment(&window.app, card);
+    assert_eq!(window.app.startup_pane_check(), Ok(true));
+
+    let mut later = replacement_proof();
+    later.host_session_id = HostSessionId::new("later-host");
+    later.host_incarnation = HostIncarnation::new("later-incarnation");
+    let answer = |window: &mut Window, proof| {
+        window.app.startup_gate.fixture_ask_again();
+        drop(window.app.update(Message::VerifyStartupPanes));
+        drop(
+            window
+                .app
+                .fixture_answer_startup_under(proof, StartupState::Ready),
+        );
+        let (accepted, _, _) = window.app.startup_gate.fixture_verdict();
+        drop(window.app.update(Message::VerifyStartupPanes));
+        let (_, saving, reported) = window.app.startup_gate.fixture_verdict();
+        (accepted, saving, reported)
+    };
+    assert_eq!(
+        answer(&mut window, later),
+        (false, false, false),
+        "the answer of a daemon this terminal is not attached under is fenced out"
+    );
+    assert_eq!(
+        answer(&mut window, replacement_proof()),
+        (true, true, false),
+        "the terminal's own daemon does vouch for it"
+    );
+}
+
+/// A reported pane held for a registry that has not answered, as the notice
+/// about it describes.
+fn reported_held_terminal(window: &mut Window) -> CardId {
+    let card = window.cached.id;
+    let source = session(&window.cached);
+    window.app.startup_gate = crate::app::startup_gate::State::fixture_reported();
+    window.app.startup_attach_failed(
+        card,
+        source.id,
+        "the shared workspace has not answered".into(),
+    );
+    assert!(window.app.startup_pane_held(card));
+    assert!(window.app.startup_terminal_gave_up(card));
+    assert_eq!(
+        window.app.startup_gave_up_title(card),
+        "Waiting for the shared workspace"
+    );
+    let caption = window.app.startup_gave_up_caption(card);
+    assert!(
+        caption.starts_with("This terminal reconnects here once the shared workspace is ready."),
+        "{caption}"
+    );
+    card
+}
+
+/// What a lifecycle sweep does once the cached pane's tab is on screen.
+fn show_cached(window: &mut Window) {
+    let visible = HashSet::from([window.cached.id]);
+    drop(
+        window
+            .app
+            .reconcile_lifecycle(&visible, &HashSet::new(), &HashSet::new()),
+    );
+}
+
+/// The notice says a held terminal reconnects when opened once the workspace
+/// answers, and needs nothing else from the reader.
+#[test]
+fn a_reported_held_terminal_reconnects_when_opened_after_the_registry_answers() {
+    let mut window = reopened_window(false);
+    let card = reported_held_terminal(&mut window);
+    admit(&mut window);
+    assert!(!window.app.startup_pane_held(card));
+    assert!(
+        !window.app.terminal_start_in_flight(card),
+        "an unopened pane waits to be opened once the gate has reported"
+    );
+    show_cached(&mut window);
+    assert!(window.app.terminal_start_in_flight(card));
+    assert!(!window.app.startup_terminal_gave_up(card));
+}
+
+/// The caption an opened held terminal shows: it stays held while the registry
+/// is silent, and reconnects where it is when the registry answers.
+#[test]
+fn an_opened_held_terminal_reconnects_when_the_registry_answers() {
+    let mut window = reopened_window(false);
+    let card = reported_held_terminal(&mut window);
+    show_cached(&mut window);
+    assert!(
+        !window.app.terminal_start_in_flight(card),
+        "still held while the registry is silent"
+    );
+    assert!(window.app.startup_pane_held(card));
+    admit(&mut window);
+    show_cached(&mut window);
+    assert!(window.app.terminal_start_in_flight(card));
+    let directory = tempfile::tempdir().unwrap();
+    let source = session(&window.cached);
+    drop(window.app.update(Message::RestoredAgentAttached {
+        card,
+        terminal: source.id,
+        result: Ok(Some(attached(directory.path(), &source))),
+    }));
+    assert!(!window.app.startup_terminal_gave_up(card));
+    assert_eq!(window.app.startup_terminal_latest(card), None);
+}
+
+/// A view held for a managed agent, with every pane connected, names no pane.
+/// The report's promise is that this needs nothing and clears by itself.
+#[test]
+fn a_view_held_for_a_managed_agent_says_it_catches_up_and_does() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_window(false);
+    admit(&mut window);
+    run_gate(&mut window, directory.path(), false);
+    assert_eq!(window.app.startup_pane_check(), Ok(true));
+
+    window
+        .app
+        .shared_views
+        .blocked
+        .insert(Scope::Channel(window.hidden));
+    drop(window.app.update(Message::VerifyStartupPanes));
+    window.app.startup_gate.expire_views_unready();
+    let report = window.app.startup_pane_check().unwrap_err();
+    assert!(
+        report.contains("its view holds a managed agent this window may not show yet"),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "Its saved panes are connected, and nothing is needed from you now; the workspace catches up on its own once it is ready."
+        ),
+        "{report}"
+    );
+
+    admit(&mut window);
+    assert_eq!(window.app.startup_pane_check(), Ok(true));
 }

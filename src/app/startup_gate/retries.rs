@@ -204,6 +204,25 @@ impl Cagents {
             && self.startup_gate.retries.latest(card).is_some()
     }
 
+    /// The tab and pane title of a terminal that gave up: one held for the
+    /// registry is still waiting, where any other needs something done.
+    pub(in crate::app) fn startup_gave_up_title(&self, card: CardId) -> &'static str {
+        if self.startup_pane_held(card) {
+            "Waiting for the shared workspace"
+        } else {
+            "Reconnect unavailable"
+        }
+    }
+
+    pub(in crate::app) fn startup_gave_up_caption(&self, card: CardId) -> String {
+        let reason = self.startup_terminal_latest(card);
+        if self.startup_pane_held(card) {
+            super::held_terminal_caption(reason)
+        } else {
+            super::unavailable_terminal_caption(reason)
+        }
+    }
+
     /// The latest reason `card` is not settled, if one is known.
     pub(in crate::app) fn startup_terminal_latest(&self, card: CardId) -> Option<&str> {
         self.startup_gate.retries.latest(card)

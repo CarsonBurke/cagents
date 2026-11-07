@@ -1350,12 +1350,45 @@ fn a_report_tells_held_panes_from_failed_ones() {
         "{report}"
     );
     assert!(
-        report.contains("1 saved pane is waiting for the shared workspace: \u{201c}Held\u{201d}."),
+        report.contains(
+            "1 saved pane is waiting for the shared workspace: \u{201c}Held\u{201d}. Nothing is needed from you now; once the workspace is ready, it reconnects when you open it."
+        ),
         "{report}"
     );
 
     let held = app.startup_incomplete(&cards[1..], &[], None);
-    assert!(!held.contains("Open"), "{held}");
+    assert!(!held.contains("retry"), "{held}");
+}
+
+/// A report that runs out of time still says what a held pane waits for, and
+/// keeps the pane with an attempt under way apart from it.
+#[test]
+fn a_budget_report_gives_held_panes_their_next_step() {
+    let (mut app, cards) = waiting(2);
+    card_with_title(&mut app, cards[0], "Attaching");
+    card_with_title(&mut app, cards[1], "Held");
+    app.workspace_model.identity = crate::workspace_model::NO_REGISTRY.to_owned();
+    app.shared_views.attached.extend(cards.iter().copied());
+    app.begin_terminal_start(cards[0]);
+    assert!(!app.startup_pane_held(cards[0]));
+    assert!(app.startup_pane_held(cards[1]));
+
+    let pending = app.startup_pending().unwrap().unwrap();
+    let report = app.reconnecting_reason(&pending);
+    assert!(
+        report.contains("1 saved pane did not reconnect in time: \u{201c}Attaching\u{201d}."),
+        "{report}"
+    );
+    assert!(
+        report.contains(
+            "1 saved pane is waiting for the shared workspace: \u{201c}Held\u{201d}. Nothing is needed from you now; once the workspace is ready, it reconnects when you open it."
+        ),
+        "{report}"
+    );
+    assert!(
+        report.contains("The update has not been verified."),
+        "{report}"
+    );
 }
 
 /// A shared chat the registry has not admitted opens to its saved draft, with
@@ -1373,10 +1406,12 @@ fn a_chat_awaiting_admission_is_held() {
     assert!(app.startup_pane_held(chat));
     let report = app.startup_incomplete(&[chat], &[], None);
     assert!(
-        report.contains("waiting for the shared workspace"),
+        report.contains(
+            "It reopens on its own once the workspace is ready; until then, opening it shows any unsent text."
+        ),
         "{report}"
     );
-    assert!(!report.contains("Open"), "{report}");
+    assert!(!report.contains("retry"), "{report}");
 }
 
 /// Past its limit the launcher closes the window, so a report at its longest

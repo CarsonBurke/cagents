@@ -156,6 +156,20 @@ impl State {
         }
     }
 
+    /// Whether the gate accepted a daemon answer, is saving, and has reported.
+    #[cfg(test)]
+    pub(in crate::app) fn fixture_verdict(&self) -> (bool, bool, bool) {
+        (self.daemon.is_some(), self.saving, self.reported)
+    }
+
+    /// Lets the next check ask the daemon again, as one whose request has been
+    /// answered and whose interval has passed.
+    #[cfg(test)]
+    pub(in crate::app) fn fixture_ask_again(&mut self) {
+        self.inspected = None;
+        self.outstanding = None;
+    }
+
     #[cfg(test)]
     pub(super) fn fixture_opened() -> Self {
         Self {
@@ -381,8 +395,8 @@ impl Cagents {
     }
 
     /// What is true of each kind of unsettled pane, since opening one does
-    /// different things: a failed pane offers a retry, a held one only says
-    /// what it waits for, and an out-of-step one is already working.
+    /// different things: a failed pane offers a retry, a held one says what it
+    /// waits for, and an out-of-step one is already working.
     fn startup_unsettled_sentences(&self, failures: &[CardId], out_of_step: &[CardId]) -> String {
         let (held, failed): (Vec<_>, Vec<_>) = failures
             .iter()
@@ -397,14 +411,7 @@ impl Cagents {
                 self.startup_pane_names(&failed),
             ));
         }
-        if !held.is_empty() {
-            let verb = if held.len() == 1 { "is" } else { "are" };
-            sentences.push(format!(
-                "{} {verb} waiting for the shared workspace: {}.",
-                saved_panes(held.len()),
-                self.startup_pane_names(&held),
-            ));
-        }
+        sentences.extend(self.startup_held_sentences(&held));
         if !out_of_step.is_empty() {
             let them = pronoun(out_of_step.len());
             sentences.push(format!(
@@ -416,12 +423,71 @@ impl Cagents {
         sentences.join(" ")
     }
 
-    /// Whether opening `card` would only show what it waits for: a shared chat
-    /// the registry has not admitted, or a terminal whose start is held for it.
-    fn startup_pane_held(&self, card: CardId) -> bool {
+    /// What held panes wait for and what happens when it comes. Nothing is
+    /// asked of the reader: projecting a view admits its chats whether or not
+    /// they are open, and releases its terminals to attach once opened.
+    fn startup_held_sentences(&self, held: &[CardId]) -> Vec<String> {
+        let (chats, terminals): (Vec<_>, Vec<_>) = held
+            .iter()
+            .copied()
+            .partition(|card| self.chat_awaiting_admission(*card));
+        let mut sentences = Vec::new();
+        if !terminals.is_empty() {
+            let reconnects = match terminals.len() {
+                1 => "it reconnects when you open it",
+                _ => "each reconnects when you open it",
+            };
+            sentences.push(format!(
+                "{} {} waiting for the shared workspace: {}. Nothing is needed from you now; once the workspace is ready, {reconnects}.",
+                saved_panes(terminals.len()),
+                is_or_are(terminals.len()),
+                self.startup_pane_names(&terminals),
+            ));
+        }
+        if !chats.is_empty() {
+            let (reopens, them) = match chats.len() {
+                1 => ("It reopens on its own", "it"),
+                _ => ("They reopen on their own", "them"),
+            };
+            sentences.push(format!(
+                "{} {} waiting for the shared workspace: {}. {reopens} once the workspace is ready; until then, opening {them} shows any unsent text.",
+                saved_panes(chats.len()),
+                is_or_are(chats.len()),
+                self.startup_pane_names(&chats),
+            ));
+        }
+        sentences
+    }
+
+    /// Whether `card` is only waiting for the registry: a shared chat it has
+    /// not admitted, or a terminal whose start is held for it with no attempt
+    /// under way.
+    pub(in crate::app) fn startup_pane_held(&self, card: CardId) -> bool {
         self.chat_awaiting_admission(card)
             || (matches!(self.cards.get(&card), Some(CardRuntime::Loading) | None)
+                && !self.terminal_start_in_flight(card)
+                && !self.terminal_retry_pending(card)
                 && self.terminal_start_held(card, false))
+    }
+
+    /// The panes still waiting when the time ran out: `lapsed` for those with
+    /// something under way, and what a held pane waits for otherwise.
+    fn startup_waiting_sentences(&self, panes: &[CardId], lapsed: String) -> String {
+        let (held, attempting): (Vec<_>, Vec<_>) = panes
+            .iter()
+            .copied()
+            .partition(|card| self.startup_pane_held(*card));
+        let mut sentences = Vec::new();
+        if !attempting.is_empty() {
+            sentences.push(format!(
+                "{} {lapsed}: {}. {}.",
+                saved_panes(attempting.len()),
+                self.startup_pane_names(&attempting),
+                they_stay(attempting.len()),
+            ));
+        }
+        sentences.extend(self.startup_held_sentences(&held));
+        sentences.join(" ")
     }
 
     /// Why the gate was still waiting when its time ran out, as a report's
@@ -789,12 +855,9 @@ impl Cagents {
                 "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available.{settled} The update has not been verified.{detail}"
             );
         }
-        format!(
-            "recovery-incomplete: {} did not reconnect in time: {}. {}.{settled} The update has not been verified.{detail}",
-            saved_panes(pending.panes.len()),
-            self.startup_pane_names(&pending.panes),
-            they_stay(pending.panes.len()),
-        )
+        let waiting =
+            self.startup_waiting_sentences(&pending.panes, "did not reconnect in time".into());
+        format!("recovery-incomplete: {waiting}{settled} The update has not been verified.{detail}")
     }
 
     fn stalled_reason(&self, pending: &Pending) -> String {
@@ -806,13 +869,14 @@ impl Cagents {
                 NO_PROGRESS.as_secs()
             );
         }
-        format!(
-            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. {}.{settled} The update has not been verified.{detail}",
-            saved_panes(pending.panes.len()),
-            NO_PROGRESS.as_secs(),
-            self.startup_pane_names(&pending.panes),
-            they_stay(pending.panes.len()),
-        )
+        let waiting = self.startup_waiting_sentences(
+            &pending.panes,
+            format!(
+                "made no progress reconnecting for {} seconds",
+                NO_PROGRESS.as_secs()
+            ),
+        );
+        format!("recovery-incomplete: {waiting}{settled} The update has not been verified.{detail}")
     }
 
     fn retire_stale_observation(&mut self, pending: Option<&Pending>) {
@@ -1103,7 +1167,7 @@ fn terminal_surface_ready(
 /// The report for a view this window shows that was never admitted.
 fn views_incomplete(hold: &str) -> String {
     format!(
-        "recovery-incomplete: this window's shared workspace did not finish restoring: {hold}. This window stays available."
+        "recovery-incomplete: this window's shared workspace did not finish restoring: {hold}. Its saved panes are connected, and nothing is needed from you now; the workspace catches up on its own once it is ready. This window stays available."
     )
 }
 
@@ -1128,16 +1192,32 @@ fn launcher_budget(count: usize) -> Duration {
 /// window's decision, so it says so instead of offering either.
 pub(super) fn unavailable_terminal_caption(reason: Option<&str>) -> String {
     match reason {
-        Some(reason) => {
-            let reason = reason.trim_end_matches('.');
-            let mut letters = reason.chars();
-            let reason = letters.next().map_or(String::new(), |first| {
-                first.to_uppercase().chain(letters).collect()
-            });
-            format!("This terminal could not reconnect. {reason}. Nothing was closed or restarted.")
-        }
+        Some(reason) => format!(
+            "This terminal could not reconnect. {}. Nothing was closed or restarted.",
+            reason_sentence(reason)
+        ),
         None => "This terminal could not reconnect. Nothing was closed or restarted. The notice in this window has the details.".to_owned(),
     }
+}
+
+/// What an opened terminal shows while its start is held for the registry.
+/// Opening it is all that was needed, so releasing it attaches it here.
+pub(super) fn held_terminal_caption(reason: Option<&str>) -> String {
+    match reason {
+        Some(reason) => format!(
+            "This terminal reconnects here once the shared workspace is ready. {}. Nothing was closed or restarted.",
+            reason_sentence(reason)
+        ),
+        None => "This terminal reconnects here once the shared workspace is ready. Nothing was closed or restarted.".to_owned(),
+    }
+}
+
+fn reason_sentence(reason: &str) -> String {
+    let reason = reason.trim_end_matches('.');
+    let mut letters = reason.chars();
+    letters.next().map_or(String::new(), |first| {
+        first.to_uppercase().chain(letters).collect()
+    })
 }
 
 /// What this window shows for `reason`. The handshake prefix tells the
@@ -1254,6 +1334,13 @@ fn they_stay(count: usize) -> &'static str {
     }
 }
 
+fn is_or_are(count: usize) -> &'static str {
+    match count {
+        1 => "is",
+        _ => "are",
+    }
+}
+
 fn pronoun(count: usize) -> &'static str {
     match count {
         1 => "it",
@@ -1314,5 +1401,31 @@ fn report(result: Result<(), String>) -> Task<Message> {
 
 #[cfg(test)]
 mod attachment_tests;
+#[cfg(test)]
+impl Cagents {
+    /// Completes the inspection the gate reserved, with the daemon answering
+    /// `state` under `proof`.
+    pub(in crate::app) fn fixture_answer_startup_under(
+        &mut self,
+        proof: crate::model::HostSessionProof,
+        state: StartupState,
+    ) -> Task<Message> {
+        let context = self
+            .startup_gate
+            .inspecting
+            .clone()
+            .expect("the gate reserved no inspection");
+        let socket = self.startup_gate.fixture_endpoint.clone().unwrap();
+        self.startup_state_inspected(Inspection {
+            context,
+            outcome: Ok(Observation {
+                socket,
+                proof,
+                state,
+            }),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests;

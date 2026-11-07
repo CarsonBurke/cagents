@@ -10479,10 +10479,8 @@ impl Cagents {
                 widget::container(
                     widget::container(
                         widget::column::with_children(vec![
-                            design::title("Reconnect unavailable").into(),
-                            design::caption(startup_gate::unavailable_terminal_caption(
-                                self.startup_terminal_latest(id),
-                            ))
+                            design::title(self.startup_gave_up_title(id)).into(),
+                            design::caption(self.startup_gave_up_caption(id))
                             .wrapping(cosmic::iced::widget::text::Wrapping::Word)
                             .into(),
                         ])
