@@ -648,9 +648,10 @@ struct Codex {
 #[derive(Default)]
 struct TurnDiff {
     diff: String,
-    /// The changed lines each completed file-change item of the turn gave
-    /// each file, by absolute path, as `+line` or `-line`.
-    edited: BTreeMap<String, Vec<String>>,
+    /// Each completed file-change item of the turn, by its ID, with the
+    /// lines it changed in each file, by absolute path, as `+line` or
+    /// `-line`. An item reported again replaces itself.
+    edited: BTreeMap<String, Vec<(String, Vec<String>)>>,
     shown: bool,
 }
 
@@ -695,6 +696,9 @@ impl Codex {
         if value["type"] != "fileChange" || value["status"] != "completed" {
             return;
         }
+        let Some(item) = value["id"].as_str() else {
+            return;
+        };
         let mut noted = Vec::new();
         for change in value["changes"].as_array().into_iter().flatten() {
             let lines = changed_lines(
@@ -703,17 +707,14 @@ impl Codex {
             );
             for path in [&change["path"], &change["kind"]["move_path"]] {
                 if let Some(path) = path.as_str() {
-                    noted.push((self.cwd.join(path), lines.clone()));
+                    noted.push((
+                        self.cwd.join(path).to_string_lossy().into_owned(),
+                        lines.clone(),
+                    ));
                 }
             }
         }
-        let diff = self.turn_diff(turn);
-        for (path, lines) in noted {
-            diff.edited
-                .entry(path.to_string_lossy().into_owned())
-                .or_default()
-                .extend(lines);
-        }
+        self.turn_diff(turn).edited.insert(item.into(), noted);
         self.show_turn_diff(turn, step);
     }
 
@@ -721,11 +722,7 @@ impl Codex {
     /// items made, such as a file a shell command rewrote, as one change row
     /// for the turn, or retract that row once items account for all of them.
     fn show_turn_diff(&mut self, turn: &str, step: &mut Step) {
-        if !self
-            .turn_diffs
-            .get(turn)
-            .is_some_and(|state| !state.diff.is_empty())
-        {
+        if !self.turn_diffs.contains_key(turn) {
             return;
         }
         let root = self
@@ -754,14 +751,17 @@ impl Codex {
                 if let ChangeKind::Renamed { from } = &change.kind {
                     paths.push(from);
                 }
-                let edits = paths
-                    .iter()
-                    .filter_map(|path| state.edited.get(*path))
+                let edits = state
+                    .edited
+                    .values()
                     .flatten()
+                    .filter(|(path, _)| paths.contains(&path.as_str()))
+                    .flat_map(|(_, lines)| lines)
                     .collect::<Vec<_>>();
                 // Explained when the items edited the file and made every
                 // line of the turn's change to it, as often as it appears.
-                edits.is_empty() || {
+                // No item changes a file's mode, so a mode change is never.
+                edits.is_empty() || change.diff.starts_with("old mode ") || {
                     let mut made = BTreeMap::<&str, usize>::new();
                     for line in edits {
                         *made.entry(line).or_default() += 1;
@@ -3773,11 +3773,7 @@ fn changed_lines(diff: &str, kind: Option<&str>) -> Vec<String> {
     match hunks {
         Some(start) => diff[start..]
             .lines()
-            .filter(|line| {
-                (line.starts_with('+') || line.starts_with('-'))
-                    && !line.starts_with("+++ ")
-                    && !line.starts_with("--- ")
-            })
+            .filter(|line| line.starts_with('+') || line.starts_with('-'))
             .map(str::to_owned)
             .collect(),
         _ => {
@@ -3847,7 +3843,8 @@ fn turn_diff_changes(diff: &str) -> Vec<FileChange> {
             Some(FileChange {
                 path,
                 kind,
-                // A change with no hunks keeps what its header says of it.
+                // A change with no hunks keeps what its header says of it,
+                // and one with hunks any change of mode it also made.
                 diff: if body.is_empty() {
                     header
                         .lines()
@@ -3856,7 +3853,14 @@ fn turn_diff_changes(diff: &str) -> Vec<FileChange> {
                         .map(|line| format!("{line}\n"))
                         .collect()
                 } else {
-                    body.into()
+                    header
+                        .lines()
+                        .filter(|line| {
+                            line.starts_with("old mode ") || line.starts_with("new mode ")
+                        })
+                        .map(|line| format!("{line}\n"))
+                        .chain(std::iter::once(body.to_owned()))
+                        .collect()
                 },
             })
         })
@@ -9272,6 +9276,49 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
             .receive(json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":diff}}))
             .unwrap();
         assert!(unchanged.events.is_empty());
+
+        // An item reported again counts once: a shell's second `-a/+b` in
+        // the same file stays shown when the patch is replayed.
+        let mut adapter = super::tests::adapter();
+        adapter
+            .receive(file_change(
+                "lib",
+                "/tmp/src/lib.rs",
+                "@@ -1 +1 @@\n-a\n+b\n",
+            ))
+            .unwrap();
+        let twice = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1,3 +1,3 @@\n-a\n+b\n c\n-a\n+b\n";
+        let diff_update = |diff: &str| json!({"method":"turn/diff/updated","params":{"threadId":"thread-exact","turnId":"turn","diff":diff}});
+        assert_eq!(
+            paths(&adapter.receive(diff_update(twice)).unwrap().events),
+            ["/tmp/src/lib.rs"]
+        );
+        let replayed = adapter
+            .receive(file_change(
+                "lib",
+                "/tmp/src/lib.rs",
+                "@@ -1 +1 @@\n-a\n+b\n",
+            ))
+            .unwrap();
+        assert_eq!(paths(&replayed.events[..1]), ["/tmp/src/lib.rs"]);
+        // A line whose text starts `++` is a change like any other.
+        let plus = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1,2 @@\n-a\n+b\n+++ note\n";
+        assert_eq!(
+            paths(&adapter.receive(diff_update(plus)).unwrap().events),
+            ["/tmp/src/lib.rs"]
+        );
+        // A mode change no item made stays, with the lines an item did make.
+        let mode = "diff --git a/src/lib.rs b/src/lib.rs\nold mode 100644\nnew mode 100755\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-a\n+b\n";
+        let moded = adapter.receive(diff_update(mode)).unwrap();
+        assert!(
+            matches!(&moded.events[..], [Event::Item(Item { content: ItemContent::Changes { changes, .. }, .. })]
+            if changes[0].diff == "old mode 100644\nnew mode 100755\n@@ -1 +1 @@\n-a\n+b\n")
+        );
+        // An empty diff retracts what an earlier one showed.
+        let empty = adapter.receive(diff_update("")).unwrap();
+        assert!(
+            matches!(&empty.events[..], [Event::ItemsRemoved { ids }] if ids == &["turn/diff"])
+        );
     }
 
     #[test]
