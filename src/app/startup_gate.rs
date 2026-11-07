@@ -46,6 +46,9 @@ pub(super) struct State {
     budget: Option<Duration>,
     saving: bool,
     reported: bool,
+    /// The daemon kept its original owners, so no pane reconnects until the
+    /// terminal service restarts.
+    retained: bool,
     /// Terminals the gate is waiting on without anything settling them.
     pub(super) retries: retries::Retries,
     /// Since when a view this window shows has not been admitted.
@@ -1033,6 +1036,7 @@ impl Cagents {
         };
         let reason = retained_reason(detail);
         let notice = TransientNotice::warning(RETAINED_NOTICE).with_details(bounded_detail(detail));
+        self.startup_gate.retained = true;
         self.report_startup_failure(reason, notice)
     }
 
@@ -1211,6 +1215,10 @@ pub(super) fn held_terminal_caption(reason: Option<&str>) -> String {
         None => "This terminal reconnects here once the shared workspace is ready. Nothing was closed or restarted.".to_owned(),
     }
 }
+
+/// What an opened terminal shows once the daemon has kept its original owners:
+/// waiting would not bring it back, so it points at the notice's steps.
+const RETAINED_TERMINAL_CAPTION: &str = "This terminal's process is still running, but it cannot reconnect until the terminal service restarts. Nothing was closed or restarted. The notice in this window has the steps.";
 
 fn reason_sentence(reason: &str) -> String {
     let reason = reason.trim_end_matches('.');

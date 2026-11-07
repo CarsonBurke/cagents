@@ -1914,3 +1914,42 @@ fn a_view_held_for_a_managed_agent_says_it_catches_up_and_does() {
     admit(&mut window);
     assert_eq!(window.app.startup_pane_check(), Ok(true));
 }
+
+/// A daemon that kept its original owners will not answer until it restarts,
+/// so a held terminal must not read as about to reconnect.
+#[test]
+fn a_held_terminal_under_a_retained_restore_does_not_promise_to_reconnect() {
+    let mut window = reopened_window(false);
+    let card = window.cached.id;
+    let source = session(&window.cached);
+    window.app.startup_gate.fixture_ask_again();
+    drop(window.app.update(Message::VerifyStartupPanes));
+    drop(window.app.fixture_answer_startup_under(
+        replacement_proof(),
+        StartupState::Retained {
+            detail: "retained".into(),
+        },
+    ));
+    let (_, _, reported) = window.app.startup_gate.fixture_verdict();
+    assert!(reported);
+    window.app.startup_attach_failed(
+        card,
+        source.id,
+        "the shared workspace has not answered".into(),
+    );
+    assert!(window.app.startup_terminal_gave_up(card));
+    assert!(window.app.startup_pane_held(card));
+    assert_eq!(
+        window.app.startup_gave_up_title(card),
+        "Reconnect unavailable"
+    );
+    let caption = window.app.startup_gave_up_caption(card);
+    assert!(
+        caption.contains("cannot reconnect until the terminal service restarts"),
+        "{caption}"
+    );
+    assert!(
+        !caption.contains("once the shared workspace is ready"),
+        "{caption}"
+    );
+}
