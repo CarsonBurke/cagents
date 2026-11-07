@@ -14983,6 +14983,13 @@ mod tests {
                     && account.launch_home().is_none()
                 {
                     expected.insert("CLAUDE_CONFIG_DIR".to_owned());
+                    assert!(
+                        !session
+                            .launch
+                            .recipe
+                            .environment
+                            .contains_key("CLAUDE_CONFIG_DIR")
+                    );
                 }
                 assert_eq!(session.launch.recipe.unset_environment, expected);
                 for name in account.credential_overrides() {

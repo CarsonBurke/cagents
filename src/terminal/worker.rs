@@ -2839,11 +2839,22 @@ impl Worker {
         command.env("CAGENTS_TERMINAL_ID", session.id.to_string());
         // A cagents process started in this terminal must not take the
         // account selected for it for the system account.
-        match crate::account::registry::selection_marker(|name| {
-            command.get_env(name)?.to_str().map(str::to_owned)
-        }) {
-            Some(marker) => command.env(crate::account::SELECTION_MARKER, marker),
-            None => command.env_remove(crate::account::SELECTION_MARKER),
+        let home_of = |name: &str| command.get_env(name)?.to_str().map(str::to_owned);
+        let selection = crate::account::registry::selection_marker(home_of);
+        // It must keep the Claude home the reader started cagents with,
+        // though, rather than take it for the default earlier cagents
+        // exported to every launch.
+        let system = crate::account::system_home_marker(home_of, selection.as_deref(), |name| {
+            std::env::var(name).ok()
+        });
+        for (marker, value) in [
+            (crate::account::SELECTION_MARKER, selection),
+            (crate::account::SYSTEM_HOME_MARKER, system),
+        ] {
+            match value {
+                Some(value) => command.env(marker, value),
+                None => command.env_remove(marker),
+            }
         }
         command.env_remove(crate::agent_execution::AUTHORITY_ENV);
         if let Some(token) = config.agent_authority.token() {

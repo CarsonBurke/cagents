@@ -1014,13 +1014,15 @@ cagents process starts it. Claude Code keeps who a login is in `~/.claude.json`,
 and an explicit `CLAUDE_CONFIG_DIR=~/.claude` moves that record to
 `~/.claude/.claude.json` instead, although history and credentials stay in
 `~/.claude` either way. If you set it yourself, cagents keeps it and uses that
-record too. Earlier versions of cagents exported it for every launch, so their
-conversations kept a second record; conversations saved then still resume with
-the setting they started with, and can rewrite that record. A cagents window,
-daemon, or `cagents` command started from a cagents terminal - by you or by an
-agent - ignores a variable that still holds the listed home, any path inside a
-cagents `accounts/<provider>/<id>` directory, or `CLAUDE_CONFIG_DIR` naming
-`~/.claude`, when deciding the system default. A daemon started before this
+record too, and so does a cagents window, daemon or command started from its
+terminals and conversations. Earlier versions of cagents exported it for every
+launch, so their conversations kept a second record; conversations saved then
+still resume with the setting they started with, and can rewrite that record.
+A cagents window, daemon, or `cagents` command started from a cagents terminal
+or conversation - by you or by an agent - ignores a variable that still holds
+the listed home, any path inside a cagents `accounts/<provider>/<id>`
+directory, or a `CLAUDE_CONFIG_DIR` naming `~/.claude` that an earlier version
+exported, when deciding the system default. A daemon started before this
 protection keeps its environment until it restarts.
 
 The Accounts pane flags a row whose home is not a login of its own: **Login

@@ -1568,14 +1568,25 @@ fn start_with_execution(
         // Like the capability, transient: a cagents process the provider
         // starts must not take this conversation's account for the system
         // account.
-        match crate::account::registry::selection_marker(|name| spec.environment.get(name).cloned())
-        {
-            Some(marker) => {
-                spec.environment
-                    .insert(crate::account::SELECTION_MARKER.into(), marker);
-            }
-            None => {
-                spec.environment.remove(crate::account::SELECTION_MARKER);
+        let home_of = |name: &str| spec.environment.get(name).cloned();
+        let selection = crate::account::registry::selection_marker(home_of);
+        // It must keep the Claude home the reader started cagents with,
+        // though, rather than take it for the default earlier cagents
+        // exported to every launch.
+        let system = crate::account::system_home_marker(home_of, selection.as_deref(), |name| {
+            std::env::var(name).ok()
+        });
+        for (marker, value) in [
+            (crate::account::SELECTION_MARKER, selection),
+            (crate::account::SYSTEM_HOME_MARKER, system),
+        ] {
+            match value {
+                Some(value) => {
+                    spec.environment.insert(marker.into(), value);
+                }
+                None => {
+                    spec.environment.remove(marker);
+                }
             }
         }
         let execution_instance = uuid::Uuid::new_v4();
