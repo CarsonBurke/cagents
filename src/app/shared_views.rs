@@ -2551,19 +2551,17 @@ fn attached_to_same_terminal(attached: &CardKind, shared: &CardKind) -> bool {
     )
 }
 
-/// Whether a card's surface stands behind the proof its record claims. A
-/// hibernated surface has no connection yet to disagree with the proof its
-/// start returned; one whose connection failed no longer stands behind it.
+/// Whether a card's surface is attached, now, under the proof its record
+/// claims. A start returns once attached and hibernating keeps the connection,
+/// so no current attachment means that connection ended, and the proof may be
+/// older than the registry's.
 fn surface_attached_under(runtime: Option<&CardRuntime>, kind: &CardKind) -> bool {
     let (Some(CardRuntime::Terminal(surface)), CardKind::Terminal(session)) = (runtime, kind)
     else {
         return false;
     };
-    match surface.current_attachment() {
-        Ok(Some(attached)) => session.continuity.live_proof().as_ref() == Some(&attached),
-        Ok(None) => true,
-        Err(_) => false,
-    }
+    matches!(surface.current_attachment(), Ok(Some(attached))
+        if session.continuity.live_proof().as_ref() == Some(&attached))
 }
 
 fn preserve_observed_terminal_exit(card: &CardState, incoming: &mut CardKind) {

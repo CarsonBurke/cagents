@@ -28,8 +28,14 @@ mod retries;
 /// The launcher's deadline starts when it spawns this process, and the gate's
 /// budget when the window opens. This covers the daemon handshake and state
 /// loading in between, so the launcher's generic timeout does not replace the
-/// report naming what is stuck.
-const LAUNCHER_MARGIN: Duration = Duration::from_secs(15);
+/// report naming what is stuck. Everything spent here is taken from a daemon's
+/// restore, including for a window with no panes of its own, and running past
+/// it only makes the launcher's report less specific.
+const LAUNCHER_MARGIN: Duration = Duration::from_secs(5);
+/// The longest report sent to the launcher. Its limit on one line is 4 KiB
+/// (`MAX_UI_LAUNCH_HANDSHAKE_BYTES`), past which it closes the window; this
+/// leaves room for the line's prefix.
+const MAX_REPORT_BYTES: usize = 4096 - 128;
 const DETAILS_LABEL: &str = " Details: ";
 
 #[derive(Default)]
@@ -98,6 +104,17 @@ struct Observed {
 pub(super) struct Inspection {
     context: InspectionContext,
     outcome: Result<Observation, String>,
+}
+
+/// What one check of the saved panes found.
+struct Scan {
+    admission: bool,
+    panes: Vec<CardId>,
+    failures: Vec<CardId>,
+    out_of_step: Vec<CardId>,
+    reasons: Vec<String>,
+    views_stalled: Option<&'static str>,
+    registry_unavailable: bool,
 }
 
 /// What a waiting gate is still waiting for. Any change is progress.
@@ -186,6 +203,33 @@ impl Cagents {
     /// What still keeps the gate waiting, or `None` once every saved pane has
     /// recovered.
     pub(super) fn startup_pending(&self) -> Result<Option<Pending>, String> {
+        let scan = self.startup_scan();
+        if scan.admission || !scan.panes.is_empty() {
+            return Ok(Some(Pending {
+                admission: scan.admission,
+                panes: scan.panes,
+            }));
+        }
+        if !scan.out_of_step.is_empty() || !scan.failures.is_empty() {
+            return Err(self.startup_incomplete(
+                &scan.failures,
+                &scan.out_of_step,
+                scan.reasons.first(),
+            ));
+        }
+        if let Some(hold) = scan.views_stalled {
+            return Err(views_incomplete(hold));
+        }
+        if scan.registry_unavailable {
+            return Err(format!(
+                "recovery-incomplete: saved panes reconnected, but the shared workspace could not be restored because {}. This window remains available with its own saved layout.",
+                crate::workspace_model::REGISTRY_UNAVAILABLE
+            ));
+        }
+        Ok(None)
+    }
+
+    fn startup_scan(&self) -> Scan {
         // A native window opens independently of the observer/SeedView task.
         // Wait for that actual admission boundary before judging saved chats
         // or declaring a formerly shared workspace recovered.
@@ -310,88 +354,74 @@ impl Cagents {
                 }
             }
         }
-        if admission || !panes.is_empty() {
-            return Ok(Some(Pending { admission, panes }));
+        Scan {
+            admission,
+            panes,
+            failures,
+            out_of_step,
+            reasons,
+            views_stalled,
+            registry_unavailable,
         }
-        if !out_of_step.is_empty() {
-            return Err(self.startup_out_of_step(&failures, &out_of_step, reasons.first()));
-        }
-        if !failures.is_empty() {
-            return Err(self.startup_incomplete(&failures, reasons.first()));
-        }
-        if let Some(hold) = views_stalled {
-            return Err(views_incomplete(hold));
-        }
-        if registry_unavailable {
-            return Err(format!(
-                "recovery-incomplete: saved panes reconnected, but the shared workspace could not be restored because {}. This window remains available with its own saved layout.",
-                crate::workspace_model::REGISTRY_UNAVAILABLE
-            ));
-        }
-        Ok(None)
     }
 
-    /// The report for `failures`, named as their tabs are, with the first
-    /// reason any of them gave.
-    fn startup_incomplete(&self, failures: &[CardId], reason: Option<&String>) -> String {
-        let count = saved_panes(failures.len());
-        let names = self.startup_pane_names(failures);
-        let detail = startup_details(reason);
-        if failures.iter().all(|card| self.startup_pane_held(*card)) {
-            return format!(
-                "recovery-incomplete: {count} could not reconnect: {names}. Nothing was closed or restarted, and this window remains available.{detail}"
-            );
-        }
-        let them = match failures.len() {
-            1 => "it",
-            _ => "them",
-        };
-        format!(
-            "recovery-incomplete: {count} could not reconnect: {names}. Open {them} to see why and retry. Nothing was closed, and this window remains available.{detail}"
-        )
-    }
-
-    /// Whether `card` has no surface because something holds it back, so
-    /// opening it would only show why rather than reconnect it.
-    fn startup_pane_held(&self, card: CardId) -> bool {
-        if !matches!(self.cards.get(&card), Some(CardRuntime::Loading) | None) {
-            return false;
-        }
-        self.shared_views_startup_hold()
-            .filter(|_| !self.shared_views.registry_unavailable)
-            .is_some()
-            || matches!(
-                self.card_state(card).map(|state| &state.kind),
-                Some(CardKind::Terminal(session))
-                    if self.shared_terminal_attach_hold(card, session).is_some()
-            )
-    }
-
-    /// The report when `out_of_step` panes are attached and working, so
-    /// opening them would change nothing, but the shared workspace's record
-    /// of them names something else.
-    fn startup_out_of_step(
+    /// The report for panes that will not settle by waiting, named as their
+    /// tabs are, with the first reason any of them gave.
+    fn startup_incomplete(
         &self,
         failures: &[CardId],
         out_of_step: &[CardId],
         reason: Option<&String>,
     ) -> String {
-        let count = saved_panes(out_of_step.len());
-        let names = self.startup_pane_names(out_of_step);
-        let them = match out_of_step.len() {
-            1 => "it",
-            _ => "them",
-        };
-        let sentence = format!(
-            "{count} reconnected and can be used in this window, but the shared workspace lists {them} under a different terminal service: {names}."
-        );
+        let sentences = self.startup_unsettled_sentences(failures, out_of_step);
         let detail = startup_details(reason);
-        if failures.is_empty() {
-            format!("recovery-incomplete: {sentence} This window remains available.{detail}")
-        } else {
-            let failed = self.startup_incomplete(failures, None);
-            format!("{failed} {sentence}{detail}")
+        format!(
+            "recovery-incomplete: {sentences} Nothing was closed or restarted, and this window remains available.{detail}"
+        )
+    }
+
+    /// What is true of each kind of unsettled pane, since opening one does
+    /// different things: a failed pane offers a retry, a held one only says
+    /// what it waits for, and an out-of-step one is already working.
+    fn startup_unsettled_sentences(&self, failures: &[CardId], out_of_step: &[CardId]) -> String {
+        let (held, failed): (Vec<_>, Vec<_>) = failures
+            .iter()
+            .copied()
+            .partition(|card| self.startup_pane_held(*card));
+        let mut sentences = Vec::new();
+        if !failed.is_empty() {
+            let them = pronoun(failed.len());
+            sentences.push(format!(
+                "{} could not reconnect: {}. Open {them} to see why and retry.",
+                saved_panes(failed.len()),
+                self.startup_pane_names(&failed),
+            ));
         }
+        if !held.is_empty() {
+            let verb = if held.len() == 1 { "is" } else { "are" };
+            sentences.push(format!(
+                "{} {verb} waiting for the shared workspace: {}.",
+                saved_panes(held.len()),
+                self.startup_pane_names(&held),
+            ));
+        }
+        if !out_of_step.is_empty() {
+            let them = pronoun(out_of_step.len());
+            sentences.push(format!(
+                "{} reconnected and can be used in this window, but the shared workspace lists {them} under a different terminal service: {}.",
+                saved_panes(out_of_step.len()),
+                self.startup_pane_names(out_of_step),
+            ));
+        }
+        sentences.join(" ")
+    }
+
+    /// Whether opening `card` would only show what it waits for: a shared chat
+    /// the registry has not admitted, or a terminal whose start is held for it.
+    fn startup_pane_held(&self, card: CardId) -> bool {
+        self.chat_awaiting_admission(card)
+            || (matches!(self.cards.get(&card), Some(CardRuntime::Loading) | None)
+                && self.terminal_start_held(card, false))
     }
 
     /// Why the gate was still waiting when its time ran out, as a report's
@@ -408,6 +438,19 @@ impl Cagents {
                 .map(|card| self.startup_waiting_reason(*card))
         });
         startup_details(reason.as_ref())
+    }
+
+    /// Panes that had already stopped waiting when the time ran out, as a
+    /// sentence following a report about the ones still waiting.
+    fn startup_settled_alongside(&self) -> String {
+        let scan = self.startup_scan();
+        if scan.failures.is_empty() && scan.out_of_step.is_empty() {
+            return String::new();
+        }
+        format!(
+            " {}",
+            self.startup_unsettled_sentences(&scan.failures, &scan.out_of_step)
+        )
     }
 
     fn startup_waiting_reason(&self, card: CardId) -> String {
@@ -740,13 +783,14 @@ impl Cagents {
 
     pub(super) fn reconnecting_reason(&self, pending: &Pending) -> String {
         let detail = self.startup_waiting_details(pending);
+        let settled = self.startup_settled_alongside();
         if pending.panes.is_empty() {
             return format!(
-                "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available. The update has not been verified.{detail}"
+                "recovery-incomplete: this window's shared workspace did not finish loading in time. The window and its saved panes remain available.{settled} The update has not been verified.{detail}"
             );
         }
         format!(
-            "recovery-incomplete: {} did not reconnect in time: {}. {}. The update has not been verified.{detail}",
+            "recovery-incomplete: {} did not reconnect in time: {}. {}.{settled} The update has not been verified.{detail}",
             saved_panes(pending.panes.len()),
             self.startup_pane_names(&pending.panes),
             they_stay(pending.panes.len()),
@@ -755,14 +799,15 @@ impl Cagents {
 
     fn stalled_reason(&self, pending: &Pending) -> String {
         let detail = self.startup_waiting_details(pending);
+        let settled = self.startup_settled_alongside();
         if pending.panes.is_empty() {
             return format!(
-                "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window and its saved panes remain available. The update has not been verified.{detail}",
+                "recovery-incomplete: this window's shared workspace made no progress loading for {} seconds. The window and its saved panes remain available.{settled} The update has not been verified.{detail}",
                 NO_PROGRESS.as_secs()
             );
         }
         format!(
-            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. {}. The update has not been verified.{detail}",
+            "recovery-incomplete: {} made no progress reconnecting for {} seconds: {}. {}.{settled} The update has not been verified.{detail}",
             saved_panes(pending.panes.len()),
             NO_PROGRESS.as_secs(),
             self.startup_pane_names(&pending.panes),
@@ -942,19 +987,23 @@ impl Cagents {
                 .all(|(_, proof)| proof == &observed.daemon.proof)
     }
 
-    fn startup_connected_owners(&self) -> Vec<(CardId, crate::model::HostSessionProof)> {
+    pub(super) fn startup_connected_owners(&self) -> Vec<(CardId, crate::model::HostSessionProof)> {
         self.durable
             .cards
             .iter()
             .filter(|card| card.existence.is_open())
             .filter_map(|card| {
                 let proof = match (&card.kind, self.cards.get(&card.id)) {
+                    // A hibernated surface shows a detached snapshot but keeps
+                    // its connection, so that says nothing about its owner.
                     (CardKind::Terminal(session), Some(CardRuntime::Terminal(surface)))
-                        if !terminal_ended(session)
-                            && surface.terminal_id() == session.id
-                            && !surface.snapshot().detached =>
+                        if !terminal_ended(session) && surface.terminal_id() == session.id =>
                     {
-                        surface.host_proof().filter(|proof| proof.is_complete())
+                        surface
+                            .current_attachment()
+                            .ok()
+                            .flatten()
+                            .filter(|proof| proof.is_complete())
                     }
                     (CardKind::Chat(_), Some(CardRuntime::Chat(runtime))) => {
                         runtime.startup_host_proof()
@@ -1205,6 +1254,13 @@ fn they_stay(count: usize) -> &'static str {
     }
 }
 
+fn pronoun(count: usize) -> &'static str {
+    match count {
+        1 => "it",
+        _ => "them",
+    }
+}
+
 fn saved_panes(count: usize) -> String {
     match count {
         1 => "1 saved pane".to_owned(),
@@ -1231,7 +1287,22 @@ fn poll() -> Task<Message> {
     })
 }
 
+/// `reason` cut to what the launcher accepts, keeping its recovery prefix: past
+/// its limit the launcher treats the window as broken and closes it.
+fn bounded_report(mut reason: String) -> String {
+    if reason.len() > MAX_REPORT_BYTES {
+        let end = (0..=MAX_REPORT_BYTES - '\u{2026}'.len_utf8())
+            .rev()
+            .find(|&end| reason.is_char_boundary(end))
+            .unwrap_or(0);
+        reason.truncate(end);
+        reason.push('\u{2026}');
+    }
+    reason
+}
+
 fn report(result: Result<(), String>) -> Task<Message> {
+    let result = result.map_err(bounded_report);
     cosmic::task::future(async move {
         let result = tokio::task::spawn_blocking(move || instance::report_ui_startup(&result))
             .await

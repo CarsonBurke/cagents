@@ -1404,9 +1404,10 @@ fn a_held_restored_pane_is_reported_with_its_hold() {
         report.contains("the shared workspace is still starting its terminal"),
         "{report}"
     );
-    // Opening it would show the same hold, as its pane does, not reconnect it.
+    // Opening it completes that start, so that is what the report offers.
+    assert!(report.contains("Open it to see why and retry"), "{report}");
     assert!(
-        report.contains("Nothing was closed or restarted") && !report.contains("Open it"),
+        report.contains("Nothing was closed or restarted"),
         "{report}"
     );
 }
@@ -1705,4 +1706,59 @@ fn a_stale_update_is_refused_only_when_neither_its_source_nor_result_holds() {
     assert!(!source_update_conflicts(&model, &scope, &change));
     model.views[1].panes[0] = live("another-host");
     assert!(source_update_conflicts(&model, &scope, &change));
+}
+
+/// A start returns attached, so no current attachment means the connection has
+/// ended, and its proof may be older than the registry's.
+#[test]
+fn an_attachment_whose_connection_ended_is_not_rebased() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut window, model, rx) = window_seeding_a_saved_terminal();
+    let card = window.cached.id;
+    let saved = session(&window.cached);
+    let (started, connection) = attached_with_connection(directory.path(), &saved);
+    connection.shutdown(std::net::Shutdown::Both).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while started
+        .handle
+        .current_attachment()
+        .is_ok_and(|proof| proof.is_some())
+    {
+        assert!(Instant::now() < deadline, "the connection did not end");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    window.app.card_state_mut(card).unwrap().kind = CardKind::Terminal(started.session.clone());
+    window
+        .app
+        .cards
+        .insert(card, CardRuntime::Terminal(started.handle));
+
+    let updates = acknowledge_seed(&mut window, &model, &rx);
+
+    let [(before, _)] = updates.as_slice() else {
+        panic!("expected one update, got {updates:?}");
+    };
+    assert_eq!(before.kind, CardKind::Terminal(saved));
+}
+
+/// The panes a gate attaches in the background are hibernated. Hibernating
+/// keeps the connection, so they stay under the fence on the daemon's answer.
+#[test]
+fn a_hibernated_terminal_is_an_owner_the_gate_fences_on() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut window = reopened_window(false);
+    let card = window.cached.id;
+    let saved = session(&window.cached);
+    let started = attached(directory.path(), &saved);
+    started.handle.hibernate().unwrap();
+    window.app.card_state_mut(card).unwrap().kind = CardKind::Terminal(started.session.clone());
+    window
+        .app
+        .cards
+        .insert(card, CardRuntime::Terminal(started.handle));
+    assert_hibernated_attachment(&window.app, card);
+    assert_eq!(
+        window.app.startup_connected_owners(),
+        vec![(card, replacement_proof())]
+    );
 }

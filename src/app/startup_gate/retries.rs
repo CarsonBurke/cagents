@@ -8,7 +8,8 @@
 //! condition no longer holds.
 //!
 //! Either is reported once it has lasted a window measured from its first
-//! occurrence. Only a replaced terminal starts that window again.
+//! occurrence. A replaced terminal starts that window again, and so does the
+//! daemon saying it is still restoring.
 use super::*;
 
 /// Paces retries so a refusal that returns at once does not spin.
