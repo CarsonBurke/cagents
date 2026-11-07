@@ -22,6 +22,7 @@ faithfully is refused with the reason.
 """
 
 import base64
+import contextlib
 import fcntl
 import hashlib
 import ipaddress
@@ -94,6 +95,8 @@ HELD = "CAGENTS_BUILD_OFFLOAD_HELD"
 LOOPBACK = "CAGENTS_BUILD_REMOTE_LOOPBACK"
 # How `--host` reports a build host that is this one, reached by loopback.
 LOOPBACK_MARK = "\tloopback"
+# The shell a loopback runs commands in, instead of the user's login shell.
+LOOPBACK_SHELL = "CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL"
 # Set beside CAGENTS_BUILD_METADATA, whose value it then owns: an empty one is
 # no metadata, and build.rs leaves the checkout alone. Its own value never
 # changes between commits, so watching it costs build.rs no reruns.
@@ -505,11 +508,19 @@ SSH_VALUED = set("BbcDEeFIiJLlmOoPpQRSWw")
 
 
 def loopback_shell(arguments):
-    """Stands in for `ssh [OPTIONS] HOST COMMAND...` to this host: runs
-    COMMAND in the user's login shell from the home directory, with only
-    what sshd itself would give the session, so nothing of the caller's
-    build, such as its CARGO_TARGET_DIR, reaches the slot. A control command
-    (`-O`) has no shared connection to act on."""
+    """Stands in for `ssh [OPTIONS] HOST COMMAND...` to this host. It runs
+    COMMAND as sshd would: in the user's login shell, from the home
+    directory, with only the basics a session starts from (the shell's own
+    configuration adds the rest), so nothing of the caller's build, such as
+    its CARGO_TARGET_DIR, reaches the slot. sshd's SSH_CONNECTION, ~/.ssh/rc
+    and ~/.ssh/environment have no counterpart. A control command (`-O`) has
+    no shared connection to act on.
+
+    The command reads its input through this process, as through an ssh
+    connection: when this ends, even by SIGKILL, the command sees its input
+    close and ends what it started, as the build host's agent does when its
+    caller's connection drops. A shell that does not `exec` its command
+    would otherwise leave that running."""
     while arguments and arguments[0].startswith("-") and len(arguments[0]) > 1:
         option = arguments.pop(0)
         if option[1] == "O":
@@ -520,7 +531,7 @@ def loopback_shell(arguments):
         say("loopback: missing host or command")
         return 2
     account = pwd.getpwuid(os.getuid())
-    shell = account.pw_shell or "/bin/sh"
+    shell = os.environ.get(LOOPBACK_SHELL) or account.pw_shell or "/bin/sh"
     environment = {"HOME": account.pw_dir, "USER": account.pw_name,
                    "LOGNAME": account.pw_name, "SHELL": shell,
                    "PATH": "/usr/local/bin:/usr/bin:/bin"}
@@ -530,12 +541,25 @@ def loopback_shell(arguments):
     runtime = f"/run/user/{os.getuid()}"
     if os.path.isdir(runtime):
         environment["XDG_RUNTIME_DIR"] = runtime
-    try:
-        os.chdir(account.pw_dir)
-    except OSError:
-        os.chdir("/")
+    home = account.pw_dir if os.path.isdir(account.pw_dir) else "/"
     # ssh passes the command to the shell as one string, its words joined.
-    os.execve(shell, [shell, "-c", " ".join(arguments[1:])], environment)
+    command = subprocess.Popen([shell, "-c", " ".join(arguments[1:])], env=environment,
+                               cwd=home, stdin=subprocess.PIPE)
+
+    def relay():
+        try:
+            while data := os.read(0, 65536):
+                command.stdin.write(data)
+                command.stdin.flush()
+        except OSError:
+            pass  # The command stopped reading; its status says why.
+        finally:
+            with contextlib.suppress(OSError):
+                command.stdin.close()
+    threading.Thread(target=relay, daemon=True).start()
+    status = command.wait()
+    sys.stdout.flush()
+    os._exit(status if status >= 0 else 128 - status)
 
 
 def resolve(name, found):
