@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Exercise scripts/build-disk-guard with private locks and a stand-in pruner."""
 
+import fcntl
 import os
 import shutil
 from pathlib import Path
@@ -28,10 +29,14 @@ class BuildDiskGuard(unittest.TestCase):
         self.env["CAGENTS_BUILD_INSTALLED_GATE"] = ""
         self.env["CAGENTS_BUILD_REMOTE"] = "local"
         self.env["CAGENTS_BUILD_PRUNE"] = f"echo pruned >> {self.pruned}"
+        # The schedule is tested on its own; elsewhere it would add prunes.
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "0"
+        self.env["CAGENTS_BUILD_PRUNE_STATE"] = str(self.root / "pruner")
+        self.env["CAGENTS_BUILD_PRUNE_ROOTS"] = str(self.root / "roots")
 
-    def guard(self, floor, directory=None):
+    def guard(self, floor, directory=None, guard=GUARD):
         return subprocess.run(
-            [str(GUARD), str(directory or self.root / "absent/build/target")],
+            [str(guard), str(directory or self.root / "absent/build/target")],
             env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(floor)},
             capture_output=True, text=True, timeout=60,
         )
@@ -86,17 +91,240 @@ class BuildDiskGuard(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn("Usage", result.stderr)
 
-    def test_without_a_pruner_it_only_refuses(self):
+    def alone(self):
+        """A copy of the guard with no pruner beside it."""
+        directory = self.root / "guard"
+        directory.mkdir()
+        shutil.copy2(GUARD, directory / GUARD.name)
+        return directory / GUARD.name
+
+    def test_without_a_pruner_it_says_so_and_refuses(self):
         del self.env["CAGENTS_BUILD_PRUNE"]
-        tools = self.root / "bin"
-        tools.mkdir()
-        for tool in ("sh", "df", "awk", "dirname", "flock", "find", "date"):
-            (tools / tool).symlink_to(shutil.which(tool))
-        self.env["PATH"] = str(tools)
-        result = self.guard(10**9)
+        result = self.guard(10**9, guard=self.alone())
         self.assertEqual(result.returncode, 2)
         self.assertNotIn("reclaiming", result.stderr)
+        self.assertIn("nothing to reclaim build directories with", result.stderr)
+        self.assertIn("prune-build-dirs is missing", result.stderr)
         self.assertIn("refusing to build", result.stderr)
+
+    def test_without_a_pruner_and_with_room_it_says_nothing(self):
+        del self.env["CAGENTS_BUILD_PRUNE"]
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        result = self.guard(1, guard=self.alone())
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+
+    def stand_in_pruner(self, status=0, then=""):
+        """The guard beside a pruner that records how it was run, and as the
+        real one does, stamps the schedule unless it was cut short."""
+        guard = self.alone()
+        calls = self.root / "calls"
+        pruner = guard.with_name("prune-build-dirs")
+        pruner.write_text(
+            "#!/bin/sh\n"
+            'arguments="$*"\n'
+            "while [ $# -gt 0 ]; do\n"
+            f'    [ "$1" != --stamp ] || [ {status} -eq 75 ] || touch "$2"\n'
+            "    shift\n"
+            "done\n"
+            f"{then}"
+            f'printf "%s\\n" "$arguments" >> {calls}\n'
+            f"exit {status}\n")
+        pruner.chmod(0o755)
+        del self.env["CAGENTS_BUILD_PRUNE"]
+        return guard, calls
+
+    def calls(self, path, count, timeout=10):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            lines = path.read_text().splitlines() if path.exists() else []
+            if len(lines) >= count:
+                return lines
+            time.sleep(0.05)
+        return path.read_text().splitlines() if path.exists() else []
+
+    def test_low_on_space_it_runs_the_pruner_beside_it(self):
+        guard, calls = self.stand_in_pruner()
+        checkout = self.root / "checkout"
+        checkout.mkdir()
+        subprocess.run(["git", "init", "-q", str(checkout)], check=True)
+        result = subprocess.run(
+            [str(guard), str(self.root)], cwd=checkout,
+            env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)},
+            capture_output=True, text=True, timeout=60)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("reclaiming unused build directories", result.stderr)
+        # A complete run in the background, and the one the build waits for.
+        lines = self.calls(calls, 2)
+        self.assertEqual(len(lines), 2)
+        (background,) = [line for line in lines if "--output" in line]
+        self.assertNotIn("--budget", background)
+        self.assertIn("--orphan-hours 0", background)
+        (call,) = [line for line in lines if "--output" not in line]
+        self.assertIn("--apply --max-idle 7", call)
+        self.assertIn("--orphan-hours 0 --budget 300 --wait", call)
+        self.assertIn(f"--stamp {self.root}/pruner.scheduled", call)
+        self.assertIn(f"--keep {self.root}", call)
+        self.assertIn(f"--root {checkout.resolve()} --keep-checkout {checkout.resolve()}", call)
+        self.assertIn(f"--log {self.root}/pruner.tsv", call)
+
+    def test_under_pressure_the_schedule_starts_nothing_more(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        result = self.guard(10**9, guard=guard)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+        # That complete run was this period's: a build with room starts none.
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        time.sleep(0.5)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+
+    def test_a_reclaim_cut_short_leaves_the_scheduled_run_to_come(self):
+        guard, calls = self.stand_in_pruner(status=75)
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        self.assertEqual(self.guard(10**9, guard=guard).returncode, 2)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        lines = self.calls(calls, 3)
+        self.assertEqual(len(lines), 3)
+        # The background runs, below the floor and on the schedule.
+        self.assertEqual(len([line for line in lines if "--budget" not in line]), 2)
+
+    def test_a_scheduled_run_cut_short_is_started_again(self):
+        guard, calls = self.stand_in_pruner(status=75)
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        self.calls(calls, 1)
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+
+    def test_no_run_starts_while_one_is_pruning(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        with open(self.root / "pruner.lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+            time.sleep(0.5)
+            self.assertEqual(self.calls(calls, 0, timeout=0), [])
+
+    def band(self):
+        """A floor that leaves free space between it and twice it."""
+        free = shutil.disk_usage(self.root).free // 2**30
+        if free < 4:
+            self.skipTest("too little free space to place a floor below it")
+        return free * 2 // 3
+
+    def test_running_low_the_pruner_runs_in_the_background(self):
+        guard, calls = self.stand_in_pruner(then="sleep 3\n")
+        started = time.monotonic()
+        result = self.guard(self.band(), guard=guard)
+        self.assertLess(time.monotonic() - started, 2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("reclaiming unused build directories in the background", result.stderr)
+        (call,) = self.calls(calls, 1)
+        self.assertIn("--orphan-hours 0", call)
+        self.assertNotIn("--budget", call)
+        self.assertIn(f"--output {self.root}/pruner.log", call)
+        # Once it has searched everything, the next hour's builds start none.
+        result = self.guard(self.band(), guard=guard)
+        self.assertNotIn("reclaiming", result.stderr)
+        time.sleep(0.5)
+        self.assertEqual(len(self.calls(calls, 1)), 1)
+        long_ago = time.time() - 2 * 3600
+        os.utime(self.root / "pruner.scheduled", (long_ago, long_ago))
+        self.assertIn("in the background", self.guard(self.band(), guard=guard).stderr)
+
+    def test_the_background_run_keeps_none_of_the_builds_descriptors(self):
+        # As the real pruner closes what it inherited, and then runs on.
+        guard, calls = self.stand_in_pruner(
+            then="exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\nsleep 5\n")
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        # Like `flock FILE command`, which passes its lock to the command.
+        read, write = os.pipe()
+        started = time.monotonic()
+        with os.fdopen(read, "rb") as reader:
+            result = subprocess.run(
+                [str(guard), str(self.root / "absent/target")], pass_fds=(write,),
+                env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": "1"},
+                capture_output=True, timeout=20)
+            os.close(write)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(reader.read(), b"")
+        self.assertLess(time.monotonic() - started, 4)
+        self.calls(calls, 1)
+
+    def test_a_build_directory_in_use_is_marked_so(self):
+        build = self.root / "build/target"
+        build.mkdir(parents=True)
+        (build / ".rustc_info.json").write_text("{}")
+        self.assertEqual(self.guard(1, directory=build).returncode, 0)
+        self.assertTrue((build / ".cagents-gate-used").is_file())
+        # Never one Cargo has not made.
+        plain = self.root / "plain"
+        plain.mkdir()
+        self.assertEqual(self.guard(1, directory=plain).returncode, 0)
+        self.assertEqual(list(plain.iterdir()), [])
+
+    def test_the_build_directory_it_guards_is_kept(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        build = self.root / "it's here/target"
+        self.assertEqual(self.guard(1, directory=build, guard=guard).returncode, 0)
+        (call,) = self.calls(calls, 1)
+        self.assertIn(f"--keep {build}", call)
+
+    def test_on_schedule_it_prunes_in_the_background_whatever_the_space(self):
+        guard, calls = self.stand_in_pruner()
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        self.env["CAGENTS_BUILD_PRUNE_IDLE_DAYS"] = "3"
+        result = self.guard(1, guard=guard)
+        self.assertEqual((result.returncode, result.stderr), (0, ""))
+        (call,) = self.calls(calls, 1)
+        self.assertIn("--apply --max-idle 3", call)
+        self.assertNotIn("--orphan-hours", call)
+        # Once it has finished, and within the interval, no build starts another.
+        stamp = self.root / "pruner.scheduled"
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        time.sleep(0.5)
+        self.assertEqual(len(self.calls(calls, 1)), 1)
+        # Once it has passed, the next build does.
+        long_ago = time.time() - 7 * 3600
+        os.utime(stamp, (long_ago, long_ago))
+        self.assertEqual(self.guard(1, guard=guard).returncode, 0)
+        self.assertEqual(len(self.calls(calls, 2)), 2)
+
+    def test_the_build_does_not_wait_for_the_scheduled_prune(self):
+        guard = self.alone()
+        pruner = guard.with_name("prune-build-dirs")
+        pidfile = self.root / "pruner.pid"
+        pruner.write_text(f'#!/bin/sh\necho $$ > {pidfile}\nexec sleep 30\n')
+        pruner.chmod(0o755)
+        del self.env["CAGENTS_BUILD_PRUNE"]
+        self.env["CAGENTS_BUILD_PRUNE_INTERVAL_HOURS"] = "6"
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(guard), str(self.root)],
+            env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": "1"},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20)
+        self.assertEqual(result.returncode, 0)
+        self.assertLess(time.monotonic() - started, 10)
+        deadline = time.monotonic() + 10
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        os.kill(int(pidfile.read_text()), 9)
+
+    def test_an_invalid_schedule_is_a_usage_error(self):
+        for name, value in (("CAGENTS_BUILD_PRUNE_INTERVAL_HOURS", "08"),
+                            ("CAGENTS_BUILD_PRUNE_INTERVAL_HOURS", "999999"),
+                            ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "week"),
+                            ("CAGENTS_BUILD_PRUNE_IDLE_DAYS", "0"),
+                            ("CAGENTS_BUILD_PRUNE_BUDGET_SECONDS", "-1"),
+                            ("CAGENTS_BUILD_PRUNE_BUDGET_SECONDS", "0")):
+            with self.subTest(name=name, value=value):
+                self.env[name] = value
+                result = self.guard(1)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("Usage", result.stderr)
+                del self.env[name]
 
     def test_a_build_waits_for_another_builds_reclaim(self):
         self.env["CAGENTS_BUILD_PRUNE"] = f"sleep 2; echo pruned >> {self.pruned}"
@@ -150,7 +378,7 @@ class InstallCargoGate(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         names = ["build-disk-guard", "cagents-cargo-gate", "cargo-gate-command.py",
                  "cargo-gate-rustc-guard", "cargo-gate-sync.py", "cargo-offload",
-                 "seed-build-dir"]
+                 "prune-build-dirs", "seed-build-dir"]
         self.assertEqual(
             sorted(path.name for path in self.root.iterdir()),
             sorted(names + ["cagents-cargo-gate.d", "cagents-cargo-gate.install.lock",
@@ -194,8 +422,7 @@ class InstallCargoGate(unittest.TestCase):
         scripts.mkdir(parents=True)
         for name in ("install-cargo-gate", "cargo-gate", "cargo-gate-command.py",
                      "cargo-gate-sync.py", "cargo-gate-rustc-guard", "cargo-offload",
-                     "seed-build-dir",
-                     "build-disk-guard"):
+                     "seed-build-dir", "build-disk-guard", "prune-build-dirs"):
             shutil.copy2(ROOT / "scripts" / name, scripts / name)
         (scripts / "cargo-gate-command.py").write_text("import sys\nsys.exit(3)\n")
         installed = self.root / "installed"

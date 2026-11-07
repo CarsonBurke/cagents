@@ -94,7 +94,15 @@ impl Retries {
             .is_none_or(|record| !record.exhausted(terminal) && record.at.elapsed() >= RETRY_DELAY)
     }
 
-    #[cfg(test)]
+    /// Starts every pane's window again. A daemon still restoring is expected
+    /// to refuse them, so that time does not count against them.
+    pub(super) fn restart_windows(&mut self) {
+        let now = Instant::now();
+        for record in self.records_mut() {
+            record.since = now;
+        }
+    }
+
     fn records_mut(&mut self) -> impl Iterator<Item = &mut Record> {
         self.attempts.values_mut().chain(self.observed.values_mut())
     }

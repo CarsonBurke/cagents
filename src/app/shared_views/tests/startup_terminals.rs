@@ -375,7 +375,7 @@ fn reopened_shared_window_reports_a_refused_offscreen_attach() {
     let report = app.startup_pane_check().unwrap_err();
     assert!(
         report.starts_with(
-            "recovery-incomplete: 1 pane did not reconnect: \u{201c}Terminal\u{201d}."
+            "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}Terminal\u{201d}."
         ),
         "named as its tab is: {report}"
     );
@@ -1437,10 +1437,13 @@ fn the_budget_report_names_each_waiting_pane_and_why() {
     admit(&mut window);
     drop(window.app.update(Message::VerifyStartupPanes));
     assert!(window.app.terminal_start_in_flight(window.cached.id));
-    let report = window.app.startup_timeout_report();
+    let budget_report = |app: &Cagents| {
+        app.reconnecting_reason(&app.startup_pending().unwrap().expect("still waiting"))
+    };
+    let report = budget_report(&window.app);
     assert!(
         report.starts_with(
-            "recovery-incomplete: 1 pane did not reconnect: \u{201c}Terminal\u{201d}."
+            "recovery-incomplete: 1 saved pane did not reconnect in time: \u{201c}Terminal\u{201d}."
         ),
         "{report}"
     );
@@ -1454,7 +1457,7 @@ fn the_budget_report_names_each_waiting_pane_and_why() {
         terminal: session(&window.cached).id,
         result: Err(REFUSAL.to_owned()),
     }));
-    let report = window.app.startup_timeout_report();
+    let report = budget_report(&window.app);
     assert!(report.contains(REFUSAL), "the latest refusal: {report}");
 }
 

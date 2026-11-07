@@ -28,11 +28,17 @@ pub(super) fn retained_helper_executable() -> std::path::PathBuf {
 // provider, holder, checkpoint and successor all retain one issued session.
 #[test]
 fn committed_upgrade_tail_preserves_exact_claude_actor_and_successor_attachment() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_upgrade_tail(false);
 }
 
 #[test]
 fn failed_final_upgrade_save_preserves_exact_claude_actor_and_successor_attachment() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_upgrade_tail(true);
 }
 
@@ -70,6 +76,7 @@ fn retained_upgrade_tail(fail_final_save: bool) {
         for (key, _) in std::env::vars_os() {
             if key != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
                 && key != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+                && key != std::ffi::OsStr::new(crate::retained_fixture::OWNER_ENV)
             {
                 command = command.env_remove(key);
             }
@@ -441,21 +448,33 @@ fn retained_upgrade_tail(fail_final_save: bool) {
 
 #[test]
 fn slow_turn_keeps_exact_provider_and_frames_across_daemon_lease_rotation() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("close");
 }
 
 #[test]
 fn retained_terminal_handoff_proves_original_console_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("handoff");
 }
 
 #[test]
 fn retained_checked_terminal_close_proves_original_console_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("checked");
 }
 
 #[test]
 fn retained_completed_terminal_release_proves_original_console_cleanup() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     retained_turn_final_action("release");
 }
 
@@ -486,6 +505,7 @@ fn retained_turn_final_action(action: &str) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                 retained_helper_executable(),
@@ -1638,6 +1658,7 @@ fn sigkill_child(root: &Path, role: &str, case: &SigkillCase) -> std::process::C
     command
         .args(["--exact", &case.selected_test, "--nocapture"])
         .env_clear()
+        .envs(crate::retained_fixture::owner_env())
         .env(
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
             retained_helper_executable(),
@@ -2010,12 +2031,18 @@ impl Drop for SigkillCoordinator {
 #[cfg(target_os = "linux")]
 #[test]
 fn slow_turn_survives_sigkill_of_the_host_owner_process() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     sigkill_host_fixture(false);
 }
 
 #[cfg(target_os = "linux")]
 #[test]
 fn semantic_retirement_precedes_original_parent_wait_after_host_sigkill() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     sigkill_host_fixture(true);
 }
 
@@ -2609,6 +2636,9 @@ fn sigkill_host_fixture(semantic_held: bool) {
 /// provider-confirmed thread while its exact ownership proof rotates.
 #[test]
 fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provider_result() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNNAMED_ACTOR_PERSISTENCE_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -2628,6 +2658,7 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &test, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                 retained_helper_executable(),
@@ -2887,6 +2918,9 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
 /// commit using the roster and private receipt, without recreating an actor.
 #[test]
 fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const EXACT: &str = "host::chat::retained_actor_tests::retired_helper_receipt_completes_after_host_sigkill_before_registry_commit";
     const ROLE: &str = "CAGENTS_RETIRED_HOST_PROCESS_ROLE";
@@ -2901,6 +2935,7 @@ fn retired_helper_receipt_completes_after_host_sigkill_before_registry_commit() 
         command
             .args(["--exact", EXACT, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(
                 "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                 retained_helper_executable(),
@@ -3338,6 +3373,9 @@ fn pending_startup_keeps_exact_cleanup_owner_until_retry_proves_teardown() {
 
 #[test]
 fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNATTACHED_CLAUDE_CLOSE_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -3359,6 +3397,7 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -3774,6 +3813,9 @@ fn unattached_claude_cleanup_authenticates_old_alias_and_closes_original_pair() 
 /// owner.
 #[test]
 fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_PAIRED_INTERRUPTED_EXIT_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -3795,6 +3837,7 @@ fn paired_conversation_reopens_after_an_ordinary_or_interrupted_exit() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -4118,12 +4161,28 @@ fn unattached_claude_cleanup_refuses_unsupported_protocol_before_reservation() {
     assert!(state.native_closing.is_empty());
 }
 
+/// Kills an actor the way a crash takes it down with its daemon, helper
+/// first. A helper still alive when its provider dies terminates the
+/// provider's whole process group, which would remove a survivor the test
+/// means to leave behind.
+fn kill_helper_then_provider(record: &crate::daemon::holder_registry::Record) {
+    for process in [&record.holder, &record.root] {
+        unsafe {
+            libc::kill(process.pid, libc::SIGKILL);
+        }
+        wait_until(|| !process.is_current(), "the killed actor never exited");
+    }
+}
+
 /// A same-boot actor that died without writing retirement grants disk resume
 /// only once its helper, its provider and every process left in either's
 /// process group or session are gone. A survivor in the provider's group
 /// refuses, and its exit then allows exactly one proved successor.
 #[test]
 fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_ABANDONED_CLAUDE_RESUME_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -4145,6 +4204,7 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -4265,15 +4325,7 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
     drop(handle);
     drop(host);
     drop(lease);
-    for process in [&identity.record.root, &identity.record.holder] {
-        unsafe {
-            libc::kill(process.pid, libc::SIGKILL);
-        }
-    }
-    wait_until(
-        || !identity.record.holder.is_current() && !identity.record.root.is_current(),
-        "the killed actor never exited",
-    );
+    kill_helper_then_provider(&identity.record);
     let next = proof("successor");
     let _lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
     let mut state = HostState::new(next.clone());
@@ -4347,6 +4399,9 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
 
 #[test]
 fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     let _helper_executable = retained_helper_executable();
     const MODE: &str = "CAGENTS_UNNAMED_CLAUDE_RESUME_TEST";
     if std::env::var_os(MODE).is_none() {
@@ -4368,6 +4423,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["--exact", &test, "--nocapture"])
                 .env_clear()
+                .envs(crate::retained_fixture::owner_env())
                 .env(
                     "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
                     retained_helper_executable(),
@@ -4482,11 +4538,7 @@ fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
         drop(notifications);
         drop(host);
         drop(lease);
-        for process in [&identity.record.root, &identity.record.holder] {
-            unsafe {
-                libc::kill(process.pid, libc::SIGKILL);
-            }
-        }
+        kill_helper_then_provider(&identity.record);
     } else {
         // An ordinary close retires the actor with a verified receipt that
         // records the conversation it confirmed, if any.

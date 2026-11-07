@@ -271,12 +271,10 @@ fn large_literal_pathspec_mutations_roundtrip_without_argv_limits() {
             drop(current);
             let current = phase("40k pathspec size verify");
             assert!(
-                service
-                    .stage_command(root, &selection_pathspecs(&selection))
-                    .unwrap()
-                    .stdin
-                    .unwrap()
-                    .len()
+                selection_pathspecs(&selection)
+                    .iter()
+                    .map(|path| path.as_bytes().len() + 1)
+                    .sum::<usize>()
                     > 2_097_152
             );
             drop(current);

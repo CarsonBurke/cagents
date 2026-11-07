@@ -510,7 +510,17 @@ builds counted include those the host's own gate admits in its shared
 families, through the registry described [above](#sharing-a-host-between-several-checkouts),
 where these slots record their builds in turn. A plain
 `cargo test` runs its tests there, in the slot, which stays leased until they
-end. One build's
+end. Cargo builds everything a test run needs before it runs any test, so the
+compile's expected peak stops applying once it only runs executables it built
+into a `deps` directory: from then on the slot is priced at the most its
+processes have held since its tests began, sampled every 2 s, and never below
+2 GiB. Builds the host admits meanwhile may take the memory the compile no
+longer reserves, while whatever the tests hold stays counted. Growth beyond
+that peak is not reserved, as the memory of tests the gate runs on this host
+is not; memory pressure then holds further builds back. Running a compiler or build
+script again, as doctests do, prices it as a build again. Without this, slots
+running only tests on fw16 reserved about 18 of its 26 GiB available, and
+queued builds waited beside idle slots. One build's
 steps share one ssh connection, which ends with it. Output streams back and
 the exit status is Cargo's; cancelling the gate ends the command's processes
 on the host before the slot is free again. Commands there run without core
@@ -636,8 +646,7 @@ directory a plain `cargo` would create. After copying a target by hand, run
 there, before its first build. It fails when it can't find this checkout's
 crates in `Cargo.lock`, or can't search or clean `TARGET`; a `TARGET` with no
 fingerprints has nothing to forget. Seeded directories carry Cargo's
-`CACHEDIR.TAG`, so `prune-cargo-build-dirs` reclaims them after their worktree
-is removed.
+markers, so `scripts/prune-build-dirs` reclaims them once they go unused.
 
 The gate's helpers run from the gate's own directory. Install a changed gate
 for every checkout with `scripts/install-cargo-gate`, never by copying
@@ -645,14 +654,35 @@ for every checkout with `scripts/install-cargo-gate`, never by copying
 the staged gate runs a command, renames them into `/var/tmp`, and checks the
 result.
 
-Build directories share one disk. When the file system holding them has less
-than twice a floor free (5% of its size, at most 64 GiB), `scripts/cargo-gate`
-runs `scripts/build-disk-guard`, which reclaims removed worktrees' build
-directories at once with `prune-cargo-build-dirs`, at most every ten minutes
-across the host; idle live worktrees' are left to the pruner's own schedule.
-Below the floor it refuses the build and says why. Remove worktrees you no
-longer need; their build directories follow. Set `CAGENTS_BUILD_FREE_FLOOR_GIB`
-to change the floor, or `0` to disable the guard.
+Build directories share one disk, and Cargo never removes one. Worktrees'
+`target/`s, `CARGO_TARGET_DIR`s under `~/.cache` and `/var/tmp`, and test
+roots under `~/.local/state` all stay until something removes them.
+`scripts/build-disk-guard`, which `scripts/cargo-gate` runs before every
+local build, removes them with `scripts/prune-build-dirs` in two ways:
+
+- **On a schedule.** While the file system has room, at most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, it starts the pruner in the background, in a session of its own at idle CPU and I/O priority, with none of the build's open files. The build doesn't wait for it. A run that is cut short or killed is started again by the next build; none starts while one is running.
+- **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout; on the schedule they wait six hours.
+- **Below the floor.** The guard starts the same background run, unless one did within the hour. The build waits for the pruner, at most every ten minutes across the host, or for the run already pruning. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If there is still too little room, the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with. A `CAGENTS_BUILD_PRUNE` command runs before the build whenever there is less than twice the floor free.
+
+The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the first three. It skips a checkout's committed directories, which hold only sources.
+
+It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. It removes a build directory only when all of these hold:
+
+- nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees;
+- every Cargo lock in it is free;
+- no process has its working directory, an open file, its executable or a mapping inside it.
+
+Under those locks it renames the directory aside, so a build that starts afterwards begins with an empty directory rather than a partly removed one. Still holding them, it puts the renamed copy back if a process opened it meanwhile, such as a build waiting for one of those locks; afterwards, if anything wrote to it. A directory holding a `.git` or `Cargo.toml` is a checkout and never counts as build output. A gated build marks its build directory as used before it waits for a slot, so another build's pruner doesn't take it meanwhile.
+
+It never touches:
+- the build directory being guarded;
+- the build of this repository's main checkout, in its `target/` or the mirror;
+- `~/.local/share`;
+- the offload slots, which their leases manage;
+- other users' files;
+- anything reached through a symlink.
+
+What it removed goes to `/var/tmp/cagents-prune-build-dirs-UID.tsv` (`CAGENTS_BUILD_PRUNE_STATE` sets the prefix). The last two background runs' output goes to `.log` and `.log.1` beside it. Run `scripts/prune-build-dirs --verbose` without `--apply` to see what it would remove and why the rest stays. On the build host, gated builds take this path too. Builds offloaded from other hosts write only into the slots there, and the leases manage those. Cargo run without the gate is pruned only when a gated build next runs on that host. Remove worktrees you no longer need. Set `CAGENTS_BUILD_FREE_FLOOR_GIB` to change the floor, or `0` to disable the guard.
 
 The build script that stamps `--version` reruns only when the stamp could
 change, because each rerun recompiles `cagents`. It watches this checkout's
@@ -847,6 +877,16 @@ separately retained fixture evidence until their original children have settled;
 this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
+
+Tests that spawn the retained helper call `retained_fixture::run_isolated()`
+first. The helper calls `setsid` and enters its own systemd scope, so killing a
+process group or cgroup misses it. `run_isolated()` reruns the exact test as a
+worker beneath a private subreaper. When the worker exits, for any reason, the
+subreaper kills and reaps every remaining descendant. Only killing the
+subreaper itself, for example by the OOM killer, leaves them behind. After a
+passing worker it prints how many it killed: a nonzero count means the product
+left processes behind. Same-test reexecs that call `env_clear()` must pass
+`retained_fixture::owner_env()` through.
 
 Prefer the narrow target that covers the changed contract, for example:
 
