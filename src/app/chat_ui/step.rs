@@ -38,6 +38,26 @@ const RAIL_INSET: f32 = space::M;
 const THREAD_RAIL_OFFSET: f32 =
     GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
 
+/// A row's heading on one line, cut short with an ellipsis where the pane
+/// is too narrow for it, filling what the row's other parts leave. The
+/// heading is held in a clipped box of exactly that width, so the duration
+/// and status beside it keep their place whatever width the shaped text
+/// reports; the whole of what was cut is in the open row.
+fn one_line<'a>(
+    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
+) -> Element<'a, Message> {
+    widget::container(
+        text.width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::advanced::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            )),
+    )
+    .width(Length::Fill)
+    .clip(true)
+    .into()
+}
+
 /// The indicator and tone a group's status draws as.
 ///
 /// Status is information, not a control, so it is a plain glyph rather than
@@ -45,20 +65,6 @@ const THREAD_RAIL_OFFSET: f32 =
 /// a static glyph for work in flight says only that something was running
 /// when the frame was drawn, so it is the animated indicator the rest of the
 /// shell uses for the same state.
-/// A row's heading on one line, cut short with an ellipsis where the pane
-/// is too narrow for it, filling what the row's other parts leave. The row's
-/// duration and status are laid out first, so they always stay in view; the
-/// whole of what was cut is in the open row.
-fn one_line<'a>(
-    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
-) -> cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer> {
-    text.width(Length::Fill)
-        .wrapping(iced::widget::text::Wrapping::None)
-        .ellipsize(iced::advanced::text::Ellipsize::End(
-            iced::advanced::text::EllipsizeHeightLimit::Lines(1),
-        ))
-}
-
 fn status_indicator<'a>(status: ToolStatus) -> (Element<'a, Message>, Option<design::Tone>) {
     let glyph = |name: Icon, tone: Option<design::Tone>| {
         (
@@ -334,18 +340,20 @@ impl Runtime {
             }
             None => None,
         };
-        // One line, whatever the summary names: a group of one long
-        // command would otherwise wrap it across the pane and push its
-        // duration off the edge. Opening the group shows the whole command.
-        line.push(one_line(design::heading(turn.summary.clone())).into());
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
         let elapsed = self
             .source_now_ms()
             .and_then(|now| turn.duration_label(now));
-        if let Some(elapsed) = &elapsed {
-            line.push(design::caption(elapsed.clone()).into());
-        }
+        // One line, whatever the summary names: a group of one long
+        // command would otherwise wrap it across the pane. The duration is
+        // measured first and the summary cut to what it leaves, so the
+        // duration stays in view. Opening the group shows the whole command.
+        let summary = one_line(design::heading(turn.summary.clone()));
+        line.push(match &elapsed {
+            Some(elapsed) => trailing::trailing(summary, design::caption(elapsed.clone()), GAP_S),
+            None => summary,
+        });
         // The duration is part of what the control says, so it belongs in the
         // name as well: a reader on a screen reader is the one who cannot see
         // the caption beside it.
@@ -488,7 +496,7 @@ impl Runtime {
         // row forgetting what is being built.
         let mut preview: Vec<Element<'static, Message>> = Vec::new();
         if let Some(coordinated) = coordinated {
-            preview.push(one_line(design::body(label.clone())).into());
+            preview.push(one_line(design::body(label.clone())));
             let arrived = coordinated.reading.outcome.messages.len();
             if arrived > 0 {
                 preview.push(
@@ -501,7 +509,7 @@ impl Runtime {
                 );
             }
         } else if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(one_line(design::body(label.clone())).into());
+            preview.push(one_line(design::body(label.clone())));
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
