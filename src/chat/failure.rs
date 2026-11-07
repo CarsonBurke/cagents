@@ -233,6 +233,9 @@ impl<'a> Failure<'a> {
             Provider::Codex => "Codex",
             Provider::Omp => "Oh My Pi",
         };
+        // What stopped is the provider's program, named as the stopped
+        // chat's controls name it, rather than its service.
+        let program = provider.label();
         let reset = (kind == FailureKind::AccountLimit)
             .then(|| reported_reset(&signal))
             .flatten();
@@ -258,7 +261,7 @@ impl<'a> Failure<'a> {
                 "Review the retained work before continuing.",
             ),
             FailureKind::OutOfMemory => (
-                format!("{name} stopped because the system ran out of memory"),
+                format!("{program} stopped because the system ran out of memory"),
                 "The system stopped the agent to keep the computer responsive. Free up memory before you resume the conversation.",
             ),
             FailureKind::CommandOutOfMemory => (
@@ -266,7 +269,7 @@ impl<'a> Failure<'a> {
                 "The system stopped the command that was using the most memory. The agent is still running and sees that the command failed.",
             ),
             FailureKind::Exited => (
-                exit_summary(&name, &signal),
+                exit_summary(program, &signal),
                 "Resume to continue the same conversation. Details show what the agent reported before it stopped.",
             ),
         };
@@ -865,6 +868,10 @@ mod tests {
             failure.summary
         );
         assert!(failure.action.contains("resume"), "{}", failure.action);
+        assert_eq!(
+            failure.summary,
+            "Claude Code stopped because the system ran out of memory"
+        );
         assert_eq!(failure.details, oom);
 
         let command = format!(
@@ -881,23 +888,23 @@ mod tests {
         for (raw, summary) in [
             (
                 "Provider exited with signal: 9 (SIGKILL)",
-                "Claude was force-stopped",
+                "Claude Code was force-stopped",
             ),
             (
                 "Provider exited with signal: 6 (SIGABRT) (core dumped)",
-                "Claude crashed",
+                "Claude Code crashed",
             ),
             (
                 "Provider exited with signal: 15 (SIGTERM)",
-                "Claude was stopped",
+                "Claude Code was stopped",
             ),
             (
                 "Provider exited with signal: 40",
-                "Claude stopped unexpectedly",
+                "Claude Code stopped unexpectedly",
             ),
             (
                 "Provider exited with exit status: 3. Last ignored output: boom",
-                "Claude quit unexpectedly with code 3",
+                "Claude Code quit unexpectedly with code 3",
             ),
         ] {
             let failure = Failure::parse(Provider::Claude, raw).unwrap();
