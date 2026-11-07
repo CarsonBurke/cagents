@@ -5,7 +5,7 @@ use crate::process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProc
 use std::{
     fs,
     io::Write,
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     time::Duration,
 };
 
@@ -32,15 +32,8 @@ pub(crate) fn isolated_fixture_case(qualified: &str) -> bool {
         }
         return false;
     }
-    let private = |prefix: &str| {
-        tempfile::Builder::new()
-            .prefix(prefix)
-            .permissions(fs::Permissions::from_mode(0o700))
-            .tempdir()
-            .unwrap()
-    };
-    let runtime = private("cagents-pr-runtime-");
-    let data = private("cagents-pr-data-");
+    let runtime = crate::test_fixture::tempdir_with_prefix("cagents-pr-runtime-").unwrap();
+    let data = crate::test_fixture::tempdir_with_prefix("cagents-pr-data-").unwrap();
     let mut command = CommandSpec::new(std::env::current_exe().unwrap())
         .args([
             case,
