@@ -1084,6 +1084,9 @@ impl Prepared {
                     .clone(),
             );
             previous.prepared_tools.clone_from(&self.prepared_tools);
+            // The retained item now names the new content, so a title read
+            // from the old one must not pass for it.
+            previous.title = None;
             *cached = CachedItem::updated(
                 &self
                     .request
