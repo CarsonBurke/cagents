@@ -1165,17 +1165,20 @@ restarts forever, outliving a `timeout` on its parent. So scripts here name
 needs it there. `scripts/cargo-gate` also sets `MISE_DATA_DIR` from the shims directory
 on `PATH`, so what it runs can move `HOME` without that loop.
 
-Separately, in a terminal, a shim started under a `mise.toml` that mise has not been told
-to trust stops at mise's trust prompt and waits for an answer. The gate's own helpers no
-longer reach it, but `scripts/cargo-gate exec python3` and a bare `python3` still do.
-The gate does not answer for you, because trusting a checkout's configuration is your
-decision. Run `mise trust` in a new worktree, or take the shims off `PATH`. Without a
-terminal mise skips the untrusted file instead, so a tool only that file pins, such as
-`zig`, fails at once with `No version is set for shim`.
+Separately, a shim under a `mise.toml` that mise has not been told to trust stops at
+mise's trust prompt and waits for an answer whenever its stderr is a terminal, even with
+stdin from `/dev/null` or stdout piped. The gate's own helpers no longer reach it, but
+`scripts/cargo-gate exec python3` and a bare `python3` still do. The gate does not answer
+for you, because trusting a checkout's configuration is your decision. Run `mise trust`
+in a new worktree, and in the checkout above it if that isn't trusted either. Taking
+the shims off `PATH` also avoids the prompt, but removes the tools only they provide,
+such as `zig`. With stderr elsewhere mise skips the untrusted file instead, so a tool
+only that file pins can fail at once with `No version is set for shim`.
 
-A harness of your own that moves `HOME` should take the shims off `PATH`. mise keeps its
-trust list under `HOME`, so setting `MISE_DATA_DIR` stops the loop but not the prompt.
-Run it in a systemd scope with a time limit too, which stops everything it started.
+A harness of your own that moves `HOME` should take the shims off `PATH` and name the
+tools it needs by their real paths. mise keeps its trust list under `HOME`, so setting
+`MISE_DATA_DIR` stops the loop but not the prompt. Run it in a systemd scope with a time
+limit too, which stops everything it started.
 
 ## Standalone editor
 

@@ -337,11 +337,11 @@ class ScriptsNameTheirPython(unittest.TestCase):
         ("cargo-offload", 'return ["python3", "-c", BOOTSTRAP, encoded]'),
         ("cargo-offload", 'RUNNER = ["python3", "-c",'),
     }
-    bare = re.compile(r"(?<![\w/.-])python3?(?![\w.-])")
+    bare = re.compile(r"(?<![\w/.-])python3?(?:\.\d+)?(?![\w.-])")
 
     def test_no_script_finds_python_on_path(self):
         found = []
-        for script in sorted((ROOT / "scripts").iterdir()):
+        for script in sorted((ROOT / "scripts").rglob("*")):
             if not script.is_file():
                 continue
             try:
