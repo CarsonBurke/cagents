@@ -487,7 +487,9 @@ impl Runtime {
                 preview.push(design::caption(description.to_owned()).into());
             }
         }
-        preview.extend(cached.preview.tail_view());
+        if !coordinated.is_some_and(|coordinated| coordinated.reading.output_is_agent_states()) {
+            preview.extend(cached.preview.tail_view());
+        }
         line.push(
             widget::column::with_children(preview)
                 .spacing(GAP_XS)
