@@ -265,8 +265,10 @@ impl<'a> Failure<'a> {
                 "The system stopped the agent to keep the computer responsive. Free up memory before you resume the conversation.",
             ),
             FailureKind::CommandOutOfMemory => (
-                "A command was stopped because the system ran out of memory".to_owned(),
-                "The system stopped the command that was using the most memory. The agent is still running and sees that the command failed.",
+                // Its step reads "failed", as the agent reported it: this
+                // says why, in the same word.
+                "A command failed because the system ran out of memory".to_owned(),
+                "The system stopped the command that was using the most memory. The agent is still running and sees the failure.",
             ),
             FailureKind::Exited => (
                 exit_summary(program, &signal),
@@ -879,6 +881,11 @@ mod tests {
         );
         let failure = Failure::parse(Provider::Codex, &command).unwrap();
         assert_eq!(failure.kind, FailureKind::CommandOutOfMemory);
+        // The stopped command's step reads "failed"; the card agrees.
+        assert_eq!(
+            failure.summary,
+            "A command failed because the system ran out of memory"
+        );
         assert!(
             failure.action.contains("still running"),
             "{}",
