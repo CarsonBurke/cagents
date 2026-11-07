@@ -996,9 +996,16 @@ impl Residence {
                     } else {
                         DetachedWork::Stop
                     };
+                    // A server its launcher started is the provider's own.
+                    let server: Vec<i32> = self
+                        .recovery
+                        .server_process
+                        .iter()
+                        .map(|server| server.pid)
+                        .collect();
                     match self
                         .child
-                        .decide_detached(detached)
+                        .decide_detached(detached, &server)
                         .map_err(|error| error.to_string())
                         .and_then(|()| self.release())
                     {
@@ -2889,7 +2896,14 @@ exec /bin/sleep 60
         }
         let detached = Process::read(detached).unwrap();
         let running = Process::read(running).unwrap();
+        let holder_process = holder.identity.record.holder.clone();
         holder.close_inner(false, DetachedWork::Spare).unwrap();
+        // Through the holder's own exit, after its last teardown.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while holder_process.is_current() {
+            assert!(Instant::now() < deadline, "the holder did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         assert!(
             !running.is_current(),
             "a running command stops with the provider"

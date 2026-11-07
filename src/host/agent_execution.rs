@@ -1012,7 +1012,8 @@ pub(super) fn close_lost_agent_from_pane(
 /// leaves it running: they may have asked for it. An agent nobody attends, an
 /// automation's or one a session started until a person takes part in it,
 /// stops it, so unattended runs do not leave processes behind. Decided at the
-/// close, since a person can take part after launch. An unreadable registry
+/// close, since a person can take part after launch. Without the optional
+/// agent registry no conversation is an agent; an agent that cannot be read
 /// keeps the stop every close made before.
 pub(super) fn detached_work_on_close(
     host: &SharedHost,

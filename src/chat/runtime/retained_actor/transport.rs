@@ -3290,6 +3290,12 @@ impl Server {
                         DetachedWork::Stop
                     });
                     self.actor.close()?;
+                    // A provider something else killed, such as the system
+                    // for memory, leaves nothing to spare: what it left would
+                    // hold the memory it needed.
+                    if self.actor.provider_was_force_stopped() {
+                        self.spared = Some(Default::default());
+                    }
                     reap_orphans(self.spared())?;
                     self.finish_inputs();
                 }

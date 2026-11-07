@@ -642,7 +642,11 @@ impl LocalHandle {
                         .flatten()
                         .and_then(|s| s.code());
                     child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
-                    if let Err(error) = child.terminate() {
+                    let result = child.terminate();
+                    if child.force_stopped == Some(true) {
+                        detached_work.force_stopped();
+                    }
+                    if let Err(error) = result {
                         direct_closed = false;
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(format!("Provider cleanup is unconfirmed: {error}"));
@@ -1459,6 +1463,12 @@ impl LocalHandle {
         self.0.detached_work.decide(detached);
     }
 
+    /// Whether teardown found the provider killed by something outside
+    /// cagents. Known once the provider's teardown has run.
+    pub(crate) fn provider_was_force_stopped(&self) -> bool {
+        self.0.detached_work.was_force_stopped()
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -1784,8 +1794,16 @@ fn spawn_provider(
 /// direct provider's leaves that work running unless the provider was
 /// force-stopped, and a native holder stops it with the provider.
 #[derive(Default)]
-struct DetachedDecision(std::sync::atomic::AtomicU8);
+struct DetachedDecision(std::sync::atomic::AtomicU8, AtomicBool);
 impl DetachedDecision {
+    /// Something outside cagents killed the provider, such as the system
+    /// for memory: what it left would hold that memory, so nothing is spared.
+    fn force_stopped(&self) {
+        self.1.store(true, Ordering::Release);
+    }
+    fn was_force_stopped(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
     const STOP: u8 = 1;
     const SPARE: u8 = 2;
     fn decide(&self, detached: DetachedWork) {
