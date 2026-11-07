@@ -115,6 +115,7 @@ STUBS = {
         [ -z "${STUB_CARGO_FAILS:-}" ] || exit 101
         printf '%s %s\\n' "$CARGO_TARGET_DIR" "$CARGO_BUILD_JOBS" >> "$STUB_LOG/cargo-env"
         printf '%s\\n' "${CAGENTS_BUILD_SEED:-unset}" >> "$STUB_LOG/cargo-seed"
+        printf '%s\\n' "${CAGENTS_BUILD_REMOTE_LOOPBACK:-unset}" >> "$STUB_LOG/cargo-loopback"
         mkdir -p "$CARGO_TARGET_DIR/dev-runtime"
         for name in cagents cagentsd cagents-ui; do
             cp "$STUB_BIN/fixture-cli" "$CARGO_TARGET_DIR/dev-runtime/$name"
@@ -195,6 +196,8 @@ class Evidence(unittest.TestCase):
             # These fixtures exercise this host's queue; Rust never compiles.
             "CAGENTS_BUILD_REMOTE": "local",
             "CAGENTS_BUILD_INSTALLED_GATE": "",
+            # The disk guard must not start the host's own pruner from a fixture.
+            "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CAGENTS_EVIDENCE_TASK": str(self.task),
             "GIT_CONFIG_GLOBAL": "/dev/null",
         }
@@ -382,15 +385,12 @@ class Evidence(unittest.TestCase):
         subprocess.run(["git", "-C", str(checkout), "add", "staged"], check=True, env=self.env)
         self.assertIn("changed since its build", self.run_tool("start", "after", check=False).stderr)
 
-    def test_a_failed_build_leaves_no_record_from_its_seed_or_last_build(self) -> None:
-        before = self.built("before")
+    def test_a_failed_build_leaves_no_record_from_its_last_build(self) -> None:
         after = self.checkout("after")
-        seed = self.task / "target-before"
-        failed = self.run_tool("build", "after", str(after), "--seed-target", str(seed),
-                               check=False, extra={"STUB_CARGO_FAILS": "1"})
+        failed = self.run_tool("build", "after", str(after), check=False,
+                               extra={"STUB_CARGO_FAILS": "1"})
         self.assertNotEqual(failed.returncode, 0)
         self.assertIn("has not been built", self.run_tool("start", "after", check=False).stderr)
-        self.assertIn(str(before), (seed / "evidence-source").read_text())
         self.run_tool("build", "after", str(after))
         self.assertNotEqual(self.run_tool("build", "after", str(after), check=False,
                                           extra={"STUB_CARGO_FAILS": "1"}).returncode, 0)
@@ -467,73 +467,73 @@ class Evidence(unittest.TestCase):
         (self.logs / "harness-waits").touch()
         self.assert_fails_promptly("build did not compile that")
 
-    def test_a_seed_target_keeps_no_fingerprint_of_the_checkouts_own_crates(self) -> None:
-        probe = self.root / "reflink-probe"
-        probe.touch()
-        if subprocess.run(["cp", "--reflink=always", probe, f"{probe}-copy"],
-                          capture_output=True).returncode != 0:
-            self.skipTest("this file system cannot reflink")
-        self.built("before")
-        seed = self.task / "target-before"
-        fingerprints = seed / "debug/.fingerprint"
-        (fingerprints / "cagents-0a1b").mkdir(parents=True)
-        (fingerprints / "zstd-sys-2c3d").mkdir()
-        after = self.checkout("after")
-        (after / "Cargo.lock").write_text(
-            '[[package]]\nname = "cagents"\nversion = "0.1.0"\n\n'
-            '[[package]]\nname = "zstd-sys"\nversion = "2.0.0"\n'
-            'source = "registry+https://github.com/rust-lang/crates.io-index"\n'
-        )
-        self.run_tool("build", "after", str(after), "--seed-target", str(seed))
-        copied = self.task / "target-after/debug/.fingerprint"
-        self.assertEqual(sorted(path.name for path in copied.iterdir()), ["zstd-sys-2c3d"])
-        self.assertTrue((fingerprints / "cagents-0a1b").is_dir())
+    def test_builds_use_the_build_hosts_shared_slots(self) -> None:
+        self.built()
+        # These fixtures build locally; on the build host the gate leases a slot.
+        self.assertEqual(set((self.logs / "cargo-loopback").read_text().split()), {"1"})
+        # Nothing copies a seed into the task any more, and saying so is enough.
+        before = self.checkout("before")
+        result = self.run_tool("build", "before", str(before), "--seed-target",
+                               str(self.task / "target-after"))
+        self.assertIn("ignoring --seed-target", result.stderr)
+        self.assertEqual(sorted(path.name for path in self.task.glob("target-*")),
+                         ["target-after", "target-before"])
+        self.assertFalse((self.task / "target-before/debug").exists())
 
-    def test_a_seed_target_with_only_executables_is_still_a_seed(self) -> None:
-        # What an offloaded build leaves here: its executables come back, its fingerprints don't.
-        probe = self.root / "reflink-probe"
-        probe.touch()
-        if subprocess.run(["cp", "--reflink=always", probe, f"{probe}-copy"],
-                          capture_output=True).returncode != 0:
-            self.skipTest("this file system cannot reflink")
-        self.built("before")
-        seed = self.task / "target-before"
-        self.assertEqual(list(seed.rglob(".fingerprint")), [])
-        after = self.checkout("after")
-        (after / "Cargo.lock").write_text('[[package]]\nname = "cagents"\nversion = "0.1.0"\n')
-        self.run_tool("build", "after", str(after), "--seed-target", str(seed))
-        self.assertTrue((self.task / "target-after").is_dir())
-        self.assertFalse((self.task / "target-after.partial").exists())
+    def test_a_build_with_too_little_disk_is_refused_before_it_starts(self) -> None:
+        # Slot builds skip the gate's own disk guard, so the tool runs it.
+        checkout = self.checkout()
+        result = self.run_tool("build", "after", str(checkout), check=False, extra={
+            "CAGENTS_BUILD_FREE_FLOOR_GIB": "999999999", "CAGENTS_BUILD_PRUNE": "true"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refusing to build", result.stderr)
+        self.assertFalse((self.logs / "cargo").exists())
 
-    def test_a_relative_seed_target_is_the_callers_not_the_checkouts(self) -> None:
-        # The build runs from the checkout, inside the gate's hold.
-        probe = self.root / "reflink-probe"
-        probe.touch()
-        if subprocess.run(["cp", "--reflink=always", probe, f"{probe}-copy"],
-                          capture_output=True).returncode != 0:
-            self.skipTest("this file system cannot reflink")
-        self.built("before")
-        after = self.checkout("after")
-        (after / "Cargo.lock").write_text('[[package]]\nname = "cagents"\nversion = "0.1.0"\n')
-        self.run_tool("build", "after", str(after), "--seed-target", "target-before", cwd=self.task)
-        self.assertTrue((self.task / "target-after").is_dir())
-
-    def test_a_failed_seed_copy_cannot_pass_as_the_seeds_build(self) -> None:
-        if os.geteuid() == 0:
-            self.skipTest("root reads the unreadable file")
-        self.built("before")
-        seed = self.task / "target-before"
-        unreadable = seed / "unreadable"
-        unreadable.write_text("x")
-        unreadable.chmod(0)
-        self.addCleanup(unreadable.chmod, 0o600)
-        after = self.checkout("after")
-        result = self.run_tool("build", "after", str(after), "--seed-target", str(seed), check=False)
+    def test_a_build_on_another_host_leaves_this_disk_to_the_gate(self) -> None:
+        # Only its executables come back here, so a full disk here is no
+        # reason to refuse it; the build host's own runs guard its disk.
+        checkout = self.checkout()
+        started = time.monotonic()
+        result = self.run_tool("build", "after", str(checkout), check=False, extra={
+            "CAGENTS_BUILD_REMOTE": "build-host.invalid",
+            "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+            "CAGENTS_BUILD_FREE_FLOOR_GIB": "999999999", "CAGENTS_BUILD_PRUNE": "true"})
+        self.assertNotIn("refusing to build", result.stderr)
         self.assertNotEqual(result.returncode, 0)
-        self.assertFalse((self.task / "target-after").exists())
-        started = self.run_tool("start", "after", check=False)
-        self.assertNotEqual(started.returncode, 0)
-        self.assertFalse(self.native_lock.exists() and not self.lock_is_free(self.native_lock))
+        self.assertLess(time.monotonic() - started, 60)
+
+    def test_its_builds_and_sessions_keep_their_target_from_the_pruner(self) -> None:
+        self.built()
+        target = self.task / "target-after"
+        marker = target / ".native-evidence-used"
+        # A build holds the target open, but its Cargo does not: a compiler
+        # daemon that outlived the build would keep it from the pruner forever.
+        self.assertNotIn(str(target), (self.logs / "cargo-fds").read_text())
+        started = time.time() - 1
+        self.run_tool("start", "after")
+        self.assertGreater(marker.stat().st_mtime, started)
+        old = time.time() - 86400
+        pid = (self.task / "session/pid").read_text().strip()
+        self.assertIn(str(target), [os.readlink(f"/proc/{pid}/fd/{fd}")
+                                    for fd in os.listdir(f"/proc/{pid}/fd")])
+        # Its errors still reach the log that start names.
+        self.assertEqual(os.readlink(f"/proc/{pid}/fd/2"), str(self.task / "logs/session-after.log"))
+        # Only the supervisor holds it: a process the session leaves behind must not.
+        self.assertNotIn(str(target), (self.logs / "kwin-fds").read_text())
+        os.utime(marker, (old, old))
+        self.run_tool("stop")
+        # Unused from when the session ended.
+        self.assertGreater(marker.stat().st_mtime, old)
+
+    def test_a_target_pruned_before_its_session_starts_says_to_build_again(self) -> None:
+        checkout = self.built()
+        shutil.rmtree(self.task / "target-after")
+        result = self.run_tool("start", "after", check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("after has not been built, or its unused build was reclaimed; "
+                      "run: build after CHECKOUT", result.stderr)
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
 
     def test_a_runner_that_exits_fails_at_once_and_releases(self) -> None:
         self.built()

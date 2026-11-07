@@ -119,7 +119,8 @@ A checkout whose Cargo build directory has never been built is first seeded
 from the main checkout's with scripts/seed-build-dir. Every few hours, and
 at once when the file system holding build directories runs low,
 scripts/build-disk-guard runs scripts/prune-build-dirs, which removes Cargo
-build output nothing has used for a week; below a floor it refuses the build.
+build output nothing has used for a week, and native-evidence builds unused
+for 12 hours; below a floor it refuses the build.
 
 Environment:
   CAGENTS_BUILD_REMOTE   Host that compiles (default fw16); `local` builds here
@@ -130,6 +131,9 @@ Environment:
                          memory and CPU allow), Cargo jobs for each (default:
                          its CPUs shared among the running builds), and the
                          free space below which it builds nothing (40 GiB)
+  CAGENTS_BUILD_REMOTE_LOOPBACK=1
+                         On the build host itself, build in its shared
+                         slots, as another host would, rather than here
   CAGENTS_BUILD_INSTALLED_GATE
                          The installed gate a checkout's older gate defers
                          to (default /var/tmp/cagents-cargo-gate); empty

@@ -333,7 +333,7 @@ class TestLib(unittest.TestCase):
                                  ["--apply", "--max-idle", "7", "--lock", pruner + ".lock",
                                   "--log", pruner + ".tsv", "--stamp", pruner + ".scheduled",
                                   "--keep", str(self.root / "owned-build"),
-                                  "--orphan-hours", "0", "--budget", "300", "--wait"])
+                                  "--orphan-hours", "0", "--evidence-hours", "1", "--budget", "300", "--wait"])
                 self.assertEqual(self.events("disk")[0]["arguments"], ["-Pk", "--", str(self.root)])
                 self.assertFalse(Path(str(self.lock) + ".queue").exists(), "guard must refuse before admission")
                 self.assert_no_test()

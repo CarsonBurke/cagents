@@ -2110,7 +2110,11 @@ fn unsupported_native_transaction_refuses_before_any_checkout_effect() {
         .apply(&fixture.prepare(&fixture.request(new)))
         .unwrap_err();
     assert_eq!(failure.kind, PrCheckoutFailureKind::Refused);
-    assert!(failure.detail.contains("unavailable"));
+    assert!(
+        failure.detail.contains("unavailable"),
+        "unexpected detail: {}",
+        failure.detail
+    );
     assert_eq!(fs::read(fixture.root.join("file")).unwrap(), b"old\n");
     assert_eq!(
         git_text(&fixture.root, &["rev-parse", "HEAD"]),
