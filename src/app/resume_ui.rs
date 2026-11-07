@@ -1168,12 +1168,23 @@ fn prepared_resume_matches(source: &chat::Session, prepared: &chat::Session) -> 
     {
         return false;
     }
+    // A thread that had a listener of its own resumes on one the daemon
+    // allocated for the successor's identity, never on the old one.
+    if source.owns_codex_listener() != prepared.owns_codex_listener() {
+        return false;
+    }
     let mut expected = source.clone();
     expected.reset_owned_codex_listener();
     expected.id = prepared.id;
     expected.proof = None;
     expected.terminal = None;
-    &expected == prepared
+    let mut shape = prepared.clone();
+    if prepared.owns_codex_listener()
+        && prepared.native_continuity == chat::NativeContinuity::ReconnectOnly
+    {
+        shape.reset_owned_codex_listener();
+    }
+    expected == shape
 }
 
 /// Indices of the rows matching `query` within `scope`.
@@ -1421,6 +1432,77 @@ mod tests {
         assert_ne!(session.id, source.id);
         assert_eq!(session.launch, source.launch);
         assert!(app.resume_ui.error.is_none());
+    }
+
+    /// The daemon resumes a Codex thread that had a listener of its own on a
+    /// listener allocated for the successor, as `ChatPrepareResume` does. The
+    /// picker prepares only sources that retain their provider; a paired
+    /// durable one is not the stranded-card successor shape, so this check is
+    /// the one that admits it.
+    #[test]
+    fn codex_thread_with_its_own_listener_resumes_on_the_successors_listener() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = saved(directory.path()).session;
+        source.launch.provider = Provider::Codex;
+        source.launch.recipe.program = "codex".into();
+        source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        source.launch.session_id = None;
+        let allocator = source.proof.clone().unwrap();
+        assert!(source.claim_owned_codex_listener(Path::new("/run/old"), &allocator));
+        source.launch.session_id = Some("019a0000-0000-7000-8000-000000000001".into());
+        source.native_continuity = chat::NativeContinuity::Durable {
+            provider_version: "0.162.0".into(),
+        };
+        source.terminal = Some(
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                source.id,
+                source.launch.recipe.clone(),
+                None,
+            )
+            .session,
+        );
+        assert!(source.native_continuity.retains_provider());
+        assert!(source.has_valid_native_continuity());
+        let current = crate::model::HostSessionProof {
+            host_session_id: "current-owner".into(),
+            boot_id: "fixture-boot".into(),
+            host_incarnation: "current-incarnation".into(),
+        };
+        let mut prepared = source.clone();
+        prepared.reset_owned_codex_listener();
+        prepared.id = TerminalId::new();
+        prepared.proof = None;
+        prepared.terminal = None;
+        let shared = prepared.clone();
+        assert!(prepared.claim_codex_listener_for_resume(Path::new("/run/new"), &current));
+        assert!(!chat::is_retained_resume_successor(&source, &prepared));
+        assert!(prepared_resume_matches(&source, &prepared));
+        // Without a listener of its own a known thread would join the
+        // account's shared server instead.
+        assert!(!prepared_resume_matches(&source, &shared));
+        let mut kept = source.clone();
+        kept.id = prepared.id;
+        kept.proof = None;
+        kept.terminal = None;
+        assert!(!prepared_resume_matches(&source, &kept));
+        let mut other = prepared.clone();
+        other.launch.session_id = Some("019a0000-0000-7000-8000-000000000002".into());
+        assert!(!prepared_resume_matches(&source, &other));
+        // Continuity is learned again from the holder the start installs.
+        let mut durable = prepared.clone();
+        durable.native_continuity = source.native_continuity.clone();
+        assert!(!prepared_resume_matches(&source, &durable));
+        // A thread that had no listener of its own is not given one, and a
+        // listener the successor does not own is not normalized away.
+        let mut unowned = source.clone();
+        unowned.reset_owned_codex_listener();
+        assert!(!prepared_resume_matches(&unowned, &prepared));
+        assert!(prepared_resume_matches(&unowned, &shared));
+        let mut stray = shared.clone();
+        stray.owned_codex_listener = prepared.owned_codex_listener.clone();
+        assert!(!stray.owns_codex_listener());
+        assert!(!prepared_resume_matches(&source, &stray));
+        assert!(!prepared_resume_matches(&unowned, &stray));
     }
 
     #[test]

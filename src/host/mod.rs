@@ -717,7 +717,10 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
-            chat.close().and_then(|()| {
+            // A durable holder keeps its cleanup receipt: the next daemon
+            // proves this close from it and reopens the pane as a successor,
+            // which nothing else can after the holder is gone.
+            chat.close_for_resume().and_then(|()| {
                 if !upgrading {
                     // Closing the provider leaves its retained helper alive
                     // until final outcomes are durably committed and ACKed.

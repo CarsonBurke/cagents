@@ -1279,8 +1279,13 @@ fn restore(
         session.native_continuity,
         super::NativeContinuity::RetainedClaudeActor { .. }
     ) && session.launch.provider == crate::agent::Provider::Claude
+        || matches!(
+            session.native_continuity,
+            super::NativeContinuity::Durable { .. }
+        ) && session.launch.provider == crate::agent::Provider::Codex
+            && session.terminal.is_none()
     {
-        return resume_retained_claude(
+        return resume_retained(
             stream,
             codec,
             attach_request,
@@ -1321,8 +1326,9 @@ fn restore(
         execution_environment,
     })
 }
-/// A retained Claude card whose helper no daemon hosts any more, typically
-/// because an application update or crash outlived it.
+/// A retained Claude or durable Codex card whose helper no daemon hosts any
+/// more, typically because an application update, a daemon restart or a
+/// crash outlived it.
 ///
 /// Its conversation is still on disk, so the card asks the daemon for the same
 /// proof-checked successor the resume picker uses: the daemon only prepares
@@ -1334,7 +1340,7 @@ fn restore(
 /// A card that never learned its conversation ID resumes the one the daemon
 /// proves its ended actor confirmed, or starts one in place when the daemon
 /// proves that actor confirmed none; it never becomes a draft.
-fn resume_retained_claude(
+fn resume_retained(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
     attach_request: &mut u64,
@@ -3966,6 +3972,105 @@ mod tests {
         assert!(super::super::is_retained_resume_commit(&source, &started));
         started.launch.recipe.arguments.push("--other".into());
         assert!(!super::super::is_retained_resume_commit(&source, &started));
+    }
+
+    fn stranded_durable_codex() -> Session {
+        let mut source = omp_card(
+            Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            Some(host_proof("previous")),
+        );
+        source.launch.provider = crate::agent::Provider::Codex;
+        source.launch.recipe.program = "codex".into();
+        source.launch.recipe.arguments = vec!["--remote".into(), "unix://".into()];
+        let allocator = source.proof.clone().unwrap();
+        assert!(
+            source.claim_codex_listener_for_resume(std::path::Path::new("/run/old"), &allocator)
+        );
+        source.native_continuity = super::super::NativeContinuity::Durable {
+            provider_version: "0.157.1".into(),
+        };
+        assert!(source.has_valid_native_continuity());
+        source
+    }
+
+    #[test]
+    fn stranded_durable_codex_card_starts_the_daemon_prepared_successor() {
+        let source = stranded_durable_codex();
+        let (result, resumed, asked) = resume_stranded(source.clone(), |source| {
+            let mut successor = source.clone();
+            successor.reset_owned_codex_listener();
+            successor.id = TerminalId::new();
+            successor.proof = None;
+            assert!(successor.claim_codex_listener_for_resume(
+                std::path::Path::new("/run/new"),
+                &host_proof("current")
+            ));
+            ServerMessage::Response {
+                response: ServerResponse::ChatResumePrepared { session: successor },
+            }
+        });
+        let Ok(ClientRequest::ChatStart {
+            session,
+            source: None,
+            terminate_source: false,
+            ..
+        }) = result
+        else {
+            panic!("a proved successor must be started: {result:?}");
+        };
+        assert_eq!(asked, 2, "upgrade lineage, then resume preparation");
+        assert_ne!(session.id, source.id);
+        assert_eq!(session.launch.session_id, source.launch.session_id);
+        assert!(session.owns_codex_listener());
+        assert_eq!(
+            session.launch.recipe.arguments,
+            [
+                "--remote".to_owned(),
+                format!("unix:///run/new/cagents-codex-{}/control.sock", session.id)
+            ],
+            "the old allocation's listener is not reused"
+        );
+        assert_eq!(resumed.as_ref(), Some(&source));
+        // Its start proves it and installs a holder.
+        let mut started = session.clone();
+        started.proof = Some(host_proof("current"));
+        assert!(super::super::is_retained_resume_commit(&source, &started));
+        started.native_continuity = source.native_continuity.clone();
+        assert!(super::super::is_retained_resume_commit(&source, &started));
+        let mut other_thread = started.clone();
+        other_thread.launch.session_id = Some("cccccccc-cccc-4ccc-8ccc-cccccccccccc".into());
+        assert!(!super::super::is_retained_resume_commit(
+            &source,
+            &other_thread
+        ));
+        let mut foreign = started.clone();
+        foreign.owned_codex_listener.as_mut().unwrap().socket = "/run/new/elsewhere.sock".into();
+        assert!(!super::super::is_retained_resume_commit(&source, &foreign));
+        // A successor that kept the old listener, joins the shared server, or
+        // changed anything else, is not the daemon's resume.
+        let mut kept = source.clone();
+        kept.id = TerminalId::new();
+        kept.proof = None;
+        assert!(!super::super::is_retained_resume_successor(&source, &kept));
+        let mut shared = session.clone();
+        shared.reset_owned_codex_listener();
+        assert!(!super::super::is_retained_resume_successor(
+            &source, &shared
+        ));
+        let mut paired = source.clone();
+        paired.terminal = Some(
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                paired.id,
+                paired.launch.recipe.clone(),
+                None,
+            )
+            .session,
+        );
+        let mut successor = session.clone();
+        successor.terminal = None;
+        assert!(!super::super::is_retained_resume_successor(
+            &paired, &successor
+        ));
     }
 
     #[test]

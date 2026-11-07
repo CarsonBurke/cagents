@@ -730,11 +730,14 @@ pub fn is_upgrade_recovery(source: &Session, replacement: &Session) -> bool {
 }
 
 /// Whether `successor` is exactly the daemon's prepared resume of the stranded
-/// retained Claude card `source`: the same conversation, launch and account
-/// under a new allocation with no ownership proof yet. This shape is
-/// no authority by itself; only an authenticated `ChatPrepareResume` answer on
-/// the same daemon stream may produce one.
+/// retained Claude or durable Codex card `source`: the same conversation,
+/// launch and account under a new allocation with no ownership proof yet. This
+/// shape is no authority by itself; only an authenticated `ChatPrepareResume`
+/// answer on the same daemon stream may produce one.
 pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bool {
+    if source.launch.provider == Provider::Codex {
+        return is_durable_codex_resume_successor(source, successor);
+    }
     let valid = |id: &String| uuid::Uuid::parse_str(id).is_ok();
     // A pane whose actor never reported its conversation resumes the one the
     // daemon proved that actor confirmed, or, when it confirmed none, starts
@@ -762,6 +765,28 @@ pub fn is_retained_resume_successor(source: &Session, successor: &Session) -> bo
         && successor.terminal.is_none()
         && successor.owned_codex_listener.is_none()
         && successor.native_continuity == NativeContinuity::ReconnectOnly
+}
+
+/// A durable Codex card whose holder closed resumes its exact thread under a
+/// new allocation. Its listener belonged to the old allocation, so the daemon
+/// gives the successor a listener of its own at the successor's path, and it
+/// learns its continuity again from the holder its start installs.
+fn is_durable_codex_resume_successor(source: &Session, successor: &Session) -> bool {
+    if !matches!(source.native_continuity, NativeContinuity::Durable { .. })
+        || !source.has_valid_native_continuity()
+        || source.terminal.is_some()
+        || successor.id == source.id
+        || !successor.owns_codex_listener()
+    {
+        return false;
+    }
+    let mut expected = source.clone();
+    expected.reset_owned_codex_listener();
+    expected.id = successor.id;
+    expected.proof = None;
+    let mut prepared = successor.clone();
+    prepared.reset_owned_codex_listener();
+    expected == prepared
 }
 
 /// Whether `started` is the daemon's started form of a prepared resume
@@ -1052,6 +1077,21 @@ impl Session {
         }
         self.owned_codex_listener = None;
         self.native_continuity = NativeContinuity::ReconnectOnly;
+    }
+
+    /// Give a resume successor of an owned-listener Codex thread a listener of
+    /// its own under `root`, as a new thread asks for one. Only the daemon
+    /// preparing that successor chooses `root`; the old allocation's endpoint
+    /// is never reused under the new identity.
+    pub(crate) fn claim_codex_listener_for_resume(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        let thread = self.launch.session_id.take();
+        let claimed = self.claim_owned_codex_listener(root, allocator);
+        self.launch.session_id = thread;
+        claimed
     }
 
     /// Whether `started` is this new Codex thread as the daemon started it.

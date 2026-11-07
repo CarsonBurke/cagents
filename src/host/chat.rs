@@ -2849,10 +2849,22 @@ fn process_inner(
                 .as_ref()
                 .and_then(|terminal| terminal.recovery_origin);
             let mut session = source;
+            let owned_listener = session.owns_codex_listener();
             session.reset_owned_codex_listener();
             session.id = TerminalId::new();
             session.proof = None;
             session.terminal = None;
+            // A bare `unix://` remote on a known thread joins the account's
+            // shared Codex server. A thread that had a listener of its own
+            // keeps one, allocated for the successor's identity.
+            if owned_listener
+                && session.launch.session_id.is_some()
+                && !session.claim_codex_listener_for_resume(&std::env::temp_dir(), &proof)
+            {
+                return Err(unavailable(
+                    "The reopened Codex conversation could not be given its own listener; no replacement was started.",
+                ));
+            }
             // The old owner's close is proved, so the reopened conversation
             // takes over its lineage, unless another of its sessions runs.
             if let Ok(registry) = super::agent_execution::registry(host) {
