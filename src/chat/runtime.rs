@@ -1770,6 +1770,9 @@ struct ChildGuard {
     directory: Option<Arc<std::fs::File>>,
     /// The provider's cgroup scope, when the OS user manager provided one.
     scope: Option<crate::daemon::process_scope::ProviderScope>,
+    /// Whether the provider had been force-stopped, settled by the first
+    /// teardown: a retry must not take cagents' own `SIGKILL` for one.
+    force_stopped: Option<bool>,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
 }
@@ -1856,6 +1859,7 @@ impl ChildGuard {
             child,
             identity,
             terminated: false,
+            force_stopped: None,
             directory: None,
             scope: None,
             _registration: registration,
@@ -1925,8 +1929,10 @@ impl ChildGuard {
         // Something outside cagents force-stopped the provider, such as the
         // system for memory: a closed or finished chat is not, whether or
         // not it ignores the signals below.
-        let force_stopped = ended.is_some_and(|status| {
-            std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL)
+        let force_stopped = *self.force_stopped.get_or_insert_with(|| {
+            ended.is_some_and(|status| {
+                std::os::unix::process::ExitStatusExt::signal(&status) == Some(libc::SIGKILL)
+            })
         });
         let pid = self.child.id() as i32;
         let signal_group = |signal| {
@@ -9201,7 +9207,12 @@ for line in sys.stdin:
                 stat.rsplit_once(") ").unwrap().1.starts_with('Z')
             })
         }
-        for (case, then) in [("closed", "read done"), ("finished", "read done; exit 0")] {
+        for (case, before, after) in [
+            ("closed", "", ""),
+            // cagents' own escalation to SIGKILL is not a forced stop.
+            ("closed while ignoring SIGTERM", "trap '' TERM; ", ""),
+            ("finished", "", "; exit 0"),
+        ] {
             let spec = ProcessSpec {
                 stdout_noise: None,
                 execution: None,
@@ -9210,7 +9221,11 @@ for line in sys.stdin:
                 program: "/bin/sh".into(),
                 arguments: vec![
                     "-c".into(),
-                    format!("read go; setsid sleep 300 & echo $!; {then}"),
+                    // The command reports its PID once it has left the
+                    // provider's process group, which teardown signals.
+                    format!(
+                        "read go; {before}setsid sh -c 'echo $$; exec sleep 300' & read done{after}"
+                    ),
                 ],
                 working_directory: std::env::current_dir().unwrap(),
                 environment: Default::default(),
@@ -9231,9 +9246,8 @@ for line in sys.stdin:
             let mut stdin = provider.child.stdin.take().unwrap();
             writeln!(stdin, "go").unwrap();
             let mut line = String::new();
-            std::io::BufReader::new(provider.child.stdout.take().unwrap())
-                .read_line(&mut line)
-                .unwrap();
+            let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
+            stdout.read_line(&mut line).unwrap();
             let detached: u32 = line.trim().parse().unwrap();
             if case == "finished" {
                 writeln!(stdin, "done").unwrap();
