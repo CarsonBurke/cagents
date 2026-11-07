@@ -3529,6 +3529,17 @@ impl Runtime {
             Connection::Live(handle) => Some(handle),
         }
     }
+    /// The current confirmed connection's owner, without issuing a request.
+    pub(super) fn startup_host_proof(&self) -> Option<crate::model::HostSessionProof> {
+        if self.disconnected {
+            return None;
+        }
+        self.handle()
+            .filter(|handle| handle.is_connected())
+            .and_then(|handle| handle.proof())
+            .filter(|proof| proof.is_complete())
+    }
+
     /// Readiness for the updater's saved-pane gate; no provider is launched here.
     pub(super) fn restored_pane_ready(&self) -> Result<bool, String> {
         if self.is_draft() {
@@ -15796,10 +15807,13 @@ mod tests {
         let runtime = app.chat_runtime_mut(target).unwrap();
         runtime.disconnected = true;
         runtime.error = Some("Upgrade replacement changed configuration".into());
+        let reason = app.startup_pane_check().unwrap_err();
+        let title = app.card_display_title(app.card_state(card).unwrap());
         assert!(
-            app.startup_pane_check()
-                .unwrap_err()
-                .contains(&card.to_string())
+            reason.starts_with(&format!(
+                "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+            )),
+            "{reason}"
         );
         assert_eq!(chat_runtime(&app, card).composer.text().trim(), "Draft 99");
         app.chat_runtime_mut(target).unwrap().disconnected = false;
@@ -15825,10 +15839,13 @@ mod tests {
                 card,
                 CardRuntime::Failed("Fixture terminal failed to attach".into()),
             );
+            let reason = app.startup_pane_check().unwrap_err();
+            let title = app.card_display_title(app.card_state(card).unwrap());
             assert!(
-                app.startup_pane_check()
-                    .unwrap_err()
-                    .contains(&card.to_string())
+                reason.starts_with(&format!(
+                    "recovery-incomplete: 1 saved pane could not reconnect: \u{201c}{title}\u{201d}."
+                )),
+                "{program}: {reason}"
             );
             app.cards.remove(&card);
             assert_eq!(
@@ -26962,6 +26979,7 @@ mod tests {
                 >= 512 * 1024
         );
         let old_item = Arc::downgrade(&runtime.snapshot.subagents[0].items[0]);
+        let client_retired = handle.observe_snapshot_retirement_for_test();
         runtime.replace_draft(text_editor::Content::with_text("unsent reader draft"));
         runtime.find = Some("kept query".into());
         runtime.expanded.insert("scratch-owner".into());
@@ -26972,6 +26990,11 @@ mod tests {
         // A live hidden presentation releases the graph and its parser scratch;
         // a draft has no provider transcript to suspend.
         assert!(runtime.cache.is_empty() && runtime.child_cache.is_empty());
+        // The client's publication still holds the old body until it retires
+        // on its own worker, which the presentation barrier does not cover.
+        client_retired
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the hidden client's exact publication must retire");
         assert!(old_item.upgrade().is_none());
         assert_eq!(runtime.snapshot.transcript_bytes(), 0);
         assert_eq!(handle.snapshot().transcript_bytes(), 0);
@@ -30536,6 +30559,9 @@ mod tests {
                 .cache
                 .get("tool")
                 .map(|cached| cached.revision);
+            // The previous iteration's shaping slot is released on the
+            // retirement worker; a dispatch that overtakes it is only deferred.
+            preparation::retirement_barrier();
             let reply = executor.block_on(async {
                 let task = app.handle_chat_action(action);
                 let mut outputs =

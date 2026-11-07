@@ -174,6 +174,12 @@ pub enum Response {
     RemovalPlan(Box<RemovalPlan>),
     Removed(Box<Removed>),
     Snapshots(Vec<SavedSnapshot>),
+    /// The answer to a conversation's pull request subscription, as of
+    /// `revision`.
+    WatchingConversation {
+        revision: u64,
+        pull_requests: Box<ConversationPullRequests>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -491,6 +497,111 @@ pub enum Review {
     Approved,
     ChangesRequested,
     Required,
+}
+
+/// How a conversation came to be associated with a pull request, strongest
+/// first. The order is the ranking: a pull request keeps the strongest
+/// relation any of the conversation's activity gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Relation {
+    /// `gh pr create` (or a forge tool) printed its URL.
+    Created,
+    /// A branch was pushed that the pull request is the head of.
+    Pushed,
+    /// Files were edited in a worktree whose branch the pull request heads.
+    Edited,
+    /// Its branch was checked out, switched to or added as a worktree.
+    CheckedOut,
+    /// Merged, edited, closed, reopened or marked ready.
+    Updated,
+    /// Reviewed or commented on.
+    Reviewed,
+    /// Only named: a URL or `#N` in prose, or a read-only `gh pr view`.
+    Mentioned,
+}
+
+impl Relation {
+    /// Everything stronger than a mention is work the conversation did.
+    pub fn worked_on(self) -> bool {
+        self != Self::Mentioned
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => "Created",
+            Self::Pushed => "Pushed",
+            Self::Edited => "Edited",
+            Self::CheckedOut => "Checked out",
+            Self::Updated => "Updated",
+            Self::Reviewed => "Reviewed",
+            Self::Mentioned => "Mentioned",
+        }
+    }
+}
+
+/// The pull requests one conversation's agents and user worked on or
+/// mentioned, read from its transcript rather than declared, with what the
+/// forge last said about each.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationPullRequests {
+    pub generated_at_unix_ms: u64,
+    /// The repository of the conversation's project, against which `#N`
+    /// resolves; others are named in full.
+    pub repository: Option<crate::github_identity::GitHubRepoKey>,
+    /// Worked-on first, strongest relation first, then most recent.
+    pub pull_requests: Vec<ConversationPullRequest>,
+    pub transcript: TranscriptCoverage,
+    /// Why some pull requests could not be read from GitHub, which then
+    /// show what was last read about them.
+    pub forge_error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationPullRequest {
+    pub repository: crate::github_identity::GitHubRepoKey,
+    pub number: u64,
+    pub relation: Relation,
+    /// Every signal came from a subagent the conversation started.
+    pub by_subagent: bool,
+    /// The head of the branch checked out where the conversation works.
+    pub current_branch: bool,
+    /// What GitHub last said; `None` until it has answered once.
+    pub pull_request: Option<PullRequest>,
+    pub observed_at_unix_ms: Option<u64>,
+}
+
+impl ConversationPullRequest {
+    pub fn url(&self) -> String {
+        match &self.pull_request {
+            Some(pull_request) => pull_request.url.clone(),
+            None => format!(
+                "https://{}/{}/{}/pull/{}",
+                self.repository.authority(),
+                self.repository.owner,
+                self.repository.name,
+                self.number
+            ),
+        }
+    }
+}
+
+/// How much of the conversation's transcript the list was read from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptCoverage {
+    /// Every line the provider has written so far.
+    Complete,
+    /// Not read yet, or no conversation ID has been reported.
+    Pending,
+    /// The transcript is larger than the reader's budget; its newest part
+    /// was read.
+    Partial,
+    /// This provider's transcripts are not read.
+    Unsupported,
+    Unavailable {
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

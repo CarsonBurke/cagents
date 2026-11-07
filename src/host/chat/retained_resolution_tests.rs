@@ -1089,7 +1089,7 @@ fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
             .is_err_and(|error| error.contains("fixture reinstall retirement commit failure"))
     );
     assert!(!fixture.identity.record.root.is_current());
-    assert!(!fixture.identity.record.holder.is_current());
+    assert!(fixture.identity.record.holder.reaped());
     let cleanup_handle = fixture.handle();
     assert!(cleanup_handle.is_close_only());
     let cleanup_source = fixture.host.lock().unwrap().chats[&fixture.original.id]
@@ -1138,7 +1138,7 @@ fn real_retirement_commit_failure_cannot_reinstall_a_completed_cleanup_owner() {
         Some(ownership)
     );
     assert!(!fixture.identity.record.root.is_current());
-    assert!(!fixture.identity.record.holder.is_current());
+    assert!(fixture.identity.record.holder.reaped());
     fixture.no_prompt();
 
     // Remove only this fixture's fault and finish the original cleanup retry;
