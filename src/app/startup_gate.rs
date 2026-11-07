@@ -49,6 +49,9 @@ pub(super) struct State {
     /// The daemon kept its original owners, so no pane reconnects until the
     /// terminal service restarts.
     retained: bool,
+    /// What this window's report said, so a failed update's notice that only
+    /// repeats it is not shown twice.
+    reported_notice: Option<String>,
     /// Terminals the gate is waiting on without anything settling them.
     pub(super) retries: retries::Retries,
     /// Since when a view this window shows has not been admitted.
@@ -159,8 +162,8 @@ impl State {
         }
     }
 
-    pub(super) fn retained(&self) -> bool {
-        self.retained
+    pub(super) fn reported_notice(&self) -> Option<&str> {
+        self.reported_notice.as_deref()
     }
 
     /// Whether the gate accepted a daemon answer, is saving, and has reported.
@@ -175,6 +178,14 @@ impl State {
     pub(in crate::app) fn fixture_ask_again(&mut self) {
         self.inspected = None;
         self.outstanding = None;
+    }
+
+    #[cfg(test)]
+    pub(in crate::app) fn fixture_reported_saying(message: &str) -> Self {
+        Self {
+            reported_notice: Some(message.to_owned()),
+            ..Self::fixture_reported()
+        }
     }
 
     #[cfg(test)]
@@ -1134,6 +1145,7 @@ impl Cagents {
     fn report_startup_failure(&mut self, reason: String, notice: TransientNotice) -> Task<Message> {
         self.startup_gate.retire_inspections();
         self.startup_gate.reported = true;
+        self.startup_gate.reported_notice = Some(notice.message.clone());
         self.status = Some(notice);
         report(Err(reason))
     }
