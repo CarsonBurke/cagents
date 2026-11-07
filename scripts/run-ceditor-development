@@ -12,8 +12,8 @@ case "${1:-}" in
     --review-alerts) alerts=1; shift; [ "${1:-}" != -- ] || shift ;;
     --) shift ;;
 esac
-command -v python3 >/dev/null 2>&1 || {
-    printf '%s\n' 'required command not found: python3 (reads Cargo executable artifacts)' >&2
+[ -x /usr/bin/python3 ] || {
+    printf '%s\n' 'required command not found: /usr/bin/python3 (reads Cargo executable artifacts)' >&2
     exit 1
 }
 if [ "$alerts" = 1 ]; then

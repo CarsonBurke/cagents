@@ -14,7 +14,8 @@ set -eu
 # that is the shims directory of mise's data directory. With HOME or XDG_DATA_HOME
 # moved, as in a fixture, the shim finds itself and re-executes without end. Naming
 # the directory here covers this gate's helpers and whatever moves HOME below it.
-if [ -z "${MISE_DATA_DIR+set}" ]; then
+# mise treats an empty value as unset.
+if [ -z "${MISE_DATA_DIR-}" ]; then
     rest=$PATH:
     while [ -n "$rest" ]; do
         entry=${rest%%:*}

@@ -12,8 +12,8 @@ while [ "$#" -gt 0 ]; do
     shift
 done
 case "$prefix" in /*) ;; *) printf '%s\n' '--prefix must be absolute' >&2; exit 2 ;; esac
-command -v python3 >/dev/null 2>&1 || {
-    printf '%s\n' 'required command not found: python3 (reads Cargo executable artifacts)' >&2
+[ -x /usr/bin/python3 ] || {
+    printf '%s\n' 'required command not found: /usr/bin/python3 (reads Cargo executable artifacts)' >&2
     exit 1
 }
 # Keep host and UI implementation graphs in separate invocations.

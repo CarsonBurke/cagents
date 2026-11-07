@@ -58,6 +58,8 @@ if sys.argv[1] == 'rev-parse': print('fixture-revision')
 assert sys.argv[1:5] == ['--signal=TERM', '--kill-after=5s', '120s',
     str(root / 'configured target/x86_64-unknown-linux-gnu/release/cagents-ui')], sys.argv
 Path(os.environ['CAGENTS_LATENCY_OUTPUT']).write_text('{}\\n')
+with (root / 'ui-environment').open('a') as output:
+    output.write(json.dumps({key: os.environ[key] for key in ('HOME', 'PATH')}) + '\\n')
 """)
         # jq is outside the artifact-routing contract; no performance acceptance
         # is inferred from these synthetic workload files.
@@ -65,6 +67,8 @@ Path(os.environ['CAGENTS_LATENCY_OUTPUT']).write_text('{}\\n')
 if sys.argv[1:3] == ['-er', '.target_directory']:
     print(json.load(sys.stdin)['target_directory'])
 elif sys.argv[1] != '-e': print('{}')
+with (root / 'jq-homes').open('a') as output:
+    output.write(os.environ['HOME'] + '\\n')
 """)
         self.environment = os.environ.copy()
         self.environment.pop("CARGO_BUILD_TARGET", None)
@@ -120,6 +124,20 @@ with Path(os.environ['MOCK_CALLS']).open('a') as output:
         cleanups = [args for tool, args in calls if tool == "product"]
         self.assertEqual(cleanups, [[str(self.products / "cagents"), "daemon", "stop-for-rebuild",
                                      "--including-subagents"]] * 5)
+
+    def test_the_sandbox_reaches_the_product_without_mise_shims(self):
+        shims = self.root / "data/mise/shims"
+        shims.mkdir(parents=True)
+        result = self.run_runner(PATH=f"{shims}:{self.environment['PATH']}")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        runs = [json.loads(line) for line in (self.root / "ui-environment").read_text().splitlines()]
+        self.assertEqual(len(runs), 5)
+        for run in runs:
+            self.assertNotIn(str(shims), run["PATH"].split(os.pathsep))
+            self.assertNotEqual(run["HOME"], self.environment["HOME"])
+        # Its own tools keep the caller's HOME, where a shim works.
+        homes = set((self.root / "jq-homes").read_text().splitlines())
+        self.assertEqual(homes, {self.environment["HOME"]})
 
     def test_each_build_failure_preserves_status_and_stops_before_launch(self):
         for index, name in enumerate(("cagents", "cagentsd", "cagents-ui"), 1):

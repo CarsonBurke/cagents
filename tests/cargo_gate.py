@@ -315,9 +315,48 @@ class ThroughAMiseShim(unittest.TestCase):
 
     def test_a_callers_data_directory_is_theirs(self):
         self.env["HOME"] = str(self.root / "real")
-        self.env["MISE_DATA_DIR"] = str(self.shims.parent)
+        theirs = str(self.root / "their-own-data")
+        self.env["MISE_DATA_DIR"] = theirs
         result = self.gate_runs("sh", "-c", 'echo "$MISE_DATA_DIR"')
-        self.assertEqual(result.stdout.strip(), str(self.shims.parent), result.stderr)
+        self.assertEqual(result.stdout.strip(), theirs, result.stderr)
+
+    def test_an_empty_data_directory_counts_as_unset(self):
+        # As it does to mise, which would keep re-executing.
+        self.env["HOME"] = str(self.root / "real")
+        self.env["MISE_DATA_DIR"] = ""
+        result = self.gate_runs("sh", "-c", f'HOME={self.scratch} python3 -c "print(1)"')
+        self.assertEqual(result.stdout, "1\n", result.stderr)
+
+
+class ScriptsNameTheirPython(unittest.TestCase):
+    """`python3` found on PATH can be a shim, which can re-execute forever or stop to ask."""
+
+    # What cargo-offload starts over SSH on the build host, under that host's own
+    # HOME: no moved HOME there, and its path to Python isn't this host's to name.
+    on_the_build_host = {
+        ("cargo-offload", 'return ["python3", "-c", BOOTSTRAP, encoded]'),
+        ("cargo-offload", 'RUNNER = ["python3", "-c",'),
+    }
+    bare = re.compile(r"(?<![\w/.-])python3?(?![\w.-])")
+
+    def test_no_script_finds_python_on_path(self):
+        found = []
+        for script in sorted((ROOT / "scripts").iterdir()):
+            if not script.is_file():
+                continue
+            try:
+                lines = script.read_text().splitlines()
+            except UnicodeDecodeError:
+                continue
+            if lines and lines[0].startswith("#!") and "python" in lines[0] and not lines[0].startswith("#!/usr/bin/python3"):
+                found.append(f"{script.name}:1: {lines[0]}")
+            for number, line in enumerate(lines, 1):
+                text = line.strip()
+                if text.startswith("#") or (script.name, text) in self.on_the_build_host:
+                    continue
+                if self.bare.search(line):
+                    found.append(f"{script.name}:{number}: {text}")
+        self.assertEqual(found, [], "name /usr/bin/python3; see docs/development.md, Scripts and mise shims")
 
 
 class InstalledGateSync(unittest.TestCase):
