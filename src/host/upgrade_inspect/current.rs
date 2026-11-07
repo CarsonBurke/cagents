@@ -291,6 +291,7 @@ impl Client {
             119,
             ipc::CANDIDATE_LINE_PROTOCOL,
             ipc::STARTUP_STATE_PROTOCOL,
+            ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
             ipc::PROTOCOL_VERSION,
         ]
         .contains(&self.protocol)
@@ -401,6 +402,7 @@ pub(super) fn supports_protocol(protocol: u16) -> bool {
         119,
         ipc::CANDIDATE_LINE_PROTOCOL,
         ipc::STARTUP_STATE_PROTOCOL,
+        ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
         ipc::PROTOCOL_VERSION,
     ]
     .contains(&protocol)
@@ -583,6 +585,7 @@ mod tests {
             119,
             ipc::CANDIDATE_LINE_PROTOCOL,
             ipc::STARTUP_STATE_PROTOCOL,
+            ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
             ipc::PROTOCOL_VERSION,
         ]
         .into()

@@ -512,14 +512,15 @@ fn candidate_can_upgrade_source(
 
 /// Older protocols whose update this release's worker performs itself, so
 /// its own inspector and preflight decide what the update must preserve. The
-/// install candidate line (128) and the set after it (129) are two: their own
-/// workers would apply their older preflight to the panes this release knows
-/// how to qualify.
+/// install candidate line (128) and the sets after it (129, 151) are among them:
+/// their own workers would apply their older preflight to the panes this release
+/// knows how to qualify.
 fn is_bootstrapped_source(protocol: u16) -> bool {
     (matches!(protocol, 77 | 119) && crate::terminal_ipc::PROTOCOL_VERSION > 77)
         || ([
             crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
             crate::terminal_ipc::STARTUP_STATE_PROTOCOL,
+            crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
         ]
         .contains(&protocol)
             && crate::terminal_ipc::PROTOCOL_VERSION > protocol)
@@ -3011,6 +3012,9 @@ finally:
         assert!(is_bootstrapped_source(candidate_line));
         assert!(is_bootstrapped_source(
             crate::terminal_ipc::STARTUP_STATE_PROTOCOL
+        ));
+        assert!(is_bootstrapped_source(
+            crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL
         ));
         assert!(!is_bootstrapped_source(candidate_line - 1));
         assert!(!is_bootstrapped_source(

@@ -722,6 +722,19 @@ impl Registry {
         tx.commit().map_err(|e| e.to_string())
     }
 
+    pub(crate) fn has_agent_launch_for_session(
+        &self,
+        id: crate::model::TerminalId,
+    ) -> Result<bool, String> {
+        self.db
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_launches WHERE session_id = ?1)",
+                [id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|error| error.to_string())
+    }
+
     pub(crate) fn pending_agent_launch(
         &self,
         id: AgentId,
@@ -870,6 +883,42 @@ impl Registry {
             )
             .map_err(|error| error.to_string())?;
         Ok(())
+    }
+
+    /// [`Self::retire_agent_authority`] after confirmed teardown. `by_process`
+    /// also retires a capability recorded for the same process under older
+    /// conversation metadata, as [`Self::retire_agent_process`] does; a close
+    /// that proves its process gone without a receipt has no fresher record.
+    pub(crate) fn retire_agent_process_authority(
+        &mut self,
+        source: &HostedSession,
+        by_process: bool,
+    ) -> Result<(), String> {
+        if !by_process {
+            return self.retire_agent_authority(source);
+        }
+        let tx = self
+            .db
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| error.to_string())?;
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT source FROM agent_authorities WHERE session_id = ?1",
+                [source.id().to_string()],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| error.to_string())?;
+        if let Some(stored) = stored
+            && source.same_process(&decode::<HostedSession>(&stored)?)
+        {
+            tx.execute(
+                "DELETE FROM agent_authorities WHERE session_id = ?1 AND source = ?2",
+                params![source.id().to_string(), stored],
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        tx.commit().map_err(|error| error.to_string())
     }
 
     /// Invoked only after holder authentication and a successful adoption of

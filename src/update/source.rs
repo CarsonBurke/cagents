@@ -189,7 +189,8 @@ impl Client {
         match protocol {
             crate::terminal_ipc::PROTOCOL_VERSION
             | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
-            | crate::terminal_ipc::STARTUP_STATE_PROTOCOL => {
+            | crate::terminal_ipc::STARTUP_STATE_PROTOCOL
+            | crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL => {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -349,6 +350,7 @@ pub(super) fn is_qualified_source(protocol: u16) -> bool {
         77 | 119
             | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
             | crate::terminal_ipc::STARTUP_STATE_PROTOCOL
+            | crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL
             | crate::terminal_ipc::PROTOCOL_VERSION
     )
 }

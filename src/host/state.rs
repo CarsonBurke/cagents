@@ -1337,7 +1337,7 @@ impl HostState {
             .any(|id| *id != predecessor && self.is_live(id))
     }
 
-    fn is_live(&self, id: &TerminalId) -> bool {
+    pub(super) fn is_live(&self, id: &TerminalId) -> bool {
         self.terminals
             .get(id)
             .is_some_and(|record| record.running || !record.handle.is_completed())
@@ -3010,6 +3010,71 @@ fn restore_terminal_execution_authority(
     Ok(())
 }
 
+/// An agent row names the exact descriptor its provider was issued, and
+/// dispatch refuses any other. A relaunched provider has a new descriptor under
+/// the same ID, so move the agent, its console and its delegated authority to
+/// it. Only the previous daemons' checkpointed sources are lineage. The agent
+/// recorded one either as issued or after its provider confirmed the
+/// conversation, and before any console was paired with it: a console is
+/// recorded beside the agent's session, not in it.
+///
+/// A refusal leaves the agent on its previous descriptor, so its next prompt is
+/// refused rather than delivered to an unproved process. It does not fail the
+/// restore: the conversation itself was relaunched and confirmed, and windows
+/// still resolve it through the upgrade aliases.
+fn restore_relaunched_execution_authority(host: &SharedHost, id: TerminalId) {
+    let (registry, successor, sources) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let (Some(registry), Some(record), Some(sources)) = (
+            state.execution_registry.clone(),
+            state.chats.get(&id),
+            state.upgrade_chats.get(&id),
+        ) else {
+            return;
+        };
+        (registry, record.session.clone(), sources.clone())
+    };
+    let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    if let Err(reason) = adopt_relaunched_agent(&mut registry, &sources, successor) {
+        tracing::warn!(session = %id, %reason,
+            "relaunched conversation was restored, but its agent could not be moved to the new provider; the agent keeps its previous descriptor and refuses new prompts");
+    }
+}
+
+fn adopt_relaunched_agent(
+    registry: &mut super::model::Registry,
+    sources: &[crate::upgrade::handoff::ChatSource],
+    successor: crate::chat::Session,
+) -> Result<bool, String> {
+    use crate::agent_execution::HostedSession;
+    let mut retained = Vec::new();
+    for saved in sources {
+        let mut confirmed = saved.source.clone();
+        confirmed.launch.session_id = saved.launch.session_id.clone();
+        for issued in [saved.source.clone(), confirmed] {
+            if issued.terminal.is_some() {
+                let mut unpaired = issued.clone();
+                unpaired.terminal = None;
+                retained.push(HostedSession::Chat(unpaired));
+            }
+            retained.push(HostedSession::Chat(issued));
+        }
+    }
+    // This daemon issued the provider's capability as it started, before a
+    // relaunched paired view replaced the descriptor's terminal.
+    if let Some(HostedSession::Chat(started)) =
+        registry.retained_agent_authority_source(successor.id)?
+        && started.proof == successor.proof
+        && (crate::chat::Session {
+            terminal: successor.terminal.clone(),
+            ..started.clone()
+        }) == successor
+    {
+        retained.push(HostedSession::Chat(started));
+    }
+    registry.adopt_authenticated_agent_session(&retained, &HostedSession::Chat(successor))
+}
+
 pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> {
     let directory = crate::terminal::holder::directory()?;
     let proof = host
@@ -3454,6 +3519,14 @@ fn restore_upgrade_from(
             "Upgrade restore failed: {error}; checkpoint retained at {}",
             store.path.display()
         ));
+    }
+    // Only now is every relaunched provider kept. Moving an agent earlier
+    // would leave it on a descriptor that a failed restore then closes, which
+    // a replay of this checkpoint could no longer recognize.
+    for chat in &checkpoint.chats {
+        if ChatRestore::of(chat) != ChatRestore::Retained {
+            restore_relaunched_execution_authority(host, chat.source.id);
+        }
     }
     let finalized = if interrupted_setups {
         store.archive_interrupted_setup().map(|evidence| {
@@ -4986,6 +5059,8 @@ mod bounded_input_upgrade_tests;
 mod native_upgrade_tests;
 #[cfg(test)]
 mod redraw_identity_tests;
+#[cfg(test)]
+mod relaunch_lineage_tests;
 #[cfg(test)]
 mod retained_child_shutdown_tests;
 #[cfg(test)]

@@ -541,6 +541,7 @@ mod tests {
             119,
             crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
             crate::terminal_ipc::STARTUP_STATE_PROTOCOL,
+            crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
             crate::terminal_ipc::PROTOCOL_VERSION,
         ] {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
@@ -829,6 +830,14 @@ mod tests {
     #[test]
     fn authenticated_startup_state_source_previews_and_prepares_at_its_own_protocol() {
         previews_and_prepares_at_its_own_protocol(crate::terminal_ipc::STARTUP_STATE_PROTOCOL);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn authenticated_inferred_pull_requests_source_previews_and_prepares_at_its_own_protocol() {
+        previews_and_prepares_at_its_own_protocol(
+            crate::terminal_ipc::INFERRED_PULL_REQUESTS_PROTOCOL,
+        );
     }
 
     #[cfg(feature = "host")]

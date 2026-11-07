@@ -202,10 +202,14 @@ use crate::{
 /// candidate line (0.1.3+local.c68275e94) and is never reissued here: its
 /// daemons are update sources this release inspects and replaces, not peers.
 /// Version 129 is this release's matched set with the same extension.
-/// Version 130 appends the saved-transcript list to the directory reply. A
+/// Version 151 appends a conversation's inferred pull requests: the
+/// `WatchConversationPullRequests` request, its `work::Response` and the
+/// `ConversationPullRequests` push. 147-148 are taken by unmerged branches
+/// and are not adopted here.
+/// Version 152 appends the saved-transcript list to the directory reply. A
 /// client of this version can't read that reply from an earlier daemon, while
 /// an earlier client stops reading before the list and is unaffected.
-pub const PROTOCOL_VERSION: u16 = 130;
+pub const PROTOCOL_VERSION: u16 = 152;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -217,6 +221,9 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 /// among the messages an update exchanges, so an update speaks this source's
 /// protocol as it does the candidate line's.
 pub const STARTUP_STATE_PROTOCOL: u16 = 129;
+/// The matched set with inferred pull requests, also an update source: it only
+/// appended messages an update doesn't exchange.
+pub const INFERRED_PULL_REQUESTS_PROTOCOL: u16 = 151;
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
 /// a resize still has to fit, so keep generous headroom.
@@ -574,6 +581,13 @@ pub enum ClientRequest {
     /// or kept them after a failure. Answered during recovery, unlike every
     /// request that recovery refuses with the same `TerminalUnavailable`.
     StartupState,
+    /// Subscribes this connection to the pull requests one conversation
+    /// worked on or mentioned and returns them, as
+    /// [`crate::work::Response::WatchingConversation`]. Each later change
+    /// arrives as [`ServerMessage::ConversationPullRequests`].
+    WatchConversationPullRequests {
+        conversation: TerminalId,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -788,6 +802,14 @@ pub enum ServerMessage {
     WorkBoard {
         revision: u64,
         board: Box<crate::work::Board>,
+    },
+    /// A conversation's pull requests after a change, delivered only to a
+    /// connection that subscribed with
+    /// [`ClientRequest::WatchConversationPullRequests`].
+    ConversationPullRequests {
+        conversation: TerminalId,
+        revision: u64,
+        pull_requests: Box<crate::work::ConversationPullRequests>,
     },
 }
 

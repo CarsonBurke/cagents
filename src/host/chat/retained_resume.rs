@@ -158,6 +158,14 @@ fn current_admission(
 /// captured, so its provider reads the same on-disk conversation.
 fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<(), String> {
     captured.revalidate()?;
+    if !same_scope(captured, &selected_account_home(source)?) {
+        return Err("Claude disk resume would select a different physical account home".into());
+    }
+    Ok(())
+}
+
+/// The physical Claude account home `source`'s launch would select now.
+fn selected_account_home(source: &Session) -> Result<LaunchAccountScope, String> {
     let launch = super::prepare_native_process_launch(
         &source.launch,
         Some(crate::model::agent_recovery::fresh_native_environment(
@@ -168,18 +176,66 @@ fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<
         None,
     )
     .map_err(|e| e.message)?;
-    let selected =
-        LaunchAccountScope::resolve(Provider::Claude, &launch.recipe.working_directory, |name| {
-            launch
-                .recipe
-                .environment
-                .get(name)
-                .map(std::ffi::OsString::from)
-        })?;
-    if !same_scope(captured, &selected) {
-        return Err("Claude disk resume would select a different physical account home".into());
+    LaunchAccountScope::resolve(Provider::Claude, &launch.recipe.working_directory, |name| {
+        launch
+            .recipe
+            .environment
+            .get(name)
+            .map(std::ffi::OsString::from)
+    })
+}
+
+/// Whether two captures from different kernel boots name the same physical
+/// home. A device number is assigned when its filesystem is mounted, such as
+/// an anonymous number for a btrfs subvolume or a device-mapper minor in
+/// activation order, so it can differ after a restart while the home is
+/// unchanged. Its canonical path and inode on that filesystem cannot. A home
+/// that is itself a mount point shares its root inode with any filesystem of
+/// that kind, so another volume mounted there in its place is not told apart.
+fn same_home_across_boots(left: &LaunchAccountScope, right: &LaunchAccountScope) -> bool {
+    left.provider == right.provider
+        && left.canonical_home == right.canonical_home
+        && left.inode == right.inode
+}
+
+/// The refusal when the recorded launch would now resume a conversation from
+/// another account home than the one it last ran under before a restart.
+pub(super) const PRIOR_BOOT_ACCOUNT_CHANGED: &str = "This conversation last ran under a different Claude account home before the computer restarted, so it was not resumed here. Continue it on another account to choose which account it runs under";
+
+/// A kernel boot change proves an earlier owner of this pane is gone, but not
+/// that the recorded launch still selects the account home it ran under. The
+/// newest earlier-boot ownership row of the pane names that home; refuse if
+/// the launch would now select another one. Rows are never deleted, and an
+/// older boot's home may have been changed deliberately since, so only the
+/// newest counts. A pane with no such row, or whose newest row captured no
+/// home, has nothing to compare; the launch's own account checks still apply.
+pub(super) fn ensure_prior_boot_account(host: &SharedHost, source: &Session) -> Result<(), String> {
+    let boot = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .boot_id
+        .clone();
+    let newest = super::super::agent_execution::registry(host)?
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .newest_native_actor_ownership(source.id, &boot)?;
+    let Some(captured) = newest.as_ref().and_then(|ownership| ownership.scope().ok()) else {
+        return Ok(());
+    };
+    // The launch's own failure to select a home is its own refusal, not an
+    // account change.
+    let selected = selected_account_home(source)?;
+    if same_home_across_boots(captured, &selected) {
+        return Ok(());
     }
-    Ok(())
+    tracing::warn!(
+        chat = %source.id,
+        captured = %captured.canonical_home.display(),
+        selected = %selected.canonical_home.display(),
+        "earlier-boot Claude account home changed"
+    );
+    Err(PRIOR_BOOT_ACCOUNT_CHANGED.to_owned())
 }
 
 const SURVIVOR: &str = "A process from this conversation's earlier Claude session is still running, so nothing was started in its place. Retry once it has exited";

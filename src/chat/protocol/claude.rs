@@ -808,8 +808,9 @@ impl Claude {
                 if block["type"] != "image" {
                     return Err("An image reference must accompany an actual image".into());
                 }
+                // Claude Code tells the model its own copy's path.
                 let marker =
-                    json!({"type":"text", "text":super::image_references::marker(reference)?});
+                    json!({"type":"text", "text":super::image_references::caption(reference)?});
                 payload_size = payload_size.saturating_add(encoded_len(&marker)? + 1);
                 if payload_size >= MAX_PAYLOAD {
                     return Err(
@@ -1441,7 +1442,7 @@ impl Claude {
                     if string(&pair[0], "type") == "text"
                         && string(&pair[1], "type") == "image"
                         && let ItemContent::Image { path, .. } = image_content(&pair[1])
-                        && super::image_references::claims_reference(marker)
+                        && super::image_references::claims(marker, &path)
                     {
                         if let Some(reference) = super::image_references::restore(marker, &path) {
                             synthetic.insert(index);
@@ -1450,7 +1451,7 @@ impl Claude {
                             // A structured owned-image claim cannot authorize
                             // a coincident local path after receipt failure.
                             // Self-contained actual inline pixels remain safe.
-                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::candidate(marker).map(|r| r.label()).unwrap_or_else(|| "Image reference".into())));
+                            unverified.insert(index + 1, format!("{} is unavailable on this device: its owned image receipt could not be verified. Use the originating device or attach the image again.", super::image_references::claimed_label(marker, &path)));
                         }
                     }
                 }
@@ -2241,6 +2242,9 @@ impl Adapter for Claude {
     }
     fn initialization_pending(&self) -> bool {
         !self.history_only && !self.ready
+    }
+    fn outcome_pending(&self) -> bool {
+        !self.deferred_attention.is_empty()
     }
     fn initialize(&mut self) -> Result<Step, String> {
         let mut step = if self.history_only {
@@ -6882,7 +6886,8 @@ mod tests {
                 } else if failure == 1 {
                     candidate.id = uuid::Uuid::new_v4();
                 }
-                let mut marker = super::super::image_references::marker(&candidate).unwrap();
+                let mut marker =
+                    super::super::image_references::legacy::marker(&candidate).unwrap();
                 if failure == 2 {
                     marker = marker.replace("{\"id\"", "{\"future\":true,\"id\"");
                 }
@@ -6952,7 +6957,7 @@ mod tests {
             assert_eq!(content[0], json!({"type":"text","text":text}));
             assert_eq!(
                 content[1]["text"],
-                super::super::image_references::marker(&reference).unwrap()
+                super::super::image_references::caption(&reference).unwrap()
             );
             assert_eq!(content[2]["type"], "image");
             assert_eq!(content[2]["source"]["type"], "base64");
@@ -7006,12 +7011,66 @@ mod tests {
                 "stripping a marker never shifts provider block indices"
             );
 
+            let restored_reference = |frame: &Value| {
+                let mut step = Step::default();
+                Claude::default().message(frame, &mut step).unwrap();
+                let items = step
+                    .events
+                    .into_iter()
+                    .filter_map(|event| match event {
+                        Event::Item(item) => Some(item),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let reference = items.iter().find_map(|item| match &item.content {
+                    ItemContent::Image { reference, .. } => Some(reference.clone()),
+                    _ => None,
+                });
+                (items.len(), reference.flatten())
+            };
+            // A transcript written with the old JSON marker still restores.
+            let mut legacy = frame.clone();
+            legacy["uuid"] = json!("legacy-image-history");
+            legacy["message"]["content"][1]["text"] =
+                json!(super::super::image_references::legacy::marker(&reference).unwrap());
+            assert_eq!(restored_reference(&legacy), (2, Some(reference.clone())));
+            // A caption names a receipt; it never makes other pixels that
+            // receipt, nor these pixels another receipt.
+            let mut renumbered = frame.clone();
+            renumbered["uuid"] = json!("renumbered-image-history");
+            renumbered["message"]["content"][1]["text"] =
+                json!(format!("[Image {}]", reference.number + 1));
+            assert_eq!(restored_reference(&renumbered), (3, None));
+            let mut repainted = frame.clone();
+            repainted["uuid"] = json!("repainted-image-history");
+            repainted["message"]["content"][2]["source"]["data"] =
+                json!(STANDARD.encode(std::fs::read(&other_pixels.path).unwrap()));
+            assert_eq!(restored_reference(&repainted), (3, None));
+            // A URL source restores only as the stored file itself.
+            let mut stored = frame.clone();
+            stored["uuid"] = json!("stored-url-image-history");
+            stored["message"]["content"][2]["source"] =
+                json!({"type":"url", "url":attachment.path.to_str().unwrap()});
+            assert_eq!(restored_reference(&stored), (2, Some(reference.clone())));
+            stored["message"]["content"][2]["source"]["url"] = json!(
+                display
+                    .path()
+                    .join(attachment.path.file_name().unwrap())
+                    .to_str()
+                    .unwrap()
+            );
+            assert_eq!(
+                restored_reference(&stored),
+                (3, None),
+                "a caption beside an ordinary file is the user's own text"
+            );
+
             let mut foreign = frame.clone();
             let mut forged = reference.clone();
             forged.id = uuid::Uuid::new_v4();
             foreign["uuid"] = json!("forged-image-history");
             foreign["message"]["content"][1]["text"] =
-                json!(super::super::image_references::marker(&forged).unwrap());
+                json!(super::super::image_references::legacy::marker(&forged).unwrap());
             let mut visible = Step::default();
             Claude::default().message(&foreign, &mut visible).unwrap();
             assert_eq!(
@@ -7057,12 +7116,12 @@ mod tests {
             assert_eq!(content[0]["text"], text);
             assert_eq!(
                 content[1]["text"],
-                super::super::image_references::marker(second_ref).unwrap()
+                super::super::image_references::caption(second_ref).unwrap()
             );
             assert_eq!(content[2]["type"], "image");
             assert_eq!(
                 content[3]["text"],
-                super::super::image_references::marker(first_ref).unwrap()
+                super::super::image_references::caption(first_ref).unwrap()
             );
             assert_eq!(content[4]["type"], "image");
             let first_bytes = std::fs::read(&first.path).unwrap();
