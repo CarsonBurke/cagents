@@ -240,7 +240,7 @@ impl ProviderScope {
     }
 }
 
-fn cgroup_path(relative: &str) -> io::Result<PathBuf> {
+pub(super) fn cgroup_path(relative: &str) -> io::Result<PathBuf> {
     let relative = relative.strip_prefix('/').unwrap_or(relative);
     if relative.is_empty()
         || relative
