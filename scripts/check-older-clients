@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Check that every older client the daemon serves was proven at this protocol.
 
 The daemon serves listed older-protocol CLIs (src/terminal/ipc/older_clients.rs)
