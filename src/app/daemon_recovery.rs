@@ -462,7 +462,7 @@ fn prove_not_hosted_at(
         .iter()
         .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
     {
-        return Err(open_agent_refusal(agent, &chats));
+        return Err(open_agent_refusal(agent, &chats, &current.boot_id));
     }
     // Authenticate the answer: reaching a socket that reports another identity
     // is not evidence that the daemon holding the runtime's lease answered.
@@ -538,9 +538,10 @@ fn survivor_refusal(
 fn open_agent_refusal(
     agent: &crate::agent_execution::Agent,
     hosted: &[crate::chat::Session],
+    boot: &crate::model::BootId,
 ) -> String {
     use crate::agent_execution::Origin;
-    if !agent_close_can_release(agent, hosted) {
+    if !agent_close_can_release(agent, hosted, boot) {
         return "An open agent still uses this terminal and Cagents can't confirm it has stopped, so the pane was kept. There's no way to close this pane yet.".into();
     }
     // The daemon only lets an agent's owner close it, and a person's shell owns
@@ -554,18 +555,29 @@ fn open_agent_refusal(
     }
 }
 
-/// Whether the daemon has anything to stop this agent's session with. A launch
-/// still pending isn't visible from here, so `None` can be optimistic.
+/// Whether the daemon has a way to close this agent: something to stop its
+/// session with, or a changed kernel boot proving that session has gone. A
+/// launch still pending isn't visible from here, and neither is what the daemon
+/// checks before relying on the boot, so this can be optimistic.
 fn agent_close_can_release(
     agent: &crate::agent_execution::Agent,
     hosted: &[crate::chat::Session],
+    boot: &crate::model::BootId,
 ) -> bool {
-    use crate::agent_execution::HostedSession;
+    use crate::agent_execution::{HostedSession, Origin};
     match &agent.session {
         None => true,
         Some(HostedSession::Terminal(_)) => false,
         Some(HostedSession::Chat(session)) => {
-            session.closes_without_hosted_actor() || hosted.iter().any(|chat| chat.id == session.id)
+            session.closes_without_hosted_actor()
+                || hosted.iter().any(|chat| chat.id == session.id)
+                // A scheduled agent is its automation's to end, so the daemon
+                // doesn't take this route for one.
+                || (!matches!(agent.origin, Origin::Automation { .. })
+                    && session
+                        .proof
+                        .as_ref()
+                        .is_some_and(|saved| saved.is_complete() && saved.boot_id != *boot))
         }
     }
 }
@@ -2181,20 +2193,24 @@ mod tests {
             created_ms: 1,
             closed: false,
         };
+        let boot = proof("current").boot_id;
         let lost = chat_with(NativeContinuity::RetainedClaudeActor { protocol: 2 });
         assert!(!agent_close_can_release(
             &agent(Some(HostedSession::Chat(lost.clone()))),
-            &[]
+            &[],
+            &boot
         ));
         assert!(agent_close_can_release(
             &agent(Some(HostedSession::Chat(lost.clone()))),
-            std::slice::from_ref(&lost)
+            std::slice::from_ref(&lost),
+            &boot
         ));
         assert!(!agent_close_can_release(
             &agent(Some(HostedSession::Chat(chat_with(
                 NativeContinuity::ReconnectOnly
             )))),
-            &[]
+            &[],
+            &boot
         ));
         assert!(agent_close_can_release(
             &agent(Some(HostedSession::Chat(chat_with(
@@ -2202,16 +2218,60 @@ mod tests {
                     provider_version: "1".into()
                 }
             )))),
-            &[]
+            &[],
+            &boot
         ));
-        assert!(agent_close_can_release(&agent(None), &[]));
+        assert!(agent_close_can_release(&agent(None), &[], &boot));
 
         let command = |agent: &Agent| format!("cagents agent close {}", agent.id);
         let own = agent(None);
-        assert!(open_agent_refusal(&own, &[]).contains(&command(&own)));
+        assert!(open_agent_refusal(&own, &[], &boot).contains(&command(&own)));
+        let lost_session = lost.clone();
         let lost_agent = agent(Some(HostedSession::Chat(lost)));
-        assert!(!open_agent_refusal(&lost_agent, &[]).contains(&command(&lost_agent)));
-        assert!(open_agent_refusal(&lost_agent, &[]).contains("no way to close"));
+        assert!(!open_agent_refusal(&lost_agent, &[], &boot).contains(&command(&lost_agent)));
+        assert!(open_agent_refusal(&lost_agent, &[], &boot).contains("no way to close"));
+
+        // A changed kernel boot gives the daemon a way to close a lost agent.
+        let left_behind = crate::chat::Session {
+            proof: Some(other_boot("old")),
+            ..lost_session.clone()
+        };
+        let earlier = agent(Some(HostedSession::Chat(left_behind.clone())));
+        assert!(open_agent_refusal(&earlier, &[], &boot).contains(&command(&earlier)));
+        // Not from this boot's own proof, or from one that isn't complete.
+        let this_boot = crate::chat::Session {
+            proof: Some(proof("old")),
+            ..lost_session.clone()
+        };
+        let incomplete = crate::chat::Session {
+            proof: Some(HostSessionProof {
+                host_incarnation: HostIncarnation::new(""),
+                ..other_boot("old")
+            }),
+            ..lost_session
+        };
+        for session in [this_boot, incomplete] {
+            let held = agent(Some(HostedSession::Chat(session)));
+            assert!(open_agent_refusal(&held, &[], &boot).contains("no way to close"));
+        }
+        // Whoever started it decides, and an automation's agent has no route.
+        let child = Agent {
+            origin: Origin::Child {
+                parent: crate::agent_execution::Lineage(TerminalId::new()),
+            },
+            ..earlier.clone()
+        };
+        let refusal = open_agent_refusal(&child, &[], &boot);
+        assert!(!refusal.contains("cagents agent close"), "{refusal}");
+        assert!(refusal.contains("Only what started it"), "{refusal}");
+        let scheduled = Agent {
+            origin: Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            },
+            ..earlier
+        };
+        assert!(open_agent_refusal(&scheduled, &[], &boot).contains("no way to close"));
+
         // The daemon refuses a shell closing an agent it doesn't own.
         for origin in [
             Origin::Child {
@@ -2225,7 +2285,7 @@ mod tests {
                 origin,
                 ..agent(None)
             };
-            let refusal = open_agent_refusal(&other, &[]);
+            let refusal = open_agent_refusal(&other, &[], &boot);
             assert!(!refusal.contains("cagents agent close"), "{refusal}");
             assert!(refusal.contains("Only what started it"), "{refusal}");
         }
