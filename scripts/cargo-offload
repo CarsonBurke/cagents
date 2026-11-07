@@ -1283,12 +1283,19 @@ elif command == "run":
         resource.setrlimit(resource.RLIMIT_CORE, (0, resource.getrlimit(resource.RLIMIT_CORE)[1]))
     running = open(os.path.join(base, "running"), "a")
     fcntl.flock(running, fcntl.LOCK_EX)
-    # Builds admitted later price this one by what its processes hold.
+    # Builds admitted later price this one by what its processes hold. Under
+    # a hold, a command before this one may have repriced the claim for its
+    # tests and been killed before restoring it, so each starts from what the
+    # lease was priced at, which the first records.
     cost, _ = claim(base)
     with open(os.path.join(base, "claim.new"), "w") as file:
         claimed = read_claim(base)
-        json.dump({"cost": cost, "pid": os.getpid(), "build": claimed.get("build", ""),
-                   "key": claimed.get("key", "")}, file)
+        try:
+            cost = int(claimed.get("leased") or cost)
+        except (ValueError, TypeError):
+            pass
+        json.dump({"cost": cost, "leased": cost, "pid": os.getpid(),
+                   "build": claimed.get("build", ""), "key": claimed.get("key", "")}, file)
     os.replace(os.path.join(base, "claim.new"), os.path.join(base, "claim"))
     register(base, cost, os.getpid())
     os.chdir(os.path.join(base, "src", directory))

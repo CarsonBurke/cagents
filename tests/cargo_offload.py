@@ -1870,6 +1870,20 @@ class RemoteRun(unittest.TestCase):
         self.assertIn(build_cost, seen["doc"])
         self.assertTrue(tested & recorded, (tested, recorded))
 
+    def test_a_command_in_a_lease_starts_from_the_leases_price(self):
+        # A command before it under the same hold repriced the claim for its
+        # tests and was killed before it could restore it.
+        with FixtureDirectory() as scope:
+            root = scope.name
+            base = os.path.join(root, "slot-0")
+            os.makedirs(os.path.join(base, "src"))
+            Path(base, "claim").write_text(json.dumps(
+                {"cost": 2 * 2**30, "leased": 9 * 2**30, "pid": None, "build": "", "key": "key"}))
+            self.hold(root, 0)
+            self.run_agent(scope, base, ["true"])
+            claimed = json.loads(Path(base, "claim").read_text())
+            self.assertEqual((claimed["cost"], claimed["leased"]), (9 * 2**30, 9 * 2**30))
+
     def test_a_build_shares_the_hosts_cpus_with_the_builds_running_there(self):
         cpus = len(os.sched_getaffinity(0))
         with FixtureDirectory() as scope:
