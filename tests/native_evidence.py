@@ -807,18 +807,17 @@ class Evidence(unittest.TestCase):
     def test_a_sessions_builds_never_start_the_pruner(self) -> None:
         # Its runner's builds replay what `build` made. Their disk guard would
         # otherwise start the account's pruner, under the fixture's HOME,
-        # while the app is being captured; a command given as
-        # CAGENTS_BUILD_PRUNE replaces it, and the guard still refuses a
-        # build below the floor.
+        # while the app is being captured.
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", extra={"CAGENTS_BUILD_FREE_FLOOR_GIB": "7"})
         for _ in range(100):
             if (self.logs / "runner-env").exists():
                 break
             time.sleep(0.05)
         runner = (self.logs / "runner-env").read_text()
-        self.assertIn("CAGENTS_BUILD_PRUNE=true\n", runner)
-        self.assertNotIn("CAGENTS_BUILD_FREE_FLOOR_GIB=", runner)
+        self.assertIn("CAGENTS_BUILD_FREE_FLOOR_GIB=0\n", runner)
+        # Only the runner's: the fixture's other commands keep their guard.
+        self.assertNotIn("CAGENTS_BUILD_FREE_FLOOR_GIB=", self.run_tool("cli", "print-env").stdout)
         self.run_tool("stop")
 
     def killed_supervisor_processes(self, signal: int, extra: dict | None = None) -> None:
