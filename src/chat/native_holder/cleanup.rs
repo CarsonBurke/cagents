@@ -6,7 +6,10 @@ use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::PathBuf};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    daemon::{
+        holder_registry::{self as registry, Kind, Process, Record},
+        owned_children::DetachedWork,
+    },
     model::{HostSessionProof, TerminalId},
 };
 
@@ -115,15 +118,16 @@ impl Detached {
         })
     }
 
+    #[cfg(test)]
     pub fn close(&self) -> Result<(), String> {
-        self.close_inner(false)
+        self.close_with(false, DetachedWork::Stop)
     }
 
     pub fn close_retaining_receipt(&self) -> Result<(), String> {
-        self.close_inner(true)
+        self.close_with(true, DetachedWork::Stop)
     }
 
-    fn close_inner(&self, retain: bool) -> Result<(), String> {
+    pub(crate) fn close_with(&self, retain: bool, detached: DetachedWork) -> Result<(), String> {
         let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
         if crate::daemon::lease_owner(&paths.lock, &self.proof)
             .map_err(|error| error.to_string())?
@@ -141,7 +145,7 @@ impl Detached {
             return Err("Native cleanup belongs to a different daemon owner".into());
         }
         let (mut holder, _) = super::transport::adopt(&self.record, &self.source, &self.proof)?;
-        holder.close_inner(retain)
+        holder.close_inner(retain, detached)
     }
 
     pub fn consume_receipt(&self) -> Result<bool, String> {

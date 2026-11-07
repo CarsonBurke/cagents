@@ -1,15 +1,90 @@
 //! Descendant cleanup for dedicated process owners, never the daemon itself.
 use std::{
     io,
+    os::fd::{FromRawFd, OwnedFd},
     process::Child,
     time::{Duration, Instant},
 };
+
+/// What closing a provider does with work it had already detached from
+/// itself, such as a server a command started with `nohup` or `setsid`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum DetachedWork {
+    /// Stop it with the provider. Forced kills and unattended executions do,
+    /// and so does every close that has not decided otherwise.
+    #[default]
+    Stop,
+    /// Leave running what had left the provider before the close began.
+    Spare,
+}
+
+/// Children of a subreaper that its teardown leaves running: work the
+/// provider had detached before the close began. Each is pinned by a pidfd,
+/// so a process that later reuses a spared pid is not spared.
+#[derive(Default)]
+pub(crate) struct Spared(Vec<(i32, OwnedFd)>);
+
+impl Spared {
+    pub(crate) const NOTHING: Self = Self(Vec::new());
+
+    /// Pins `children`, which must be unreaped children of this process. One
+    /// that has already been reaped is not spared.
+    pub(crate) fn pin(children: impl IntoIterator<Item = i32>) -> io::Result<Self> {
+        let mut spared = Vec::new();
+        for pid in children {
+            // SAFETY: pidfd_open takes scalar arguments and returns a new
+            // owned descriptor or -1 without writing through any pointer.
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            if fd == -1 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::ESRCH) {
+                    continue;
+                }
+                return Err(error);
+            }
+            // SAFETY: a successful pidfd_open returned this fresh descriptor.
+            spared.push((pid, unsafe { OwnedFd::from_raw_fd(fd as i32) }));
+        }
+        Ok(Self(spared))
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Whether `pid` is still the process pinned under it. A spared child
+    /// that has exited but is unreaped still is; once reaped it no longer is.
+    pub(crate) fn spares(&self, pid: i32) -> bool {
+        self.0.iter().any(|(spared, fd)| {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the descriptor is live; signal 0 only checks existence,
+            // and a null siginfo with zero flags is supported.
+            *spared == pid
+                && unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        fd.as_raw_fd(),
+                        0,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    )
+                } == 0
+        })
+    }
+
+    /// Whether every child is spared, so teardown has nothing left to stop.
+    pub(crate) fn spares_all(&self, children: &std::collections::BTreeSet<i32>) -> bool {
+        children.iter().all(|pid| self.spares(*pid))
+    }
+}
 
 /// Used only in the dedicated, single-threaded subreaper process. It owns every
 /// child of that process; this cleanup must never run inside the daemon.
 pub(crate) struct OwnedChildren {
     child: Option<Child>,
     group_signalled: bool,
+    /// Pinned once, before the first teardown signal; `None` stops them all.
+    spared: Option<Spared>,
 }
 
 impl OwnedChildren {
@@ -19,7 +94,29 @@ impl OwnedChildren {
         Self {
             child: Some(child),
             group_signalled: false,
+            spared: None,
         }
+    }
+
+    /// Decides, before teardown first signals anything, what it does with
+    /// the children this process had adopted from the provider: work the
+    /// provider detached. Sparing pins them as they are now, so children
+    /// adopted once the provider is stopping, such as its running commands,
+    /// are still stopped. A later decision cannot spare more than the first.
+    pub(crate) fn decide_detached(&mut self, detached: DetachedWork) -> io::Result<()> {
+        match detached {
+            DetachedWork::Stop => self.spared = None,
+            DetachedWork::Spare if self.spared.is_none() && !self.group_signalled => {
+                let provider = self.child.as_ref().map(|child| child.id() as i32);
+                self.spared = Some(Spared::pin(
+                    direct_children()?
+                        .into_iter()
+                        .filter(|pid| Some(*pid) != provider),
+                )?);
+            }
+            DetachedWork::Spare => {}
+        }
+        Ok(())
     }
 
     pub(crate) fn id(&self) -> i32 {
@@ -84,8 +181,18 @@ impl OwnedChildren {
             self.group_signalled = true;
         }
         let deadline = Instant::now() + timeout;
+        let spared = self.spared.take().unwrap_or_default();
+        let result = self.stop_children(&spared, deadline);
+        self.spared = Some(spared).filter(|spared| !spared.is_empty());
+        result
+    }
+
+    fn stop_children(&mut self, spared: &Spared, deadline: Instant) -> io::Result<bool> {
         loop {
             for pid in direct_children()? {
+                if spared.spares(pid) {
+                    continue;
+                }
                 // No other thread or handler reaps children in this process.
                 // A child that exits stays a zombie until the loop below.
                 if unsafe { libc::kill(pid, libc::SIGKILL) } == -1
@@ -116,6 +223,10 @@ impl OwnedChildren {
                     _ => return Err(io::Error::last_os_error()),
                 }
             }
+            // Every child still running is one the close spared.
+            if !spared.is_empty() && spared.spares_all(&direct_children()?) {
+                return Ok(true);
+            }
             if Instant::now() >= deadline {
                 return Ok(false);
             }
@@ -139,4 +250,107 @@ pub(crate) fn direct_children() -> io::Result<std::collections::BTreeSet<i32>> {
         );
     }
     Ok(children)
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use std::{os::unix::process::CommandExt, path::Path, process::Command};
+
+    /// A provider in its own process group that has detached one process
+    /// already, adopted by this subreaper, and is still running a command in
+    /// a session of its own, as Claude Code runs each Bash command.
+    pub(crate) fn provider_with_detached_work(root: &Path) -> Command {
+        let mut command = Command::new("/bin/sh");
+        command
+            .arg("-c")
+            .arg(
+                r#"(setsid /bin/sleep 600 & echo $! > "$1.tmp"; mv "$1.tmp" "$1")
+setsid /bin/sleep 601 & echo $! > "$2.tmp"; mv "$2.tmp" "$2"
+exec /bin/sleep 602"#,
+            )
+            .args([
+                "provider",
+                root.join("detached").to_str().unwrap(),
+                root.join("running").to_str().unwrap(),
+            ])
+            .process_group(0);
+        command
+    }
+
+    pub(crate) fn parent(pid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat[stat.rfind(')')? + 2..].split(' ').nth(1)?.parse().ok()
+    }
+
+    /// The detached and running pids, once the detached one is adopted here.
+    pub(crate) fn detached_work(root: &Path) -> (i32, i32) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let pid = |name| {
+                std::fs::read_to_string(root.join(name))
+                    .ok()?
+                    .trim()
+                    .parse::<i32>()
+                    .ok()
+            };
+            if let (Some(detached), Some(running)) = (pid("detached"), pid("running"))
+                && parent(detached) == Some(std::process::id() as i32)
+            {
+                return (detached, running);
+            }
+            assert!(Instant::now() < deadline, "the provider did not detach");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    pub(crate) fn exists(pid: i32) -> bool {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+
+    #[test]
+    fn an_ordinary_teardown_spares_only_work_detached_before_it() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        // Stands in for the native holder: the subreaper owning the provider.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let provider = provider_with_detached_work(root.path()).spawn().unwrap();
+        let (detached, running) = detached_work(root.path());
+        let mut children = OwnedChildren::new(provider);
+        children.decide_detached(DetachedWork::Spare).unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert_eq!(
+            parent(detached),
+            Some(std::process::id() as i32),
+            "work detached before the close keeps running"
+        );
+        assert!(
+            !exists(running),
+            "a command the provider was running when it stopped is stopped and reaped"
+        );
+        // Deciding again cannot spare what was adopted since, and a later
+        // decision to stop everything does.
+        children.decide_detached(DetachedWork::Spare).unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(exists(detached));
+        children.decide_detached(DetachedWork::Stop).unwrap();
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(!exists(detached), "stopping everything reaps it too");
+    }
+
+    #[test]
+    fn a_teardown_that_did_not_decide_stops_detached_work() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let provider = provider_with_detached_work(root.path()).spawn().unwrap();
+        let (detached, running) = detached_work(root.path());
+        let mut children = OwnedChildren::new(provider);
+        assert!(children.terminate(Duration::from_secs(10)).unwrap());
+        assert!(!exists(detached) && !exists(running));
+    }
 }

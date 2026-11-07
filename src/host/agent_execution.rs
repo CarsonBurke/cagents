@@ -1007,6 +1007,43 @@ pub(super) fn close_lost_agent_from_pane(
     Ok(true)
 }
 
+/// What closing this chat does with the work its provider detached, such as
+/// a server a command started with `nohup`. A conversation someone attends
+/// leaves it running: they may have asked for it. An agent nobody attends, an
+/// automation's or one a session started until a person takes part in it,
+/// stops it, so unattended runs do not leave processes behind. Decided at the
+/// close, since a person can take part after launch. An unreadable registry
+/// keeps the stop every close made before.
+pub(super) fn detached_work_on_close(
+    host: &SharedHost,
+    session: TerminalId,
+) -> crate::daemon::owned_children::DetachedWork {
+    use crate::daemon::owned_children::DetachedWork;
+    let Ok(registry) = registry(host) else {
+        return DetachedWork::Spare;
+    };
+    let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+    let unattended = registry.agent_for_session(session).and_then(|agent| {
+        agent.map_or(Ok(false), |agent| {
+            if matches!(agent.origin, Origin::User) {
+                Ok(false)
+            } else {
+                registry
+                    .agent_is_interactive(agent.id)
+                    .map(|attended| !attended)
+            }
+        })
+    });
+    match unattended {
+        Ok(false) => DetachedWork::Spare,
+        Ok(true) => DetachedWork::Stop,
+        Err(error) => {
+            tracing::warn!(%error, "closing a chat stops its detached work: its agent is unknown");
+            DetachedWork::Stop
+        }
+    }
+}
+
 /// Reads only the managed presentation. No registry means ordinary interactive
 /// conversations still close without the optional managed-agent subsystem.
 pub(super) fn preflight_retirement(

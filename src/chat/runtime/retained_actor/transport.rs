@@ -9,7 +9,10 @@ use crate::{
         self, Command, Snapshot,
         protocol::{ExecutionContext, ProcessSpec, TransportSpec},
     },
-    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    daemon::{
+        holder_registry::{self as registry, Kind, Process, Record},
+        owned_children::DetachedWork,
+    },
     model::HostSessionProof,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -303,6 +306,9 @@ struct Remote {
     stop: AtomicBool,
     installed: AtomicBool,
     preserved: AtomicBool,
+    /// Whether `close` asks the helper to spare the work the provider
+    /// already detached. See [`DetachedWork`].
+    spare_detached: AtomicBool,
     worker: Mutex<Option<thread::JoinHandle<()>>>,
     startup: Mutex<Option<UnixStream>>,
 }
@@ -496,6 +502,7 @@ impl RemoteActor {
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(true),
             preserved: AtomicBool::new(false),
+            spare_detached: AtomicBool::new(false),
 
             worker: Mutex::new(None),
             startup: Mutex::new(None),
@@ -1131,6 +1138,7 @@ impl RemoteActor {
             stop: AtomicBool::new(false),
             installed: AtomicBool::new(false),
             preserved: AtomicBool::new(false),
+            spare_detached: AtomicBool::new(false),
 
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
@@ -2109,8 +2117,15 @@ impl RemoteActor {
             thread::sleep(Duration::from_millis(10));
         }
     }
+    pub(crate) fn decide_detached_work(&self, detached: DetachedWork) {
+        self.0
+            .spare_detached
+            .store(detached == DetachedWork::Spare, Ordering::Release);
+    }
+    /// A helper from before sparing ignores the decision and stops it all.
     pub fn close(&self) -> Result<(), String> {
-        self.close_method("close", Value::Null)
+        let spare = self.0.spare_detached.load(Ordering::Acquire);
+        self.close_method("close", json!([spare]))
     }
 }
 impl chat::protocol::LaunchCleanup for RemoteActor {
@@ -2282,6 +2297,9 @@ struct Server {
     // attachment. A newly authenticated attach may own the still-live actor.
     attachment_preserved: bool,
     close_only: bool,
+    /// Work the provider detached before an ordinary close, which teardown
+    /// leaves running. Decided by the first close; `None` stops everything.
+    spared: Option<crate::daemon::owned_children::Spared>,
 }
 impl Server {
     fn start_after_scope_enrollment(
@@ -2441,6 +2459,7 @@ impl Server {
             session_stopping: false,
             attachment_preserved: false,
             close_only: false,
+            spared: None,
         })
     }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
@@ -3249,9 +3268,29 @@ impl Server {
                 value!(self.try_close_if_idle(generation)?)
             }
             "close" => {
+                // `[true]` spares the work the provider already detached. A
+                // daemon that sends no decision stops everything, as before.
+                let spare = request.args.get(0).and_then(Value::as_bool) == Some(true);
                 if self.closed_snapshot.is_none() {
+                    // Pin before the provider stops: what it orphans while
+                    // stopping, such as its running commands, still stops.
+                    // A retry may stop more, never spare more.
+                    if !spare {
+                        self.spared = Some(Default::default());
+                    } else if self.spared.is_none() {
+                        self.spared = Some(
+                            crate::daemon::adopted_orphans::pin_adopted()
+                                .map_err(|error| error.to_string())?,
+                        );
+                    }
+                    // The provider's scope holds what it detached, too.
+                    self.actor.decide_detached_work(if spare {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    });
                     self.actor.close()?;
-                    reap_orphans()?;
+                    reap_orphans(self.spared())?;
                     self.finish_inputs();
                 }
                 value!(self.publish_close()?)
@@ -3331,6 +3370,11 @@ impl Server {
         }
         Ok(())
     }
+    fn spared(&self) -> &crate::daemon::owned_children::Spared {
+        static NOTHING: crate::daemon::owned_children::Spared =
+            crate::daemon::owned_children::Spared::NOTHING;
+        self.spared.as_ref().unwrap_or(&NOTHING)
+    }
     fn try_close_if_idle(
         &mut self,
         generation: u64,
@@ -3339,7 +3383,7 @@ impl Server {
             if !self.actor.try_close_if_idle(generation)? {
                 return Ok(ConditionalClosePublication::Changed);
             }
-            reap_orphans()?;
+            reap_orphans(self.spared())?;
             self.finish_inputs();
         }
         self.publish_close()
@@ -3385,7 +3429,7 @@ impl Server {
             resident: self.resident()?,
         })
     }
-    fn serve(mut self, startup: UnixStream) -> Result<(), String> {
+    fn serve(&mut self, startup: UnixStream) -> Result<(), String> {
         send(
             &startup,
             &Ok::<_, String>(self.attached()?),
@@ -3401,7 +3445,7 @@ impl Server {
             self.finish_inputs();
             if !self.installed && disconnected(&startup)? {
                 self.actor.close()?;
-                reap_orphans()?;
+                reap_orphans(self.spared())?;
                 break;
             }
             let accepting = connections.has_capacity();
@@ -3650,7 +3694,8 @@ impl OrphanSweep {
 }
 /// Only after the actor's ChildGuard has joined: no competing provider reaper
 /// remains. A child PID cannot be recycled until this sole reaper consumes it.
-fn reap_orphans() -> Result<(), String> {
+/// Stops every child but those `spared`, and returns once only they remain.
+fn reap_orphans(spared: &crate::daemon::owned_children::Spared) -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         let children =
@@ -3659,6 +3704,7 @@ fn reap_orphans() -> Result<(), String> {
         for pid in children
             .split_whitespace()
             .filter_map(|pid| pid.parse::<i32>().ok())
+            .filter(|pid| !spared.spares(*pid))
         {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
@@ -3676,6 +3722,15 @@ fn reap_orphans() -> Result<(), String> {
                 }
                 _ => return Err(std::io::Error::last_os_error().to_string()),
             }
+        }
+        // Every child still running is one the close spared.
+        if !spared.is_empty()
+            && spared.spares_all(
+                &crate::daemon::owned_children::direct_children()
+                    .map_err(|error| error.to_string())?,
+            )
+        {
+            return Ok(());
         }
         if Instant::now() >= deadline {
             return Err(
@@ -3732,21 +3787,29 @@ pub(crate) fn run_helper_if_requested() -> Option<Result<(), String>> {
         }
         // Every child spawned from here on must register with the sweep.
         crate::daemon::adopted_orphans::become_sweeper();
+        let mut spared = None;
         let result = (|| {
             crate::daemon::seal_inherited_descriptors().map_err(|error| error.to_string())?;
-            let server = Server::start_after_scope_enrollment(
+            let mut server = Server::start_after_scope_enrollment(
                 startup,
                 &control,
                 crate::daemon::process_scope::enroll_holder,
             )?;
-            server.serve(control.try_clone().map_err(|error| error.to_string())?)
+            let served = server.serve(control.try_clone().map_err(|error| error.to_string())?);
+            spared = server.spared.take();
+            served
         })();
         if let Err(error) = result {
             let _ = send(&control, &Err::<Attached, _>(error), TIMEOUT);
         }
         // Exit status 73 means cleanup is proved, even when startup itself was
         // refused. Failure to reap cannot be reported as successful teardown.
-        reap_orphans()
+        // Work a close spared is the user's, not the provider's.
+        reap_orphans(
+            spared
+                .as_ref()
+                .unwrap_or(&crate::daemon::owned_children::Spared::NOTHING),
+        )
     })())
 }
 fn validate_control_descriptor(fd: RawFd) -> Result<(), String> {
@@ -3977,7 +4040,10 @@ printf '{"type":"result","subtype":"success","is_error":false,"session_id":"%s"}
         }
         let mut serving = Serving {
             parent: Some(parent),
-            worker: Some(thread::spawn(move || server.serve(control))),
+            worker: Some(thread::spawn(move || {
+                let mut server = server;
+                server.serve(control)
+            })),
         };
         let attached: Result<Attached, String> =
             receive(serving.parent.as_ref().unwrap(), TIMEOUT).unwrap();
@@ -4097,7 +4163,10 @@ while IFS= read -r frame; do :; done
         let server = Server::start_after_scope_enrollment(startup, &control, || Ok(())).unwrap();
         let provider = server.identity.record.root.clone();
         let mut parent = Some(parent);
-        let worker = thread::spawn(move || server.serve(control));
+        let worker = thread::spawn(move || {
+            let mut server = server;
+            server.serve(control)
+        });
         let attached: Result<Attached, String> =
             receive(parent.as_ref().unwrap(), TIMEOUT).unwrap();
         attached.unwrap();
@@ -4139,6 +4208,45 @@ while IFS= read -r frame; do :; done
         parent.take();
         worker.join().unwrap().unwrap();
         assert!(!provider.is_current(), "original provider must be reaped");
+    }
+
+    #[test]
+    fn an_ordinary_close_spares_only_what_the_provider_detached_before_it() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        use crate::daemon::owned_children::{Spared, tests as children};
+        // This isolated process stands in for the helper, which owns its
+        // provider through a registration and adopts what the provider's
+        // commands detach.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let (mut provider, registration) = crate::daemon::adopted_orphans::spawn_owned(
+            &mut children::provider_with_detached_work(root.path()),
+        )
+        .unwrap();
+        let (detached, running) = children::detached_work(root.path());
+        let spared = crate::daemon::adopted_orphans::pin_adopted().unwrap();
+        assert!(spared.spares(detached));
+        assert!(!spared.spares(running) && !spared.spares(provider.id() as i32));
+        // As the actor's ChildGuard does, then the close's reap.
+        unsafe { libc::kill(-(provider.id() as i32), libc::SIGKILL) };
+        provider.wait().unwrap();
+        drop(registration);
+        reap_orphans(&spared).unwrap();
+        assert_eq!(
+            children::parent(detached),
+            Some(std::process::id() as i32),
+            "work detached before the close keeps running"
+        );
+        assert!(
+            !children::exists(running),
+            "a command the provider was running is stopped and reaped"
+        );
+        // A close that spares nothing, as for an unattended agent, or the
+        // helper's exit after one, reaps it too.
+        reap_orphans(&Spared::NOTHING).unwrap();
+        assert!(!children::exists(detached));
     }
 
     thread_local! {
@@ -4272,6 +4380,7 @@ while IFS= read -r frame; do :; done
                 session_stopping: false,
                 attachment_preserved: false,
                 close_only: false,
+                spared: None,
             },
             root,
         )
