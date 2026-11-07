@@ -231,8 +231,9 @@ impl DeliveryQueue {
     }
 
     /// Speaks `client`'s protocol for the rest of this connection. The
-    /// connection's first frame decides this, before anything is queued for
-    /// the client to read.
+    /// connection's first frame decides this. Frames are adapted as they are
+    /// sent, so only one sent before that frame arrives, such as a shutdown
+    /// notice, goes out in this protocol's version.
     pub(crate) fn speak_older(&self, client: OlderClient) {
         let _ = self.older.set(client);
     }

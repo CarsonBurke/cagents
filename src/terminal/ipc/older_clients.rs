@@ -6,6 +6,11 @@
 //! one for everything it can say, the daemon answers it in its own envelope
 //! version instead of refusing every command the carried session runs.
 //!
+//! Only that CLI is served. An older `cagents-ui` must keep failing its
+//! handshake: that is how it learns an update superseded it and hands over
+//! to the installed window. The CLI may not stop or update the daemon either,
+//! since it was built for another one.
+//!
 //! Admission is per protocol and proven against that protocol's recorded wire
 //! format (`tests/fixtures/wire-formats/<protocol>.json`):
 //! - every request the older client can send decodes here as it meant it;
@@ -15,6 +20,8 @@
 //! refused or withheld at the connection, since the older client cannot
 //! encode or decode them. Payloads carried as JSON text inside a message
 //! (device account reports) are not part of the recorded format.
+
+use std::path::Path;
 
 use serde::{
     Serialize, Serializer,
@@ -77,11 +84,11 @@ impl OlderClient {
         }
     }
 
-    /// Whether this request exists in the client's protocol. A request this
-    /// protocol appended cannot come from it, so only a malformed or foreign
-    /// frame is refused here.
+    /// Whether this request exists in the client's protocol and leaves the
+    /// daemon to the CLI that matches it.
     pub fn admits_request(&self, request: &ClientRequest) -> bool {
         variant_index(request).is_some_and(|index| index < self.client_requests)
+            && !changes_the_daemon(request)
     }
 
     /// Whether the client can decode this message.
@@ -112,6 +119,29 @@ impl OlderClient {
             false,
         )
     }
+}
+
+/// Requests that stop, update or hand off the daemon itself.
+fn changes_the_daemon(request: &ClientRequest) -> bool {
+    matches!(
+        request,
+        ClientRequest::Shutdown { .. }
+            | ClientRequest::ShutdownV1 { .. }
+            | ClientRequest::PrepareUpgrade { .. }
+            | ClientRequest::UpgradeImpact { .. }
+            | ClientRequest::PrepareConfirmedUpgrade { .. }
+            | ClientRequest::ResolveUpgradeChat { .. }
+    )
+}
+
+/// Whether `executable`, a peer's `/proc/<pid>/exe`, is the `cagents` CLI:
+/// the only older client this daemon serves. A pruned version directory
+/// leaves the link marked deleted.
+pub fn is_cli_executable(executable: &Path) -> bool {
+    executable
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.strip_suffix(" (deleted)").unwrap_or(name) == "cagents")
 }
 
 /// The postcard variant index of an enum value: its position in the
@@ -292,6 +322,26 @@ mod tests {
     }
 
     #[test]
+    fn only_the_cli_executable_is_served_as_an_older_client() {
+        for cli in [
+            "/home/user/.local/share/cagents/versions/0.1.3/bin/cagents",
+            "/usr/bin/cagents",
+            "/home/user/.local/share/cagents/versions/0.1.3/bin/cagents (deleted)",
+        ] {
+            assert!(is_cli_executable(Path::new(cli)), "{cli}");
+        }
+        for other in [
+            "/usr/bin/cagents-ui",
+            "/usr/bin/cagentsd",
+            "/usr/bin/cagents-ui (deleted)",
+            "/usr/bin/python3",
+            "/",
+        ] {
+            assert!(!is_cli_executable(Path::new(other)), "{other}");
+        }
+    }
+
+    #[test]
     fn only_this_protocol_and_the_listed_older_ones_are_served() {
         assert_eq!(older_client(PROTOCOL_VERSION), None);
         assert_eq!(
@@ -330,6 +380,16 @@ mod tests {
             response: ServerResponse::Detached,
         }));
         assert!(!earlier.admits_message(&ServerMessage::Error(earlier.refusal())));
+        let shutdown = ClientRequest::ShutdownV1 {
+            version: crate::terminal_ipc::SHUTDOWN_VERSION,
+            operation: crate::terminal_ipc::ShutdownOperation::Preflight,
+        };
+        let every_request = OlderClient {
+            client_requests: u32::MAX,
+            ..client
+        };
+        assert!(every_request.admits_request(&ClientRequest::List));
+        assert!(!every_request.admits_request(&shutdown));
         let refusal = client.refusal();
         assert_eq!(refusal.code, ProtocolErrorCode::UnsupportedVersion);
         assert!(!refusal.retryable);

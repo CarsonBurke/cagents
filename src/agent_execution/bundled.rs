@@ -416,8 +416,8 @@ fn publish_serving_cli_at(runtime: &Path, paired: Option<&Path>) -> io::Result<(
         Err(error) => return Err(error),
     }
     std::os::unix::fs::symlink(paired, &staged)?;
-    // Renaming replaces an earlier daemon's link in one step; a directory or
-    // file in its place is refused rather than replaced.
+    // Renaming replaces an earlier daemon's link, or a stray file, in one
+    // step; a directory in its place is refused.
     fs::rename(&staged, &entry).inspect_err(|_| {
         let _ = fs::remove_file(&staged);
     })
