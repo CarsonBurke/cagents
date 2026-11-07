@@ -81,8 +81,10 @@ PATHS = {"--manifest-path", "--lockfile-path", "--target-dir", "--artifact-dir",
 # Settings naming a path that only this repository's scripts read, never a
 # build or its tests; they stay here. A development instance's daemon gives
 # CAGENTS_DEVELOPMENT_HOSTED_BY, runtime directories on this host, to the
-# terminals and agents it hosts.
+# terminals and agents it hosts. scripts/native-evidence reads its own, such
+# as the CAGENTS_EVIDENCE_TASK its users export, whose builds come here.
 SCRIPT_SETTINGS = {"CAGENTS_ZIG", "CAGENTS_DEVELOPMENT_HOSTED_BY"}
+SCRIPT_PREFIXES = ("CAGENTS_EVIDENCE_",)
 RUN_MARKER = "cargo-offload-run "
 # What `--hold` gives the command it runs: the build host, the slot it holds
 # there and the checkout it holds it for, and a lock it keeps while it does.
@@ -323,7 +325,8 @@ def path_settings(environment):
     such as the retained-actor helper the HOST tests execute."""
     return [name for name, value in sorted(environment.items())
             if name.startswith("CAGENTS_") and not name.startswith("CAGENTS_BUILD_")
-            and name not in SCRIPT_SETTINGS and value.startswith(("/", "~"))
+            and name not in SCRIPT_SETTINGS and not name.startswith(SCRIPT_PREFIXES)
+            and value.startswith(("/", "~"))
             and not secret(name)]
 
 

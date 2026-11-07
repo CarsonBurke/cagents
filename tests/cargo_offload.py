@@ -433,7 +433,9 @@ class Settings(unittest.TestCase):
             "CAGENTS_TEST_RETAINED_ACTOR_HELPER": "/t/cagentsd", "CAGENTS_LIVE_TESTS": "0",
             "CAGENTS_BUILD_LOCK": "/var/tmp/l", "TMPDIR": "/tmp/x", "CAGENTS_ZIG": "/z/zig",
             "CAGENTS_DEVELOPMENT_HOSTED_BY": "/run/user/1/cagents\n/run/user/1/nh-a/cagents-development-a",
-            "CAGENTS_FIXTURE": "~/f", "CAGENTS_API_KEY_FILE": "/k"}),
+            "CAGENTS_FIXTURE": "~/f", "CAGENTS_API_KEY_FILE": "/k",
+            "CAGENTS_EVIDENCE_TASK": "/home/u/.local/state/cev/task",
+            "CAGENTS_EVIDENCE_NATIVE_LOCK": "/var/tmp/native.lock"}),
             ["CAGENTS_FIXTURE", "CAGENTS_TEST_RETAINED_ACTOR_HELPER"])
 
 
