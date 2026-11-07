@@ -2577,8 +2577,22 @@ impl Adapter for Claude {
                     _ => {}
                 }
             }
+            let mut items = settled(items);
+            if !self.history_only {
+                // This process has not started, so a step its history leaves
+                // running ended with an earlier one, such as one the system
+                // stopped. A background agent can outlive it, and stays.
+                for item in &mut items {
+                    if !self.background_agents.contains(&item.id)
+                        && let Some(status) = item.content.status_mut()
+                        && *status == ToolStatus::Running
+                    {
+                        *status = ToolStatus::Stopped;
+                    }
+                }
+            }
             step.events.push(Event::History {
-                items: settled(items),
+                items,
                 has_earlier: history.offset > 0,
             });
             step.events.extend(children);
@@ -13432,6 +13446,59 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, ["tool-read", "answer-message:0"]);
         assert_eq!(items[0].content.status(), Some(ToolStatus::Succeeded));
+    }
+
+    /// A provider killed while a command ran leaves its call without a
+    /// result. The resumed process never runs it, so it reads as stopped,
+    /// while a background agent it launched may still be running.
+    #[test]
+    fn a_resumed_conversation_shows_a_call_its_killed_process_left_running_as_stopped() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let records = || {
+            let mut file = tempfile::tempfile().unwrap();
+            for value in [
+                json!({"type":"assistant","uuid":"launch","parentUuid":null,"sessionId":session,"message":{"content":[{"type":"tool_use","id":"tool-agent","name":"Agent","input":{"run_in_background":true}}]}}),
+                json!({"type":"user","uuid":"returned","parentUuid":"launch","sessionId":session,"message":{"content":[{"type":"tool_result","tool_use_id":"tool-agent","content":"Launched"}]}}),
+                json!({"type":"assistant","uuid":"call","parentUuid":"returned","sessionId":session,"message":{"id":"call-message","content":[{"type":"tool_use","id":"tool-bash","name":"Bash","input":{"command":"sleep 6001"}}]}}),
+            ] {
+                writeln!(file, "{value}").unwrap();
+            }
+            file.rewind().unwrap();
+            History::index(file, session).unwrap()
+        };
+        let statuses = |history_only| {
+            let mut adapter = Claude {
+                history: Some(records()),
+                history_only,
+                ..Claude::default()
+            };
+            let replayed = adapter.initialize().unwrap();
+            let Some(Event::History { items, .. }) = replayed
+                .events
+                .iter()
+                .find(|event| matches!(event, Event::History { .. }))
+            else {
+                panic!("history was not replayed");
+            };
+            let running = adapter.background_agents.contains("tool-agent");
+            let status = |id: &str| {
+                items
+                    .iter()
+                    .find(|item| item.id == id)
+                    .and_then(|item| item.content.status())
+            };
+            (status("tool-agent"), status("tool-bash"), running)
+        };
+        let (agent, bash, agent_running) = statuses(false);
+        assert_eq!(bash, Some(ToolStatus::Stopped));
+        assert!(agent_running, "the background agent may still run");
+        assert_ne!(
+            agent,
+            Some(ToolStatus::Stopped),
+            "and is not marked stopped"
+        );
+        // Only reading the history starts nothing, so it is left as it was.
+        assert_eq!(statuses(true).1, Some(ToolStatus::Running));
     }
 
     #[test]
