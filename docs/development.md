@@ -269,11 +269,13 @@ work there as they do in your own terminal, with the session's
   descends from, since stopping that would end them. Every process a daemon
   hosts runs below one of the daemon's own processes, so this holds for hosts
   of any version and after a daemon restart. `niri-harness` detaches an
-  instance from the session that started it, so `--instance` also records the
+  instance from the session that started it, so the runner records the
   runtime directories of the daemons hosting that session in
-  `CAGENTS_DEVELOPMENT_HOSTED_BY`, and the check reads it from each daemon
-  above the caller. A session in instance B, started from a session in
-  instance A, can't stop A either.
+  `CAGENTS_DEVELOPMENT_HOSTED_BY` for every app it starts, and the check reads
+  it from each daemon above the caller. A session in instance B, started from
+  a session in instance A, can't stop A either.
+- It refuses when it can't tell: no daemon above the hosted caller, or one
+  whose environment it can't read.
 - It refuses the unnamed development daemon in the login runtime
   (`/run/user/UID/cagents-development`), which belongs to the person at the
   computer, and every production daemon. A production CLI still refuses all
@@ -283,7 +285,8 @@ Other lifecycle commands, such as `daemon stop` and `daemon upgrade`, remain
 refused in every hosted session. Stopping an instance also ends whatever else
 runs in its harness session, so the runner refuses `--stop-instance` and
 `--fresh-daemon` for an instance whose daemon hosts the caller, or a session it
-descends from, before it asks the CLI.
+descends from, before it asks the CLI. Like the CLI, it refuses a hosted caller
+whose hosts it can't tell.
 
 #### Finding and stopping instances
 
