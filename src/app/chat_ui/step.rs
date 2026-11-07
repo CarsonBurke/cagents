@@ -38,6 +38,26 @@ const RAIL_INSET: f32 = space::M;
 const THREAD_RAIL_OFFSET: f32 =
     GAP_S + design::COMPACT_ICON_SIZE as f32 / 2.0 - design::BORDER_WIDTH / 2.0;
 
+/// A row's heading on one line, cut short with an ellipsis where the pane
+/// is too narrow for it, filling what the row's other parts leave. The
+/// heading is held in a clipped box of exactly that width, so the duration
+/// and status beside it keep their place whatever width the shaped text
+/// reports; the whole of what was cut is in the open row.
+fn one_line<'a>(
+    text: cosmic::iced::widget::Text<'a, cosmic::Theme, cosmic::Renderer>,
+) -> Element<'a, Message> {
+    widget::container(
+        text.width(Length::Fill)
+            .wrapping(iced::widget::text::Wrapping::None)
+            .ellipsize(iced::advanced::text::Ellipsize::End(
+                iced::advanced::text::EllipsizeHeightLimit::Lines(1),
+            )),
+    )
+    .width(Length::Fill)
+    .clip(true)
+    .into()
+}
+
 /// The indicator and tone a group's status draws as.
 ///
 /// Status is information, not a control, so it is a plain glyph rather than
@@ -320,19 +340,20 @@ impl Runtime {
             }
             None => None,
         };
-        line.push(
-            design::heading(turn.summary.clone())
-                .width(Length::Fill)
-                .into(),
-        );
         // The one-second chat tick advances running timers even while a tool
         // is quiet. The label shares its cadence with the retained-turn cache.
         let elapsed = self
             .source_now_ms()
             .and_then(|now| turn.duration_label(now));
-        if let Some(elapsed) = &elapsed {
-            line.push(design::caption(elapsed.clone()).into());
-        }
+        // One line, whatever the summary names: a group of one long
+        // command would otherwise wrap it across the pane. The duration is
+        // measured first and the summary cut to what it leaves, so the
+        // duration stays in view. Opening the group shows the whole command.
+        let summary = one_line(design::heading(turn.summary.clone()));
+        line.push(match &elapsed {
+            Some(elapsed) => trailing::trailing(summary, design::caption(elapsed.clone()), GAP_S),
+            None => summary,
+        });
         // The duration is part of what the control says, so it belongs in the
         // name as well: a reader on a screen reader is the one who cannot see
         // the caption beside it.
@@ -397,26 +418,40 @@ impl Runtime {
         settings: markdown::Settings,
     ) -> Element<'static, Message> {
         let open = self.item_expanded(&item.id);
-        let header = self.step_header(item, cached, open);
         if !open {
-            return header;
+            return self.step_header(item, cached, open);
         }
         let detail = self.step_detail(item, cached, settings);
-        widget::column::with_children(vec![
-            header,
+        // The step's actions stay beside its header, and its detail keeps to
+        // the header's width rather than running out under them, so an open
+        // step ends at one right edge.
+        hover::beside_first(
+            self.step_button(item, cached, open),
+            self.message_copy(item),
             widget::container(detail)
                 .padding(iced::Padding::from([0.0, GAP_S]).bottom(GAP_S))
-                .width(Length::Fill)
-                .into(),
-        ])
-        .spacing(GAP_XS)
-        .width(Length::Fill)
-        .into()
+                .width(Length::Fill),
+            GAP_XS,
+        )
     }
 
     /// A step's summary line, which is the whole of a closed step and owns
     /// what it draws, so a finished exchange can keep it between frames.
     pub(super) fn step_header(
+        &self,
+        item: &chat::Item,
+        cached: &CachedItem,
+        open: bool,
+    ) -> Element<'static, Message> {
+        hover::view(
+            self.step_button(item, cached, open),
+            self.message_copy(item),
+            GAP_XS,
+        )
+    }
+
+    /// The summary line's toggle, without the actions placed beside it.
+    fn step_button(
         &self,
         item: &chat::Item,
         cached: &CachedItem,
@@ -428,10 +463,10 @@ impl Runtime {
         let coordinated = cached.coordination.as_deref();
         let (verb, label) = match coordinated {
             Some(coordinated) => coordinated.line(&|id| self.listed_agent_name(id)),
-            None => (
-                turn::step_verb(&item.content).to_owned(),
-                turn::step_label(&item.content).to_owned(),
-            ),
+            None => {
+                let (verb, label) = turn::step_title(&item.content, cached.title_of(item));
+                (verb.to_owned(), label.into_owned())
+            }
         };
         let glyph = coordinated
             .and_then(Coordinated::glyph)
@@ -461,7 +496,7 @@ impl Runtime {
         // row forgetting what is being built.
         let mut preview: Vec<Element<'static, Message>> = Vec::new();
         if let Some(coordinated) = coordinated {
-            preview.push(design::body(label.clone()).into());
+            preview.push(one_line(design::body(label.clone())));
             let arrived = coordinated.reading.outcome.messages.len();
             if arrived > 0 {
                 preview.push(
@@ -474,7 +509,7 @@ impl Runtime {
                 );
             }
         } else if matches!(item.content, ItemContent::Tool { .. }) {
-            preview.push(design::body(label.clone()).into());
+            preview.push(one_line(design::body(label.clone())));
             if !cached.preview.text.is_empty() {
                 preview.push(cached.preview.view());
             }
@@ -507,7 +542,7 @@ impl Runtime {
         if let Some(description) = turn::command_description(&item.content) {
             name = format!("{name} · {description}");
         }
-        let header = widget::button::custom(
+        widget::button::custom(
             widget::row::with_children(line)
                 .spacing(GAP_S)
                 .align_y(Alignment::Start),
@@ -516,8 +551,8 @@ impl Runtime {
         .class(crate::ui_controls::control_style(open, None))
         .padding([GAP_XS as u16, GAP_S as u16])
         .width(Length::Fill)
-        .on_press(action(Action::Toggle(target, item.id.clone())));
-        hover::view(header, self.message_copy(item), GAP_XS)
+        .on_press(action(Action::Toggle(target, item.id.clone())))
+        .into()
     }
 
     /// The bounded height a step's raw output is allowed to occupy before it
