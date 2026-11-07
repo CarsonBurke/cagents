@@ -20,6 +20,7 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 
 /// By full name, because other enums are also called `Response`.
 const WORK_RESPONSE: &str = "cagents::work::Response";
+const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 
 fn fixture(protocol: u16) -> PathBuf {
@@ -285,13 +286,15 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 client.client_requests,
                 client.server_messages,
                 client.server_responses,
-                client.work_responses
+                client.work_responses,
+                client.agent_replies
             ),
             (
                 variant_count(&older, "ClientRequest"),
                 variant_count(&older, "ServerMessage"),
                 variant_count(&older, "ServerResponse"),
                 variant_count(&older, WORK_RESPONSE),
+                variant_count(&older, AGENT_REPLY),
             ),
             "protocol {}'s variant counts",
             client.protocol
@@ -303,6 +306,7 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 ("ServerMessage", client.server_messages as usize),
                 ("ServerResponse", client.server_responses as usize),
                 (WORK_RESPONSE, client.work_responses as usize),
+                (AGENT_REPLY, client.agent_replies as usize),
             ],
             if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
                 vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]

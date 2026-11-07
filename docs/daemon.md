@@ -37,7 +37,7 @@ older window or daemon is still refused at its handshake, which is how a stale w
 that an update superseded it. The daemon answers that CLI in its protocol's
 version. It refuses requests to stop, update or hand off the daemon, and requests whose
 reply the CLI couldn't read, such as `automation history`, `automation run` and
-`automation run-now` on protocols before 153. It withholds notifications the CLI couldn't read.
+`automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
 encodes the same way, except for what is refused or withheld. It checks
@@ -97,7 +97,8 @@ cagents daemon stop --confirm
 | `project open`, `list`, `close` | Manage the projects every window shares, with or without a window running |
 | `channel spawn`, `list`, `close` | Manage the channels every window shares |
 | `channel move PANE_OR_SESSION_OR_AGENT --to CHANNEL_ID` | Move a live pane within its project without restarting its session; accepts full pane/session IDs or an agent's full ID, unique ID prefix or unique name, and reports the resulting placement |
-| `sessions [--project PATH \| --all]` (alias `ls`), `whoami` | List live agent sessions in this project, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `sessions [--project PATH \| --all \| --channel [CHANNEL]]` (alias `ls`), `whoami` | List live agent sessions in this project or everyone in a channel, or identify the calling session and its peers; see [Hosted agent execution](agent-execution.md#finding-other-sessions) |
+| `transcript SESSION [-n N] [--before ID] [--tools] [--full]` (alias `history`) | Read one page of a session's conversation from its provider's saved history; see [Reading your channel](agent-execution.md#reading-your-channel) |
 | `work ls [--project PATH] [--column COLUMN] [--fresh]`, `work pin ITEM COLUMN`, `work unpin ITEM` | Show every worktree and branch in progress across open projects, newest activity first, or override a card's column; see [Work board](user-guide.md#work-board). Hosted sessions may read the board but not pin |
 | `send SESSION`, `ask`, `reply MESSAGE_ID`, `inbox` | Message another live session, wait for its reply, answer a message, or read the messages left for you; see [Hosted agent execution](agent-execution.md#messages-between-sessions) |
 

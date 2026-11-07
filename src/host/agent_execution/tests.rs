@@ -3,6 +3,7 @@ mod automation_removal;
 mod owned_late_decision;
 #[cfg(target_os = "linux")]
 mod retained_automation;
+mod transcript;
 
 use super::*;
 use crate::{
@@ -144,6 +145,10 @@ while IFS= read -r frame; do
     *'"type":"user"'*)
       n=$((n + 1))
       printf 'prompt\n' >> "$HOME/../prompts"
+      case "$frame" in
+        # Ends the provider mid-turn, as a usage limit does.
+        *EXIT_NOW*) exit 3 ;;
+      esac
       case "$frame" in
         *HOLD_CLEANUP_BUSY*)
           : > "$HOME/../cleanup-busy"

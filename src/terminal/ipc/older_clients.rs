@@ -34,8 +34,8 @@ use super::{
 };
 
 /// What an older protocol's client can decode, as variant counts of the three
-/// top-level enums and of the work reply nested in one of them. Later variants
-/// exist only in newer protocols.
+/// top-level enums and of the work and agent replies nested in one of them.
+/// Later variants exist only in newer protocols.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OlderClient {
     pub protocol: u16,
@@ -46,24 +46,28 @@ pub struct OlderClient {
     server_messages: u32,
     server_responses: u32,
     work_responses: u32,
+    /// Variants of `agent_execution::Reply`. A later one answers only an
+    /// operation the older client cannot encode.
+    agent_replies: u32,
 }
 
 /// The install candidate line, 0.1.3+local.c68275e94. Its chats are carried
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 153,
+    proven_at: 156,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
     work_responses: 6,
+    agent_replies: 11,
 };
 
 const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
 
 /// The first protocol whose `Firing` carries its skipped occurrences. Postcard
 /// is positional, so a client before this one cannot read a reply holding one.
-const FIRING_WITH_SKIPPED_OCCURRENCES: u16 = 153;
+const FIRING_WITH_SKIPPED_OCCURRENCES: u16 = 156;
 
 /// The `automations::Response` variants holding a `Firing`. The wire format
 /// proof skips exactly these, so a variant here is one no older client gets.
@@ -93,6 +97,7 @@ impl OlderClient {
             server_messages,
             server_responses,
             work_responses: u32::MAX,
+            agent_replies: u32::MAX,
         }
     }
 
@@ -138,6 +143,9 @@ impl OlderClient {
                     ServerResponse::Automation(automation) => {
                         self.protocol >= FIRING_WITH_SKIPPED_OCCURRENCES
                             || !holds_a_firing(automation)
+                    }
+                    ServerResponse::Agent(reply) => {
+                        variant_index(reply).is_some_and(|index| index < self.agent_replies)
                     }
                     _ => true,
                 };
@@ -507,6 +515,29 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_reply_after_the_older_protocol_is_refused() {
+        use crate::agent_execution::{
+            Reply,
+            directory::{Directory, Members, Scope},
+        };
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = |reply| ServerMessage::Response {
+            response: ServerResponse::Agent(reply),
+        };
+        assert!(client.admits_message(&reply(Reply::Directory(Directory {
+            caller: None,
+            scope: Scope::All,
+            sessions: Vec::new(),
+        }))));
+        assert!(client.admits_message(&reply(Reply::InboxAcknowledged)));
+        assert!(!client.admits_message(&reply(Reply::Members(Members {
+            channel: crate::model::ChannelId::new(),
+            caller: None,
+            sessions: Vec::new(),
+        }))));
+    }
+
+    #[test]
     fn variants_after_the_older_protocols_are_refused_or_withheld() {
         let detached = variant_index(&ServerResponse::Detached).unwrap();
         let list = variant_index(&ClientRequest::List).unwrap();
@@ -517,6 +548,7 @@ mod tests {
             server_messages: 1,
             server_responses: detached,
             work_responses: u32::MAX,
+            agent_replies: u32::MAX,
         };
         assert!(!client.admits_request(&ClientRequest::List));
         assert!(client.admits_request(&ClientRequest::Connect {
