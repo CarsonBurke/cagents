@@ -184,13 +184,17 @@ impl Prepared {
         let (preview, long) = match policy {
             PreviewPolicy::User => preview(body),
             PreviewPolicy::Notice => {
-                let long = body.lines().take(view::NOTICE_LINES + 1).count() > view::NOTICE_LINES;
+                let long = body.lines().take(view::NOTICE_LINES + 1).count() > view::NOTICE_LINES
+                    || body.chars().nth(view::NOTICE_CHARS).is_some();
                 (
                     if long {
                         body.lines()
                             .take(view::NOTICE_LINES)
                             .collect::<Vec<_>>()
                             .join("\n")
+                            .chars()
+                            .take(view::NOTICE_CHARS)
+                            .collect()
                     } else {
                         String::new()
                     },
