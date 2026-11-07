@@ -842,7 +842,7 @@ def session_phase(session):
     return "test" if testing else None
 
 
-def price_by_phase(slot, cost, session):
+def price_by_phase(slot, cost, session, ended):
     """Prices the command in `slot`, whose processes form `session`, by its
     phase. Cargo runs tests only once it has built everything they need, and
     a test run needs what its tests hold, not what compiling them did: while
@@ -853,10 +853,11 @@ def price_by_phase(slot, cost, session):
     counted, however much that is; growth beyond that peak is not reserved,
     as tests run by the gate here are not, and the host's memory pressure
     holds further builds back. When it compiles again, as doctests do, it is
-    priced as a build."""
-    priced, peak = cost, 0
-    while True:
-        time.sleep(PHASE_INTERVAL)
+    priced as a build. Once `ended` is set, the slot is priced as a build
+    again, for whatever builds in it next under the same lease, and pricing
+    stops."""
+    priced, peak, repriced = cost, 0, False
+    while not ended.wait(PHASE_INTERVAL):
         try:
             phase = session_phase(session)
             if phase == "test":
@@ -869,12 +870,19 @@ def price_by_phase(slot, cost, session):
             # Small changes in what the tests hold are not worth rewriting for.
             if price != priced and (price == cost or priced == cost
                                     or abs(price - priced) >= 64 * 2**20):
+                repriced = True
                 reprice(slot, price)
                 priced = price
         except Exception:
             # Repricing never ends a command. A failed pass, such as a claim
             # the full disk could not take, is tried again at the next.
             continue
+    # Even a pass that failed partway may have changed the claim.
+    if repriced:
+        try:
+            reprice(slot, cost)
+        except Exception:
+            pass
 
 
 def start_time(pid):
@@ -1334,7 +1342,14 @@ elif command == "run":
         sys.stdout.flush()
     child = subprocess.Popen(arguments, env=environment, stdin=subprocess.DEVNULL,
                              start_new_session=True)
-    threading.Thread(target=price_by_phase, args=(base, cost, child.pid), daemon=True).start()
+    ended = threading.Event()
+    pricing = threading.Thread(target=price_by_phase, args=(base, cost, child.pid, ended),
+                               daemon=True)
+    pricing.start()
+    def priced_as_built():
+        # A hold builds again in this slot under the same lease and claim.
+        ended.set()
+        pricing.join(10)
     def end(sent_first):
         """Signals the command's process group until it is gone: children
         that ignore an interrupt, as a shell's background jobs do, get a
@@ -1354,6 +1369,7 @@ elif command == "run":
     def cancel():
         cancelling.set()
         end(signal.SIGINT)
+        priced_as_built()
         os._exit(130)
     until_closed(cancel)
     status = child.wait()
@@ -1363,6 +1379,7 @@ elif command == "run":
             time.sleep(3600)
     # What the command left running would keep the connection open.
     end(signal.SIGTERM)
+    priced_as_built()
     os._exit(status if status >= 0 else 128 - status)
 '''
 
@@ -1547,9 +1564,7 @@ class Offload:
 
         if self.cancelled:
             return 128 + self.cancelled
-        # Tests run in a slot of their own, priced by what they hold, so a
-        # hold, which lasts for its builds, never keeps a slot through tests.
-        if not self.runs_tests_there() and self.held(base, top) is not None:
+        if self.held(base, top) is not None:
             status = self.build_held(base, top, workspace, cwd, metadata)
             if status is not None:
                 return status
@@ -1633,13 +1648,8 @@ class Offload:
                 self.close_connection()
 
     def tests_there(self):
-        """Whether the command builds tests for the build host, where a Git
-        marker would change what they see."""
-        return self.plan.subcommand in ("test", "bench")
-
-    def runs_tests_there(self):
         """Whether the command runs tests on the build host."""
-        return self.tests_there() and not self.plan.no_run
+        return self.plan.subcommand in ("test", "bench")
 
     def refuse_marker(self, marker):
         # Tests that check Git ancestry would fail there for a reason
@@ -2173,9 +2183,9 @@ class Hold(Offload):
     """Leases one slot on the build host and holds it while `command` runs
     here, for a script of builds such as the development runner's: each
     gated Cargo command in it builds in that slot, one at a time, with no
-    admission of its own; one that runs tests leases a slot of its own. The
-    slot stays leased, at the hold's expected cost, until the command ends,
-    so hold only for builds."""
+    admission of its own. Tests run there too, priced by what they hold while
+    they run and at the hold's cost again once they end. The slot stays
+    leased until the command ends, so hold only for builds."""
 
     def __init__(self, host, command, environment):
         super().__init__(host, None, environment)

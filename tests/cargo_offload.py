@@ -962,17 +962,17 @@ class StandInHost(unittest.TestCase):
                 self.assertEqual(self.leases(log), 1)
                 log.unlink()
 
-    def test_tests_in_a_hold_run_in_a_slot_of_their_own(self):
-        # A hold lasts for its builds, priced as builds; tests are priced by
-        # what they hold, in a lease that ends with them.
+    def test_tests_in_a_hold_run_in_its_slot(self):
+        # On a host of one slot, tests leasing a slot of their own would wait
+        # for the hold around them.
         log = self.root / "requests"
-        env = self.remote_env() | {"STAND_IN_LOG": str(log)}
+        env = self.remote_env() | {"STAND_IN_LOG": str(log), "CAGENTS_BUILD_REMOTE_SLOTS": "1"}
         result = self.gate_run(
             "exec", "--hold", "sh", "-ec",
-            "cargo build --bin probe; cargo test; cargo test --no-run; cargo build --bin probe",
+            "cargo build --bin probe; cargo test; cargo build --bin probe",
             env=env, timeout=60)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.leases(log), 2, log.read_text())
+        self.assertEqual(self.leases(log), 1, log.read_text())
 
     def test_tests_in_a_hold_stop_under_a_stray_git_marker_and_builds_do_not(self):
         env = self.remote_env() | {"CAGENTS_BUILD_REMOTE": "marked"}
@@ -1777,10 +1777,10 @@ class RemoteRun(unittest.TestCase):
         agent.stdout.close()
         return output.decode()
 
-    def phased_run(self, *, least=None):
+    def phased_run(self, *, least=None, doctests=True):
         """Runs a command shaped as `cargo test` is in the agent: a compile, a
-        test harness Cargo built into `deps`, then a compile again, as for
-        doctests. Returns the slot's claimed costs during each step, the costs
+        test harness Cargo built into `deps`, then, with `doctests`, a compile
+        again. Returns the slot's claimed costs during each step, the costs
         its host record named, and the build's own cost."""
         build_cost = 9 * 2**30
         with FixtureDirectory() as scope, tempfile.TemporaryDirectory() as host:
@@ -1802,10 +1802,11 @@ class RemoteRun(unittest.TestCase):
             shutil.copy(python, harnesses / "cagents-0123456789abcdef")
             steps = Path(host, "steps")
             pause = "import sys, time; time.sleep(float(sys.argv[1]))"
-            command = ["sh", "-ec",
-                       f'"{tools}/rustc" -c "$0" 1.5; touch "{steps}.test"; '
-                       f'"{harnesses}/cagents-0123456789abcdef" -c "$0" 2; touch "{steps}.doc"; '
-                       f'"{tools}/rustc" -c "$0" 1.5', pause]
+            script = (f'"{tools}/rustc" -c "$0" 1.5; touch "{steps}.test"; '
+                      f'"{harnesses}/cagents-0123456789abcdef" -c "$0" 2')
+            if doctests:
+                script += f'; touch "{steps}.doc"; "{tools}/rustc" -c "$0" 1.5'
+            command = ["sh", "-ec", script, pause]
             registry = Path(host, "registry")
             settings = {"CAGENTS_OFFLOAD_PHASE_INTERVAL": "0.1",
                         "CAGENTS_BUILD_REGISTRY": str(registry)}
@@ -1832,8 +1833,16 @@ class RemoteRun(unittest.TestCase):
                 time.sleep(0.05)
             self.assertEqual(agent.returncode, 0)
             agent.stdin.close()
+            # Priced as a build again once it ends, whatever it did last: a
+            # hold builds again in the slot under the same claim.
             self.assertEqual(json.loads((base / "claim").read_text())["cost"], build_cost)
+            for record in records(registry):
+                self.assertEqual(int(record.read_text().split()[1]) * 1024, build_cost)
             return seen, recorded, build_cost
+
+    def test_a_command_that_ends_testing_leaves_its_slot_priced_as_a_build(self):
+        seen, _, build_cost = self.phased_run(doctests=False)
+        self.assertIn(2 * 2**30, seen["test"])
 
     def test_a_command_running_its_tests_is_priced_at_least_as_a_build_is(self):
         # A remote `cargo test` runs its harnesses in the slot. Once it only

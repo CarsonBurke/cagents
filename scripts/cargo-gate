@@ -100,8 +100,7 @@ with the reason.
 it builds on that host, each admitted there on its own. With --hold, for a
 script that only builds, one slot there is leased first, priced as a UI
 build, and held until COMMAND exits: its Cargo commands build in that slot one
-at a time, with no wait for admission of their own. A command that runs tests
-still leases a slot of its own.
+at a time, with no wait for admission of their own.
 
 With CAGENTS_BUILD_REMOTE=local, or on the build host itself, commands build
 here, each once a build slot is free. For `test`, `bench` and `run`, only the
