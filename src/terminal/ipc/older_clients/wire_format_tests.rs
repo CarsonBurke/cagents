@@ -21,6 +21,7 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 /// By full name, because other enums are also called `Response`.
 const WORK_RESPONSE: &str = "cagents::work::Response";
 const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
+const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
 
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -57,6 +58,9 @@ struct Comparison<'a> {
     /// (`ServerMessage`) or full path (`cagents::work::Response`), with the
     /// older client's variant count.
     gated: Vec<(&'static str, usize)>,
+    /// Variants of the named enum that the connection refuses, so their
+    /// contents need not match. Their positions still must.
+    refused: Vec<(&'static str, &'static [&'static str])>,
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,
 }
@@ -113,6 +117,11 @@ impl Comparison<'_> {
                     };
                     if name != next {
                         self.differ(&path, format!("variant {index} is now {next}"));
+                    }
+                    if self.refused.iter().any(|(enum_name, variants)| {
+                        *enum_name == current && variants.contains(&name.as_str())
+                    }) {
+                        continue;
                     }
                     match (fields, next_fields) {
                         (Some(old), Some(new)) => self.fields(direction, old, new, &path),
@@ -190,11 +199,17 @@ impl Comparison<'_> {
     }
 }
 
-fn differences(older: &Shapes, current: &Shapes, gated: Vec<(&'static str, usize)>) -> Vec<String> {
+fn differences(
+    older: &Shapes,
+    current: &Shapes,
+    gated: Vec<(&'static str, usize)>,
+    refused: Vec<(&'static str, &'static [&'static str])>,
+) -> Vec<String> {
     let mut comparison = Comparison {
         older,
         current,
         gated,
+        refused,
         visited: BTreeSet::new(),
         differences: Vec::new(),
     };
@@ -243,8 +258,8 @@ fn this_protocols_wire_format_is_recorded() {
         return;
     }
     let recorded = recorded(PROTOCOL_VERSION);
-    let mut changed = differences(&recorded, &current, Vec::new());
-    changed.extend(differences(&current, &recorded, Vec::new()));
+    let mut changed = differences(&recorded, &current, Vec::new(), Vec::new());
+    changed.extend(differences(&current, &recorded, Vec::new(), Vec::new()));
     assert!(
         changed.is_empty(),
         "the wire format differs from protocol {PROTOCOL_VERSION}'s recording. Postcard is \
@@ -293,6 +308,11 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
             ],
+            if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
+                vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]
+            } else {
+                Vec::new()
+            },
         );
         assert!(
             differences.is_empty(),

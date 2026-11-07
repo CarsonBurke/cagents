@@ -110,9 +110,11 @@ check_head() {
             behind=" ($(commits "$(git rev-list --count "HEAD..$tip")") behind origin/$default)"
         fi
         # A branch checked out in another worktree cannot be checked out here.
+        # awk reads to the end: exiting early could kill git with SIGPIPE,
+        # which pipefail and set -e would turn into a silent exit.
         worktree=$(git worktree list --porcelain | awk -v ref="refs/heads/$default" '
             /^worktree / { path = substr($0, 10) }
-            $0 == "branch " ref { print path; exit }')
+            $0 == "branch " ref && !found { print path; found = 1 }')
         if [[ -n $worktree ]]; then
             refuse_stale_head "HEAD is detached at $SHORT$behind." \
                 "To build $default, run: cd $(printf '%q' "$worktree") && git pull --ff-only && scripts/install-local$ARGUMENTS"
@@ -236,9 +238,14 @@ EOF
     # A remote build may link against a newer glibc than this host provides.
     have=$(getconf GNU_LIBC_VERSION | awk '{ print $2 }')
     tar -xzf "$OUTPUT/$ARCHIVE" -C "$OUTPUT" "cagents-$VERSION/bin"
-    need=$(for binary in cagents cagentsd cagents-ui; do
-        LC_ALL=C readelf --wide --version-info "$OUTPUT/cagents-$VERSION/bin/$binary"
-    done | grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' | sed 's/GLIBC_//' | sort -Vu | tail -n1)
+    versions=
+    for binary in cagents cagentsd cagents-ui; do
+        versions+=$(LC_ALL=C readelf --wide --version-info "$OUTPUT/cagents-$VERSION/bin/$binary")$'\n' \
+            || fail "could not read the glibc versions $binary requires"
+    done
+    # No GLIBC symbol leaves need empty; pipefail must not turn grep's status
+    # into a silent exit before the message below.
+    need=$(grep -oE 'GLIBC_[0-9]+(\.[0-9]+)+' <<<"$versions" | sed 's/GLIBC_//' | sort -Vu | tail -n1) || :
     [[ -n $need ]] || fail 'could not determine the glibc the build requires'
     [[ $(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1) == "$have" ]] \
         || fail "the build requires glibc $need; this host has $have"

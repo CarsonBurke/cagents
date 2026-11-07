@@ -626,13 +626,29 @@ stop until ownership is resolved. Removing the chosen account or replacing the
 target directory cannot silently redirect a future run to another account or
 directory. Closing a project pauses its schedules.
 
-**Run history** includes runs from removed definitions. It pages through
-their original names, times, outcomes, and bounded results. Opening history does
-not start or attach a provider. **Open agent** explicitly opens a still-live
-session; completed fresh sessions remain readable in history. A completion alert
-opens its run under **Automations**, with a trail back to the list, and
-survives provider cleanup. Removing a definition prevents future runs and
-retains its past runs.
+**Run history** pages through original names, times, outcomes, and bounded
+results. Consecutive scheduled skips with the same reason share one entry
+showing how many times the schedule was skipped and the first and last times, so
+a run waiting for you stays near the top instead of behind pages of skips. A
+manual request, a successful run, a different reason, or a change to what the
+automation runs starts another entry. A name-only edit keeps a group's original
+name. Time the daemon was not running is summarized without a count, because
+those times were never individually recorded.
+
+Each automation keeps up to 500 finished entries. Runs still in progress or
+needing your attention stay however old they are. A removed automation's
+finished entries are kept for 30 days and then deleted; its saved definition and
+agent sessions stay, so this limits history, not total storage. Opening an alert
+or entry whose details were already removed says they are no longer available.
+An old manual request ID still cannot run again when its details expire: retries
+report that the original request was recorded. Use a new request ID only for an
+intentional new run.
+
+Opening history does not start or attach a provider. **Open agent** explicitly
+opens a still-live session; retained completed sessions remain readable in
+history. A completion alert opens its run under **Automations**, with a trail
+back to the list, and survives provider cleanup. Removing a definition prevents
+future runs without bypassing active ownership or cleanup.
 
 The same operations are available without a window:
 
