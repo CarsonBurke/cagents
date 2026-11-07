@@ -32,8 +32,9 @@ both use the same fixture data and synthetic provider.
   build SIDE CHECKOUT
                   Build the runner's three browserless executables in one of
                   the build host's shared slots, and keep them in the side's
-                  target. scripts/prune-build-dirs removes a target that no
-                  session or build has used for 12 hours.
+                  target. scripts/prune-build-dirs reclaims a task's targets
+                  once no build or session has used them for 12 hours, or 1
+                  hour while the disk is low.
   start SIDE [--width PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
                   Take the native lock and start a headless session. The lock is
                   released by stop, or after --limit seconds (default 2700).
@@ -204,6 +205,10 @@ cmd_build() {
     [ ! -e "${zig%/*}/cargo" ] ||
         die "$zig has a cargo beside it, which a session would run while holding the native lock; set CAGENTS_ZIG to a Zig installed apart from Cargo"
     cargo_path=$(cd -- "$checkout" && rustup which cargo)
+    # Builds in shared slots skip the gate's disk guard, which starts the
+    # pruner on its schedule and refuses a build when the disk is too full.
+    # The slots share this host's disk, so run it here.
+    (cd -- "$checkout" && "$tool_root/scripts/build-disk-guard" "$target") || exit
     # Each of the three builds goes through the gate's `cargo`, into one slot
     # it holds for all three: on the build host, or with
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
@@ -212,10 +217,14 @@ cmd_build() {
         __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
 }
 
-# Marks a side's target as just used, so the pruner leaves it for its
-# --evidence-hours from now. Its absence is reported by what reads it.
+# Marks both sides' targets as just used, so the pruner leaves them for its
+# --evidence-hours from now: a task between its before and after sessions is
+# in use. A missing target is reported by what reads it.
 mark_used() {
-    touch -- "$(target_of "$1")/.native-evidence-used" 2>/dev/null || :
+    local side
+    for side in before after; do
+        touch -- "$(target_of "$side")/.native-evidence-used" 2>/dev/null || :
+    done
 }
 
 run_build() {
@@ -252,11 +261,17 @@ run_build() {
     printf 'built %s at %s\n' "$side" "$(head -n1 <<<"$revision")"
 }
 
+# What a side without a build says. scripts/prune-build-dirs reclaims one that
+# has gone unused, which only another build brings back.
+not_built() {
+    printf '%s has not been built, or its unused build was reclaimed; run: build %s %s\n' "$1" "$1" "$2"
+}
+
 # Reads what the side's build recorded: its checkout, tools and source state.
 load_side() {
     local side=$1 record=${2:-}
     record=${record:-$(target_of "$side")/evidence-source}
-    [ -f "$record" ] || die "$side has not been built; run: build $side CHECKOUT"
+    [ -f "$record" ] || die "$(not_built "$side" CHECKOUT)"
     {
         read -r checkout
         read -r zig
@@ -436,15 +451,15 @@ run_session() {
     load_side "$side" "$state/source"
     # Open for the whole session, even while it waits for the native lock, so
     # the pruner leaves the target.
-    exec 8<"$target" 2>/dev/null || {
-        printf '%s has not been built; run: build %s %s\n' "$side" "$side" "$checkout" >"$state/failed"
+    { exec 8<"$target"; } 2>/dev/null || {
+        not_built "$side" "$checkout" >"$state/failed"
         return 1
     }
     exec 9>"$native_lock"
     compositor=
     lock_waiter=
     # A waiter left in the queue would take the lock for a moment later on.
-    trap '[ -z "$lock_waiter" ] || kill -KILL "$lock_waiter" 2>/dev/null; end_session; exit 143' TERM INT HUP
+    trap '[ -z "$lock_waiter" ] || kill -KILL "$lock_waiter" 2>/dev/null; end_session; mark_used; exit 143' TERM INT HUP
     wait_for_native_lock "$wait_lock" "$starter" || return 1
     settle_session_processes 9>&-
     # A document portal can leave a FUSE mount in the runtime directory.
@@ -486,7 +501,7 @@ run_session() {
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
         --width 1596 --height 929 --exit-with-session \
         "$self --task $task __inner $side $width" \
-        >"$logs/kwin-$side.log" 2>&1 9>&- &
+        >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
     compositor=$!
     local deadline=$((SECONDS + limit)) stop_deadline=
     while kill -0 "$compositor" 2>/dev/null; do
@@ -512,7 +527,7 @@ run_session() {
         printf 'the compositor exited before the session was ready; see %s\n' "$logs/kwin-$side.log" >"$state/failed"
     end_session
     # Unused from now on, as far as the pruner can tell.
-    mark_used "$side"
+    mark_used
 }
 
 run_inner() {
@@ -640,12 +655,13 @@ cmd_start() {
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     live_session && die 'a session is already running for this task; stop it first'
     # Before anything reads it: the pruner leaves a target written meanwhile.
-    mark_used "$side"
+    mark_used
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"
     rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env"
     # Fix what this session runs: everything it reports reads this copy.
-    cp -- "$(target_of "$side")/evidence-source" "$state/source"
+    cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
+        die "$(not_built "$side" "$checkout")"
     printf '%s\n' "$side" >"$state/side"
     printf '%s\n' "$width" >"$state/width"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"

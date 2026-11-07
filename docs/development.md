@@ -565,8 +565,9 @@ On the build host itself, or with
 above. With `CAGENTS_BUILD_REMOTE_LOOPBACK=1`, the build host's own commands
 build in its offloaded slots instead, as another host's would: the gate runs
 the same commands and copies through a local stand-in for ssh, which starts
-them from a clean environment as sshd would, and only what the caller uses
-comes back. `scripts/native-evidence` builds this way. A gate without
+them in the user's login shell (`CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL` names
+another) from a clean environment, as sshd would, and only what the caller
+uses comes back. `scripts/native-evidence` builds this way. A gate without
 `scripts/cargo-offload` beside it refuses to build unless
 `CAGENTS_BUILD_REMOTE=local` is set.
 
@@ -1206,13 +1207,16 @@ harness, it provides:
   inherited the task's private runtime directory. That path is the proof of
   ownership, so nothing else on the host is touched.
 - **Reclaimed builds.** `scripts/prune-build-dirs` removes a task's
-  `target-before` or `target-after` once nothing has written it, no build or
-  session has it open and no process runs its executables for 12 hours, or 1
-  hour while the disk is low. `build`, `start` and the end of a session each
-  count as use. A side whose target went says it has not been built; build it
-  again, which in a shared slot takes minutes. Screenshots, logs and the
-  fixture stay. Tasks outside the pruner's roots, `~/.cache`,
-  `~/.local/state` and `/var/tmp`, are not searched.
+  `target-before` and `target-after` once the task has gone unused for 12
+  hours, or 1 hour while the disk is low. `build`, `start` and the end of a
+  session each count as use of both sides, and it never removes a target that
+  a build or session has open or whose executables are running. A side whose
+  target went says so; build it again, which in a shared slot recompiles only
+  what changed since that slot's last build. Screenshots, logs and the fixture
+  stay. Tasks outside the pruner's roots, `~/.cache`, `~/.local/state` and
+  `/var/tmp`, are not searched. `build` also runs `scripts/build-disk-guard`,
+  as a gated build on this host does, so it starts the pruner on its schedule
+  and is refused when the disk is below its floor.
 
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
 that authority, so a hosted agent shell cannot use it. Remove the task directory

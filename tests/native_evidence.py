@@ -186,6 +186,8 @@ class Evidence(unittest.TestCase):
             # These fixtures exercise this host's queue; Rust never compiles.
             "CAGENTS_BUILD_REMOTE": "local",
             "CAGENTS_BUILD_INSTALLED_GATE": "",
+            # The disk guard must not start the host's own pruner from a fixture.
+            "CAGENTS_BUILD_FREE_FLOOR_GIB": "0",
             "CAGENTS_EVIDENCE_TASK": str(self.task),
             "GIT_CONFIG_GLOBAL": "/dev/null",
         }
@@ -408,6 +410,15 @@ class Evidence(unittest.TestCase):
                          ["target-after", "target-before"])
         self.assertFalse((self.task / "target-before/debug").exists())
 
+    def test_a_build_with_too_little_disk_is_refused_before_it_starts(self) -> None:
+        # Slot builds skip the gate's own disk guard, so the tool runs it.
+        checkout = self.checkout()
+        result = self.run_tool("build", "after", str(checkout), check=False, extra={
+            "CAGENTS_BUILD_FREE_FLOOR_GIB": "999999999", "CAGENTS_BUILD_PRUNE": "true"})
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("refusing to build", result.stderr)
+        self.assertFalse((self.logs / "cargo").exists())
+
     def test_its_builds_and_sessions_keep_their_target_from_the_pruner(self) -> None:
         self.built()
         target = self.task / "target-after"
@@ -422,6 +433,10 @@ class Evidence(unittest.TestCase):
         pid = (self.task / "session/pid").read_text().strip()
         self.assertIn(str(target), [os.readlink(f"/proc/{pid}/fd/{fd}")
                                     for fd in os.listdir(f"/proc/{pid}/fd")])
+        # Its errors still reach the log that start names.
+        self.assertEqual(os.readlink(f"/proc/{pid}/fd/2"), str(self.task / "logs/session-after.log"))
+        # Only the supervisor holds it: a process the session leaves behind must not.
+        self.assertNotIn(str(target), (self.logs / "kwin-fds").read_text())
         os.utime(marker, (old, old))
         self.run_tool("stop")
         # Unused from when the session ended.
@@ -432,7 +447,8 @@ class Evidence(unittest.TestCase):
         shutil.rmtree(self.task / "target-after")
         result = self.run_tool("start", "after", check=False)
         self.assertEqual(result.returncode, 1)
-        self.assertIn(f"after has not been built; run: build after", result.stderr)
+        self.assertIn("after has not been built, or its unused build was reclaimed; "
+                      "run: build after CHECKOUT", result.stderr)
         self.run_tool("build", "after", str(checkout))
         self.run_tool("start", "after")
 
