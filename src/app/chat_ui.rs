@@ -14995,6 +14995,22 @@ mod tests {
         }
     }
 
+    /// An image whose receipt names nothing, which no draft can save.
+    fn malformed_image(path: &str) -> Attachment {
+        let path = PathBuf::from(path);
+        Attachment {
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::nil(),
+                number: 0,
+                device: uuid::Uuid::nil(),
+                name: path.file_name().unwrap().to_string_lossy().into_owned(),
+                sha256: String::new(),
+                extension: "png".into(),
+            }),
+            path,
+        }
+    }
+
     fn paths(attachments: &[Attachment]) -> Vec<&Path> {
         attachments
             .iter()
@@ -15138,7 +15154,9 @@ mod tests {
         assert_eq!(runtime.composer.text().trim(), "second task\nlater draft");
         assert_eq!(runtime.attachments.len(), 4);
         assert_eq!(runtime.attachments[0].path, Path::new("third.png"));
-        assert!(runtime.transition_blocker().is_some(), "attachments remain");
+        // The files returned to the composer are saved with its draft.
+        assert!(runtime.transition_blocker().is_none());
+        assert_eq!(runtime.persistent_draft().1, runtime.attachments);
     }
 
     #[test]
@@ -18670,10 +18688,11 @@ mod tests {
                 panic!("expected chat");
             };
             match kind {
-                0 => runtime.attachments.push(Attachment {
-                    path: "/workspace/draft.txt".into(),
-                    reference: None,
-                }),
+                // A file is saved with the draft; an image the workspace
+                // cannot save is not.
+                0 => runtime
+                    .attachments
+                    .push(malformed_image("/workspace/draft.png")),
                 1 => runtime
                     .followups
                     .push(followup(0, "accepted local task", &[])),
@@ -18847,10 +18866,15 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&live) else {
             panic!("expected live chat runtime");
         };
-        runtime.attachments.push(Attachment {
-            path: "/workspace/example.txt".into(),
-            reference: None,
-        });
+        // A file is saved with the draft; an image the workspace cannot save
+        // holds the update back.
+        runtime
+            .attachments
+            .push(Attachment::file("/workspace/example.txt"));
+        assert!(runtime.restart_blocker().is_none());
+        runtime
+            .attachments
+            .push(malformed_image("/workspace/example.png"));
         assert!(runtime.restart_blocker().is_some());
         runtime.attachments.clear();
 
@@ -27442,17 +27466,9 @@ mod tests {
             unreachable!()
         };
         // An image whose receipt is malformed cannot be saved with the draft.
-        runtime.attachments.push(Attachment {
-            path: PathBuf::from("/tmp/unsent-attachment.png"),
-            reference: Some(chat::ImageReference {
-                id: uuid::Uuid::nil(),
-                number: 0,
-                device: uuid::Uuid::nil(),
-                name: "unsent-attachment.png".into(),
-                sha256: String::new(),
-                extension: "png".into(),
-            }),
-        });
+        runtime
+            .attachments
+            .push(malformed_image("/tmp/unsent-attachment.png"));
         let reason = "Send or remove the attached images before leaving the chat.";
         assert_eq!(app.chat_switch_blocker(card).as_deref(), Some(reason));
         assert!(!app.chat_switch_ready(card));
