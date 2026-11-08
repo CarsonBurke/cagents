@@ -20,8 +20,11 @@ any process that left the group but still carries its CAGENTS_BOUNDED mark.
 
 import argparse
 import ctypes
+import errno
 import json
+import math
 import os
+import select
 import signal
 import subprocess
 import sys
@@ -38,11 +41,16 @@ PR_SET_PDEATHSIG = 1
 
 
 def say(message):
-    print(f"bounded: {message}", file=sys.stderr, flush=True)
+    # After an SSH connection drops, its terminal is gone too.
+    try:
+        print(f"bounded: {message}", file=sys.stderr, flush=True)
+    except OSError:
+        pass
 
 
 def stat(pid):
-    """(command name, parent, start ticks) of a process, or None."""
+    """(command name, state, parent, process group, start ticks) of a
+    process, or None. The name, in parentheses, may hold anything."""
     try:
         with open(f"/proc/{pid}/stat") as file:
             text = file.read()
@@ -50,12 +58,14 @@ def stat(pid):
         return None
     name = text[text.index("(") + 1:text.rindex(")")]
     fields = text[text.rindex(")") + 2:].split()
-    return name, int(fields[1]), int(fields[19])
+    return name, fields[0], int(fields[1]), int(fields[2]), int(fields[19])
 
 
 def alive(pid, start):
+    """Whether the process that had this ID and start still runs: not a later
+    one given the same ID, and not one that has exited but not been reaped."""
     found = stat(pid)
-    return found is not None and found[2] == start
+    return found is not None and found[4] == start and found[1] not in "ZX"
 
 
 def describe(pid):
@@ -74,64 +84,82 @@ def owner(chosen=None):
     such as its agent's provider, else the shell that ran this."""
     if chosen is not None:
         found = stat(chosen)
-        if found is None:
+        if found is None or not alive(chosen, found[4]):
             raise SystemExit(f"bounded: --owner {chosen} is not running")
-        return chosen, found[2], f"{describe(chosen)} (pid {chosen})"
+        return chosen, found[4], f"{describe(chosen)} (pid {chosen})"
     chain, pid = [], os.getppid()
     while pid > 1:
         found = stat(pid)
         if found is None:
             break
         chain.append((pid, found))
-        pid = found[1]
-    for pid, (name, _, start) in chain:
-        if name.startswith("sshd"):
-            return pid, start, f"the SSH connection (pid {pid})"
-    for (pid, (name, _, start)), (_, (parent_name, _, _)) in zip(chain, chain[1:]):
-        if parent_name.startswith("cagentsd"):
-            return pid, start, f"{name} (pid {pid}), which the cagents session runs"
+        pid = found[2]
+    for pid, found in chain:
+        if found[0].startswith("sshd"):
+            return pid, found[4], f"the SSH connection (pid {pid})"
+    for (pid, found), (_, parent) in zip(chain, chain[1:]):
+        if parent[0].startswith("cagentsd"):
+            return pid, found[4], f"{found[0]} (pid {pid}), which the cagents session runs"
     pid = os.getppid()
     found = stat(pid)
-    return pid, found[2] if found else 0, f"{describe(pid)} (pid {pid})"
+    return pid, found[4] if found else 0, f"{describe(pid)} (pid {pid})"
 
 
-def marked(identity):
-    """Every process started for the workload: they carry its mark."""
-    needle = f"{MARK}={identity}".encode()
+def members(identity, leader=None):
+    """Every running process of the workload: those carrying its mark, which
+    a nested workload adds to rather than replaces, and those still in its
+    process group, whatever their environment. `leader` is the group's
+    (pid, start); its group counts only while that ID is the leader's or
+    nobody's, so a later process given the ID is never taken for it."""
+    group = None
+    if leader is not None:
+        found = stat(leader[0])
+        if found is None or found[4] == leader[1]:
+            group = leader[0]
+    mark = f"{MARK}=".encode()
     found = []
     for name in os.listdir("/proc"):
         if not name.isdigit() or int(name) == os.getpid():
             continue
+        process = stat(name)
+        if process is None or process[1] in "ZX":
+            continue
+        if group is not None and process[3] == group:
+            found.append(int(name))
+            continue
         try:
             with open(f"/proc/{name}/environ", "rb") as file:
-                if needle in file.read().split(b"\0"):
-                    found.append(int(name))
+                environment = file.read().split(b"\0")
         except OSError:
             continue
+        for entry in environment:
+            if entry.startswith(mark):
+                if identity.encode() in entry[len(mark):].split(b":"):
+                    found.append(int(name))
+                break
     return found
 
 
-def stop(identity, group):
-    """TERM, then KILL after the grace period, to the group and every marked
-    process. True if anything had to be killed."""
+def stop(identity, leader=None):
+    """TERM, then KILL after the grace period, to every member. True if
+    anything had to be killed."""
     def signal_all(number):
-        if group:
-            try:
-                os.killpg(group, number)
-            except OSError:
-                pass
-        for pid in marked(identity):
+        for pid in members(identity, leader):
             try:
                 os.kill(pid, number)
             except OSError:
                 pass
     signal_all(signal.SIGTERM)
     deadline = time.monotonic() + GRACE
-    while time.monotonic() < deadline and marked(identity):
+    while time.monotonic() < deadline and members(identity, leader):
         time.sleep(0.2)
-    killed = bool(marked(identity))
+    killed = bool(members(identity, leader))
     if killed:
         signal_all(signal.SIGKILL)
+        # KILL takes effect on the way back from the kernel, not at once.
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline and members(identity, leader):
+            time.sleep(0.05)
     return killed
 
 
@@ -139,51 +167,80 @@ def record_path(identity):
     return os.path.join(STATE, f"{identity}.json")
 
 
-def run(arguments):
-    os.makedirs(STATE, exist_ok=True)
-    identity = f"{os.getpid()}-{stat(os.getpid())[2]}"
-    owner_pid, owner_start, owner_name = owner(arguments.owner)
-    started = time.time()
-    record = {"name": arguments.name or os.path.basename(arguments.command[0]),
-              "command": arguments.command, "cwd": os.getcwd(), "wrapper": os.getpid(),
-              "wrapper_start": stat(os.getpid())[2], "owner": owner_pid,
-              "owner_start": owner_start, "owner_name": owner_name,
-              "started": started, "ttl": arguments.ttl}
+def write_record(identity, record):
     with open(record_path(identity) + ".new", "w") as file:
         json.dump(record, file)
     os.replace(record_path(identity) + ".new", record_path(identity))
 
-    def leader():
-        # Its own session and group, so its children go with it; and TERM if
-        # this wrapper is killed outright, which leaves the rest to --reap.
-        os.setsid()
-        ctypes.CDLL(None, use_errno=True).prctl(PR_SET_PDEATHSIG, signal.SIGTERM)
 
+def run(arguments):
     reason, status = None, 143
+    wake_read, wake_write = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
 
     def stopped(number, _frame):
         nonlocal reason
         reason = reason or f"this wrapper got {signal.Signals(number).name}"
 
+    # Before anything that would need undoing, so a signal can't skip that.
     for number in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
         signal.signal(number, stopped)
-    child = subprocess.Popen(arguments.command, env=os.environ | {MARK: identity},
-                             preexec_fn=leader)
+    signal.set_wakeup_fd(wake_write)
+
+    os.makedirs(STATE, exist_ok=True)
+    me = stat(os.getpid())
+    identity = f"{os.getpid()}-{me[4]}"
+    owner_pid, owner_start, owner_name = owner(arguments.owner)
+    started, clock = time.time(), time.monotonic()
+    record = {"name": arguments.name or os.path.basename(arguments.command[0]),
+              "command": arguments.command, "cwd": os.getcwd(), "wrapper": os.getpid(),
+              "wrapper_start": me[4], "owner": owner_pid, "owner_start": owner_start,
+              "owner_name": owner_name, "started": started, "ttl": arguments.ttl}
+    prctl = ctypes.CDLL(None, use_errno=True).prctl
+    parent = os.getpid()
+
+    def as_child():
+        # TERM if this wrapper is killed outright; then --reap stops the rest.
+        # A wrapper killed before this ran has already gone.
+        if prctl(PR_SET_PDEATHSIG, signal.SIGTERM) != 0 or os.getppid() != parent:
+            os._exit(143)
+
+    inherited = os.environ.get(MARK)
+    marks = f"{inherited}:{identity}" if inherited else identity
+    leader = None
     try:
+        write_record(identity, record)
+        try:
+            child = subprocess.Popen(arguments.command, env=os.environ | {MARK: marks},
+                                     start_new_session=True, preexec_fn=as_child)
+        except OSError as error:
+            say(f"cannot run {arguments.command[0]}: {error.strerror}")
+            return 127 if error.errno == errno.ENOENT else 126
+        # Its pidfd says when it exits, without reaping it: until it is
+        # reaped, its ID, and so its group's, cannot pass to another process.
+        exited = os.pidfd_open(child.pid)
+        found = stat(child.pid)
+        leader = (child.pid, found[4] if found else 0)
+        record["leader"], record["leader_start"] = leader
+        write_record(identity, record)
         while reason is None:
-            try:
-                code = child.wait(timeout=POLL)
-                # Whatever it left running in the background goes too.
-                if marked(identity):
-                    stop(identity, child.pid)
+            ready, _, _ = select.select([exited, wake_read], [], [], POLL)
+            if exited in ready:
+                # What it left running in the background goes too.
+                if members(identity, leader):
+                    stop(identity, leader)
+                code = child.wait()
                 return code if code >= 0 else 128 - code
-            except subprocess.TimeoutExpired:
-                pass
+            if wake_read in ready:
+                try:
+                    os.read(wake_read, 64)
+                except BlockingIOError:
+                    pass
+                continue
             if not alive(owner_pid, owner_start):
                 reason = f"its owner, {owner_name}, ended"
-            elif time.time() - started >= arguments.ttl:
+            elif time.monotonic() - clock >= arguments.ttl:
                 reason, status = f"its --ttl of {arguments.ttl:g} seconds passed", 124
-        killed = stop(identity, child.pid)
+        killed = stop(identity, leader)
         child.wait()
         say(f"stopped {record['name']} after {time.time() - started:.0f}s: {reason}"
             + ("; it ignored TERM, so it was killed" if killed else ""))
@@ -193,6 +250,7 @@ def run(arguments):
             os.unlink(record_path(identity))
         except OSError:
             pass
+        forget_finished()
 
 
 def records():
@@ -212,7 +270,24 @@ def records():
     return found
 
 
+def leader_of(record):
+    return (record["leader"], record["leader_start"]) if "leader" in record else None
+
+
+def forget_finished():
+    """Drop the records of wrappers that were killed after all they ran had
+    ended, such as one inside a workload that was stopped as a whole."""
+    for identity, record in records():
+        if not alive(record["wrapper"], record["wrapper_start"]) and \
+                not members(identity, leader_of(record)):
+            try:
+                os.unlink(record_path(identity))
+            except OSError:
+                pass
+
+
 def list_records():
+    forget_finished()
     found = records()
     if not found:
         print("Nothing runs bounded on this host.")
@@ -227,7 +302,7 @@ def list_records():
             print(f"  stop:    kill {record['wrapper']}")
         else:
             print(f"  stop:    its wrapper was killed; scripts/bounded --reap stops the "
-                  f"{len(marked(identity))} processes it left")
+                  f"{len(members(identity, leader_of(record)))} processes it left")
     return 0
 
 
@@ -236,9 +311,9 @@ def reap():
     for identity, record in records():
         if alive(record["wrapper"], record["wrapper_start"]):
             continue
-        left = marked(identity)
+        left = members(identity, leader_of(record))
         if left:
-            stop(identity, 0)
+            stop(identity, leader_of(record))
             say(f"stopped {record['name']}: its wrapper had been killed, leaving {len(left)} processes")
             reaped += 1
         try:
@@ -254,8 +329,9 @@ def main():
     parser = argparse.ArgumentParser(
         prog="scripts/bounded", description=__doc__.split("\n\n")[0],
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="The command's exit status is this one's; 124 when --ttl stopped it, and 143 "
-               "when its owner ended or this wrapper was stopped.")
+        epilog="The command's exit status is this one's; 124 when --ttl stopped it, 143 "
+               "when its owner ended or this wrapper was stopped, and 127 or 126 when it "
+               "could not be run.")
     parser.add_argument("--ttl", type=float, default=3600,
                         help="stop it this many seconds after it starts (default 3600)")
     parser.add_argument("--name", help="what --list and messages call it")
@@ -274,8 +350,8 @@ def main():
         arguments.command = arguments.command[1:]
     if not arguments.command:
         parser.error("give the command after --")
-    if arguments.ttl <= 0:
-        parser.error("--ttl must be positive")
+    if not (math.isfinite(arguments.ttl) and arguments.ttl > 0):
+        parser.error("--ttl must be a positive number of seconds")
     return run(arguments)
 
 

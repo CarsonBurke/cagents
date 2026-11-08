@@ -971,21 +971,35 @@ It stops the workload when the first of these happens:
 - the wrapper itself gets TERM, INT or HUP.
 
 It sends TERM to everything the workload started, then KILL after 10 seconds.
-That covers the workload's process group and any process that left the group
-but still carries the workload's `CAGENTS_BOUNDED` environment mark. When the
-command exits by itself, whatever it left running in the background goes too.
-The exit status is the command's, or 124 when `--ttl` stopped it and 143 when
-the owner ended or the wrapper was stopped. Either way, it prints the reason.
+That covers every process still in the workload's process group, and any
+process that left the group but still carries the workload's `CAGENTS_BOUNDED`
+environment mark. When the command exits by itself, whatever it left running
+in the background goes too. The exit status is the command's own. It is 124
+when `--ttl` stopped the workload, 143 when the owner ended or the wrapper was
+stopped, and 127 or 126 when the command could not be run. A stop always prints
+its reason.
 
 `scripts/bounded --list` shows what runs bounded on the host: whose it is, how
 long it has left, and how to stop it. If the wrapper itself was killed with
 KILL, its workload has lost its watcher. `--list` says so, and
 `scripts/bounded --reap` stops what it left.
 
-A process that clears its environment, such as one started with `env -i`,
-loses the mark. If it has also left the group, the wrapper cannot find it. Cap
-memory as well by nesting the two:
+The workload runs in a session of its own, without the terminal. Ctrl-C stops
+it, but it can't prompt on `/dev/tty`, and Ctrl-Z pauses only the wrapper.
+Nesting is safe: an inner `scripts/bounded` adds its mark to the outer one's,
+so stopping the outer one stops both. Cap memory as well by nesting
+`scripts/memory-capped` inside it:
 `scripts/bounded --ttl 1800 -- scripts/memory-capped ./probe-loop`.
+
+Three things escape it:
+
+- a process that both left the group and cleared its environment, such as a
+  daemon started with `env -i`.
+- a setuid or non-dumpable process outside the group, whose environment can't
+  be read.
+- a connection that dies silently, such as a network drop. Its `sshd-session`
+  lives on until SSH's keepalive gives up, so only `--ttl` stops the workload
+  in time.
 
 ### Process scope isolation
 

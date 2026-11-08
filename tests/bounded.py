@@ -177,9 +177,47 @@ class Bounded(unittest.TestCase):
         self.assert_all_stopped()
         self.assertEqual(self.records(), [])
 
+    def test_what_cleared_its_environment_but_stayed_in_the_group_goes_too(self):
+        unmarked = f'env -i sh -c \'echo $$ >>"{self.pids}"; trap "" TERM; exec sleep 300\' &\n'
+        for name, body, arguments in (("after it exits", unmarked + "sleep 0.3\nexit 0\n", []),
+                                      ("when stopped", unmarked + "sleep 300\n", ["--ttl", "1"])):
+            with self.subTest(name):
+                self.pids.unlink(missing_ok=True)
+                process = self.start(*arguments, "--", self.workload(body))
+                process.communicate(timeout=30)
+                self.assertTrue(wait_for(lambda: len(self.recorded_pids()) == 3))
+                self.assert_all_stopped()
+
+    def test_a_command_that_cannot_run_says_so_and_leaves_no_record(self):
+        result = subprocess.run([TOOL, "--", str(self.directory / "missing")], env=self.env,
+                                capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 127)
+        self.assertIn("bounded: cannot run", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.records(), [])
+
+    def test_an_owner_that_exited_unreaped_has_ended(self):
+        owner = subprocess.Popen(["sleep", "1"])
+        self.addCleanup(owner.wait)
+        process = self.start("--ttl", "60", "--owner", str(owner.pid), "--", self.workload("sleep 300\n"))
+        _, stderr = process.communicate(timeout=20)
+        self.assertEqual(process.returncode, 143, stderr)
+        self.assertIn("ended", stderr)
+        self.assert_all_stopped()
+
+    def test_a_nested_workload_stays_the_outer_ones(self):
+        inner = self.workload("trap '' TERM\nwhile :; do sleep 0.1; done\n")
+        process = self.start("--ttl", "1", "--", str(TOOL), "--ttl", "60", "--", inner)
+        _, stderr = process.communicate(timeout=30)
+        self.assertEqual(process.returncode, 124, stderr)
+        self.assert_all_stopped()
+        self.assertTrue(wait_for(lambda: not self.records()), (self.records(), stderr))
+
     def test_it_refuses_what_it_cannot_bound(self):
         for arguments, message in ((["--"], "give the command after --"),
-                                   (["--ttl", "0", "--", "true"], "--ttl must be positive"),
+                                   (["--ttl", "0", "--", "true"], "--ttl must be a positive"),
+                                   (["--ttl", "nan", "--", "true"], "--ttl must be a positive"),
+                                   (["--ttl", "inf", "--", "true"], "--ttl must be a positive"),
                                    (["--owner", "999999999", "--", "true"], "is not running")):
             result = subprocess.run([TOOL, *arguments], env=self.env, capture_output=True,
                                     text=True, timeout=20)
