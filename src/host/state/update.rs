@@ -254,7 +254,7 @@ impl HostState {
             } else if record.handle.is_completed() {
                 (
                     Disposition::Blocked,
-                    "Its provider stopped but may still hold unfinished work. Close this conversation to release it.",
+                    crate::update::impact::STOPPED_WITH_UNSETTLED_WORK,
                 )
             } else if let Err(reason) = &migration {
                 (Disposition::Blocked, reason.as_str())

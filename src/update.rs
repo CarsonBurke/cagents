@@ -592,6 +592,9 @@ pub fn upgrade_installed(
     };
     let mut submitted = None;
     let mut policy_requested = None;
+    // The preview whose unreachable conversations were ended; the worker
+    // publishes the changed impact under a new nonce.
+    let mut ended_for: Option<String> = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     loop {
         let job = status()?
@@ -617,7 +620,9 @@ pub fn upgrade_installed(
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
                     policy_requested = Some(confirmation.nonce.clone());
                 }
-            } else if submitted.as_ref() != Some(&confirmation.nonce) {
+            } else if submitted.as_ref() != Some(&confirmation.nonce)
+                && ended_for.as_ref() != Some(&confirmation.nonce)
+            {
                 if submitted.is_some() {
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
                     return Err(invalid(
@@ -646,21 +651,36 @@ pub fn upgrade_installed(
                         for blocker in &daemon.blockers {
                             eprintln!("  {blocker}");
                         }
-                        decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                        return Err(invalid(
-                            "Resolve the displayed update blockers, then retry.",
-                        ));
+                        let ended = if accept_unreopenable && ended_for.is_none() {
+                            end_unreachable_source_chats(&job.id, &confirmation.nonce, daemon, yes)
+                        } else {
+                            Ok(false)
+                        };
+                        match ended {
+                            Ok(true) => {}
+                            Ok(false) => {
+                                decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                                return Err(invalid(if accept_unreopenable {
+                                    "Resolve the displayed update blockers, then retry. --accept-unreopenable ends only conversations whose provider can no longer be carried."
+                                } else {
+                                    "Resolve the displayed update blockers, then retry."
+                                }));
+                            }
+                            Err(error) => {
+                                // Never leave the reviewed preview pending: the
+                                // worker would hold it until it expires.
+                                let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                                return Err(error);
+                            }
+                        }
+                        ended_for = Some(confirmation.nonce.clone());
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
                     }
                 }
-                if !yes {
-                    eprint!("Proceed with this update? [y/N] ");
-                    io::stderr().flush()?;
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                        decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                        return Err(UpdateError::Cancelled);
-                    }
+                if !yes && !confirm_on_terminal("Proceed with this update? [y/N] ")? {
+                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                    return Err(UpdateError::Cancelled);
                 }
                 decide(&job.id, &confirmation.nonce, UpdateChoice::Confirm)?;
                 submitted = Some(confirmation.nonce.clone());
@@ -673,6 +693,171 @@ pub fn upgrade_installed(
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn confirm_on_terminal(question: &str) -> io::Result<bool> {
+    eprint!("{question}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// Show what ending the blocked conversations loses, ask unless `yes`, and
+/// end them. `Ok(false)` means something else blocks, so nothing was ended.
+/// A conversation that changed while the person decided is not ended: the
+/// worker issues a new nonce for any reviewed change, and the source's list
+/// must still name exactly the reviewed conversations.
+fn end_unreachable_source_chats(
+    job: &str,
+    nonce: &str,
+    daemon: &impact::DaemonImpact,
+    yes: bool,
+) -> Result<bool, UpdateError> {
+    let Some(ending) = unreachable_source_chats(daemon)? else {
+        return Ok(false);
+    };
+    eprintln!("--accept-unreopenable ends these conversations, which this update cannot carry:");
+    for (title, loss, _) in &ending {
+        eprintln!("  {title}: {loss}");
+    }
+    if !yes && !confirm_on_terminal("End them and continue? [y/N] ")? {
+        return Err(UpdateError::Cancelled);
+    }
+    let still_reviewed = status()?
+        .filter(|current| current.id == job)
+        .and_then(|current| {
+            current
+                .active_confirmation()
+                .map(|active| active.nonce.clone())
+        })
+        .is_some_and(|current| current == nonce);
+    let reselected = unreachable_source_chats(daemon)?;
+    let unchanged = reselected.as_ref().is_some_and(|reselected| {
+        reselected.len() == ending.len()
+            && reselected
+                .iter()
+                .zip(&ending)
+                .all(|(now, reviewed)| now.2 == reviewed.2)
+    });
+    if !still_reviewed || !unchanged {
+        return Err(invalid(
+            "The conversations to end changed while you decided; nothing more was ended. Review and retry the update.",
+        ));
+    }
+    end_source_chats(daemon, ending)?;
+    Ok(true)
+}
+
+/// A blocked source conversation that only ending it resolves, with what
+/// ending it loses. Every blocked conversation must be one, and nothing else
+/// may block, or the update still needs the person to resolve it.
+type EndedChat = (String, &'static str, crate::chat::Session);
+
+/// The source cannot carry a Codex conversation whose server it can no longer
+/// reach: its listener is gone, so no successor can join that server, and the
+/// server still writes the thread, so none may resume it beside the server.
+/// A provider that stopped without confirming its work settled is refused
+/// for the same reason, and the source itself asks for it to be closed.
+fn unreachable_source_chats(
+    daemon: &impact::DaemonImpact,
+) -> Result<Option<Vec<EndedChat>>, UpdateError> {
+    if !daemon.blockers.is_empty() {
+        // Connect only when a selection is possible.
+        return Ok(None);
+    }
+    let listed = source_client_for(daemon)?.list_chats()?;
+    Ok(select_unreachable_chats(daemon, &listed))
+}
+
+fn select_unreachable_chats(
+    daemon: &impact::DaemonImpact,
+    listed: &[crate::chat::Session],
+) -> Option<Vec<EndedChat>> {
+    if !daemon.blockers.is_empty() {
+        return None;
+    }
+    let mut ending = Vec::new();
+    for session in daemon
+        .sessions
+        .iter()
+        .filter(|session| session.disposition == impact::Disposition::Blocked)
+    {
+        let Some(source) = listed.iter().find(|listed| listed.id == session.id) else {
+            return None;
+        };
+        let recorded = source.launch.session_id.is_some();
+        let lost_listener = source.launch.provider == crate::agent::Provider::Codex
+            && source.owns_codex_listener()
+            && source
+                .owned_codex_listener
+                .as_ref()
+                .is_some_and(|listener| {
+                    session.reason.starts_with(&format!(
+                        "Cannot join existing Codex daemon at {}:",
+                        listener.socket.display()
+                    )) && fs::metadata(&listener.socket)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                });
+        let loss = if session.kind != impact::SessionKind::NativeChat {
+            return None;
+        } else if lost_listener && recorded {
+            "its Codex server can no longer be reached, so ending it stops that server and any turn it is running. Its thread stays on disk and can be reopened with Resume."
+        } else if lost_listener {
+            "its Codex server can no longer be reached, so ending it stops that server and any turn it is running. It never recorded a thread to reopen."
+        } else if session.reason == impact::STOPPED_WITH_UNSETTLED_WORK && recorded {
+            "its provider stopped without confirming its work finished; any unfinished work it held is lost. Its conversation stays on disk and can be reopened with Resume."
+        } else if session.reason == impact::STOPPED_WITH_UNSETTLED_WORK {
+            "its provider stopped without confirming its work finished; any unfinished work it held is lost. It never recorded a conversation to reopen."
+        } else {
+            return None;
+        };
+        ending.push((session.title.clone(), loss, source.clone()));
+    }
+    (!ending.is_empty()).then_some(ending)
+}
+
+fn end_source_chats(
+    daemon: &impact::DaemonImpact,
+    ending: Vec<EndedChat>,
+) -> Result<(), UpdateError> {
+    let mut client = source_client_for(daemon)?;
+    // One the source cannot end does not keep the rest: each was approved
+    // on its own, and ending it releases what it held either way.
+    let mut failed = Vec::new();
+    for (title, _, session) in ending {
+        match client.close_chat(session) {
+            Ok(()) => eprintln!("  Ended {title}"),
+            Err(error) => {
+                eprintln!("  Could not end {title}: {error}");
+                failed.push(title);
+            }
+        }
+    }
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "The update still cannot carry {}; it was not started.",
+            failed.join(", ")
+        )))
+    }
+}
+
+/// The reviewed source, authenticated again: a preview never authorizes
+/// acting on a different owner.
+fn source_client_for(daemon: &impact::DaemonImpact) -> Result<source::Client, UpdateError> {
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let client = source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+    if *client.proof() != daemon.capability.proof {
+        return Err(invalid(
+            "The source changed since its update impact was reviewed",
+        ));
+    }
+    Ok(client)
 }
 
 fn running_installation() -> Result<Installation, UpdateError> {
@@ -1975,6 +2160,150 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    fn codex_chat(root: &Path) -> crate::chat::Session {
+        let id = crate::model::TerminalId::new();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("source-host"),
+            boot_id: crate::model::BootId::new("source-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("source-incarnation"),
+        };
+        let socket = root.join(format!("cagents-codex-{id}/control.sock"));
+        crate::chat::Session {
+            id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: crate::model::LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), format!("unix://{}", socket.display())],
+                    working_directory: root.to_owned(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: Some(crate::chat::OwnedCodexListener {
+                socket,
+                allocator: proof,
+            }),
+        }
+    }
+
+    fn blocked(session: &crate::chat::Session, reason: &str) -> impact::SessionImpact {
+        impact::SessionImpact {
+            id: session.id,
+            kind: impact::SessionKind::NativeChat,
+            title: format!("chat {}", session.id),
+            identity: "identity".into(),
+            disposition: impact::Disposition::Blocked,
+            reason: reason.into(),
+            interrupted_subagents: Vec::new(),
+        }
+    }
+
+    fn daemon_impact(sessions: Vec<impact::SessionImpact>) -> impact::DaemonImpact {
+        impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("source-host"),
+                    boot_id: crate::model::BootId::new("source-boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("source-incarnation"),
+                },
+                token: "preview".into(),
+                inventory_generation: 1,
+                live_terminals: 0,
+                background_subagents: 0,
+                background_identity: "none".into(),
+                expires_at_unix_ms: 100,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions,
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_conversations_the_source_cannot_carry_are_ended_on_acceptance() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let lost = codex_chat(root.path());
+        let reachable = codex_chat(root.path());
+        let socket = &reachable.owned_codex_listener.as_ref().unwrap().socket;
+        fs::create_dir(socket.parent().unwrap()).unwrap();
+        let _server = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let mut stopped = codex_chat(root.path());
+        stopped.launch.provider = crate::agent::Provider::Claude;
+        stopped.owned_codex_listener = None;
+        let listed = [lost.clone(), reachable.clone(), stopped.clone()];
+        let cannot_join = |session: &crate::chat::Session| {
+            format!(
+                "Cannot join existing Codex daemon at {}: No such file or directory (os error 2). Start the Codex shared daemon first; no private fallback is launched.",
+                session
+                    .owned_codex_listener
+                    .as_ref()
+                    .unwrap()
+                    .socket
+                    .display()
+            )
+        };
+        let unreachable = blocked(&lost, &cannot_join(&lost));
+        let unsettled = blocked(&stopped, impact::STOPPED_WITH_UNSETTLED_WORK);
+
+        let ending = select_unreachable_chats(
+            &daemon_impact(vec![unreachable.clone(), unsettled.clone()]),
+            &listed,
+        )
+        .unwrap();
+        let ended = ending
+            .iter()
+            .map(|(_, _, session)| session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ended, [lost.id, stopped.id]);
+        assert!(ending[0].1.contains("can be reopened with Resume"));
+        assert!(ending[1].1.contains("unfinished work it held is lost"));
+
+        // Resume is offered only for a conversation the source recorded.
+        let mut unrecorded = lost.clone();
+        unrecorded.launch.session_id = None;
+        let ending = select_unreachable_chats(
+            &daemon_impact(vec![blocked(&unrecorded, &cannot_join(&unrecorded))]),
+            &[unrecorded.clone()],
+        )
+        .unwrap();
+        assert!(ending[0].1.contains("never recorded a thread"));
+
+        // A Codex server still reachable at its listener is carried or waited
+        // for, never ended to clear a blocker it does not cause.
+        for refused in [
+            vec![
+                unreachable.clone(),
+                blocked(&reachable, &cannot_join(&reachable)),
+            ],
+            // A lost listener does not explain a different refusal.
+            vec![blocked(
+                &lost,
+                "Finish the pending return to terminal or close this conversation.",
+            )],
+            vec![blocked(&stopped, "Its provider is not ready yet.")],
+            vec![impact::SessionImpact {
+                kind: impact::SessionKind::Terminal,
+                ..unsettled.clone()
+            }],
+        ] {
+            assert!(select_unreachable_chats(&daemon_impact(refused), &listed).is_none());
+        }
+        // A conversation the source no longer lists cannot be ended here.
+        assert!(select_unreachable_chats(&daemon_impact(vec![unreachable.clone()]), &[]).is_none());
+        // Any other blocker still needs the person.
+        let mut other = daemon_impact(vec![unreachable]);
+        other
+            .blockers
+            .push("Wait for starting sessions to finish opening.".into());
+        assert!(select_unreachable_chats(&other, &listed).is_none());
+        // Nothing blocked: nothing to end.
+        assert!(select_unreachable_chats(&daemon_impact(Vec::new()), &listed).is_none());
+    }
 
     #[test]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {

@@ -271,6 +271,40 @@ impl Client {
     }
 }
 
+impl Client {
+    /// The conversations the source lists, as it issued them.
+    pub(crate) fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .list_chats()
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::V77(_) | Self::V119(_) => Err(invalid(
+                "This source cannot end conversations for the update",
+            )),
+        }
+    }
+
+    /// Ends one listed conversation through the source's own authenticated
+    /// close: attached, as any client the source did not open must be, and
+    /// answered only once the source confirms its provider's teardown.
+    pub(crate) fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .close_chat(session)
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::V77(_) | Self::V119(_) => Err(invalid(
+                "This source cannot end conversations for the update",
+            )),
+        }
+    }
+}
+
 pub(super) struct InstalledIdentity {
     pub protocol: u16,
     pub proof: Option<HostSessionProof>,
