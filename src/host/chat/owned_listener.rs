@@ -111,15 +111,11 @@ pub(crate) fn refresh(endpoint: &Path) -> io::Result<()> {
     let Some(directory) = endpoint.parent() else {
         return Ok(());
     };
-    let account = unsafe { libc::geteuid() };
-    let private = std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
-        metadata.is_dir() && metadata.uid() == account && metadata.mode() & 0o777 == 0o700
-    });
-    if !private {
+    if !private_allocation(directory) {
         return Ok(());
     }
     match std::fs::symlink_metadata(endpoint) {
-        Ok(entry) if entry.uid() == account => touch(endpoint)?,
+        Ok(entry) if entry.uid() == unsafe { libc::geteuid() } => touch(endpoint)?,
         Ok(_) => return Ok(()),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {}
         Err(error) => return Err(error),
@@ -127,8 +123,19 @@ pub(crate) fn refresh(endpoint: &Path) -> io::Result<()> {
     touch(directory)
 }
 
+/// Whether `directory` is an allocation only this account can change: a real
+/// directory it owns with no access for anyone else.
+fn private_allocation(directory: &Path) -> bool {
+    std::fs::symlink_metadata(directory).is_ok_and(|metadata| {
+        metadata.is_dir()
+            && metadata.uid() == unsafe { libc::geteuid() }
+            && metadata.mode() & 0o777 == 0o700
+    })
+}
+
 /// Refreshes every listener still served from the daemon's temporary
-/// directory, now and every [`REFRESH_INTERVAL`], until the host is gone.
+/// directory, now and every [`REFRESH_INTERVAL`]. The thread ends at the first
+/// wake after the host is dropped.
 ///
 /// It reads the directory rather than this daemon's records, so it also keeps
 /// the listener of a retained server that a restore left unattached, which
@@ -168,12 +175,25 @@ fn refresh_served(root: &Path) -> io::Result<()> {
         Err(error) => return Err(error),
     };
     for entry in entries {
-        let entry = entry?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    root = %root.display(),
+                    "a temporary directory entry could not be read"
+                );
+                continue;
+            }
+        };
         if !entry.file_name().as_bytes().starts_with(b"cagents-codex-") {
             continue;
         }
-        let endpoint = entry.path().join("control.sock");
-        if listening(&endpoint) {
+        // Only this account's private allocations are ever connected to: an
+        // endpoint anyone else could place must not choose what is dialed.
+        let directory = entry.path();
+        let endpoint = directory.join("control.sock");
+        if private_allocation(&directory) && listening(&endpoint) {
             if let Err(error) = refresh(&endpoint) {
                 tracing::warn!(
                     %error,
@@ -495,10 +515,29 @@ mod tests {
         let _unrelated_server = UnixListener::bind(&unrelated_target).unwrap();
         symlink(&unrelated_target, unrelated.join("control.sock")).unwrap();
 
-        for directory in [&served_allocation, &stopped_allocation, &unrelated] {
+        // Anyone could place an allocation-named directory that is not
+        // private; the scan neither touches it nor dials what it names.
+        let open = root.path().join("cagents-codex-open");
+        std::fs::DirBuilder::new()
+            .mode(0o755)
+            .create(&open)
+            .unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let open_target = runtime.join("open");
+        let open_server = UnixListener::bind(&open_target).unwrap();
+        open_server.set_nonblocking(true).unwrap();
+        symlink(&open_target, open.join("control.sock")).unwrap();
+
+        for directory in [&served_allocation, &stopped_allocation, &unrelated, &open] {
             age(directory);
         }
         refresh_served(root.path()).unwrap();
+        assert_eq!(modified(&open), std::time::SystemTime::UNIX_EPOCH);
+        assert_eq!(
+            open_server.accept().unwrap_err().kind(),
+            io::ErrorKind::WouldBlock,
+            "an endpoint outside a private allocation is never connected to"
+        );
         let recent = std::time::SystemTime::now() - std::time::Duration::from_secs(60);
         assert!(modified(&served_allocation) > recent);
         assert_eq!(

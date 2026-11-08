@@ -396,13 +396,14 @@ exact saved conversation can resume without the ephemeral runtime receipt.
 Each owned Codex server listens at `cagents-codex-<conversation>/control.sock`
 under `codex/` in the daemon's runtime directory (`$XDG_RUNTIME_DIR/cagents`
 for the production instance), which the system's temporary-file cleaner does
-not age. Releases before #2436 allocated it in the daemon's `TMPDIR`, and a
+not age. Earlier releases allocated it in the daemon's `TMPDIR`, and a
 runtime directory too long for a Unix socket address (some development
 instances) still does. A conversation allocated there keeps that path, also
 when its server is started again, because the recipe every window was issued
-names it. While its server runs, the daemon refreshes the entry's timestamps
-at startup and every six hours, so `systemd-tmpfiles` does not remove the
-published symlink from a server that is still running.
+names it. While its server runs, the daemon refreshes the timestamps of the
+entry and its private directory at startup and every six hours, so
+`systemd-tmpfiles` does not remove the published symlink from a server that is
+still running.
 
 Durable continuity is enabled only after the actual server confirms its exact
 thread, account directory, process identity, and a tested version. The
