@@ -251,11 +251,11 @@ Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
 including local builds, use this same flow. When the newer build speaks the
-running daemon's protocol, or bootstraps that daemon's older protocol, its own
-updater performs the update whichever window asks, so its checks decide which
-sessions it carries. Otherwise the daemon's own updater, which can update
-across protocols, performs it. A window from an older build may still hand the
-update to its own updater; if that refuses sessions the newer build carries,
+running daemon's protocol, or shares the window's protocol and bootstraps the
+daemon's older one, its own updater performs the update whichever window asks,
+so its checks decide which sessions it carries. Otherwise the running daemon's
+or the window's own updater performs it. A window from an older build may
+still run its own updater; if that refuses sessions the newer build carries,
 run `cagents daemon upgrade` instead. Source trees and OS packages retain
 their own update method; browserless builds do not download full releases.
 
