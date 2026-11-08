@@ -9375,6 +9375,7 @@ impl Cagents {
                 VisibilityClass::Visible | VisibilityClass::Overscan => reconcile_now = true,
             }
         }
+        self.trim_warm_chats();
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
@@ -12815,6 +12816,7 @@ impl Cagents {
                 failures.push((*id, visible, error));
             }
         }
+        self.trim_warm_chats();
         self.report_surface_visibility(failures);
     }
 
