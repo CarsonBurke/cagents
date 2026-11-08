@@ -1231,7 +1231,7 @@ mod tests {
         );
         // The next check finds the same record: the header keeps it, but the
         // reasons are not raised again.
-        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job)))));
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job.clone())))));
         assert!(app.status.is_none());
         assert!(app.has_update_control());
         // A window that predates the refusal field reads the same record as
