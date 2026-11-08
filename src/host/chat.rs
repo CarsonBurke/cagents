@@ -5709,6 +5709,87 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn distinct_first_send_candidates_must_not_admit_two_providers() {
+        let (directory, host, saved) = upgrade_fixture();
+        let executable = directory.path().join("omp");
+        let script = std::fs::read_to_string(&executable).unwrap().replace(
+            "identity = sys.argv[sys.argv.index(\"--resume\") + 1]",
+            "import uuid\nidentity = str(uuid.uuid4())\nwith open(\"launches\", \"a\") as launches:\n    launches.write(identity + \"\\n\")",
+        );
+        std::fs::write(&executable, script).unwrap();
+        let mut first = saved.source;
+        first.proof = None;
+        first.launch.session_id = None;
+        let mut second = first.clone();
+        second.id = TerminalId::new();
+        assert!(first.is_unstarted() && second.is_unstarted());
+
+        // These are the two distinct candidates that two windows can persist
+        // for one pane. Hold delivery of the first Ready message to the UI:
+        // its canonical raw pane still cannot identify a running provider.
+        let mut admitted = Vec::new();
+        let mut outcomes = Vec::new();
+        for (client, session) in [(1, first), (2, second)] {
+            let outcome = process(
+                &host,
+                client,
+                ClientRequest::ChatStart {
+                    session,
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default(),
+                },
+            );
+            if let Ok(ServerResponse::ChatAttached { session, .. }) = &outcome {
+                admitted.push((client, session.id));
+            }
+            outcomes.push(outcome);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut executed = true;
+        while std::fs::read_to_string(directory.path().join("launches"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < admitted.len()
+        {
+            if Instant::now() >= deadline {
+                executed = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let launches =
+            std::fs::read_to_string(directory.path().join("launches")).unwrap_or_default();
+        let count = admitted.len();
+        let live = host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .filter(|record| record.handle.owns_work())
+            .count();
+        // Retire every exact actor before reporting a failed assertion.
+        let mut close_errors = Vec::new();
+        for (client, chat_id) in admitted {
+            if let Err(error) = process(&host, client, ClientRequest::ChatClose { chat_id }) {
+                close_errors.push(error);
+            }
+        }
+        assert!(executed, "admitted providers must execute");
+        assert!(
+            close_errors.is_empty(),
+            "provider cleanup failed: {close_errors:?}"
+        );
+        assert_eq!(
+            count, 1,
+            "one pane admitted distinct starts: {outcomes:?}; launches={launches}; live={live}"
+        );
+        assert_eq!(launches.lines().count(), 1);
+        assert_eq!(live, 1);
+    }
+
+    #[test]
     fn distinct_recovery_candidates_share_one_conversation_spawn_claim() {
         let (_directory, host, saved) = upgrade_fixture();
         let barrier = Arc::new(std::sync::Barrier::new(3));

@@ -118,6 +118,129 @@ fn no_starter(app: &Cagents, card: CardId) {
 }
 
 #[test]
+fn peer_send_during_unproved_first_start_does_not_schedule_another_provider() {
+    use crate::workspace_model::{
+        ModelEdit,
+        views::{Change, Pane, Scope, View},
+    };
+    let (mut creator, directory, card, target) = fixture();
+    let source = runtime(&creator, card).session.clone();
+    let channel = crate::model::ChannelId::new();
+    Arc::make_mut(&mut creator.durable)
+        .channels
+        .push(crate::model::ProjectChannel {
+            id: channel,
+            project_id: crate::model::ProjectId::new(),
+            title: "Shared draft".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: true,
+            cards: vec![card],
+            focused: Some(card),
+        });
+    let scope = Scope::Channel(channel);
+    let mut view = View::empty(channel);
+    view.revision = 1;
+    view.panes
+        .push(Pane::from_card(creator.card_state(card).unwrap(), None).unwrap());
+    creator.workspace_model.identity = uuid::Uuid::new_v4();
+    creator.workspace_model.views = vec![view.clone()];
+    let (publish, published) = async_channel::unbounded();
+    creator.workspace_model_tx = publish;
+    creator.publish_view_changes();
+    assert!(matches!(
+        published.try_recv().unwrap(),
+        ModelEdit::SeedView { .. }
+    ));
+    creator.acknowledge_view_edit(scope.clone(), None);
+    drop(creator.reconcile_shared_views());
+
+    // Each native window owns its own database. Only shared pane edits pass
+    // between them; a local SQLite compare-and-swap cannot fence this race.
+    let mut peer = crate::app::tests::context_inspector_test_app(false);
+    let (writer, _) = crate::session::SessionRuntime::open(
+        directory.path().join("peer.sqlite3"),
+        crate::model::BootId::new("peer-first-start"),
+    )
+    .unwrap();
+    peer.session = Some(writer);
+    peer.durable = creator.durable.clone();
+    Arc::make_mut(&mut peer.durable).active_channel = None;
+    peer.workspace_model = creator.workspace_model.clone();
+    drop(peer.open_chat(card, source.clone(), chat::Intent::Start));
+    peer.publish_view_changes();
+    peer.acknowledge_view_edit(scope.clone(), None);
+    drop(peer.reconcile_shared_views());
+    peer.persist();
+    peer.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+
+    let saved = checkpoint(creator.start_chat_draft(target));
+    assert!(saved.2.is_ok(), "{:?}", saved.2);
+    // This deliberately holds A before the provider Task is polled, rather
+    // than relying on the measured 185 ms timing or a sleeping fake provider.
+    drop(creator.draft_start_checkpointed(saved.0, saved.1, saved.2));
+    let candidate = creator.chat_ui.attempt(card).unwrap().session.clone();
+    let change = std::iter::from_fn(|| published.try_recv().ok())
+        .find_map(|edit| match edit {
+            ModelEdit::ChangeView {
+                scope: changed_scope,
+                change: change @ Change::Update { .. },
+                ..
+            } if changed_scope == scope
+                && matches!(&change, Change::Update { before, pane }
+                if before.id == card && before.kind == CardKind::Chat(source.clone())
+                    && pane.kind == CardKind::Chat(candidate.clone())) =>
+            {
+                Some(change)
+            }
+            _ => None,
+        })
+        .expect("A really publishes its unproved candidate");
+    assert!(view.apply(&change).unwrap());
+    view.revision += 1;
+    // The first candidate is canonical, but B's observer has not delivered
+    // that edge yet. Both windows legitimately showed the original draft.
+    // Hold that delivery as well as A's provider Task; no timing is involved.
+    assert_eq!(runtime(&peer, card).session, source);
+    let target = runtime(&peer, card).target;
+    if let CardRuntime::Chat(runtime) = peer.cards.get_mut(&card).unwrap() {
+        runtime.replace_draft(text_editor::Content::with_text("Keep the losing prompt"));
+    }
+    let images = runtime(&peer, card).attachments.clone();
+    let saved = checkpoint(peer.start_chat_draft(target));
+    assert!(
+        saved.2.is_ok(),
+        "peer checkpoint unexpectedly refused: {:?}; stored={:?}; runtime={:?}",
+        saved.2,
+        stored(&peer, card),
+        runtime(&peer, card).session
+    );
+    drop(peer.draft_start_checkpointed(saved.0, saved.1, saved.2));
+    eprintln!(
+        "peer phases starting={} error={:?}",
+        matches!(peer.chat_ui.phases.get(&card), Some(Phase::Starting(_))),
+        runtime(&peer, card).error
+    );
+    assert!(
+        !matches!(peer.chat_ui.phases.get(&card), Some(Phase::Starting(_))),
+        "B must not authorize a distinct provider while A is starting"
+    );
+    assert_eq!(
+        runtime(&peer, card).composer.text(),
+        "Keep the losing prompt"
+    );
+    assert_eq!(runtime(&peer, card).attachments, images);
+    assert!(matches!(
+        creator.chat_ui.phases.get(&card),
+        Some(Phase::Starting(_))
+    ));
+}
+
+#[test]
 fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_or_starting() {
     let (mut app, _directory, card, target) = fixture();
     let source = runtime(&app, card).session.clone();
