@@ -61,7 +61,7 @@ pub(crate) struct Store {
     pub(super) file_cwd: Option<PathBuf>,
     pub(super) presented_file_changes: Option<(u64, crate::chat::FileChangesCoverage)>,
     directory: PathBuf,
-    _lease: fs::File,
+    _lease: crate::instance::OwnedLock,
     end: Option<Cursor>,
     first: Option<Cursor>,
     newest: Option<Cursor>,
@@ -1906,6 +1906,9 @@ mod tests {
             .unwrap();
         journal.sync_all().unwrap();
         drop(journal);
+        // An unrelated fork duplicates the lease description until exec. It
+        // cannot extend Store ownership after the reducer has been dropped.
+        let unrelated_fork = retained._lease.try_clone().unwrap();
         drop(retained);
         assert!(retained_directory.join("transcript.sqlite").exists());
         assert_eq!(
@@ -1925,6 +1928,7 @@ mod tests {
             1
         );
         assert!(!retained_directory.exists());
+        drop(unrelated_fork);
     }
 
     #[test]
