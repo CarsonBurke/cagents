@@ -433,36 +433,42 @@ When a build starts waiting for CPU, the gate says what holds the CPUs. Once
 it has released its admission decision, it samples the host's processes for
 about a second. It reports how many CPUs the running builds use and how many
 everything else uses. It then names up to three process sessions outside the
-builds that use at least half a CPU each. For each one it gives the command
-that started it and how long ago, the CPUs it uses, how many processes it has
-and its busiest process. If the session's leader has exited, it says so.
-Other sessions are summed. The message ends with the `pkill -s` command for
-the first session, and points at `scripts/bounded --list` when the checkout
-has that script:
+builds that use at least half a CPU each, and the kernel's own threads when
+they do. For each session it gives the command that started it and how long
+ago, the CPUs it uses, how many processes it has and its busiest process. If
+the session's leader has exited, it says so. Other sessions are summed. The
+message ends with how to look at the first session, `ps -s SESSION`, and to
+end it, `pkill -s SESSION`. It does not offer `pkill` for the session the
+wait runs in, a desktop's or a terminal's; it says which it is instead. It
+points at `scripts/bounded --list` when the checkout has that script:
 
 ```
-cargo-gate: builds use 14.2 CPUs and everything else 17.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 16.9 CPUs in 17 processes, most in pid 2272069 (sh -c while :; do true; done); and 4 more sessions using 0.4 CPUs. `pkill -s 2270967` ends the first
+cargo-gate: builds use 14.2 CPUs and everything else 17.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 16.9 CPUs in 17 processes, most in pid 2272069 (sh -c while :; do true; done); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
 ```
 
 When no other session uses half a CPU, and everything else together uses
 less than a CPU or a quarter of what the builds use, the message begins
 `nothing else uses much; the running builds hold them` instead, or `nothing
-uses much at the moment` when the builds use less than a CPU too. A session is what one login, ssh command or
-terminal started. A loop that keeps starting short-lived commands is one
-session, and the time of the commands it has reaped counts as its own. The
-builds are:
+uses much at the moment` when the builds use less than a CPU too.
 
-- the processes below a running build's holder, or below the holder of a
-  slot lock;
+A session is what one login, ssh command or terminal started. A loop that
+keeps starting short-lived commands is one session, and the time of the
+commands it has reaped counts as its own. The builds are:
+
+- the processes below a running build's holder, or below a process holding
+  a slot lock, which includes one taken by a plain `flock`;
 - processes whose environment marks them as a running build's:
   `CAGENTS_BUILD_SLOT_HELD` for a gated command, `CAGENTS_OFFLOAD_SLOT` for an
   offloaded one;
 - processes working in a leased offload slot, as its file copies do.
 
+A process in an offload slot, or with its mark, that started before the
+slot's current lease is left from an earlier build, and it is named.
 Whatever a gated command detaches stays below the gate's command supervisor,
 which is a subreaper. A plain `flock` holder's command carries no mark, so
-whatever it detaches is named as something else. An offloaded build's wait
-says the same about the build host, with `on HOST` after the `pkill` command.
+whatever it detaches without the lock's descriptor is named as something else.
+An offloaded build's wait says the same about the build host, whose commands
+it says to run `there`.
 
 Each build has an expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
 GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`

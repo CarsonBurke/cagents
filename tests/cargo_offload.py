@@ -288,9 +288,10 @@ class Busiest(unittest.TestCase):
 
     TICKS = os.sysconf("SC_CLK_TCK")
 
-    def process(self, pid, *, parent=1, session=None, own=0.0, reaped=0.0, age=30, name="spin"):
+    def process(self, pid, *, parent=1, session=None, terminal=0, own=0.0, reaped=0.0, age=30,
+                name="spin"):
         return pid, self.scope["Process"](
-            parent, pid if session is None else session, round(own * self.TICKS),
+            parent, pid if session is None else session, terminal, round(own * self.TICKS),
             round(reaped * self.TICKS), round((self.up - age - 0.5) * self.TICKS), name)
 
     def busiest(self, first, second, *, seconds=1.0, **options):
@@ -317,7 +318,21 @@ class Busiest(unittest.TestCase):
             [self.process(loop, own=1.1, reaped=5 + 10.5 + 0.4, name="sh")])
         self.assertRegex(text, rf"; besides builds, the CPUs go to session {loop} "
                                rf"\(sh, started 3\ds ago\): 1\.0 CPU in 1 process\. ")
-        self.assertIn(f"`pkill -s {loop}` ends the first", text)
+        self.assertTrue(text.endswith(f". `ps -s {loop}` lists session {loop}'s processes, "
+                                      f"and `pkill -s {loop}` ends them"), text)
+
+    def test_what_ended_within_the_sample_is_taken_off_the_ancestor_that_outlived_it(self):
+        # A shell runs make, which runs a compiler an hour in; both end.
+        shell, make, compiler = 5_000_003, 5_000_004, 5_000_005
+        text = self.busiest(
+            [self.process(shell, name="sh"), self.process(make, parent=shell, session=shell, own=2),
+             self.process(compiler, parent=make, session=shell, own=3600)],
+            [self.process(shell, reaped=2 + 3600 + 0.5, name="sh")])
+        self.assertIn(f"session {shell} (sh, started 30s ago): 0.5 CPUs in 1 process", text)
+        # Nothing is said to use more than every CPU, however its ticks came.
+        text = self.busiest([self.process(shell, name="sh")],
+                            [self.process(shell, reaped=10**6, name="sh")])
+        self.assertIn(f": {os.cpu_count()}.0 CPUs in 1 process", text)
 
     def test_a_session_whose_leader_has_exited_says_so(self):
         session, orphan = 5_000_010, 5_000_011
@@ -344,13 +359,30 @@ class Busiest(unittest.TestCase):
         second = [self.process(pid, own=2) for pid in sessions[:4]] + [self.process(sessions[4], own=0.6)]
         with patch.dict(os.environ, {"CAGENTS_OFFLOAD_BUSIEST_SHOWN": "a few",
                                      "CAGENTS_OFFLOAD_BUSIEST_LEAST": "nan"}):
-            text = self.busiest(first, second, seconds=2.0, on="fw16")
+            text = self.busiest(first, second, seconds=2.0, there=True)
         self.assertTrue(text.startswith("builds use 0.0 CPUs and everything else 4.3 CPUs; "), text)
         # Settings that are not numbers show the default three of at least
         # half a CPU.
         self.assertEqual(text.count(": 1.0 CPU in 1 process"), 3, text)
-        self.assertIn("; and 2 more sessions using 1.3 CPUs. `pkill -s ", text)
-        self.assertTrue(text.endswith(" on fw16 ends the first"), text)
+        self.assertIn("; and 2 more sessions using 1.3 CPUs. `ps -s ", text)
+        self.assertRegex(text, r"`ps -s \d+` there lists session \d+'s processes, and `pkill -s \d+` ends them$")
+
+    def test_no_session_a_person_works_in_is_offered_to_end_whole(self):
+        terminal, desktop_like, kernel = 5_000_060, os.getsid(0), 5_000_062
+        cases = (([self.process(terminal, terminal=34816, name="bash")], terminal, "a terminal's"),
+                 ([self.process(5_000_061, session=desktop_like)], desktop_like, "the one this wait runs in"))
+        for table, session, why in cases:
+            with self.subTest(why):
+                busy = [(pid, entry._replace(own=entry.own + self.TICKS)) for pid, entry in table]
+                text = self.busiest(table, busy)
+                self.assertIn(f". Session {session} is {why}: `ps -s {session}` lists its processes, "
+                              f"to end only what you recognise", text)
+                self.assertNotIn("pkill", text)
+        # The kernel's threads are named, though no one can end them.
+        text = self.busiest([self.process(kernel, parent=2, session=0, name="kswapd0")],
+                            [self.process(kernel, parent=2, session=0, own=1.5, name="kswapd0")])
+        self.assertEqual(text, "builds use 0.0 CPUs and everything else 1.5 CPUs; besides builds, "
+                               "the CPUs go to the kernel's own threads: 1.5 CPUs")
 
     def test_a_session_using_under_half_a_cpu_is_not_named(self):
         quiet, builds = 5_000_040, 5_000_041
@@ -718,10 +750,12 @@ cd "$HOME"
 ulimit -Sn 256
 # Its Cargo keeps intermediates outside the slot, as a build-dir setting in
 # its configuration would, and inside the stand-in's home, which the test
-# removes.
+# removes. A test may have it name every session that holds its CPUs.
 exec env -i CAGENTS_BUILD_REGISTRY= HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
-    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" \
+    CAGENTS_OFFLOAD_BUSIEST_SHOWN="${CAGENTS_OFFLOAD_BUSIEST_SHOWN-}" \
+    CAGENTS_OFFLOAD_BUSIEST_LEAST="${CAGENTS_OFFLOAD_BUSIEST_LEAST-}" sh -c "$*"
 """
 
 
@@ -1677,9 +1711,14 @@ class StandInHost(unittest.TestCase):
     def test_a_wait_for_the_build_hosts_cpus_names_what_holds_them(self):
         other = self.host_home / ".cache/cagents-offload/crate/slot-1"
         other.mkdir(parents=True)
-        lock = open(other / "lock", "a")
-        self.addCleanup(lock.close)
-        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Another build's lease holds a slot: a process of its own, which
+        # what this test starts is not below.
+        lease = self.scope.popen(
+            [sys.executable, "-c", "import fcntl, sys, time\nlock = open(sys.argv[1], 'a')\n"
+             "fcntl.flock(lock, fcntl.LOCK_EX)\nprint(flush=True)\ntime.sleep(600)", str(other / "lock")],
+            stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (lease.kill(), lease.wait(), lease.stdout.close()))
+        lease.stdout.readline()
         write_figures(self.host_home / "figures", cpu=90)
         # A runaway loop on the build host, in a session of its own.
         runaway = self.scope.popen(["runaway-fixture", "-c", "while True: pass"],
@@ -1695,7 +1734,8 @@ class StandInHost(unittest.TestCase):
                                         r"else \d+\.\d CPUs?; besides builds, the CPUs go to ")
         self.assertRegex(result.stderr, rf"session {runaway.pid} \(runaway-fixture -c while True: pass, "
                                         rf"started \d+s ago\): \d+\.\d CPUs? in 1 process")
-        self.assertRegex(result.stderr, r"`pkill -s \d+` on \S+ ends the first")
+        self.assertRegex(result.stderr, r"`ps -s \d+` there lists session \d+'s processes, and "
+                                        r"`pkill -s \d+` ends them|Session \d+ is ")
 
     def test_remote_commands_leave_no_core_dumps_unless_asked(self):
         (self.crate / "src/main.rs").write_text(textwrap.dedent("""

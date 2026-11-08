@@ -2339,6 +2339,8 @@ class CpuPressureAdmission(TwoSlots):
 
     def test_the_wait_names_what_else_holds_the_cpus(self):
         shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
+        (self.root / "bounded").write_text("#!/bin/sh\n")
+        (self.root / "bounded").chmod(0o755)
         runaway = self.spinner()
         # The running build spins too, in a process it detaches.
         pid_file = self.root / "build-spinner.pid"
@@ -2360,7 +2362,10 @@ class CpuPressureAdmission(TwoSlots):
                                  rf"besides builds, the CPUs go to .*session {runaway.pid} "
                                  rf"\(runaway-fixture -c while True: pass, started \d+s ago\): "
                                  rf"\d+\.\d CPUs? in 1 process")
-        self.assertRegex(stderr, r"`pkill -s \d+` ends the first")
+        self.assertRegex(stderr, r"`ps -s \d+` lists session \d+'s processes, and `pkill -s \d+` "
+                                 r"ends them|Session \d+ is ")
+        # Beside this gate is where workloads can be bounded to their session.
+        self.assertIn("; `./bounded --list` shows the workloads bounded to their session", stderr)
         # The build's own spinning counts as builds', not as something else's.
         self.assertNotIn("build-spinner", stderr)
         self.assertGreater(self.build_cpus(stderr), 0)
@@ -2374,8 +2379,13 @@ class CpuPressureAdmission(TwoSlots):
                                  start_new_session=True)
         self.addCleanup(lambda: (os.killpg(build.pid, signal.SIGKILL), build.wait()))
         deadline = time.monotonic() + 10
-        while not any("plain-flock-build" in path.read_text(errors="replace")
-                      for path in Path("/proc").glob("[0-9]*/cmdline") if path.exists()):
+        def started():
+            for path in Path("/proc").glob("[0-9]*/cmdline"):
+                with contextlib.suppress(OSError):
+                    if "plain-flock-build" in path.read_text(errors="replace"):
+                        return True
+            return False
+        while not started():
             self.assertLess(time.monotonic(), deadline, "the build never started")
             time.sleep(0.05)
         stderr = self.wait_for_cpu()
@@ -2453,34 +2463,42 @@ class CpuPressureAdmission(TwoSlots):
         (slot / "src").mkdir(parents=True)
         lock = slot / "lock"
         lock.touch()
-        # The lease holds the slot from another process, as on a build host.
-        lease = subprocess.Popen(
-            [sys.executable, "-c", "import fcntl, sys, time\nlock = open(sys.argv[1], 'a')\n"
-             "fcntl.flock(lock, fcntl.LOCK_EX)\ntime.sleep(60)", str(lock)], start_new_session=True)
-        self.addCleanup(lambda: (lease.kill(), lease.wait()))
-        deadline = time.monotonic() + 10
-        with lock.open("a") as probe:
-            while True:
-                try:
-                    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    break
-                fcntl.flock(probe, fcntl.LOCK_UN)
-                self.assertLess(time.monotonic(), deadline, "the slot was never leased")
-                time.sleep(0.02)
-        # One a command started and detached, still marked with its slot, and
-        # one working in the slot, as a copy of its files does.
-        self.spinner("marked-fixture", env=os.environ | {"CAGENTS_OFFLOAD_SLOT": str(slot.resolve())})
-        self.spinner("working-fixture", cwd=slot / "src")
+
+        def lease():
+            """A lease holding the slot from a process of its own, as on a build host."""
+            holder = subprocess.Popen(
+                [sys.executable, "-c", "import fcntl, sys, time\nlock = open(sys.argv[1], 'a')\n"
+                 "fcntl.flock(lock, fcntl.LOCK_EX)\nprint(flush=True)\ntime.sleep(60)", str(lock)],
+                start_new_session=True, stdout=subprocess.PIPE)
+            self.addCleanup(lambda: (holder.kill(), holder.wait(), holder.stdout.close()))
+            holder.stdout.readline()
+            return holder
+
+        def detached(kind):
+            # One a command started and detached, still marked with its
+            # slot, and one working in the slot, as a copy of its files does.
+            self.spinner(f"{kind}-marked", env=os.environ | {"CAGENTS_OFFLOAD_SLOT": str(slot.resolve())})
+            self.spinner(f"{kind}-working", cwd=slot / "src")
+
+        first = lease()
+        detached("first")
         named = self.busiest(lock)
-        self.assertNotIn("marked-fixture", named)
-        self.assertNotIn("working-fixture", named)
+        self.assertNotIn("first-marked", named)
+        self.assertNotIn("first-working", named)
         # With the slot no longer leased, they are leftovers worth naming.
-        lease.kill()
-        lease.wait()
+        first.kill()
+        first.wait()
         named = self.busiest(lock)
-        self.assertIn("marked-fixture", named)
-        self.assertIn("working-fixture", named)
+        self.assertIn("first-marked", named)
+        self.assertIn("first-working", named)
+        # And still once another build leases the slot: they are older than it.
+        lease()
+        detached("second")
+        named = self.busiest(lock)
+        self.assertIn("first-marked", named)
+        self.assertIn("first-working", named)
+        self.assertNotIn("second-marked", named)
+        self.assertNotIn("second-working", named)
 
     def test_a_lone_build_starts_whatever_the_pressure(self):
         self.report("100.00")

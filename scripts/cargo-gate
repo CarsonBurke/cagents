@@ -439,11 +439,13 @@ name_culprits() {
         set -- "$@" "$(slot_path "$other")"
         other=$((other + 1))
     done
-    # Where a workload left running can be bounded to its session, when this
-    # checkout has it.
+    # Where a workload left running can be bounded to its session: beside
+    # this gate, or in the checkout it runs for, when that is this project's.
     bounded=$here/bounded
     if [ ! -x "$bounded" ]; then
-        bounded=$(git rev-parse --show-toplevel 2>/dev/null)/scripts/bounded || bounded=
+        top=$(git rev-parse --show-toplevel 2>/dev/null) || top=
+        bounded=
+        [ -z "$top" ] || [ ! -f "$top/scripts/cargo-gate" ] || bounded=$top/scripts/bounded
     fi
     if [ -x "$bounded" ]; then
         set -- --bounded "$bounded" "$@"
