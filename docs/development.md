@@ -1461,7 +1461,7 @@ harness, it provides:
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
 that authority, so a hosted agent shell cannot run it locally; it runs it on the
 build host instead, as the next section describes. Remove the task directory
-when the PR merges.
+when the PR merges, and on the host run `clean`.
 
 ### Native evidence from a cagents session
 
@@ -1472,15 +1472,23 @@ reached it. Add `--remote HOST` (or set `CAGENTS_EVIDENCE_REMOTE`); every
 command is the same, and the screenshots come back here:
 
 ```sh
+mkdir -p ~/.local/state/cev-steps
 cat >~/.local/state/cev-steps/my-task.sh <<'STEPS'
 evidence cli project open '{fixture}/project'
 evidence drive click 'Open repository'
 evidence shot channel-prs
 STEPS
+git fetch origin main
 scripts/native-evidence --remote fw16 --task ~/.local/state/cev/my-task \
     pair --before origin/main --after . --steps ~/.local/state/cev-steps/my-task.sh --width 1200
 ls ~/.local/state/cev/my-task/shots   # before-channel-prs.webp after-channel-prs.webp manifest.tsv
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/my-task clean   # once the PR merges
 ```
+
+`pair` takes minutes: it builds two sides and may wait up to 30 minutes for
+the host's native lock while another session runs. Run it in the background,
+or with a command timeout of at least an hour. A command killed by a short
+tool timeout drops the SSH connection, and that ends the work on the host too.
 
 `pair` builds both sides, then for each starts a session, runs the steps file
 on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
@@ -1505,7 +1513,9 @@ scripts/native-evidence stop
   as this one, or `CAGENTS_EVIDENCE_REMOTE_REPOSITORY`), and checks it out at
   `.worktrees/cev-TASK-SIDE` there. `sources.tsv` in the task records each
   side's local checkout, its HEAD, and the commit that was built, which is the
-  revision `shots/manifest.tsv` names.
+  revision `shots/manifest.tsv` names. Every untracked file that isn't
+  ignored goes to the host, so make sure a stray file, such as a local `.env`,
+  is ignored or removed before you build.
 - **One tool.** Both sides run the `native-evidence` and synthetic provider of
   the checkout you run it from, copied to `.worktrees/cev-TASK-tool`, as a local
   run would.
@@ -1513,7 +1523,13 @@ scripts/native-evidence stop
   underscores, names `~/.local/state/cev/NAME` on the host. Locally it holds only
   `shots/` and `sources.tsv`. `where` prints the host's paths.
 - **Fixture paths.** `{fixture}` in `cli` and `env` arguments becomes the
-  fixture's root on the host.
+  fixture's root on the host, both on the command line here and in a steps
+  file. A path you type into a file chooser is a host path, so put the file to
+  attach under the fixture first, as in `evidence env sh -c 'cp ... "$CAGENTS_EVIDENCE_FIXTURE/project/"'`.
+- **Cleaning up.** `clean` stops the task's session, if any, and removes its
+  checkouts, the refs that pinned their commits, and its task directory from
+  the host. The shots here stay. A side can't be rebuilt while its session
+  runs, so the checkout is never rewritten under it. Stop the session first.
 - **Login shells.** Every script travels to `bash -s` on standard input, so the
   host's login shell may be fish. Commands get no standard input from here.
 

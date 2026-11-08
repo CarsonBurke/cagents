@@ -2,6 +2,9 @@
 # Native before/after evidence for a checkout, in an isolated fixture session.
 # See "Native evidence" in docs/development.md.
 set -euo pipefail
+# Read whole before any of it runs: a build or session runs for minutes, and
+# a checkout updated meanwhile must not change what the rest of this does.
+{
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
@@ -921,3 +924,5 @@ case $command in
     __app) run_app "$@" ;;
     *) usage >&2; exit 2 ;;
 esac
+exit
+}

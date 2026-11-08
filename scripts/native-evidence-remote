@@ -9,6 +9,9 @@
 # native-evidence still refuses inherited authority, so a forwarded
 # environment could not get a fixture past it.
 set -euo pipefail
+# Read whole before any of it runs: a build or session runs for minutes, and
+# a checkout updated meanwhile must not change what the rest of this does.
+{
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
@@ -39,6 +42,8 @@ or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
   shot NAME       Capture on HOST and bring back shots/SIDE-NAME.webp.
   fetch           Bring back every shot and the manifest.
   where           Print the task and checkouts on HOST.
+  clean           Remove the task's session, checkouts, refs and directory
+                  from HOST; the shots here are kept.
   start, stop, status, cli, env, drive, nested, save-seed
                   As in native-evidence, run on HOST. In cli and env
                   arguments, {fixture} stands for the fixture's root there.
@@ -93,6 +98,9 @@ fi
 tool_source=${CAGENTS_EVIDENCE_REMOTE_TOOL:-$tool_root}
 
 ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
+# Git's own SSH connection, the first contact in a build, gets the same
+# options, so an unreachable host fails in seconds rather than prompting.
+git_ssh="${ssh_command[*]}"
 
 # Runs a Bash script on HOST in a fresh SSH login, which inherits nothing from
 # this shell. The login shell there may be fish, so the script travels on
@@ -155,7 +163,16 @@ repository=$(printf '%q' "$repository")
 name=$(printf '%q' "$name")
 task=\$HOME/.local/state/cev/\$name
 tool=\$repository/.worktrees/cev-\$name-tool
-evidence() { "\$tool/scripts/native-evidence" --task "\$task" "\$@"; }
+# In cli and env arguments, {fixture} stands for the fixture's root, in a
+# forwarded command and a steps file alike.
+evidence() {
+    local command=\$1
+    shift
+    case \$command in
+        cli | env) set -- "\${@//\{fixture\}/\$task/fixture}" ;;
+    esac
+    "\$tool/scripts/native-evidence" --task "\$task" "\$command" "\$@"
+}
 PRELUDE
 )
 
@@ -167,7 +184,7 @@ snapshot() {
     local checkout=$1 head index tree
     head=$(git -C "$checkout" rev-parse --verify HEAD^{commit}) ||
         die "$checkout has no commit to start from"
-    if [ -z "$(git -C "$checkout" status --porcelain=v1 --untracked-files=all)" ]; then
+    if [ -z "$(git -C "$checkout" --no-optional-locks status --porcelain=v1 --untracked-files=all)" ]; then
         printf '%s\n' "$head"
         return
     fi
@@ -205,7 +222,7 @@ resolve_source() {
 # exactly that commit: untracked files left by an earlier copy are removed.
 sync_checkout() {
     local role=$1 checkout=$2 commit=$3
-    git -C "$checkout" push --quiet --force --no-verify "ssh://$host$repository" \
+    git -C "$checkout" -c core.sshCommand="$git_ssh" push --quiet --force --no-verify "ssh://$host$repository" \
         "$commit:refs/native-evidence/$name/$role" ||
         die "could not copy $commit to $host:$repository"
     on_host "$remote_prelude"'
@@ -245,20 +262,12 @@ fetch_shots() {
     rm -f -- "$task/.shots.tar"
 }
 
-# Forwards a native-evidence command, with {fixture} replaced in cli and env.
+# Forwards a native-evidence command.
 forward() {
     on_host "$remote_prelude"'
         [ -x "$tool/scripts/native-evidence" ] ||
             { echo "native-evidence-remote: nothing is built for this task on this host yet; run build first" >&2; exit 1; }
-        command=$1
-        shift
-        case $command in
-            cli | env)
-                fixture=$task/fixture
-                set -- "${@//\{fixture\}/$fixture}"
-                ;;
-        esac
-        evidence "$command" "$@"
+        evidence "$@"
     ' "$@"
 }
 
@@ -276,13 +285,40 @@ cmd_build() {
     case $side in before | after) ;; *) die 'side must be before or after' 2 ;; esac
     [ -n "$source" ] || die 'build needs a checkout or revision' 2
     resolve_source "$source"
+    # Before its checkout is rewritten under a session started from it.
+    if on_host "$remote_prelude"'
+        [ -x "$tool/scripts/native-evidence" ] || exit 1
+        evidence status 2>/dev/null | grep -q "^session: $1,"
+    ' "$side"; then
+        die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop"
+    fi
     sync_tool
     checkout=$(sync_checkout "$side" "$source_checkout" "$source_commit")
-    record_source "$side"
     if [ "$source_commit" != "$source_head" ]; then
         printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
     fi
     forward build "$side" "$checkout"
+    record_source "$side"
+}
+
+# Removes everything this task keeps on HOST: its session, if any, its
+# checkouts, the refs that pinned their commits, and its task directory. The
+# screenshots here stay.
+cmd_clean() {
+    on_host "$remote_prelude"'
+        if [ -x "$tool/scripts/native-evidence" ]; then
+            evidence stop >/dev/null 2>&1 || :
+        fi
+        for role in before after tool; do
+            checkout=$repository/.worktrees/cev-$name-$role
+            [ ! -e "$checkout" ] || git -C "$repository" worktree remove --force "$checkout"
+        done
+        git -C "$repository" worktree prune
+        git -C "$repository" for-each-ref --format="%(refname)" "refs/native-evidence/$name/" |
+            while IFS= read -r ref; do git -C "$repository" update-ref -d "$ref"; done
+        rm -rf -- "$task"
+    '
+    printf 'removed task %s from %s; its shots here are kept in %s\n' "$name" "$host" "$task/shots"
 }
 
 cmd_pair() {
@@ -336,13 +372,18 @@ cmd_pair() {
 
 case $command in
     pair) cmd_pair "$@" ;;
+    clean) cmd_clean ;;
     build) cmd_build "$@" ;;
     shot)
         [ "$#" -eq 1 ] || die 'shot needs a name' 2
         forward shot "$1" >/dev/null
         fetch_shots
-        side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p')
-        printf '%s\n' "$task/shots/${side:-*}-$1.webp"
+        side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p') || side=
+        if [ -n "$side" ]; then
+            printf '%s\n' "$task/shots/$side-$1.webp"
+        else
+            printf '%s\n' "$task/shots"
+        fi
         ;;
     fetch) fetch_shots; printf '%s\n' "$task/shots" ;;
     where)
@@ -359,3 +400,5 @@ case $command in
     start | stop | status | cli | env | drive | nested | save-seed) forward "$command" "$@" ;;
     *) usage >&2; exit 2 ;;
 esac
+exit
+}

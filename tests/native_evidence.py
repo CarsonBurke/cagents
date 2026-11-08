@@ -1076,7 +1076,8 @@ REMOTE_STUBS = {
         host=$1
         shift
         [ "$host" = buildhost ] || { echo "ssh: unknown host $host" >&2; exit 255; }
-        exec env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" \\
+        # What travels to the host: its arguments, above, and its input.
+        tee -a "$STUB_LOG/ssh-input" | env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" \\
             GIT_CONFIG_GLOBAL=/dev/null sh -c "$*"
     """,
 }
@@ -1181,6 +1182,12 @@ class RemoteEvidence(unittest.TestCase):
         self.run_tool("build", "after", str(checkout))
         environment = (self.logs / "remote-env").read_text()
         self.assertNotIn("CAGENTS_AGENT_AUTHORITY", environment)
+        # Nor does anything sent carry it, which the stub's clean login
+        # would otherwise hide.
+        for sent in ("ssh", "ssh-input"):
+            data = (self.logs / sent).read_bytes()
+            self.assertNotIn(b"inherited-token", data, sent)
+            self.assertNotIn(b"CAGENTS_AGENT_AUTHORITY", data, sent)
         self.assertNotIn("inherited-token", environment)
         built = (self.remote_task / "built-after").read_text().strip()
         self.assertEqual(built, str(self.remote_repository / ".worktrees" / "cev-mytask-after"))
@@ -1248,6 +1255,36 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("start before --width 1200 --portal gtk", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
+
+    def test_steps_name_the_fixture_on_the_host(self) -> None:
+        before = self.repository("before", {"src.rs": "old\n"})
+        steps = self.root / "steps.sh"
+        steps.write_text("evidence cli project open '{fixture}/project'\n")
+        self.run_tool("pair", "--before", str(before), "--after", str(before), "--steps", str(steps))
+        self.assertIn(f"cli project open {self.remote_task}/fixture/project", self.tool_calls())
+
+    def test_a_running_side_is_not_rebuilt_under_its_session(self) -> None:
+        checkout = self.repository("after", {"src.rs": "one\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        (checkout / "src.rs").write_text("two\n")
+        result = self.run_tool("build", "after", str(checkout), check=False)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("the after side is running on buildhost; stop it", result.stderr)
+        built = self.remote_repository / ".worktrees/cev-mytask-after/src.rs"
+        self.assertEqual(built.read_text(), "one\n")
+
+    def test_clean_removes_the_task_from_the_host_and_keeps_the_shots_here(self) -> None:
+        checkout = self.repository("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        self.run_tool("shot", "home")
+        self.run_tool("clean")
+        self.assertFalse(self.remote_task.exists())
+        self.assertFalse((self.remote_repository / ".worktrees/cev-mytask-after").exists())
+        self.assertFalse((self.remote_repository / ".worktrees/cev-mytask-tool").exists())
+        self.assertEqual(self.git(self.remote_repository, "for-each-ref", "refs/native-evidence/"), "")
+        self.assertTrue((self.task / "shots" / "after-home.webp").exists())
 
     def test_a_failing_step_still_stops_its_session(self) -> None:
         before = self.repository("before", {"src.rs": "old\n"})
