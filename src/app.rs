@@ -287,6 +287,8 @@ impl NoticeSeverity {
 enum NoticeKey {
     /// Opening the conversation in this card, or switching its terminal to one.
     ChatAttach(CardId),
+    /// An attached session's card staying here until its unfinished work clears.
+    SessionHeld(CardId),
     /// Saving the account that one sign-in produced.
     SignIn(uuid::Uuid),
     /// Adding an existing account home from the accounts table.
@@ -297,6 +299,8 @@ enum NoticeKey {
     GitCommit(ActiveWorktreeKey),
     /// Saving this chat's return to a terminal.
     ChatReturn(CardId),
+    /// Deleting this channel, until a retry starts or the channel is gone.
+    ChannelDelete(ChannelId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -431,6 +435,13 @@ impl NoticeLog {
         self.entries
             .iter()
             .any(|entry| entry.notice.key.as_ref() == Some(&key))
+    }
+
+    /// Whether `key` has a report standing whose words differ from `message`.
+    fn says_otherwise(&self, key: &NoticeKey, message: &str) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.notice.key.as_ref() == Some(key) && entry.notice.message != message)
     }
 
     /// Withdraws whatever `key` last reported, because its condition no
@@ -12508,10 +12519,13 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
-                    if self
-                        .card_state(*card)
-                        .is_none_or(|state| !state.existence.is_open()) =>
+                Some(
+                    key @ (NoticeKey::ChatAttach(card)
+                    | NoticeKey::SessionHeld(card)
+                    | NoticeKey::ChatReturn(card)),
+                ) if self
+                    .card_state(*card)
+                    .is_none_or(|state| !state.existence.is_open()) =>
                 {
                     Some(key.clone())
                 }
@@ -18136,7 +18150,10 @@ impl Application for Cagents {
                 self.flush_document_tone()
             }
             Message::NativeWindowAction(action) => Task::done(cosmic::Action::Cosmic(action)),
-            Message::ChatUi(action) => self.handle_chat_ui(action),
+            Message::ChatUi(action) => {
+                let handled = self.handle_chat_ui(action);
+                Task::batch([handled, self.reconcile_cleared_blocked_aliases()])
+            }
             Message::ResetSettings => {
                 if self.settings_reset_confirm {
                     return Task::none();
@@ -19088,7 +19105,13 @@ impl Application for Cagents {
                         .channels
                         .iter()
                         .find(|channel| channel.id == id)
-                        .map(|channel| channel.title.clone())
+                        .map(|channel| {
+                            channel_ui::channel_display_title(
+                                channel,
+                                self.sidebar_model.project(channel.project_id),
+                            )
+                            .into_owned()
+                        })
                 })
                 .or_else(|| {
                     directory

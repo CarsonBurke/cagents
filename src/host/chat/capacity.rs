@@ -153,7 +153,7 @@ impl Reservation {
             record.handle.owns_work() && same_conversation(&launch, &source.launch)
         }) {
             return Err(error(
-                "This exact conversation already owns work; attach to its existing chat",
+                "This conversation is already running. If no window shows it, `cagents sessions` says how to put it in a channel.",
             ));
         }
         if state
@@ -1489,6 +1489,20 @@ exit 0
                 assert!(!reader.subscribers.contains_key(&0));
                 assert!(!reader.observations.contains_key(&0));
             }
+            assert!(
+                crate::host::agent_execution::live_sessions(&host)
+                    .iter()
+                    .any(|live| live.id == source.id && live.history_only),
+                "a reader stays addressable and says it has no provider process"
+            );
+            let directory = crate::host::agent_execution::read_directory(
+                &host,
+                &crate::agent_execution::Authority::default(),
+                crate::agent_execution::directory::Scope::All,
+            )
+            .unwrap();
+            assert_eq!(directory.saved_transcripts, [source.id]);
+            assert!(directory.sessions.iter().any(|entry| entry.id == source.id));
             assert!(!marker.exists(), "automatic restore launched a provider");
             if index == 0 {
                 let mut older_alias = source.clone();
@@ -1523,6 +1537,66 @@ exit 0
             "65 exact history handshakes and releases: {:?}",
             started.elapsed()
         );
+    }
+
+    #[test]
+    fn a_channel_listing_names_only_its_own_saved_transcript_readers() {
+        use crate::{
+            agent_execution::{Authority, Placement},
+            model::{CardId, CardKind, ChannelId, ProjectKind},
+            workspace_model::{ModelEdit, views::Pane},
+        };
+        let host = host();
+        let (_directory, source, _) = history_reader(&host, false);
+        let (reader, server) = restore_client(&host, source.clone(), 72);
+        let reader = reader.unwrap();
+        wait_for_client_history(&reader, true);
+        let (channel, other) = (ChannelId::new(), ChannelId::new());
+        {
+            let registry = crate::host::agent_execution::registry(&host).unwrap();
+            let mut model = registry.lock().unwrap();
+            model
+                .apply(&ModelEdit::OpenProject {
+                    repository: source.launch.recipe.working_directory.clone(),
+                    name: "Fixture".into(),
+                    kind: ProjectKind::Folder,
+                })
+                .unwrap();
+            for id in [channel, other] {
+                model
+                    .apply(&ModelEdit::CreateChannel {
+                        id,
+                        repository: source.launch.recipe.working_directory.clone(),
+                        title: "Channel".into(),
+                        title_source: Default::default(),
+                    })
+                    .unwrap();
+            }
+            model
+                .apply(&ModelEdit::SeedView {
+                    scope: Placement::Channel(channel),
+                    closed: vec![],
+                    panes: vec![Pane {
+                        id: CardId::new(),
+                        title: "Reader".into(),
+                        user_title: None,
+                        pending_terminal_start: false,
+                        width_fraction: 1.0,
+                        kind: CardKind::Chat(source.clone()),
+                        scope: None,
+                    }],
+                })
+                .unwrap();
+        }
+        let saved = |channel| {
+            crate::host::agent_execution::read_channel(&host, &Authority::default(), Some(channel))
+                .unwrap()
+                .saved_transcripts
+        };
+        assert_eq!(saved(channel), [source.id]);
+        assert_eq!(saved(other), []);
+        drop(reader);
+        server.join().unwrap();
     }
 
     #[test]

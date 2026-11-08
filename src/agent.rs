@@ -94,6 +94,15 @@ impl Provider {
         self.adapter().label
     }
 
+    /// The placeholder title of a chat that has not named itself yet.
+    pub fn chat_title(self) -> &'static str {
+        match self {
+            Self::Omp => "OMP chat",
+            Self::Claude => "Claude chat",
+            Self::Codex => "Codex chat",
+        }
+    }
+
     /// Recognize an exact executable basename, not a shell command or JS wrapper.
     pub fn from_program(program: &str) -> Option<Self> {
         let name = Path::new(program).file_name()?.to_str()?;

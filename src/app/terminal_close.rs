@@ -360,6 +360,10 @@ impl Cagents {
         {
             return Task::none();
         }
+        // The session is that pane's, and closing this card must not end it.
+        if self.another_pane_holds_session(card) {
+            return self.release_card_held_elsewhere(card);
+        }
         if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
             self.completed_release = Some(card);
             return cosmic::task::future(async move {

@@ -541,7 +541,10 @@ mod tests {
             119,
             crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
             crate::terminal_ipc::PROTOCOL_VERSION,
-        ] {
+        ]
+        .into_iter()
+        .chain(crate::terminal_ipc::EARLIER_MATCHED_SETS)
+        {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
             bytes.extend_from_slice(&[255, 255, 255, 255, 255]);
             assert_eq!(discovered_version(&bytes).unwrap(), version);
@@ -748,6 +751,16 @@ mod tests {
         worker.join().unwrap();
     }
 
+    #[test]
+    fn a_protocol_bump_keeps_every_recorded_protocol_an_update_source() {
+        for protocol in crate::terminal_ipc::recorded_protocols() {
+            assert!(
+                super::super::is_qualified_source(protocol),
+                "protocol {protocol} would be stranded on this release"
+            );
+        }
+    }
+
     /// The candidate line (128) is spoken with this release's types, so the
     /// messages an update exchanges with it must keep the variant positions
     /// that line published. Moving one would silently mis-decode its replies.
@@ -821,8 +834,20 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn authenticated_candidate_line_source_previews_and_prepares_at_its_own_protocol() {
+        previews_and_prepares_at_its_own_protocol(crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn authenticated_earlier_matched_sets_preview_and_prepare_at_their_own_protocol() {
+        for protocol in crate::terminal_ipc::EARLIER_MATCHED_SETS {
+            previews_and_prepares_at_its_own_protocol(protocol);
+        }
+    }
+
+    #[cfg(feature = "host")]
+    fn previews_and_prepares_at_its_own_protocol(protocol: u16) {
         use std::os::unix::net::UnixListener;
-        let protocol = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
         let paths = crate::daemon::RuntimePaths {

@@ -115,6 +115,19 @@ pub struct Directory {
     pub scope: Scope,
     /// Every other matching session, the caller's relatives first.
     pub sessions: Vec<Entry>,
+    /// Listed sessions open only to read a saved transcript: a client attached,
+    /// with no provider process behind it.
+    ///
+    /// Keep this last. Nothing follows it in the reply's frame, so a CLI from an
+    /// earlier protocol, which carried chats keep on `PATH` after an update,
+    /// stops reading before it and still gets every session.
+    pub saved_transcripts: Vec<TerminalId>,
+}
+
+impl Directory {
+    pub fn is_saved_transcript(&self, entry: &Entry) -> bool {
+        self.saved_transcripts.contains(&entry.id)
+    }
 }
 
 /// A session as a channel listing or transcript reports it: its directory
@@ -142,9 +155,19 @@ pub struct Members {
     pub caller: Option<Member>,
     /// Every other member, most recently active first.
     pub sessions: Vec<Member>,
+    /// Members open only to read a saved transcript. Keep this last, as in
+    /// [`Directory`].
+    pub saved_transcripts: Vec<TerminalId>,
 }
 
 impl Entry {
+    /// A provider session no shared view holds, with no agent record to place
+    /// one. A window may still show it from a card it has not published, so this
+    /// does not by itself mean the session is hidden.
+    pub fn has_no_shared_pane(&self) -> bool {
+        self.provider.is_some() && self.view_scope.is_none() && self.delegation.is_none()
+    }
+
     /// One line for people and agents scanning a list. IDs are printed whole
     /// because they are what every other command takes.
     pub fn line(&self) -> String {
@@ -178,6 +201,9 @@ impl Entry {
         }
         if let Some(super::Placement::Worktree { path, .. }) = &self.view_scope {
             line.push_str(&format!(" [worktree view: {}]", path.display()));
+        }
+        if self.has_no_shared_pane() {
+            line.push_str(" [no shared pane]");
         }
         line.push_str(relation);
         if self.lineage.0 != self.id {

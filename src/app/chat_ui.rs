@@ -846,6 +846,10 @@ impl Default for State {
 }
 impl State {
     #[cfg(test)]
+    pub(super) fn draft_for_test(&self, card: CardId) -> Option<&str> {
+        self.drafts.get(&card).map(String::as_str)
+    }
+    #[cfg(test)]
     pub(super) fn with_drafts(drafts: HashMap<CardId, String>) -> Self {
         Self {
             drafts,
@@ -5329,7 +5333,9 @@ impl Runtime {
     /// it and a returning runtime restores it, so typing a single character no
     /// longer makes the card impossible to leave. Managed image receipts are
     /// stashed alongside it. Legacy path-only attachments and half-entered
-    /// request answers still need this runtime.
+    /// request answers still need this runtime, except answers to a provider
+    /// that has exited: nothing can take them, and the card no longer lets the
+    /// reader change them, so holding a card for them would never end.
     pub(super) fn transition_blocker(&self) -> Option<&'static str> {
         if self.attachment_chooser_pending.is_some() {
             Some("Finish or cancel the file chooser before leaving the chat.")
@@ -5353,10 +5359,11 @@ impl Runtime {
             })
         {
             Some("Send or remove the attached files before leaving the chat.")
-        } else if self
-            .answers
-            .values()
-            .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
+        } else if !self.snapshot.exited
+            && self
+                .answers
+                .values()
+                .any(|answers| answers.iter().any(|answer| !answer.is_empty()))
         {
             Some("Submit or clear the answer you started before leaving the chat.")
         } else {
@@ -5418,11 +5425,7 @@ fn stream(source: &Source) -> Pin<Box<dyn iced::futures::Stream<Item = (Target, 
 /// a bare "Native chat" left the reader unable to tell which agent a tab was
 /// talking to.
 pub(super) fn chat_card_title(provider: Provider) -> &'static str {
-    match provider {
-        Provider::Omp => "OMP chat",
-        Provider::Claude => "Claude chat",
-        Provider::Codex => "Codex chat",
-    }
+    provider.chat_title()
 }
 
 fn observed_launch(session: &TerminalSession) -> Option<LaunchRecipe> {
@@ -7546,6 +7549,18 @@ impl Cagents {
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
+    /// Says so on the card, and returns true, when a start here would end the
+    /// session in the pane holding it.
+    fn refuse_start_held_elsewhere(&mut self, target: Target) -> bool {
+        let Some(refusal) = self.session_held_elsewhere_start_refusal(target.card) else {
+            return false;
+        };
+        if let Some(runtime) = self.chat_runtime_mut(target) {
+            runtime.error = Some(refusal);
+        }
+        true
+    }
+
     pub(super) fn chat_retry_intent(&self, card: CardId, session: &chat::Session) -> chat::Intent {
         if self.chat_ui.explicit_starts.get(&card) == Some(session)
             && match self.cards.get(&card) {
@@ -7753,14 +7768,118 @@ impl Cagents {
                 }))
     }
 
-    pub(super) fn can_rekey_shared_terminal_draft(&self, alias: CardId, canonical: CardId) -> bool {
+    /// Whether a chat card can give way to the pane holding its conversation.
+    /// Text and attachments go with it. What is mid-flight or queued belongs to
+    /// this card's runtime, as does a card closed elsewhere with a draft to
+    /// rescue, so it stays until that clears.
+    pub(super) fn can_move_chat_to_pane(&self, alias: CardId, canonical: CardId) -> bool {
+        let runtime = match self.cards.get(&alias) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&alias).map(Box::as_ref),
+        };
+        if runtime.is_some_and(|runtime| {
+            runtime.closed_elsewhere || runtime.transition_blocker().is_some()
+        }) {
+            return false;
+        }
+        !self.shared_chat_has_local_work(alias)
+            // An open pane has already read its saved draft and would not see this one.
+            || (self.can_rekey_shared_draft(alias, canonical)
+                && !self.cards.contains_key(&canonical))
+    }
+
+    /// Hands what `alias` has not sent to `canonical`, which shows it when it
+    /// opens. Returns whether there was anything to hand over.
+    pub(super) fn carry_chat_draft_to_pane(&mut self, alias: CardId, canonical: CardId) -> bool {
+        self.chat_forget(alias);
+        let carried = self
+            .chat_ui
+            .drafts
+            .get(&alias)
+            .is_some_and(|draft| !draft.is_empty())
+            || self
+                .chat_ui
+                .draft_attachments
+                .get(&alias)
+                .is_some_and(|images| !images.is_empty());
+        carried && self.rekey_shared_draft(alias, canonical)
+    }
+
+    /// What `card` has not sent, wherever it currently lives.
+    fn chat_unsent_draft(&self, card: CardId) -> (String, Vec<Attachment>) {
+        let runtime = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
+            _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
+        };
+        match runtime {
+            Some(runtime) => runtime.persistent_draft(),
+            None => (
+                self.chat_ui.drafts.get(&card).cloned().unwrap_or_default(),
+                self.chat_ui
+                    .draft_attachments
+                    .get(&card)
+                    .cloned()
+                    .unwrap_or_default(),
+            ),
+        }
+    }
+
+    pub(super) fn chat_has_unsent_draft(&self, card: CardId) -> bool {
+        let (text, images) = self.chat_unsent_draft(card);
+        !text.is_empty() || !images.is_empty()
+    }
+
+    /// An open pane has already read its saved draft and would not see this
+    /// one, and text of its own is not overwritten.
+    pub(super) fn chat_draft_can_go_to_pane(&self, canonical: CardId) -> bool {
+        !self.cards.contains_key(&canonical) && !self.shared_chat_has_local_work(canonical)
+    }
+
+    /// A card being given up leaves its text with the pane holding the
+    /// session. Unlike a move, its own runtime is about to go, so nothing it
+    /// has in flight needs to finish first. Returns whether any text went.
+    pub(super) fn carry_released_chat_draft(&mut self, card: CardId, canonical: CardId) -> bool {
+        if !self.chat_draft_can_go_to_pane(canonical) {
+            return false;
+        }
+        let (text, images) = self.chat_unsent_draft(card);
+        if text.is_empty() && images.is_empty() {
+            return false;
+        }
+        if !images.is_empty() {
+            self.chat_ui.draft_attachments.insert(canonical, images);
+        }
+        if !text.is_empty() {
+            self.chat_ui.drafts.insert(canonical, text);
+        }
+        true
+    }
+
+    pub(super) fn chat_closed_elsewhere_here(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.closed_elsewhere,
+            _ => self
+                .chat_ui
+                .parked
+                .get(&card)
+                .is_some_and(|runtime| runtime.closed_elsewhere),
+        }
+    }
+
+    /// A released card's remaining text and attachments go with it.
+    pub(super) fn chat_discard_local_work(&mut self, card: CardId) {
+        self.chat_ui.drafts.remove(&card);
+        self.chat_ui.draft_attachments.remove(&card);
+    }
+
+    pub(super) fn can_rekey_shared_draft(&self, alias: CardId, canonical: CardId) -> bool {
         !self.chat_ui.phases.contains_key(&alias)
             && !self.chat_ui.parked.contains_key(&alias)
             && !self.shared_chat_has_local_work(canonical)
     }
 
-    pub(super) fn rekey_shared_terminal_draft(&mut self, alias: CardId, canonical: CardId) -> bool {
-        if !self.can_rekey_shared_terminal_draft(alias, canonical) {
+    pub(super) fn rekey_shared_draft(&mut self, alias: CardId, canonical: CardId) -> bool {
+        if !self.can_rekey_shared_draft(alias, canonical) {
             return false;
         }
         if let Some(images) = self.chat_ui.draft_attachments.remove(&alias) {
@@ -7923,10 +8042,12 @@ impl Cagents {
         if self.chat_start_pending(card) {
             return false;
         }
-        match self.cards.get(&card) {
+        let offered = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.offers_fresh_conversation(),
             _ => self.chat_ui.fresh_offers.contains(&card),
-        }
+        };
+        // Replacing the conversation here would end it in the pane that holds it.
+        offered && !self.another_pane_holds_session(card)
     }
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
@@ -7998,6 +8119,10 @@ impl Cagents {
             return Some(Cow::Borrowed(
                 "This pane is moving to a channel. Wait for the move to finish before changing views.",
             ));
+        }
+        // Either direction ends the session here, and the pane holding it with it.
+        if let Some(reason) = self.session_held_elsewhere_reason(card) {
+            return Some(Cow::Owned(reason));
         }
         if let Some(phase) = self.chat_ui.phases.get(&card) {
             return Some(Cow::Borrowed(match phase {
@@ -8149,6 +8274,10 @@ impl Cagents {
             *close_requested = true;
             return Task::none();
         }
+        // The session is that pane's now, and closing this card must not end it.
+        if self.another_pane_holds_session(card) {
+            return self.release_card_held_elsewhere(card);
+        }
         // Only a live conversation is ever parked behind its terminal.
         if let Some(runtime) = self.chat_ui.parked.get(&card)
             && let Some(handle) = runtime.handle().cloned()
@@ -8242,6 +8371,15 @@ impl Cagents {
         session: Option<chat::Session>,
         end: fn(Option<Arc<ClientHandle>>, Option<chat::Session>) -> Result<(), String>,
     ) -> Task<Message> {
+        // Dropping the handle only disconnects this card; the pane keeps the session.
+        let handle_session = handle.as_ref().map(|handle| handle.session().id);
+        if handle_session
+            .into_iter()
+            .chain(session.as_ref().map(|session| session.id))
+            .any(|id| self.another_pane_holds(card, id))
+        {
+            return Task::none();
+        }
         let target = self.chat_ui.next_target(card);
         self.chat_ui.retiring.insert(target);
         cosmic::task::future(async move {
@@ -10940,10 +11078,14 @@ impl Cagents {
                 } else {
                     self.chat_retry_intent(target.card, &session)
                 };
+                if intent != chat::Intent::Restore && self.refuse_start_held_elsewhere(target) {
+                    return Task::none();
+                }
                 return self.start_chat(target.card, session, intent, None, false);
             }
             Action::ResumeSaved(target) => {
-                if self.chat_start_pending(target.card) {
+                if self.chat_start_pending(target.card) || self.refuse_start_held_elsewhere(target)
+                {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -20167,7 +20309,7 @@ mod tests {
                 .draft_attachments
                 .insert(canonical, vec![image.clone()]);
             assert!(app.shared_chat_has_local_work(canonical));
-            assert!(!app.rekey_shared_terminal_draft(alias, canonical));
+            assert!(!app.rekey_shared_draft(alias, canonical));
             assert_eq!(app.chat_ui.draft_attachments[&canonical], [image]);
         });
     }
@@ -22120,6 +22262,368 @@ mod tests {
         assert_eq!(chat_runtime(&app, card).attachments, attachments);
     }
 
+    /// `cagents channel move` can give a session a shared pane while this window
+    /// still shows it from a local card. That card's close button is not a request
+    /// to end the session.
+    /// A daemon view lists `card`'s session under a pane of its own.
+    fn hold_elsewhere(app: &mut Cagents, card: CardId) -> CardId {
+        use crate::{
+            model::ChannelId,
+            workspace_model::views::{Pane, View},
+        };
+        let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        pane.id = CardId::new();
+        let held = pane.id;
+        let mut view = View::empty(ChannelId::new());
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        held
+    }
+
+    /// `card`'s session is attached to a new shared channel while this window
+    /// shows it from a card that view does not list.
+    fn attach_to_new_channel(app: &mut Cagents, card: CardId) -> CardId {
+        use crate::{
+            model::{ChannelId, ProjectChannel, ProjectId},
+            workspace_model::views::{Pane, Scope, View},
+        };
+        app.retain_local_pane(card);
+        let destination = ChannelId::new();
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .push(ProjectChannel {
+                id: destination,
+                project_id: ProjectId::new(),
+                title: "destination".into(),
+                title_source: Default::default(),
+                ordinal: 2,
+                shared: true,
+                cards: vec![],
+                focused: None,
+            });
+        app.mark_view_ready_for_test(Scope::Channel(destination));
+        let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        pane.id = CardId::new();
+        let held = pane.id;
+        let mut view = View::empty(destination);
+        view.revision = 1;
+        view.panes.push(pane);
+        app.workspace_model.views = vec![view];
+        drop(app.reconcile_shared_views());
+        held
+    }
+
+    fn notice(app: &Cagents) -> &str {
+        app.status
+            .as_ref()
+            .map_or("", |notice| notice.message.as_str())
+    }
+
+    #[test]
+    fn unsent_text_goes_with_an_attached_session_to_its_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        write(&mut app, card, "still typing");
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.card_state(held).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("still typing")
+        );
+        assert!(notice(&app).contains("destination"), "{}", notice(&app));
+    }
+
+    #[test]
+    fn closing_a_held_card_sends_its_typed_text_to_the_pane_and_discards_the_rest() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        write(&mut app, card, "still typing");
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.followups.push(followup(0, "waiting", &[]));
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(notice(&app).contains("sends your unsent text there"));
+        let promised = app.session_held_elsewhere_note(card, &[]).unwrap();
+        assert!(
+            promised.contains("your unsent text goes with it"),
+            "{promised}"
+        );
+        assert!(promised.contains("Anything else waiting"), "{promised}");
+
+        drop(app.begin_chat_close(card));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("still typing")
+        );
+    }
+
+    /// A chosen answer holds the card only while a provider could take it. Once
+    /// the provider exits the card can neither submit nor change the answer, so
+    /// holding on would leave the conversation on a card that may not resume it
+    /// and away from the pane that may.
+    #[test]
+    fn an_answer_stops_holding_an_attached_session_here_when_its_provider_exits() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        write(&mut app, card, "still typing");
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.answers.insert(
+                ("request".into(), "question".into()),
+                vec!["chosen answer".into()],
+            );
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.card_state(held)
+                .is_none_or(|state| !state.existence.is_open())
+        );
+        let refusal = app.session_held_elsewhere_start_refusal(card).unwrap();
+        assert!(
+            refusal.contains("once what's waiting here is finished or cleared"),
+            "the destination does not show it yet: {refusal}"
+        );
+
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            Arc::make_mut(&mut runtime.snapshot).exited = true;
+        }
+        let _ = app.update(Message::ChatUi(Action::Tick));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.card_state(held).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("still typing")
+        );
+    }
+
+    #[test]
+    fn a_queued_followup_keeps_an_attached_session_here_until_a_chat_action_clears_it() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.followups.push(followup(0, "waiting", &[]));
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(
+            app.card_state(held)
+                .is_none_or(|state| !state.existence.is_open())
+        );
+        let raised = notice(&app).to_owned();
+        assert!(raised.contains("destination"), "{raised}");
+        assert!(
+            raised.contains("keeps the conversation running"),
+            "{raised}"
+        );
+
+        // Still held: said once, not again on every reconcile.
+        app.status = None;
+        drop(app.reconcile_shared_views());
+        assert_eq!(notice(&app), "");
+        assert!(app.card_state(card).unwrap().existence.is_open());
+
+        // No direct reconcile: the chat action itself has to get it moving.
+        let _ = app.update(Message::ChatUi(Action::TakeBackQueued(target, None)));
+        assert!(!app.card_state(card).unwrap().existence.is_open());
+        assert!(app.card_state(held).unwrap().existence.is_open());
+        assert_eq!(
+            app.chat_ui.drafts.get(&held).map(String::as_str),
+            Some("waiting")
+        );
+        // What was promised is withdrawn, and where the text went stays up.
+        let keys = app
+            .notices
+            .recent()
+            .map(|entry| (entry.notice.severity, entry.notice.key.clone()))
+            .collect::<Vec<_>>();
+        assert!(
+            !keys
+                .iter()
+                .any(|(_, key)| *key == Some(crate::app::NoticeKey::SessionHeld(card))),
+            "{keys:?}"
+        );
+        assert!(
+            app.notices.recent().any(|entry| {
+                entry.notice.severity == NoticeSeverity::Warning
+                    && entry.notice.message.contains("with what you hadn't sent")
+            }),
+            "{keys:?}"
+        );
+    }
+
+    #[test]
+    fn a_card_closed_elsewhere_says_closing_it_shows_the_pane() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.closed_elsewhere = true;
+        }
+        attach_to_new_channel(&mut app, card);
+        let notice = app.status.take().expect("a hold says so");
+        assert!(
+            notice.message.contains("Close this card to show it there")
+                && !notice.message.contains("finished or cleared"),
+            "{}",
+            notice.message
+        );
+    }
+
+    #[test]
+    fn the_held_notice_follows_the_pane_holding_the_session() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.followups.push(followup(0, "waiting", &[]));
+        }
+        let held = attach_to_new_channel(&mut app, card);
+        let drain = |app: &mut Cagents| {
+            if let Some(notice) = app.status.take() {
+                app.notices.record(notice);
+            }
+        };
+        drain(&mut app);
+        let held_notice = |app: &Cagents| {
+            app.notices
+                .recent()
+                .find(|entry| entry.notice.key == Some(crate::app::NoticeKey::SessionHeld(card)))
+                .map(|entry| entry.notice.message.clone())
+        };
+        assert!(held_notice(&app).unwrap().contains("destination"));
+
+        // Renamed while waiting: the notice says the name the sidebar shows.
+        let durable = Arc::make_mut(&mut app.durable);
+        let channel = durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.title == "destination")
+            .unwrap();
+        channel.title = "renamed".into();
+        drop(app.reconcile_shared_views());
+        drain(&mut app);
+        assert!(held_notice(&app).unwrap().contains("renamed"));
+
+        // Dismissing it is not undone by the reconcile that follows.
+        app.notices
+            .resolve(crate::app::NoticeKey::SessionHeld(card));
+        drop(app.reconcile_shared_views());
+        drain(&mut app);
+        assert_eq!(held_notice(&app), None);
+
+        // The holding pane left, so the promise no longer holds.
+        app.status = Some(
+            crate::app::TransientNotice::warning("standing")
+                .with_key(crate::app::NoticeKey::SessionHeld(card)),
+        );
+        drain(&mut app);
+        for view in &mut app.workspace_model.views {
+            view.panes.retain(|pane| pane.id != held);
+            view.revision += 1;
+        }
+        drop(app.reconcile_shared_views());
+        drain(&mut app);
+        assert_eq!(held_notice(&app), None);
+        assert!(app.card_state(card).unwrap().existence.is_open());
+    }
+
+    #[test]
+    fn returning_to_the_terminal_leaves_a_session_another_pane_holds_alone() {
+        for session in [Some(KNOWN_THREAD), None] {
+            for held_elsewhere in [true, false] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, session);
+                if held_elsewhere {
+                    hold_elsewhere(&mut app, card);
+                }
+                let _ = app.update(Message::ChatUi(Action::Switch(card)));
+                assert_eq!(
+                    app.chat_ui.phases.contains_key(&card),
+                    !held_elsewhere,
+                    "{session:?}: {}",
+                    notice(&app)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn starting_fresh_leaves_a_session_another_pane_holds_alone() {
+        for held_elsewhere in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            app.chat_ui.fresh_offers.insert(card);
+            if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+                let mut snapshot = (*runtime.snapshot).clone();
+                snapshot.exited = true;
+                snapshot.session_id = Some("another".into());
+                runtime.snapshot = Arc::new(snapshot);
+            }
+            if held_elsewhere {
+                hold_elsewhere(&mut app, card);
+            }
+            assert_eq!(app.chat_offers_fresh_conversation(card), !held_elsewhere);
+            let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
+            assert_eq!(app.chat_ui.phases.contains_key(&card), !held_elsewhere);
+        }
+    }
+
+    /// Every start failure, abandoned start and replaced conversation gives its
+    /// session up through this one call.
+    #[test]
+    fn retiring_a_chat_leaves_a_session_another_pane_holds_alone() {
+        for held_elsewhere in [true, false] {
+            for with_handle in [true, false] {
+                let mut app = crate::app::tests::context_inspector_test_app(false);
+                let card = live_chat(&mut app, Some(KNOWN_THREAD));
+                if held_elsewhere {
+                    hold_elsewhere(&mut app, card);
+                }
+                let handle = chat_runtime(&app, card).handle().cloned();
+                let session = app.chat_return_session(card);
+                let task = if with_handle {
+                    app.retire_chat(card, handle, None)
+                } else {
+                    app.retire_chat(card, None, session)
+                };
+                drop(task);
+                assert_eq!(app.chat_ui.retiring.is_empty(), held_elsewhere);
+            }
+        }
+    }
+
+    #[test]
+    fn closing_a_card_only_ends_its_session_when_no_other_pane_holds_it() {
+        use crate::{
+            model::ChannelId,
+            workspace_model::views::{Pane, View},
+        };
+        for held_elsewhere in [true, false] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = live_chat(&mut app, Some(KNOWN_THREAD));
+            if held_elsewhere {
+                let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+                pane.id = CardId::new();
+                let mut view = View::empty(ChannelId::new());
+                view.panes.push(pane);
+                app.workspace_model.views = vec![view];
+            }
+            drop(app.begin_chat_close(card));
+            assert_eq!(
+                app.chat_ui.transition_pending(),
+                !held_elsewhere,
+                "a close reaches the session only when nothing else holds it"
+            );
+            assert_eq!(
+                app.card_state(card).unwrap().existence.is_open(),
+                !held_elsewhere,
+                "released at once, or open until the session's close finishes"
+            );
+        }
+    }
+
     /// A stranded retained card is rebound to its started successor only once
     /// the store has it; until then, and when the store refuses it or the card
     /// closes meanwhile, the card names its source and the successor is
@@ -22354,6 +22858,23 @@ mod tests {
             "{offer:?}"
         );
         assert_eq!(offer.secondary, None);
+
+        // A pane holding the session keeps its actor: neither control starts here.
+        let views = app.workspace_model.views.clone();
+        let mut holder = crate::workspace_model::views::View::empty(crate::model::ChannelId::new());
+        let mut held = pane(&app, &source);
+        held.id = CardId::new();
+        holder.panes.push(held);
+        app.workspace_model.views.push(holder);
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        drop(app.handle_chat_ui(Action::ResumeSaved(target)));
+        assert!(app.chat_ui.attempt(card).is_none());
+        let refusal = chat_runtime(&app, card).error.clone().unwrap_or_default();
+        assert!(refusal.contains("Resume it from there"), "{refusal}");
+        app.workspace_model.views = views;
+        if let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) {
+            runtime.error = None;
+        }
 
         drop(app.handle_chat_ui(Action::Reconnect(target)));
         let attempt = app.chat_ui.attempt(card).expect("Resume starts");

@@ -55,7 +55,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 156,
+    proven_at: 157,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -359,6 +359,20 @@ impl Serializer for VariantIndex {
     }
 }
 
+/// The protocols with a recorded wire format, which are kept across bumps.
+#[cfg(test)]
+pub(crate) fn recorded_protocols() -> Vec<u16> {
+    let directory =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/wire-formats");
+    std::fs::read_dir(directory)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            path.file_stem().unwrap().to_str().unwrap().parse().unwrap()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod wire_format_tests;
 #[cfg(test)]
@@ -528,12 +542,14 @@ mod tests {
             caller: None,
             scope: Scope::All,
             sessions: Vec::new(),
+            saved_transcripts: Vec::new(),
         }))));
         assert!(client.admits_message(&reply(Reply::InboxAcknowledged)));
         assert!(!client.admits_message(&reply(Reply::Members(Members {
             channel: crate::model::ChannelId::new(),
             caller: None,
             sessions: Vec::new(),
+            saved_transcripts: Vec::new(),
         }))));
     }
 

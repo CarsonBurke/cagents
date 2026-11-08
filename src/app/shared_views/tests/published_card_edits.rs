@@ -9,7 +9,7 @@ fn chat_session(app: &Cagents, card: CardId) -> crate::chat::Session {
 }
 
 /// A window with a session writer showing one shared channel.
-fn shared_channel_app() -> (Cagents, Scope, tempfile::TempDir) {
+pub(super) fn shared_channel_app() -> (Cagents, Scope, tempfile::TempDir) {
     let mut app = super::super::super::tests::context_inspector_test_app(false);
     let directory = tempfile::tempdir().unwrap();
     let (writer, _) = crate::session::SessionRuntime::open(
@@ -45,13 +45,13 @@ fn flushed(app: &Cagents) -> Arc<crate::persistence::StateStore> {
     writer.operation_store()
 }
 
-fn stored(app: &Cagents, card: CardId) -> CardState {
+pub(super) fn stored(app: &Cagents, card: CardId) -> CardState {
     flushed(app).load_card(card, None).unwrap().unwrap()
 }
 
 /// The registry accepts the window's panes as they are, and acknowledges
 /// every edit published so far.
-fn accept_local_view(app: &mut Cagents, scope: &Scope) -> View {
+pub(super) fn accept_local_view(app: &mut Cagents, scope: &Scope) -> View {
     let Scope::Channel(channel) = scope else {
         unreachable!()
     };
