@@ -124,6 +124,9 @@ fn peer_send_during_unproved_first_start_does_not_schedule_another_provider() {
         views::{Change, Pane, Scope, View},
     };
     let (mut creator, directory, card, target) = fixture();
+    if let Some(CardRuntime::Chat(runtime)) = creator.cards.get_mut(&card) {
+        runtime.attachments.clear();
+    }
     let source = runtime(&creator, card).session.clone();
     let channel = crate::model::ChannelId::new();
     Arc::make_mut(&mut creator.durable)
@@ -138,12 +141,25 @@ fn peer_send_during_unproved_first_start_does_not_schedule_another_provider() {
             cards: vec![card],
             focused: Some(card),
         });
+    Arc::make_mut(&mut creator.durable).active_channel = Some(channel);
+    creator.workspace.resize_viewport(1280.0);
     let scope = Scope::Channel(channel);
     let mut view = View::empty(channel);
     view.revision = 1;
     view.panes
         .push(Pane::from_card(creator.card_state(card).unwrap(), None).unwrap());
     creator.workspace_model.identity = uuid::Uuid::new_v4();
+    creator.workspace_model.sequence = 3;
+    creator
+        .workspace_model
+        .channels
+        .push(crate::workspace_model::ModelChannel {
+            id: channel,
+            repository: directory.path().to_owned(),
+            title: "Shared draft".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+        });
     creator.workspace_model.views = vec![view.clone()];
     let (publish, published) = async_channel::unbounded();
     creator.workspace_model_tx = publish;
@@ -165,7 +181,9 @@ fn peer_send_during_unproved_first_start_does_not_schedule_another_provider() {
     .unwrap();
     peer.session = Some(writer);
     peer.durable = creator.durable.clone();
-    Arc::make_mut(&mut peer.durable).active_channel = None;
+    Arc::make_mut(&mut peer.durable).active_channel = Some(channel);
+    peer.workspace = Cagents::rebuild_workspace(&peer.durable);
+    peer.workspace.resize_viewport(1280.0);
     peer.workspace_model = creator.workspace_model.clone();
     drop(peer.open_chat(card, source.clone(), chat::Intent::Start));
     peer.publish_view_changes();
@@ -178,7 +196,7 @@ fn peer_send_during_unproved_first_start_does_not_schedule_another_provider() {
         .flush(Duration::from_secs(5))
         .unwrap();
 
-    let saved = checkpoint(creator.start_chat_draft(target));
+    let saved = checkpoint(creator.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
     assert!(saved.2.is_ok(), "{:?}", saved.2);
     // This deliberately holds A before the provider Task is polled, rather
     // than relying on the measured 185 ms timing or a sleeping fake provider.
@@ -211,7 +229,7 @@ fn peer_send_during_unproved_first_start_does_not_schedule_another_provider() {
         runtime.replace_draft(text_editor::Content::with_text("Keep the losing prompt"));
     }
     let images = runtime(&peer, card).attachments.clone();
-    let saved = checkpoint(peer.start_chat_draft(target));
+    let saved = checkpoint(peer.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
     assert!(
         saved.2.is_ok(),
         "peer checkpoint unexpectedly refused: {:?}; stored={:?}; runtime={:?}",
