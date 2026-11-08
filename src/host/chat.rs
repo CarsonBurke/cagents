@@ -1129,6 +1129,9 @@ fn start_with_execution(
     // Reserve before provider/account initialization. Pending owners recovered above
     // use their own exact reservation through restore.
     let mut admission = capacity::Reservation::new_with_source(host, &session, source.as_ref())?;
+    if pane.is_none() {
+        pane_start::validate_known_allocation(host, &session)?;
+    }
     let _pane_start = pane
         .as_ref()
         .map(|pane| pane_start::Reservation::new(host, pane, &session))

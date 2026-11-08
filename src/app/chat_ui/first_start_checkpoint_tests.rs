@@ -119,23 +119,9 @@ fn no_starter(app: &Cagents, card: CardId) {
 
 #[test]
 fn a_proven_candidate_with_the_same_id_attaches_without_sending_the_peer_draft() {
-    use crate::workspace_model::views::{Pane, View};
     let (mut app, _directory, card, _) = fixture();
     let images = runtime(&app, card).attachments.clone();
     let source = runtime(&app, card).session.clone();
-    let channel = crate::model::ChannelId::new();
-    Arc::make_mut(&mut app.durable)
-        .channels
-        .push(crate::model::ProjectChannel {
-            id: channel,
-            project_id: crate::model::ProjectId::new(),
-            title: "Shared candidate".into(),
-            title_source: Default::default(),
-            ordinal: 1,
-            shared: true,
-            cards: vec![card],
-            focused: Some(card),
-        });
     let mut accepted = source;
     accepted.proof = Some(HostSessionProof {
         host_session_id: "owner".into(),
@@ -143,14 +129,9 @@ fn a_proven_candidate_with_the_same_id_attaches_without_sending_the_peer_draft()
         host_incarnation: "host".into(),
     });
     accepted.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
-    let mut pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
-    pane.kind = CardKind::Chat(accepted.clone());
-    let mut view = View::empty(channel);
-    view.revision = 2;
-    view.panes.push(pane);
-    app.workspace_model.identity = uuid::Uuid::new_v4();
-    app.workspace_model.views = vec![view];
-    drop(app.reconcile_shared_views());
+    // Exercise the adoption boundary directly. The private-wire passive-peer
+    // tests below cover delivery through a complete authoritative shared model.
+    drop(app.adopt_shared_draft_session(card, &accepted));
     assert!(
         app.chat_start_matches(card, &accepted),
         "proof must schedule attachment even for the same ID"

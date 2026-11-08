@@ -1347,9 +1347,12 @@ impl HostState {
             || self
                 .chats
                 .get(id)
-                .is_some_and(|record| !record.handle.is_completed())
+                .is_some_and(|record| record.handle.owns_work() || record.returning_terminal)
             || self.chat_spawning.contains_key(id)
             || self.chat_handoffs.contains_key(id)
+            || self.native_actor_startups.contains_key(id)
+            || self.native_closing.contains_key(id)
+            || self.historical_chat_retirements.contains_key(id)
     }
 
     pub(crate) fn cancel_spawn(&mut self, terminal_id: TerminalId) {

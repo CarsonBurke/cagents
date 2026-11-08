@@ -21,15 +21,64 @@ pub(super) struct Reservation {
 }
 
 fn resident_owner(state: &HostState, id: TerminalId) -> bool {
-    state
-        .chats
-        .get(&id)
-        .is_some_and(|record| record.handle.owns_work() || record.returning_terminal)
-        || state.chat_spawning.contains_key(&id)
-        || state.native_actor_startups.contains_key(&id)
-        || state.native_closing.contains_key(&id)
-        || state.chat_handoffs.contains_key(&id)
-        || state.historical_chat_retirements.contains_key(&id)
+    state.is_live(&id)
+}
+
+fn binding_owns_work(
+    host: &SharedHost,
+    binding: &crate::host::model::PaneChatBinding,
+    candidate: Option<TerminalId>,
+) -> Result<bool, ProtocolError> {
+    if candidate != Some(binding.current)
+        && resident_owner(
+            &host.lock().unwrap_or_else(|p| p.into_inner()),
+            binding.current,
+        )
+    {
+        return Ok(true);
+    }
+    if binding.current == binding.candidate.id {
+        return has_native_owner(&binding.candidate);
+    }
+    // Typed succession may have moved this pane to a terminal allocation.
+    // Its ID is recorded by the same transaction as Registry::succeed.
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    for kind in [Kind::Native, Kind::Terminal] {
+        let directory = registry::directory(kind).map_err(unavailable)?;
+        if registry::recovery_candidate(&registry::socket(&directory, binding.current), kind)
+            .map_err(unavailable)?
+            .is_some()
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// An older typed request may still be in flight when a pane accepts a newer
+/// first send. Its capacity reservation and the writer make that race atomic.
+pub(super) fn validate_known_allocation(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<(), ProtocolError> {
+    let writer = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state
+            .workspace_registry
+            .clone()
+            .or_else(|| state.execution_registry.clone())
+    };
+    // Standalone legacy hosts need no pane namespace. Once present, registry
+    // failures are refusals rather than permission to revive an old allocation.
+    let Some(writer) = writer else { return Ok(()) };
+    let mut registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+    if !registry
+        .pane_chat_allocation_is_current(session.id)
+        .map_err(unavailable)?
+    {
+        return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT));
+    }
+    Ok(())
 }
 
 impl Reservation {
@@ -69,12 +118,24 @@ impl Reservation {
         {
             return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT));
         }
+        let binding = registry
+            .pane_chat_start(request.card)
+            .map_err(unavailable)?;
+        if binding
+            .as_ref()
+            .is_some_and(|binding| binding.current != binding.candidate.id)
+        {
+            return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT));
+        }
         let current = match canonical {
             Some((_, pane)) => match &pane.kind {
                 CardKind::Chat(current) => current,
                 _ => return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT)),
             },
-            None if request.allow_local => &request.source,
+            None if request.allow_local => binding
+                .as_ref()
+                .map(|binding| &binding.candidate)
+                .unwrap_or(&request.source),
             None => {
                 return Err(ProtocolError::new(
                     ProtocolErrorCode::QueueFull,
@@ -83,7 +144,16 @@ impl Reservation {
                 ));
             }
         };
-        if current != &request.source && current != candidate {
+        let eligible = if let (None, Some(binding)) = (canonical, binding.as_ref()) {
+            // After a failed start, provider/account/permission choices may
+            // change this accepted ID's recipe. Check the saved launch's owner
+            // below before permitting that same draft's next candidate.
+            binding.current == request.source.id
+                || (binding.current == candidate.id && binding.candidate == *candidate)
+        } else {
+            current == &request.source || current == candidate
+        };
+        if !eligible {
             return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT));
         }
         {
@@ -93,6 +163,11 @@ impl Reservation {
             {
                 return Err(error("Chat is already starting"));
             }
+        }
+        if let Some(binding) = &binding
+            && binding_owns_work(host, binding, Some(candidate.id))?
+        {
+            return Err(error("This pane already has a provider owner"));
         }
         // Resident maps disappear on daemon replacement; a retained provider
         // does not. Errors cannot authorize replacement of that owner either.
@@ -115,6 +190,12 @@ impl Reservation {
             pane: request.card,
             token,
         };
+        if !registry
+            .bind_pane_chat_start(request.card, binding.as_ref(), candidate)
+            .map_err(unavailable)?
+        {
+            return Err(error(crate::host::model::Registry::VIEW_SOURCE_CONFLICT));
+        }
         if let Some((view, pane)) = canonical {
             let mut desired = pane.clone();
             desired.kind = CardKind::Chat(candidate.clone());
@@ -190,6 +271,7 @@ pub(in crate::host) fn requires_edit_check(edit: &ModelEdit) -> bool {
 /// a same-ID account edit, cannot move the pane away from its live provider.
 pub(in crate::host) fn validate_edit(
     host: &SharedHost,
+    registry: &crate::host::model::Registry,
     model: &crate::workspace_model::WorkspaceModel,
     edit: &ModelEdit,
 ) -> Result<(), ProtocolError> {
@@ -205,6 +287,20 @@ pub(in crate::host) fn validate_edit(
         _ => return Ok(()),
     };
     for pane in desired {
+        let binding = registry.pane_chat_start(pane.id).map_err(unavailable)?;
+        let desired_id = match &pane.kind {
+            CardKind::Chat(session) => Some(session.id),
+            CardKind::Terminal(session) => Some(session.id),
+            _ => None,
+        };
+        if let Some(binding) = &binding
+            && desired_id != Some(binding.current)
+            && (binding.current != binding.candidate.id || binding_owns_work(host, binding, None)?)
+        {
+            return Err(error(
+                "This pane's conversation is starting or running; attach to it before replacing its source",
+            ));
+        }
         let current = model
             .views
             .iter()
@@ -225,12 +321,20 @@ pub(in crate::host) fn validate_edit(
             (claimed, resident)
         };
         let explicitly_claimed = claimed.is_some();
-        let source = claimed.or(resident).or_else(|| {
-            current.and_then(|current| match &current.kind {
-                CardKind::Chat(session) => Some(session.clone()),
-                _ => None,
+        let source = claimed
+            .or(resident)
+            .or_else(|| {
+                current.and_then(|current| match &current.kind {
+                    CardKind::Chat(session) => Some(session.clone()),
+                    _ => None,
+                })
             })
-        });
+            .or_else(|| {
+                binding
+                    .as_ref()
+                    .filter(|binding| binding.current == binding.candidate.id)
+                    .map(|binding| binding.candidate.clone())
+            });
         let Some(source) = source else {
             continue;
         };
@@ -362,8 +466,21 @@ mod tests {
 
     #[test]
     fn distinct_first_send_candidates_admit_exactly_one_provider() {
+        real_provider_admission(false);
+    }
+
+    #[test]
+    fn copied_local_first_send_candidates_admit_exactly_one_provider() {
+        real_provider_admission(true);
+    }
+
+    fn real_provider_admission(local: bool) {
         use std::os::unix::fs::PermissionsExt;
         let mut fixture = Fixture::new();
+        if local {
+            fixture.request.card = CardId::new();
+            fixture.request.allow_local = true;
+        }
         let root = fixture._directory.path();
         let executable = root.join("omp");
         std::fs::write(&executable, r#"#!/usr/bin/python3
@@ -383,17 +500,19 @@ for line in sys.stdin:
         let before = model.views[0].panes[0].clone();
         let mut pane = before.clone();
         pane.kind = CardKind::Chat(fixture.request.source.clone());
-        crate::host::workspace::edit(
-            &fixture.host,
-            1,
-            ModelEdit::ChangeView {
-                scope: fixture.scope.clone(),
-                expected_revision: model.views[0].revision,
-                operation: uuid::Uuid::new_v4(),
-                change: Change::Update { before, pane },
-            },
-        )
-        .unwrap();
+        if !local {
+            crate::host::workspace::edit(
+                &fixture.host,
+                1,
+                ModelEdit::ChangeView {
+                    scope: fixture.scope.clone(),
+                    expected_revision: model.views[0].revision,
+                    operation: uuid::Uuid::new_v4(),
+                    change: Change::Update { before, pane },
+                },
+            )
+            .unwrap();
+        }
         let mut admitted = Vec::new();
         let mut outcomes = Vec::new();
         // Deliver neither Ready response to the windows. Both requests retain
@@ -668,6 +787,150 @@ for line in sys.stdin:
                 .iter()
                 .flat_map(|view| &view.panes)
                 .any(|pane| pane.id == local.card)
+        );
+    }
+
+    #[test]
+    fn copied_local_draft_cannot_replace_the_winner_after_request_or_daemon_ends() {
+        let fixture = Fixture::new();
+        let mut local = fixture.request.clone();
+        local.card = CardId::new();
+        local.allow_local = true;
+        let first = fixture.candidate();
+        let admission = capacity::Reservation::new(&fixture.host, &first).unwrap();
+        let claim = Reservation::new(&fixture.host, &local, &first).unwrap();
+        drop(claim);
+        assert!(
+            Reservation::new(&fixture.host, &local, &fixture.candidate()).is_err(),
+            "a copied old draft must remain fenced after the request returns"
+        );
+        let mut retry = local.clone();
+        retry.source = first.clone();
+        retry
+            .source
+            .launch
+            .recipe
+            .environment
+            .insert("MODEL".into(), "different".into());
+        let mut next = retry.source.clone();
+        next.id = TerminalId::new();
+        assert!(
+            Reservation::new(&fixture.host, &retry, &next).is_err(),
+            "edited options cannot evade the original candidate's owner"
+        );
+        drop(admission);
+        drop(Reservation::new(&fixture.host, &retry, &next).unwrap());
+        let mut proof = fixture.host.lock().unwrap().proof().clone();
+        proof.host_incarnation = HostIncarnation::new("replacement");
+        let mut replacement = HostState::new(proof);
+        replacement
+            .install_model(Registry::at(&fixture._directory.path().join("model.sqlite3")).unwrap());
+        let replacement = Arc::new(HostLock::new(replacement));
+        assert!(
+            Reservation::new(&replacement, &local, &fixture.candidate()).is_err(),
+            "daemon replacement must not forget which local candidate won"
+        );
+        let mut retry_after_restart = local;
+        retry_after_restart.source = next;
+        let candidate = fixture.candidate();
+        drop(Reservation::new(&replacement, &retry_after_restart, &candidate).unwrap());
+    }
+
+    #[test]
+    fn publishing_a_local_pane_cannot_displace_its_live_winner() {
+        let fixture = Fixture::new();
+        let mut local = fixture.request.clone();
+        local.card = CardId::new();
+        local.allow_local = true;
+        let first = fixture.candidate();
+        let _admission = capacity::Reservation::new(&fixture.host, &first).unwrap();
+        drop(Reservation::new(&fixture.host, &local, &first).unwrap());
+        let pane = |session| Pane {
+            id: local.card,
+            title: "Draft".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            kind: CardKind::Chat(session),
+            scope: None,
+        };
+        let seed = |session| ModelEdit::SeedView {
+            scope: fixture.scope.clone(),
+            closed: vec![],
+            panes: vec![pane(session)],
+        };
+        assert!(
+            crate::host::workspace::edit(&fixture.host, 2, seed(local.source.clone())).is_err()
+        );
+        crate::host::workspace::edit(&fixture.host, 1, seed(first.clone())).unwrap();
+        let mut shared = local;
+        shared.allow_local = false;
+        assert!(Reservation::new(&fixture.host, &shared, &fixture.candidate()).is_err());
+    }
+
+    #[test]
+    fn typed_succession_fences_both_stale_drafts_and_delayed_legacy_starts() {
+        let fixture = Fixture::new();
+        let mut local = fixture.request.clone();
+        local.card = CardId::new();
+        local.allow_local = true;
+        let first = fixture.candidate();
+        drop(Reservation::new(&fixture.host, &local, &first).unwrap());
+        let successor = TerminalId::new();
+        crate::host::workspace::writer(&fixture.host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .succeed(successor, first.id, None, |_| false)
+            .unwrap();
+        let retried = TerminalId::new();
+        crate::host::workspace::writer(&fixture.host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .succeed(retried, first.id, None, |_| false)
+            .unwrap();
+        let mut stale = local;
+        stale.source = first.clone();
+        assert!(Reservation::new(&fixture.host, &stale, &fixture.candidate()).is_err());
+        assert!(validate_known_allocation(&fixture.host, &first).is_err());
+        let mut current = first;
+        current.id = retried;
+        assert!(validate_known_allocation(&fixture.host, &current).is_ok());
+        let advanced = TerminalId::new();
+        assert!(
+            crate::host::workspace::writer(&fixture.host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .succeed(advanced, current.id, None, |_| false)
+                .is_ok()
+        );
+        let competing = TerminalId::new();
+        let mut pending = fixture.candidate();
+        pending.id = advanced;
+        fixture
+            .host
+            .lock()
+            .unwrap()
+            .historical_chat_retirements
+            .insert(advanced, pending);
+        assert!(
+            crate::host::workspace::writer(&fixture.host)
+                .unwrap()
+                .lock()
+                .unwrap()
+                .succeed(competing, stale.source.id, None, |members| fixture
+                    .host
+                    .lock()
+                    .unwrap()
+                    .any_other_live(members, stale.source.id))
+                .is_err()
+        );
+        stale.source = current;
+        assert!(
+            Reservation::new(&fixture.host, &stale, &fixture.candidate()).is_err(),
+            "typed resume/account/terminal operations keep their own lifecycle; a raw copy is not a fresh draft"
         );
     }
 
