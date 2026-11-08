@@ -608,6 +608,7 @@ impl Cagents {
         let mut unsettled = Vec::new();
         let mut settled = Vec::new();
         let mut attached_now = Vec::new();
+        let mut views_ready = None;
         for card in &self.durable.cards {
             let CardKind::Terminal(session) = &card.kind else {
                 continue;
@@ -653,8 +654,8 @@ impl Cagents {
                     }
                 }
                 Some(CardRuntime::Loading) => {
-                    if let Some(hold) =
-                        views_hold.or_else(|| self.restored_attach_hold(card.id, session))
+                    if let Some(hold) = views_hold
+                        .or_else(|| self.restored_attach_hold(card.id, session, &mut views_ready))
                     {
                         settled.pop();
                         unsettled.push((card.id, session.id, hold, String::new()));

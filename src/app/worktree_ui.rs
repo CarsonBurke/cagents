@@ -19,7 +19,7 @@ pub(super) struct WorktreeRoots<'a> {
 }
 
 impl<'a> WorktreeRoots<'a> {
-    fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
+    pub(super) fn new(roots: impl Iterator<Item = &'a Path>) -> Self {
         Self {
             roots: roots.map(|root| (root, root)).collect(),
         }
@@ -261,6 +261,13 @@ impl Cagents {
                 self.worktree_focus.remove(path);
             }
         }
+        let open = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+            .map(|card| card.id)
+            .collect::<HashSet<_>>();
         let needs_update = self.durable.active_worktree != self.active_workspace
             || self.durable.worktree_focus != self.worktree_focus
             || active_order.as_ref().is_some_and(|(id, order)| {
@@ -271,13 +278,7 @@ impl Cagents {
             })
             || self.durable.channels.iter().any(|channel| {
                 (Some(channel.id) == self.durable.active_channel && channel.focused != focused)
-                    || channel.cards.iter().any(|id| {
-                        !self
-                            .durable
-                            .cards
-                            .iter()
-                            .any(|card| card.id == *id && card.existence.is_open())
-                    })
+                    || channel.cards.iter().any(|id| !open.contains(id))
             });
         if !needs_update {
             return;
@@ -289,12 +290,7 @@ impl Cagents {
             }
         }
         for channel in &mut durable.channels {
-            channel.cards.retain(|id| {
-                durable
-                    .cards
-                    .iter()
-                    .any(|card| card.id == *id && card.existence.is_open())
-            });
+            channel.cards.retain(|id| open.contains(id));
             if !channel
                 .focused
                 .is_some_and(|id| channel.cards.contains(&id))
@@ -623,17 +619,27 @@ impl Cagents {
     }
 
     pub(super) fn indexed_worktree_roots(&self) -> WorktreeRoots<'_> {
-        WorktreeRoots::new(
-            self.known_worktree_roots
-                .iter()
-                .map(PathBuf::as_path)
-                .chain(self.sidebar_model.projects.iter().flat_map(|project| {
-                    project
-                        .worktrees
-                        .iter()
-                        .map(|worktree| worktree.path.as_path())
-                })),
-        )
+        WorktreeRoots::new(self.worktree_root_candidates())
+    }
+
+    /// The roots `indexed_worktree_roots` indexes, owned, for an index that
+    /// must outlive mutable updates of this window.
+    pub(super) fn worktree_root_paths(&self) -> Vec<PathBuf> {
+        self.worktree_root_candidates()
+            .map(Path::to_owned)
+            .collect()
+    }
+
+    fn worktree_root_candidates(&self) -> impl Iterator<Item = &Path> {
+        self.known_worktree_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(self.sidebar_model.projects.iter().flat_map(|project| {
+                project
+                    .worktrees
+                    .iter()
+                    .map(|worktree| worktree.path.as_path())
+            }))
     }
 
     pub(super) fn unchanneled_card_worktree_indexed<'a>(

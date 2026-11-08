@@ -6007,6 +6007,7 @@ impl Cagents {
         &self,
         card: CardId,
         session: &TerminalSession,
+        views_ready: &mut Option<bool>,
     ) -> Option<&'static str> {
         if let Err(hold) = self.restored_attach_residency(card) {
             return Some(hold);
@@ -6017,7 +6018,7 @@ impl Cagents {
         {
             return Some("its worktree is being deleted");
         }
-        self.shared_terminal_attach_hold(card, session)
+        self.shared_terminal_attach_hold(card, session, views_ready)
     }
 
     /// Starts the next queued restored agent attach that still applies, once
@@ -6035,6 +6036,8 @@ impl Cagents {
         // only record, which is attached the way it was before sharing.
         let mut held = Vec::new();
         let mut task = Task::none();
+        // Only the attach that ends this loop changes any state.
+        let mut views_ready = None;
         while let Some(card) = self.restored_agent_attaches.pop_front() {
             // A card being opened has a start of its own. One that is cold
             // has none coming while it is off screen, which is how a shared
@@ -6053,7 +6056,8 @@ impl Cagents {
                 self.card_state(card),
                 matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
             ) {
-                if !self.shared_terminal_ready_for_restored_attach(card, &session) {
+                if !self.shared_terminal_ready_for_restored_attach(card, &session, &mut views_ready)
+                {
                     held.push(card);
                     continue;
                 }
