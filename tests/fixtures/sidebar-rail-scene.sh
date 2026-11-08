@@ -24,6 +24,9 @@
 #   failed    an error result ends the turn
 #   waiting   a tool permission request, held open
 #
+# The result frames carry no session_id: the app refuses a result from any
+# conversation but the agent's own, and the fixture names that one itself.
+#
 # Half the projects have a github.com remote whose owner has an avatar seeded
 # for the fixture's offline forge (docs/fixtures.md, "An offline GitHub"), so
 # the rail mixes avatar images with initials. The avatars are generated
@@ -151,12 +154,12 @@ frames_for() {
         working) rm -f -- "$frames" ;;
         unread)
             printf '%s\n' \
-                '{"type":"result","subtype":"success","is_error":false,"result":"Done.","session_id":"fixture"}' \
+                '{"type":"result","uuid":"scene-result-@TURN@","subtype":"success","is_error":false,"result":"Done."}' \
                 '{"_end":true}' >"$frames"
             ;;
         failed)
             printf '%s\n' \
-                '{"type":"result","subtype":"error_during_execution","is_error":true,"result":"The test runner crashed.","session_id":"fixture"}' \
+                '{"type":"result","uuid":"scene-result-@TURN@","subtype":"error_during_execution","is_error":true,"errors":["The test runner crashed."]}' \
                 '{"_end":true}' >"$frames"
             ;;
         waiting)

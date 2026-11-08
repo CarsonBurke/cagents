@@ -10895,10 +10895,9 @@ fn navigation_search_ranks(
 
 /// The rail has room only for rows worth a glance: a search's matches, where
 /// the user is, news, live agents, deletions, and rows the Attention list
-/// keeps in place. A row is not drawn merely because it exists or has panes
-/// open: the rail is a list of reasons to switch, and the expanded sidebar,
-/// one window-width away, lists everything. Drawing and keyboard order both
-/// ask this, so the two cannot disagree about which rows exist.
+/// keeps in place. A worktree with open panes counts as where the user is: the
+/// rail is how they switch back to it. Drawing and keyboard order both ask
+/// this, so the two cannot disagree about which rows exist.
 fn compact_rail_shows_channel(state: &SidebarState, channel: &SidebarChannel) -> bool {
     compact_rail_searching(state)
         || channel.selected
@@ -10921,6 +10920,7 @@ fn compact_rail_shows_worktree(
                 worktree_id: worktree.id,
             })
         || state.has_agent_update(project, worktree.id)
+        || state.worktree_has_panes(project, worktree.id)
         || state.agent_activity(project, worktree.id).is_some()
         || worktree.deletion.is_some()
         || state.retained_in_attention(SelectionRow::Worktree(project, worktree.id))

@@ -30,19 +30,20 @@ pub(super) const CELL_HEIGHT: f32 = design::ROW_HEIGHT;
 /// The square each glyph is centred in and each badge is pinned to. It is the
 /// same for a project's chip and a channel's glyph, so badges form one column
 /// down the rail.
-const FRAME: f32 = 28.0;
+const FRAME: f32 = 30.0;
 /// A project's identity: its avatar or initials.
 pub(super) const PROJECT_CHIP: f32 = 22.0;
 /// A channel, worktree or operation inside a project.
 pub(super) const CHILD_GLYPH: u16 = design::ROW_ICON_SIZE;
 /// A count's pill, ring included.
-const PILL_HEIGHT: f32 = 15.0;
-/// A badge is cut out of what it overlaps by a ring of the rail's own surface,
-/// so it reads as attached to the glyph rather than drawn on top of it.
+const PILL_HEIGHT: f32 = 14.0;
+/// A badge is cut out of what it overlaps by a ring of the project tray it
+/// sits on, so it reads as attached to the glyph rather than drawn on top of
+/// it.
 const RING: f32 = 2.0;
 /// A news badge with no count to show, ring included.
 const DOT: f32 = 10.0;
-const SPINNER: f32 = 12.0;
+const SPINNER: f32 = 10.0;
 /// The spinner's backing disc, ring included.
 const SPINNER_DISC: f32 = SPINNER + RING;
 
@@ -206,7 +207,7 @@ pub(super) fn cell<'a>(
 }
 
 fn ring(theme: &cosmic::Theme) -> Color {
-    theme.cosmic().primary(theme.transparent).base.into()
+    design::rail_tray(theme)
 }
 
 fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
