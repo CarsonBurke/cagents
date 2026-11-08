@@ -644,6 +644,9 @@ struct Claude {
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
     forced_history: bool,
+    /// A compaction boundary arrived, so the provider context that follows
+    /// is the summary standing in for the turns before it.
+    compaction_summary_due: bool,
     /// The running main turn received content this version cannot show.
     turn_unsupported_content: bool,
     /// The running main turn produced something the transcript can show.
@@ -1509,6 +1512,20 @@ impl Claude {
             ]
             .iter()
             .any(|key| frame[*key].as_bool() == Some(true));
+        // The transcript names its compaction summary; the wire folds that
+        // flag away, so there the summary is the context that follows a
+        // compaction boundary.
+        let compaction = context
+            && (frame["isCompactSummary"].as_bool() == Some(true)
+                || (!history && child.is_none() && self.compaction_summary_due));
+        if !history && child.is_none() {
+            self.compaction_summary_due = false;
+        }
+        let context_item = if compaction {
+            compaction_item
+        } else {
+            context_item
+        };
         let content_role = if context { Role::System } else { role };
         let message = &frame["message"];
         let id = message["id"]
@@ -3897,6 +3914,18 @@ fn model_only(frame: &Value) -> bool {
 /// Preserve opaque provider context without attributing it to the user, a
 /// particular tool, or another agent. System notices are explicit disclosures.
 fn context_item(id: String, body: String) -> Item {
+    notice_item(id, "Claude context", body)
+}
+
+/// Where compaction restarted the model's context, with the summary that
+/// replaced the turns before it available on demand.
+fn compaction_item(id: String, body: String) -> Item {
+    notice_item(id, COMPACTED, body)
+}
+
+const COMPACTED: &str = "Context compacted";
+
+fn notice_item(id: String, summary: &str, body: String) -> Item {
     Item {
         id,
         role: Role::System,
@@ -3904,7 +3933,7 @@ fn context_item(id: String, body: String) -> Item {
             kind: DeliveryKind::Notice,
             from: String::new(),
             sender: String::new(),
-            summary: "Claude context".into(),
+            summary: summary.into(),
             body,
         },
         started_at: None,
@@ -5550,6 +5579,7 @@ impl Claude {
             // the usage again exactly as a refresh does, rather than
             // narrating itself into the transcript.
             "compact_boundary" => {
+                self.compaction_summary_due = true;
                 let usage = self.control(json!({"subtype":"get_context_usage"}))?;
                 step.writes.extend(usage.writes);
             }
@@ -5635,6 +5665,9 @@ impl std::ops::Deref for HistoryRecord {
 }
 struct HistoryNode {
     parent: Option<String>,
+    /// The record a compaction boundary continues. Compaction starts a new
+    /// parent chain, so only this link leads back to the turns it summarised.
+    logical_parent: Option<String>,
     visible: bool,
     message: bool,
     range: (u64, u64, usize),
@@ -5881,6 +5914,10 @@ impl History {
             if let Some(parent) = &parent {
                 parents.insert(parent.clone());
             }
+            let logical_parent = parent
+                .is_none()
+                .then(|| value["logicalParentUuid"].as_str().map(str::to_owned))
+                .flatten();
             let message = matches!(string(&value, "type"), "user" | "assistant");
             let visible = message
                 && !model_only(&value)
@@ -5935,6 +5972,7 @@ impl History {
                 uuid.into(),
                 HistoryNode {
                     parent,
+                    logical_parent,
                     visible,
                     message,
                     range,
@@ -5976,8 +6014,15 @@ impl History {
         let mut chain = Vec::new();
         let mut chain_tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
+        let mut compacted = false;
         while let Some(id) = leaf {
             if !seen.insert(id) {
+                // Turns already found before a compaction boundary that led
+                // back into them stay readable; only the current chain
+                // looping on itself is malformed.
+                if compacted {
+                    break;
+                }
                 return Err("Claude transcript contains a cyclic parent chain".into());
             }
             let Some(node) = nodes.get(id) else {
@@ -5987,7 +6032,12 @@ impl History {
                 chain.push(node.range);
                 chain_tools.push((node.range, &node.tool_refs));
             }
-            leaf = node.parent.as_deref();
+            // A compaction boundary has no parent: the turns it summarised
+            // continue through its logical parent instead.
+            leaf = node.parent.as_deref().or_else(|| {
+                compacted |= node.logical_parent.is_some();
+                node.logical_parent.as_deref()
+            });
         }
         chain.reverse();
         chain_tools.reverse();
@@ -14673,12 +14723,12 @@ mod tests {
     }
 
     #[test]
-    fn history_follows_current_parent_chain_without_precompaction_or_sidechain() {
+    fn history_reads_back_across_compaction_without_sidechain() {
         let id = "00000000-0000-4000-8000-000000000001";
         let mut file = tempfile::tempfile().unwrap();
         for value in [
             json!({"type":"user","uuid":"old","parentUuid":null,"sessionId":id,"message":{"content":"old"}}),
-            json!({"type":"system","uuid":"compact","parentUuid":null,"logicalParentUuid":"old","sessionId":id}),
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"old","sessionId":id}),
             json!({"type":"user","uuid":"summary","parentUuid":"compact","isCompactSummary":true,"sessionId":id,"message":{"content":"summary"}}),
             json!({"type":"assistant","uuid":"a1","parentUuid":"summary","sessionId":id,"message":{"id":"m1","content":[{"type":"thinking","thinking":"Consider"}]}}),
             json!({"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":id,"message":{"id":"m1","content":[{"type":"text","text":"Answer"}]}}),
@@ -14693,9 +14743,96 @@ mod tests {
             page.iter()
                 .map(|v| v["uuid"].as_str().unwrap())
                 .collect::<Vec<_>>(),
-            vec!["summary", "a1", "a2"]
+            vec!["old", "summary", "a1", "a2"],
+            "the turns before the compaction are part of the conversation"
         );
-        assert_eq!(page[2]["_cagents_block_base"], 1);
+        assert_eq!(page[3]["_cagents_block_base"], 1);
+        let mut step = Step::default();
+        let mut adapter = Claude::default();
+        for record in &page {
+            adapter.history_message(record, &mut step).unwrap();
+        }
+        let delivered = deliveries(&step);
+        assert!(
+            matches!(&delivered[0], (Role::User, ItemContent::Text { text, .. }) if text == "old"),
+            "{delivered:#?}"
+        );
+        assert_eq!(
+            delivered[1],
+            (
+                Role::System,
+                compaction_item("summary:0".into(), "summary".into()).content
+            ),
+            "the summary marks where the context restarted"
+        );
+    }
+
+    #[test]
+    fn history_pages_back_through_every_compaction() {
+        // Real transcripts compact repeatedly; each boundary starts a chain
+        // whose only link back is its logical parent. Pages are bounded by
+        // record count, so the earliest turns arrive through later pages.
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        let mut parent = Value::Null;
+        let mut prompts = Vec::new();
+        for round in 0..3 {
+            if round > 0 {
+                let boundary = format!("boundary-{round}");
+                writeln!(file, "{}", json!({"type":"system","subtype":"compact_boundary","uuid":boundary,"parentUuid":null,"logicalParentUuid":parent,"sessionId":id})).unwrap();
+                // Claude Code records attachments between the boundary and
+                // its summary.
+                writeln!(file, "{}", json!({"type":"attachment","uuid":format!("attachment-{round}"),"parentUuid":boundary,"sessionId":id})).unwrap();
+                let summary = format!("summary-{round}");
+                writeln!(file, "{}", json!({"type":"user","uuid":summary,"parentUuid":format!("attachment-{round}"),"isCompactSummary":true,"isVisibleInTranscriptOnly":true,"sessionId":id,"message":{"content":format!("Summary {round}")}})).unwrap();
+                parent = json!(summary);
+                prompts.push(format!("summary-{round}"));
+            }
+            for turn in 0..70 {
+                let uuid = format!("prompt-{round}-{turn}");
+                writeln!(file, "{}", json!({"type":"user","uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"content":format!("Prompt {round}.{turn}")}})).unwrap();
+                parent = json!(uuid);
+                prompts.push(uuid);
+            }
+        }
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        let mut read = Vec::new();
+        while history.offset > 0 {
+            let page = history.page().unwrap();
+            assert!(!page.is_empty());
+            let mut earlier = page
+                .iter()
+                .map(|v| v["uuid"].as_str().unwrap().to_owned())
+                .collect::<Vec<_>>();
+            earlier.append(&mut read);
+            read = earlier;
+        }
+        assert_eq!(read, prompts, "every turn, in order, once");
+    }
+
+    #[test]
+    fn a_compaction_link_back_into_the_current_chain_keeps_the_turns_found() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let mut file = tempfile::tempfile().unwrap();
+        for value in [
+            json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":"answer","sessionId":id}),
+            json!({"type":"user","uuid":"summary","parentUuid":"compact","isCompactSummary":true,"sessionId":id,"message":{"content":"summary"}}),
+            json!({"type":"assistant","uuid":"answer","parentUuid":"summary","sessionId":id,"message":{"content":"Answer"}}),
+        ] {
+            writeln!(file, "{value}").unwrap();
+        }
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        assert_eq!(
+            history
+                .page()
+                .unwrap()
+                .iter()
+                .map(|v| v["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["summary", "answer"]
+        );
     }
 
     #[test]
@@ -15372,6 +15509,30 @@ mod tests {
             step.events.is_empty(),
             "compaction narrated itself into the conversation: {:?}",
             step.events
+        );
+        // The summary the wire sends after it stands for the turns before,
+        // as the resumed transcript shows it, while other provider context
+        // keeps its generic disclosure.
+        let body = "Conversation summary";
+        let summary = adapter
+            .receive(json!({"type":"user","uuid":"summary","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":body}]}}))
+            .unwrap();
+        assert_eq!(
+            deliveries(&summary),
+            vec![(
+                Role::System,
+                compaction_item("summary:0".into(), body.into()).content
+            )]
+        );
+        let later = adapter
+            .receive(json!({"type":"user","uuid":"later","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":body}]}}))
+            .unwrap();
+        assert_eq!(
+            deliveries(&later),
+            vec![(
+                Role::System,
+                context_item("later:0".into(), body.into()).content
+            )]
         );
         let quiet = adapter
             .receive(json!({"type":"system","subtype":"hook_started","uuid":"h1","hook_name":"PreToolUse"}))

@@ -95,6 +95,30 @@ emit_record() {
     printf '%s\n' "$1"
 }
 
+# `/compact` replaces the context with a summary as Claude Code does. The
+# boundary starts a new parent chain, linked back to the turns it summarised
+# only by logicalParentUuid; the wire folds the summary's transcript flags
+# into isSynthetic. The prompt itself is not recorded, so its summary is the
+# record that counts the turn on resume.
+compact_turn() {
+    boundary=fixture-compact-$turn
+    jq -cn --arg uuid "$boundary" --arg session "$session" \
+        '{type:"system",subtype:"compact_boundary",uuid:$uuid,session_id:$session,compact_metadata:{trigger:"manual",pre_tokens:48000}}'
+    jq -cn --arg uuid "$boundary" --arg session "$session" --arg previous "$parent" \
+        '{type:"system",subtype:"compact_boundary",uuid:$uuid,parentUuid:null,logicalParentUuid:(if $previous == "null" then null else $previous end),sessionId:$session,content:"Conversation compacted",compactMetadata:{trigger:"manual",preTokens:48000}}' >> "$history"
+    parent=$boundary
+    summary="This session is being continued from a previous conversation that ran out of context. The summary below covers the earlier portion of the conversation.
+
+Summary:
+1. The submission logs were compared with the last successful run.
+2. The failure is in the scoring step; nothing has been changed yet."
+    persist_record "$(jq -cn --arg turn "$turn" --arg text "$summary" '{type:"user",uuid:("fixture-compact-summary-"+$turn),isCompactSummary:true,isVisibleInTranscriptOnly:true,message:{role:"user",content:$text}}')"
+    jq -cn --arg turn "$turn" --arg text "$summary" \
+        '{type:"user",uuid:("fixture-compact-summary-"+$turn),isSynthetic:true,message:{role:"user",content:$text}}'
+    jq -cn --arg session "$session" --arg turn "$turn" \
+        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+}
+
 # A fixed live receipt precedes its launch acknowledgement, without a timer.
 # The main result ends the turn; only the receipt/ACK can settle its Agent.
 task_receipt_turn() {
@@ -383,6 +407,9 @@ while IFS= read -r frame; do
             if [ "$busy" = true ]; then
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
+            elif [ "$(printf '%s' "$frame" | jq -r '.message.content | if type == "array" then map(.text // "") | join("") else . end')" = /compact ]; then
+                turn=$((turn + 1))
+                compact_turn
             else
                 turn=$((turn + 1))
                 persist_record "$frame"
