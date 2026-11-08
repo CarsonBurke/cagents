@@ -3,6 +3,7 @@
 
 use super::{SharedHost, caller, registry};
 use crate::{
+    account::{UsageStatus, WindowKind, info::RemainingWindow},
     agent::{ActivityState, Provider},
     agent_execution::{
         Authority, Lineage, Origin,
@@ -524,7 +525,7 @@ pub(in crate::host) fn chat_limit(
 
 /// The usage limit that stops a conversation whose provider last reported
 /// `failure`. Once its own next turn is accepted (`turn_accepted`), no limit
-/// stops it, though the provider's last error may outlive that turn's start.
+/// stops it, whatever failure is still on record.
 /// Background children working on do not count: they keep a refused
 /// conversation looking busy without its taking a prompt.
 fn stopping_limit(
@@ -575,17 +576,22 @@ pub(in crate::host) fn usage_limit(
         }
     }
     let after_failure = |at_ms: u64| failed_at.is_none_or(|failed| at_ms > failed);
-    // A window whose reset has since passed still dates the limit: that
-    // reset is what ends it.
-    let resets_at = account.and_then(|account| {
+    // A window used up until after the failure. One whose reset has since
+    // passed still counts: that reset is what ends the limit.
+    let spent_past_failure = |window: &&RemainingWindow| {
+        window.remaining_fraction <= 0.0
+            && window
+                .window
+                .resets_at
+                .is_some_and(|at| at >= 0 && after_failure((at as u64).saturating_mul(1000)))
+    };
+    let spent = || {
         account
-            .remaining
-            .iter()
-            .filter(|window| window.remaining_fraction <= 0.0)
-            .filter_map(|window| window.window.resets_at)
-            .filter(|at| *at >= 0 && after_failure((*at as u64).saturating_mul(1000)))
-            .max()
-    });
+            .into_iter()
+            .flat_map(|account| account.remaining.iter())
+            .filter(spent_past_failure)
+    };
+    let resets_at = spent().filter_map(|window| window.window.resets_at).max();
     let limit = UsageLimit {
         summary,
         reset: failure.reset,
@@ -596,26 +602,19 @@ pub(in crate::host) fn usage_limit(
     }
     // A reading taken after the failure is newer evidence than it, however
     // old that reading has since grown. It lifts the limit when the provider
-    // says the account may be used, or else when it shows allowance and no
-    // window in it still used up until after the failure: a model's own
-    // window leaves the account's status untouched, yet stops a conversation
-    // on that model.
+    // says the account may be used as usual, or else when it shows allowance
+    // and no window spent past the failure. Either way a model's own spent
+    // window still holds it: it leaves the account's status, and Codex's
+    // permission, untouched, yet stops a conversation on that model.
+    let model_spent = spent().any(|window| window.window.kind == WindowKind::Scoped);
     let recovered = failed_at.is_some()
+        && !model_spent
         && account.is_some_and(|account| {
             account.observed_at.is_some_and(after_failure)
-                && match account.ordinary_usage_allowed {
-                    Some(allowed) => allowed,
-                    None => {
-                        limit.resets_at.is_none()
-                            && matches!(
-                                account.status,
-                                Some(
-                                    crate::account::UsageStatus::Ok
-                                        | crate::account::UsageStatus::Warning
-                                )
-                            )
-                    }
-                }
+                && account.ordinary_usage_allowed.unwrap_or(
+                    limit.resets_at.is_none()
+                        && matches!(account.status, Some(UsageStatus::Ok | UsageStatus::Warning)),
+                )
         });
     (!recovered).then_some(limit)
 }
@@ -808,6 +807,26 @@ mod tests {
             None,
             "permission read after the failure lifts a dated limit"
         );
+        let codex_model_spent = usage_limit(
+            Provider::Codex,
+            "Usage limit reached for this plan",
+            Some(failed_at),
+            Some(&SessionAccount {
+                ordinary_usage_allowed: Some(true),
+                ..account_reading(
+                    UsageStatus::Warning,
+                    failed_at + 60_000,
+                    &[("Model", WindowKind::Scoped, 1.0, weekly_reset)],
+                    failed_at + 120_000,
+                )
+            }),
+            failed_at + 120_000,
+        );
+        assert_eq!(
+            codex_model_spent.map(|limit| limit.resets_at),
+            Some(Some(weekly_reset)),
+            "permission for ordinary usage does not lift a model's spent window"
+        );
 
         // A model's own window used up leaves the account's status Ok, yet
         // stops a conversation on that model until it resets: a reading after
@@ -886,8 +905,7 @@ mod tests {
         };
         // Refused, though background children may still be working.
         assert!(limit(false).is_some());
-        // The error that refused the previous turn can outlive the next
-        // turn's start, as when a history error keeps it.
+        // An accepted turn outranks whatever failure is still on record.
         assert_eq!(limit(true), None, "an accepted turn is not limited");
         assert_eq!(
             stopping_limit(
