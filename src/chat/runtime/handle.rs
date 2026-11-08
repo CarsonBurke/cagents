@@ -178,6 +178,12 @@ impl Handle {
     ) -> Result<Option<super::retained_actor::transport::RetirementReceipt>, String> {
         RemoteActor::retired_actor_receipt(record, proof)
     }
+    pub(crate) fn compact_retired_receipt(
+        record: &crate::daemon::holder_registry::Record,
+        proof: &crate::model::HostSessionProof,
+    ) -> Result<u64, String> {
+        RemoteActor::compact_retired_receipt(record, proof)
+    }
     pub(crate) fn is_remote_record(record: &crate::daemon::holder_registry::Record) -> bool {
         RemoteActor::is_record(record)
     }

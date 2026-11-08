@@ -221,6 +221,45 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
     Ok(DaemonAdmission { _guard: admission })
 }
 
+/// How often the daemon reclaims runtime-directory space that its chats no
+/// longer need. The directory is RAM-backed, so leaving this to the next
+/// daemon start lets a long-running daemon hold it for days.
+const RUNTIME_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
+/// Reclaims transcript caches whose owners have ended and the transcripts that
+/// retired actors' final receipts no longer need: now, then every interval,
+/// until the daemon is gone. The startup sweep has already run.
+fn collect_runtime_directory(host: std::sync::Weak<state::HostLock>, root: std::path::PathBuf) {
+    let mut first = true;
+    loop {
+        if !first {
+            std::thread::sleep(RUNTIME_COLLECT_INTERVAL);
+        }
+        let Some(host) = host.upgrade() else {
+            return;
+        };
+        if !first {
+            match crate::transcript_cache::sweep(&root) {
+                Ok(usage) if usage.count > 0 => tracing::info!(
+                    caches = usage.count,
+                    bytes = usage.bytes,
+                    "reclaimed transcript caches"
+                ),
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved")
+                }
+            }
+        }
+        first = false;
+        match chat::retained_actor::compact_retired_receipts(&host) {
+            Ok(0) => {}
+            Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
+            Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
+        }
+    }
+}
+
 /// Reserve and configure the serving socket before restore can take ownership
 /// of an original holder. The caller still holds HostLease and admission, and
 /// does not accept clients or publish readiness until restoration finishes.
@@ -396,6 +435,16 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
             .spawn(move || account_lifecycle::restore_unregistered_homes(restore_host))
         {
             tracing::warn!(%error, "lost accounts will not be restored automatically");
+        }
+    }
+    if !recovery_only {
+        let collect_host = Arc::downgrade(&host);
+        let runtime_root = paths.directory.clone();
+        if let Err(error) = std::thread::Builder::new()
+            .name("cagents-runtime-collect".into())
+            .spawn(move || collect_runtime_directory(collect_host, runtime_root))
+        {
+            tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
         }
     }
     let mut automation_broker = if recovery_only {
