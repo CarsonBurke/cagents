@@ -196,9 +196,12 @@ fn a_prompt_sent_during_another_turn_waits_and_then_runs_once() {
         "a queued prompt held the control gate"
     );
 
+    // Interrupting would stop the turn the queued prompt waits for, so the
+    // refusal points to withdrawing only the prompt.
     let another = busy.send("third").unwrap_err();
+    assert!(another.contains("already has a prompt queued"), "{another}");
     assert!(another.contains("agent wait"), "{another}");
-    assert!(another.contains("cagents send"), "{another}");
+    assert!(another.contains("--prompt-only"), "{another}");
 
     busy.release();
     let run = settled_run(&busy.host, queued.id);
@@ -522,8 +525,42 @@ fn the_actor_refuses_a_run_prompt_in_the_words_dispatch_retries_on() {
         .prompt_for_run(RunId::new(), "Second".into())
         .unwrap_err();
     assert!(refused.lost_idle_to_another_turn(), "{refused:?}");
+    assert!(refused.proves_unsent(), "{refused:?}");
     assert_eq!(busy.count("prompts"), prompts);
     busy.release();
+}
+
+/// The actor reports a failure after it queued a prompt's input the same way
+/// it reports a refusal, so only the refusals made before input can say the
+/// prompt was not sent.
+#[test]
+fn only_a_refusal_before_input_proves_a_prompt_unsent() {
+    use chat::runtime::Rejection;
+    for unsent in [
+        "The provider is no longer idle for the accepted run",
+        "Chat is closing",
+        "Provider process exited; explicitly recover the exact session",
+        "Chat command queue unavailable: sending on a full channel",
+        crate::chat::failure::delivery::RECONNECTING_INPUT,
+        crate::chat::failure::delivery::CROWDED_INPUT,
+    ] {
+        assert!(
+            Rejection::Refused(unsent.into()).proves_unsent(),
+            "{unsent}"
+        );
+    }
+    for uncertain in [
+        "Provider stdin queue exceeds 64 MiB; no frames discarded",
+        "Cannot persist the transcript",
+        crate::chat::failure::delivery::UNACKNOWLEDGED_INPUT,
+        crate::chat::failure::delivery::STOPPED_INPUT,
+    ] {
+        assert!(
+            !Rejection::Refused(uncertain.into()).proves_unsent(),
+            "{uncertain}"
+        );
+    }
+    assert!(!Rejection::Unacknowledged("Chat is closing".into()).proves_unsent());
 }
 
 /// A person's Stop in the chat means the same as the owner's interrupt: the
@@ -638,6 +675,10 @@ fn an_owner_withdraws_a_queued_prompt_after_a_person_took_the_turn_over() {
         refused.contains("A person took this agent over"),
         "{refused}"
     );
+    // Withdrawing again says there is nothing to withdraw, rather than
+    // pointing to the command that was just run.
+    let refused = busy.withdraw_reply().unwrap_err();
+    assert!(refused.contains("no queued prompt"), "{refused}");
     busy.release();
     wait_for("the turn to end", || busy.handle.is_idle());
     assert_eq!(busy.count("interrupts"), 0);
@@ -660,6 +701,16 @@ fn an_owner_cannot_withdraw_a_prompt_the_person_who_took_over_sent() {
         .lock()
         .unwrap()
         .claim_agent_interaction(busy.agent, Some(queued.id))
+        .unwrap();
+    let refused = busy.interrupt_reply().unwrap_err();
+    assert!(refused.contains("only they can withdraw it"), "{refused}");
+    // Answering the turn's question, as the queue tells them to, is another
+    // action of theirs; the prompt they sent stays theirs.
+    registry(&busy.host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_agent_interaction(busy.agent, None)
         .unwrap();
     let refused = busy.interrupt_reply().unwrap_err();
     assert!(refused.contains("only they can withdraw it"), "{refused}");

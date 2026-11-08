@@ -683,13 +683,17 @@ impl Registry {
         Ok(sources)
     }
 
+    /// A person's action takes the agent over, and `run` is a prompt they
+    /// sent. Their later actions without one leave that prompt recorded as
+    /// theirs, so its owner still can't withdraw it.
     pub(crate) fn claim_agent_interaction(
         &mut self,
         id: AgentId,
         run: Option<RunId>,
     ) -> Result<(), String> {
         self.db.execute("INSERT INTO agent_policies(agent, interactive, interactive_run) VALUES (?1, 1, ?2)
-            ON CONFLICT(agent) DO UPDATE SET interactive = 1, interactive_run = excluded.interactive_run",
+            ON CONFLICT(agent) DO UPDATE SET interactive = 1,
+                interactive_run = COALESCE(excluded.interactive_run, agent_policies.interactive_run)",
             params![id.to_string(), run.map(|run| run.to_string())]).map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1140,20 +1144,28 @@ impl Registry {
                 if agent.closed {
                     return Err("The agent is closed".into());
                 }
-                let unsettled: Option<String> = tx
+                let unsettled: Option<(String, bool)> = tx
                     .query_row(
-                        "SELECT state FROM agent_runs WHERE agent = ?1
+                        "SELECT state, json_extract(record, '$.queued_ms') IS NOT NULL
+                     FROM agent_runs WHERE agent = ?1
                      AND state IN ('accepted', 'running', 'waiting', 'interrupted')
-                     ORDER BY state = 'interrupted' LIMIT 1",
+                     ORDER BY state = 'interrupted' DESC LIMIT 1",
                         [id.to_string()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
                     .optional()
                     .map_err(|error| error.to_string())?;
-                match unsettled.as_deref() {
+                match unsettled {
                     None => {}
-                    Some("interrupted") => {
+                    Some((state, _)) if state == "interrupted" => {
                         return Err("The outcome of this agent's last prompt is uncertain, so it can't safely take another: inspect its conversation, then close it".into());
+                    }
+                    // Interrupting would stop the turn the prompt waits for,
+                    // which its owner may want to keep.
+                    Some((_, true)) => {
+                        return Err(format!(
+                            "The agent already has a prompt queued, waiting for its current turn to end, and takes one at a time. Wait for it with `cagents agent wait {id}`, or replace it: withdraw it with `cagents agent interrupt {id} --prompt-only`, which leaves the turn running, then send again"
+                        ));
                     }
                     Some(_) => {
                         return Err("The agent already has a prompt in progress. Wait for it with `cagents agent wait`, stop it with `cagents agent interrupt`, or leave a message with `cagents send`, which arrives once the agent is idle".into());

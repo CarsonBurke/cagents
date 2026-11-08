@@ -1559,12 +1559,15 @@ fn status_activity(reply: &Reply) -> Option<crate::agent_execution::ProviderActi
 }
 
 fn withdrawal_line(withdrawn: Option<crate::model::RunId>) -> String {
-    withdrawn.map_or_else(String::new, |run| {
-        format!(
-            "Withdrew queued run {}; its prompt was not sent. The current turn keeps running.",
-            short(run)
-        )
-    })
+    withdrawn.map_or_else(
+        || "Nothing was withdrawn, and nothing was interrupted.".into(),
+        |run| {
+            format!(
+                "Withdrew queued run {}; its prompt was not sent. The current turn keeps running.",
+                short(run)
+            )
+        },
+    )
 }
 
 fn interrupt_lines(

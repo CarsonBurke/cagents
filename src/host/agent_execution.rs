@@ -679,6 +679,7 @@ fn dispatch(
     // Still held from reclaiming the claim, so nothing can act on this run
     // before its first check below.
     let mut held = Some(dispatch);
+    let mut lost_idle: u32 = 0;
     loop {
         if !handle.is_idle() && !handle.has_exited() {
             if scheduled {
@@ -688,9 +689,9 @@ fn dispatch(
             }
             // A turn can outlast anything that needs the control gate
             // exclusively, so a queued prompt must not hold it meanwhile.
-            held = None;
             _control = None;
-            run = queue_until_idle(host, &registry, &gate, &handle, run)?;
+            run = queue_until_idle(host, &registry, &gate, held.take(), &handle, run)?;
+            lost_idle = 0;
             let guard = control.read().unwrap_or_else(|p| p.into_inner());
             super::client::ensure_control_open(host)
                 .map_err(|error| before(format!("{}; {UNSENT_AFTER_WAIT}", error.message)))?;
@@ -708,9 +709,10 @@ fn dispatch(
                         .agent_dispatch_is_authorized(accepted.agent.id, run.id)
                         .map_err(before)?)
             {
-                return Err(before(
-                    "Execution ownership changed while the provider initialized".into(),
-                ));
+                return Err(before(unsent_after_wait(
+                    &run,
+                    "Execution ownership changed before prompt dispatch".into(),
+                )));
             }
         }
         if !host
@@ -720,9 +722,10 @@ fn dispatch(
             .get(&session.id)
             .is_some_and(|record| record.handle.same_actor(&handle))
         {
-            return Err(before(
+            return Err(before(unsent_after_wait(
+                &run,
                 "The exact provider changed before prompt dispatch".into(),
-            ));
+            )));
         }
         if accepted.agent.spec.surface == Surface::Terminal && !console {
             create_console(host, &registry, accepted.agent.id, &session, &handle)
@@ -731,13 +734,7 @@ fn dispatch(
         }
         context
             .verify_directory(&accepted.agent.spec.target.directory)
-            .map_err(|error| {
-                before(if run.queued_ms.is_some() {
-                    format!("{error}; {UNSENT_AFTER_WAIT}")
-                } else {
-                    error
-                })
-            })?;
+            .map_err(|error| before(unsent_after_wait(&run, error)))?;
         if scheduled {
             // Live interactive work may survive removal; each scheduled prompt
             // still requires its explicitly selected account to be registered.
@@ -757,25 +754,48 @@ fn dispatch(
             Ok(()) => return Ok(()),
             // Another turn won the idle provider, and the actor refused this
             // prompt without sending it. A retained actor's reported state can
-            // briefly lag that refusal, so give it time to catch up.
+            // briefly lag that refusal, so give it time to catch up, longer
+            // each time it keeps lagging.
             Err(error) if !scheduled && error.lost_idle_to_another_turn() => {
                 // Queued again before the gate opens, so an interrupt, a Stop
                 // or a restart in this gap still finds a prompt proven unsent.
                 run = advance_run(&registry, &run, Update::Queued).map_err(before)?;
                 announce(host, &registry);
                 drop(_dispatch);
-                std::thread::sleep(Duration::from_millis(50));
+                std::thread::sleep(Duration::from_millis(50 << lost_idle.min(4)));
+                lost_idle += 1;
             }
-            // Nothing reached the provider, so the outcome isn't uncertain.
-            Err(chat::runtime::Rejection::Refused(error)) if !scheduled => {
-                return Err(before(format!("{error}; the prompt was not sent")));
+            // Only a refusal made before the prompt could reach the provider
+            // proves it unsent; any other failure may follow queued input.
+            Err(error) if !scheduled && error.proves_unsent() => {
+                return Err(before(format!(
+                    "{}; the prompt was not sent",
+                    String::from(error)
+                )));
             }
             Err(error) => return Err((State::Interrupted, error.into())),
         }
     }
 }
 
+fn nothing_queued(run: &Run) -> String {
+    format!(
+        "The agent has no queued prompt, so nothing was withdrawn. Its latest run is {:?}.",
+        run.state
+    )
+}
+
 const UNSENT_AFTER_WAIT: &str = "this prompt waited for another turn to end and was not sent.";
+
+/// A failure before dispatch, which says the prompt went unsent when the
+/// failure follows its wait.
+fn unsent_after_wait(run: &Run, error: String) -> String {
+    if run.queued_ms.is_some() {
+        format!("{error}; {UNSENT_AFTER_WAIT}")
+    } else {
+        error
+    }
+}
 const PROVIDER_EXITED_UNSENT: &str = "The daemon can no longer reach the provider, which may have exited, while this prompt waited for another turn to end. It was not sent. Check `cagents agent status`: send it again if the agent is still live, otherwise close the agent and spawn a new one.";
 
 fn advance_run(registry: &SharedRegistry, run: &Run, update: Update) -> Result<Run, String> {
@@ -792,17 +812,21 @@ fn queue_until_idle(
     host: &SharedHost,
     registry: &SharedRegistry,
     gate: &Mutex<Option<Undelivered>>,
+    held: Option<std::sync::MutexGuard<'_, Option<Undelivered>>>,
     handle: &chat::runtime::Handle,
     run: Run,
 ) -> Result<Run, (State, String)> {
     const POLL: Duration = Duration::from_millis(250);
     let before = |message| (State::Failed, message);
+    // Queued before the gate it arrived with opens, so a Stop or an interrupt
+    // taking the gate next finds this prompt to withdraw.
     let run = if run.queued_ms.is_none() {
-        let _settling = gate.lock().unwrap_or_else(|p| p.into_inner());
+        let _settling = held.unwrap_or_else(|| gate.lock().unwrap_or_else(|p| p.into_inner()));
         let queued = advance_run(registry, &run, Update::Queued).map_err(before)?;
         announce(host, registry);
         queued
     } else {
+        drop(held);
         run
     };
     loop {
@@ -1611,7 +1635,7 @@ fn control(
                 .unwrap_or_else(|p| p.into_inner())
                 .agent_dispatch_is_authorized(id, run.id)?
             {
-                return Err("A person sent this queued prompt after taking the agent over, so only they can withdraw it, from its chat or console.".into());
+                return Err("A person sent this queued prompt after taking the agent over, so only they can withdraw it, from the agent's chat or console.".into());
             }
             withdraw_queued(host, &run)?;
             return Ok(Reply::Interrupted {
@@ -1620,7 +1644,12 @@ fn control(
                 withdrawn: Some(run.id),
             });
         }
-        return Err("A person took this agent over, so its controls are theirs: answer or stop it from its chat or console. `cagents agent send` still reaches it".into());
+        if matches!(command, Control::WithdrawQueued) {
+            return Err(nothing_queued(&run));
+        }
+        return Err(format!(
+            "A person took this agent over, so only a person can answer its requests or stop it, from the agent's chat or console. You can still send it a prompt with `cagents agent send`, and withdraw a queued prompt of yours with `cagents agent interrupt {id} --prompt-only`."
+        ));
     }
     let answered = match command {
         Control::WithdrawQueued => {
@@ -1632,10 +1661,7 @@ fn control(
                 });
             }
             if run.queued_ms.is_none() {
-                return Err(format!(
-                    "The agent has no queued prompt, so nothing was withdrawn. Its latest run is {:?}.",
-                    run.state
-                ));
+                return Err(nothing_queued(&run));
             }
             withdraw_queued(host, &run)?;
             return Ok(Reply::Interrupted {

@@ -141,10 +141,27 @@ const NOT_IDLE_FOR_RUN: &str = "The provider is no longer idle for the accepted 
 /// run ended or its prompt never reached the provider.
 pub(crate) const NOT_ACTIVE_RUN: &str = "The requested run is no longer the provider's active turn";
 
+/// Refusals made before a command could reach the actor or its provider.
+const CHAT_CLOSING: &str = "Chat is closing";
+const PROVIDER_EXITED: &str = "Provider process exited; explicitly recover the exact session";
+const QUEUE_UNAVAILABLE: &str = "Chat command queue unavailable";
+
 impl Rejection {
     /// Whether this is that refusal, so the prompt provably was not sent.
     pub(crate) fn lost_idle_to_another_turn(&self) -> bool {
         matches!(self, Self::Refused(error) if error == NOT_IDLE_FOR_RUN)
+    }
+
+    /// Whether this refusal was made before the command could reach the
+    /// provider: one of the actor's own, or a retained helper's delivery
+    /// outcome that is certainly not sent. Others aren't proof: the actor
+    /// reports a failure after it queued the command's input as a refusal too.
+    pub(crate) fn proves_unsent(&self) -> bool {
+        matches!(self, Self::Refused(error)
+            if [NOT_IDLE_FOR_RUN, CHAT_CLOSING, PROVIDER_EXITED].contains(&error.as_str())
+                || error.starts_with(QUEUE_UNAVAILABLE)
+                || crate::chat::failure::DeliveryOutcome::parse(error)
+                    .is_some_and(|outcome| !outcome.unknown))
     }
 }
 
@@ -928,18 +945,16 @@ impl LocalHandle {
 
     fn submit_actor_command(&self, command: ActorCommand) -> Result<(), Rejection> {
         if self.is_completed() || self.0.draining.load(Ordering::Acquire) {
-            return Err(Rejection::Refused(
-                "Provider process exited; explicitly recover the exact session".into(),
-            ));
+            return Err(Rejection::Refused(PROVIDER_EXITED.into()));
         }
         if self.0.stop.load(Ordering::Acquire) {
-            return Err(Rejection::Refused("Chat is closing".into()));
+            return Err(Rejection::Refused(CHAT_CLOSING.into()));
         }
         let (reply, response) = crossbeam_channel::bounded(1);
         self.0
             .commands
             .try_send((command, reply))
-            .map_err(|e| Rejection::Refused(format!("Chat command queue unavailable: {e}")))?;
+            .map_err(|e| Rejection::Refused(format!("{QUEUE_UNAVAILABLE}: {e}")))?;
         self.wake();
         response
             .recv_timeout(Duration::from_secs(10))
@@ -960,7 +975,7 @@ impl LocalHandle {
         self.0
             .commands
             .try_send((command, reply))
-            .map_err(|error| format!("Chat command queue unavailable: {error}"))?;
+            .map_err(|error| format!("{QUEUE_UNAVAILABLE}: {error}"))?;
         self.wake();
         response
             .recv_timeout(Duration::from_secs(10))
@@ -2847,7 +2862,7 @@ impl Actor {
             let effects = InputEffects(effects);
             let refuse = |error| reply.send(Err(Rejection::Refused(error)));
             if closing || self.stop.load(Ordering::Acquire) {
-                let _ = refuse("Chat is closing".into());
+                let _ = refuse(CHAT_CLOSING.into());
                 continue;
             }
             let (run, command) = match command {
@@ -2910,8 +2925,7 @@ impl Actor {
                         };
                         if !valid {
                             let _ = refuse(
-                                "Without an active run, you may only decline a current pending request"
-                                    .into(),
+                                "Without an active run of yours, you may only decline a current pending request. Only a person can approve it, from the agent's chat or console".into(),
                             );
                             continue;
                         }
