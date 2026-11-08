@@ -159,11 +159,6 @@ enum Request {
         application: Option<String>,
     },
     PinnedLaunchDirectory,
-    /// Pin the work the provider has already detached, as the close begins
-    /// and before the daemon interrupts its turn: what interrupting it
-    /// orphans is still a running command. Sent only to a holder reporting
-    /// `sparing_release`.
-    PinDetached,
     /// Stop the provider and every child of the holder.
     Release,
     /// Stop the provider but leave running the work it had already detached.
@@ -183,7 +178,6 @@ enum Report {
     },
     Confirmed,
     SourceUpdated,
-    DetachedPinned,
     Released,
     Inspected {
         protocol: u32,
@@ -353,36 +347,6 @@ impl Holder {
             Some(Report::SourceUpdated) => Ok(()),
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge paired view ownership".into()),
-        }
-    }
-
-    /// Pins the work the provider has detached so far, for a sparing close
-    /// that follows. A holder too old to pin does so at release instead.
-    pub(in crate::chat) fn pin_detached(&mut self) -> Result<(), String> {
-        if !self.sparing_release {
-            return Ok(());
-        }
-        if self.control_poisoned {
-            return Err(
-                "Native holder control framing is uncertain; only exact cleanup is available"
-                    .into(),
-            );
-        }
-        let control = self.control.as_ref().ok_or("Native holder is detached")?;
-        let exchange =
-            send(control, &Request::PinDetached, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
-        match exchange {
-            Ok(Some(Report::DetachedPinned)) => Ok(()),
-            Ok(Some(Report::Failed(error))) => Err(error),
-            Ok(_) => {
-                self.control_poisoned = true;
-                Err("Native holder did not acknowledge pinning detached work".into())
-            }
-            Err(error) => {
-                // A partial exchange can't carry the release that follows.
-                self.control_poisoned = true;
-                Err(error)
-            }
         }
     }
 
@@ -1025,26 +989,20 @@ impl Residence {
                 }
                 continue;
             }
-            // A server its launcher started is the provider's own.
-            let server: Vec<i32> = self
-                .recovery
-                .server_process
-                .iter()
-                .map(|server| server.pid)
-                .collect();
             let response = match request {
-                Request::PinDetached => {
-                    match self.child.decide_detached(DetachedWork::Spare, &server) {
-                        Ok(()) => Report::DetachedPinned,
-                        Err(error) => Report::Failed(error.to_string()),
-                    }
-                }
                 Request::Release | Request::ReleaseSparing => {
                     let detached = if matches!(request, Request::ReleaseSparing) {
                         DetachedWork::Spare
                     } else {
                         DetachedWork::Stop
                     };
+                    // A server its launcher started is the provider's own.
+                    let server: Vec<i32> = self
+                        .recovery
+                        .server_process
+                        .iter()
+                        .map(|server| server.pid)
+                        .collect();
                     match self
                         .child
                         .decide_detached(detached, &server)
@@ -2864,12 +2822,12 @@ exec /bin/sleep 60
     }
 
     #[test]
-    fn an_ordinary_release_spares_only_what_the_provider_detached_before_it() {
+    fn an_ordinary_release_leaves_what_the_provider_leaves() {
         const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SPARING_TEST";
         if std::env::var_os(STAGE).is_none() {
             let directory = tempfile::tempdir_in("/var/tmp").unwrap();
             let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", "chat::native_holder::transport::tests::an_ordinary_release_spares_only_what_the_provider_detached_before_it", "--nocapture"])
+                .args(["--exact", "chat::native_holder::transport::tests::an_ordinary_release_leaves_what_the_provider_leaves", "--nocapture"])
                 .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
                 .env("XDG_DATA_HOME", directory.path().join("data"))
                 .output().unwrap();
@@ -2929,7 +2887,7 @@ exec /bin/sleep 60
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        let (detached, running) = (pid("detached"), pid("running"));
+        let (detached, running, left) = (pid("detached"), pid("running"), pid("left"));
         let holder_pid = holder.identity.record.holder.pid;
         let deadline = Instant::now() + Duration::from_secs(10);
         while crate::daemon::owned_children::tests::parent(detached) != Some(holder_pid) {
@@ -2938,9 +2896,8 @@ exec /bin/sleep 60
         }
         let detached = Process::read(detached).unwrap();
         let running = Process::read(running).unwrap();
+        let left = Process::read(left).unwrap();
         let holder_process = holder.identity.record.holder.clone();
-        // As the close begins, before the turn is interrupted.
-        holder.pin_detached().unwrap();
         holder.close_inner(false, DetachedWork::Spare).unwrap();
         // Through the holder's own exit, after its last teardown.
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2950,13 +2907,15 @@ exec /bin/sleep 60
         }
         assert!(
             !running.is_current(),
-            "a running command stops with the provider"
+            "the provider stopped its own command as it quit"
         );
         assert!(
-            detached.is_current(),
-            "work detached before the close keeps running"
+            detached.is_current() && left.is_current(),
+            "what the provider leaves running keeps running"
         );
-        unsafe { libc::kill(detached.pid, libc::SIGKILL) };
+        for process in [detached, left] {
+            unsafe { libc::kill(process.pid, libc::SIGKILL) };
+        }
     }
 
     #[test]

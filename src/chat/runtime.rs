@@ -515,7 +515,6 @@ impl LocalHandle {
                     native_peer: None,
                     preserve_native: preserve_native.clone(),
                     native_installed: native_installed.clone(),
-                    detached_work: detached_work.clone(),
                     adapter,
                     state,
                     confirmed_session,
@@ -1788,6 +1787,8 @@ fn spawn_provider(
     Ok(Some(child))
 }
 
+/// Sole reaper of the provider leader. Observations retain its zombie until
+/// every group signal is finished, so its numeric PID/PGID cannot be recycled.
 /// An owner's decision about the work its provider detached. Until it
 /// decides, each teardown keeps what it did before decisions existed: a
 /// direct provider's leaves that work running unless the provider was
@@ -1825,9 +1826,6 @@ impl DetachedDecision {
         self.get().unwrap_or(DetachedWork::Stop)
     }
 }
-
-/// Sole reaper of the provider leader. Observations retain its zombie until
-/// every group signal is finished, so its numeric PID/PGID cannot be recycled.
 struct ChildGuard {
     child: Child,
     identity: OwnedFd,
@@ -2082,8 +2080,6 @@ struct Actor {
     native_peer: Option<crate::daemon::holder_registry::Process>,
     preserve_native: Arc<AtomicBool>,
     native_installed: Arc<AtomicBool>,
-    /// What closing does with the work the provider detached.
-    detached_work: Arc<DetachedDecision>,
     adapter: Box<dyn Adapter>,
     state: Arc<Mutex<Snapshot>>,
     confirmed_session: Arc<Mutex<Option<String>>>,

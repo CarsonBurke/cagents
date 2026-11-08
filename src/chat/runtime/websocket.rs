@@ -201,22 +201,6 @@ fn startup_halt_reason(child: Option<&ChildGuard>, cancelled: bool) -> Option<&'
 }
 
 impl Actor {
-    /// A close that spares detached work pins it now, before the interrupt:
-    /// a command interrupting the turn orphans is not work the person left
-    /// running. If the holder can't pin, the close stops everything.
-    fn pin_detached_work(&mut self) {
-        if self.detached_work.get() != Some(DetachedWork::Spare) {
-            return;
-        }
-        let Some(holder) = self.native_holder.as_mut() else {
-            return;
-        };
-        if let Err(error) = holder.pin_detached() {
-            tracing::warn!(%error, "detached work could not be pinned; the close stops it");
-            self.detached_work.decide(DetachedWork::Stop);
-        }
-    }
-
     /// Serve the listener this conversation's own server is bringing up.
     pub(super) fn run_launched_websocket(
         &mut self,
@@ -327,7 +311,6 @@ impl Actor {
             }
             if self.stop.load(Ordering::Acquire) && closing.is_none() {
                 closing = Some(Instant::now());
-                self.pin_detached_work();
             }
             let busy = self.state.lock().unwrap_or_else(|p| p.into_inner()).busy;
             if closing.is_some()

@@ -135,23 +135,6 @@ pub(crate) fn reap_exited(limit: usize) -> io::Result<Sweep> {
     Ok(sweep)
 }
 
-/// Pins the children this subreaper has adopted and no in-process owner
-/// registered: work the provider detached, which a close can leave running.
-/// Under the gate, every owned child is already registered, and no sweep can
-/// reap an adopted one before it is pinned.
-pub(crate) fn pin_adopted() -> io::Result<super::owned_children::Spared> {
-    let _gate = GATE
-        .write()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let children = super::owned_children::direct_children()?;
-    let owned = owned();
-    super::owned_children::Spared::pin(
-        children
-            .into_iter()
-            .filter(|pid| !owned.contains_key(&(*pid as u32))),
-    )
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

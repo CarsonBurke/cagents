@@ -47,15 +47,15 @@ explicitly permits stopping the background work. Stopped background tasks do not
 resume automatically. Closing an agent stops the entire owned conversation and
 its background tasks.
 
-Closing a chat, or an agent you started, leaves running what its provider had
-already detached from itself before the close, such as a server started with
-`nohup ... &` or `setsid`; so does stopping the daemon. Everything still running
-under the provider stops with it, including commands it was running and Claude's
-`run_in_background` shells. An agent an automation or another session started
-stops everything, unless you have taken part in it. If something outside cagents
-killed the provider, for example the system for memory, nothing is left running.
-Returning a chat to its terminal, and switching accounts, still stop detached
-work.
+Closing a chat ends its provider the way quitting the provider's own CLI does,
+and cagents stops nothing more. Whatever the provider leaves running keeps
+running, such as a server an agent started with `setsid`, `nohup` or `tmux`.
+Commands it was still running stop, because the provider stops them as it quits.
+Three cases stop everything the provider started instead:
+- an automation's agent, or one another session started, until a person takes
+  part in it;
+- a provider something outside cagents killed, such as the system for memory;
+- a close that hands the chat elsewhere, such as returning it to its terminal.
 
 Daemon Stop confirmation counts running background subagents as well as hosted
 sessions. If those tasks change before confirmation is accepted, refresh the
