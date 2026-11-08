@@ -32,6 +32,9 @@ use crate::{
 #[cfg(feature = "ui")]
 mod review_cache;
 
+#[cfg(test)]
+mod history_scale;
+
 // Format 12 introduces retained Claude descriptors that older readers cannot
 // decode safely. Admission must reject them before partial workspace loading
 // can omit a card and a later snapshot can tombstone it. This supplements the
