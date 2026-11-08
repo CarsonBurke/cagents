@@ -5992,6 +5992,16 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    /// Whether `card` is a chat whose message input, or the picker search
+    /// standing in for it, is in the widget tree: it has a runtime that is
+    /// neither starting, changing session nor waiting for admission.
+    pub(super) fn chat_input_drawn(&self, card: CardId) -> bool {
+        matches!(
+            self.cards.get(&card),
+            Some(CardRuntime::Chat(runtime)) if !runtime.awaiting_admission()
+        ) && !self.chat_ui.phases.contains_key(&card)
+    }
+
     /// Keyboard and palette commands use the same pickers as the composer.
     /// Respect the control's availability before capturing a selection gesture.
     pub(super) fn open_chat_control(

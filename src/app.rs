@@ -8965,16 +8965,6 @@ impl Cagents {
             })
     }
 
-    /// Whether `card` is a chat whose message input, or the picker search
-    /// standing in for it, is in the widget tree: it has a runtime that is
-    /// neither starting, changing session nor waiting for admission.
-    fn chat_input_drawn(&self, card: CardId) -> bool {
-        matches!(
-            self.cards.get(&card),
-            Some(CardRuntime::Chat(runtime)) if !runtime.awaiting_admission()
-        ) && !self.chat_ui.phases.contains_key(&card)
-    }
-
     /// Whether `card` is a chat pane that owes its message input the keyboard
     /// once that input is drawn.
     fn owes_chat_input(&self, card: CardId) -> bool {
