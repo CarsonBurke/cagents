@@ -3809,11 +3809,28 @@ fn route_subagent_events(events: &mut Vec<Event>, start: usize, parent: &str) {
     events.extend(child);
 }
 fn slash_command_prompt(content: &str) -> Option<String> {
-    let content = content.strip_prefix("<command-message>")?;
-    let (message, content) = content.split_once("</command-message>\n<command-name>")?;
-    let (name, args) = content.split_once("</command-name>\n<command-args>")?;
-    let args = args.strip_suffix("</command-args>")?;
-    if name.strip_prefix('/')? != message || message.is_empty() {
+    // The stream sends the message first; the transcript records the name
+    // first, with the later elements indented.
+    let mut rest = content;
+    let mut element = |tag: &str| {
+        let open = format!("<{tag}>");
+        let close = format!("</{tag}>");
+        let (value, after) = rest
+            .trim_start()
+            .strip_prefix(open.as_str())?
+            .split_once(close.as_str())?;
+        rest = after;
+        Some(value)
+    };
+    let (message, name) = if content.starts_with("<command-message>") {
+        let message = element("command-message")?;
+        (message, element("command-name")?)
+    } else {
+        let name = element("command-name")?;
+        (element("command-message")?, name)
+    };
+    let args = element("command-args")?;
+    if !rest.trim().is_empty() || name.strip_prefix('/')? != message || message.is_empty() {
         return None;
     }
     Some(if args.is_empty() {
@@ -5938,7 +5955,11 @@ impl History {
             let message = matches!(string(&value, "type"), "user" | "assistant");
             let main = value["isSidechain"].as_bool() != Some(true)
                 && value["teamName"].as_str().is_none_or(str::is_empty);
-            let visible = message && !model_only(&value) && main;
+            // A manual compaction's output repeats the summary shown above it.
+            let visible = message
+                && !model_only(&value)
+                && main
+                && value["repeatsCompactSummary"].as_bool() != Some(true);
             // A rewritten record keeps what it first said: where it was, the
             // parent it had, and the boundary it was.
             let previous = nodes.get_mut(uuid);
@@ -11836,6 +11857,14 @@ mod tests {
         assert!(step.events.iter().any(|event| matches!(event, Event::Item(item)
             if item.role == Role::User && matches!(&item.content, ItemContent::Text { text, .. } if text == "/solve-task in worktree"))));
         assert_eq!(slash_command_prompt("plain message"), None);
+        // The form the transcript records, which a reopened chat reads.
+        assert_eq!(
+            slash_command_prompt(
+                "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"
+            )
+            .as_deref(),
+            Some("/compact")
+        );
         assert_eq!(
             slash_command_prompt(
                 "<command-message>other</command-message>\n<command-name>/solve-task</command-name>\n<command-args>in worktree</command-args>"
@@ -14843,6 +14872,36 @@ mod tests {
                 compaction_item("summary:0".into(), "summary".into()).content
             ),
             "the summary marks where the context restarted"
+        );
+    }
+
+    #[test]
+    fn a_reopened_manual_compaction_reads_as_the_command_the_user_typed() {
+        // After its summary the transcript records /compact as a command
+        // run in the terminal, and output that repeats the summary.
+        let mut history = correlation_history(vec![
+            json!({"type":"user","uuid":"summary","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"Summary"}}),
+            json!({"type":"user","uuid":"caveat","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}),
+            json!({"type":"user","uuid":"command","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}),
+            json!({"type":"user","uuid":"output","repeatsCompactSummary":true,"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}),
+        ]);
+        let mut step = Step::default();
+        let mut adapter = Claude::default();
+        for record in history.page().unwrap() {
+            adapter.history_message(&record, &mut step).unwrap();
+        }
+        let delivered = deliveries(&step);
+        assert_eq!(delivered.len(), 2, "{delivered:#?}");
+        assert_eq!(
+            delivered[0],
+            (
+                Role::System,
+                compaction_item("summary:0".into(), "Summary".into()).content
+            )
+        );
+        assert!(
+            matches!(&delivered[1], (Role::User, ItemContent::Text { text, .. }) if text == "/compact"),
+            "{delivered:#?}"
         );
     }
 
