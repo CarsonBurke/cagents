@@ -169,6 +169,10 @@ impl std::ops::Deref for OwnedLock {
 }
 
 impl OwnedLock {
+    fn file_mut(&mut self) -> &mut File {
+        self.0.as_mut().expect("owned lock file")
+    }
+
     /// Hand this description to a process that already inherited its own copy.
     /// Closing the returned file preserves that recipient's lock ownership.
     pub(crate) fn into_file(mut self) -> File {
@@ -324,11 +328,11 @@ impl WindowLease {
             &runtime_directory()?.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
             libc::LOCK_EX,
         )?;
-        identity.0.set_len(0)?;
+        identity.set_len(0)?;
         if let Some(device) = crate::device::selected() {
-            identity.0.write_all(device.name.as_bytes())?;
+            identity.file_mut().write_all(device.name.as_bytes())?;
         }
-        identity.0.sync_all()?;
+        identity.sync_all()?;
         WINDOW_SLOT
             .set(slot)
             .map_err(|_| io::Error::other("window slot already initialized"))?;
@@ -382,9 +386,7 @@ impl WindowLease {
                 libc::LOCK_EX | libc::LOCK_NB,
             ) {
                 Ok(mut lock) => {
-                    daemon_admission::publish_capability(
-                        lock.0.as_mut().expect("owned lock file"),
-                    )?;
+                    daemon_admission::publish_capability(lock.file_mut())?;
                     return Ok((
                         Self {
                             _legacy_fence: legacy,
@@ -1412,7 +1414,7 @@ pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
                 Err(error) => return Err(error),
             };
             let mut name = String::new();
-            (&mut identity.0).take(64).read_to_string(&mut name)?;
+            identity.file_mut().take(64).read_to_string(&mut name)?;
             Ok(name == selected.name)
         }
     }
@@ -1431,7 +1433,7 @@ fn window_device_identity(
         libc::LOCK_SH,
     )?;
     let mut name = String::new();
-    (&mut identity.0).take(64).read_to_string(&mut name)?;
+    identity.file_mut().take(64).read_to_string(&mut name)?;
     if !devices.iter().any(|device| device.name == name) {
         return Err(io::Error::other(format!(
             "device profile for window {slot} is unavailable"
