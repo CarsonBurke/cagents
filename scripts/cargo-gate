@@ -421,8 +421,10 @@ cpu_allows() {
 
 # Names what holds the CPUs besides the running builds, once a CPU wait has
 # been announced: a runaway loop otherwise looks like builds. Sampling takes a
-# second, so it runs once per wait, with the decision, the slot and every lock
-# descriptor released or closed, so no other build waits it out. The running
+# second, so it runs once per wait, with the host's decision and the slot
+# released, so no other family's build waits it out, and the helper holds no
+# lock descriptor. This gate keeps its place at the head of its family's
+# queue meanwhile, as it does throughout its wait. The running
 # builds are their holders in `culprit_holders` and whatever holds this
 # family's slots, such as a plain `flock`.
 name_culprits() {
@@ -450,8 +452,14 @@ name_culprits() {
     if [ -x "$bounded" ]; then
         set -- --bounded "$bounded" "$@"
     fi
-    culprits=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; exec "$here/cargo-offload" --busiest "$@") ||
-        culprits=
+    # Reading a process stuck on a hung mount can block, so the sample has a
+    # limit, where the host has timeout(1).
+    if command -v timeout >/dev/null 2>&1; then
+        set -- timeout 10 "$here/cargo-offload" --busiest "$@"
+    else
+        set -- "$here/cargo-offload" --busiest "$@"
+    fi
+    culprits=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; exec "$@") || culprits=
     [ -z "$culprits" ] || printf '%s: %s\n' "$program" "$culprits" >&2
 }
 

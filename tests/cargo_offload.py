@@ -349,6 +349,10 @@ class Busiest(unittest.TestCase):
         self.assertEqual(self.busiest(first, second, pids=[build]),
                          "nothing else uses much; the running builds hold them: "
                          "builds use 3.0 CPUs and everything else 0.1 CPUs")
+        # One build compiling a crate on one CPU holds them as surely.
+        self.assertEqual(self.busiest(first, [self.process(build, own=0.9)], pids=[build]),
+                         "nothing else uses much; the running builds hold them: "
+                         "builds use 0.9 CPUs and everything else 0.0 CPUs")
         self.assertEqual(self.busiest(first, [self.process(other, own=0.1)]),
                          "nothing uses much at the moment: builds use 0.0 CPUs and everything else 0.1 CPUs")
 
@@ -368,9 +372,30 @@ class Busiest(unittest.TestCase):
         self.assertRegex(text, r"`ps -s \d+` there lists session \d+'s processes, and `pkill -s \d+` ends them$")
 
     def test_no_session_a_person_works_in_is_offered_to_end_whole(self):
-        terminal, desktop_like, kernel = 5_000_060, os.getsid(0), 5_000_062
-        cases = (([self.process(terminal, terminal=34816, name="bash")], terminal, "a terminal's"),
-                 ([self.process(5_000_061, session=desktop_like)], desktop_like, "the one this wait runs in"))
+        def idle(name, **env):
+            """A real process, for what busiest reads of it from /proc."""
+            directory = Path(tempfile.mkdtemp(prefix="cagents-busiest-"))
+            self.addCleanup(shutil.rmtree, directory, True)
+            program = directory / name
+            shutil.copy2(shutil.which("sleep"), program)
+            process = subprocess.Popen([program, "60"], env=os.environ | env)
+            self.addCleanup(lambda: (process.kill(), process.wait()))
+            return process.pid
+
+        terminal, own, kernel, starter, leaderless = 5_000_060, 5_000_061, 5_000_062, 5_000_063, 5_000_064
+        desktop = idle("sleep", XDG_SESSION_TYPE="wayland")
+        daemon = idle("cagentsd")
+        cases = (
+            ([self.process(terminal, terminal=34816, name="bash")], terminal, "a terminal's"),
+            ([self.process(own, session=os.getsid(0))], os.getsid(0), "the one this wait runs in"),
+            # What started this wait, such as the agent waiting, in a session of its own.
+            ([(os.getpid(), self.scope["Process"](starter, os.getsid(0), 0, 0, 0, 0, "python3")),
+              self.process(starter, session=starter, name="agent")], starter, "the one this wait runs in"),
+            # A daemon whose leader has exited, started from the desktop.
+            ([self.process(desktop, session=leaderless)], leaderless, "one started from the desktop"),
+            # cagents' own daemon, whatever started it.
+            ([self.process(daemon, session=leaderless)], leaderless, "cagents' own"),
+        )
         for table, session, why in cases:
             with self.subTest(why):
                 busy = [(pid, entry._replace(own=entry.own + self.TICKS)) for pid, entry in table]
@@ -1721,7 +1746,7 @@ class StandInHost(unittest.TestCase):
         lease.stdout.readline()
         write_figures(self.host_home / "figures", cpu=90)
         # A runaway loop on the build host, in a session of its own.
-        runaway = self.scope.popen(["runaway-fixture", "-c", "while True: pass"],
+        runaway = self.scope.popen([f"runaway-{os.getpid()}", "-c", "while True: pass"],
                                    executable=sys.executable, start_new_session=True)
         self.addCleanup(lambda: (runaway.kill(), runaway.wait()))
         env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "4",
@@ -1732,7 +1757,7 @@ class StandInHost(unittest.TestCase):
         self.assertRegex(result.stderr, r"waiting for CPU on stand-in: its CPU pressure is 90%, at or "
                                         r"above the 40% limit; builds use \d+\.\d CPUs? and everything "
                                         r"else \d+\.\d CPUs?; besides builds, the CPUs go to ")
-        self.assertRegex(result.stderr, rf"session {runaway.pid} \(runaway-fixture -c while True: pass, "
+        self.assertRegex(result.stderr, rf"session {runaway.pid} \(runaway-{os.getpid()} -c while True: pass, "
                                         rf"started \d+s ago\): \d+\.\d CPUs? in 1 process")
         self.assertRegex(result.stderr, r"`ps -s \d+` there lists session \d+'s processes, and "
                                         r"`pkill -s \d+` ends them|Session \d+ is ")

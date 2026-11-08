@@ -958,9 +958,12 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
     to point at."""
     recorded = recorded_builds()
     # scripts/cargo-gate's slots in their default place, wherever their
-    # holder came from, as a plain `flock` on the build host.
+    # holder came from, as a plain `flock` on the build host. A slot family
+    # has a queue beside its first slot; other locks there, such as a native
+    # session's, are not builds.
     gate_slots = [path for path in glob.glob("/var/tmp/cagents-*.lock*")
-                  if re.fullmatch(r".*\.lock(?:\.[0-9]+)?", path)]
+                  if (match := re.fullmatch(r"(.*\.lock)(?:\.[0-9]+)?", path))
+                  and os.path.isfile(match[1] + ".queue")]
     held = lock_holders([*locks, *(lock for _, lock in recorded), *gate_slots])
     roots = {pid for pid in pids if pid > 0}.union(*held.values())
     roots |= {pid for pid, lock in recorded if pid > 0 and os.path.realpath(lock) in held}
@@ -1081,7 +1084,11 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as file:
                 words = file.read().split(b"\0")
-            text = " ".join(word.decode(errors="replace") for word in words if word)
+            words = [word.decode(errors="replace") for word in words if word]
+            # The program by its name, which a long path would push out.
+            if words and "/" in words[0]:
+                words[0] = os.path.basename(words[0]) or words[0]
+            text = " ".join(words)
         except OSError:
             text = ""
         if not text.strip():
@@ -1110,26 +1117,48 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
             return f"{seconds // 60}m"
         return f"{seconds}s"
 
-    caller = os.getsid(0)
-    def risky(session):
-        """Why ending `session` whole may end more than a workload, or None."""
-        if session == caller:
+    # The sessions of this process and of everything that started it, such
+    # as the agent whose command waits: none of them is a workload to end.
+    callers, pid = {os.getsid(0)}, os.getpid()
+    while pid > 1 and pid in second and len(callers) < 128:
+        callers.add(second[pid].session)
+        pid = second[pid].parent
+    install = os.path.realpath(os.path.expanduser("~/.local/share/cagents-install"))
+    def cagents_own(pid):
+        """Whether `pid` is cagents itself, such as the daemon hosting every
+        terminal and agent: installed, or by its executable's name."""
+        try:
+            executable = os.readlink(f"/proc/{pid}/exe").removesuffix(" (deleted)")
+        except OSError:
+            entry = second.get(pid)
+            return entry is not None and entry.name in ("cagentsd", "cagents-ui", "cagents")
+        return (executable.startswith(install + "/")
+                or os.path.basename(executable) in ("cagentsd", "cagents-ui", "cagents"))
+
+    def risky(session, top):
+        """Why ending `session` whole may end more than a workload, or None.
+        No hint offers to end the session of cagents itself, of this wait or
+        of what started it, such as the agent waiting, nor the system's, a
+        desktop's or a terminal's."""
+        if session in callers:
             return "the one this wait runs in"
         if session == 1:
             return "the system's own"
+        if any(entry.session == session and cagents_own(pid) for pid, entry in second.items()):
+            return "cagents' own"
         leader = second.get(session)
-        if leader is None or leader.session != session:
-            # Its leader has exited, as a dropped connection's loop's has.
-            return None
-        if marks(session, ("XDG_SESSION_TYPE",)).get("XDG_SESSION_TYPE") in ("wayland", "x11", "mir"):
-            return "a desktop's"
-        if leader.terminal:
+        alive = leader is not None and leader.session == session
+        # A daemon's leader has exited; what it runs still says where it came from.
+        found = marks(session if alive else top, ("XDG_SESSION_TYPE",))
+        if found.get("XDG_SESSION_TYPE") in ("wayland", "x11", "mir"):
+            return "one started from the desktop"
+        if alive and leader.terminal:
             return "a terminal's"
         return None
 
     def members(session):
-        return sum(1 for pid, entry in second.items()
-                   if entry.session == session and pid != os.getpid() and not in_build(pid))
+        # Builds in it too: ending the session ends them as well.
+        return sum(1 for pid, entry in second.items() if entry.session == session and pid != os.getpid())
 
     # More, and less busy, for tests whose own load must show however busy
     # their host is.
@@ -1149,7 +1178,7 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
     totals = f"builds use {cpu_count(builds)} and everything else {cpu_count(others)}"
     if not named:
         if others < max(1.0, builds / 4):
-            if builds >= 1:
+            if builds >= max(0.5, others):
                 return f"nothing else uses much; the running builds hold them: {totals}"
             return f"nothing uses much at the moment: {totals}"
         least_text = "half a CPU" if least == 0.5 else cpu_count(least)
@@ -1176,9 +1205,10 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
         more = sum(total for _, (total, _) in rest)
         text += f"; and {len(rest)} more session{'s' if len(rest) != 1 else ''} using {cpu_count(more)}"
     where = " there" if there else ""
-    first_session = next((session for session, _ in named if session != 0), None)
+    first_session, first_top = next(((session, top) for session, (_, (_, top)) in named if session != 0),
+                                    (None, None))
     if first_session is not None:
-        why = risky(first_session)
+        why = risky(first_session, first_top)
         if why is None:
             text += (f". `ps -s {first_session}`{where} lists session {first_session}'s processes, "
                      f"and `pkill -s {first_session}` ends them")
@@ -1644,7 +1674,19 @@ if command == "lease":
                 holders = [pid for _, pid in running_builds(base, slot) if isinstance(pid, int)]
                 locks = [os.path.join(base, f"slot-{index}", "lock") for index in slot_indices(base)
                          if os.path.join(base, f"slot-{index}") != slot]
-                why = f"{why} -- {busiest(holders, locks, there=True)}"
+                # Naming them never ends a lease, nor holds it up for long:
+                # reading a process stuck on a hung mount can block.
+                culprits = []
+                def sample():
+                    try:
+                        culprits.append(busiest(holders, locks, there=True))
+                    except Exception:
+                        pass
+                sampler = threading.Thread(target=sample, daemon=True)
+                sampler.start()
+                sampler.join(10)
+                if culprits:
+                    why = f"{why} -- {culprits[0]}"
             say("wait", why)
             announced = True
             waiting = why.split()[0]

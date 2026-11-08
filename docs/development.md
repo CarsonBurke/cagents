@@ -438,9 +438,14 @@ they do. For each session it gives the command that started it and how long
 ago, the CPUs it uses, how many processes it has and its busiest process. If
 the session's leader has exited, it says so. Other sessions are summed. The
 message ends with how to look at the first session, `ps -s SESSION`, and to
-end it, `pkill -s SESSION`. It does not offer `pkill` for the session the
-wait runs in, a desktop's or a terminal's; it says which it is instead. It
-points at `scripts/bounded --list` when the checkout has that script:
+end it, `pkill -s SESSION`. It never offers `pkill` for a session holding
+cagents itself, such as the installed daemon that hosts every terminal and
+agent; for the session of the wait or of anything that started it, such as
+the waiting agent; or for the system's session, one started from the desktop
+or a terminal's. It says which it is instead. The process count is
+everything in the session, as `pkill -s` would end it. The message points at
+`scripts/bounded --list` when the checkout has that script. Sampling gives up
+after 10 seconds, as reading a process stuck on a hung mount can block:
 
 ```
 cargo-gate: builds use 14.2 CPUs and everything else 17.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 16.9 CPUs in 17 processes, most in pid 2272069 (sh -c while :; do true; done); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
@@ -449,21 +454,28 @@ cargo-gate: builds use 14.2 CPUs and everything else 17.3 CPUs; besides builds, 
 When no other session uses half a CPU, and everything else together uses
 less than a CPU or a quarter of what the builds use, the message begins
 `nothing else uses much; the running builds hold them` instead, or `nothing
-uses much at the moment` when the builds use less than a CPU too.
+uses much at the moment` when the builds use less than half a CPU and less
+than everything else. When everything else uses more than that, but no
+session half a CPU, it ends `though no session outside them uses half a
+CPU`.
 
 A session is what one login, ssh command or terminal started. A loop that
 keeps starting short-lived commands is one session, and the time of the
 commands it has reaped counts as its own. The builds are:
 
 - the processes below a running build's holder, or below a process holding
-  a slot lock, which includes one taken by a plain `flock`;
+  a slot lock, which includes one taken by a plain `flock`. The slot locks
+  are the waiting family's, those the build registry names, and on the host
+  each `/var/tmp/cagents-*.lock` slot family with a `.queue` beside it; other
+  locks there, such as a native-evidence session's, are not builds;
 - processes whose environment marks them as a running build's:
   `CAGENTS_BUILD_SLOT_HELD` for a gated command, `CAGENTS_OFFLOAD_SLOT` for an
   offloaded one;
 - processes working in a leased offload slot, as its file copies do.
 
 A process in an offload slot, or with its mark, that started before the
-slot's current lease is left from an earlier build, and it is named.
+process holding the slot's lock is left from an earlier build, and it is
+named.
 Whatever a gated command detaches stays below the gate's command supervisor,
 which is a subreaper. A plain `flock` holder's command carries no mark, so
 whatever it detaches without the lock's descriptor is named as something else.

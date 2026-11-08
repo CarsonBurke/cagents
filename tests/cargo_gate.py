@@ -48,6 +48,9 @@ def uptime():
 # tests, nor its registry of real builds; the tests about either set them.
 os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
 os.environ["CAGENTS_BUILD_REGISTRY"] = ""
+# In the names of what these tests leave spinning, so that another run of
+# them on the same host cannot be taken for this one's.
+TAG = str(os.getpid())
 
 
 class CargoGateApplicability(unittest.TestCase):
@@ -2288,7 +2291,7 @@ class CpuPressureAdmission(TwoSlots):
         self.assertIsNone(self.holder.poll())
         self.assertIn("CPUs busy (60% pressure, limit 60%)", waiter.stderr.read())
 
-    def spinner(self, name="runaway-fixture", **options):
+    def spinner(self, name=f"runaway-{TAG}", **options):
         """A runaway loop in its own session, as an abandoned ssh command's,
         whose command line starts with `name`."""
         spinner = subprocess.Popen([name, "-c", "while True: pass"], executable=sys.executable,
@@ -2334,8 +2337,9 @@ class CpuPressureAdmission(TwoSlots):
         return stderr
 
     def build_cpus(self, stderr):
-        return float(re.search(r"cargo-gate: (?:nothing else uses much; the running builds hold "
-                               r"them: )?builds use (\d+\.\d) CPU", stderr)[1])
+        found = re.search(r"cargo-gate: (?:[a-z ;]+: )?builds use (\d+\.\d) CPU", stderr)
+        self.assertIsNotNone(found, stderr)
+        return float(found[1])
 
     def test_the_wait_names_what_else_holds_the_cpus(self):
         shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
@@ -2343,13 +2347,13 @@ class CpuPressureAdmission(TwoSlots):
         (self.root / "bounded").chmod(0o755)
         runaway = self.spinner()
         # The running build spins too, in a process it detaches.
-        pid_file = self.root / "build-spinner.pid"
+        pid_file = self.root / f"build-spinner-{TAG}.pid"
         self.addCleanup(lambda: pid_file.exists() and os.kill(int(pid_file.read_text()), signal.SIGKILL))
         detach = ("import os, sys\nif os.fork(): os._exit(0)\nos.setsid()\n"
                   "open(sys.argv[1], 'w').write(str(os.getpid()))\nwhile True: pass")
         holder = self.scope.popen(
             [str(self.gate), "exec", "sh", "-c",
-             f"{self.named_python('build-spinner')} -c {shlex.quote(detach)} {pid_file}; "
+             f"{self.named_python(f'build-spinner-{TAG}')} -c {shlex.quote(detach)} {pid_file}; "
              f"touch {self.root}/held; while [ ! -e {self.root}/release ]; do sleep 0.05; done"],
             env=self.env | {"CAGENTS_BUILD_COST_GIB": "1"}, cwd=self.root, stderr=subprocess.DEVNULL)
         self.addCleanup((self.root / "release").touch)
@@ -2360,14 +2364,14 @@ class CpuPressureAdmission(TwoSlots):
         stderr = self.wait_for_cpu()
         self.assertRegex(stderr, rf"cargo-gate: builds use \d+\.\d CPUs? and everything else \d+\.\d CPUs?; "
                                  rf"besides builds, the CPUs go to .*session {runaway.pid} "
-                                 rf"\(runaway-fixture -c while True: pass, started \d+s ago\): "
+                                 rf"\(runaway-{TAG} -c while True: pass, started \d+s ago\): "
                                  rf"\d+\.\d CPUs? in 1 process")
         self.assertRegex(stderr, r"`ps -s \d+` lists session \d+'s processes, and `pkill -s \d+` "
                                  r"ends them|Session \d+ is ")
         # Beside this gate is where workloads can be bounded to their session.
         self.assertIn("; `./bounded --list` shows the workloads bounded to their session", stderr)
         # The build's own spinning counts as builds', not as something else's.
-        self.assertNotIn("build-spinner", stderr)
+        self.assertNotIn(f"build-spinner-{TAG}", stderr)
         self.assertGreater(self.build_cpus(stderr), 0)
         holder.kill()
 
@@ -2375,26 +2379,27 @@ class CpuPressureAdmission(TwoSlots):
         shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
         # It records no holder or cost: only its lock on the slot says it builds.
         build = subprocess.Popen(["flock", str(self.root / "slot.lock"),
-                                  self.named_python("plain-flock-build"), "-c", "while True: pass"],
+                                  self.named_python(f"plain-flock-{TAG}"), "-c", "while True: pass"],
                                  start_new_session=True)
         self.addCleanup(lambda: (os.killpg(build.pid, signal.SIGKILL), build.wait()))
         deadline = time.monotonic() + 10
         def started():
             for path in Path("/proc").glob("[0-9]*/cmdline"):
                 with contextlib.suppress(OSError):
-                    if "plain-flock-build" in path.read_text(errors="replace"):
+                    if f"plain-flock-{TAG}" in path.read_text(errors="replace"):
                         return True
             return False
         while not started():
             self.assertLess(time.monotonic(), deadline, "the build never started")
             time.sleep(0.05)
         stderr = self.wait_for_cpu()
-        self.assertNotIn("plain-flock-build", stderr)
+        self.assertNotIn(f"plain-flock-{TAG}", stderr)
         self.assertGreater(self.build_cpus(stderr), 0)
 
     def test_what_holds_the_cpus_is_sampled_once_outside_the_decision(self):
         """Sampling takes a second, which no other build on the host may wait
-        out: the decision, the slot and the queue are not held for it."""
+        out: the decision and the slot are not held for it, and the sampler
+        holds no lock descriptor."""
         registry = self.root / "registry"
         calls = self.root / "busiest-calls"
         stand_in = self.root / "cargo-offload"
@@ -2427,9 +2432,9 @@ class CpuPressureAdmission(TwoSlots):
 
     def test_the_running_builds_are_not_named_as_what_holds_the_cpus(self):
         spinner = self.spinner()
-        self.assertIn("runaway-fixture", self.busiest())
+        self.assertIn(f"runaway-{TAG}", self.busiest())
         # A build's holder, and everything below it, is a build.
-        self.assertNotIn("runaway-fixture", self.busiest(spinner.pid))
+        self.assertNotIn(f"runaway-{TAG}", self.busiest(spinner.pid))
 
     def test_a_loop_of_short_lived_commands_is_named(self):
         # Each command ends long before the next sample, so the loop's CPU
@@ -2439,23 +2444,23 @@ class CpuPressureAdmission(TwoSlots):
         briefly.write_text(f"#!{sys.executable}\nimport time\nend = time.monotonic() + 0.05\n"
                            "while time.monotonic() < end: pass\n")
         briefly.chmod(0o755)
-        loop = subprocess.Popen(["sh", "-c", "while :; do ./b & ./b & ./b; wait; done", "short-lived"],
+        loop = subprocess.Popen(["sh", "-c", "while :; do ./b & ./b & ./b; wait; done", f"loop-{TAG}"],
                                 cwd=self.root, start_new_session=True)
         self.addCleanup(lambda: (os.killpg(loop.pid, signal.SIGKILL), loop.wait()))
         time.sleep(0.5)
         self.assertRegex(self.busiest(), rf"session {loop.pid} \(sh -c while :; do \./b & \./b & \./b; wait; done "
-                                         rf"short-lived, started \d+s ago\): \d+\.\d CPUs? in [1-4] process")
+                                         rf"loop-{TAG}, started \d+s ago\): \d+\.\d CPUs? in [1-4] process")
 
     def test_a_session_whose_leader_has_exited_is_named_by_its_busiest_process(self):
         leader = subprocess.Popen(
-            ["sh", "-c", f"./{self.named_python('leaderless-fixture').name} -c 'while True: pass' & echo $!"],
+            ["sh", "-c", f"./{self.named_python(f'leaderless-{TAG}').name} -c 'while True: pass' & echo $!"],
             cwd=self.root, start_new_session=True, stdout=subprocess.PIPE, text=True)
         orphan = int(leader.stdout.readline())
         leader.stdout.close()
         self.addCleanup(lambda: os.kill(orphan, signal.SIGKILL))
         leader.wait(timeout=10)
         self.assertRegex(self.busiest(), rf"session {leader.pid}, whose leader has exited: \d+\.\d CPUs? "
-                                         rf"in 1 process, most in pid {orphan} \(\./leaderless-fixture -c "
+                                         rf"in 1 process, most in pid {orphan} \(leaderless-{TAG} -c "
                                          rf"while True: pass, started \d+s ago\)")
 
     def test_an_offloaded_builds_detached_processes_are_its_own(self):
@@ -2477,28 +2482,28 @@ class CpuPressureAdmission(TwoSlots):
         def detached(kind):
             # One a command started and detached, still marked with its
             # slot, and one working in the slot, as a copy of its files does.
-            self.spinner(f"{kind}-marked", env=os.environ | {"CAGENTS_OFFLOAD_SLOT": str(slot.resolve())})
-            self.spinner(f"{kind}-working", cwd=slot / "src")
+            self.spinner(f"{kind}-marked-{TAG}", env=os.environ | {"CAGENTS_OFFLOAD_SLOT": str(slot.resolve())})
+            self.spinner(f"{kind}-working-{TAG}", cwd=slot / "src")
 
         first = lease()
         detached("first")
         named = self.busiest(lock)
-        self.assertNotIn("first-marked", named)
-        self.assertNotIn("first-working", named)
+        self.assertNotIn(f"first-marked-{TAG}", named)
+        self.assertNotIn(f"first-working-{TAG}", named)
         # With the slot no longer leased, they are leftovers worth naming.
         first.kill()
         first.wait()
         named = self.busiest(lock)
-        self.assertIn("first-marked", named)
-        self.assertIn("first-working", named)
+        self.assertIn(f"first-marked-{TAG}", named)
+        self.assertIn(f"first-working-{TAG}", named)
         # And still once another build leases the slot: they are older than it.
         lease()
         detached("second")
         named = self.busiest(lock)
-        self.assertIn("first-marked", named)
-        self.assertIn("first-working", named)
-        self.assertNotIn("second-marked", named)
-        self.assertNotIn("second-working", named)
+        self.assertIn(f"first-marked-{TAG}", named)
+        self.assertIn(f"first-working-{TAG}", named)
+        self.assertNotIn(f"second-marked-{TAG}", named)
+        self.assertNotIn(f"second-working-{TAG}", named)
 
     def test_a_lone_build_starts_whatever_the_pressure(self):
         self.report("100.00")
