@@ -381,7 +381,7 @@ sweep_instance_runtime() {
 # no longer be able to tell its hosts, which the CLI needs.
 reap_instance() {
     reap_name=$1 reap_runtime=$2 reason=$3
-    private_runtime "$reap_runtime" || return 0
+    private_runtime "$reap_runtime" || return 1
     instance_log "$reap_name" "stopped: $reason"
     signal_runtime TERM "$reap_runtime"
     deadline=$(($(date +%s) + 10))
@@ -430,10 +430,13 @@ watch_instance_lifetime() {
     done
     record=$runtime/$owner_record
     printf 'watcher=%s\nwatcher_start=%s\n' "$$" "$(process_start $$)" >>"$record"
+    : "${XDG_RUNTIME_DIR:=${runtime%/nh-*}}"
+    export XDG_RUNTIME_DIR
     interval=${CAGENTS_INSTANCE_WATCH_SECONDS:-30}
-    case $interval in
-        '' | *[!0-9.]* | *.*.* | . | 0 | 0.0*) interval=30 ;;
-    esac
+    if ! printf '%s' "$interval" | grep -Eqx '[0-9]+(\.[0-9]*)?|\.[0-9]+' ||
+        ! awk -v interval="$interval" 'BEGIN { exit !(interval + 0 > 0) }'; then
+        interval=30
+    fi
     gone=
     while sleep "$interval"; do
         [ -f "$record" ] || exit 0
@@ -477,7 +480,9 @@ describe_lifetime() {
         *) description='started by an older runner: runs until stopped, or scripts/run-development --gc once its starter has ended' ;;
     esac
     [ -z "$ttl" ] || description="$description, or $ttl seconds after it started"
-    if [ -n "$(record_value "$1" lifetime)" ] && ! watcher_alive "$1"; then
+    # A kept instance without a --ttl has nothing to apply, so no watcher.
+    if [ -n "$(record_value "$1" lifetime)" ] && ! watcher_alive "$1" &&
+        { [ "$(record_value "$1" lifetime)" != kept ] || [ -n "$ttl" ]; }; then
         description="$description; its watcher is gone, so the next launch or --gc applies this"
     fi
     printf '%s\n' "$description"
@@ -575,7 +580,12 @@ collect_instances() {
             printf '%s\n' "cannot tell which daemons host this session, so no instance can safely be stopped from it; run --gc from a terminal outside cagents" >&2
         return 0
     fi
-    sessions=$(niri-harness list 2>/dev/null | awk '$1 ~ /^cagents-/') || sessions=
+    if ! listing=$(niri-harness list 2>&1); then
+        [ "$explicit" = false ] ||
+            printf '%s\n' "niri-harness list failed, so no instance was checked: $listing" >&2
+        return 1
+    fi
+    sessions=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/')
     while read -r session state _backend _cpu session_root; do
         [ -n "$session" ] || continue
         name=${session#cagents-}
@@ -587,17 +597,18 @@ collect_instances() {
         fi
         if [ "$state" = dead ]; then
             ! recently_changed "$session_root" || continue
-            printf '%s\n' "instance $name: its session had ended without being stopped; cleared what it left" >&2
-            reap_instance "$name" "$runtime" "its session had ended without being stopped"
+            if reap_instance "$name" "$runtime" "its session had ended without being stopped" &&
+                [ ! -e "$runtime" ]; then
+                printf '%s\n' "instance $name: its session had ended without being stopped; cleared what it left" >&2
+            fi
             continue
         fi
         record=$runtime/$owner_record
         if [ -f "$record" ]; then
             ! watcher_alive "$record" || continue
             [ "$explicit" = true ] || [ -n "$(record_value "$record" lifetime)" ] || continue
-            if reason=$(reap_reason "$record"); then
-                printf '%s\n' "instance $name: stopping it because $reason" >&2
-                reap_instance "$name" "$runtime" "$reason"
+            if reason=$(reap_reason "$record") && reap_instance "$name" "$runtime" "$reason"; then
+                printf '%s\n' "instance $name: stopped it because $reason" >&2
             fi
         elif [ "$explicit" = true ]; then
             printf '%s\n' "instance $name: left running, since nothing records who started it; stop it with --stop-instance $name if it is unused" >&2
@@ -614,7 +625,14 @@ SESSIONS
 # process was started for it, such as a daemon outliving its session.
 collect_storage() {
     days=$1 removed=false
-    live=$(niri-harness list 2>/dev/null | awk '$1 ~ /^cagents-/ && $2 != "dead" { print substr($1, 9) }') || live=
+    live=
+    if command -v niri-harness >/dev/null 2>&1; then
+        listing=$(niri-harness list 2>/dev/null) || {
+            printf '%s\n' "niri-harness list failed, so no storage was removed, since which instances run can't be told" >&2
+            return 1
+        }
+        live=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/ && $2 != "dead" { print substr($1, 9) }')
+    fi
     live=$live$(printf '\n'; cat /proc/[0-9]*/environ 2>/dev/null | tr '\0' '\n' |
         sed -n 's/^CAGENTS_DEVELOPMENT_INSTANCE=//p' | sort -u)
     data_root=${XDG_DATA_HOME:-$HOME/.local/share}
@@ -650,8 +668,12 @@ NAMES
 }
 
 if [ "$collect_garbage" = true ]; then
-    collect_instances true
-    [ -z "$storage_days" ] || collect_storage "$storage_days"
+    if ! collect_instances true; then
+        [ -z "$storage_days" ] ||
+            printf '%s\n' "no storage was removed either, since which instances run can't be told" >&2
+        exit 1
+    fi
+    [ -z "$storage_days" ] || collect_storage "$storage_days" || exit 1
     exit 0
 fi
 
@@ -673,7 +695,7 @@ if [ -n "$instance" ]; then
     if [ "$stop_instance" = false ]; then
         # What earlier sessions left: this name's dead session, which would
         # otherwise block the launch, and expired instances nothing watches.
-        collect_instances false
+        collect_instances false || :
     fi
     if [ "$stop_instance" = false ] && [ "$fresh_daemon" = false ] &&
         session_live "$harness_session"; then
@@ -1178,6 +1200,7 @@ if [ "$stop_instance" = true ]; then
     fi
     printf '%s\n' "Stopping instance $instance stops its terminal/chat jobs and all their background subagents." >&2
     stop_instance_session
+    instance_log "$instance" "stopped: --stop-instance from $root by $(cat "/proc/$(owner_process)/comm" 2>/dev/null || echo unknown)"
     printf '%s\n' "stopped instance $instance; its storage is kept"
     exit 0
 fi
@@ -1237,7 +1260,9 @@ if [ -n "$instance" ]; then
 os.closerange(3, os.sysconf("SC_OPEN_MAX"))
 os.execv(sys.argv[1], sys.argv[1:])' "$@"
         fi
-        setsid "$@" </dev/null >/dev/null 2>&1 &
+        # With the runtime directory sessions are made in, not this caller's:
+        # stopping a session that this caller runs in must not end it.
+        XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR%/nh-*} setsid "$@" </dev/null >/dev/null 2>&1 &
     fi
     instance_log "$instance" "started from $root by $(cat "/proc/$(owner_process)/comm" 2>/dev/null || echo unknown)"
     if [ "$keep_instance" = true ]; then

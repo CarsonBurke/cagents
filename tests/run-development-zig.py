@@ -820,6 +820,19 @@ exit 83
             f"  started by: fixture-agent (pid {starter}), still running, in a cagents session")
         # Without a runner session, only its process can be named.
         self.assertTrue(block[5].startswith(f"  stop:       kill {process.pid} "), block)
+        # What each recorded lifetime says, with no watcher running.
+        record = runtime / "cagents-run-development.owner"
+        base = record.read_text()
+        for lifetime, said in (
+                ("lifetime=kept\n", "kept until stopped"),
+                ("lifetime=kept\nttl=60\n", "kept until stopped, or 60 seconds after it started; "
+                 "its watcher is gone, so the next launch or --gc applies this"),
+                ("lifetime=owner\ngrace=600\n", "stops 600 seconds after its starter ends; its "
+                 "watcher is gone, so the next launch or --gc applies this")):
+            with self.subTest(lifetime):
+                record.write_text(base + lifetime)
+                self.assertEqual(listing()[4], f"  lifetime:   {said}")
+        record.write_text(base)
         # A session whose hosts can't be told is offered no way to stop it.
         unknown = self.below_daemon(
             ["--list-instances"], [f"XDG_RUNTIME_DIR={self.root / 'elsewhere'}"],
@@ -1026,6 +1039,15 @@ def process_start(pid):
     return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
 
 
+def wait_for(predicate, timeout=10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.05)
+    return predicate()
+
+
 class InstanceLifetime(unittest.TestCase):
     """An instance stops once the session that started it has been gone for its
     grace period, or its --ttl passes, unless it is kept; and what dead
@@ -1129,7 +1151,7 @@ exit 1
             "lifetime": "owner", "grace": 50, "started_at": old})
         result = self.run_runner("--gc")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("instance ended: stopping it because ended-agent", result.stderr)
+        self.assertIn("instance ended: stopped it because ended-agent", result.stderr)
         self.assertIn("which started it, has ended, and it started over 50 seconds ago", result.stderr)
         self.assert_stopped(runtime, process)
         self.assertFalse((self.sessions / "cagents-ended").exists())
@@ -1156,7 +1178,7 @@ exit 1
         runtime, process = self.session("brief", record=self.living_owner() | {
             "lifetime": "kept", "grace": 600, "started_at": int(time.time()) - 30, "ttl": 20})
         result = self.run_runner("--gc")
-        self.assertIn("instance brief: stopping it because its --ttl of 20 seconds passed", result.stderr)
+        self.assertIn("instance brief: stopped it because its --ttl of 20 seconds passed", result.stderr)
         self.assert_stopped(runtime, process)
 
     def test_gc_tells_of_a_running_instance_nothing_records_and_leaves_it(self):
@@ -1228,7 +1250,7 @@ exit 1
         record["owner_start"] = ""
         runtime, process = self.session("unstarted", record=record)
         result = self.run_runner("--gc")
-        self.assertIn("instance unstarted: stopping it because living-agent", result.stderr)
+        self.assertIn("instance unstarted: stopped it because living-agent", result.stderr)
         self.assert_stopped(runtime, process)
 
     def test_a_stop_never_ends_the_processes_it_runs_under(self):
@@ -1258,6 +1280,32 @@ exit 1
         time.sleep(0.5)
         self.assertIsNone(process.poll())
         self.assertTrue(shared.exists())
+
+    def test_gc_says_so_and_fails_when_the_harness_cannot_list(self):
+        harness = self.root / "bin/niri-harness"
+        harness.write_text("#!/bin/sh\necho 'state directory is locked' >&2\nexit 3\n")
+        harness.chmod(0o755)
+        result = self.run_runner("--gc", "--storage", "7")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("niri-harness list failed, so no instance was checked: state directory is locked",
+                      result.stderr)
+        self.assertIn("no storage was removed either", result.stderr)
+
+    def test_the_watcher_does_not_carry_the_callers_session_runtime(self):
+        # Started from inside another instance's session, it must not be one
+        # of the processes that stopping that session ends.
+        caller = self.runtime_root / "nh-caller"
+        caller.mkdir()
+        result = self.run_runner("--browserless", "--instance", "inner",
+                                 XDG_RUNTIME_DIR=str(caller), CAGENTS_INSTANCE_WATCH_SECONDS="0.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        record = self.sessions / "cagents-inner.runtime/cagents-run-development.owner"
+        self.assertTrue(wait_for(lambda: "watcher=" in record.read_text()))
+        watcher = int(record.read_text().split("watcher=", 1)[1].split()[0])
+        self.addCleanup(lambda: os.kill(watcher, signal.SIGKILL) if Path(f"/proc/{watcher}").exists() else None)
+        environment = Path(f"/proc/{watcher}/environ").read_bytes().split(b"\0")
+        self.assertIn(f"XDG_RUNTIME_DIR={self.runtime_root}".encode(), environment)
+        (self.sessions / "cagents-inner").unlink()
 
     def test_a_live_session_still_refuses_a_second_launch(self):
         self.session("busy", record=self.living_owner() | {"lifetime": "owner", "grace": 600,
