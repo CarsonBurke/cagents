@@ -1,4 +1,4 @@
-//! Canonical channel work keys must accept forge URL casing without borrowing
+//! Canonical pull request keys must accept forge URL casing without borrowing
 //! a different base repository, fork, authority, or PR number.
 use super::*;
 use serde_json::json;
@@ -11,7 +11,7 @@ fn document(url: &str, number: u64) -> Vec<u8> {
     serde_json::to_vec(&json!({
         "id":"PR_identity",
         "number":number,
-        "title":"Declared channel work",
+        "title":"Inferred pull request",
         "state":"OPEN",
         "headRefName":"contribution",
         "headRefOid":"a".repeat(40),
@@ -25,7 +25,7 @@ fn document(url: &str, number: u64) -> Vec<u8> {
 }
 
 #[test]
-fn canonical_channel_key_accepts_mixed_case_forge_base_url() {
+fn canonical_pull_request_key_accepts_mixed_case_forge_base_url() {
     let repository = repository();
     let url = Url::parse("https://enterprise.example:8443/Owner/Repository/pull/7").unwrap();
     assert_eq!(pull_request_number(&url, &repository).unwrap(), 7);

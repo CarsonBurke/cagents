@@ -20,9 +20,9 @@ fn fixture() -> SharedHost {
     });
     state.register_client(USER);
     state.register_client(AGENT);
-    // Reuse the authenticated-connection fixture from the channel-work tests.
-    // This supplies the state produced by Authenticate, not a fake wire token
-    // or a claim that this unit test exercised a live provider's authentication.
+    // The state Authenticate leaves for an agent connection. It is not a
+    // fake wire token, nor a claim that this test exercised a live provider's
+    // authentication.
     state
         .agent_clients
         .insert(AGENT, Lineage(TerminalId::new()));

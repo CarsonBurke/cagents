@@ -793,13 +793,6 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
-                // A channel-work invalidation is not a folded canonical edit,
-                // and nothing in the window shows channel work. Advancing the
-                // watermark could discard a delayed, lower-sequence edit.
-                if matches!(edit, ModelEdit::ChannelWorkChanged { .. }) {
-                    return Task::none();
-                }
-
                 if sequence <= self.workspace_model.sequence {
                     if let ModelEdit::DeleteChannel { id } = edit {
                         // A snapshot can overtake this explicit instruction.

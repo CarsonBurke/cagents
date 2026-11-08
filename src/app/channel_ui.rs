@@ -1,7 +1,7 @@
 use super::*;
 use crate::model::{ChannelId, ProjectChannel};
 use crate::sidebar::SidebarChannel;
-use crate::workspace_model::ModelEdit;
+use crate::workspace_model::{ChannelIncarnation, ModelEdit};
 use std::collections::BTreeMap;
 
 /// Closes the daemon's live sessions behind `sessions`, by the identities the
@@ -329,7 +329,7 @@ pub struct State {
     /// Emptied channels waiting for their view publication to settle, by the
     /// incarnation the close saw. The registry checks that incarnation and
     /// the settled view revision before it retires one.
-    pub(super) retire_candidates: HashSet<crate::channel_work::Home>,
+    pub(super) retire_candidates: HashSet<ChannelIncarnation>,
     /// Retirements sent to the registry, with the view revision each expects
     /// and when it was sent. The registry applies edits in order, so a pane
     /// published into one of these channels before the answer arrives would
@@ -342,7 +342,7 @@ const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(
 
 #[derive(Debug)]
 struct PendingReopen {
-    home: crate::channel_work::Home,
+    home: ChannelIncarnation,
     sent: std::time::Instant,
     intents: Vec<Reopen>,
 }
@@ -853,7 +853,7 @@ impl Cagents {
                     .find(|channel| channel.id == id)
                     .map(|channel| channel.ordinal)
             })?;
-        let home = crate::channel_work::Home {
+        let home = ChannelIncarnation {
             registry: self.workspace_model.identity,
             channel: id,
             creation_ordinal,
@@ -1127,7 +1127,6 @@ impl Cagents {
     }
 
     /// Defer automatic retirement until the canonical view publication settles.
-    /// A work-bearing channel survives its final conversation, across windows.
     pub(super) fn close_emptied_channels(&mut self, retired: &[CardId]) -> Task<Message> {
         let emptied = self.channels_emptied_by(retired);
         for &id in &emptied {
@@ -1149,12 +1148,12 @@ impl Cagents {
         }
         let captured = emptied.into_iter().filter_map(|id| {
             let channel = self.workspace_model.channel(id)?;
-            let home = crate::channel_work::Home {
+            let home = ChannelIncarnation {
                 registry: self.workspace_model.identity,
                 channel: id,
                 creation_ordinal: channel.ordinal,
             };
-            home.validate().ok().map(|_| home)
+            home.is_confirmed().then_some(home)
         });
         self.channel_ui.retire_candidates.extend(captured);
         Task::none()
@@ -1162,8 +1161,6 @@ impl Cagents {
 
     /// View publication supplies the settled revision. The registry checks
     /// that exact revision and the channel's incarnation before retiring it.
-    /// Until the daemon's channel work store is retired, it also keeps a
-    /// channel whose incarnation has channel work entries or operations.
     pub(super) fn retire_settled_empty_channels(&mut self) {
         let candidates = self
             .channel_ui
@@ -2025,8 +2022,8 @@ mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
 
-    fn captured_home() -> crate::channel_work::Home {
-        crate::channel_work::Home {
+    fn captured_home() -> ChannelIncarnation {
+        ChannelIncarnation {
             registry: uuid::Uuid::new_v4(),
             channel: ChannelId::new(),
             creation_ordinal: 4,
@@ -2034,7 +2031,7 @@ mod tests {
     }
 
     fn model_with_empty_channel(
-        home: crate::channel_work::Home,
+        home: ChannelIncarnation,
     ) -> crate::workspace_model::WorkspaceModel {
         use crate::workspace_model::views::{Scope, View};
         crate::workspace_model::WorkspaceModel {
@@ -2057,37 +2054,14 @@ mod tests {
     }
 
     #[test]
-    fn a_channel_work_invalidation_never_skips_a_delayed_canonical_channel_edit() {
-        use super::super::workspace_model_sync::ModelUpdate;
-        let home = captured_home();
-        let mut app = super::super::tests::context_inspector_test_app(false);
-        app.workspace_model = model_with_empty_channel(home);
-        app.workspace_model.sequence = 8;
-        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
-            sequence: 10,
-            edit: ModelEdit::ChannelWorkChanged { home },
-        }));
-        assert_eq!(
-            app.workspace_model.sequence, 8,
-            "an invalidation cannot acknowledge an unseen canonical edit"
-        );
-        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
-            sequence: 9,
-            edit: ModelEdit::DeleteChannel { id: home.channel },
-        }));
-        assert!(app.workspace_model.channel(home.channel).is_none());
-        assert_eq!(app.workspace_model.sequence, 9);
-    }
-
-    #[test]
     fn deferred_empty_retirement_never_rebinds_to_replacement_registry_or_channel_incarnation() {
         let original = captured_home();
         for current in [
-            crate::channel_work::Home {
+            ChannelIncarnation {
                 registry: uuid::Uuid::new_v4(),
                 ..original
             },
-            crate::channel_work::Home {
+            ChannelIncarnation {
                 creation_ordinal: original.creation_ordinal + 1,
                 ..original
             },
@@ -2126,13 +2100,13 @@ mod tests {
         ] {
             let mut app = super::super::tests::context_inspector_test_app(true);
             let card = app.durable.cards[0].id;
-            app.workspace_model = model_with_empty_channel(crate::channel_work::Home {
+            app.workspace_model = model_with_empty_channel(ChannelIncarnation {
                 creation_ordinal: ordinal,
                 ..original
             });
             Arc::make_mut(&mut app.durable)
                 .channels
-                .push(crate::model::ProjectChannel {
+                .push(ProjectChannel {
                     id: original.channel,
                     project_id: ProjectId::new(),
                     title: "Work".into(),

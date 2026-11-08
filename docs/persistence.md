@@ -226,10 +226,9 @@ pane per hosted resource of a kind" are constraints instead of a separate index
 kept in step by hand. The constraint matches `same_resource`, which compares
 resources only within one kind (chat and terminal ids share a type). A draft
 belongs to its pane and goes with it; closing a pane with a draft keeps the
-draft text in its `closed_panes` row's descriptor, as reopening does today. `shared_view_terminal_sources`, `channel_work_placement_epochs`
-and `shared_terminal_retention_pins` keep their columns; the sources and pins
-reference `panes`, and placement epochs stay keyed by pane id without a
-foreign key, deleted when their pane leaves.
+draft text in its `closed_panes` row's descriptor, as reopening does today. `shared_view_terminal_sources` and `shared_terminal_retention_pins` keep their
+columns and reference `panes`. Schema 24 removes all five `channel_work`
+tables, including the placement epochs and clock.
 
 ### What is a column and what is a descriptor
 
@@ -307,8 +306,7 @@ any write. Each edit sets `view_scopes.revision` for the scopes it changed and
 records its `operation` in `view_operations`. The conflict checks keep their current
 semantics: `expected_revision` against the scope's revision, and
 `source_update_conflicts` against the stored row. Other derived state that
-`write` maintains today (channel auto-title reset, terminal retention pins,
-channel work placement) observes the changed rows instead of diffing two whole
+`write` maintains today (channel auto-title reset and terminal retention pins) observes the changed rows instead of diffing two whole
 views.
 
 `SeedView` remains while any window can hold a local copy (until stage 5);
@@ -457,6 +455,13 @@ stores, so an old copy can never feed a later upgrade or seed.
   view holding a pane without a `channel_work_placement_epochs` row, so a step
   that brings back `channel_work` tables writes one epoch per pane and sets
   the placement clock, as the channel-work migration does.
+- Schema 24 retires channel work. Its 24 → 23 converter restores the published
+  tables with empty declaration history, one positive epoch for every pane in
+  every scope, and a singleton clock at the last allocated epoch (zero when
+  there are no panes). The older daemon repairs channel homes on open. A
+  further conversion to 22 keeps these placement rows, so the older view writer
+  can edit existing panes. Retired declarations are not recovered by rollback;
+  other workspace and execution state survives both conversions.
 - The wire changes (scope revisions on edits, `ReadWorkspaceView`, draft
   edits) bump `PROTOCOL_VERSION`. Window and daemon versions are a matched set,
   so the in-app update performs a full daemon upgrade, with its existing

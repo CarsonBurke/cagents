@@ -32,8 +32,6 @@ pub mod automations;
 pub mod browser;
 #[cfg(feature = "ui")]
 pub mod capability;
-pub mod channel_work;
-pub mod channel_work_api;
 pub mod chat;
 pub mod companion;
 pub mod control;

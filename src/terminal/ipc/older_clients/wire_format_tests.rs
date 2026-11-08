@@ -308,11 +308,10 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
             ],
-            if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
-                vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]
-            } else {
-                Vec::new()
-            },
+            (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
+                .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES))
+                .into_iter()
+                .collect(),
         );
         assert!(
             differences.is_empty(),
@@ -321,5 +320,22 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             client.protocol,
             differences.join("\n")
         );
+    }
+}
+
+#[test]
+fn removed_channel_work_tags_are_incompatible_with_published_older_clients() {
+    let current = traced();
+    for protocol in [super::super::CANDIDATE_LINE_PROTOCOL, 160] {
+        assert_eq!(older_client(protocol), None);
+        let changed = differences(&recorded(protocol), &current, Vec::new(), Vec::new());
+        for removed in ["ChannelWork", "channel_work", "ChannelWorkChanged"] {
+            assert!(
+                changed
+                    .iter()
+                    .any(|difference| difference.contains(removed)),
+                "protocol {protocol} should expose removed {removed}: {changed:?}"
+            );
+        }
     }
 }

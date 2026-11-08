@@ -25459,9 +25459,9 @@ mod tests {
                 1 => failed_chat(&mut app),
                 _ => live_chat(&mut app, Some("thread")),
             };
-            // A confirmed canonical Home, rather than an unregistered local
+            // A confirmed channel incarnation, rather than an unregistered local
             // channel: only its authoritative disappearance permits retirement.
-            let home = crate::channel_work::Home {
+            let home = crate::workspace_model::ChannelIncarnation {
                 registry: uuid::Uuid::new_v4(),
                 channel,
                 creation_ordinal: 4,

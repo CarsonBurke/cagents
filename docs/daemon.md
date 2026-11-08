@@ -28,20 +28,17 @@ handshake rejects incompatible clients without terminating their PTYs.
 Upgrade the three companion executables (`cagents`, `cagents-ui`, `cagentsd`)
 together.
 
-A session carried across an update keeps running the `cagents` CLI it was
-launched with. The daemon still serves that CLI when its protocol is listed as
-an older client: currently protocol 128, the 0.1.3+local.c68275e94 line. Only
-a peer running the `cagents` executable is served this way, and not one
-running `cagents daemon bridge`, which relays a remote device's window. An
-older window or daemon is still refused at its handshake, which is how a stale window learns
-that an update superseded it. The daemon answers that CLI in its protocol's
-version. It refuses requests to stop, update or hand off the daemon, and requests whose
-reply the CLI couldn't read, such as `automation history`, `automation run` and
-`automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
+A session carried across an update may keep the `cagents` CLI it was launched
+with. Protocol 161 removes channel-work request, reply and workspace-edit
+variants, changing their positional encoding. Earlier CLIs, including protocol
+128, are refused at the handshake. Use the matched CLI at
+`$XDG_RUNTIME_DIR/cagents/bin/cagents` (or the development runtime's `bin/cagents`)
+from a carried session. Historical upgrade inspection still supports the
+candidate line; it does not admit that CLI to the new daemon.
+
 Each protocol's postcard wire format is recorded under
-`tests/fixtures/wire-formats/`. A test checks that every listed older protocol
-encodes the same way, except for what is refused or withheld. It checks
-encoding, not meaning, and not JSON carried as text inside a message.
+`tests/fixtures/wire-formats/`. The older-client contract tests check the
+version refusal and successful matching-client requests.
 
 When a daemon takes the runtime lease, it points `bin` in its runtime
 directory at its own matched CLI. That runtime directory is

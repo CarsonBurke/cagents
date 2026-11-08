@@ -32,9 +32,6 @@ pub(super) use automation_attention::{AutomationAttentionReceipt, PendingAutomat
 pub(super) mod automation_notifications;
 mod automation_proposals;
 mod automations;
-pub(super) mod channel_work;
-#[cfg(test)]
-mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 mod execution;
 pub(super) use execution::ResidentRelease;
@@ -45,6 +42,7 @@ mod native_actor_retirement;
 pub(super) use native_actor::NativeActorEvent;
 pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
 mod navigation;
+mod retired_channel_work;
 mod schema;
 mod terminal_owners;
 mod terminal_retention;
@@ -54,7 +52,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 23;
+const SCHEMA_VERSION: u32 = 24;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -301,7 +299,7 @@ impl Registry {
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
-            ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
+            ModelEdit::AgentsChanged => {
                 return Err("Agent model changes are committed by the execution service".into());
             }
             ModelEdit::OpenProject {
@@ -383,15 +381,6 @@ impl Registry {
             // nobody has open is reachable from no window's sidebar.
             ModelEdit::CloseProject { repository } => {
                 let key = repository_key(repository)?;
-                let channels = {
-                    let mut statement = transaction.prepare("SELECT id FROM channels WHERE repository=?1").map_err(|e| e.to_string())?;
-                    statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
-                        .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
-                };
-                views::retire_project_placements(&transaction, repository)?;
-                for channel in channels {
-                    channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
-                }
                 let removed = transaction
                     .execute("DELETE FROM projects WHERE repository = ?1", params![key])
                     .map_err(|error| error.to_string())?
@@ -450,7 +439,6 @@ impl Registry {
                             params![id.to_string(), key, title, ordinal, *title_source as i64],
                         )
                         .map_err(|error| error.to_string())?;
-                    channel_work::created_in(&transaction, *id)?;
                     true
                 }
             }
@@ -490,15 +478,11 @@ impl Registry {
                 ).map_err(|error| error.to_string())? > 0
             }
             ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
-                if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
-                    views::retire_channel_placements(&transaction, home.channel)?;
-                    channel_work::deleted_in(&transaction, home.channel)?;
+                if channel_is_empty_in(&transaction, home, *expected_view_revision)? {
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
             ModelEdit::DeleteChannel { id } => {
-                views::retire_channel_placements(&transaction, *id)?;
-                channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
                         "DELETE FROM channels WHERE id = ?1",
@@ -509,14 +493,6 @@ impl Registry {
             }
         };
         if changed {
-            match edit {
-                ModelEdit::RetitleChannel { id, .. }
-                | ModelEdit::SuggestChannelTitle { id, .. }
-                | ModelEdit::SuggestConversationTitle { id, .. } => {
-                    channel_work::renamed_in(&transaction, *id)?
-                }
-                _ => {}
-            }
             transaction
                 .execute(
                     "UPDATE metadata SET sequence = sequence + 1 WHERE key = 0",
@@ -717,11 +693,13 @@ fn migrate_through(
         schema::migration_checkpoint(16)?;
     }
     if version < 17 && target >= 17 {
-        channel_work::migrate(tx)?;
+        tx.execute_batch(retired_channel_work::TABLES)
+            .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(17)?;
     }
     if version < 18 && target >= 18 {
-        channel_work::placement::migrate(tx)?;
+        tx.execute_batch(retired_channel_work::PLACEMENT)
+            .map_err(|error| error.to_string())?;
         schema::migration_checkpoint(18)?;
     }
     if version < 19 && target >= 19 {
@@ -744,7 +722,52 @@ fn migrate_through(
         views::store::migrate(tx)?;
         schema::migration_checkpoint(23)?;
     }
+    if version < 24 && target >= 24 {
+        retired_channel_work::remove(tx)?;
+        schema::migration_checkpoint(24)?;
+    }
     Ok(())
+}
+
+/// Whether `home` is still the channel it names and its view has held no pane
+/// since `expected_view_revision`. A pane published in between, by any window,
+/// moves the revision and keeps the channel.
+fn channel_is_empty_in(
+    tx: &rusqlite::Transaction<'_>,
+    home: &crate::workspace_model::ChannelIncarnation,
+    expected_view_revision: u64,
+) -> Result<bool, String> {
+    let identity: String = tx
+        .query_row("SELECT identity FROM metadata WHERE key = 0", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())?;
+    let identity: Uuid = identity
+        .parse()
+        .map_err(|_| "The registry identity is unreadable")?;
+    if identity != home.registry {
+        return Err("The channel belongs to another registry".into());
+    }
+    let ordinal: Option<u32> = tx
+        .query_row(
+            "SELECT ordinal FROM channels WHERE id = ?1",
+            [home.channel.to_string()],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| error.to_string())?;
+    match ordinal {
+        None => return Err("The channel no longer exists".into()),
+        Some(ordinal) if ordinal != home.creation_ordinal => {
+            return Err("The channel incarnation changed".into());
+        }
+        Some(_) => {}
+    }
+    let view = views::read(
+        tx,
+        &crate::workspace_model::views::Scope::Channel(home.channel),
+    )?;
+    Ok(view.revision == expected_view_revision && view.panes.is_empty())
 }
 
 #[cfg(test)]
@@ -1296,11 +1319,6 @@ mod tests {
                  DROP TABLE view_scopes;
                  DROP TABLE view_revision_clock;
                  DROP TABLE automation_notifications;
-                 DROP TABLE channel_work_placement_epochs;
-                 DROP TABLE channel_work_placement_clock;
-                 DROP TABLE channel_work_operations;
-                 DROP TABLE channel_work_entries;
-                 DROP TABLE channel_work_homes;
                  DROP TABLE automation_lifecycle;
                  ALTER TABLE channels DROP COLUMN title_source; PRAGMA user_version = 2;",
             )
