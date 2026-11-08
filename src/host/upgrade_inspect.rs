@@ -729,7 +729,7 @@ fn codex_listener_survives(
         let status = match std::fs::read_to_string(path.join("status")) {
             Ok(status) => status,
             Err(error) if gone(&error) => continue,
-            Err(error) => return Err(format!("Cannot inspect a process: {error}")),
+            Err(error) => return Err(format!("Cannot inspect process status: {error}")),
         };
         let effective = status
             .lines()
@@ -783,7 +783,7 @@ fn process_arguments(process: &Path) -> Result<Threads, String> {
         Ok(argv) if argv.is_empty() => threads(process),
         Ok(argv) => Ok(Threads::Arguments(argv)),
         Err(error) if gone(&error) => Ok(Threads::Ended),
-        Err(error) => Err(format!("Cannot inspect a process: {error}")),
+        Err(error) => Err(format!("Cannot inspect process arguments: {error}")),
     }
 }
 
@@ -811,7 +811,7 @@ fn settled_process_arguments(
 /// is read last: a thread that runs `execve` takes the leader's id, and stops
 /// being found under its own, only once the old leader has gone.
 fn threads(process: &Path) -> Result<Threads, String> {
-    let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
+    let unreadable = |error: io::Error| format!("Cannot inspect process threads: {error}");
     let list = || -> Result<Option<Vec<std::ffi::OsString>>, String> {
         let threads = match std::fs::read_dir(process.join("task")) {
             Ok(threads) => threads,
@@ -869,7 +869,7 @@ fn threads(process: &Path) -> Result<Threads, String> {
 /// (`PF_EXITING`), or with `SIGKILL` pending. A status it cannot read
 /// whole says it can.
 fn thread_ended(thread: &Path) -> Result<bool, String> {
-    let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
+    let unreadable = |error: io::Error| format!("Cannot inspect process exit state: {error}");
     let stat = match std::fs::read_to_string(thread.join("stat")) {
         Ok(stat) => stat,
         Err(error) if gone(&error) => return Ok(true),
@@ -1591,6 +1591,65 @@ mod tests {
                 SavedExecution::Unproved
             );
         }
+    }
+
+    /// Keep whole-host kernel coverage alongside the controlled state fixture.
+    /// An unresolved exec is explicit uncertainty; every other error must stay
+    /// visible instead of being collapsed into SavedExecution::Unproved.
+    #[test]
+    fn real_exec_churn_reports_only_explicit_argument_settlement_uncertainty() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [card, _] = codex_cards(root.path());
+        let listener = &card.owned_codex_listener.as_ref().unwrap().socket;
+        let control = crate::daemon::holder_registry::socket(holders.path(), card.id);
+        let stop = Arc::new(AtomicBool::new(false));
+        let churn = {
+            let stop = stop.clone();
+            std::thread::spawn(move || -> io::Result<usize> {
+                let mut spawned = 0;
+                while !stop.load(Ordering::Relaxed) {
+                    let status = std::process::Command::new("/usr/bin/true").status()?;
+                    if !status.success() {
+                        return Err(io::Error::other(format!("exec churn failed: {status}")));
+                    }
+                    spawned += 1;
+                }
+                Ok(spawned)
+            })
+        };
+        let mut absent = 0;
+        let mut unpublished = 0;
+        let mut unexpected = std::collections::BTreeMap::<String, usize>::new();
+        for _ in 0..300 {
+            match codex_listener_survives(
+                Path::new("/proc"),
+                card.id,
+                &[listener.as_path(), control.as_path()],
+                Duration::from_secs(2),
+            ) {
+                Ok(false) => absent += 1,
+                Err(error) if error == "A process has not published its arguments yet" => {
+                    unpublished += 1;
+                }
+                result => *unexpected.entry(format!("{result:?}")).or_default() += 1,
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let spawned = churn.join().unwrap().unwrap();
+        eprintln!(
+            "CODEX_KERNEL_CENSUS scans=300 absent={absent} unpublished={unpublished} spawned={spawned} unexpected={unexpected:?}"
+        );
+        assert!(spawned > 0, "the kernel exec interleaving was exercised");
+        assert!(
+            unexpected.is_empty(),
+            "a whole-host inspection may only report absence or the exact unpublished-arguments condition: {unexpected:?}"
+        );
+        assert_eq!(absent + unpublished, 300);
     }
 
     #[test]
