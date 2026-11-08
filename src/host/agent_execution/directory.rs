@@ -3,7 +3,7 @@
 
 use super::{SharedHost, caller, registry};
 use crate::{
-    account::{UsageStatus, info::RemainingWindow},
+    account::{UsageStatus, UsageWindow, info::RemainingWindow},
     agent::{ActivityState, Provider},
     agent_execution::{
         Authority, Lineage, Origin,
@@ -581,11 +581,11 @@ pub(in crate::host) fn usage_limit(
     // A window scoped to one model, of any span, bears on it only when the
     // provider named that model: one model's allowance running out leaves
     // the others usable.
-    let spent_past_failure = |window: &&RemainingWindow| {
-        window.remaining_fraction <= 0.0
-            && scope(&window.window.label).is_none_or(|model| names_model(&summary, model))
+    let spent_past_failure = |remaining: &&RemainingWindow| {
+        let window = &remaining.window;
+        remaining.remaining_fraction <= 0.0
+            && bears_on(&summary, scope(provider, window))
             && window
-                .window
                 .resets_at
                 .is_some_and(|at| at >= 0 && after_failure((at as u64).saturating_mul(1000)))
     };
@@ -596,7 +596,7 @@ pub(in crate::host) fn usage_limit(
             .filter(spent_past_failure)
     };
     let resets_at = spent().filter_map(|window| window.window.resets_at).max();
-    let model_spent = spent().any(|window| scope(&window.window.label).is_some());
+    let model_spent = spent().any(|window| scope(provider, &window.window).is_some());
     let limit = UsageLimit {
         summary,
         reset: failure.reset,
@@ -623,19 +623,21 @@ pub(in crate::host) fn usage_limit(
     (!recovered).then_some(limit)
 }
 
-/// The model or bucket a window is scoped to, which both providers name
-/// after its span: "Weekly · Opus", "5h window · GPT-5.1-Codex-Max".
-fn scope(label: &str) -> Option<&str> {
-    label
-        .rsplit_once(" · ")
-        .map(|(_, model)| model.trim())
-        .filter(|model| !model.is_empty())
+/// The model, bucket or surface a provider scoped a window to, read from
+/// what it reported rather than from how the label reads.
+fn scope(provider: Provider, window: &UsageWindow) -> Option<&str> {
+    match provider {
+        Provider::Claude => crate::account::claude::window_scope(window),
+        Provider::Codex => crate::account::codex::window_scope(window),
+        Provider::Omp => None,
+    }
 }
 
-/// Whether a limit's summary names a window's model, as "Claude Opus limit
-/// reached" names "Weekly · Opus".
-fn names_model(summary: &str, model: &str) -> bool {
-    summary.to_lowercase().contains(&model.to_lowercase())
+/// Whether a window bears on a limit: an account-wide one always does, and
+/// one scoped to a model only when the limit's summary names it, as "Claude
+/// Opus limit reached" names the Opus weekly window.
+fn bears_on(summary: &str, scope: Option<&str>) -> bool {
+    scope.is_none_or(|scope| summary.to_lowercase().contains(&scope.to_lowercase()))
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views
@@ -681,10 +683,13 @@ mod tests {
         let usage = UsageSnapshot {
             windows: windows
                 .iter()
-                .map(|(key, kind, used, resets_at)| UsageWindow {
-                    key: (*key).into(),
+                .map(|(label, kind, used, resets_at)| UsageWindow {
+                    // Keyed as both providers key a scoped window.
+                    key: label
+                        .split_once(" · ")
+                        .map_or_else(|| (*label).into(), |(_, scope)| format!("scoped:{scope}")),
                     kind: *kind,
-                    label: (*key).into(),
+                    label: (*label).into(),
                     used: *used,
                     resets_at: Some(*resets_at),
                     span_secs: None,
@@ -873,6 +878,34 @@ mod tests {
         assert_eq!(
             codex_model_spent, None,
             "a model's spent window does not hold a limit that did not name it"
+        );
+
+        // Scope is what the provider said a window applies to, not its label:
+        // a kind this build does not know is labelled under its group, yet an
+        // account-wide one still dates a limit.
+        let mut burst = account_reading(
+            UsageStatus::Limited,
+            failed_at + 60_000,
+            &[(
+                "Session · Daily burst",
+                WindowKind::Session,
+                1.0,
+                weekly_reset,
+            )],
+            failed_at + 120_000,
+        );
+        burst.remaining[0].window.key = "daily_burst".into();
+        assert_eq!(
+            usage_limit(
+                Provider::Claude,
+                "You've hit your limit",
+                Some(failed_at),
+                Some(&burst),
+                failed_at + 120_000,
+            )
+            .expect("an account-wide window holds")
+            .resets_at,
+            Some(weekly_reset)
         );
 
         // A model's own window used up leaves the account's status Ok, yet
