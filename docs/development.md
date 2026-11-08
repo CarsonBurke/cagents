@@ -1434,6 +1434,11 @@ harness, it provides:
   (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
   evidence. A session gives the lock up after `--limit` seconds even if its
   owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
+  the GTK backend on the session's private bus, so the app's Attach dialog
+  opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
+  `drive type PATH`, `drive key Return`. `kde`, `gnome` and `cosmic` select
+  those backends where they are installed.
 - **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
   the holder and whether it is doing anything, when `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that

@@ -92,7 +92,9 @@ evidence shot channel-prs
 ```
 
 `scripts/native-evidence --remote fw16 --task DIR pair --before origin/main
---after . --steps FILE` runs such a file on both sides. Prepare data that both
+--after . --steps FILE` runs such a file on both sides; options such as
+`--width 1200` or `--portal gtk`, for a scene that attaches a file through the
+real file chooser, go to each side's `start`. Prepare data that both
 sides need once, then `save-seed` it, rather than repeating slow setup in each
 side's steps.
 
