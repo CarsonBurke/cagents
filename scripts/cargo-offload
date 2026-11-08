@@ -579,7 +579,7 @@ def real_cargo(environment):
 # command ends with what it started when its standard input closes: the
 # connection to this host dropped or the gate here was cancelled.
 REMOTE_AGENT = r'''
-import fcntl, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
+import collections, fcntl, hashlib, json, os, re, resource, shutil, signal, stat, subprocess, sys, threading, time
 command, base = sys.argv[1], os.path.expanduser(sys.argv[2])
 DIRECTORIES_MARKER = "cargo-offload-directories "
 
@@ -826,52 +826,206 @@ def room(base, mine, cost):
     return f"memory {max(0, available - outstanding) / GIB:.1f} {cost / GIB:.1f} {len(others)}"
 
 
-def busiest(builds, interval=1.0, shown=None):
-    """What holds the CPUs other than the builds rooted at `builds`: the
-    process sessions using the most CPU over `interval` seconds, as one line,
-    or None when nothing else uses much. A session is what one login, ssh
-    command or terminal started, so a runaway loop and the children it keeps
-    starting count together, under the command that started them."""
-    def sample():
-        found = {}
-        for name in os.listdir("/proc"):
-            if not name.isdigit():
-                continue
-            try:
-                with open(f"/proc/{name}/stat") as file:
-                    fields = file.read().rsplit(")", 1)[1].split()
-            except (OSError, IndexError):
-                continue
-            # parent, session, user and system ticks, start in ticks since boot.
-            found[int(name)] = (int(fields[1]), int(fields[3]), int(fields[11]) + int(fields[12]),
-                                int(fields[19]))
+# The marks a running build's processes carry in their environment, into
+# whatever session they move: the gate whose slot a scripts/cargo-gate
+# command holds, and the slot an offloaded command runs in.
+HELD_MARK = "CAGENTS_BUILD_SLOT_HELD"
+SLOT_MARK = "CAGENTS_OFFLOAD_SLOT"
+Process = collections.namedtuple("Process", "parent session own reaped start name")
+
+
+def process_table():
+    """Each process's parent, session, CPU ticks of its own and of the
+    children it has reaped, start in ticks since boot, and name."""
+    table = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as file:
+                head, rest = file.read().rsplit(")", 1)
+            # proc(5)'s fields 4, 6, 14 to 17 and 22, counted from field 3.
+            fields = rest.split()
+            table[int(name)] = Process(
+                int(fields[1]), int(fields[3]), int(fields[11]) + int(fields[12]),
+                int(fields[13]) + int(fields[14]), int(fields[19]), head.partition("(")[2])
+        except (OSError, ValueError, IndexError):
+            continue
+    return table
+
+
+def lock_holders(paths):
+    """The processes that took a flock(2) lock on any of the files at
+    `paths`, and which of those files are locked, as resolved paths.
+    /proc/locks names a file by its superblock's device, which on btrfs is not
+    the one stat reports, so only the inode is matched."""
+    inodes = {}
+    for path in paths:
+        try:
+            inodes[os.stat(path).st_ino] = os.path.realpath(path)
+        except OSError:
+            pass
+    holders, locked = set(), set()
+    try:
+        with open("/proc/locks") as file:
+            lines = file.read().splitlines() if inodes else []
+    except OSError:
+        lines = []
+    for line in lines:
+        # "1: FLOCK ADVISORY WRITE PID MAJOR:MINOR:INODE 0 EOF"; a request
+        # still waiting has "->" before FLOCK, and holds nothing.
+        fields = line.split()
+        if len(fields) < 6 or fields[1] != "FLOCK":
+            continue
+        try:
+            pid, inode = int(fields[4]), int(fields[5].rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            continue
+        if inode in inodes:
+            locked.add(inodes[inode])
+            if pid > 0:
+                holders.add(pid)
+    return holders, locked
+
+
+def recorded_builds():
+    """The holder and lock of each build this host's registry records."""
+    found = []
+    try:
+        names = os.listdir(REGISTRY) if REGISTRY else []
+    except OSError:
         return found
-    first = sample()
+    for name in names:
+        if not name.startswith(("gate-", "offload-")) or name.endswith(".new"):
+            continue
+        try:
+            with open(os.path.join(REGISTRY, name)) as file:
+                first, _since, lock = (file.read().splitlines() + ["", "", ""])[:3]
+            found.append((int(first.split()[0]), lock))
+        except (OSError, ValueError, IndexError):
+            continue
+    return found
+
+
+def cpu_count(amount):
+    figure = f"{amount:.1f}"
+    return f"{figure} CPU" if figure == "1.0" else f"{figure} CPUs"
+
+
+def busiest(pids=(), locks=(), interval=1.0, shown=None, on=None, bounded=None):
+    """What holds this host's CPUs besides its running builds, as a clause:
+    how many CPUs the builds and everything else use, and which process
+    sessions outside the builds use the most, over about `interval` seconds.
+    A session is what one login, ssh command or terminal started, so a
+    runaway loop and the children it keeps starting count together.
+
+    A build is everything below a process in `pids`, below the holder of a
+    lock in `locks`, or below one the registry records while its lock is
+    held; and any process carrying a running build's mark in its
+    environment, or working in a running offloaded build's slot, as its file
+    copies do. The marks follow a build's processes into sessions of their
+    own. What both leaves the build's process tree and clears its
+    environment or leaves its slot is counted as not a build, as is anything
+    a plain `flock` holder's command detaches, which carries no mark.
+    `on` names this host in the hint, for a caller elsewhere; `bounded` is a
+    scripts/bounded to point at."""
+    recorded = recorded_builds()
+    holders, locked = lock_holders([*locks, *(lock for _, lock in recorded)])
+    roots = {pid for pid in pids if pid > 0} | holders
+    roots |= {pid for pid, lock in recorded if pid > 0 and os.path.realpath(lock) in locked}
+    # An offloaded build's lock is `lock` in its slot, where its files are.
+    slots = {os.path.dirname(lock) for lock in locked
+             if os.path.basename(lock) == "lock"
+             and os.path.basename(os.path.dirname(lock)).startswith("slot-")}
+
+    # Each process is read about midway through its scan.
+    began = time.monotonic()
+    first = process_table()
+    scanned = time.monotonic()
     time.sleep(interval)
-    second = sample()
-    excluded = set(builds)
-    def in_build(pid):
-        seen = 0
-        while pid > 1 and seen < 64:
-            if pid in excluded:
-                return True
-            entry = second.get(pid)
-            if entry is None:
-                return False
-            pid, seen = entry[0], seen + 1
-        return False
+    resumed = time.monotonic()
+    second = process_table()
+    elapsed = max(1e-3, (resumed + time.monotonic() - began - scanned) / 2)
     ticks = os.sysconf("SC_CLK_TCK")
-    sessions = {}
-    for pid, (_, session, used, start) in second.items():
+
+    # A process's own ticks and those of the children it reaped meanwhile,
+    # where a loop of short-lived commands spends its time. A child that
+    # ended within the sample brought its parent its whole life's ticks, so
+    # what it had used before the sample comes off again.
+    before_sample = collections.Counter()
+    for pid, before in first.items():
+        after = second.get(pid)
+        if after is None or after.start != before.start:
+            before_sample[before.parent] += before.own + before.reaped
+    used = {}
+    for pid, after in second.items():
+        spent = after.own + after.reaped
         before = first.get(pid)
-        # Session 0 is the kernel's own threads.
-        if session == 0 or before is None or before[3] != start or pid == os.getpid() or in_build(pid):
+        # One that started within the sample used nothing before it.
+        if before is not None and before.start == after.start:
+            spent -= before.own + before.reaped + before_sample[pid]
+        used[pid] = max(0, spent) / ticks / elapsed
+
+    def marks(pid):
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as file:
+                entries = file.read().split(b"\0")
+        except OSError:
+            return {}
+        found = {}
+        for entry in entries:
+            key, _, value = entry.decode(errors="replace").partition("=")
+            if key in (HELD_MARK, SLOT_MARK):
+                found[key] = value
+        return found
+
+    def builds_itself(pid):
+        if pid in roots:
+            return True
+        found = marks(pid)
+        held = found.get(HELD_MARK, "")
+        if held.isdigit() and int(held) in roots or found.get(SLOT_MARK) in slots:
+            return True
+        try:
+            directory = os.readlink(f"/proc/{pid}/cwd")
+        except OSError:
+            return False
+        return any(directory == slot or directory.startswith(slot + "/") for slot in slots)
+
+    verdicts = {}
+    def in_build(pid):
+        chain, verdict = [], False
+        while pid > 1 and len(chain) < 128:
+            if pid in verdicts:
+                verdict = verdicts[pid]
+                break
+            chain.append(pid)
+            if builds_itself(pid):
+                verdict = True
+                break
+            entry = second.get(pid) or first.get(pid)
+            if entry is None:
+                break
+            pid = entry.parent
+        for link in chain:
+            verdicts[link] = verdict
+        return verdict
+
+    builds = others = 0.0
+    sessions = {}
+    for pid, share in used.items():
+        if share <= 0 or pid == os.getpid():
             continue
-        share = (used - before[2]) / ticks / interval * 100
-        if share <= 0:
+        if in_build(pid):
+            builds += share
             continue
-        total, count, top = sessions.get(session, (0.0, 0, (0.0, pid)))
-        sessions[session] = (total + share, count + 1, max(top, (share, pid)))
+        others += share
+        # Session 0 is the kernel's own threads, which no one can end.
+        session = second[pid].session
+        if session != 0:
+            total, top = sessions.get(session, (0.0, (0.0, pid)))
+            sessions[session] = (total + share, max(top, (share, pid)))
+
     def command_of(pid):
         try:
             with open(f"/proc/{pid}/cmdline", "rb") as file:
@@ -880,34 +1034,78 @@ def busiest(builds, interval=1.0, shown=None):
         except OSError:
             text = ""
         text = " ".join(text.split())
-        return (text[:60] + "...") if len(text) > 63 else (text or "?")
+        if not text:
+            # Ended since, or a kernel thread: the name it was sampled with.
+            entry = first.get(pid) or second.get(pid)
+            text = entry.name if entry else "?"
+        return (text[:60] + "...") if len(text) > 63 else text
+
     def age_of(pid):
         try:
             with open("/proc/uptime") as file:
                 up = float(file.read().split()[0])
-            started = second[pid][3] / ticks
-        except (OSError, KeyError, ValueError, IndexError):
+        except (OSError, ValueError, IndexError):
             return "?"
-        seconds = max(0, int(up - started))
+        entry = second.get(pid) or first.get(pid)
+        if entry is None:
+            return "?"
+        seconds = max(0, int(up - entry.start / ticks))
         if seconds >= 86400:
             return f"{seconds // 86400}d{seconds % 86400 // 3600}h"
         if seconds >= 3600:
             return f"{seconds // 3600}h{seconds % 3600 // 60}m"
-        return f"{seconds // 60}m"
-    # More, for tests whose own load must show however busy their host is.
-    shown = shown or int(os.environ.get("CAGENTS_OFFLOAD_BUSIEST_SHOWN") or 3)
+        if seconds >= 60:
+            return f"{seconds // 60}m"
+        return f"{seconds}s"
+
+    def members(session):
+        return sum(1 for pid, entry in second.items()
+                   if entry.session == session and pid != os.getpid() and not in_build(pid))
+
+    # More, and less busy, for tests whose own load must show however busy
+    # their host is.
+    try:
+        shown = shown or max(1, int(os.environ.get("CAGENTS_OFFLOAD_BUSIEST_SHOWN") or 3))
+    except ValueError:
+        shown = 3
+    try:
+        least = float(os.environ.get("CAGENTS_OFFLOAD_BUSIEST_LEAST") or 0.5)
+    except ValueError:
+        least = 0.5
+    if not 0 <= least < float("inf"):
+        least = 0.5
     ranked = sorted(sessions.items(), key=lambda item: -item[1][0])
+    named = [item for item in ranked[:shown] if item[1][0] >= least]
+    rest = ranked[len(named):]
+    totals = f"builds use {cpu_count(builds)} and everything else {cpu_count(others)}"
+    if not named:
+        if others < max(1.0, builds / 4):
+            if builds >= 1:
+                return f"nothing else uses much; the running builds hold them: {totals}"
+            return f"nothing uses much at the moment: {totals}"
+        return f"{totals}, though no session outside them uses half a CPU"
     parts = []
-    for session, (total, count, (_, top)) in ranked[:shown]:
-        if total < 50:
-            break
-        leader = session if session in second else top
-        part = f"{total:.0f}% from {count} process{'es' if count != 1 else ''} of session {session}"
-        part += f" ({command_of(leader)}, started {age_of(leader)} ago)"
-        if top != leader:
-            part += f", most in pid {top} ({command_of(top)})"
+    for session, (total, (_, top)) in named:
+        count = members(session)
+        processes = f"{count} process{'es' if count != 1 else ''}"
+        leader = second.get(session)
+        if leader is not None and leader.session == session:
+            part = (f"session {session} ({command_of(session)}, started {age_of(session)} ago): "
+                    f"{cpu_count(total)} in {processes}")
+            if top != session:
+                part += f", most in pid {top} ({command_of(top)})"
+        else:
+            part = (f"session {session}, whose leader has exited: {cpu_count(total)} in "
+                    f"{processes}, most in pid {top} ({command_of(top)}, started {age_of(top)} ago)")
         parts.append(part)
-    return "; ".join(parts) or None
+    text = f"{totals}; besides builds, the CPUs go to " + "; ".join(parts)
+    if rest:
+        more = sum(total for _, (total, _) in rest)
+        text += f"; and {len(rest)} more session{'s' if len(rest) != 1 else ''} using {cpu_count(more)}"
+    text += f". `pkill -s {named[0][0]}`{f' on {on}' if on else ''} ends the first"
+    if bounded:
+        text += f"; `{bounded} --list` shows the workloads bounded to their session"
+    return text
 
 
 # Where this host's builds record themselves, whichever slot family runs
@@ -1359,10 +1557,12 @@ if command == "lease":
             record_refusal(slot, refused_since, now)
         if why.split()[0] != waiting:
             if why.startswith("cpu "):
-                # Named once, as the wait starts: sampling takes a second.
-                culprits = busiest([pid for _, pid in running_builds(base, slot) if isinstance(pid, int)])
-                if culprits:
-                    why = f"{why} -- {culprits}"
+                # Named once, as the wait starts, outside the decision:
+                # sampling takes a second.
+                holders = [pid for _, pid in running_builds(base, slot) if isinstance(pid, int)]
+                locks = [os.path.join(base, f"slot-{index}", "lock") for index in slot_indices(base)
+                         if os.path.join(base, f"slot-{index}") != slot]
+                why = f"{why} -- {busiest(holders, locks, on=os.uname().nodename)}"
             say("wait", why)
             announced = True
             waiting = why.split()[0]
@@ -1466,10 +1666,18 @@ elif command == "prune":
             os.rmdir(directory)
 
 elif command == "busiest":
-    # For scripts/cargo-gate's own wait on this host; `base` is unused.
-    culprits = busiest([int(pid) for pid in sys.argv[3:] if pid.isdigit()])
-    if culprits:
-        print(culprits)
+    # For scripts/cargo-gate's own wait on this host; `base` is unused. After
+    # an optional `--bounded PATH`, each argument is a running build's holder
+    # or one of the gate's slot locks.
+    arguments, bounded = sys.argv[3:], None
+    if arguments[:1] == ["--bounded"] and len(arguments) > 1:
+        bounded, arguments = arguments[1], arguments[2:]
+        # As the caller would type it here.
+        relative = os.path.relpath(bounded)
+        if not relative.startswith(".."):
+            bounded = relative if "/" in relative else f"./{relative}"
+    print(busiest([int(word) for word in arguments if word.isdigit()],
+                  [word for word in arguments if not word.isdigit()], bounded=bounded))
 
 elif command == "exists":
     # Whether a result the caller may copy back is there.
@@ -1531,6 +1739,8 @@ elif command == "run":
     # limited to 108 bytes. The slot runs one command at a time, so whatever
     # the last one left there is stale.
     environment["TMPDIR"] = temporary = temporary_directory(base)
+    # What the command starts is this build's, whichever session it moves to.
+    environment[SLOT_MARK] = os.path.realpath(base)
     clear(temporary)
     os.makedirs(temporary, mode=0o700, exist_ok=True)
 
@@ -2020,10 +2230,11 @@ class Offload:
                         say(f"waiting for memory on {self.host}: its memory pressure is "
                             f"{words[2]}%, at or above the {words[3]}% limit")
                     elif reason == "cpu":
+                        # What holds them there, after a host that names it.
                         culprits = line.split(" -- ", 1)[1] if " -- " in line else ""
                         say(f"waiting for CPU on {self.host}: its CPU pressure is "
                             f"{words[2]}%, at or above the {words[3]}% limit"
-                            + (f"; besides builds, the CPUs go to {culprits}" if culprits else ""))
+                            + (f"; {culprits}" if culprits else ""))
                     elif reason == "same":
                         say(f"waiting for the same build of this checkout on {self.host} to "
                             f"finish, which leaves this one little to compile")
@@ -2566,7 +2777,8 @@ def main(arguments):
     if arguments[:1] == ["--loopback-shell"]:
         return loopback_shell(arguments[1:])
     if arguments[:1] == ["--busiest"]:
-        # What holds this host's CPUs besides the builds whose PIDs follow.
+        # What holds this host's CPUs besides the builds that the PIDs and
+        # slot locks which follow are of.
         sys.argv = ["cargo-offload", "busiest", "~", *arguments[1:]]
         exec(compile(REMOTE_AGENT, "cargo-offload", "exec"), {"__name__": "cargo-offload-agent"})
         return 0
