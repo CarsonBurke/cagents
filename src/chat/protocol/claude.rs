@@ -10833,13 +10833,14 @@ mod tests {
                     assert!(context.events.is_empty(), "{marker}: {context:?}");
                     assert!(adapter.carrier_items["internal"].is_empty());
                 } else {
-                    assert_eq!(
-                        deliveries(&context),
-                        vec![(
-                            Role::System,
-                            context_item("internal:0".into(), body.into()).content
-                        )]
-                    );
+                    // Only the transcript's own summary flag names a
+                    // compaction; the broader flags stay generic context.
+                    let expected = if marker == "isCompactSummary" {
+                        compaction_item("internal:0".into(), body.into())
+                    } else {
+                        context_item("internal:0".into(), body.into())
+                    };
+                    assert_eq!(deliveries(&context), vec![(Role::System, expected.content)]);
                     assert_eq!(adapter.carrier_items["internal"], vec!["internal:0"]);
                 }
 
@@ -10985,7 +10986,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["wire:0", "raw-summary:0", "tail:0"]
         );
-        assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && summary == "Claude context" && original.as_bytes() == body.as_bytes())));
+        assert!(contexts.iter().all(|item| matches!(&item.content, ItemContent::Delivery { kind: DeliveryKind::Notice, from, sender, summary, body: original } if from.is_empty() && sender.is_empty() && *summary == if item.id == "raw-summary:0" { COMPACTED } else { "Claude context" } && original.as_bytes() == body.as_bytes())));
         source.rewind().unwrap();
         let mut after = String::new();
         source.read_to_string(&mut after).unwrap();
@@ -11096,14 +11097,26 @@ mod tests {
             Claude::default()
                 .history_message(&records[0], &mut restored)
                 .unwrap();
-            let wire = Claude::default().receive(json!({"type":"user","uuid":"summary","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":body}]}})).unwrap();
+            // On the wire a summary follows its compaction boundary.
+            let summary = flags["isCompactSummary"] == true;
+            let mut adapter = Claude::default();
+            if summary {
+                adapter
+                    .receive(
+                        json!({"type":"system","subtype":"compact_boundary","uuid":"boundary"}),
+                    )
+                    .unwrap();
+            }
+            let wire = adapter.receive(json!({"type":"user","uuid":"summary","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":body}]}})).unwrap();
             assert_eq!(deliveries(&restored), deliveries(&wire));
+            let expected = if summary {
+                compaction_item("summary:0".into(), body.into())
+            } else {
+                context_item("summary:0".into(), body.into())
+            };
             assert_eq!(
                 deliveries(&restored),
-                vec![(
-                    Role::System,
-                    context_item("summary:0".into(), body.into()).content
-                )]
+                vec![(Role::System, expected.content)]
             );
         }
     }
