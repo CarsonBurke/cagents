@@ -448,14 +448,16 @@ everything in the session, as `pkill -s` would end it. The message points at
 after 10 seconds, as reading a process stuck on a hung mount can block:
 
 ```
-cargo-gate: builds use 14.2 CPUs and everything else 17.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 16.9 CPUs in 17 processes, most in pid 2272069 (sh -c while :; do true; done); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
+cargo-gate: builds use 6.2 CPUs and everything else 9.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 8.9 CPUs in 11 processes, most in pid 2272069 (python3 -I stress.py --workers 8); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
 ```
 
 When no other session uses half a CPU, and everything else together uses
-less than a CPU or a quarter of what the builds use, the message begins
-`nothing else uses much; the running builds hold them` instead, or `nothing
-uses much at the moment` when the builds use less than half a CPU and less
-than everything else. When everything else uses more than that, but no
+less than one CPU, or less than a quarter of what the builds use when that is
+more, the message begins `nothing else uses much; the running builds hold
+them` instead. It begins `nothing uses much at the moment` when the builds
+use less than half a CPU, less than everything else, or, with everything
+else, less than half the host's CPUs: pressure is a ten-second average, so a
+wait can follow a burst that has already ended. When everything else uses more than that, but no
 session half a CPU, it ends `though no session outside them uses half a
 CPU`.
 

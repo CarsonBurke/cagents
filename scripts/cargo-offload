@@ -934,6 +934,11 @@ def recorded_builds():
     return found
 
 
+def host_cpus():
+    """The CPUs the whole host's pressure is over."""
+    return os.cpu_count() or 1
+
+
 def cpu_count(amount):
     figure = f"{amount:.1f}"
     return f"{figure} CPU" if figure == "1.0" else f"{figure} CPUs"
@@ -1005,7 +1010,7 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
         before_sample[ancestor] += before.own + before.reaped
     # Whatever is misattributed, as to a subreaper that took a child over
     # meanwhile, no process uses more than every CPU.
-    cpus = os.cpu_count() or 1
+    cpus = host_cpus()
     used = {}
     for pid, after in second.items():
         spent = after.own + after.reaped
@@ -1095,7 +1100,9 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
             # Ended since, or a kernel thread: the name it was sampled with.
             entry = first.get(pid) or second.get(pid)
             text = entry.name if entry else "?"
-        # On one line, whatever a command or name holds.
+        # On one line, and printable, whatever a command or name holds: an
+        # escape sequence in one must not reach the terminal showing it.
+        text = "".join(char if char.isprintable() else " " for char in text)
         text = " ".join(text.split()) or "?"
         return (text[:60] + "...") if len(text) > 63 else text
 
@@ -1178,9 +1185,12 @@ def busiest(pids=(), locks=(), interval=1.0, shown=None, there=False, bounded=No
     totals = f"builds use {cpu_count(builds)} and everything else {cpu_count(others)}"
     if not named:
         if others < max(1.0, builds / 4):
-            if builds >= max(0.5, others):
+            # Pressure is a ten-second average, so a wait can follow a burst
+            # that has since ended: builds hold the CPUs only when, with the
+            # rest, they keep at least half of them busy.
+            if builds >= max(0.5, others) and builds + others >= cpus / 2:
                 return f"nothing else uses much; the running builds hold them: {totals}"
-            return f"nothing uses much at the moment: {totals}"
+            return f"nothing uses much at the moment: {totals}, of {cpus} in all"
         least_text = "half a CPU" if least == 0.5 else cpu_count(least)
         return f"{totals}, though no session outside them uses {least_text}"
     parts = []

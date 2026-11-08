@@ -445,7 +445,7 @@ name_culprits() {
     # this gate, or in the checkout it runs for, when that is this project's.
     bounded=$here/bounded
     if [ ! -x "$bounded" ]; then
-        top=$(git rev-parse --show-toplevel 2>/dev/null) || top=
+        top=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; git rev-parse --show-toplevel) || top=
         bounded=
         [ -z "$top" ] || [ ! -f "$top/scripts/cargo-gate" ] || bounded=$top/scripts/bounded
     fi

@@ -306,6 +306,8 @@ class Busiest(unittest.TestCase):
 
     def setUp(self):
         self.scope = agent_scope()
+        # A host of two CPUs, whatever this one has.
+        self.scope["host_cpus"] = lambda: 2
         self.up = float(Path("/proc/uptime").read_text().split()[0])
 
     def test_a_loop_of_short_lived_commands_is_named_by_what_it_reaps(self):
@@ -332,7 +334,7 @@ class Busiest(unittest.TestCase):
         # Nothing is said to use more than every CPU, however its ticks came.
         text = self.busiest([self.process(shell, name="sh")],
                             [self.process(shell, reaped=10**6, name="sh")])
-        self.assertIn(f": {os.cpu_count()}.0 CPUs in 1 process", text)
+        self.assertIn(": 2.0 CPUs in 1 process", text)
 
     def test_a_session_whose_leader_has_exited_says_so(self):
         session, orphan = 5_000_010, 5_000_011
@@ -340,6 +342,14 @@ class Busiest(unittest.TestCase):
                             [self.process(orphan, session=session, own=1, age=45, name="runaway")])
         self.assertIn(f"session {session}, whose leader has exited: 1.0 CPU in 1 process, "
                       f"most in pid {orphan} (runaway, started 45s ago)", text)
+
+    def test_a_command_reaches_the_terminal_without_its_control_characters(self):
+        loop = 5_000_012
+        name = "spin\x1b]0;owned\x07\x1b[2Jloop"
+        text = self.busiest([self.process(loop, name=name)],
+                            [self.process(loop, own=1, name=name)])
+        self.assertIn("(spin ]0;owned [2Jloop, started", text)
+        self.assertFalse(any(not char.isprintable() for char in text), repr(text))
 
     def test_the_running_builds_holding_the_cpus_is_said_outright(self):
         build, detached, other = 5_000_020, 5_000_021, 5_000_022
@@ -350,11 +360,18 @@ class Busiest(unittest.TestCase):
                          "nothing else uses much; the running builds hold them: "
                          "builds use 3.0 CPUs and everything else 0.1 CPUs")
         # One build compiling a crate on one CPU holds them as surely.
-        self.assertEqual(self.busiest(first, [self.process(build, own=0.9)], pids=[build]),
+        self.assertEqual(self.busiest(first, [self.process(build, own=1.0)], pids=[build]),
                          "nothing else uses much; the running builds hold them: "
-                         "builds use 0.9 CPUs and everything else 0.0 CPUs")
+                         "builds use 1.0 CPU and everything else 0.0 CPUs")
         self.assertEqual(self.busiest(first, [self.process(other, own=0.1)]),
-                         "nothing uses much at the moment: builds use 0.0 CPUs and everything else 0.1 CPUs")
+                         "nothing uses much at the moment: builds use 0.0 CPUs and everything else "
+                         "0.1 CPUs, of 2 in all")
+        # Pressure averages ten seconds, so it can outlast a burst: builds
+        # leaving most CPUs idle don't hold them.
+        self.scope["host_cpus"] = lambda: 16
+        self.assertEqual(self.busiest(first, [self.process(build, own=3)], pids=[build]),
+                         "nothing uses much at the moment: builds use 3.0 CPUs and everything else "
+                         "0.0 CPUs, of 16 in all")
 
     def test_the_rate_is_over_the_time_the_sample_took(self):
         sessions = [5_000_030 + index for index in range(5)]
