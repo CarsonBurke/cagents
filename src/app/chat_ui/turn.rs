@@ -16,8 +16,12 @@
 //! work that follows belongs to the next group.
 
 use super::coordination::Coordinated;
+use super::tool_title::{Title, verb};
 use crate::chat::{self, Item, ItemContent, Phase, Role, ToolStatus};
-use std::{borrow::Borrow, collections::HashSet};
+use std::{
+    borrow::{Borrow, Cow},
+    collections::HashSet,
+};
 
 /// Where an item belongs inside its group.
 ///
@@ -156,11 +160,7 @@ impl Turn {
     }
 
     /// Fills in the summary once the group's membership is final.
-    fn describe<'c, T: Borrow<Item>>(
-        &mut self,
-        items: &[T],
-        coordinated: &impl Fn(&Item) -> Option<&'c Coordinated>,
-    ) {
+    fn describe<'c, T: Borrow<Item>>(&mut self, items: &[T], presented: &impl Presented<'c>) {
         // A single step names itself, because "1 step" tells the reader
         // nothing they could not see from the row's absence. Several steps are
         // counted, with a failure called out, because that is the one thing a
@@ -169,22 +169,32 @@ impl Turn {
             // A group that did no work draws no strip, so it needs no line.
             [] => return,
             [only] => match items.get(only.index).map(Borrow::borrow) {
-                Some(item) => {
-                    if let Some(coordinated) = coordinated(item) {
-                        coordinated.summary()
-                    } else {
-                        let verb = step_verb(&item.content);
-                        let label = step_label(&item.content);
-                        if verb.is_empty() {
-                            label.to_owned()
-                        } else {
-                            format!("{verb} {label}")
-                        }
+                Some(item) => headline(if let Some(coordinated) = presented.coordinated(item) {
+                    coordinated.summary()
+                } else if let ItemContent::Tool {
+                    name,
+                    input,
+                    status,
+                    ..
+                } = &item.content
+                {
+                    // A call whose presentation is not formed yet, as
+                    // one that just changed, is read here once.
+                    match presented.titled(item) {
+                        Some(title) => title.line(),
+                        None => Title::of(name, input, *status).line(),
                     }
-                }
+                } else {
+                    let (verb, label) = step_title(&item.content, None);
+                    if verb.is_empty() {
+                        label.into_owned()
+                    } else {
+                        format!("{verb} {label}")
+                    }
+                }),
                 None => "1 step".to_owned(),
             },
-            steps => summarize_steps(steps, items, coordinated)
+            steps => summarize_steps(steps, items, presented)
                 .unwrap_or_else(|| format!("{} steps", steps.len())),
         };
         // Still working outranks how the finished steps went, because a
@@ -301,13 +311,15 @@ enum Open {
 /// the reader genuinely sent back to back land in one group as well, which is
 /// right for the same reason: there is no activity between them to attribute.
 ///
-/// `coordinated` reads what an item did to work with other agents: a message
-/// or a launch is drawn as a card among the prose rather than as a step.
+/// `presented` reads what an item did to work with other agents, where a
+/// message or a launch is drawn as a card among the prose rather than as a
+/// step, and the titles that name a group of one tool call.
 pub(super) fn group<'c, T: Borrow<Item>>(
     items: &[T],
     asked_after: &HashSet<String>,
-    coordinated: impl Fn(&Item) -> Option<&'c Coordinated>,
+    presented: impl Presented<'c>,
 ) -> Vec<Turn> {
+    let coordinated = |item: &Item| presented.coordinated(item);
     let mut turns: Vec<Turn> = Vec::new();
     let mut state = Open::Closed;
     for (index, item) in items.iter().map(Borrow::borrow).enumerate() {
@@ -377,7 +389,7 @@ pub(super) fn group<'c, T: Borrow<Item>>(
         };
     }
     for turn in &mut turns {
-        turn.describe(items, &coordinated);
+        turn.describe(items, &presented);
     }
     turns
 }
@@ -414,6 +426,25 @@ fn renders(content: &ItemContent) -> bool {
     }
 }
 
+/// What grouping reads from items' presentations: what an item did to work
+/// with other agents, and what a plain tool call's row says it did. Both
+/// are formed once per change to an item and kept with its presentation.
+///
+/// A closure over coordination alone is one, with no titles kept: a group
+/// that is a single tool call then reads that call's input to name itself.
+pub(super) trait Presented<'c> {
+    fn coordinated(&self, item: &Item) -> Option<&'c Coordinated>;
+    fn titled(&self, _item: &Item) -> Option<&'c Title> {
+        None
+    }
+}
+
+impl<'c, F: Fn(&Item) -> Option<&'c Coordinated>> Presented<'c> for F {
+    fn coordinated(&self, item: &Item) -> Option<&'c Coordinated> {
+        self(item)
+    }
+}
+
 /// Where an item belongs inside its group.
 ///
 /// A session notice is filed with the agent's own narration: it is the
@@ -444,8 +475,8 @@ pub(super) fn slot_of(item: &Item) -> Slot {
 /// one, because the provider knows what it was doing; the fallbacks exist so an
 /// adapter that cannot supply a label still produces something a reader can act
 /// on rather than the word "Tool".
-pub(super) fn step_label(content: &ItemContent) -> &str {
-    match content {
+pub(super) fn step_label(content: &ItemContent) -> Cow<'_, str> {
+    Cow::Borrowed(match content {
         ItemContent::Text { .. } => "Thinking",
         ItemContent::Command {
             label,
@@ -477,11 +508,16 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
             // An edit whose input is still arriving: what it changes, and so
             // whether it adds or edits a file, is not known yet.
             [] if *status == ToolStatus::Running => "Preparing an edit",
+            // One that ended without describing its change still edited,
+            // or tried to edit, something.
+            [] => "a file",
             [single] => single.path.as_str(),
-            _ => "File changes",
+            changes => return Cow::Owned(format!("{} files", changes.len())),
         },
         ItemContent::WebSearch { query, .. } => query.as_str(),
-        ItemContent::Tool { name, .. } => name.as_str(),
+        // Its input is not read here: a row's title is formed once, with
+        // its presentation (see `step_title`).
+        ItemContent::Tool { name, .. } => return Cow::Owned(Title::unread(name).label),
         ItemContent::Image { description, .. } => description.as_str(),
         // As `chat::delivery_heading` has it, less a named sender's summary.
         ItemContent::Delivery {
@@ -498,7 +534,7 @@ pub(super) fn step_label(content: &ItemContent) -> &str {
                 sender.get(..8).unwrap_or(sender)
             }
         }
-    }
+    })
 }
 
 /// What a provider said a shell command was for, when it said something the
@@ -550,29 +586,55 @@ fn target(action: chat::CommandAction, label: &str) -> &str {
     }
 }
 
+/// A step's verb and label together. A plain tool call's are its `title`,
+/// formed once from its input when the call changed; nothing here reads the
+/// input, so a row drawn before its title is formed names its tool alone.
+pub(super) fn step_title<'a>(
+    content: &'a ItemContent,
+    title: Option<&'a Title>,
+) -> (&'static str, Cow<'a, str>) {
+    match (content, title) {
+        (ItemContent::Tool { .. }, Some(title)) => (title.verb, Cow::Borrowed(&title.label)),
+        (content, _) => (step_verb(content), step_label(content)),
+    }
+}
+
 /// The verb a step is introduced with, kept separate from its target so the two
 /// can be typeset differently.
 pub(super) fn step_verb(content: &ItemContent) -> &'static str {
     match content {
         ItemContent::Text { .. } => "",
-        ItemContent::Command { action, .. } => match action {
-            chat::CommandAction::Read => "Read",
-            chat::CommandAction::Search => "Searched",
-            chat::CommandAction::List => "Listed",
-            chat::CommandAction::Run => "Ran",
-        },
+        // A step says what it is doing while it runs, and what it tried
+        // when it did not happen; its status says why.
+        ItemContent::Command { action, status, .. } => match action {
+            chat::CommandAction::Read => verb("Reading", "Read", "Tried to read"),
+            chat::CommandAction::Search => verb("Searching", "Searched", "Tried to search"),
+            chat::CommandAction::List => verb("Listing", "Listed", "Tried to list"),
+            // A command that failed or was stopped did run, and its exit
+            // code says how it ended; only a refused one never ran.
+            chat::CommandAction::Run if *status == ToolStatus::Denied => {
+                return "Tried to run";
+            }
+            chat::CommandAction::Run => verb("Running", "Ran", "Ran"),
+        }
+        .said(*status),
         ItemContent::Changes { changes, status } => match changes.as_slice() {
-            [] if *status == ToolStatus::Running => "",
+            // An edit whose input is still arriving names no verb yet.
+            [] if *status == ToolStatus::Running => return "",
             [single] => match single.kind {
-                chat::ChangeKind::Added => "Added",
-                chat::ChangeKind::Deleted => "Deleted",
-                chat::ChangeKind::Updated => "Edited",
-                chat::ChangeKind::Renamed { .. } => "Renamed",
+                chat::ChangeKind::Added => verb("Adding", "Added", "Tried to add"),
+                chat::ChangeKind::Deleted => verb("Deleting", "Deleted", "Tried to delete"),
+                chat::ChangeKind::Updated => verb("Editing", "Edited", "Tried to edit"),
+                chat::ChangeKind::Renamed { .. } => verb("Renaming", "Renamed", "Tried to rename"),
             },
-            _ => "Edited",
-        },
+            _ => verb("Editing", "Edited", "Tried to edit"),
+        }
+        .said(*status),
+        // A search reported before its query, as Codex can, says only that
+        // it searched rather than leaving "for" without what followed it.
+        ItemContent::WebSearch { query, .. } if query.trim().is_empty() => "Searched the web",
         ItemContent::WebSearch { .. } => "Searched the web for",
-        ItemContent::Tool { .. } => "Called",
+        ItemContent::Tool { .. } => "",
         ItemContent::Image { .. } => "Viewed",
         ItemContent::Delivery { from, summary, .. } if from.is_empty() && !summary.is_empty() => "",
         ItemContent::Delivery { kind, .. } => kind.verb(),
@@ -587,10 +649,10 @@ pub(super) fn step_verb(content: &ItemContent) -> &'static str {
 fn summarize_steps<'c, T: Borrow<Item>>(
     steps: &[Placed],
     items: &[T],
-    coordinated: &impl Fn(&Item) -> Option<&'c Coordinated>,
+    presented: &impl Presented<'c>,
 ) -> Option<String> {
     let mut edited = std::collections::BTreeSet::new();
-    let (mut ran, mut read, mut searched, mut listed, mut web, mut called, mut viewed) =
+    let (mut ran, mut read, mut searched, mut listed, mut web, mut used, mut viewed) =
         (0, 0, 0, 0, 0, 0, 0);
     // An edit whose input is still arriving names no file yet, and a
     // summary that left it out would hide a step that is still working.
@@ -598,7 +660,10 @@ fn summarize_steps<'c, T: Borrow<Item>>(
     let mut coordinating = 0;
     for placed in steps {
         let item = items.get(placed.index)?.borrow();
-        if coordinated(item).is_some_and(|coordinated| coordinated.reading.involves_agents()) {
+        if presented
+            .coordinated(item)
+            .is_some_and(|coordinated| coordinated.reading.involves_agents())
+        {
             coordinating += 1;
             continue;
         }
@@ -618,7 +683,7 @@ fn summarize_steps<'c, T: Borrow<Item>>(
                 chat::CommandAction::List => listed += 1,
             },
             ItemContent::WebSearch { .. } => web += 1,
-            ItemContent::Tool { .. } => called += 1,
+            ItemContent::Tool { .. } => used += 1,
             ItemContent::Image { .. } => viewed += 1,
             ItemContent::Text { .. } | ItemContent::Delivery { .. } => {}
         }
@@ -658,8 +723,8 @@ fn summarize_steps<'c, T: Borrow<Item>>(
             count => format!("searched the web {count} times"),
         });
     }
-    if called > 0 {
-        parts.push(format!("called {}", counted(called, "tool", "tools")));
+    if used > 0 {
+        parts.push(format!("used {}", counted(used, "tool", "tools")));
     }
     if viewed > 0 {
         parts.push(format!("viewed {}", counted(viewed, "image", "images")));
@@ -680,6 +745,32 @@ fn summarize_steps<'c, T: Borrow<Item>>(
 /// offered none. A heredoc or a multi-line pipeline would otherwise push the
 /// whole script into a one-line summary.
 pub(super) fn first_line(command: &str) -> &str {
+    first_line_of(command)
+}
+
+/// The longest summary a group of one step keeps. The strip draws it on one
+/// line and cuts it to the pane; this only bounds the text shaped for that,
+/// as a one-line script can run to thousands of characters.
+const SUMMARY_LIMIT: usize = 240;
+
+/// A single step's summary, on one line and bounded for the strip.
+/// Text cut from it, a later line or the end of a long one, is marked with an
+/// ellipsis; the full text stays in the open step.
+fn headline(summary: String) -> String {
+    let line = first_line_of(&summary);
+    let more_lines = line.len() < summary.trim().len();
+    if !more_lines && line.len() == summary.len() && line.chars().count() <= SUMMARY_LIMIT {
+        return summary;
+    }
+    let mut chars = line.chars();
+    let mut shown: String = chars.by_ref().take(SUMMARY_LIMIT).collect();
+    if more_lines || chars.next().is_some() {
+        shown.push('…');
+    }
+    shown
+}
+
+fn first_line_of(command: &str) -> &str {
     let line = command.trim();
     match line.find('\n') {
         Some(end) => line[..end].trim_end(),
@@ -1413,7 +1504,8 @@ mod tests {
                 started_at: None,
                 at: None,
             }];
-            assert_eq!(group(&items, &unasked(), plain)[0].summary, row);
+            // The strip's one line drops a label's trailing space.
+            assert_eq!(group(&items, &unasked(), plain)[0].summary, row.trim_end());
         }
     }
 
@@ -1506,6 +1598,14 @@ mod tests {
                 status,
             };
             assert_ne!(step_label(&content), "Preparing an edit");
+            assert_eq!(
+                format!("{} {}", step_verb(&content), step_label(&content)),
+                if status == ToolStatus::Failed {
+                    "Tried to edit a file"
+                } else {
+                    "Edited a file"
+                }
+            );
         }
     }
 
@@ -1531,6 +1631,125 @@ mod tests {
         assert_eq!(
             turns[0].summary,
             "Preparing an edit, ran a command · working"
+        );
+    }
+
+    /// A group of one step names it on one line, bounded, however long the
+    /// script it ran: the strip cuts it to the pane and the open row shows
+    /// the whole of it.
+    #[test]
+    fn a_one_step_summary_is_one_bounded_line() {
+        let mut item = command("c1", ToolStatus::Succeeded);
+        if let ItemContent::Command { command, .. } = &mut item.content {
+            *command = format!("cd /tmp; {}\necho second line", "echo x; ".repeat(100));
+        }
+        let items = vec![text("u1", Role::User, Phase::Final, false), item];
+        let summary = &group(&items, &unasked(), plain)[0].summary;
+        assert!(summary.starts_with("Ran cd /tmp; echo x;"), "{summary}");
+        assert!(!summary.contains('\n'), "{summary}");
+        assert_eq!(summary.chars().count(), SUMMARY_LIMIT + 1, "{summary}");
+        assert!(summary.ends_with('…'));
+        // A short first line still says that more follows.
+        assert_eq!(
+            headline("Ran cat <<EOF\nbody\nEOF".into()),
+            "Ran cat <<EOF…"
+        );
+        assert_eq!(headline("Ran ls".into()), "Ran ls");
+    }
+
+    /// A step's verb says how it stands: under way, done, or tried and not
+    /// done. A command that failed still ran; a refused one did not.
+    #[test]
+    fn a_steps_verb_follows_its_status() {
+        let ran = |action, status| {
+            let mut item = command("c", status);
+            if let ItemContent::Command { action: kind, .. } = &mut item.content {
+                *kind = action;
+            }
+            step_verb(&item.content)
+        };
+        use CommandAction::{Read, Run};
+        assert_eq!(ran(Run, ToolStatus::Running), "Running");
+        assert_eq!(ran(Run, ToolStatus::Succeeded), "Ran");
+        assert_eq!(ran(Run, ToolStatus::Failed), "Ran");
+        assert_eq!(ran(Run, ToolStatus::Denied), "Tried to run");
+        assert_eq!(ran(Read, ToolStatus::Running), "Reading");
+        assert_eq!(ran(Read, ToolStatus::Failed), "Tried to read");
+        let edit = |status| ItemContent::Changes {
+            changes: vec![FileChange {
+                path: "a.rs".into(),
+                kind: ChangeKind::Updated,
+                diff: String::new(),
+            }],
+            status,
+        };
+        assert_eq!(step_verb(&edit(ToolStatus::Running)), "Editing");
+        assert_eq!(step_verb(&edit(ToolStatus::Succeeded)), "Edited");
+        assert_eq!(step_verb(&edit(ToolStatus::Denied)), "Tried to edit");
+        // A search reported before its query ends on what it did, not "for".
+        let search = |query: &str| ItemContent::WebSearch {
+            query: query.into(),
+            results: Vec::new(),
+        };
+        assert_eq!(step_verb(&search(" ")), "Searched the web");
+        assert_eq!(step_verb(&search("iced")), "Searched the web for");
+    }
+
+    /// Tool rows say what each call did, and the group counts them as tools
+    /// it used, so neither repeats "Called" on every line. A group of several
+    /// files counts them rather than reading "Edited File changes".
+    #[test]
+    fn tool_rows_say_what_they_did_and_groups_count_them_once() {
+        let tool = |id: &str, name: &str, input: &str| Item {
+            id: id.into(),
+            role: Role::Assistant,
+            content: ItemContent::Tool {
+                name: name.into(),
+                input: input.into(),
+                output: String::new(),
+                status: ToolStatus::Succeeded,
+            },
+            started_at: None,
+            at: None,
+        };
+        let skill = tool("t1", "Skill", r#"{"skill":"writing-copy"}"#);
+        let title = Title::of(
+            "Skill",
+            r#"{"skill":"writing-copy"}"#,
+            ToolStatus::Succeeded,
+        );
+        let (verb, label) = step_title(&skill.content, Some(&title));
+        assert_eq!((verb, label.as_ref()), ("Used skill", "writing-copy"));
+        // Without its title the row names the tool alone: nothing reads the
+        // call's input while drawing it.
+        assert_eq!(step_title(&skill.content, None), ("", "Skill".into()));
+        let items = vec![
+            text("u1", Role::User, Phase::Final, false),
+            skill,
+            tool("t2", "mcp__linear__get_issue", r#"{"id":"ENG-1"}"#),
+        ];
+        let turns = group(&items, &unasked(), plain);
+        assert_eq!(turns[0].summary, "Used 2 tools");
+        let only = vec![
+            text("u1", Role::User, Phase::Final, false),
+            tool("t1", "mcp__linear__get_issue", "{}"),
+        ];
+        assert_eq!(
+            group(&only, &unasked(), plain)[0].summary,
+            "Used Linear: get issue"
+        );
+        let change = |path: &str| chat::FileChange {
+            path: path.into(),
+            kind: chat::ChangeKind::Updated,
+            diff: String::new(),
+        };
+        let edits = ItemContent::Changes {
+            changes: vec![change("a.rs"), change("b.rs")],
+            status: ToolStatus::Succeeded,
+        };
+        assert_eq!(
+            format!("{} {}", step_verb(&edits), step_label(&edits)),
+            "Edited 2 files"
         );
     }
 }

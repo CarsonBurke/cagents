@@ -86,6 +86,61 @@ pub enum FailureKind {
     Capacity,
     Connection,
     Interrupted,
+    /// The system stopped the provider because memory ran out.
+    OutOfMemory,
+    /// The system stopped one of the provider's commands because memory ran
+    /// out; the provider kept running.
+    CommandOutOfMemory,
+    /// The provider process ended without being asked to.
+    Exited,
+}
+
+/// Opens the runtime's report of a provider that memory exhaustion ended.
+/// The runtime composes these; they are not provider text.
+pub const PROVIDER_OUT_OF_MEMORY: &str = "The system ran out of memory, so the agent was stopped.";
+/// Opens the runtime's report of a command that memory exhaustion ended
+/// while its provider kept running.
+pub const COMMAND_OUT_OF_MEMORY: &str =
+    "The system ran out of memory, so a command the agent started was stopped.";
+/// Opens the runtime's report of a provider process that exited on its own.
+pub const PROVIDER_EXITED: &str = "Provider exited with ";
+
+/// Whether a reported error tells of something the agent carried on past,
+/// rather than a failure of the conversation. It still gets its notice in
+/// the transcript, but the conversation's state does not become an error.
+pub fn is_notice(message: &str) -> bool {
+    message.trim_start().starts_with(COMMAND_OUT_OF_MEMORY)
+}
+
+/// What a runtime exit report says happened to the provider, in words: the
+/// signal or status itself stays in the details.
+fn exit_summary(name: &str, message: &str) -> String {
+    let status = message
+        .find(PROVIDER_EXITED)
+        .and_then(|at| message[at + PROVIDER_EXITED.len()..].lines().next())
+        .map(str::trim)
+        .unwrap_or_default();
+    if let Some(code) = status.strip_prefix("exit status: ") {
+        // A report can continue on the same line with the provider's output.
+        let end = code
+            .find(|c: char| !(c.is_ascii_digit() || c == '-'))
+            .unwrap_or(code.len());
+        if end > 0 {
+            return format!("{name} quit unexpectedly with code {}", &code[..end]);
+        }
+    }
+    // `9 (SIGKILL)`, possibly followed by `(core dumped)`.
+    let signal = status
+        .strip_prefix("signal: ")
+        .and_then(|signal| signal.split_once('('))
+        .and_then(|(_, name)| name.split_once(')'))
+        .map(|(name, _)| name.trim());
+    match signal {
+        Some("SIGKILL") => format!("{name} was force-stopped"),
+        Some("SIGTERM" | "SIGINT" | "SIGHUP" | "SIGQUIT") => format!("{name} was stopped"),
+        Some(_) => format!("{name} crashed"),
+        None => format!("{name} stopped unexpectedly"),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,9 +167,16 @@ impl<'a> Failure<'a> {
         let (structured_kind, signal) = classification_signal(&prefix)?;
         let lower = signal.to_ascii_lowercase();
         let contains = |needles: &[&str]| needles.iter().any(|s| lower.contains(s));
+        // The runtime's own exit reports lead their message; provider text
+        // never starts with them.
+        let runtime_report = signal.trim_start();
         let reached = reached_limit(&signal);
         let kind = if let Some(kind) = structured_kind {
             kind
+        } else if runtime_report.starts_with(PROVIDER_OUT_OF_MEMORY) {
+            FailureKind::OutOfMemory
+        } else if runtime_report.starts_with(COMMAND_OUT_OF_MEMORY) {
+            FailureKind::CommandOutOfMemory
         } else if reached.is_some()
             || contains(&[
                 "usage limit is reached",
@@ -165,6 +227,9 @@ impl<'a> Failure<'a> {
             "turn was interrupted",
         ]) {
             FailureKind::Interrupted
+        } else if runtime_report.starts_with(PROVIDER_EXITED) {
+            // Last: the output it carries often names a more specific cause.
+            FailureKind::Exited
         } else {
             return None;
         };
@@ -173,6 +238,9 @@ impl<'a> Failure<'a> {
             Provider::Codex => "Codex",
             Provider::Omp => "Oh My Pi",
         };
+        // What stopped is the provider's program, named as the stopped
+        // chat's controls name it, rather than its service.
+        let program = provider.label();
         let reset = (kind == FailureKind::AccountLimit)
             .then(|| reported_reset(&signal))
             .flatten();
@@ -196,6 +264,22 @@ impl<'a> Failure<'a> {
             FailureKind::Interrupted => (
                 format!("{name} request was interrupted"),
                 "Review the retained work before continuing.",
+            ),
+            FailureKind::OutOfMemory => (
+                format!("{program} stopped because the system ran out of memory"),
+                "The system stopped the agent to keep the computer responsive. Free up memory before you resume the conversation.",
+            ),
+            FailureKind::CommandOutOfMemory => (
+                // Its step reads "failed", as the agent reported it: this
+                // says why, in the same word.
+                "A command failed because the system ran out of memory".to_owned(),
+                "The system stopped the command to free memory. The agent is still running and sees the failure.",
+            ),
+            FailureKind::Exited => (
+                exit_summary(program, &signal),
+                // The stopped chat's bar offers what fits, Resume or Try
+                // again; this only says where the cause is.
+                "Details show what the agent reported before it stopped.",
             ),
         };
         if let Some(reset) = &reset {
@@ -928,6 +1012,96 @@ mod tests {
         assert_eq!(
             summary(Provider::Claude, "\nThe process exited\nwith details"),
             "The process exited"
+        );
+    }
+
+    #[test]
+    fn runtime_exit_reports_explain_the_stop_in_plain_words() {
+        let oom = format!(
+            "{PROVIDER_OUT_OF_MEMORY} systemd-oomd ended it and the commands it was running. Provider exited with signal: 9 (SIGKILL)"
+        );
+        let failure = Failure::parse(Provider::Claude, &oom).unwrap();
+        assert_eq!(failure.kind, FailureKind::OutOfMemory);
+        assert!(
+            failure.summary.contains("ran out of memory"),
+            "{}",
+            failure.summary
+        );
+        assert!(failure.action.contains("resume"), "{}", failure.action);
+        assert_eq!(
+            failure.summary,
+            "Claude Code stopped because the system ran out of memory"
+        );
+        assert_eq!(failure.details, oom);
+
+        let command = format!(
+            "{COMMAND_OUT_OF_MEMORY} systemd-oomd ended it (12 processes); the agent is still running."
+        );
+        let failure = Failure::parse(Provider::Codex, &command).unwrap();
+        assert_eq!(failure.kind, FailureKind::CommandOutOfMemory);
+        // The stopped command's step reads "failed"; the card agrees.
+        assert_eq!(
+            failure.summary,
+            "A command failed because the system ran out of memory"
+        );
+        assert!(
+            failure.action.contains("still running"),
+            "{}",
+            failure.action
+        );
+
+        for (raw, summary) in [
+            (
+                "Provider exited with signal: 9 (SIGKILL)",
+                "Claude Code was force-stopped",
+            ),
+            (
+                "Provider exited with signal: 6 (SIGABRT) (core dumped)",
+                "Claude Code crashed",
+            ),
+            (
+                "Provider exited with signal: 15 (SIGTERM)",
+                "Claude Code was stopped",
+            ),
+            (
+                "Provider exited with signal: 40",
+                "Claude Code stopped unexpectedly",
+            ),
+            (
+                "Provider exited with exit status: 3. Last ignored output: boom",
+                "Claude Code quit unexpectedly with code 3",
+            ),
+        ] {
+            let failure = Failure::parse(Provider::Claude, raw).unwrap();
+            assert_eq!(failure.kind, FailureKind::Exited, "{raw}");
+            assert_eq!(failure.summary, summary, "{raw}");
+            assert!(!failure.action.contains("Resume"), "{raw}");
+            assert_eq!(failure.details, raw);
+        }
+    }
+
+    #[test]
+    fn an_exit_whose_output_names_its_cause_keeps_that_cause() {
+        let limit = "Provider exited with exit status: 1. Last ignored output: You've hit your limit · resets 3pm";
+        assert_eq!(
+            Failure::parse(Provider::Claude, limit).unwrap().kind,
+            FailureKind::AccountLimit
+        );
+        let auth = "Provider exited with exit status: 1. Last ignored output: Invalid API key · Please run /login";
+        assert_eq!(
+            Failure::parse(Provider::Claude, auth).unwrap().kind,
+            FailureKind::Authentication
+        );
+    }
+
+    #[test]
+    fn provider_prose_mentioning_an_exit_is_not_a_runtime_report() {
+        // Only a report that leads with the runtime's own wording is one;
+        // the same words quoted later by a provider keep their own class.
+        let quoted = "Tool endpoint said: Provider exited with signal: 9 (SIGKILL)";
+        assert!(
+            Failure::parse(Provider::Claude, quoted)
+                .is_none_or(|failure| failure.kind != FailureKind::Exited)
         );
     }
 }

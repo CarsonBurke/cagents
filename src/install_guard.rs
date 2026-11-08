@@ -32,14 +32,21 @@ pub(crate) struct SourceInspectionRequest {
     pub(crate) require_resumable: bool,
     #[serde(default)]
     pub(crate) reconcile_retained: bool,
+    /// The person accepted that saved panes whose ended actor never recorded
+    /// its conversation are carried without reopening. Omitted when false, so
+    /// an ordinary request stays readable by an inspector that predates it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) accept_unreopenable: bool,
 }
 
 pub(crate) fn preflight_source_panes(
     guard: &UiUpdateGuard,
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
+    accept_unreopenable: bool,
 ) -> io::Result<()> {
-    crate::update::inspect_source_panes(guard, proof, require_resumable).map_err(io::Error::other)
+    crate::update::inspect_source_panes(guard, proof, require_resumable, accept_unreopenable)
+        .map_err(io::Error::other)
 }
 
 const RESULT_FD_ENV: &str = "CAGENTS_INSTALL_RESULT_FD";
@@ -240,6 +247,7 @@ pub(crate) fn run(
                 arguments
                     .iter()
                     .any(|argument| argument == "--restart-daemon"),
+                false,
             )
         })?
     };
@@ -654,6 +662,7 @@ pub(crate) fn wait_daemon_start(
 
 /// Reports once when the startup budget is crossed with the original child
 /// still running. Reporting failure cannot unwind child or caller-fence custody.
+/// The caller chooses where the command's stdout and stderr go.
 pub(crate) fn wait_daemon_start_with_progress(
     command: &mut Command,
     timeout: Duration,
@@ -662,7 +671,6 @@ pub(crate) fn wait_daemon_start_with_progress(
     let deadline = Instant::now() + timeout;
     let mut child = command
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
         .process_group(0)
         .spawn()
         .map_err(|error| DaemonStartError {
@@ -687,7 +695,9 @@ pub(crate) fn wait_daemon_start_with_progress(
                     Ok(())
                 } else {
                     Err(DaemonStartError {
-                        error: io::Error::other("The matched daemon startup command failed"),
+                        error: io::Error::other(format!(
+                            "The matched daemon startup command failed ({status})"
+                        )),
                         spawned: true,
                     })
                 };
@@ -924,7 +934,7 @@ mod tests {
         assert_eq!(error.error.kind(), io::ErrorKind::Other);
         assert_eq!(
             error.error.to_string(),
-            "The matched daemon startup command failed"
+            "The matched daemon startup command failed (exit status: 1)"
         );
         let root = tempfile::tempdir().unwrap();
         let error = wait_daemon_start(

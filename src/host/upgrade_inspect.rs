@@ -133,10 +133,16 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
 struct InspectionFailures {
     count: usize,
     details: Vec<String>,
+    /// Every distinct reason, so one pane retained by several saved windows
+    /// is one problem to resolve rather than one per store.
+    seen: HashSet<String>,
 }
 
 impl InspectionFailures {
     fn push(&mut self, reason: String) {
+        if !self.seen.insert(reason.clone()) {
+            return;
+        }
         self.count += 1;
         if self.details.len() < 40 {
             self.details.push(reason);
@@ -189,7 +195,10 @@ fn inspect(request: Request) -> Result<(), String> {
     let evidence = ExecutionEvidence::load(&current_boot);
     let no_live_panes = saved.iter().all(|(_, kind)| match kind {
         CardKind::Chat(session) => {
-            session.is_unstarted() || evidence.classify(session) == SavedExecution::Ended
+            session.is_unstarted()
+                || evidence
+                    .classify(session)
+                    .leaves_nothing_to_carry(request.accept_unreopenable)
         }
         CardKind::Terminal(session) => !terminal_requires_migration(session, &current_boot),
         _ => true,
@@ -217,10 +226,22 @@ fn inspect(request: Request) -> Result<(), String> {
                 && (source.proof.as_ref() != request.proof.as_ref()
                     || !initial_inventory.iter().any(|live| live.id == source.id))
                 && !resolutions.iter().any(|(issued, _)| issued == source)
+                && !request.proof.as_ref().is_some_and(|proof| {
+                    relisted_codex_conversation(
+                        source,
+                        &initial_inventory,
+                        proof,
+                        request.require_resumable,
+                    )
+                })
             {
                 let missing = !initial_inventory.iter().any(|live| live.id == source.id);
                 // Nothing of its old owner remains to adopt or preserve.
-                if missing && evidence.classify(source) == SavedExecution::Ended {
+                if missing
+                    && evidence
+                        .classify(source)
+                        .leaves_nothing_to_carry(request.accept_unreopenable)
+                {
                     continue;
                 }
                 let result = if missing && request.reconcile_retained {
@@ -307,11 +328,23 @@ fn inspect(request: Request) -> Result<(), String> {
                 }
             }
             CardKind::Chat(source) if !source.is_unstarted() => {
-                if cold_history.iter().any(|issued| issued == &source) {
+                if cold_history.iter().any(|issued| issued == &source)
+                    || relisted_codex_conversation(
+                        &source,
+                        &inventory,
+                        proof,
+                        request.require_resumable,
+                    )
+                {
                     continue;
                 }
-                if let Some(problem) =
-                    saved_chat_problem(card, &source, &inventory, &evidence, || {
+                if let Some(problem) = saved_chat_problem(
+                    card,
+                    &source,
+                    &inventory,
+                    &evidence,
+                    request.accept_unreopenable,
+                    || {
                         qualify_with_mode(
                             &source,
                             &inventory,
@@ -327,8 +360,8 @@ fn inspect(request: Request) -> Result<(), String> {
                                     })
                             },
                         )
-                    })
-                {
+                    },
+                ) {
                     failures.push(problem);
                 }
             }
@@ -369,6 +402,20 @@ enum SavedExecution {
     /// The pane has execution this evidence does not cover, or the evidence
     /// is absent, foreign or unreadable.
     Unproved,
+    /// A pane that never learned its conversation, every actor of which has
+    /// ended, but at least one without the retirement that records what it
+    /// confirmed. Nothing still runs, yet nothing durable names a
+    /// conversation to reopen: the destination keeps the pane and refuses to
+    /// resume or replace it. Carrying it is a loss the person must accept.
+    Unrecorded,
+}
+
+impl SavedExecution {
+    /// Whether replacing the source cannot lose this pane's execution: it has
+    /// ended, or ended unrecorded and the person accepted it will not reopen.
+    fn leaves_nothing_to_carry(self, accept_unreopenable: bool) -> bool {
+        self == Self::Ended || (accept_unreopenable && self == Self::Unrecorded)
+    }
 }
 
 /// The source daemon's own ownership evidence, read without its lease and
@@ -382,6 +429,9 @@ struct ExecutionEvidence {
     retired: Result<Vec<crate::daemon::holder_registry::Record>, String>,
     /// Where process and socket tables are read; `/proc` outside tests.
     processes: std::path::PathBuf,
+    /// How long a process that may still run can show no arguments before
+    /// it proves nothing.
+    exec_settle: Duration,
 }
 
 /// Every retained helper the durable census registered, by pane.
@@ -406,6 +456,7 @@ impl ExecutionEvidence {
             census: store.clone().and_then(|path| read_census(&path)),
             retired: store.and_then(|path| read_retired_owners(&path)),
             processes: "/proc".into(),
+            exec_settle: EXEC_SETTLE,
         }
     }
 
@@ -421,6 +472,9 @@ impl ExecutionEvidence {
     /// twice, before resolution and against the final roster, to narrow it.
     fn classify(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
+        if source.proof.is_none() {
+            return self.classify_proofless(source);
+        }
         let Some(proof) = source.proof.as_ref().filter(|proof| proof.is_complete()) else {
             return SavedExecution::Unproved;
         };
@@ -464,19 +518,76 @@ impl ExecutionEvidence {
         // its ended actor leaves it nothing to reopen.
         let unnamed = source.has_unnamed_retained_claude_actor();
         let mut execution = SavedExecution::Ended;
+        let mut unrecorded = false;
         for owner in owners.into_iter().filter(|owner| owner.boot == self.boot) {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
                 Err(_) => return SavedExecution::Unproved,
             }
-            if unnamed
-                && !self
-                    .retired
-                    .as_ref()
-                    .is_ok_and(|retired| retired.contains(owner))
-            {
+            match &self.retired {
+                Ok(retired) => unrecorded |= unnamed && !retired.contains(owner),
+                Err(_) if unnamed => return SavedExecution::Unproved,
+                Err(_) => {}
+            }
+        }
+        if execution == SavedExecution::Ended && unrecorded {
+            SavedExecution::Unrecorded
+        } else {
+            execution
+        }
+    }
+
+    /// A pane with no issued proof names no daemon that owns it. If it once
+    /// ran as a retained Claude actor, the census still names every owner it
+    /// had under its pane. It has ended only when each of those owners,
+    /// including one a discovery record names, has a recorded retirement and
+    /// none of this boot's remains with its provider or anything in their
+    /// process group or session. Without any census owner nothing proves
+    /// what ran it. Its continuity need not still say retained: any later
+    /// hosted provider would have issued the pane a proof, so a proofless
+    /// pane's only execution is the actors the census registered for it.
+    fn classify_proofless(&self, source: &Session) -> SavedExecution {
+        use crate::daemon::holder_registry::{self, Kind};
+        if source.launch.provider != crate::agent::Provider::Claude
+            || source.terminal.is_some()
+            || source.owned_codex_listener.is_some()
+        {
+            return SavedExecution::Unproved;
+        }
+        let (Ok(census), Ok(native_holders), Ok(retired)) =
+            (&self.census, &self.native_holders, &self.retired)
+        else {
+            return SavedExecution::Unproved;
+        };
+        let mut owners = census
+            .iter()
+            .filter(|(pane, _)| *pane == source.id)
+            .map(|(_, owner)| owner)
+            .collect::<Vec<_>>();
+        if owners.is_empty() {
+            return SavedExecution::Unproved;
+        }
+        let discovered = match holder_registry::recovery_candidate(
+            &holder_registry::socket(native_holders, source.id),
+            Kind::Native,
+        ) {
+            Ok(discovered) => discovered,
+            Err(_) => return SavedExecution::Unproved,
+        };
+        owners.extend(&discovered);
+        let mut execution = SavedExecution::Ended;
+        for owner in owners {
+            if !retired.contains(owner) {
                 return SavedExecution::Unproved;
+            }
+            if owner.boot != self.boot {
+                continue;
+            }
+            match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
+                Ok(true) => {}
+                Ok(false) => execution = SavedExecution::Running,
+                Err(_) => return SavedExecution::Unproved,
             }
         }
         execution
@@ -491,13 +602,20 @@ impl ExecutionEvidence {
     /// pane's listener, and no socket is bound at that path or at the socket
     /// Codex publishes it as a symlink to. Tool work that
     /// left a dead server's process group writes no conversation. A paired
-    /// console runs outside the server, so a paired pane stays unproved.
+    /// console runs outside the server, so a pane whose console was paired in
+    /// this boot stays unproved.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
+        // A console paired in an earlier kernel boot cannot still run; one of
+        // this boot, or with incomplete evidence, is outside what this sees.
+        let console_ended = source.terminal.as_ref().is_none_or(|terminal| {
+            terminal
+                .continuity
+                .live_proof()
+                .is_some_and(|proof| proof.is_complete() && proof.boot_id != self.boot)
+        });
         let Some(listener) = source.owned_codex_listener.as_ref().filter(|_| {
-            source.owns_codex_listener()
-                && source.has_valid_native_continuity()
-                && source.terminal.is_none()
+            source.owns_codex_listener() && source.has_valid_native_continuity() && console_ended
         }) else {
             return SavedExecution::Unproved;
         };
@@ -533,7 +651,7 @@ impl ExecutionEvidence {
         // publishes its record, so a starting holder is seen by that socket.
         let mut sockets = vec![listener.socket.as_path(), control.as_path()];
         sockets.extend(published.as_deref());
-        match codex_listener_survives(&self.processes, source.id, &sockets) {
+        match codex_listener_survives(&self.processes, source.id, &sockets, self.exec_settle) {
             Ok(true) => SavedExecution::Running,
             Ok(false) => SavedExecution::Ended,
             Err(_) => SavedExecution::Unproved,
@@ -543,24 +661,12 @@ impl ExecutionEvidence {
 
 /// Whether any process of this user names a Codex pane's listener directory
 /// in its arguments, or a socket is still bound at one of `sockets`. A
-/// process between `execve` and publishing its new arguments briefly shows
-/// none; it is read again for a bounded moment. One that still shows none is
-/// evidence of absence only when its last thread is a zombie or exiting (a
-/// PID-namespace init waiting in `do_exit`, or one blocked closing files after
-/// releasing its memory), which can no longer write anything. A zombie group
-/// leader whose other threads still run shows no arguments either.
+/// process shows no arguments once its group leader has released its memory,
+/// and between `execve` and publishing its new ones. It is evidence of
+/// absence only when none of its threads can run again, and a live thread
+/// shows the arguments its leader no longer does (see [`threads`]). One that
+/// still shows none is read again for up to `settle`, then proves nothing.
 fn codex_listener_survives(
-    processes: &Path,
-    pane: crate::model::TerminalId,
-    sockets: &[&Path],
-) -> Result<bool, String> {
-    codex_listener_survives_with(processes, pane, sockets, EXEC_SETTLE)
-}
-
-/// How long one process may take to publish its arguments after `execve`.
-const EXEC_SETTLE: Duration = Duration::from_millis(100);
-
-fn codex_listener_survives_with(
     processes: &Path,
     pane: crate::model::TerminalId,
     sockets: &[&Path],
@@ -570,40 +676,22 @@ fn codex_listener_survives_with(
     let marker = format!("cagents-codex-{pane}");
     let marker = marker.as_bytes();
     let uid = crate::daemon::current_uid().to_string();
-    let unavailable = |error: &std::io::Error| {
-        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
-    };
-    // The arguments a process shows, or None once it has exited.
+    // The arguments a process shows, or None once it can no longer run.
     let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
         let deadline = Instant::now() + settle;
         loop {
             let argv = match std::fs::read(path.join("cmdline")) {
                 Ok(argv) => argv,
-                Err(error) if unavailable(&error) => return Ok(None),
+                Err(error) if gone(&error) => return Ok(None),
                 Err(error) => return Err(format!("Cannot inspect a process: {error}")),
             };
             if !argv.is_empty() {
                 return Ok(Some(argv));
             }
-            let stat = match std::fs::read(path.join("stat")) {
-                Ok(stat) => stat,
-                Err(error) if unavailable(&error) => return Ok(None),
-                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
-            };
-            // Fields after the command name begin at state (3): flags is
-            // field 9 and the thread count field 20.
-            let stat = String::from_utf8_lossy(&stat);
-            let fields = stat
-                .rsplit_once(')')
-                .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
-                .unwrap_or_default();
-            let exiting = fields
-                .get(6)
-                .and_then(|flags| flags.parse::<u64>().ok())
-                .is_some_and(|flags| flags & 0x4 != 0);
-            let ended = matches!(fields.first(), Some(&"Z" | &"X")) || exiting;
-            if ended && fields.get(17) == Some(&"1") {
-                return Ok(None);
+            match threads(path)? {
+                Threads::Ended => return Ok(None),
+                Threads::Arguments(argv) => return Ok(Some(argv)),
+                Threads::Unsettled => {}
             }
             if Instant::now() >= deadline {
                 return Err("A process has not published its arguments yet".into());
@@ -627,7 +715,7 @@ fn codex_listener_survives_with(
         // root for a process that made itself non-dumpable.
         let status = match std::fs::read_to_string(path.join("status")) {
             Ok(status) => status,
-            Err(error) if unavailable(&error) => continue,
+            Err(error) if gone(&error) => continue,
             Err(error) => return Err(format!("Cannot inspect a process: {error}")),
         };
         let effective = status
@@ -657,6 +745,130 @@ fn codex_listener_survives_with(
         })
     }))
 }
+
+/// A process or thread no longer found, or a thread whose id an `execve`
+/// from another of its threads took.
+fn gone(error: &io::Error) -> bool {
+    error.kind() == io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+}
+
+/// What the threads of a process showing no arguments say about it.
+enum Threads {
+    /// None can run again, so the process can write nothing.
+    Ended,
+    /// A live thread shows the arguments of the memory the threads share,
+    /// which a group leader that exited early no longer shows.
+    Arguments(Vec<u8>),
+    /// One may still run but shows no arguments yet, as during `execve`.
+    Unsettled,
+}
+
+/// Reads every thread of a process. It has ended once none can run again:
+/// each is a zombie, exiting (`PF_EXITING`) or has `SIGKILL` pending, which a
+/// group exit sends every other thread before they run again. The last one
+/// out tears down the shared memory, which takes a while for a large process
+/// under load. A thread that cannot run cannot create another, so the
+/// threads listed again afterwards must all be ones already read. The leader
+/// is read last: a thread that runs `execve` takes the leader's id, and stops
+/// being found under its own, only once the old leader has gone.
+fn threads(process: &Path) -> Result<Threads, String> {
+    let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
+    let list = || -> Result<Option<Vec<std::ffi::OsString>>, String> {
+        let threads = match std::fs::read_dir(process.join("task")) {
+            Ok(threads) => threads,
+            Err(error) if gone(&error) => return Ok(None),
+            Err(error) => return Err(unreadable(error)),
+        };
+        threads
+            .map(|thread| thread.map(|thread| thread.file_name()).map_err(unreadable))
+            .collect::<Result<_, _>>()
+            .map(Some)
+    };
+    let Some(mut read) = list()? else {
+        return Ok(Threads::Ended);
+    };
+    let leader = process.file_name();
+    read.sort_by_key(|thread| Some(thread.as_os_str()) == leader);
+    let mut unsettled = false;
+    for thread in &read {
+        let thread = process.join("task").join(thread);
+        if thread_ended(&thread)? {
+            continue;
+        }
+        match std::fs::read(thread.join("cmdline")) {
+            Ok(argv) if !argv.is_empty() => return Ok(Threads::Arguments(argv)),
+            Ok(_) => unsettled = true,
+            Err(error) if gone(&error) => unsettled = true,
+            Err(error) => return Err(unreadable(error)),
+        }
+    }
+    if unsettled {
+        return Ok(Threads::Unsettled);
+    }
+    match list()? {
+        None => return Ok(Threads::Ended),
+        Some(listed) if listed.iter().any(|thread| !read.contains(thread)) => {
+            return Ok(Threads::Unsettled);
+        }
+        Some(_) => {}
+    }
+    // A thread created after the first listing can still have taken the
+    // leader's id by `execve` before the second; only the leader's id can
+    // change hands, so reading it once more settles that.
+    let leader = match leader {
+        Some(leader) => process.join("task").join(leader),
+        None => return Ok(Threads::Unsettled),
+    };
+    Ok(if thread_ended(&leader)? {
+        Threads::Ended
+    } else {
+        Threads::Unsettled
+    })
+}
+
+/// Whether one thread can never run again: reaped, a zombie, exiting
+/// (`PF_EXITING`), or with `SIGKILL` pending. A status it cannot read
+/// whole says it can.
+fn thread_ended(thread: &Path) -> Result<bool, String> {
+    let unreadable = |error: io::Error| format!("Cannot inspect a process: {error}");
+    let stat = match std::fs::read_to_string(thread.join("stat")) {
+        Ok(stat) => stat,
+        Err(error) if gone(&error) => return Ok(true),
+        Err(error) => return Err(unreadable(error)),
+    };
+    // Fields after the command name begin at state (3); flags is field 9.
+    let fields = stat
+        .rsplit_once(')')
+        .map(|(_, fields)| fields.split_whitespace().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(flags) = fields.get(6).and_then(|flags| flags.parse::<u64>().ok()) else {
+        return Ok(false);
+    };
+    if matches!(fields[0], "Z" | "X") || flags & PF_EXITING != 0 {
+        return Ok(true);
+    }
+    let status = match std::fs::read_to_string(thread.join("status")) {
+        Ok(status) => status,
+        Err(error) if gone(&error) => return Ok(true),
+        Err(error) => return Err(unreadable(error)),
+    };
+    Ok(status
+        .lines()
+        .filter_map(|line| {
+            line.strip_prefix("SigPnd:")
+                .or_else(|| line.strip_prefix("ShdPnd:"))
+        })
+        .any(|mask| {
+            u64::from_str_radix(mask.trim(), 16)
+                .is_ok_and(|mask| mask & 1 << (libc::SIGKILL - 1) != 0)
+        }))
+}
+
+/// How long one process may take to publish its arguments after `execve`.
+const EXEC_SETTLE: Duration = Duration::from_millis(100);
+
+/// `PF_EXITING`, set once a thread enters `do_exit`.
+const PF_EXITING: u64 = 0x4;
 
 /// The census owners whose retirement the store records, read like the census.
 fn read_retired_owners(path: &Path) -> Result<Vec<crate::daemon::holder_registry::Record>, String> {
@@ -732,6 +944,41 @@ fn read_census(path: &Path) -> Result<Census, String> {
     Ok(census)
 }
 
+/// A live Codex conversation can outlast more daemon generations than its
+/// source keeps upgrade aliases for, so a pane its window never reattached
+/// still holds an older issued proof that the source no longer resolves. When
+/// the source lists that conversation under its current proof and every other
+/// issued field is identical, including the listener its original allocator
+/// issued, the pane names exactly that conversation. The conversation migrates
+/// as the source's live work and is qualified as such above; the update does
+/// not change whether this pane can reattach, which the source already refuses.
+fn relisted_codex_conversation(
+    saved: &Session,
+    inventory: &[Session],
+    proof: &HostSessionProof,
+    require_resumable: bool,
+) -> bool {
+    if !saved.owns_codex_listener()
+        || !saved.has_valid_native_continuity()
+        || saved
+            .proof
+            .as_ref()
+            .is_none_or(|issued| !issued.is_complete() || issued == proof)
+    {
+        return false;
+    }
+    let mut current = saved.clone();
+    current.proof = Some(proof.clone());
+    let mut listed = inventory.iter().filter(|live| live.id == saved.id);
+    match (listed.next(), listed.next()) {
+        (Some(live), None) => {
+            handoff::issued_chat_matches(live, &current)
+                && validate_live_chat(live, require_resumable).is_ok()
+        }
+        _ => false,
+    }
+}
+
 /// Classify again against the final roster: a pane adopted since the first
 /// look is held and qualifies like any live chat, and an owner that started
 /// since then is no longer Ended. Only a pane the source does not list and
@@ -741,11 +988,12 @@ fn saved_chat_problem(
     source: &Session,
     inventory: &[Session],
     evidence: &ExecutionEvidence,
+    accept_unreopenable: bool,
     qualify: impl FnOnce() -> Result<(), String>,
 ) -> Option<String> {
     let execution =
         (!inventory.iter().any(|live| live.id == source.id)).then(|| evidence.classify(source));
-    if execution == Some(SavedExecution::Ended) {
+    if execution.is_some_and(|execution| execution.leaves_nothing_to_carry(accept_unreopenable)) {
         return None;
     }
     qualify()
@@ -757,6 +1005,10 @@ fn unqualified_chat_pane(card: crate::model::CardId, execution: Option<SavedExec
     if execution == Some(SavedExecution::Running) {
         format!(
             "Saved conversation pane {card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
+        )
+    } else if execution == Some(SavedExecution::Unrecorded) {
+        format!(
+            "Saved conversation pane {card} ended before it recorded which conversation it had, so the update may not be able to reopen it. Nothing of it still runs. To update anyway, run `cagents daemon upgrade --accept-unreopenable` (or `scripts/install-local --accept-unreopenable`): the pane stays in its window, and if its conversation cannot be proved it will not resume or start one. A conversation it began stays on disk and can be reopened with Resume."
         )
     } else {
         format!("Saved conversation pane {card} needs exact conversation recovery.")
@@ -1034,6 +1286,7 @@ mod tests {
             census: Ok(census),
             retired: Ok(Vec::new()),
             processes: "/proc".into(),
+            exec_settle: EXEC_SETTLE,
         }
     }
 
@@ -1113,7 +1366,7 @@ mod tests {
         assert_eq!(evidence.classify(&card), SavedExecution::Ended);
         assert_eq!(
             evidence.classify(&issued),
-            SavedExecution::Unproved,
+            SavedExecution::Unrecorded,
             "a pre-ID card reopens only what a recorded retirement confirmed"
         );
         evidence.retired = read_retired_owners(&path);
@@ -1290,10 +1543,14 @@ mod tests {
                 }
             })
         };
+        // It checks that an exec in flight is read again, not how soon the
+        // kernel finishes one, which reclaim can stall well past the bound.
+        let evidence = ExecutionEvidence {
+            exec_settle: Duration::from_secs(2),
+            ..evidence(holders.path(), Vec::new())
+        };
         let unproved = (0..300)
-            .filter(|_| {
-                evidence(holders.path(), Vec::new()).classify(&card) != SavedExecution::Ended
-            })
+            .filter(|_| evidence.classify(&card) != SavedExecution::Ended)
             .count();
         stop.store(true, Ordering::Relaxed);
         churn.join().unwrap();
@@ -1396,12 +1653,31 @@ mod tests {
         foreign.launch.recipe.arguments[1] = "unix:///elsewhere/control.sock".into();
         let mut unproved = card.clone();
         unproved.proof = None;
-        for card in [paired, unowned, foreign, unproved] {
+        // A console paired in this boot may still run outside the server.
+        let mut console = paired.clone();
+        let mut console_proof = card.proof.clone().unwrap();
+        console.terminal.as_mut().unwrap().continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: console_proof.host_session_id.clone(),
+            boot_id: console_proof.boot_id.clone(),
+            host_incarnation: console_proof.host_incarnation.clone(),
+        };
+        for card in [paired, unowned, foreign, unproved, console.clone()] {
             assert_eq!(
                 evidence(holders.path(), Vec::new()).classify(&card),
                 SavedExecution::Unproved
             );
         }
+        // One paired in an earlier boot cannot, so the server alone decides.
+        console_proof.boot_id = BootId::new("previous-boot");
+        console.terminal.as_mut().unwrap().continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: console_proof.host_session_id,
+            boot_id: console_proof.boot_id,
+            host_incarnation: console_proof.host_incarnation,
+        };
+        assert_eq!(
+            evidence(holders.path(), Vec::new()).classify(&console),
+            SavedExecution::Ended
+        );
         let mut unreadable = evidence(holders.path(), Vec::new());
         unreadable.native_holders = Err("unavailable".into());
         assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
@@ -1410,9 +1686,10 @@ mod tests {
         absent.processes = root.path().join("absent");
         assert_eq!(absent.classify(&card), SavedExecution::Unproved);
         // A process that has not published its arguments might be the
-        // server. One whose last thread is a zombie, or exiting (PF_EXITING,
-        // like a PID-namespace init waiting in do_exit), can write nothing; a
-        // zombie group leader or exiting thread with live threads still can.
+        // server, unless none of its threads can run again: each is a zombie,
+        // exiting (PF_EXITING, like a PID-namespace init waiting in do_exit)
+        // or has SIGKILL pending. A group exit leaves killed or exiting
+        // threads behind a zombie leader. A live thread can still exec.
         let processes = tempfile::tempdir_in("/var/tmp").unwrap();
         std::fs::create_dir_all(processes.path().join("net")).unwrap();
         std::fs::write(
@@ -1428,32 +1705,110 @@ mod tests {
         std::fs::write(process.join("status"), user(uid)).unwrap();
         let mut table = evidence(holders.path(), Vec::new());
         table.processes = processes.path().into();
-        let stat = |state: char, flags: u64, threads: u32| {
-            format!(
-                "4242 (a) b) {state} 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 {threads} 0 1"
+        let thread = |tid: u32, state: char, flags: u64, pending: (u64, u64)| {
+            let thread = process.join("task").join(tid.to_string());
+            std::fs::create_dir_all(&thread).unwrap();
+            std::fs::write(
+                thread.join("stat"),
+                format!("{tid} (a) b) {state} 1 4242 4242 0 0 {flags} 0 0 0 0 0 0 0 0 20 0 1 0 1"),
             )
+            .unwrap();
+            std::fs::write(
+                thread.join("status"),
+                format!(
+                    "Name:\ta\nSigPnd:\t{:016x}\nShdPnd:\t{:016x}\n",
+                    pending.0, pending.1
+                ),
+            )
+            .unwrap();
+            std::fs::write(thread.join("cmdline"), b"").unwrap();
         };
-        for (state, flags, threads, expected) in [
-            ('Z', 0, 1, SavedExecution::Ended),
-            ('X', 0, 1, SavedExecution::Ended),
-            ('D', 0x4, 1, SavedExecution::Ended),
-            ('Z', 0, 2, SavedExecution::Unproved),
-            ('D', 0x4, 2, SavedExecution::Unproved),
-            ('R', 0, 1, SavedExecution::Unproved),
+        let kill = 1 << (libc::SIGKILL - 1);
+        let term = 1 << (libc::SIGTERM - 1);
+        for (leader, other, expected) in [
+            (('Z', 0, (0, 0)), None, SavedExecution::Ended),
+            (('X', 0, (0, 0)), None, SavedExecution::Ended),
+            (('D', 0x4, (0, 0)), None, SavedExecution::Ended),
+            (('R', 0, (kill, 0)), None, SavedExecution::Ended),
+            (('R', 0, (0, kill)), None, SavedExecution::Ended),
+            (
+                ('Z', 0x4, (0, 0)),
+                Some(('R', 0x4, (0, 0))),
+                SavedExecution::Ended,
+            ),
+            (
+                ('Z', 0x4, (0, 0)),
+                Some(('S', 0, (kill, 0))),
+                SavedExecution::Ended,
+            ),
+            (
+                ('Z', 0x4, (0, 0)),
+                Some(('Z', 0, (0, 0))),
+                SavedExecution::Ended,
+            ),
+            (
+                ('Z', 0, (0, 0)),
+                Some(('S', 0, (0, 0))),
+                SavedExecution::Unproved,
+            ),
+            (
+                ('Z', 0, (0, 0)),
+                Some(('S', 0, (term, term))),
+                SavedExecution::Unproved,
+            ),
+            (
+                ('D', 0x4, (0, 0)),
+                Some(('R', 0, (0, 0))),
+                SavedExecution::Unproved,
+            ),
+            (
+                ('R', 0, (0, 0)),
+                Some(('Z', 0, (0, 0))),
+                SavedExecution::Unproved,
+            ),
+            (('R', 0, (0, 0)), None, SavedExecution::Unproved),
+            (('D', 0, (0, 0)), None, SavedExecution::Unproved),
         ] {
-            std::fs::write(process.join("stat"), stat(state, flags, threads)).unwrap();
-            assert_eq!(
-                table.classify(&card),
-                expected,
-                "{state} {flags:#x} {threads}"
-            );
+            let _ = std::fs::remove_dir_all(process.join("task"));
+            thread(4242, leader.0, leader.1, leader.2);
+            if let Some(other) = other {
+                thread(4243, other.0, other.1, other.2);
+            }
+            assert_eq!(table.classify(&card), expected, "{leader:?} {other:?}");
         }
+        // A live thread behind a zombie leader shows the arguments they share.
+        let served = card.owned_codex_listener.clone().unwrap().socket;
+        for (argv, expected) in [
+            ("python\0worker\0".to_owned(), SavedExecution::Ended),
+            (
+                format!("codex\0app-server\0--listen\0unix://{}\0", served.display()),
+                SavedExecution::Running,
+            ),
+        ] {
+            std::fs::remove_dir_all(process.join("task")).unwrap();
+            thread(4242, 'Z', 0x4, (0, 0));
+            thread(4243, 'S', 0, (0, 0));
+            std::fs::write(process.join("task/4243/cmdline"), &argv).unwrap();
+            assert_eq!(table.classify(&card), expected, "{argv:?}");
+        }
+        // A thread already reaped is gone; the group is gone with its last one.
+        std::fs::remove_dir_all(process.join("task")).unwrap();
+        thread(4243, 'Z', 0, (0, 0));
+        std::fs::create_dir_all(process.join("task/4242")).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
+        std::fs::remove_dir_all(process.join("task")).unwrap();
+        assert_eq!(table.classify(&card), SavedExecution::Ended);
         // A truncated status line proves nothing.
-        std::fs::write(process.join("stat"), b"4242 (codex) Z 1 4242 4242").unwrap();
+        thread(4242, 'Z', 0, (0, 0));
+        std::fs::write(
+            process.join("task/4242/stat"),
+            b"4242 (codex) Z 1 4242 4242",
+        )
+        .unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Unproved);
         // The effective user decides, not the owner of the process directory,
         // which is root for a non-dumpable process of this user.
-        std::fs::write(process.join("stat"), stat('R', 0, 1)).unwrap();
+        thread(4242, 'R', 0, (0, 0));
         std::fs::write(process.join("status"), user(uid.wrapping_add(1))).unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Ended);
         std::fs::write(process.join("status"), b"Name:\tcodex\n").unwrap();
@@ -1528,9 +1883,11 @@ mod tests {
             (crate::model::CardId::new(), &previous),
             (held_card, &held),
         ] {
-            if let Some(problem) = saved_chat_problem(card, source, &inventory, &evidence, || {
-                Err("unqualified".into())
-            }) {
+            if let Some(problem) =
+                saved_chat_problem(card, source, &inventory, &evidence, false, || {
+                    Err("unqualified".into())
+                })
+            {
                 failures.push(problem);
             }
         }
@@ -1544,9 +1901,73 @@ mod tests {
             "Saved conversation pane {held_card} needs exact conversation recovery."
         )));
         assert!(
-            saved_chat_problem(live_card, &live, &inventory, &evidence, || Ok(())).is_none(),
+            saved_chat_problem(live_card, &live, &inventory, &evidence, false, || Ok(())).is_none(),
             "a live actor the source adopted and qualified is not a problem"
         );
+    }
+
+    #[test]
+    fn an_unnamed_pane_whose_actor_ended_unrecorded_is_carried_only_when_accepted() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut unrecorded = retained_card(current_boot());
+        unrecorded.launch.session_id = None;
+        let mut running = retained_card(current_boot());
+        running.launch.session_id = None;
+        let ended = owner(&unrecorded, ended_process(), ended_process());
+        let census = vec![
+            (unrecorded.id, ended.clone()),
+            (
+                running.id,
+                owner(&running, running_process(), running_process()),
+            ),
+        ];
+        let mut evidence = evidence(holders.path(), census);
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
+        // A surviving provider is live work, which no acceptance waives.
+        assert_eq!(evidence.classify(&running), SavedExecution::Running);
+        let card = crate::model::CardId::new();
+        let refusal = saved_chat_problem(card, &unrecorded, &[], &evidence, false, || {
+            Err("unqualified".into())
+        })
+        .unwrap();
+        assert!(
+            refusal.contains(&format!(
+                "Saved conversation pane {card} ended before it recorded"
+            )),
+            "{refusal}"
+        );
+        assert!(refusal.contains("--accept-unreopenable"), "{refusal}");
+        assert!(refusal.contains("reopened with Resume"), "{refusal}");
+        assert_eq!(
+            saved_chat_problem(card, &unrecorded, &[], &evidence, true, || panic!(
+                "an accepted unrecorded pane needs no qualification"
+            )),
+            None
+        );
+        assert!(
+            saved_chat_problem(card, &running, &[], &evidence, true, || Err(
+                "unqualified".into()
+            ))
+            .is_some()
+        );
+        // Once the source lists it, it is the source's live work again.
+        assert!(
+            saved_chat_problem(
+                card,
+                &unrecorded,
+                std::slice::from_ref(&unrecorded),
+                &evidence,
+                true,
+                || Err("unqualified".into())
+            )
+            .is_some()
+        );
+        // A recorded retirement names what it confirmed; nothing to accept.
+        evidence.retired = Ok(vec![ended]);
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
+        // Unreadable retirements prove nothing either way.
+        evidence.retired = Err("unreadable".into());
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unproved);
     }
 
     #[test]
@@ -1785,6 +2206,153 @@ mod tests {
             .environment
             .insert("ACCOUNT".into(), "another".into());
         assert!(qualify_terminal(&saved, &[descriptor.into()], &replacement).is_err());
+    }
+
+    #[test]
+    fn a_pane_held_by_several_saved_windows_is_one_problem() {
+        let mut failures = InspectionFailures::default();
+        let card = crate::model::CardId::new();
+        for _ in 0..3 {
+            failures.push(format!(
+                "Saved conversation pane {card} needs exact conversation recovery."
+            ));
+        }
+        failures.push("Source conversation has no qualified immutable migration.".into());
+        let message = failures.finish().unwrap_err();
+        assert!(message.contains("2 saved-state problem(s)"), "{message}");
+        assert_eq!(message.matches(&card.to_string()).count(), 1, "{message}");
+    }
+
+    #[test]
+    fn a_proofless_pane_ends_only_when_every_owner_it_had_is_retired() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut card = session();
+        card.proof = None;
+        let ended = owner(&card, ended_process(), ended_process());
+        let mut earlier = ended.clone();
+        earlier.boot = BootId::new("previous-boot");
+        let running = owner(&card, running_process(), running_process());
+
+        let mut retired = evidence(
+            holders.path(),
+            vec![(card.id, ended.clone()), (card.id, earlier.clone())],
+        );
+        retired.retired = Ok(vec![ended.clone(), earlier.clone()]);
+        assert_eq!(retired.classify(&card), SavedExecution::Ended);
+
+        // A recorded retirement is required for every owner, in any boot.
+        let mut unrecorded = evidence(
+            holders.path(),
+            vec![(card.id, ended.clone()), (card.id, earlier.clone())],
+        );
+        unrecorded.retired = Ok(vec![ended.clone()]);
+        assert_eq!(unrecorded.classify(&card), SavedExecution::Unproved);
+
+        // A retirement record does not outweigh a process that remains.
+        let mut alive = evidence(holders.path(), vec![(card.id, running.clone())]);
+        alive.retired = Ok(vec![running]);
+        assert_eq!(alive.classify(&card), SavedExecution::Running);
+
+        // No census owner is no evidence of what ran the pane.
+        let mut unknown = evidence(holders.path(), Vec::new());
+        unknown.retired = Ok(vec![ended.clone()]);
+        assert_eq!(unknown.classify(&card), SavedExecution::Unproved);
+
+        // An unreadable retirement table proves nothing.
+        let mut unreadable = evidence(holders.path(), vec![(card.id, ended.clone())]);
+        unreadable.retired = Err("unreadable".into());
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+
+        // Only a retained Claude pane has an owner roster; an incomplete proof
+        // is not the absence of one.
+        let mut codex = card.clone();
+        codex.launch.provider = Provider::Codex;
+        assert_eq!(retired.classify(&codex), SavedExecution::Unproved);
+        let mut incomplete = card.clone();
+        incomplete.proof = Some(HostSessionProof {
+            host_session_id: HostSessionId::new(""),
+            boot_id: current_boot(),
+            host_incarnation: HostIncarnation::new("actor"),
+        });
+        assert_eq!(retired.classify(&incomplete), SavedExecution::Unproved);
+    }
+
+    #[test]
+    fn a_codex_pane_relisted_under_a_newer_proof_names_that_live_conversation() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let saved = codex_card(root.path(), NativeContinuity::ReconnectOnly);
+        let current = HostSessionProof {
+            host_session_id: HostSessionId::new("current"),
+            boot_id: current_boot(),
+            host_incarnation: HostIncarnation::new("current"),
+        };
+        let mut live = saved.clone();
+        live.proof = Some(current.clone());
+        let inventory = [live.clone()];
+        assert!(relisted_codex_conversation(
+            &saved, &inventory, &current, false
+        ));
+
+        // The pane's own proof, an incomplete proof or a missing one is not
+        // an older issued identity of a relisted conversation.
+        assert!(!relisted_codex_conversation(
+            &live, &inventory, &current, false
+        ));
+        let mut proofless = saved.clone();
+        proofless.proof = None;
+        assert!(!relisted_codex_conversation(
+            &proofless, &inventory, &current, false
+        ));
+
+        // Every other issued field must be identical.
+        for change in 0..4 {
+            let mut other = live.clone();
+            match change {
+                0 => other.launch.session_id = Some(uuid::Uuid::new_v4().to_string()),
+                1 => other.launch.recipe.working_directory = "/elsewhere".into(),
+                2 => other.owned_codex_listener.as_mut().unwrap().allocator = current.clone(),
+                _ => {
+                    other.terminal = Some(
+                        crate::terminal_ipc::TerminalDescriptor::relaunchable(
+                            other.id,
+                            other.launch.recipe.clone(),
+                            None,
+                        )
+                        .session,
+                    )
+                }
+            }
+            assert!(
+                !relisted_codex_conversation(&saved, &[other], &current, false),
+                "change {change}"
+            );
+        }
+        // Two listings are ambiguous, and a listing under another proof is
+        // not the source's current work.
+        assert!(!relisted_codex_conversation(
+            &saved,
+            &[live.clone(), live.clone()],
+            &current,
+            false
+        ));
+        let mut foreign = live.clone();
+        foreign.proof.as_mut().unwrap().host_incarnation = HostIncarnation::new("foreign");
+        assert!(!relisted_codex_conversation(
+            &saved,
+            &[foreign],
+            &current,
+            false
+        ));
+        // A retained Claude pane keeps its exact recovery contract.
+        let claude = retained_card(current_boot());
+        let mut relisted = claude.clone();
+        relisted.proof = Some(current.clone());
+        assert!(!relisted_codex_conversation(
+            &claude,
+            &[relisted],
+            &current,
+            false
+        ));
     }
 }
 

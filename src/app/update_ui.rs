@@ -910,8 +910,14 @@ impl Cagents {
                         self.update_ui.poll_retry = false;
                         self.update_ui.error = None;
                         if matches!(job.phase, UpdatePhase::Failed) {
-                            self.update_ui.error = Some(job.message.clone());
-                            self.status = Some(TransientNotice::error(job.message.clone()));
+                            let failure = startup_gate::update_failure(&job.message);
+                            self.update_ui.error = Some(failure.summary);
+                            // This window has already said the same thing.
+                            if self.startup_gate.reported_notice()
+                                != Some(failure.notice.message.as_str())
+                            {
+                                self.status = Some(failure.notice);
+                            }
                         }
                         // A review set aside returns by itself once nothing
                         // blocks the update, and never outlives its job.
@@ -1006,7 +1012,7 @@ impl Cagents {
                 self.update_ui.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::update::apply_installed(&installed)
+                        crate::update::apply_installed(&installed, false)
                             .map_err(|error| error.to_string())
                     })
                     .await
@@ -1100,6 +1106,38 @@ mod tests {
             inspected(&mut app),
             "a daemon an install restarted is inspected without waiting for a tick"
         );
+    }
+
+    /// A stopped update's message is usually the windows' own reports, which
+    /// each window has already shown; only something it has not said is new.
+    #[test]
+    fn a_failed_update_does_not_repeat_what_this_window_reported() {
+        let report = "2 saved panes are waiting for the shared workspace: \u{201c}A\u{201d}, \u{201c}B\u{201d}.";
+        for (message, shown) in [
+            (
+                format!(
+                    "primary: recovery-incomplete: {report}; window-2: recovery-incomplete: {report}"
+                ),
+                false,
+            ),
+            ("installed daemon startup failed".to_owned(), true),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.startup_gate = crate::app::startup_gate::State::fixture_reported_saying(report);
+            let job = UpdateJob {
+                id: "stopped".into(),
+                version: "0.1.3+local.new".into(),
+                phase: UpdatePhase::Failed,
+                message,
+                log_path: "/nonexistent/update.log".into(),
+                confirmation: None,
+            };
+            app.update_ui.job = Some(job.clone());
+            app.status = None;
+            drop(app.update_update_ui(Action::Polled(Some("stopped".into()), Ok(Some(job)))));
+            assert_eq!(app.status.is_some(), shown, "{:?}", app.status);
+            assert!(app.update_ui.error.is_some());
+        }
     }
 
     #[test]

@@ -139,6 +139,7 @@ scripts/run-development                 # with the embedded browser
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
 | `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
+| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -252,6 +253,71 @@ with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains
 for its next launch; delete `~/.local/share/cagents-development-NAME` and its
 config and state siblings to discard it.
+
+#### Stopping instances from a cagents session
+
+An agent in a terminal or chat that cagents hosts can stop and replace the
+instances it starts: `--stop-instance NAME` and `--instance NAME --fresh-daemon`
+work there as they do in your own terminal, with the session's
+`CAGENTS_AGENT_AUTHORITY` left in place. The CLI's
+`daemon stop-for-rebuild`, which both use, decides from the process tree:
+
+- It stops a development daemon with a runtime directory of its own: any
+  `--instance`, or the unnamed one inside a harness session or a fixture's
+  private `XDG_RUNTIME_DIR`.
+- It refuses the daemon that hosts the session, or one hosting a session it
+  descends from, since stopping that would end them. Every process a daemon
+  hosts runs below one of the daemon's own processes, so this holds for hosts
+  of any version and after a daemon restart. `niri-harness` detaches an
+  instance from the session that started it, so the runner records the
+  runtime directories of the daemons hosting that session in
+  `CAGENTS_DEVELOPMENT_HOSTED_BY` for every app it starts, and the check reads
+  it from each daemon above the caller. A session in instance B, started from
+  a session in instance A, can't stop A either.
+- It refuses when it can't tell: no daemon above the hosted caller, or one
+  whose environment it can't read.
+- It refuses the unnamed development daemon in the login runtime
+  (`/run/user/UID/cagents-development`), which belongs to the person at the
+  computer, and every production daemon. A production CLI still refuses all
+  lifecycle commands from a hosted session.
+
+Other lifecycle commands, such as `daemon stop` and `daemon upgrade`, remain
+refused in every hosted session. Stopping an instance also ends whatever else
+runs in its harness session, so the runner refuses `--stop-instance` and
+`--fresh-daemon` for an instance whose daemon hosts the caller, or a session it
+descends from, before it asks the CLI. Like the CLI, it refuses a hosted caller
+whose hosts it can't tell.
+
+#### Finding and stopping instances
+
+`scripts/run-development --list-instances` lists every development daemon
+running on this computer, whoever started it:
+
+```text
+pr2064, pid 1118559, running 02:17:40
+  checkout:   /home/me/cagents/.worktrees/pr2064
+  runtime:    /run/user/1000/nh-MwPpz5r1
+  started by: claude (pid 2417058), which has ended, in a cagents session
+  stop:       scripts/run-development --stop-instance pr2064
+```
+
+The checkout is marked `(removed)` when its worktree is gone, and `executable
+rebuilt since` when the daemon runs an executable that a later build replaced.
+`started by` comes from a record `--instance` keeps in the session's runtime
+directory: for a hosted caller, the process its cagents session runs, such as
+the agent's provider; otherwise the shell that ran the runner. An instance whose
+starter has ended is usually safe to stop. Daemons started another way have no
+record, and no runner session to stop, so the listing names their process ID;
+`kill PID` ends such a daemon and its jobs. The listing says when a daemon hosts
+the session that runs it, or one that started it, or is the login session's own
+development daemon, instead of offering a stop command. In a cagents session
+whose hosts can't be told, it offers none. It finds development daemons by the
+instance lock they hold, so it also lists those built outside a checkout's
+`target/`.
+
+An instance keeps running when the session that started it ends, so that
+another agent or a person can go on using it. Stop it when you're done, and
+check `--list-instances` for instances left behind.
 
 Instances started from one checkout run that checkout's executables, so start
 them all in the same lane: all `--browserless` or all integrated. The two lanes
@@ -376,7 +442,8 @@ share of the CPUs among the builds running once it starts, between 4 and 8 (the
 jobs the costs were measured with) and at most half the CPUs, as
 `CARGO_BUILD_JOBS`, which also caps a larger value; `-j` still wins. For
 `test`, `bench` and `run` only the build holds a slot, and the tests or program
-run after it is released, so do not wrap the gate in another lock. Rustdoc
+run after it is released, so do not wrap the gate in another lock. Tests and
+benchmarks run under a memory limit; see [Memory limits](#memory-limits). Rustdoc
 compiles doctests while they run, so `cargo test --doc` keeps its slot
 throughout; a plain `cargo test` compiles its doctests after the slot is
 released. The development runner builds its matched set through the gate
@@ -496,8 +563,14 @@ shim and guard. Their named `cargo` reenters the gate after the program's
 build releases its slot; their absolute `$CARGO` cannot compile here.
 On the build host itself, or with
 `CAGENTS_BUILD_REMOTE=local`, commands build here through the local slots
-above. A gate without `scripts/cargo-offload` beside it refuses to build
-unless `CAGENTS_BUILD_REMOTE=local` is set.
+above. With `CAGENTS_BUILD_REMOTE_LOOPBACK=1`, the build host's own commands
+build in its offloaded slots instead, as another host's would: the gate runs
+the same commands and copies through a local stand-in for ssh, which starts
+them in the user's login shell (`CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL` names
+another) from a clean environment, as sshd would, and only what the caller
+uses comes back. `scripts/native-evidence` builds this way. A gate without
+`scripts/cargo-offload` beside it refuses to build unless
+`CAGENTS_BUILD_REMOTE=local` is set.
 
 The host has build slots under
 `~/.cache/cagents-offload/<repository>/slot-N`, each with its own checkout and
@@ -684,16 +757,16 @@ roots under `~/.local/state` all stay until something removes them.
 local build, removes them with `scripts/prune-build-dirs` in two ways:
 
 - **On a schedule.** While the file system has room, at most every `CAGENTS_BUILD_PRUNE_INTERVAL_HOURS` (default 6) per user and host, it starts the pruner in the background, in a session of its own at idle CPU and I/O priority, with none of the build's open files. The build doesn't wait for it. A run that is cut short or killed is started again by the next build; none starts while one is running.
-- **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout; on the schedule they wait six hours.
+- **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout, and native-evidence builds unused for an hour; on the schedule they wait six and twelve hours.
 - **Below the floor.** The guard starts the same background run, unless one did within the hour. The build waits for the pruner, at most every ten minutes across the host, or for the run already pruning. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If there is still too little room, the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with. A `CAGENTS_BUILD_PRUNE` command runs before the build whenever there is less than twice the floor free.
 
-The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the first three. It skips a checkout's committed directories, which hold only sources.
+The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either. It skips a checkout's committed directories, which hold only sources.
 
-It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. It removes a build directory only when all of these hold:
+It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
 
-- nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees;
+- nothing inside it has been written or changed for `CAGENTS_BUILD_PRUNE_IDLE_DAYS` (default 7), or four times that for another main checkout's own build, which seeds that checkout's worktrees, or 12 hours for a native-evidence task's, 1 hour while running low;
 - every Cargo lock in it is free;
-- no process has its working directory, an open file, its executable or a mapping inside it.
+- no process has its working directory, an open file, its executable or a mapping inside it, and, for a native-evidence task's, no `native-evidence` process names the task with `--task`, as its session does from before it waits for the native lock.
 
 Under those locks it renames the directory aside, so a build that starts afterwards begins with an empty directory rather than a partly removed one. Still holding them, it puts the renamed copy back if a process opened it meanwhile, such as a build waiting for one of those locks; afterwards, if anything wrote to it. A directory holding a `.git` or `Cargo.toml` is a checkout and never counts as build output. A gated build marks its build directory as used before it waits for a slot, so another build's pruner doesn't take it meanwhile.
 
@@ -804,6 +877,13 @@ filter limits execution, not compilation of the selected feature graph, so
 start with the narrow feature lane and `--lib` or `--test NAME` rather than
 `--all-features`.
 
+Product tests live in the library, so select them with `--lib`, not `--bin`.
+`--bin cagents` and `--bin cagents-ui` have no tests and refuse a filter rather
+than pass by running none, except that `--bin cagents-ui` does not refuse with the
+`hot-reload` feature. `--bin cagentsd` has only a few of its own and does
+not refuse. A filter that matches nothing still exits 0 on any target, so check
+the reported test count before relying on a green run.
+
 The jobs setting is not a hard process or memory limit. In the pinned
 dependencies, parallel `cc` builds share Cargo's jobserver; CMake uses it for
 supported Makefile builds and otherwise may start a separate pool based on
@@ -819,6 +899,55 @@ Lowering Cargo concurrency does not reclaim memory held by other workloads or
 guarantee a build fits when RAM and swap are already under pressure. Browserless
 lanes avoid the large Servo/SpiderMonkey graph when embedded-browser behavior is
 not being changed.
+
+### Memory limits
+
+A runaway test can take the whole host with it: one mutation run reached 41 GiB
+of memory and 70 GiB of swap at about 18 GiB a minute, and FW16 stalled for about
+12 minutes until the kernel killed it. `scripts/memory-capped COMMAND` runs a
+command and its children in a systemd scope limited to 16 GiB of memory
+(`CAGENTS_MEMORY_MAX`; `0` turns the limit off) and 4 GiB of swap
+(`CAGENTS_MEMORY_SWAP_MAX`), stops the scope when they go over, says so and exits
+137. The swap limit matters as much as the memory one, because without it a
+runaway just moves into swap. For scale, the whole UI lib test binary peaks at
+about 3 GiB and the host one at about 1 GiB. A native evidence session with 8 busy
+chats and 6 long terminals peaked at about 800 MiB, and the integrated app at about
+8 GiB after ten loads of deliberately heavy pages, apparently because Servo kept
+pages it had navigated away from. A long integrated session on heavy sites can reach
+the limit. The notice names the app and how to raise it.
+
+`scripts/cargo-gate test` and `bench` run under it, inside a held slot too, as do
+`scripts/test-lib`, the app in `scripts/run-development`, `--instance` included,
+and a `scripts/native-evidence` session. A command already under any memory limit
+keeps that one, even a looser one, and `CAGENTS_MEMORY_MAX` then has no effect. A
+capped command leaves the caller's cgroup, so a caller's CPU quota stops applying
+to it. It doesn't cover outer `cargo-gate test --doc`, `cargo-gate run`, `--hot`,
+tests run on a build host through `cargo-offload`, or a harness that runs Cargo or a
+test binary itself.
+
+A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
+covered, and so is its compile, which runs inside the limit there. A UI test rebuild
+peaked at about 11 GiB with page cache, so it fits, but a cold build and an
+integrated one are unmeasured.
+
+**Writing a mutation harness:** a mutant can turn a bounded loop into an endless
+one that allocates, so run each mutant through `scripts/cargo-gate test` or
+`scripts/test-lib`, or put `scripts/memory-capped` in front of the command, and
+give it a lower limit than the default if you know what the tests need. Don't use `ulimit -v`: it limits
+address space rather than memory, and these binaries reserve far more than they
+touch. A `signal: 9` from a mutant is a result to read, and doesn't show that a
+test caught it. A test that allocates on purpose needs a ceiling of its own: a
+mutant may remove the very limit it was testing, and did.
+
+**Scratch files in agent sessions:** use a fresh `mktemp -d` directory per batch
+of work and remove old ones by exact name. Don't run a bare wildcard delete such as
+`cd DIR; rm -f *`, or reword one to get past a guard: most of the ones agents ran
+stalled with no process and no result, apparently held for an approval nobody could
+give, though that mechanism is inferred. Treat a tool call with no process and no
+result as a held approval rather than a slow command.
+
+Where no scope can be made, as without a user manager, the command runs without a
+limit and says so.
 
 ### Process scope isolation
 
@@ -1080,15 +1209,15 @@ Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
 
-Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` takes one `scripts/cargo-gate` slot. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
+Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.5 GiB. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
 export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-task
 git worktree add --detach .worktrees/my-task-before origin/main
 
-# A build slot only. Seed a new target copy-on-write from a finished one.
-scripts/native-evidence build before .worktrees/my-task-before --seed-target /var/tmp/other/target
-scripts/native-evidence build after . --seed-target "$CAGENTS_EVIDENCE_TASK/target-before"
+# A shared build slot only; the executables come back to the task.
+scripts/native-evidence build before .worktrees/my-task-before
+scripts/native-evidence build after .
 
 # Prepare data once, then keep it. Every later start restores this seed.
 scripts/native-evidence start before
@@ -1134,10 +1263,23 @@ harness, it provides:
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that
   inherited the task's private runtime directory. That path is the proof of
   ownership, so nothing else on the host is touched.
+- **Reclaimed builds.** `scripts/prune-build-dirs` removes a task's
+  `target-before` and `target-after` once the task has gone unused for 12
+  hours, or 1 hour while the disk is low. `build`, `start` and the end of a
+  session each count as use of both sides, and it never removes a target that
+  a build or session has open or whose executables are running, nor either
+  side while any `native-evidence` process names the task, including a session
+  still waiting for the native lock. A side whose
+  target went says so; build it again, which in a shared slot recompiles only
+  what changed since that slot's last build. Screenshots, logs and the fixture
+  stay. Tasks outside the pruner's roots, `~/.cache`, `~/.local/state` and
+  `/var/tmp`, are not searched. When it compiles on this host, `build` also
+  runs `scripts/build-disk-guard`, as a gated build here does, so it starts
+  the pruner on its schedule and is refused when the disk is below its floor.
 
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
 that authority, so a hosted agent shell cannot use it. Remove the task directory
-when the PR merges; its targets are large.
+when the PR merges.
 
 ## Installer and package checks
 

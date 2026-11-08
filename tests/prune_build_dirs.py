@@ -2,7 +2,9 @@
 """Exercise scripts/prune-build-dirs on private directories only."""
 
 import fcntl
+import json
 import os
+import pwd
 from pathlib import Path
 import subprocess
 import sys
@@ -147,6 +149,166 @@ class PruneBuildDirs(unittest.TestCase):
         self.prune()
         self.assertTrue(venv.exists())
         self.assertTrue(evidence.exists())
+
+    def evidence_task(self, path):
+        """A native-evidence task whose after side was built in a shared slot:
+        its target holds only the executables that came back."""
+        (path / "shots").mkdir(parents=True)
+        (path / ".native-evidence").write_text("")
+        (path / "shots/after-board.webp").write_bytes(b"webp")
+        (path / "fixture/home").mkdir(parents=True)
+        target = path / "target-after"
+        (target / "dev-runtime").mkdir(parents=True)
+        for name in ("cagents", "cagentsd", "cagents-ui"):
+            (target / "dev-runtime" / name).write_bytes(b"x" * 8192)
+        (target / "evidence-source").write_text("checkout\n")
+        return target
+
+    def test_a_native_evidence_build_goes_after_its_hours_and_its_task_stays(self):
+        task = self.roots / "cev/task"
+        target = self.evidence_task(task)
+        # One built in the task's own target, as older tools and
+        # CAGENTS_BUILD_REMOTE=local leave it.
+        private = self.target(task / "target-before")
+        self.settle()
+        # A week's grace for other build output, an hour for these.
+        self.prune("--max-idle", "7", "--evidence-hours", "1")
+        self.assertTrue(target.exists())
+        output = self.prune("--max-idle", "7", "--evidence-hours", str(IDLE / 3600))
+        for path in (target, private):
+            self.assertFalse(path.exists(), path)
+            self.assertIn(f"removed {path}", output)
+        self.assertIn("native-evidence build", output)
+        # Its screenshots, fixture and marker are not build output.
+        self.assertTrue((task / "shots/after-board.webp").exists())
+        self.assertTrue((task / "fixture/home").is_dir())
+        self.assertTrue((task / ".native-evidence").exists())
+
+    def test_a_native_evidence_build_waits_no_longer_than_other_build_output(self):
+        target = self.evidence_task(self.roots / "cev/task")
+        self.settle()
+        self.prune("--evidence-hours", "24")
+        self.assertFalse(target.exists())
+
+    def test_only_a_marked_tasks_sides_are_native_evidence_builds(self):
+        unmarked = self.evidence_task(self.roots / "cev/unmarked")
+        (unmarked.parent / ".native-evidence").unlink()
+        task = self.roots / "cev/task"
+        other = self.evidence_task(task).with_name("target-other")
+        (task / "target-after").rename(other)
+        (task / ".native-evidence").unlink()
+        (task / ".native-evidence").mkdir()
+        checkout = self.evidence_task(self.roots / "cev/checkout")
+        (checkout / ".git").mkdir()
+        self.settle()
+        self.prune("--evidence-hours", "0")
+        for path in (unmarked, other, checkout):
+            self.assertTrue(path.exists(), path)
+
+    def test_a_session_holding_a_native_evidence_build_open_keeps_it(self):
+        target = self.evidence_task(self.roots / "cev/task")
+        # As the session's supervisor holds it while it waits for the native lock.
+        descriptor = os.open(target, os.O_RDONLY | os.O_DIRECTORY)
+        self.addCleanup(os.close, descriptor)
+        self.settle()
+        output = self.prune("--evidence-hours", "0")
+        self.assertTrue(target.exists())
+        self.assertIn(f"keep {target}: process", output)
+
+    def test_running_a_native_evidence_build_keeps_it(self):
+        target = self.evidence_task(self.roots / "cev/task")
+        executable = target / "dev-runtime/cagents-ui"
+        executable.write_bytes(Path("/bin/sleep").read_bytes())
+        executable.chmod(0o755)
+        self.settle()
+        process = subprocess.Popen([str(executable), "30"])
+        self.addCleanup(process.wait)
+        self.addCleanup(process.kill)
+        output = self.prune("--evidence-hours", "0")
+        self.assertTrue(target.exists())
+        self.assertIn(f"process {process.pid} uses it", output)
+
+    def test_a_session_naming_its_task_keeps_both_its_builds(self):
+        # A session started by an older native-evidence, which holds neither
+        # target open, waiting for the native lock before its application runs.
+        task = self.roots / "cev/task"
+        after = self.evidence_task(task)
+        before = self.target(task / "target-before")
+        other = self.evidence_task(self.roots / "cev/other")
+        script = self.root / "worktree/scripts/native-evidence"
+        script.parent.mkdir(parents=True)
+        script.write_text("sleep 30\n")
+        unrelated = self.root / "worktree/scripts/other-tool"
+        unrelated.write_text("sleep 30\n")
+        def run(*command):
+            process = subprocess.Popen(command, cwd=self.root)
+            self.addCleanup(process.wait)
+            self.addCleanup(process.kill)
+            return process
+        session = run("bash", str(script), "--task", str(task), "__session", "after")
+        # As a task named from its own working directory.
+        relative = run("bash", str(script), "--task", str(task.relative_to(self.root)), "start")
+        # Another tool's --task, and another task's session, keep nothing.
+        run("bash", str(unrelated), "--task", str(other.parent))
+        run("bash", str(script), "--task", str(self.roots / "cev/elsewhere"), "__session")
+        self.settle()
+        output = self.prune("--evidence-hours", "0")
+        for path in (after, before):
+            self.assertTrue(path.exists(), path)
+            self.assertIn(f"keep {path}: process {session.pid} uses it", output)
+        self.assertFalse(other.exists())
+        session.kill()
+        session.wait()
+        self.settle()
+        output = self.prune("--evidence-hours", "0")
+        self.assertIn(f"keep {after}: process {relative.pid} uses it", output)
+        relative.kill()
+        relative.wait()
+        self.prune("--evidence-hours", "0")
+        self.assertFalse(after.exists())
+        self.assertFalse(before.exists())
+
+    def test_a_moved_home_still_searches_the_accounts_own(self):
+        # A fixture's builds, and so the pruner they start, run under a
+        # private HOME that holds none of the account's builds. Searching only
+        # that would find nothing, yet stamp the schedule.
+        account = Path(pwd.getpwuid(os.geteuid()).pw_dir)
+        self.assertNotEqual(account, self.home)
+        roots, never = self.homes()
+        self.assertEqual(roots, [str(account / ".cache"), str(account / ".local/state"),
+                                 str(self.home / ".cache"), str(self.home / ".local/state"),
+                                 "/var/tmp"])
+        # Both homes' installs and offload slots stay untouched.
+        for home in (account, self.home):
+            for place in (".local/share", ".cache/cagents-offload"):
+                self.assertIn(str(home / place), never)
+
+    def test_an_account_without_a_password_entry_searches_its_home(self):
+        # As a container's arbitrary user is.
+        roots, never = self.homes(registered=False)
+        self.assertEqual(roots, [str(self.home / ".cache"), str(self.home / ".local/state"),
+                                 "/var/tmp"])
+        self.assertEqual(never, [str(self.home / ".local/share"),
+                                 str(self.home / ".cache/cagents-offload")])
+
+    def homes(self, registered=True):
+        """The pruner's default roots and never-touched directories."""
+        probe = """
+import importlib.machinery, importlib.util, json, pwd, sys
+def unregistered(uid):
+    raise KeyError(uid)
+if sys.argv[2] == "unregistered":
+    pwd.getpwuid = unregistered
+loader = importlib.machinery.SourceFileLoader("pruner", sys.argv[1])
+pruner = importlib.util.module_from_spec(importlib.util.spec_from_loader("pruner", loader))
+loader.exec_module(pruner)
+print(json.dumps([[str(path) for path in pruner.default_roots()],
+                  [str(path) for path in pruner.never()]]))
+"""
+        result = subprocess.run(
+            [sys.executable, "-c", probe, str(PRUNER), "registered" if registered else "unregistered"],
+            env=self.env, capture_output=True, text=True, check=True, timeout=30)
+        return json.loads(result.stdout)
 
     def test_kept_and_protected_directories_stay(self):
         kept = self.target(self.roots / "repo/target")
@@ -350,9 +512,9 @@ loader = importlib.machinery.SourceFileLoader("pruner", sys.argv[1])
 pruner = importlib.util.module_from_spec(importlib.util.spec_from_loader("pruner", loader))
 loader.exec_module(pruner)
 in_use, survey, recreate = pruner.in_use, pruner.survey, sys.argv[2]
-def late_user(directory):
+def late_user(directory, task=None):
     if ".cagents-pruned-" not in directory.name:
-        return in_use(directory)
+        return in_use(directory, task)
     if recreate == "recreate":
         # As a build starting there would: a rename replaces only an empty one.
         (directory.parent / "target/debug").mkdir(parents=True)

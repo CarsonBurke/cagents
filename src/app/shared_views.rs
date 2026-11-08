@@ -14,6 +14,47 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
+/// Each open card's worktree during one projection, with how many cards
+/// each path holds, so a view no card resolves to is known without a scan.
+#[derive(Default)]
+struct CardWorktrees {
+    paths: HashMap<CardId, PathBuf>,
+    counts: HashMap<PathBuf, usize>,
+}
+
+impl CardWorktrees {
+    fn get(&self, card: CardId) -> Option<&PathBuf> {
+        self.paths.get(&card)
+    }
+
+    fn holds(&self, path: &Path) -> bool {
+        self.counts.contains_key(path)
+    }
+
+    fn insert(&mut self, card: CardId, path: PathBuf) {
+        self.remove(card);
+        *self.counts.entry(path.clone()).or_default() += 1;
+        self.paths.insert(card, path);
+    }
+
+    fn remove(&mut self, card: CardId) {
+        let Some(path) = self.paths.remove(&card) else {
+            return;
+        };
+        if let Some(count) = self.counts.get_mut(&path) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&path);
+            }
+        }
+    }
+}
+
+struct ScopeDiscovery<'a> {
+    scopes: Vec<Scope>,
+    worktree_cards: Vec<(&'a CardState, &'a Path)>,
+}
+
 /// Whole descriptors can contain concurrently changed metadata even for the
 /// same process. Retry only while the complete base is still authoritative;
 /// the daemon must also enforce this fence when it applies the operation.
@@ -58,6 +99,24 @@ pub(super) fn blocked_managed_view_scopes(
     blocked
 }
 
+/// Why one of `scopes` is not admitted by the registry yet.
+fn view_scope_hold<'a>(
+    state: &State,
+    mut scopes: impl Iterator<Item = &'a Scope>,
+) -> Option<&'static str> {
+    scopes.find_map(|scope| {
+        if !state.initialized.contains(scope) {
+            Some("the shared workspace has not admitted its view")
+        } else if state.seeding.contains(scope) {
+            Some("its view is still being restored into the shared workspace")
+        } else if state.blocked.contains(scope) {
+            Some("its view holds a managed agent this window may not show yet")
+        } else {
+            None
+        }
+    })
+}
+
 #[derive(Default)]
 pub(super) struct State {
     // Full snapshots advance view/agent authority. Metadata-only folds advance
@@ -65,6 +124,8 @@ pub(super) struct State {
     pub(super) snapshot_sequence: u64,
     #[cfg(test)]
     local_projection_count: std::cell::Cell<usize>,
+    /// The daemon answered this window without a shared model to give.
+    pub(super) registry_unavailable: bool,
     baseline: HashMap<Scope, Vec<Pane>>,
     initialized: HashSet<Scope>,
     seeding: HashSet<Scope>,
@@ -110,6 +171,13 @@ impl State {
 
     pub(super) fn has_observed_chat(&self, card: CardId) -> bool {
         self.observed_chats.contains_key(&card)
+    }
+
+    /// Whether an edit to `card`'s pane is waiting for the registry.
+    pub(super) fn has_pending_update(&self, card: CardId) -> bool {
+        self.pending
+            .iter()
+            .any(|(_, _, change)| matches!(change, Change::Update { pane, .. } if pane.id == card))
     }
 
     pub(super) fn requested_transfer_card(&self, operation: uuid::Uuid) -> Option<CardId> {
@@ -455,18 +523,26 @@ impl Cagents {
     /// terminals, but some terminals have no projection to do it: the
     /// registry lists a window-local terminal in no view, and a listed one's
     /// view can stay unprojected while its scope loads. Once the registry has
-    /// answered, every terminal still held is released here, so none waits on
-    /// a projection that never comes.
+    /// answered, or the daemon has said it has none to give, every terminal
+    /// still held is released here, so none waits on a projection that never
+    /// comes.
     ///
-    /// A terminal the registry lists in no view belongs to this window alone.
-    /// It stops counting as shared and restores the way an unshared window
-    /// restores it: a saved recipe is inspected without being run, attaching
-    /// only to its exact existing terminal. A listed terminal is admitted to
-    /// hydrate again and only attaches, since another window may host it.
-    fn release_held_terminals(&mut self) -> Task<Message> {
-        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+    /// A terminal no view lists belongs to this window alone. It stops
+    /// counting as shared and restores the way an unshared window restores
+    /// it, opened or not: a saved recipe is inspected without being run,
+    /// attaching only to its exact existing terminal. One that cannot restore
+    /// that way only attaches, unless the registry confirmed it is not shared
+    /// and it is being opened. A listed terminal is admitted to hydrate again
+    /// and only attaches, since another window may host it.
+    pub(super) fn release_held_terminals(&mut self) -> Task<Message> {
+        if self.shared_registry_connecting() {
             return Task::none();
         }
+        self.retire_startup_registry_waits();
+        // An unopened terminal is not asking to start, so it can wait until
+        // the view that may yet list it has been admitted.
+        let views_settled =
+            self.shared_views.registry_unavailable || self.shared_views_ready_for_startup();
         let held = self
             .durable
             .cards
@@ -475,31 +551,50 @@ impl Cagents {
                 CardKind::Terminal(session)
                     if !terminal_ended(session)
                         && card.existence.is_open()
-                        && matches!(card.residency, Residency::Hydrating { .. })
+                        && (views_settled
+                            || matches!(card.residency, Residency::Hydrating { .. }))
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Loading))
                         && self.shared_views.attached.contains(&card.id)
-                        && !self.terminal_start_held(card.id, false)
+                        && !self.shared_views.defaults.contains_key(&card.id)
+                        && !self.durable.pending_terminal_creations.contains(&card.id)
                         && !self.terminal_start_in_flight(card.id)
                         && !self.terminal_retry_pending(card.id)
                         && !self.pane_close_owned(card.id) =>
                 {
-                    Some((card.id, card.exposure, session.clone()))
+                    Some((
+                        card.id,
+                        card.exposure,
+                        matches!(card.residency, Residency::Hydrating { .. }),
+                        session.clone(),
+                    ))
                 }
                 _ => None,
             })
             .collect::<Vec<_>>();
+        let confirmed = self.workspace_model.identity != crate::workspace_model::NO_REGISTRY;
         let mut tasks = Vec::new();
         let mut hydrate = false;
-        for (card, exposure, session) in held {
+        for (card, exposure, opening, session) in held {
             if !self.listed_in_registry(card) {
                 self.shared_views.attached.remove(&card);
                 if self.prepare_saved_terminal(card, &session) {
+                    self.restored_agent_attaches
+                        .retain(|queued| *queued != card);
                     tasks.push(self.inspect_saved_terminal(card));
                     continue;
                 }
+                if !(confirmed && opening) {
+                    self.shared_views.attached.insert(card);
+                    if !confirmed && !self.restored_agent_attaches.contains(&card) {
+                        self.restored_agent_attaches.push_back(card);
+                    }
+                    continue;
+                }
             }
-            self.readmit_held_terminal(card, exposure);
-            hydrate = true;
+            if opening {
+                self.readmit_held_terminal(card, exposure);
+                hydrate = true;
+            }
         }
         if hydrate {
             tasks.push(cosmic::task::message(Message::LifecycleSweep));
@@ -526,58 +621,222 @@ impl Cagents {
         })
     }
 
+    /// Whether a shared pane is still waiting to learn the registry: none is
+    /// joined yet, and the daemon has not said it has none to give.
+    pub(super) fn shared_registry_connecting(&self) -> bool {
+        self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+            && !self.shared_views.registry_unavailable
+    }
+
+    /// Whether `card` attaches as a pane of a joined registry rather than
+    /// from this window's own saved descriptor.
+    pub(super) fn attaches_as_shared(&self, card: CardId) -> bool {
+        self.shared_views.attached.contains(&card)
+            && self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
+    }
+
+    /// Whether every view this window shows has been admitted by the
+    /// registry, so its panes' records are the shared ones.
     pub(super) fn shared_views_ready_for_startup(&self) -> bool {
+        self.shared_views_startup_hold().is_none()
+    }
+
+    /// Why a view this window shows is not admitted by the registry yet.
+    pub(super) fn shared_views_startup_hold(&self) -> Option<&'static str> {
         if self.durable.workspace_model_identity.is_none() && self.shared_views.attached.is_empty()
         {
-            return true;
+            return None;
+        }
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Some("the shared workspace has not answered this window");
         }
         let scopes = self.local_view_scopes();
-        self.workspace_model.identity != crate::workspace_model::NO_REGISTRY
-            && scopes.iter().all(|scope| {
-                self.shared_views.initialized.contains(scope)
-                    && !self.shared_views.seeding.contains(scope)
-                    && !self.shared_views.blocked.contains(scope)
-            })
+        view_scope_hold(&self.shared_views, scopes.iter())
+    }
+
+    /// A queued row may attach only after its own canonical view is admitted.
+    /// The daemon still resolves this exact terminal under its current proof;
+    /// this check never compares that proof with a cached session's old proof.
+    pub(super) fn shared_terminal_ready_for_restored_attach(
+        &self,
+        card: CardId,
+        source: &TerminalSession,
+        views_ready: &mut Option<bool>,
+    ) -> bool {
+        self.shared_terminal_attach_hold(card, source, views_ready)
+            .is_none()
+    }
+
+    /// Why a queued row may not attach `source` yet. `views_ready` remembers
+    /// whether every view is admitted, so a caller asking about each of many
+    /// rows while nothing changes discovers the views only once.
+    pub(super) fn shared_terminal_attach_hold(
+        &self,
+        card: CardId,
+        source: &TerminalSession,
+        views_ready: &mut Option<bool>,
+    ) -> Option<&'static str> {
+        if self.shared_views.defaults.contains_key(&card)
+            || self.durable.pending_terminal_creations.contains(&card)
+        {
+            return Some("its pane is still being created");
+        }
+        if !self.shared_views.attached.contains(&card) {
+            return None;
+        }
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            // A daemon whose registry store is unavailable never admits the
+            // view, so its rows attach from their own descriptors as before.
+            return (!self.shared_views.registry_unavailable)
+                .then_some("the shared workspace has not answered this window");
+        }
+        let mut owners = self.workspace_model.views.iter().flat_map(|view| {
+            view.panes
+                .iter()
+                .filter(move |pane| pane.id == card)
+                .map(move |pane| (view, pane))
+        });
+        let Some((view, pane)) = owners.next() else {
+            // Once every view is admitted, no view will list it: it is this
+            // window's own and attaches from its descriptor.
+            return (!*views_ready.get_or_insert_with(|| self.shared_views_ready_for_startup()))
+                .then_some("the shared workspace does not list its pane");
+        };
+        if owners.next().is_some() {
+            return Some("the shared workspace lists its pane in more than one view");
+        }
+        if view.retired.contains(&card) {
+            return Some("the shared workspace closed its pane");
+        }
+        if let Some(hold) = view_scope_hold(&self.shared_views, std::iter::once(&view.scope)) {
+            return Some(hold);
+        }
+        if pane.pending_terminal_start {
+            return Some("the shared workspace is still starting its terminal");
+        }
+        if !matches!(&pane.kind, CardKind::Terminal(current) if current == source) {
+            return Some("the shared workspace names a different terminal for its pane");
+        }
+        None
     }
 
     fn local_view_scopes(&self) -> Vec<Scope> {
+        self.discover_view_scopes().scopes
+    }
+
+    /// Every scope this window shows, and the worktree each card outside a
+    /// channel resolves to. A large workspace holds thousands of cards and
+    /// historical worktrees, so each card and path is resolved by lookup
+    /// rather than by comparing it with every root or project worktree.
+    fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
+        let roots = self.indexed_worktree_roots();
+        let channel_cards = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        // Preserve the first matching project's authority, just as
+        // worktree_view_scope does, without searching every worktree per path.
+        let mut repositories = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            for path in project
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+                .chain(std::iter::once(project.repository.as_path()))
+                .chain(
+                    project
+                        .repository
+                        .file_name()
+                        .is_some_and(|name| name == ".git")
+                        .then(|| project.repository.parent())
+                        .flatten(),
+                )
+            {
+                repositories.entry(path).or_insert(&project.repository);
+            }
+        }
+        let worktree_cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| !channel_cards.contains(&card.id))
+            .filter_map(|card| {
+                self.unchanneled_card_worktree_indexed(card, &roots)
+                    .map(|path| (card, path))
+            })
+            .collect::<Vec<_>>();
         let mut scopes = self
             .durable
             .channels
             .iter()
             .map(|channel| Scope::Channel(channel.id))
             .collect::<Vec<_>>();
-        for scope in self.workspace_model.views.iter().map(|view| &view.scope) {
-            if let Scope::Worktree { repository, .. } = scope {
-                if self
-                    .sidebar_model
-                    .projects
-                    .iter()
-                    .any(|project| &project.repository == repository)
-                {
-                    scopes.push(scope.clone());
-                }
-            }
-        }
-        let paths = self
+        let project_repositories = self
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| &project.repository)
+            .collect::<HashSet<_>>();
+        scopes.extend(
+            self.workspace_model
+                .views
+                .iter()
+                .filter_map(|view| match &view.scope {
+                    Scope::Worktree { repository, .. }
+                        if project_repositories.contains(repository) =>
+                    {
+                        Some(view.scope.clone())
+                    }
+                    _ => None,
+                }),
+        );
+        for path in self
             .known_worktree_roots
             .iter()
             .map(PathBuf::as_path)
             .chain(self.active_workspace.as_deref())
-            .chain(
-                self.durable
-                    .cards
-                    .iter()
-                    .filter_map(|card| self.card_worktree(card)),
-            );
-        for path in paths {
-            if let Some(scope) = self.worktree_view_scope(path) {
-                scopes.push(scope);
+            .chain(worktree_cards.iter().map(|(_, path)| *path))
+        {
+            if let Some(repository) = repositories.get(path) {
+                scopes.push(Scope::Worktree {
+                    repository: (*repository).clone(),
+                    path: path.to_owned(),
+                });
             }
         }
         let mut seen = HashSet::new();
         scopes.retain(|scope| seen.insert(scope.clone()));
+        ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        }
+    }
+
+    /// The local views that list `card`, as `local_view_cards` would,
+    /// without resolving every view's cards to find one.
+    fn local_scopes_listing(&self, card: CardId) -> Vec<Scope> {
+        let ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        } = self.discover_view_scopes();
+        let worktree = worktree_cards
+            .iter()
+            .find(|(state, _)| state.id == card)
+            .filter(|(state, _)| state.existence.is_open() && !state.kind.is_utility())
+            .map(|(_, path)| *path);
         scopes
+            .into_iter()
+            .filter(|scope| match scope {
+                Scope::Channel(id) => self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == *id && channel.cards.contains(&card)),
+                Scope::Worktree { path, .. } => worktree == Some(path.as_path()),
+            })
+            .collect()
     }
 
     fn local_view_cards(&self, scope: &Scope) -> Vec<CardId> {
@@ -675,91 +934,16 @@ impl Cagents {
         self.shared_views
             .local_projection_count
             .set(self.shared_views.local_projection_count.get() + 1);
-        let roots = self.indexed_worktree_roots();
         let cards = self
             .durable
             .cards
             .iter()
             .map(|card| (card.id, card))
             .collect::<HashMap<_, _>>();
-        let channel_cards = self
-            .durable
-            .channels
-            .iter()
-            .flat_map(|channel| channel.cards.iter().copied())
-            .collect::<HashSet<_>>();
-        // Preserve the first matching project's authority, just as
-        // worktree_view_scope does, without searching every worktree per path.
-        let mut repositories = HashMap::new();
-        for project in &self.sidebar_model.projects {
-            for path in project
-                .worktrees
-                .iter()
-                .map(|worktree| worktree.path.as_path())
-                .chain(std::iter::once(project.repository.as_path()))
-                .chain(
-                    project
-                        .repository
-                        .file_name()
-                        .is_some_and(|name| name == ".git")
-                        .then(|| project.repository.parent())
-                        .flatten(),
-                )
-            {
-                repositories.entry(path).or_insert(&project.repository);
-            }
-        }
-        let worktree_cards = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| !channel_cards.contains(&card.id))
-            .filter_map(|card| {
-                self.unchanneled_card_worktree_indexed(card, &roots)
-                    .map(|path| (card, path))
-            })
-            .collect::<Vec<_>>();
-        let mut scopes = self
-            .durable
-            .channels
-            .iter()
-            .map(|channel| Scope::Channel(channel.id))
-            .collect::<Vec<_>>();
-        let project_repositories = self
-            .sidebar_model
-            .projects
-            .iter()
-            .map(|project| &project.repository)
-            .collect::<HashSet<_>>();
-        scopes.extend(
-            self.workspace_model
-                .views
-                .iter()
-                .filter_map(|view| match &view.scope {
-                    Scope::Worktree { repository, .. }
-                        if project_repositories.contains(repository) =>
-                    {
-                        Some(view.scope.clone())
-                    }
-                    _ => None,
-                }),
-        );
-        for path in self
-            .known_worktree_roots
-            .iter()
-            .map(PathBuf::as_path)
-            .chain(self.active_workspace.as_deref())
-            .chain(worktree_cards.iter().map(|(_, path)| *path))
-        {
-            if let Some(repository) = repositories.get(path) {
-                scopes.push(Scope::Worktree {
-                    repository: (*repository).clone(),
-                    path: path.to_owned(),
-                });
-            }
-        }
-        let mut seen = HashSet::new();
-        scopes.retain(|scope| seen.insert(scope.clone()));
+        let ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        } = self.discover_view_scopes();
         let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
         for (card, path) in worktree_cards {
             if card.existence.is_open() && !card.kind.is_utility() {
@@ -1149,6 +1333,12 @@ impl Cagents {
             cards,
             mut panes,
         } = projected;
+        // Publishing only queues edits, so the model's views stay put: find
+        // each scope's first view by lookup rather than a scan per scope.
+        let mut view_indices = HashMap::new();
+        for (index, view) in self.workspace_model.views.iter().enumerate() {
+            view_indices.entry(view.scope.clone()).or_insert(index);
+        }
         let previous_owners = self
             .shared_views
             .baseline
@@ -1175,12 +1365,9 @@ impl Cagents {
                         destination: destination.clone(),
                         before,
                     };
-                    let expected_revision = self
-                        .workspace_model
-                        .views
-                        .iter()
-                        .find(|view| view.scope == source)
-                        .map(|view| view.revision)
+                    let expected_revision = view_indices
+                        .get(&source)
+                        .map(|&index| self.workspace_model.views[index].revision)
                         .unwrap_or(0);
                     self.shared_views
                         .pending
@@ -1216,11 +1403,9 @@ impl Cagents {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
                     // tombstones and utility panes are unrelated client state.
-                    let closed = self
-                        .workspace_model
-                        .views
-                        .iter()
-                        .find(|view| view.scope == scope)
+                    let closed = view_indices
+                        .get(&scope)
+                        .map(|&index| &self.workspace_model.views[index])
                         .map(|view| {
                             view.panes
                                 .iter()
@@ -1260,12 +1445,9 @@ impl Cagents {
                 .get(&scope)
                 .cloned()
                 .unwrap_or_default();
-            let revision = self
-                .workspace_model
-                .views
-                .iter()
-                .find(|view| view.scope == scope)
-                .map(|view| view.revision)
+            let revision = view_indices
+                .get(&scope)
+                .map(|&index| self.workspace_model.views[index].revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
                 // A Remove is every window's instruction to close the pane. A
@@ -1339,9 +1521,48 @@ impl Cagents {
                 .retain(|(id, _, _)| *id != operation);
         } else {
             self.shared_views.seeding.remove(&scope);
-            self.shared_views.initialized.insert(scope);
+            self.shared_views.initialized.insert(scope.clone());
+            self.rebase_seeded_attachments(&scope);
             // Preserve edits made while the seed snapshot was in flight.
             self.publish_view_changes();
+        }
+    }
+
+    /// A seed's baseline is what this window saved, but the registry keeps the
+    /// panes it already holds. A terminal attached while the seed was in flight
+    /// has proved its same session under the running daemon, so that update is
+    /// based on the registry's record. Based on the saved one it is refused, and
+    /// the record then stays behind the attachment until another window writes.
+    fn rebase_seeded_attachments(&mut self, scope: &Scope) {
+        let local = self.local_views().panes.remove(scope).unwrap_or_default();
+        let Some(view) = self
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == *scope)
+        else {
+            return;
+        };
+        let Some(baseline) = self.shared_views.baseline.get_mut(scope) else {
+            return;
+        };
+        for seeded in baseline {
+            let same_id = |pane: &&Pane| pane.id == seeded.id;
+            let (Some(current), Some(shared)) =
+                (local.iter().find(same_id), view.panes.iter().find(same_id))
+            else {
+                continue;
+            };
+            if current.kind != seeded.kind
+                && current.scope == shared.scope
+                && current.pending_terminal_start == shared.pending_terminal_start
+                && attached_to_same_terminal(&current.kind, &shared.kind)
+                && surface_attached_under(self.cards.get(&seeded.id), &current.kind)
+            {
+                seeded.kind = shared.kind.clone();
+                seeded.pending_terminal_start = shared.pending_terminal_start;
+                seeded.scope = shared.scope.clone();
+            }
         }
     }
 
@@ -1403,10 +1624,9 @@ impl Cagents {
                 continue;
             }
             let current = owner.panes.iter().find(|pane| pane.id == card).unwrap();
-            let source_changed = before.kind != pane.kind
-                || before.pending_terminal_start != pane.pending_terminal_start
-                || before.scope != pane.scope;
-            if source_changed && !can_retry_source_fields(before, current) {
+            if crate::workspace_model::views::updates_source(before, pane)
+                && !can_retry_source_fields(before, current)
+            {
                 before.kind = current.kind.clone();
                 pane.kind = current.kind.clone();
                 before.pending_terminal_start = current.pending_terminal_start;
@@ -1524,21 +1744,23 @@ impl Cagents {
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
         self.prepare_shared_aliases(&views, &owned);
-        // Root discovery is immutable during this projection. Keep only owned
-        // paths across mutable view updates, and refresh the panes each view
-        // changes before visiting the next one.
-        let mut local_worktrees = {
-            let roots = self.indexed_worktree_roots();
-            self.durable
-                .cards
-                .iter()
-                .filter(|card| card.existence.is_open())
-                .filter_map(|card| {
-                    self.unchanneled_card_worktree_indexed(card, &roots)
-                        .map(|path| (card.id, path.to_owned()))
-                })
-                .collect::<HashMap<_, _>>()
-        };
+        // Root discovery is immutable during this projection, so index it once
+        // over owned paths that outlive each mutable view update. Keep only
+        // owned card paths too, and refresh the panes each view changes before
+        // visiting the next one.
+        let root_paths = self.worktree_root_paths();
+        let roots = worktree_ui::WorktreeRoots::new(root_paths.iter().map(PathBuf::as_path));
+        let mut local_worktrees = CardWorktrees::default();
+        for card in self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+        {
+            if let Some(path) = self.unchanneled_card_worktree_indexed(card, &roots) {
+                local_worktrees.insert(card.id, path.to_owned());
+            }
+        }
         let mut projected_scopes = Vec::new();
         for mut view in views {
             if self.shared_views.blocked.contains(&view.scope) {
@@ -1558,6 +1780,8 @@ impl Cagents {
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
+                // Most views are historical: no card resolves to them at all.
+                Scope::Worktree { path, .. } if !local_worktrees.holds(path) => Vec::new(),
                 Scope::Worktree { path, .. } => {
                     let channel_cards = self
                         .durable
@@ -1572,7 +1796,7 @@ impl Cagents {
                             card.existence.is_open()
                                 && !card.kind.is_utility()
                                 && !channel_cards.contains(&card.id)
-                                && local_worktrees.get(&card.id) == Some(path)
+                                && local_worktrees.get(card.id) == Some(path)
                         })
                         .map(|card| card.id)
                         .collect()
@@ -1580,7 +1804,6 @@ impl Cagents {
             };
             tasks.push(self.project_shared_view_with_cards(&view, &owned, current));
             if !view.panes.is_empty() {
-                let roots = self.indexed_worktree_roots();
                 for pane in &view.panes {
                     if let Some(path) = self
                         .card_state(pane.id)
@@ -1588,7 +1811,7 @@ impl Cagents {
                     {
                         local_worktrees.insert(pane.id, path.to_owned());
                     } else {
-                        local_worktrees.remove(&pane.id);
+                        local_worktrees.remove(pane.id);
                     }
                 }
             }
@@ -1617,6 +1840,8 @@ impl Cagents {
         }
         self.reproject_notification_unread();
         tasks.push(self.release_held_terminals());
+        // Restored shared panes queued for an attach wait for the registry.
+        tasks.push(self.attach_next_restored_agent());
         Task::batch(tasks)
     }
 
@@ -1662,9 +1887,8 @@ impl Cagents {
                                 .any(|project| &project.repository == repository),
                         };
                     if !ready {
-                        for scope in self.local_view_scopes() {
-                            if scope != view.scope && self.local_view_cards(&scope).contains(&alias)
-                            {
+                        for scope in self.local_scopes_listing(alias) {
+                            if scope != view.scope {
                                 self.shared_views.blocked.insert(scope);
                             }
                         }
@@ -1678,10 +1902,8 @@ impl Cagents {
                     };
                     if !can_adopt {
                         self.shared_views.blocked.insert(view.scope.clone());
-                        for scope in self.local_view_scopes() {
-                            if self.local_view_cards(&scope).contains(&alias) {
-                                self.shared_views.blocked.insert(scope);
-                            }
+                        for scope in self.local_scopes_listing(alias) {
+                            self.shared_views.blocked.insert(scope);
                         }
                         self.status = Some(TransientNotice::warning(
                             "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
@@ -2450,6 +2672,35 @@ impl Cagents {
 // A layout snapshot can predate a runtime exit. Missing recipe metadata cannot
 // revoke a settled exit for that exact terminal; new identities and live host
 // proofs still adopt normally, as do the incoming launch and other metadata.
+/// `attached` holds a complete live proof for the terminal `shared` records as
+/// still running. An ended record is newer than any attachment made to it.
+fn attached_to_same_terminal(attached: &CardKind, shared: &CardKind) -> bool {
+    matches!(
+        (attached, shared),
+        (CardKind::Terminal(attached), CardKind::Terminal(shared))
+            if attached.id == shared.id
+                && shared.continuity.live_proof().is_some()
+                && matches!(attached.continuity, TerminalContinuity::Live { .. })
+                && attached
+                    .continuity
+                    .live_proof()
+                    .is_some_and(|proof| proof.is_complete())
+    )
+}
+
+/// Whether a card's surface is attached, now, under the proof its record
+/// claims. A start returns once attached and hibernating keeps the connection,
+/// so no current attachment means that connection ended, and the proof may be
+/// older than the registry's.
+fn surface_attached_under(runtime: Option<&CardRuntime>, kind: &CardKind) -> bool {
+    let (Some(CardRuntime::Terminal(surface)), CardKind::Terminal(session)) = (runtime, kind)
+    else {
+        return false;
+    };
+    matches!(surface.current_attachment(), Ok(Some(attached))
+        if session.continuity.live_proof().as_ref() == Some(&attached))
+}
+
 fn preserve_observed_terminal_exit(card: &CardState, incoming: &mut CardKind) {
     let Some(observed) = ended_terminal(Some(card)) else {
         return;
@@ -2513,6 +2764,7 @@ mod tests {
     mod history_start;
     mod published_card_edits;
     mod startup_admission;
+    mod startup_terminals;
 
     use super::*;
     use crate::model::{
@@ -4234,6 +4486,46 @@ mod tests {
         );
     }
 
+    /// Scope discovery by scanning every root and project worktree per card
+    /// and path: the definition the indexed discovery must reproduce.
+    fn reference_view_scopes(app: &Cagents) -> Vec<Scope> {
+        let mut scopes = app
+            .durable
+            .channels
+            .iter()
+            .map(|channel| Scope::Channel(channel.id))
+            .collect::<Vec<_>>();
+        scopes.extend(app.workspace_model.views.iter().filter_map(|view| {
+            match &view.scope {
+                Scope::Worktree { repository, .. }
+                    if app
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .any(|project| &project.repository == repository) =>
+                {
+                    Some(view.scope.clone())
+                }
+                _ => None,
+            }
+        }));
+        let paths = app
+            .known_worktree_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(app.active_workspace.as_deref())
+            .chain(
+                app.durable
+                    .cards
+                    .iter()
+                    .filter_map(|card| app.card_worktree(card)),
+            );
+        scopes.extend(paths.filter_map(|path| app.worktree_view_scope(path)));
+        let mut seen = HashSet::new();
+        scopes.retain(|scope| seen.insert(scope.clone()));
+        scopes
+    }
+
     #[test]
     fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
         let (mut app, channel, _, pane) = fixture();
@@ -4325,14 +4617,23 @@ mod tests {
         let batched = app.local_views();
         let batched_elapsed = started.elapsed();
         let started = Instant::now();
-        let scopes = app.local_view_scopes();
+        let scopes = reference_view_scopes(&app);
         let reference = scopes
             .iter()
             .map(|scope| (scope.clone(), app.local_view_panes(scope)))
             .collect::<HashMap<_, _>>();
         let reference_elapsed = started.elapsed();
         assert_eq!(batched.scopes, scopes);
+        assert_eq!(app.local_view_scopes(), scopes);
         assert_eq!(batched.panes, reference);
+        for card in app.durable.cards.iter().step_by(17) {
+            let listing = scopes
+                .iter()
+                .filter(|scope| app.local_view_cards(scope).contains(&card.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(app.local_scopes_listing(card.id), listing);
+        }
         assert!(batched.panes[&Scope::Channel(channel)][0].pending_terminal_start);
         assert!(
             batched.panes[&Scope::Worktree {
@@ -5830,6 +6131,31 @@ mod tests {
         assert!(app.terminal_starts.lock().unwrap().contains_key(&id));
     }
 
+    /// A window restored with a terminal nobody has opened, while its registry
+    /// is still connecting.
+    fn restored_unopened_terminal() -> (Cagents, CardId, uuid::Uuid) {
+        let (mut app, _, _, _) = fixture();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        let state = app.card_state_mut(id).unwrap();
+        state.exposure = Exposure::Offscreen;
+        state.residency = Residency::Hibernated;
+        app.lifecycle.register(
+            id,
+            Exposure::Offscreen,
+            Residency::Hibernated,
+            Instant::now(),
+        );
+        (app, id, identity)
+    }
+
     /// #2104: a window restored while its registry is still connecting holds
     /// every saved terminal it may share. Projecting a view admits its own held
     /// terminals again once the registry answers; a terminal the registry lists
@@ -5896,6 +6222,117 @@ mod tests {
         );
         assert!(app.saved_terminal_current(id).is_some());
         assert!(!app.shared_views.attached.contains(&id));
+    }
+
+    /// A daemon that answers without a registry answers just the same: a held
+    /// terminal must not keep waiting for a registry it has been told is not
+    /// coming.
+    #[test]
+    fn restored_terminal_held_for_registry_restores_as_saved_once_it_is_unavailable() {
+        let (mut app, _, _, _) = fixture();
+        let session = fresh_terminal_session(LaunchRecipe::shell(PathBuf::from("/repo")).unwrap());
+        drop(app.insert_terminal_card(session, None));
+        let id = app.workspace.focused().unwrap();
+        let identity = app.workspace_model.identity;
+        Arc::make_mut(&mut app.durable).workspace_model_identity = Some(identity);
+        app.shared_views = State::for_workspace(&app.durable);
+        app.workspace_model = crate::workspace_model::WorkspaceModel::default();
+        app.terminal_starts.lock().unwrap().clear();
+        app.cards.insert(id, CardRuntime::Loading);
+        app.card_state_mut(id).unwrap().residency = Residency::Hibernated;
+        app.lifecycle
+            .register(id, Exposure::Visible, Residency::Hibernated, Instant::now());
+        drop(app.reconcile_lifecycle(&HashSet::from([id]), &HashSet::new(), &HashSet::new()));
+        assert!(
+            app.terminal_starts.lock().unwrap().is_empty(),
+            "a possibly shared terminal waits for the registry"
+        );
+
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Unavailable(
+                "daemon rejected the request (Internal): registry is unavailable".into(),
+            ),
+        ));
+        assert!(app.saved_terminal_current(id).is_some());
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+    }
+
+    /// A terminal nobody has opened is held just the same, and the gate waits
+    /// for it. It must not be reported as lost because no view lists it.
+    #[test]
+    fn unopened_terminal_no_view_lists_restores_as_saved_once_the_registry_answers() {
+        let (mut app, id, identity) = restored_unopened_terminal();
+        let mut model = crate::workspace_model::WorkspaceModel::default();
+        model.identity = identity;
+        model.sequence = 1;
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Connected(model),
+        ));
+        assert!(!app.shared_views.attached.contains(&id));
+        assert!(app.saved_terminal_current(id).is_some());
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        assert!(matches!(
+            app.lifecycle.state(id),
+            Some((_, Residency::Hibernated))
+        ));
+    }
+
+    /// Opening a terminal whose daemon has no registry must not run its saved
+    /// command: nothing has said no other window hosts it.
+    #[test]
+    fn unopened_terminal_never_runs_its_recipe_when_the_registry_is_unavailable() {
+        let (mut app, id, _) = restored_unopened_terminal();
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Unavailable(
+                "daemon rejected the request (Internal): registry is unavailable".into(),
+            ),
+        ));
+        assert!(app.saved_terminal_current(id).is_some());
+        assert_eq!(app.terminal_starts.lock().unwrap().get(&id), Some(&1));
+        let CardKind::Terminal(session) = app.card_state(id).unwrap().kind.clone() else {
+            panic!("a terminal card");
+        };
+        drop(app.start_terminal(id, session, true, false));
+        assert_eq!(
+            app.terminal_starts.lock().unwrap().get(&id),
+            Some(&1),
+            "opening it does not start anything beyond the inspection"
+        );
+    }
+
+    /// A terminal that cannot restore as saved stays attach-only while the
+    /// daemon has no registry: nothing has said no other window hosts it.
+    #[test]
+    fn terminal_that_cannot_restore_as_saved_only_attaches_when_the_registry_is_unavailable() {
+        let (mut app, id, _) = restored_unopened_terminal();
+        let CardKind::Terminal(session) = &mut app.card_state_mut(id).unwrap().kind else {
+            panic!("a terminal card");
+        };
+        session.continuity = crate::model::TerminalContinuity::Failed {
+            typed_error: crate::model::RuntimeError {
+                code: "failed".into(),
+                message: "failed".into(),
+            },
+            retryable: false,
+        };
+        let session = session.clone();
+        drop(app.apply_workspace_model_update(
+            super::super::workspace_model_sync::ModelUpdate::Unavailable(
+                "daemon rejected the request (Internal): registry is unavailable".into(),
+            ),
+        ));
+        assert!(app.saved_terminal_current(id).is_none());
+        assert!(app.shared_views.attached.contains(&id));
+        assert!(app.terminal_start_held(id, false));
+        drop(app.start_terminal(id, session, true, false));
+        assert!(
+            !app.terminal_starts
+                .lock()
+                .unwrap()
+                .get(&id)
+                .is_some_and(|starts| *starts > 1),
+            "opening it adds no start of its own"
+        );
     }
 
     /// A terminal restored as this window's own saved terminal can be listed

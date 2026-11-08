@@ -1644,6 +1644,61 @@ fn settled(host: &SharedHost, run: RunId) -> Run {
     }
 }
 
+/// Closing a conversation leaves running what its provider detached, such
+/// as a server a command started with `nohup`, unless nobody attends it: an
+/// automation's agent stops it, until a person takes part.
+#[test]
+fn only_an_unattended_agent_stops_its_detached_work_on_close() {
+    if isolated("only_an_unattended_agent_stops_its_detached_work_on_close").is_some() {
+        return;
+    }
+    use crate::daemon::owned_children::DetachedWork;
+    let (host, request, _path) = fixture();
+    let session = |agent| {
+        registry(&host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent(agent)
+            .unwrap()
+            .session
+            .unwrap()
+            .id()
+    };
+    assert_eq!(
+        detached_work_on_close(&host, TerminalId::new()),
+        DetachedWork::Spare,
+        "a conversation that is not an agent"
+    );
+    let started = submit(&host, &Authority::default(), request.clone()).unwrap();
+    settled(&host, started.run.id);
+    assert_eq!(
+        detached_work_on_close(&host, session(started.agent.id)),
+        DetachedWork::Spare,
+        "an agent a person started"
+    );
+    let automation = automation_fixture(&host, &request);
+    let accepted = claim_fixture(&host, &automation);
+    dispatch_accepted(&host, accepted.clone()).unwrap();
+    settled(&host, accepted.run.id);
+    let unattended = session(accepted.agent.id);
+    assert_eq!(
+        detached_work_on_close(&host, unattended),
+        DetachedWork::Stop
+    );
+    registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .claim_agent_interaction(accepted.agent.id, None)
+        .unwrap();
+    assert_eq!(
+        detached_work_on_close(&host, unattended),
+        DetachedWork::Spare,
+        "once a person takes part"
+    );
+}
+
 #[test]
 fn legacy_open_console_preflight_refuses_before_provider_stop_and_keeps_followup_usable() {
     if isolated(

@@ -8,6 +8,11 @@ use cagents::instance::{
 };
 use cosmic::{Core, app::cosmic::Cosmic, iced};
 
+// The hot-reload root compiles this file with the application's modules, tests
+// included, and its `cagents` is itself, so the refusal doesn't belong there.
+#[cfg(all(test, not(feature = "hot-reload")))]
+cagents::refuse_filtered_test_run!();
+
 const PRODUCT: &str = "cagents-ui";
 const DEFAULT_LOG_FILTER: &str = "cagents=info,warn";
 /// argv has a hard size limit and a dialog cannot show a novel either.

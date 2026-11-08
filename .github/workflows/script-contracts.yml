@@ -223,6 +223,7 @@ jobs:
               ("build offload", "scripts/cargo-offload", "tests/cargo_offload.py"),
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
               ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
+              ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
               ("local install head check", "scripts/install-local", "tests/install_local.py"),
           ):
               source_present = present(Path(source))

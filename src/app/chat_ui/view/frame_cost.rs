@@ -908,7 +908,7 @@ fn a_refresh_of_a_full_window_with_metadata() {
         let turns = turn::group(
             &pane.runtime.snapshot.items,
             &pane.runtime.asked_after,
-            |item| cache.get(&item.id)?.coordination.as_deref(),
+            Presentations(cache),
         );
         group.0.push(clock.elapsed());
         std::hint::black_box(turns);

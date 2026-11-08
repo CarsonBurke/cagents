@@ -31,6 +31,9 @@ pub enum ModelUpdate {
     /// compares the registry's identity against the one it recorded and decides
     /// whether anything it holds has ever been shared with this registry.
     Connected(WorkspaceModel),
+    /// The daemon answered but has no shared model to give, so this window's
+    /// shared panes have no registry to wait for.
+    Unavailable(String),
     /// A fresh read, taken because an edge does not carry the ranks it changed.
     Read(WorkspaceModel),
     Reopened {
@@ -132,9 +135,18 @@ fn observe_with_client(
     // One request subscribes and reads, so an edit applied between the two
     // cannot fall into a gap - the hazard `watch_terminals` then `list` has to
     // order around with two requests.
-    let model = client
-        .watch_workspace_model()
-        .map_err(|error| error.to_string())?;
+    let model = match client.watch_workspace_model() {
+        Ok(model) => model,
+        Err(ControlError::Remote { message, .. })
+            if message == crate::workspace_model::REGISTRY_UNAVAILABLE =>
+        {
+            sender
+                .send_blocking(ModelUpdate::Unavailable(message.clone()))
+                .map_err(|error| error.to_string())?;
+            return Err(message);
+        }
+        Err(error) => return Err(error.to_string()),
+    };
     sender
         .send_blocking(ModelUpdate::Connected(model))
         .map_err(|error| error.to_string())?;
@@ -409,29 +421,19 @@ fn send(
     Ok(())
 }
 
-fn source_update_conflicts(
+pub(in crate::app) fn source_update_conflicts(
     model: &WorkspaceModel,
     scope: &crate::workspace_model::views::Scope,
     change: &crate::workspace_model::views::Change,
 ) -> bool {
-    use crate::workspace_model::views::Change;
+    use crate::workspace_model::views::{Change, updates_source};
     let Change::Update { before, pane } = change else {
         return false;
     };
-    let sensitive = before.kind != pane.kind
-        || before.pending_terminal_start != pane.pending_terminal_start
-        || before.scope != pane.scope;
-    sensitive
-        && !model
-            .views
-            .iter()
-            .find(|view| &view.scope == scope)
-            .and_then(|view| view.panes.iter().find(|current| current.id == before.id))
-            .is_some_and(|current| {
-                current.kind == before.kind
-                    && current.pending_terminal_start == before.pending_terminal_start
-                    && current.scope == before.scope
-            })
+    match model.views.iter().find(|view| &view.scope == scope) {
+        Some(view) => view.source_update_conflicts(before, pane),
+        None => updates_source(before, pane),
+    }
 }
 
 /// What adopting one shared row asked of the window.
@@ -600,6 +602,10 @@ impl Cagents {
         {
             return (Task::none(), false);
         }
+        // The observer repeats this on every reconnection attempt.
+        if matches!(update, ModelUpdate::Unavailable(_)) && self.shared_views.registry_unavailable {
+            return (Task::none(), false);
+        }
         (self.apply_workspace_model_update_inner(update), true)
     }
 
@@ -668,12 +674,20 @@ impl Cagents {
                 self.retarget_transferred_pane_updates(transferred);
                 self.reconcile_workspace_model()
             }
+            ModelUpdate::Unavailable(error) => {
+                tracing::debug!(%error, "this daemon has no shared workspace model");
+                self.shared_views.registry_unavailable = true;
+                let attach = self.attach_next_restored_agent();
+                let release = self.release_held_terminals();
+                Task::batch([attach, release, self.attach_next_restored_agent()])
+            }
             ModelUpdate::Connected(model) => {
                 if model.identity == self.workspace_model.identity
                     && model.sequence < self.shared_views.snapshot_sequence
                 {
                     return Task::none();
                 }
+                self.shared_views.registry_unavailable = false;
                 self.join_workspace_model(model.identity);
                 self.install_workspace_model_snapshot(model);
                 let closed = self.apply_closed_project_tombstones();

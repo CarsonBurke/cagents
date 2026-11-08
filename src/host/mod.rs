@@ -292,6 +292,27 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if let Err(error) = crate::transcript_cache::sweep(&paths.directory) {
         tracing::warn!(%error, "transcript cache cleanup was refused; evidence preserved");
     }
+    // An empty session scope stays loaded in the user manager until it
+    // exits. Enrollment withdraws its own, but a manager too slow to answer
+    // can outlast that, and earlier versions left them too. Collecting them
+    // waits on the manager, so it runs beside the daemon.
+    if let Err(error) = std::thread::Builder::new()
+        .name("cagents-scope-collect".into())
+        .spawn(|| {
+            loop {
+                match crate::daemon::process_scope::collect_empty_scopes() {
+                    Ok(0) => {}
+                    Ok(stopped) => tracing::info!(stopped, "stopped empty session scopes"),
+                    Err(error) => {
+                        tracing::warn!(%error, "empty session scopes were not collected")
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_secs(600));
+            }
+        })
+    {
+        tracing::warn!(%error, "empty session scopes were not collected");
+    }
     // This mandatory thread service must be available before any adoption
     // can discard the holder's replay copy. It observes no process until the
     // same HostState publishes one; it initiates no execution.
@@ -717,6 +738,7 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
+            chat.decide_detached_work(agent_execution::detached_work_on_close(host, session.id));
             chat.close().and_then(|()| {
                 if !upgrading {
                     // Closing the provider leaves its retained helper alive

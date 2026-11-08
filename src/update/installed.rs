@@ -71,6 +71,7 @@ pub(super) fn perform(
     state: &Path,
     job: &mut UpdateJob,
     root: &Path,
+    accept_unreopenable: bool,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, source_proof) = source::inspect_identity(None)?;
@@ -122,7 +123,7 @@ pub(super) fn perform(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    reconcile_saved_sources(staged.identity.protocol)?;
+    reconcile_saved_sources(staged.identity.protocol, accept_unreopenable)?;
     let confirmed = confirmation::wait(state, job, observe)?;
     set_phase(
         state,
@@ -134,7 +135,7 @@ pub(super) fn perform(
     crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
         crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
+            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, accept_unreopenable)?;
         let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
             .map_err(io::Error::other)?;
         if !confirmed.preserves_consent(&latest) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
@@ -156,6 +157,9 @@ pub(super) fn perform(
                 "the installed build or session ownership changed; review the update again",
             ));
         }
+        // Prepare the capture while the source daemon still runs: failing to
+        // create it must not leave the runtime without a daemon.
+        let output = StartupOutput::create(state)?;
         if let Some(daemon) = current.daemon {
             let socket = crate::terminal_ipc::daemon_socket_path()?;
             let mut client =
@@ -175,17 +179,26 @@ pub(super) fn perform(
             root.join("bin")
                 .join(crate::companion::Product::Cli.file_name()),
         );
-        command
-            .args(["--json", "daemon", "start"])
-            .stderr(Stdio::null());
+        command.args(["--json", "daemon", "start"]);
+        output.attach(&mut command)?;
         guard.inherit_for_install(&mut command)?;
         let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
         startup_owned = started.as_ref().err().is_none_or(|failure| failure.spawned);
+        // The worker's stderr is this job's log.
+        let reason = output.record(&mut io::stderr().lock());
         // A post-spawn failure is never converted to success by readiness.
         // Its exact original command has settled, but its result remains error.
-        started.map_err(|failure| failure.error)?;
+        if let Err(failure) = started {
+            let successor_runs = crate::daemon::running_executable()
+                .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
+            return Err(startup_failure(
+                &failure.error,
+                reason.as_deref(),
+                successor_runs,
+            ));
+        }
         if crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
             != Some(root.join("bin/cagentsd"))
         {
@@ -311,9 +324,247 @@ fn wait_for_daemon_start(
     })
 }
 
+/// Bound on each captured stream: a `daemon start` envelope is well under a
+/// kilobyte, and a listing of unattached conversations stays far below this.
+const STARTUP_OUTPUT_LIMIT: u64 = 16 * 1024;
+/// Bound on the reason quoted in the job's one-line status message.
+const STARTUP_REASON_LIMIT: usize = 400;
+
+/// The startup command's JSON envelope and diagnostics. Unlinked files rather
+/// than pipes: a descendant that inherited a pipe could hold it open after the
+/// command exits, and this coordinator must return through its fences once the
+/// command itself has been waited.
+struct StartupOutput {
+    stdout: File,
+    stderr: File,
+}
+
+impl StartupOutput {
+    fn create(state: &Path) -> io::Result<Self> {
+        Ok(Self {
+            stdout: tempfile::tempfile_in(state)?,
+            stderr: tempfile::tempfile_in(state)?,
+        })
+    }
+
+    fn attach(&self, command: &mut Command) -> io::Result<()> {
+        command
+            .stdout(self.stdout.try_clone()?)
+            .stderr(self.stderr.try_clone()?);
+        Ok(())
+    }
+
+    /// Copies both streams, bounded, into `log` and returns the command's own
+    /// account of a failure: its JSON error message, else its last stderr line.
+    fn record(self, log: &mut impl Write) -> Option<String> {
+        let stdout = bounded_text(self.stdout);
+        let stderr = bounded_text(self.stderr);
+        for (name, text) in [("stdout", &stdout), ("stderr", &stderr)] {
+            if !text.trim().is_empty() {
+                // The log is diagnostic; failing to write it must not mask the result.
+                let _ = writeln!(log, "Startup command {name}:\n{}", text.trim_end());
+            }
+        }
+        failure_reason(&stderr)
+    }
+}
+
+fn bounded_text(mut file: File) -> String {
+    let mut bytes = Vec::new();
+    let read = file.seek(SeekFrom::Start(0)).and_then(|_| {
+        (&mut file)
+            .take(STARTUP_OUTPUT_LIMIT + 1)
+            .read_to_end(&mut bytes)
+    });
+    if let Err(error) = read {
+        return format!("[could not read captured output: {error}]");
+    }
+    let truncated = bytes.len() as u64 > STARTUP_OUTPUT_LIMIT;
+    bytes.truncate(STARTUP_OUTPUT_LIMIT as usize);
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        text.push_str(&format!("\n[truncated after {STARTUP_OUTPUT_LIMIT} bytes]"));
+    }
+    text
+}
+
+fn failure_reason(stderr: &str) -> Option<String> {
+    let envelope = stderr.lines().rev().find_map(|line| {
+        let value: serde_json::Value = serde_json::from_str(line).ok()?;
+        (value["ok"] == false)
+            .then(|| value["error"]["message"].as_str().map(str::to_owned))
+            .flatten()
+    });
+    let reason = envelope.or_else(|| {
+        stderr
+            .lines()
+            .rev()
+            .map(str::trim)
+            .find(|line| !line.is_empty() && !line.starts_with("[truncated after"))
+            .map(|line| line.strip_prefix("cagents: ").unwrap_or(line).to_owned())
+    })?;
+    let mut reason: String = reason
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .collect();
+    if let Some((index, _)) = reason.char_indices().nth(STARTUP_REASON_LIMIT) {
+        reason.truncate(index);
+        reason.push('…');
+    }
+    Some(reason)
+}
+
+/// Readiness never turns a failed startup command into success, but when the
+/// installed daemon owns the runtime anyway the user must not be told that the
+/// update did not take effect.
+fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool) -> UpdateError {
+    fn sentence(text: &str) -> String {
+        let text = text.trim_end();
+        if text.ends_with(['.', '!', '?', '…']) {
+            text.to_owned()
+        } else {
+            format!("{text}.")
+        }
+    }
+    let mut parts = Vec::new();
+    if successor_runs {
+        parts.push(
+            "The installed version's terminal service is running, but its startup command did not confirm it."
+                .to_owned(),
+        );
+    }
+    parts.push(sentence(&error.to_string()));
+    if let Some(reason) = reason {
+        parts.push(sentence(&format!("It reported: {reason}")));
+    }
+    if !parts
+        .iter()
+        .any(|part| part.contains("cagents daemon status"))
+    {
+        parts.push("Check cagents daemon status before retrying the update.".to_owned());
+    }
+    invalid(parts.join(" "))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn run_captured(
+        script: &str,
+    ) -> (
+        Result<(), crate::install_guard::DaemonStartError>,
+        String,
+        Option<String>,
+    ) {
+        let state = tempfile::tempdir().unwrap();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        let output = StartupOutput::create(state.path()).unwrap();
+        output.attach(&mut command).unwrap();
+        let started =
+            crate::install_guard::wait_daemon_start(&mut command, Duration::from_secs(10));
+        let mut log = Vec::new();
+        let reason = output.record(&mut log);
+        // Captures are unlinked: nothing is left in the job's state directory.
+        assert_eq!(fs::read_dir(state.path()).unwrap().count(), 0);
+        (started, String::from_utf8(log).unwrap(), reason)
+    }
+
+    #[test]
+    fn failed_startup_logs_its_envelope_and_names_the_reason() {
+        let (started, log, reason) = run_captured(
+            r#"echo 'partial stdout'
+echo 'cagents: 1 retained native conversation could not be reattached' >&2
+echo '{"ok":false,"error":{"kind":"daemon_start","message":"could not verify the running cagents daemon: daemon response deadline expired","details":null}}' >&2
+exit 1"#,
+        );
+        let failure = started.unwrap_err();
+        assert!(failure.spawned);
+        assert!(
+            log.contains("Startup command stdout:\npartial stdout"),
+            "{log}"
+        );
+        assert!(
+            log.contains("Startup command stderr:\ncagents: 1 retained"),
+            "{log}"
+        );
+        assert!(log.contains(r#""kind":"daemon_start""#), "{log}");
+        let reason = reason.unwrap();
+        assert_eq!(
+            reason,
+            "could not verify the running cagents daemon: daemon response deadline expired"
+        );
+        assert_eq!(
+            startup_failure(&failure.error, Some(&reason), false).to_string(),
+            "The matched daemon startup command failed (exit status: 1). It reported: could not \
+             verify the running cagents daemon: daemon response deadline expired. Check cagents \
+             daemon status before retrying the update."
+        );
+        assert_eq!(
+            startup_failure(&failure.error, Some(&reason), true).to_string(),
+            "The installed version's terminal service is running, but its startup command did \
+             not confirm it. The matched daemon startup command failed (exit status: 1). It \
+             reported: could not verify the running cagents daemon: daemon response deadline \
+             expired. Check cagents daemon status before retrying the update."
+        );
+    }
+
+    #[test]
+    fn startup_success_keeps_its_envelope_in_the_log() {
+        let (started, log, reason) =
+            run_captured(r#"echo '{"ok":true,"command":"daemon.start","data":{"running":true}}'"#);
+        started.unwrap();
+        assert!(
+            log.contains(
+                r#"Startup command stdout:
+{"ok":true,"command":"daemon.start""#
+            ),
+            "{log}"
+        );
+        assert!(!log.contains("stderr"), "{log}");
+        assert_eq!(reason, None);
+    }
+
+    #[test]
+    fn startup_capture_is_bounded_and_falls_back_to_the_last_stderr_line() {
+        let (started, log, reason) = run_captured(
+            "head -c 100000 /dev/zero | tr '\\0' x; printf 'first\\ncagents: last \\033[31mline\\n' >&2; exit 2",
+        );
+        assert!(started.is_err());
+        assert!(log.contains(&format!("[truncated after {STARTUP_OUTPUT_LIMIT} bytes]")));
+        assert!(
+            log.len() < 2 * STARTUP_OUTPUT_LIMIT as usize,
+            "{}",
+            log.len()
+        );
+        assert_eq!(reason.as_deref(), Some("last  [31mline"));
+        let long = "y".repeat(2 * STARTUP_REASON_LIMIT);
+        let bounded = failure_reason(&long).unwrap();
+        assert_eq!(bounded.chars().count(), STARTUP_REASON_LIMIT + 1);
+        assert!(bounded.ends_with('…'));
+    }
+
+    #[test]
+    fn budget_failure_keeps_its_own_guidance() {
+        let error = io::Error::new(
+            io::ErrorKind::TimedOut,
+            "The matched terminal service exceeded its startup budget; its original command was retained until its actual wait completed. Check cagents daemon status before retrying",
+        );
+        assert_eq!(
+            startup_failure(&error, None, true).to_string(),
+            "The installed version's terminal service is running, but its startup command did \
+             not confirm it. The matched terminal service exceeded its startup budget; its \
+             original command was retained until its actual wait completed. Check cagents \
+             daemon status before retrying."
+        );
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

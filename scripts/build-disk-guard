@@ -4,9 +4,10 @@
 # Every worktree and every agent's target directory grows as it builds, and
 # Cargo never removes any of it. At most every few hours this starts
 # prune-build-dirs in the background, which removes build output nothing has
-# used for a week. Below twice the floor it starts it at once, still in the
-# background, and it also removes removed workspaces' build directories
-# without their usual grace period. Below the floor itself the build waits
+# used for a week, and native-evidence builds unused for half a day. Below
+# twice the floor it starts it at once, still in the background, and it also
+# removes removed workspaces' build directories without their usual grace
+# period, and native-evidence builds unused for an hour. Below the floor itself the build waits
 # for it, within a budget, then is refused if there is still too little
 # room, so it fails with an explanation instead of filling the disk that
 # other builds, agents and their logs share. A guard that cannot tell how
@@ -42,7 +43,8 @@ Environment:
                                 floor starts nothing new (default 300).
   CAGENTS_BUILD_PRUNE_ROOTS     Directories the default pruner searches,
                                 colon-separated, besides the main checkout;
-                                default: ~/.cache, ~/.local/state, /var/tmp.
+                                default: ~/.cache and ~/.local/state of the
+                                account's home and of HOME, and /var/tmp.
   CAGENTS_BUILD_PRUNE_STATE     Prefix of the pruner's schedule, lock, last
                                 output (.log) and removals (.tsv); default:
                                 /var/tmp/cagents-prune-build-dirs-UID.
@@ -107,6 +109,10 @@ open7() {
     { command exec 7>>"$1"; } 2>/dev/null
 }
 prune=${CAGENTS_BUILD_PRUNE:-}
+# Running low, what is cheapest to make again goes sooner: a removed
+# workspace's build directory at once, and a native-evidence task's build,
+# whose next build in a shared slot fetches it again, after an hour unused.
+urgent='--orphan-hours 0 --evidence-hours 1'
 # The pruner beside this guard can also run detached; a command given as
 # CAGENTS_BUILD_PRUNE runs only before a build, below twice the floor.
 pruner=
@@ -126,7 +132,7 @@ if [ -z "$prune" ] && [ -x "$here/prune-build-dirs" ]; then
     esac
     # Out of room, a removed workspace's build directory goes at once, and
     # the build waits for the pruner, or one already running, only so long.
-    prune="$pruner --orphan-hours 0 --budget $budget --wait"
+    prune="$pruner $urgent --budget $budget --wait"
 fi
 
 # Starts the pruner, with the arguments after the first three, detached and
@@ -172,7 +178,7 @@ fi
 if [ "$free" -ge "$floor" ] && [ -n "$pruner" ]; then
     # Running low, but with room for this build: search everything at once,
     # and again every hour, without making builds wait.
-    if detach 60 10 '-c2 -n7' --orphan-hours 0; then
+    if detach 60 10 '-c2 -n7' $urgent; then
         printf '%s: %s GiB free on %s; reclaiming unused build directories in the background\n' \
             "$program" "$free" "$directory" >&2
     fi
@@ -186,7 +192,7 @@ fi
 # Below the floor, a complete run starts too, unless one did within the hour:
 # the build waits for it only within its budget, and it searches on after.
 if [ -n "$pruner" ]; then
-    detach 60 10 '-c2 -n7' --orphan-hours 0 || :
+    detach 60 10 '-c2 -n7' $urgent || :
 fi
 # One reclaim at a time across the host, and at most every ten minutes: a
 # queue of builds would otherwise each scan every build directory. The stamp

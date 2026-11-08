@@ -520,8 +520,8 @@ impl Cagents {
                 self.status = Some(TransientNotice::error(
                     "This pane couldn't be removed right now, so it was kept. Close it again.",
                 ));
-                // Nothing will settle this close, so nothing else would advance
-                // the queue. It waits by itself for a removal still on its way.
+                // Nothing will settle this close, so the queue moves on now. It
+                // waits by itself for a removal still on its way.
                 self.next_queued_card_close()
             }
         }

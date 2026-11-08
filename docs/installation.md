@@ -274,7 +274,21 @@ without replacing the running daemon; saved windows reopen with that daemon's
 matching UI. Finish the staged update in the application or run
 `cagents daemon upgrade`. This command displays the same impact, asks for
 approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
-additionally permits active native turns to stop.
+additionally permits active native turns to stop. `--accept-unreopenable`
+carries saved panes whose ended Claude actor never recorded its conversation:
+the update otherwise refuses them, naming each pane. They stay in their windows
+but, unless their conversation can still be proved, will not resume or start
+one; a conversation one began stays on disk and can be reopened with Resume.
+The flag accepts this for every such pane found during the update, not only the
+ones a previous refusal named. It also ends conversations the running daemon
+reports it cannot carry: a Codex chat whose server can no longer be reached,
+and a chat whose provider stopped without confirming its work finished. The
+command lists each with what ending it loses, asks before ending them unless
+`--yes` is given, ends them through the daemon's own close, and then shows the
+impact that remains. Their conversations stay on disk and can be reopened with
+Resume. If anything else blocks the update, nothing is ended and it stops. If
+the daemon cannot end one, the others are still ended, and the update stops
+without starting.
 
 To make a verified build available without saving or closing running windows,
 append `--stage-only` to the installer invocation. It publishes the complete
