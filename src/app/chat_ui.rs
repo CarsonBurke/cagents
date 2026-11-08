@@ -3243,12 +3243,7 @@ impl Runtime {
     /// recovery draft; restoring it never automatically submits either part.
     fn persistent_draft(&self) -> (String, Vec<Attachment>) {
         let mut text = self.unsent_text();
-        let mut images = self
-            .unsent_attachments()
-            .iter()
-            .filter(|image| image.reference.is_some())
-            .cloned()
-            .collect::<Vec<_>>();
+        let mut attachments = self.unsent_attachments().to_vec();
         if let Some(queued) = &self.queued {
             let first = queued.source.text();
             if text.is_empty() {
@@ -3256,14 +3251,14 @@ impl Runtime {
             } else {
                 text = format!("{first}\n{text}");
             }
-            let later = std::mem::take(&mut images);
-            for image in queued.attachments.iter().chain(later.iter()) {
-                if image.reference.is_some() && !images.contains(image) {
-                    images.push(image.clone());
+            let later = std::mem::take(&mut attachments);
+            for attachment in queued.attachments.iter().chain(later.iter()) {
+                if !attachments.contains(attachment) {
+                    attachments.push(attachment.clone());
                 }
             }
         }
-        (text, images)
+        (text, attachments)
     }
 
     /// An empty draft can show a suggestion only for its exact current turn.
@@ -5356,9 +5351,9 @@ impl Runtime {
     ///
     /// An unsent draft is deliberately absent: `Cagents::chat_forget` stashes
     /// it and a returning runtime restores it, so typing a single character no
-    /// longer makes the card impossible to leave. Managed image receipts are
-    /// stashed alongside it. Legacy path-only attachments and half-entered
-    /// request answers still need this runtime.
+    /// longer makes the card impossible to leave. Attached files and managed
+    /// image receipts are stashed alongside it. An image with a malformed
+    /// receipt and half-entered request answers still need this runtime.
     pub(super) fn transition_blocker(&self) -> Option<&'static str> {
         if self.attachment_chooser_pending.is_some() {
             Some("Finish or cancel the file chooser before leaving the chat.")
@@ -5378,10 +5373,10 @@ impl Runtime {
                 attachment
                     .reference
                     .as_ref()
-                    .is_none_or(|reference| reference.validate().is_err())
+                    .is_some_and(|reference| reference.validate().is_err())
             })
         {
-            Some("Send or remove the attached files before leaving the chat.")
+            Some("Send or remove the attached images before leaving the chat.")
         } else if self
             .answers
             .values()
@@ -5413,9 +5408,9 @@ impl Runtime {
     }
     /// Why this chat cannot survive the process restarting.
     ///
-    /// Composer text and managed image receipts are included in the workspace
-    /// snapshot flushed before an update. Path-only attachments, answers and
-    /// in-flight work still need a live UI.
+    /// Composer text, attached files and managed image receipts are included
+    /// in the workspace snapshot flushed before an update. An image whose
+    /// receipt is malformed, answers and in-flight work still need a live UI.
     pub(super) fn restart_blocker(&self) -> Option<&'static str> {
         self.transition_blocker()
     }
@@ -7708,19 +7703,7 @@ impl Cagents {
             self.settings.editor_syntax_theme,
         );
         runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
-        if let Some(draft) = self.chat_ui.drafts.remove(&card)
-            && !draft.is_empty()
-        {
-            runtime.replace_draft(text_editor::Content::with_text(&draft));
-        }
-        if let Some(images) = self.chat_ui.draft_attachments.remove(&card) {
-            runtime.replace_attachments(
-                images
-                    .into_iter()
-                    .filter(|a| a.reference.is_some())
-                    .collect(),
-            );
-        }
+        self.restore_saved_draft(card, &mut runtime);
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
         // hibernate: the card is whole as it stands.
         self.lifecycle.remove(card);
@@ -7826,6 +7809,19 @@ impl Cagents {
         true
     }
 
+    /// Gives a new runtime for `card` the draft saved when its last one
+    /// left: the text and every attachment, files as well as images.
+    pub(super) fn restore_saved_draft(&mut self, card: CardId, runtime: &mut Runtime) {
+        if let Some(draft) = self.chat_ui.drafts.remove(&card)
+            && !draft.is_empty()
+        {
+            runtime.replace_draft(text_editor::Content::with_text(&draft));
+        }
+        if let Some(attachments) = self.chat_ui.draft_attachments.remove(&card) {
+            runtime.replace_attachments(attachments);
+        }
+    }
+
     pub(super) fn shared_chat_has_local_work(&self, card: CardId) -> bool {
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
@@ -7834,6 +7830,7 @@ impl Cagents {
         runtime.is_some_and(|runtime| {
             runtime.closed_elsewhere
                 || runtime.has_unsent_text()
+                || !runtime.unsent_attachments().is_empty()
                 || runtime.transition_blocker().is_some()
         }) || self
             .chat_ui
@@ -7918,11 +7915,11 @@ impl Cagents {
     /// card builds next opens with them rather than losing them.
     pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
-            let (draft, images) = runtime.persistent_draft();
-            if images.is_empty() {
+            let (draft, attachments) = runtime.persistent_draft();
+            if attachments.is_empty() {
                 self.chat_ui.draft_attachments.remove(&card);
             } else {
-                self.chat_ui.draft_attachments.insert(card, images);
+                self.chat_ui.draft_attachments.insert(card, attachments);
             }
             if draft.is_empty() {
                 self.chat_ui.drafts.remove(&card);
@@ -10617,21 +10614,7 @@ impl Cagents {
                             );
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
-                            if let Some(draft) = self.chat_ui.drafts.remove(&target.card)
-                                && !draft.is_empty()
-                            {
-                                runtime.replace_draft(text_editor::Content::with_text(&draft));
-                            }
-                            if let Some(images) =
-                                self.chat_ui.draft_attachments.remove(&target.card)
-                            {
-                                runtime.replace_attachments(
-                                    images
-                                        .into_iter()
-                                        .filter(|a| a.reference.is_some())
-                                        .collect(),
-                                );
-                            }
+                            self.restore_saved_draft(target.card, &mut runtime);
                             runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self
@@ -18749,6 +18732,61 @@ mod tests {
         });
     }
 
+    /// A file the person chose has no managed identity, but it is as much a
+    /// part of the draft as its text and images (#2202).
+    #[test]
+    fn unsent_files_survive_saving_reopening_and_closing_with_the_draft() {
+        chat::attachment_assets::with_test_image(|image| {
+            let directory = tempfile::tempdir().unwrap();
+            let notes = directory.path().join("notes.txt");
+            std::fs::write(&notes, "notes").unwrap();
+            let file = Attachment::file(&notes);
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let card = draft_chat_for_provider(&mut app, Provider::Claude);
+            let text = format!(
+                "read this with {}",
+                image.reference.as_ref().unwrap().token()
+            );
+            write(&mut app, card, &text);
+            let target = chat_runtime(&app, card).target;
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_attachments(vec![image.clone(), file.clone()]);
+            let saved = app.persistent_workspace();
+            assert_eq!(saved.chat_drafts[&card], text);
+            assert_eq!(
+                saved.chat_draft_attachments[&card],
+                [image.clone(), file.clone()]
+            );
+            assert_eq!(
+                app.window_close_transient_blocker(),
+                None,
+                "a saved file no longer needs the live window"
+            );
+
+            // The runtime is dropped while the card lives on.
+            app.chat_forget(card);
+            assert_eq!(
+                app.chat_ui.draft_attachments[&card],
+                [image.clone(), file.clone()]
+            );
+
+            // The window reopens from what was saved.
+            let CardRuntime::Chat(runtime) = app.cards.remove(&card).unwrap() else {
+                unreachable!()
+            };
+            let session = runtime.session.clone();
+            app.chat_ui = State::with_draft_attachments(
+                saved.chat_drafts.clone(),
+                saved.chat_draft_attachments.clone(),
+            );
+            drop(app.open_chat_draft(card, session));
+            let runtime = chat_runtime(&app, card);
+            assert_eq!(runtime.composer.text(), text);
+            assert_eq!(runtime.attachments, [image, file]);
+        });
+    }
+
     #[test]
     fn image_draft_close_keeps_pending_and_unpersistable_work_protected() {
         let _admission = attachment_draft::test_admission();
@@ -18767,32 +18805,35 @@ mod tests {
             );
             assert!(runtime.finish_attachment_insert(ticket.id, "", vec![]));
             assert!(runtime.restart_blocker().is_none());
-            // A recalled managed image must not hide the original unsent
-            // path-only attachment, which the workspace cannot preserve.
-            runtime.remember_with_attachments("previous image".into(), vec![image.clone()]);
+            // A file is saved with the draft, so it no longer holds the
+            // window open.
             runtime.replace_attachments(vec![Attachment::file("/unsaved.txt")]);
+            assert!(runtime.restart_blocker().is_none());
+            // A recalled managed image must not hide the original unsent
+            // malformed image, which the workspace cannot preserve.
+            let mut malformed = image.clone();
+            malformed.reference.as_mut().unwrap().sha256.clear();
+            runtime.remember_with_attachments("previous image".into(), vec![image]);
+            runtime.replace_attachments(vec![malformed.clone()]);
             runtime.recall(true);
             assert!(
                 runtime
                     .attachments
                     .iter()
-                    .any(|attachment| attachment.reference.is_some())
+                    .all(|attachment| attachment != &malformed)
             );
             assert!(
                 runtime
                     .restart_blocker()
                     .unwrap()
-                    .contains("attached files")
+                    .contains("attached images")
             );
             runtime.recall(false);
-            let mut malformed = image;
-            malformed.reference.as_mut().unwrap().sha256.clear();
-            runtime.replace_attachments(vec![malformed]);
             assert!(
                 runtime
                     .restart_blocker()
                     .unwrap()
-                    .contains("attached files")
+                    .contains("attached images")
             );
         });
     }
@@ -27400,11 +27441,19 @@ mod tests {
         let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
             unreachable!()
         };
+        // An image whose receipt is malformed cannot be saved with the draft.
         runtime.attachments.push(Attachment {
             path: PathBuf::from("/tmp/unsent-attachment.png"),
-            reference: None,
+            reference: Some(chat::ImageReference {
+                id: uuid::Uuid::nil(),
+                number: 0,
+                device: uuid::Uuid::nil(),
+                name: "unsent-attachment.png".into(),
+                sha256: String::new(),
+                extension: "png".into(),
+            }),
         });
-        let reason = "Send or remove the attached files before leaving the chat.";
+        let reason = "Send or remove the attached images before leaving the chat.";
         assert_eq!(app.chat_switch_blocker(card).as_deref(), Some(reason));
         assert!(!app.chat_switch_ready(card));
         let _ = app.update(Message::ChatUi(Action::Switch(card)));

@@ -62,17 +62,7 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
-        if let Some(text) = self.chat_ui.drafts.remove(&card) {
-            runtime.replace_draft(text_editor::Content::with_text(&text));
-        }
-        if let Some(images) = self.chat_ui.draft_attachments.remove(&card) {
-            runtime.replace_attachments(
-                images
-                    .into_iter()
-                    .filter(|image| image.reference.is_some())
-                    .collect(),
-            );
-        }
+        self.restore_saved_draft(card, &mut runtime);
         // Deliberately no provider connection, draft skill discovery, retirement,
         // or lifecycle job: this is only a local view of saved bytes.
         self.cards
@@ -86,18 +76,15 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&copy) else {
             return Task::none();
         };
+        // Exactly what the workspace snapshot saves for this card later.
+        let (draft, attachments) = runtime.persistent_draft();
         let payload = crate::persistence::RetainedChatCopy {
             workspace: self.durable.id,
             source_card,
             source: runtime.session.clone(),
             copy: self.card_state(copy).expect("retained card exists").clone(),
-            draft: runtime.unsent_text(),
-            attachments: runtime
-                .unsent_attachments()
-                .iter()
-                .filter(|image| image.reference.is_some())
-                .cloned()
-                .collect(),
+            draft,
+            attachments,
             scope: self.durable.card_scopes.get(&copy).cloned(),
             channel: self
                 .durable
@@ -403,6 +390,48 @@ mod tests {
                 matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))),
                 "review-only admission must not start the replacement provider"
             );
+        });
+    }
+
+    /// The file a person chose stays with the draft another window's start
+    /// set aside, and in the inert copy kept beside the replacement (#2202).
+    #[test]
+    fn admission_keeps_an_unsent_file_beside_the_draft_images() {
+        chat::attachment_assets::with_test_image(|image| {
+            let file = chat::Attachment::file("/project/notes.txt");
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Claude, Some("/project".into())));
+            let card = app.workspace.focused().unwrap();
+            let mut source = match app.cards.get(&card).unwrap() {
+                CardRuntime::Chat(runtime) => runtime.session.clone(),
+                _ => panic!("native draft expected"),
+            };
+            source.launch.session_id = Some("old-file-thread".into());
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            app.chat_ui
+                .draft_attachments
+                .insert(card, vec![image.clone(), file.clone()]);
+            app.await_shared_chat_admission(card, source.clone());
+            let CardRuntime::Chat(runtime) = app.cards.get(&card).unwrap() else {
+                panic!("saved draft expected")
+            };
+            assert_eq!(runtime.unsent_attachments(), [image.clone(), file.clone()]);
+
+            let mut replacement = app.card_state(card).unwrap().clone();
+            let mut canonical = source.clone();
+            canonical.id = TerminalId::new();
+            canonical.launch.session_id = Some("different-thread".into());
+            replacement.kind = CardKind::Chat(canonical);
+            let pane = crate::workspace_model::views::Pane::from_card(
+                &replacement,
+                Some("/project".into()),
+            )
+            .unwrap();
+            let (task, retained) = app.retain_unresolved_shared_upgrade(&pane);
+            drop(task);
+            let retained = retained.expect("a file-carrying draft receives an inert source copy");
+            let saved = app.persistent_workspace();
+            assert_eq!(saved.chat_draft_attachments[&retained], [image, file]);
         });
     }
 }
