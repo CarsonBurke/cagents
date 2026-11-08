@@ -105,6 +105,10 @@ pub(crate) struct OwnedChildren {
     /// More of the provider's own processes, such as a server its launcher
     /// started, which end with it even when its detached work is spared.
     provider: Pinned,
+    /// A server its launcher left to this process, and whether reaping found
+    /// it killed by `SIGKILL` before teardown decided anything.
+    server: Option<Process>,
+    server_killed: std::cell::Cell<bool>,
 }
 
 impl OwnedChildren {
@@ -116,7 +120,16 @@ impl OwnedChildren {
             group_signalled: false,
             detached: DetachedWork::Stop,
             provider: Pinned::default(),
+            server: None,
+            server_killed: Default::default(),
         }
+    }
+
+    /// Names the server the provider's launcher started. If it becomes this
+    /// process's child and is killed, the kill is remembered when it is
+    /// reaped, as its status is gone afterwards.
+    pub(crate) fn watch_server(&mut self, server: Process) {
+        self.server = Some(server);
     }
 
     /// Decides, before teardown first signals anything, what it does with
@@ -136,7 +149,7 @@ impl OwnedChildren {
             return Ok(());
         }
         self.provider = Pinned::pin(provider)?;
-        self.detached = if self.killed() {
+        self.detached = if self.server_killed.get() || self.killed() {
             DetachedWork::Stop
         } else {
             detached
@@ -153,23 +166,7 @@ impl OwnedChildren {
         };
         std::iter::once(child.id() as i32)
             .chain(self.provider.pids.iter().copied())
-            .any(|pid| {
-                let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
-                // SAFETY: the buffer is live and writable; WNOWAIT leaves the
-                // status for teardown's own reap. A process that isn't this
-                // one's child fails with ECHILD.
-                unsafe {
-                    libc::waitid(
-                        libc::P_PID,
-                        pid as libc::id_t,
-                        &mut status,
-                        libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
-                    ) == 0
-                        && status.si_pid() != 0
-                        && status.si_code == libc::CLD_KILLED
-                        && status.si_status() == libc::SIGKILL
-                }
-            })
+            .any(killed_unreaped)
     }
 
     pub(crate) fn id(&self) -> i32 {
@@ -203,6 +200,12 @@ impl OwnedChildren {
                 .is_some_and(|child| child.id() == pid as u32)
             {
                 continue;
+            }
+            // Its status is about to be consumed: remember a killed server.
+            if self.server.as_ref().is_some_and(|server| {
+                server.pid == pid && killed_unreaped(pid) && server.is_current()
+            }) {
+                self.server_killed.set(true);
             }
             loop {
                 // This dedicated owner is the only reaper. Live children are
@@ -317,6 +320,25 @@ impl OwnedChildren {
                 _ => return Err(io::Error::last_os_error()),
             }
         }
+    }
+}
+
+/// Whether `pid`, an unreaped child of this process, exited by `SIGKILL`.
+/// WNOWAIT leaves its status for the reap; any other process fails with
+/// ECHILD.
+fn killed_unreaped(pid: i32) -> bool {
+    let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: the buffer is live and writable.
+    unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut status,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        ) == 0
+            && status.si_pid() != 0
+            && status.si_code == libc::CLD_KILLED
+            && status.si_status() == libc::SIGKILL
     }
 }
 
@@ -550,27 +572,34 @@ record "$3" $left; record "$2" $running
             return;
         }
         subreaper();
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let provider = provider_with_detached_work(root.path()).spawn().unwrap();
-        let work = detached_work(root.path());
-        let server = work.detached;
-        let detached = orphan(root.path(), "detached-work");
-        let mut children = OwnedChildren::new(provider);
-        unsafe { libc::kill(server, libc::SIGKILL) };
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let stat = std::fs::read_to_string(format!("/proc/{server}/stat")).unwrap();
-            if stat[stat.rfind(')').unwrap() + 2..].starts_with('Z') {
-                break;
+        // Whether or not the idle reaper collected the server before the close.
+        for reaped_first in [false, true] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let provider = provider_with_detached_work(root.path()).spawn().unwrap();
+            let work = detached_work(root.path());
+            let server = Process::read(work.detached).unwrap();
+            let detached = orphan(root.path(), "detached-work");
+            let mut children = OwnedChildren::new(provider);
+            children.watch_server(server.clone());
+            unsafe { libc::kill(server.pid, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while alive(server.pid) {
+                assert!(Instant::now() < deadline, "the server outlived its kill");
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(Instant::now() < deadline, "the server outlived its kill");
-            std::thread::sleep(Duration::from_millis(10));
+            if reaped_first {
+                children.reap_exited_descendants().unwrap();
+                assert!(!exists(server.pid));
+            }
+            children
+                .decide_detached(DetachedWork::Spare, std::slice::from_ref(&server))
+                .unwrap();
+            assert!(children.terminate(Duration::from_secs(10)).unwrap());
+            assert!(
+                !exists(detached) && !exists(work.left) && !exists(server.pid),
+                "reaped first: {reaped_first}"
+            );
         }
-        children
-            .decide_detached(DetachedWork::Spare, &[Process::read(server).unwrap()])
-            .unwrap();
-        assert!(children.terminate(Duration::from_secs(10)).unwrap());
-        assert!(!exists(detached) && !exists(work.left) && !exists(server));
     }
 
     #[test]

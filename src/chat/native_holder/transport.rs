@@ -1022,7 +1022,9 @@ impl Residence {
                         .and_then(|()| pin_provider_process(&process))
                         .and_then(|pidfd| {
                             let server = process.pid as u32;
+                            let watched = process.clone();
                             self.recovery.confirm(thread, identity, process)?;
+                            self.child.watch_server(watched);
                             self.provider_pidfd = pidfd;
                             self.keep_commands_apart(server);
                             Ok(())
