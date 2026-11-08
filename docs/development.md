@@ -139,7 +139,11 @@ scripts/run-development                 # with the embedded browser
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
 | `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
-| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
+| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them, when they stop and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
+| `--keep` | With `--instance`: keep the instance after the session that started it ends; see [How long an instance runs](#how-long-an-instance-runs) |
+| `--ttl SECONDS` | With `--instance`: stop the instance that long after it starts |
+| `--gc` | Stop instances whose starter has ended, other than kept ones, and clear what dead harness sessions left |
+| `--storage DAYS` | With `--gc`: also delete the storage of instances that are not running and that nothing touched for `DAYS` days |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -251,8 +255,9 @@ what `niri-harness exec` provides.
 Stopping a harness session deletes its runtime directory, so stop an instance
 with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains
-for its next launch; delete `~/.local/share/cagents-development-NAME` and its
-config and state siblings to discard it.
+for its next launch; `--gc --storage DAYS` deletes what has gone unused, or
+delete `~/.local/share/cagents-development-NAME` and its config, state and
+cache siblings to discard one.
 
 #### Stopping instances from a cagents session
 
@@ -298,6 +303,7 @@ pr2064, pid 1118559, running 02:17:40
   checkout:   /home/me/cagents/.worktrees/pr2064
   runtime:    /run/user/1000/nh-MwPpz5r1
   started by: claude (pid 2417058), which has ended, in a cagents session
+  lifetime:   stops 600 seconds after its starter ends
   stop:       scripts/run-development --stop-instance pr2064
 ```
 
@@ -315,9 +321,46 @@ whose hosts can't be told, it offers none. It finds development daemons by the
 instance lock they hold, so it also lists those built outside a checkout's
 `target/`.
 
-An instance keeps running when the session that started it ends, so that
-another agent or a person can go on using it. Stop it when you're done, and
-check `--list-instances` for instances left behind.
+#### How long an instance runs
+
+An instance stops by itself 10 minutes after the session that started it ends:
+the agent's provider process for a hosted caller, otherwise the shell that ran
+the runner. That covers a provider restarting without leaving instances behind
+when an agent finishes or is stopped. `CAGENTS_INSTANCE_GRACE_SECONDS` changes
+the 10 minutes for the instances a launch starts.
+
+- `--keep` keeps it until someone stops it, so another agent or a person can
+  go on using it. Use it when you start an instance for someone else, or
+  from a one-shot shell such as `ssh fw16 'scripts/run-development ...'`, whose
+  shell ends at once.
+- `--ttl SECONDS` stops it that long after it starts, kept or not, which suits
+  a measurement or a review with a known length.
+
+A watcher that the launch leaves detached applies this every 30 seconds, and
+ends with the session however that ends. Each stop is logged, with its
+reason, in `~/.local/state/cagents-development-NAME/run-development.log`. The
+watcher stops the daemon and everything started in the instance's runtime as
+`--stop-instance` does: `TERM`, which `daemon stop-for-rebuild` also sends, then
+`KILL` after 10 seconds, then the harness session and its runtime directory.
+
+The next `--instance` launch and `--gc` repair what a watcher could not:
+
+- A harness session that ended without being stopped, such as a killed
+  compositor, is cleared: what still runs in its runtime is stopped and the
+  directory removed, so the name can be launched again rather than refused.
+  A session that changed in the last minute may still be starting, so it is
+  left alone, as `niri-harness gc` does.
+- An instance whose watcher was killed is stopped once its lifetime has
+  passed, measured from its start.
+- `--gc` also stops instances started by older runners, which recorded no
+  lifetime, once their starter has ended; it names any running instance with
+  no record at all, and leaves it.
+
+None of them stops an instance whose daemon hosts the caller, or one that a
+session it descends from runs in; a hosted caller whose hosts can't be told
+stops nothing. `--gc --storage 14` also deletes the storage of instances that
+aren't running and that nothing touched for 14 days. An instance counts as
+running while its harness session is live or any process was started for it.
 
 Instances started from one checkout run that checkout's executables, so start
 them all in the same lane: all `--browserless` or all integrated. The two lanes

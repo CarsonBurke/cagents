@@ -793,7 +793,7 @@ exit 83
             self.assertEqual(result.returncode, 0, result.stderr)
             lines = result.stdout.splitlines()
             index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
-            return lines[index:index + 5]
+            return lines[index:index + 6]
 
         deadline = time.monotonic() + 5
         while not any(os.readlink(f"/proc/{process.pid}/fd/{fd}") == str(lock)
@@ -803,6 +803,9 @@ exit 83
         block = listing()
         self.assertEqual(
             block[4],
+            "  lifetime:   started by an older runner: runs until stopped, or scripts/run-development --gc once its starter has ended")
+        self.assertEqual(
+            block[5],
             f"  stop:       scripts/run-development --stop-instance fx1, once niri-harness is installed; or kill {process.pid}")
         # A harness that knows no such session.
         harness = Path(self.env["PATH"].split(":")[0]) / "niri-harness"
@@ -816,7 +819,7 @@ exit 83
             block[3],
             f"  started by: fixture-agent (pid {starter}), still running, in a cagents session")
         # Without a runner session, only its process can be named.
-        self.assertTrue(block[4].startswith(f"  stop:       kill {process.pid} "), block)
+        self.assertTrue(block[5].startswith(f"  stop:       kill {process.pid} "), block)
         # A session whose hosts can't be told is offered no way to stop it.
         unknown = self.below_daemon(
             ["--list-instances"], [f"XDG_RUNTIME_DIR={self.root / 'elsewhere'}"],
@@ -825,7 +828,7 @@ exit 83
         lines = unknown.stdout.splitlines()
         index = lines.index(next(line for line in lines if f"pid {process.pid}," in line))
         self.assertEqual(
-            lines[index + 4], "  stop:       not from here: which daemons host this session can't be told")
+            lines[index + 5], "  stop:       not from here: which daemons host this session can't be told")
         shutil.rmtree(checkout)
         self.assertEqual(listing()[1], f"  checkout:   {checkout} (removed)")
         self.assertFalse(self.cargo_calls.exists(), "listing built")
@@ -1017,6 +1020,297 @@ exit 1
         self.assert_built()
         self.assert_skipped()
         self.assert_built("--browserless")
+
+
+def process_start(pid):
+    return Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[19]
+
+
+class InstanceLifetime(unittest.TestCase):
+    """An instance stops once the session that started it has been gone for its
+    grace period, or its --ttl passes, unless it is kept; and what dead
+    sessions and unused instances leave behind can be cleared."""
+
+    def setUp(self):
+        # Its fake Cargo builds, so a launch gets as far as starting a session.
+        LaunchFreshness.setUp(self)
+        self.runtime_root = self.root / "rt"
+        self.runtime_root.mkdir()
+        self.sessions = self.root / "harness-sessions"
+        self.sessions.mkdir()
+        self.harness_calls = self.root / "harness-calls"
+        # A harness that knows the sessions described in self.sessions: one file
+        # per session, holding its state and runtime directory.
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(f"""#!/bin/sh
+sessions='{self.sessions}'
+printf '%s\\n' "$*" >>'{self.harness_calls}'
+session=
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --session) session=$2; shift 2 ;;
+        list)
+            for file in "$sessions"/*; do
+                [ -f "$file" ] || continue
+                read -r state runtime <"$file"
+                printf '%s %s headless 0%%  %s/%s root\\n' "${{file##*/}}" "$state" "$sessions" "${{file##*/}}.d"
+            done
+            exit 0 ;;
+        env)
+            [ -f "$sessions/$session" ] || exit 1
+            read -r state runtime <"$sessions/$session"
+            printf "export XDG_RUNTIME_DIR='%s'\\n" "$runtime"
+            exit 0 ;;
+        stop) rm -f "$sessions/$session"; exit 0 ;;
+        start)
+            # Started as the runner names it, with a fresh runtime.
+            while [ "$1" != --name ]; do shift; done
+            mkdir -p "$sessions/$2.runtime"
+            printf 'live %s\n' "$sessions/$2.runtime" >"$sessions/$2"
+            exit 0 ;;
+        gc) exit 0 ;;
+        *) shift ;;
+    esac
+done
+exit 1
+""")
+        harness.chmod(0o755)
+        self.env.update(XDG_RUNTIME_DIR=str(self.runtime_root),
+                        XDG_STATE_HOME=str(self.root / "state"),
+                        XDG_CONFIG_HOME=str(self.root / "config"),
+                        XDG_CACHE_HOME=str(self.root / "cache"))
+        for name in ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_DEVELOPMENT_INSTANCE",
+                     "CAGENTS_DEVELOPMENT_HOSTED_BY", "CAGENTS_INSTANCE_GRACE_SECONDS"):
+            self.env.pop(name, None)
+
+    def session(self, name, state="asleep", record=None, age=None):
+        """A harness session for instance `name`, with a daemon-like process
+        started with its runtime, and the runner's record when given."""
+        runtime = self.runtime_root / f"nh-{name}"
+        runtime.mkdir()
+        (self.sessions / f"cagents-{name}").write_text(f"{state} {runtime}\n")
+        root = self.sessions / f"cagents-{name}.d root"
+        root.mkdir()
+        if age is not None:
+            then = time.time() - age
+            os.utime(root, (then, then))
+        if record is not None:
+            (runtime / "cagents-run-development.owner").write_text(
+                "".join(f"{key}={value}\n" for key, value in record.items()))
+        process = subprocess.Popen(["sleep", "60"], env={"XDG_RUNTIME_DIR": str(runtime),
+                                                          "PATH": "/usr/bin:/bin"})
+        self.addCleanup(lambda: (process.kill(), process.wait()))
+        return runtime, process
+
+    def ended_owner(self):
+        owner = subprocess.Popen(["true"])
+        owner.wait()
+        return {"owner": owner.pid, "owner_start": "1", "owner_name": "ended-agent"}
+
+    def living_owner(self):
+        return {"owner": os.getpid(), "owner_start": process_start(os.getpid()),
+                "owner_name": "living-agent"}
+
+    def run_runner(self, *arguments, **changes):
+        return subprocess.run([str(self.runner), *arguments], cwd=self.root,
+                              env=self.env | changes, capture_output=True, text=True, timeout=30)
+
+    def assert_stopped(self, runtime, process):
+        self.assertEqual(process.wait(timeout=15), -signal.SIGTERM)
+        # A watcher sweeps once the processes it signalled have gone.
+        deadline = time.monotonic() + 15
+        while runtime.exists():
+            self.assertLess(time.monotonic(), deadline, "the runtime was not swept")
+            time.sleep(0.1)
+
+    def test_gc_stops_an_instance_whose_starter_ended_past_its_grace(self):
+        old = int(time.time()) - 100
+        runtime, process = self.session("ended", record=self.ended_owner() | {
+            "lifetime": "owner", "grace": 50, "started_at": old})
+        result = self.run_runner("--gc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("instance ended: stopping it because ended-agent", result.stderr)
+        self.assertIn("which started it, ended over 50 seconds ago", result.stderr)
+        self.assert_stopped(runtime, process)
+        self.assertFalse((self.sessions / "cagents-ended").exists())
+        log = (self.root / "state/cagents-development-ended/run-development.log").read_text()
+        self.assertIn("stopped: ended-agent", log)
+        self.assertFalse(self.cargo_calls.exists(), "collecting built")
+
+    def test_gc_leaves_instances_within_grace_kept_or_still_owned(self):
+        now = int(time.time())
+        cases = {
+            "fresh": self.ended_owner() | {"lifetime": "owner", "grace": 600, "started_at": now},
+            "kept": self.ended_owner() | {"lifetime": "kept", "grace": 0, "started_at": now - 100},
+            "owned": self.living_owner() | {"lifetime": "owner", "grace": 0, "started_at": now - 100},
+        }
+        sessions = {name: self.session(name, record=record) for name, record in cases.items()}
+        result = self.run_runner("--gc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name, (runtime, process) in sessions.items():
+            with self.subTest(name):
+                self.assertIsNone(process.poll())
+                self.assertTrue(runtime.exists())
+
+    def test_a_ttl_stops_even_a_kept_instance_whose_starter_runs(self):
+        runtime, process = self.session("brief", record=self.living_owner() | {
+            "lifetime": "kept", "grace": 600, "started_at": int(time.time()) - 30, "ttl": 20})
+        result = self.run_runner("--gc")
+        self.assertIn("instance brief: stopping it because its --ttl of 20 seconds passed", result.stderr)
+        self.assert_stopped(runtime, process)
+
+    def test_gc_tells_of_a_running_instance_nothing_records_and_leaves_it(self):
+        runtime, process = self.session("unrecorded")
+        result = self.run_runner("--gc")
+        self.assertIn("instance unrecorded: left running, since nothing records who started it; "
+                      "stop it with --stop-instance unrecorded", result.stderr)
+        self.assertIsNone(process.poll())
+
+    def test_a_dead_session_is_cleared_once_it_has_been_quiet_for_a_minute(self):
+        stale, stale_process = self.session("stale", state="dead", age=120)
+        starting, starting_process = self.session("starting", state="dead")
+        result = self.run_runner("--gc")
+        self.assertIn("instance stale: its session had ended without being stopped; cleared what it left",
+                      result.stderr)
+        self.assert_stopped(stale, stale_process)
+        # It may still be starting: it has not yet recorded its compositor.
+        self.assertNotIn("instance starting", result.stderr)
+        self.assertIsNone(starting_process.poll())
+        self.assertTrue(starting.exists())
+
+    def test_a_launch_clears_its_names_dead_session_instead_of_refusing(self):
+        runtime, process = self.session("again", state="dead", age=120)
+        limit = self.runner.with_name("memory-capped")
+        limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
+        limit.chmod(0o755)
+        result = self.run_runner("--browserless", "--instance", "again")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("start --backend headless --name cagents-again", self.harness_calls.read_text())
+        self.assertIn("instance again: its session had ended without being stopped", result.stderr)
+        self.assert_stopped(runtime, process)
+
+    def test_a_launch_records_its_lifetime_and_leaves_a_watcher(self):
+        result = self.run_runner("--browserless", "--instance", "kept", "--keep", "--ttl", "600",
+                                 CAGENTS_INSTANCE_WATCH_SECONDS="0.2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Instance kept is running in niri-harness session cagents-kept; it runs until "
+                      "you stop it, or 600 seconds after it started.", result.stdout)
+        record = self.sessions / "cagents-kept.runtime/cagents-run-development.owner"
+        deadline = time.monotonic() + 10
+        while "watcher=" not in record.read_text():
+            self.assertLess(time.monotonic(), deadline, "no watcher recorded itself")
+            time.sleep(0.05)
+        text = record.read_text()
+        self.assertIn("lifetime=kept\n", text)
+        self.assertIn("ttl=600\n", text)
+        watcher = int(text.split("watcher=", 1)[1].split()[0])
+        self.addCleanup(lambda: os.kill(watcher, signal.SIGKILL) if Path(f"/proc/{watcher}").exists() else None)
+        # The watcher outlives the launch, and ends with its session.
+        self.assertTrue(Path(f"/proc/{watcher}").exists())
+        (self.sessions / "cagents-kept").unlink()
+        deadline = time.monotonic() + 10
+        while Path(f"/proc/{watcher}").exists() and \
+                Path(f"/proc/{watcher}/stat").read_text().rsplit(") ", 1)[1][0] != "Z":
+            self.assertLess(time.monotonic(), deadline, "the watcher outlived its session")
+            time.sleep(0.05)
+
+    def test_a_live_session_still_refuses_a_second_launch(self):
+        self.session("busy", record=self.living_owner() | {"lifetime": "owner", "grace": 600,
+                                                             "started_at": int(time.time())})
+        result = self.run_runner("--browserless", "--instance", "busy")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("instance busy already has a running session; relaunch it with --fresh-daemon "
+                      "or stop it with --stop-instance busy", result.stderr)
+
+    def test_collection_never_stops_the_instance_hosting_the_caller(self):
+        runtime, process = self.session("host", record=self.ended_owner() | {
+            "lifetime": "owner", "grace": 0, "started_at": 1})
+        result = LaunchFreshness.below_daemon(self, ["--gc"], [f"XDG_RUNTIME_DIR={runtime}"])
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIsNone(process.poll())
+        self.assertTrue(runtime.exists())
+        # Nor anything, when its hosts can't be told.
+        unknown = LaunchFreshness.below_daemon(
+            self, ["--gc"], [f"XDG_RUNTIME_DIR={self.root / 'elsewhere'}"], ["XDG_RUNTIME_DIR=relative"])
+        self.assertIn("cannot tell which daemons host this session", unknown.stderr)
+        self.assertIsNone(process.poll())
+
+    def test_the_watcher_stops_its_instance_once_the_starter_has_been_gone_for_the_grace(self):
+        owner = subprocess.Popen(["sleep", "60"])
+        self.addCleanup(lambda: (owner.kill(), owner.wait()))
+        runtime, process = self.session("watched", record={
+            "owner": owner.pid, "owner_start": process_start(owner.pid), "owner_name": "sleep",
+            "lifetime": "owner", "grace": 1, "started_at": int(time.time())})
+        watcher = subprocess.Popen([str(self.runner), "__watch-instance", "watched", str(runtime)],
+                                   env=self.env | {"CAGENTS_INSTANCE_WATCH_SECONDS": "0.2"},
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.addCleanup(lambda: (watcher.kill(), watcher.wait()))
+        time.sleep(1.5)
+        # While its starter runs, the instance does.
+        self.assertIsNone(process.poll())
+        self.assertIn(f"watcher={watcher.pid}\n", (runtime / "cagents-run-development.owner").read_text())
+        owner.kill()
+        owner.wait()
+        self.assert_stopped(runtime, process)
+        self.assertEqual(watcher.wait(timeout=10), 0)
+        log = (self.root / "state/cagents-development-watched/run-development.log").read_text()
+        self.assertIn("stopped: sleep (pid", log)
+
+    def test_the_watcher_ends_with_its_session(self):
+        runtime, process = self.session("short", record=self.living_owner() | {
+            "lifetime": "owner", "grace": 600, "started_at": int(time.time())})
+        watcher = subprocess.Popen([str(self.runner), "__watch-instance", "short", str(runtime)],
+                                   env=self.env | {"CAGENTS_INSTANCE_WATCH_SECONDS": "0.2"})
+        self.addCleanup(lambda: (watcher.kill(), watcher.wait()))
+        (self.sessions / "cagents-short").unlink()
+        self.assertEqual(watcher.wait(timeout=10), 0)
+        self.assertIsNone(process.poll(), "a watcher whose session ended stopped something")
+
+    def test_storage_unused_for_the_given_days_is_removed_but_not_running_or_unnamed(self):
+        old = time.time() - 10 * 86400
+        roots = [self.xdg, self.root / "config", self.root / "state", self.root / "cache"]
+
+        def storage(name, age):
+            for root in roots:
+                directory = root / name
+                (directory / "inner").mkdir(parents=True)
+                (directory / "inner/file").write_text("x")
+                for path in (directory / "inner/file", directory / "inner", directory):
+                    os.utime(path, (age, age))
+
+        storage("cagents-development-unused", old)
+        storage("cagents-development-recent", time.time())
+        storage("cagents-development-running", old)
+        storage("cagents-development", old)
+        storage("cagents-other", old)
+        # Only cached data left of this one.
+        (self.root / "cache/cagents-development-cacheonly").mkdir()
+        os.utime(self.root / "cache/cagents-development-cacheonly", (old, old))
+        daemon = subprocess.Popen(["sleep", "60"], env={"CAGENTS_DEVELOPMENT_INSTANCE": "running"})
+        self.addCleanup(lambda: (daemon.kill(), daemon.wait()))
+        result = self.run_runner("--gc", "--storage", "7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("removed the storage of instance unused (", result.stdout)
+        self.assertIn("removed the storage of instance cacheonly (", result.stdout)
+        for root in roots:
+            self.assertFalse((root / "cagents-development-unused").exists())
+            for kept in ("recent", "running"):
+                self.assertTrue((root / f"cagents-development-{kept}").exists(), kept)
+            self.assertTrue((root / "cagents-development").exists())
+            self.assertTrue((root / "cagents-other").exists())
+
+    def test_lifetime_options_are_checked_before_anything_runs(self):
+        for arguments, message in (
+            (["--keep"], "--keep and --ttl go with --instance NAME"),
+            (["--ttl", "60", "--stop-instance", "x"], "--keep and --ttl go with --instance NAME"),
+            (["--instance", "x", "--ttl", "soon"], "--ttl requires a whole number of seconds"),
+            (["--storage", "3"], "--storage only goes with --gc"),
+        ):
+            with self.subTest(arguments):
+                result = self.run_runner(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+        self.assertFalse(self.harness_calls.exists())
 
 
 if __name__ == "__main__":
