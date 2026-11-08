@@ -286,7 +286,8 @@ and a chat whose provider stopped without confirming its work finished. The
 command lists each with what ending it loses, asks before ending them unless
 `--yes` is given, ends them through the daemon's own close, and then shows the
 impact that remains. Their conversations stay on disk and can be reopened with
-Resume. If anything else blocks the update, nothing is ended and it stops.
+Resume. If anything else blocks the update, nothing is ended and it stops; if
+one cannot be ended, it stops there, and those already ended stay ended.
 
 To make a verified build available without saving or closing running windows,
 append `--stage-only` to the installer invocation. It publishes the complete
