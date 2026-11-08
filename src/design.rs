@@ -240,6 +240,19 @@ pub const ELEVATION: iced::Shadow = iced::Shadow {
     blur_radius: 16.0,
 };
 
+/// A pane docked against the window edge, on COSMIC's Primary layer.
+///
+/// `Container::Primary` rounds its corners for a card floating in a layout. A
+/// navigation pane runs the full height of the window and meets its neighbour
+/// at a rule, so a rounded corner there only notches the frame at the top and
+/// bottom. This keeps the layer's fill and ink and squares the corners.
+pub fn docked_primary() -> cosmic::theme::Container<'static> {
+    cosmic::theme::Container::custom(|theme| widget::container::Style {
+        border: iced::Border::default(),
+        ..cosmic::theme::Container::primary(theme.cosmic(), theme.transparent)
+    })
+}
+
 /// An alignment-only container class.
 ///
 /// COSMIC's default transparent container resets the ink it inherits. A
