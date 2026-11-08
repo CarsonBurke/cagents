@@ -16,11 +16,9 @@ fn forge() -> Forge {
     let root = tempfile::tempdir().unwrap();
     let gh = root.path().join("bin/gh");
     std::fs::create_dir_all(gh.parent().unwrap()).unwrap();
-    std::fs::copy(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture-gh.sh"),
-        &gh,
-    )
-    .unwrap();
+    // Embedded, not copied: a test built on the build host runs elsewhere.
+    std::fs::write(&gh, include_str!("../../tests/fixtures/fixture-gh.sh")).unwrap();
+    std::fs::set_permissions(&gh, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
     let switch = root.path().join("home/.config/fixture-forge");
     std::fs::create_dir_all(switch.parent().unwrap()).unwrap();
     std::fs::write(&switch, "").unwrap();
@@ -126,10 +124,8 @@ fn without_its_switch_the_fixture_forge_refuses() {
     let error = service
         .resolve_repository(&forge.project, &[], &CancellationToken::new())
         .unwrap_err();
-    assert!(
-        error
-            .to_string()
-            .contains("the fixture has no forge access"),
-        "{error}"
-    );
+    let GitHubError::Process(failure) = &error else {
+        panic!("{error:?}");
+    };
+    assert_eq!(failure.stderr, b"gh: the fixture has no forge access\n");
 }
