@@ -5532,13 +5532,17 @@ mod tests {
             io::ErrorKind::NotFound
         );
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(listener);
+        // A forked child can retain this socket description until it execs.
+        // Keep that interleaving present while checking the refused endpoint.
+        let inherited_listener = listener.try_clone().unwrap();
+        crate::daemon::shut_down_test_listener(listener);
         assert_eq!(
             connect_control_socket(&path, Duration::from_secs(1))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::ConnectionRefused
         );
+        drop(inherited_listener);
     }
 
     fn proof(session: &str, boot: &str, incarnation: &str) -> HostSessionProof {
