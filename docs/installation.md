@@ -250,7 +250,11 @@ for idle, or you can explicitly choose interruption and exact resumption.
 Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
-including local builds, use this same flow. Source trees and OS packages retain
+including local builds, use this same flow. Whenever the newer build can
+upgrade the running daemon, its own updater performs the update, whichever
+window asks, so its own checks decide which sessions it carries. A window
+running a build older than that change still runs its own updater; finish a
+staged update from such a window with `cagents daemon upgrade` instead. Source trees and OS packages retain
 their own update method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
@@ -271,8 +275,9 @@ Rerun the installer for a compatible update: the existing daemon and its live
 PTYs keep running. By default the installer verifies the staged CLI against the
 running daemon before switching `current`. An incompatible build is installed
 without replacing the running daemon; saved windows reopen with that daemon's
-matching UI. Finish the staged update in the application or run
-`cagents daemon upgrade`. This command displays the same impact, asks for
+matching UI. Finish the staged update with `cagents daemon upgrade`, or from a
+window whose build already hands the update to the newer build's updater (see
+[In-app updates](#in-app-updates)). This command displays the same impact, asks for
 approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
 additionally permits active native turns to stop. `--accept-unreopenable`
 carries saved panes whose ended Claude actor never recorded its conversation:

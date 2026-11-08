@@ -498,14 +498,22 @@ fn installed_update_worker(
         return Err(invalid("the installed application is already running"));
     }
     let legacy_source = source_proof.is_some() && is_bootstrapped_source(source_protocol);
-    // The staged CLI can speak an older build of its exact current protocol.
-    // Its source was authenticated above; a version-root difference is not a
-    // reason to delegate the update back to that older build's updater.
-    let candidate_source = legacy_source
-        || (window.version_root == served
-            && candidate_can_upgrade_source(served, daemon, source_protocol, source_proof));
-    let worker = installation_worker_version(window, served, daemon, candidate_source);
-    if !candidate_source && served == window.prefix.join("versions").join(&worker) {
+    // A source the staged candidate can upgrade is updated by the candidate's
+    // own worker, so its inspector and preflight decide what the update
+    // carries. That holds whichever entry asks: the staged CLI, or an older
+    // window's update control. The source was authenticated above; an older
+    // build of the current protocol is not a reason to delegate the update
+    // back to that build's updater, which refuses panes this release carries.
+    if legacy_source || candidate_can_upgrade_source(served, daemon, source_protocol, source_proof)
+    {
+        return served
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(str::to_owned)
+            .ok_or_else(unsupported_install);
+    }
+    let worker = installation_worker_version(window, served, daemon);
+    if served == window.prefix.join("versions").join(&worker) {
         return Err(invalid("the installed application is already running"));
     }
     Ok(worker)
@@ -533,15 +541,12 @@ fn is_bootstrapped_source(protocol: u16) -> bool {
             && crate::terminal_ipc::PROTOCOL_VERSION > crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL)
 }
 
+/// The worker for a source the staged candidate cannot upgrade itself.
 fn installation_worker_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
-    use_window_worker: bool,
 ) -> String {
-    if use_window_worker {
-        return window.version.clone();
-    }
     // Once the candidate already owns the daemon, the old window's worker
     // must perform the remaining UI-only replacement. A current worker would
     // correctly reject replacing its own installation with itself.
@@ -3125,10 +3130,12 @@ finally:
         let mut fixture = start(&executable, false, true, 1, None);
         assert_eq!(installed_entry_worker(&window, &served).unwrap(), "old");
         fixture.finish();
-        // Fully qualified current peers still follow the original UI-only
-        // replacement route; no inventory or preparation request is sent.
+        // A fully qualified current peer owned by an older build is updated
+        // by the staged build's worker even when the old window asks, as it
+        // is from the staged CLI (#2431); no inventory or preparation request
+        // is sent to choose it.
         let mut fixture = start(&executable, true, true, 2, None);
-        assert_eq!(installed_entry_worker(&old_window, &served).unwrap(), "old");
+        assert_eq!(installed_entry_worker(&old_window, &served).unwrap(), "new");
         fixture.finish();
         let mut fixture = start(&executable, false, false, 1, None);
         assert!(installed_entry_worker(&window, &served).is_err());
@@ -3301,25 +3308,19 @@ finally:
         let new = layout("new");
         // A newer UI cannot speak the old service's protocol.
         assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old), false),
+            installation_worker_version(&new, &new.version_root, Some(&old)),
             "old"
         );
         // Once that service is already new, the old UI still needs replacement:
         // selecting the new worker would reject its candidate as itself.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, Some(&new), false),
+            installation_worker_version(&old, &new.version_root, Some(&new)),
             "old"
         );
         // Repeated staging must use the actual owner, not the window or current.
         let staged = layout("third");
         assert_eq!(
-            installation_worker_version(&old, &staged.version_root, Some(&new), false),
-            "new"
-        );
-        // An authenticated legacy source must be migrated by the new matched
-        // coordinator, even when that coordinator is already the served build.
-        assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old), true),
+            installation_worker_version(&old, &staged.version_root, Some(&new)),
             "new"
         );
         // Bootstrap from the staged CLI also works when the installed daemon
@@ -3333,6 +3334,20 @@ finally:
         assert_eq!(
             installed_update_worker(
                 &new,
+                &new.version_root,
+                Some(&old),
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                Some(&proof),
+            )
+            .unwrap(),
+            "new"
+        );
+        // The old window's update control reaches the same worker as the
+        // staged CLI (#2431): delegating to the owner's updater applied that
+        // build's preflight, which refuses panes this release carries.
+        assert_eq!(
+            installed_update_worker(
+                &old,
                 &new.version_root,
                 Some(&old),
                 crate::terminal_ipc::PROTOCOL_VERSION,
@@ -3375,17 +3390,19 @@ finally:
                 candidate_line,
                 Some(&proof)
             ));
-            assert_eq!(
-                installed_update_worker(
-                    &new,
-                    &new.version_root,
-                    daemon,
-                    candidate_line,
-                    Some(&proof)
-                )
-                .unwrap(),
-                "new"
-            );
+            for window in [&new, &old] {
+                assert_eq!(
+                    installed_update_worker(
+                        window,
+                        &new.version_root,
+                        daemon,
+                        candidate_line,
+                        Some(&proof)
+                    )
+                    .unwrap(),
+                    "new"
+                );
+            }
         }
         assert!(!candidate_can_upgrade_source(
             &new.version_root,
@@ -3439,7 +3456,7 @@ finally:
         );
         // Without a service, the old window's worker can start the candidate.
         assert_eq!(
-            installation_worker_version(&old, &new.version_root, None, false),
+            installation_worker_version(&old, &new.version_root, None),
             "old"
         );
     }
