@@ -1426,3 +1426,138 @@ fn first_shape_of_each_face() {
         resident_mib() - before
     );
 }
+
+/// Returning to a chat that was hidden: what the interface spends between the
+/// reveal and the first frame that draws the transcript instead of
+/// placeholders, for the store's whole window.
+///
+/// Each cycle hides the settled pane, as switching channel does, then shows
+/// it again. The client asks the daemon for what changed since the
+/// generation it still holds, or for everything when it kept no body; the
+/// daemon answers nothing when the conversation did not change and a full
+/// snapshot otherwise. The two cases are a conversation that did not change
+/// while hidden and one whose answer grew by a paragraph.
+///
+/// The stages are timed in sequence: `hide`; `wire`, the postcard encoding
+/// and decoding of any snapshot sent (the daemon and the client's reader
+/// thread); `install`, the runtime taking it on the UI thread; `prepare`, the
+/// parsing and highlighting its workers run; `frame`, the first view, layout
+/// and draw once preparation is done; and `settle`, background shaping and the
+/// frames until no paragraph is still waiting. `ready` is their sum: the CPU a
+/// reveal costs before the reader sees the transcript, not its scheduling
+/// latency.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_reveal_of_a_hidden_full_window() {
+    const CYCLES: usize = 12;
+    for changed in [false, true] {
+        let mut pane = Pane::new(transcript(16));
+        pane.settle_geometry();
+        pane.frame();
+        let [
+            mut hide,
+            mut wire,
+            mut install,
+            mut prepare,
+            mut frame,
+            mut settle,
+            mut ready,
+        ] = std::array::from_fn(|_| Stage::default());
+        let mut sent = 0;
+        let mut again = Vec::new();
+        let mut show = Stage::default();
+        for cycle in 0..CYCLES + 2 {
+            let revisions: HashMap<String, u64> = pane
+                .runtime
+                .cache
+                .iter()
+                .map(|(id, cached)| (id.clone(), cached.revision))
+                .collect();
+            let clock = Instant::now();
+            pane.runtime.set_visible(false).expect("hide");
+            // Unmounted: the hidden pane's widget state goes with the view.
+            pane.cache = Cache::new();
+            let hidden = clock.elapsed();
+
+            let kept = pane.handle.resident_snapshot_with_clock().is_some();
+            // What the daemon holds: the whole window, whatever the hidden
+            // client kept of it.
+            let mut current = pane.handle.snapshot().as_ref().clone();
+            if changed {
+                pane.tail()
+                    .push_str("A paragraph the answer gained while hidden.\n\n");
+                pane.generation += 1;
+            }
+            current.generation = pane.generation;
+            current.items = pane.items.iter().cloned().map(Arc::new).collect();
+            let clock = Instant::now();
+            let reply = (!kept || changed).then(|| {
+                let encoded = postcard::to_stdvec(&current).expect("a snapshot");
+                sent = encoded.len();
+                postcard::from_bytes::<Snapshot>(&encoded).expect("a snapshot")
+            });
+            let transferred = clock.elapsed();
+
+            let clock = Instant::now();
+            pane.runtime.set_visible(true).expect("show");
+            let shown = clock.elapsed();
+            if let Some(reply) = reply {
+                pane.handle.deliver_snapshot_for_test(reply);
+            }
+            pane.runtime.refresh();
+            let installed = clock.elapsed();
+
+            let clock = Instant::now();
+            preparation::drain_fixture(&mut pane.runtime);
+            let prepared = clock.elapsed();
+            let prepared_again = pane
+                .runtime
+                .cache
+                .iter()
+                .filter(|(id, cached)| revisions.get(*id) != Some(&cached.revision))
+                .count();
+
+            let first = pane.frame();
+            let first: Duration = first.iter().sum();
+
+            let clock = Instant::now();
+            pane.settle_geometry();
+            pane.frame();
+            let settled = clock.elapsed();
+
+            if cycle >= 2 {
+                again.push(prepared_again);
+                show.0.push(shown);
+                hide.0.push(hidden);
+                wire.0.push(transferred);
+                install.0.push(installed);
+                prepare.0.push(prepared);
+                frame.0.push(first);
+                settle.0.push(settled);
+                ready
+                    .0
+                    .push(transferred + installed + prepared + first + settled);
+            }
+        }
+        println!(
+            "{} items, {} while hidden, {sent} bytes sent per reveal, {CYCLES} cycles:",
+            pane.items.len(),
+            if changed { "answer grew" } else { "unchanged" },
+        );
+        again.sort_unstable();
+        println!(
+            "    messages prepared again: median {} of {}, max {}",
+            again[again.len() / 2],
+            pane.items.len(),
+            again[again.len() - 1]
+        );
+        hide.report("hide");
+        wire.report("wire");
+        install.report("install");
+        show.report("  of it showing");
+        prepare.report("prepare");
+        frame.report("frame");
+        settle.report("settle");
+        ready.report("ready");
+    }
+}
