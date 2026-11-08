@@ -1252,3 +1252,55 @@ fn streaming_fixture_applies_validated_deltas_and_prepares_each_visible_revision
         ));
     }
 }
+
+/// What preparing a window of messages costs when they are parsed one after
+/// another, as a single parser does with a backlog: each message's parse,
+/// syntax highlighting and installation, for sixteen exchanges whose answers
+/// carry two Rust fences each.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn preparing_a_window_one_message_after_another() {
+    const CYCLES: usize = 12;
+    let items = transcript(16);
+    let mut prepare = Stage::default();
+    for cycle in 0..CYCLES + 2 {
+        let account = Account::system(Provider::Claude);
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &account,
+            false,
+        )
+        .expect("a session");
+        let snapshot = Snapshot {
+            ready: true,
+            items: items.iter().cloned().map(Arc::new).collect(),
+            ..Snapshot::default()
+        };
+        let handle = Arc::new(ClientHandle::fixture(session.clone(), snapshot));
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let mut runtime = Runtime::new(
+            target,
+            session,
+            Connection::Live(handle),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        let clock = Instant::now();
+        preparation::drain_fixture(&mut runtime);
+        let elapsed = clock.elapsed();
+        assert!(runtime.cache.values().all(|cached| !cached.placeholder));
+        if cycle >= 2 {
+            prepare.0.push(elapsed);
+        }
+    }
+    println!(
+        "{} messages prepared one after another, {CYCLES} cycles:",
+        items.len()
+    );
+    prepare.report("prepare");
+}
