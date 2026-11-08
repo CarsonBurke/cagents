@@ -1028,94 +1028,74 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
         }
         return Ok(());
     }
-    close_retained_native(host, session).or_else(|refused| {
-        // Exact cleanup failing is the expected way to learn an owner is
-        // lost. Anything this check cannot establish keeps that refusal.
-        if close_lost_codex_owner(host, session).unwrap_or(false) {
-            Ok(())
-        } else {
-            Err(refused)
-        }
-    })
+    close_retained_native(host, session)
 }
 
 /// Settles the Close of a Codex conversation whose native owner is gone for
-/// good, which exact cleanup cannot do.
+/// good, as exact cleanup's answer when it finds no pending close, receipt or
+/// live holder record. The caller holds the conversation's close claim, and
+/// removes a finished resident once this succeeds.
 ///
 /// A holder that dies - killed, crashed, or taken down with its provider -
 /// writes no close receipt, and discovery deletes its record once the holder
-/// process has gone. Exact cleanup then has neither a holder to adopt nor a
-/// receipt to retire, and refused every Close of the pane again, so the pane
-/// could never be closed.
+/// process has gone. Exact cleanup then has nothing to adopt or retire, and
+/// refused every Close of the pane again, so the pane could never be closed.
 ///
-/// The owner is lost only when, held under the fence a lost Claude close
-/// uses, no resident, start, handoff, close, paired terminal or agent claims
-/// the conversation, no receipt exists, and nothing of it can still run by
-/// the evidence an upgrade requires before replacing its service: any holder
-/// record names a holder and provider gone with their process group and
-/// session, no process names the conversation's listener, and nothing is
-/// bound where it listens.
-fn close_lost_codex_owner(host: &SharedHost, session: &Session) -> Result<bool, String> {
-    use crate::daemon::holder_registry::{self as registry, Kind};
+/// The owner is lost only when no start, handoff, paired terminal or agent
+/// claims the conversation, no receipt names its terminal, and nothing of it
+/// can still run by the evidence an upgrade requires before replacing its
+/// service: no holder record, no process naming the conversation's listener,
+/// and nothing bound where it listens. Anything else keeps the refusal.
+fn close_lost_codex_owner(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    const NO_OWNER: &str = "No exact native holder or confirmed close receipt is available";
     let Some(listener) = session
         .owned_codex_listener
         .as_ref()
-        .filter(|_| session.owns_codex_listener())
+        .filter(|_| session.owns_codex_listener() && session.terminal.is_none())
     else {
-        return Ok(false);
+        return Err(NO_OWNER.into());
     };
-    let proof = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .proof()
-        .clone();
-    if chat::native_holder::closed_source(session, &proof)?.is_some() {
-        return Ok(false);
+    // A receipt is exact cleanup's, including when it closed a conversation
+    // other than the one asked for.
+    if chat::native_holder::has_receipt(session.id)? {
+        return Err(NO_OWNER.into());
     }
-    // A record whose holder and provider are gone with their process group
-    // and session names nothing; discovery would delete it. Any other record
-    // keeps its owner, and the fence below refuses while one remains.
-    let directory = registry::directory(Kind::Native)?;
-    if let Some(record) =
-        registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)?
-        && record.application == crate::instance::APPLICATION_ID
-        && crate::chat::runtime::retained_actor_abandoned(&record.holder, &record.root)?
     {
-        record.remove(&directory);
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_handoffs.contains_key(&session.id)
+            || state.native_actor_startups.values().any(|startup| {
+                startup.source.id == session.id || startup.requested.id == session.id
+            })
+        {
+            return Err(NO_OWNER.into());
+        }
     }
-    let Ok(_fence) = reserve_quiet_allocation(host, session, None) else {
-        return Ok(false);
-    };
-    {
-        let registry = super::agent_execution::registry(host)?;
+    if has_native_owner(session).map_err(|error| error.message)? {
+        return Err(NO_OWNER.into());
+    }
+    if let Ok(registry) = super::agent_execution::registry(host) {
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         if registry.agent_for_session(session.id)?.is_some()
             || registry.has_agent_launch_for_session(session.id)?
+            || !registry.retained_agent_sources(session.id)?.is_empty()
         {
-            return Ok(false);
+            return Err(NO_OWNER.into());
         }
     }
-    if !super::upgrade_inspect::codex_execution_ended(session, &proof.boot_id) {
-        return Ok(false);
+    if !super::upgrade_inspect::codex_execution_ended(session, &proof.boot_id)
+        || owned_listener::served(&listener.socket).map_err(|error| error.to_string())?
+    {
+        return Err(NO_OWNER.into());
     }
-    // Give back the allocation: its stale endpoint, then the directory.
-    if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? {
-        return Ok(false);
-    }
+    // `served` retired any stale endpoint; give back the allocation itself.
     if let Some(parent) = listener.socket.parent() {
         let _ = std::fs::remove_dir(parent);
     }
-    // What exact cleanup retires once it has closed an owner.
-    {
-        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        state.native_adoption_failures.clear(session.id);
-        if let Some(notifications) = &state.notifications {
-            notifications.retire(session.id);
-        }
-    }
-    super::state::retire_unattached_upgrade_chat(host, session.id);
-    super::state::retire_recovered_upgrade_chat(host, session.id);
-    Ok(true)
+    Ok(())
 }
 
 pub(super) fn require_unreserved_terminals(

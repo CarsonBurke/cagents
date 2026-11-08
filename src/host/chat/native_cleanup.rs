@@ -30,7 +30,9 @@ struct RetainedPair {
 /// Claude cleanup adopts its authenticated resident reducer with close-only
 /// authority from its durable registration; this grants no account read or input
 /// authority. Exact ownership and the current daemon lease authorize either
-/// route; disappearance never proves a successful close.
+/// route; disappearance never proves a successful close. A Codex owner that
+/// ended without a receipt settles only on the evidence that nothing of it can
+/// still run; see `close_lost_codex_owner`.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
     close_retained_inner(host, source, None, None)
 }
@@ -173,18 +175,19 @@ fn close_retained_inner(
     let result = (|| {
         let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
         let receipt = chat::native_holder::closed_source(source, &proof)?;
-        let owner = pending
+        let owner = match pending
             .as_ref()
             .map(|pending| pending.owner.record.clone())
             .or_else(|| receipt.as_ref().map(|(record, _)| record.clone()))
-            .map(Ok)
-            .unwrap_or_else(|| {
-                registry::recovery_candidate(&socket, Kind::Native).and_then(|record| {
-                    record.ok_or_else(|| {
-                        "No exact native holder or confirmed close receipt is available".to_owned()
-                    })
-                })
-            })?;
+        {
+            Some(owner) => owner,
+            None => match registry::recovery_candidate(&socket, Kind::Native)? {
+                Some(record) if !chat::native_holder::retire_abandoned(&record)? => record,
+                // The owner ended without a receipt and left nothing to
+                // adopt. The resident, if any, is removed below.
+                _ => return super::close_lost_codex_owner(host, source, &proof),
+            },
+        };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
             retire_closed_execution(host, source, record, &proof)?;

@@ -159,6 +159,68 @@ impl Fixture {
     }
 }
 
+/// A finished local actor: it read its history, exited and closed, so it owns
+/// no work and inventory hides it. A stand-in for a Codex actor whose provider
+/// ended with its turn, which a test cannot start without a provider.
+fn finished_actor(root: &std::path::Path) -> chat::runtime::Handle {
+    let session_id = "12345678-1234-4234-8234-123456789abc";
+    let project = root.join("missing-project");
+    let launch = chat::Launch {
+        provider: Provider::Claude,
+        session_id: Some(session_id.into()),
+        recipe: crate::model::LaunchRecipe {
+            program: "claude".into(),
+            arguments: Vec::new(),
+            working_directory: project.clone(),
+            environment: [(
+                "CLAUDE_CONFIG_DIR".into(),
+                root.join("claude").to_str().unwrap().into(),
+            )]
+            .into(),
+            unset_environment: Default::default(),
+        },
+    };
+    let encoded: String = project
+        .to_str()
+        .unwrap()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let transcript = root
+        .join("claude/projects")
+        .join(encoded)
+        .join(format!("{session_id}.jsonl"));
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(
+        &transcript,
+        serde_json::json!({"type":"user","uuid":"saved-item","parentUuid":null,"sessionId":session_id,"message":{"role":"user","content":"saved turn"}}).to_string() + "\n",
+    )
+    .unwrap();
+    let (spec, mut adapter) = chat::protocol::create(&launch).unwrap();
+    let mut initial = adapter.initialize().unwrap();
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle = chat::runtime::Handle::start(
+        spec,
+        adapter,
+        initial,
+        store,
+        launch.session_id.clone(),
+        |_| {},
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !handle
+        .snapshot(None)
+        .is_some_and(|snapshot| snapshot.exited)
+    {
+        assert!(Instant::now() < deadline, "history reader did not finish");
+        thread::sleep(Duration::from_millis(10));
+    }
+    handle.close().unwrap();
+    assert!(handle.is_completed() && !handle.owns_work());
+    handle
+}
+
 fn current() -> registry::Process {
     registry::Process::read(std::process::id() as i32).unwrap()
 }
@@ -296,4 +358,55 @@ fn a_process_naming_the_listener_keeps_the_refusal() {
     assert!(fixture.socket().parent().unwrap().exists());
     drop(named);
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+}
+
+/// A receipt shows how this terminal's owner was closed. A pane asking to close
+/// another conversation there is answered by exact cleanup, which refuses it;
+/// the receipt is not evidence that the request's owner was lost.
+#[test]
+fn a_receipt_for_another_conversation_keeps_the_refusal() {
+    let Some(root) = isolated("a_receipt_for_another_conversation_keeps_the_refusal") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let receipt = registry::directory(Kind::Native).unwrap().join(format!(
+        "{}-{}-1.closed",
+        fixture.source.id,
+        i32::MAX - 1
+    ));
+    std::fs::write(&receipt, b"{}").unwrap();
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(fixture.socket().parent().unwrap().exists());
+}
+
+/// #2426: a turn finished and its provider exited with it, taking the holder
+/// and its record. The finished actor stays resident but owns no work, so the
+/// pane's inventory no longer lists it and Close goes to exact cleanup, which
+/// refused it with "No exact native holder or confirmed close receipt is
+/// available". The pane now closes, and the resident goes with it.
+#[test]
+fn a_finished_resident_whose_owner_ended_closes() {
+    let Some(root) = isolated("a_finished_resident_whose_owner_ended_closes") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let handle = finished_actor(&root);
+    fixture.host.lock().unwrap().chats.insert(
+        fixture.source.id,
+        super::Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: fixture.source.clone(),
+            handle,
+            source_process: None,
+            subscribers: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            completion_observed: true,
+            returning_terminal: false,
+        },
+    );
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+    assert!(!fixture.socket().parent().unwrap().exists());
 }
