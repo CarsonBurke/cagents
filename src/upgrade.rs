@@ -2456,6 +2456,48 @@ mod tests {
         assert!(error.contains("agent session still has a live process"));
     }
 
+    /// A protected same-user process cannot be cleared by name or by a
+    /// root-owned parent: sudo and detached terminal descendants look alike.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    #[ignore = "#2365 needs visible recovery diagnostics; stopped before a UI change"]
+    fn protected_process_refusal_identifies_the_blocker() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        // Outside Linux's signed PID range, so the real user-manager session
+        // exception cannot accidentally classify this synthetic process.
+        let pid = u32::MAX - 1;
+        let process = directory.path().join(pid.to_string());
+        fs::create_dir(&process).unwrap();
+        fs::write(
+            process.join("stat"),
+            format!("{pid} (protected) S 1 41 41 0"),
+        )
+        .unwrap();
+        fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        // Verify this test actually exercises an unreadable environment.
+        assert_eq!(
+            fs::read(process.join("environ")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        let mut missing_diagnostics = Vec::new();
+        for name in ["ssh-agent", "sshd-session"] {
+            fs::write(process.join("comm"), name).unwrap();
+            fs::write(process.join("cmdline"), format!("{name}\0")).unwrap();
+            let error =
+                ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+            if !error.contains(&pid.to_string()) || !error.contains(name) {
+                missing_diagnostics.push((name, error));
+            }
+        }
+        assert!(
+            missing_diagnostics.is_empty(),
+            "both protected processes must be named in their refusal: {missing_diagnostics:?}"
+        );
+    }
+
     /// A zombie shows no arguments for as long as its parent leaves it, and it
     /// has stopped running, so it mustn't block every Close and Retry.
     #[cfg(any(feature = "host", feature = "ui"))]
