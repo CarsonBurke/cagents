@@ -1040,13 +1040,39 @@ pub(super) fn execute_with_context(
             show,
         } => {
             let prompt = prompt.read()?;
+            let agent = session.agent(&agent)?;
+            // Read before the run starts a turn, which clears the limit.
+            let limit = member_of(&session.members(&[agent]), agent)
+                .and_then(|member| member.limit.clone());
+            let now = super::sessions::now_ms();
+            if let Some(limit) = limit
+                .as_ref()
+                .filter(|limit| !limit.has_reset(now) && limit.resets_at.is_some())
+            {
+                return Err(AppError::new(
+                    "agent_limited",
+                    format!(
+                        "This agent is stopped by a usage limit ({}), so the prompt was not sent. Send it once the limit resets, or leave it with `cagents send`, which holds it until then.",
+                        super::sessions::limit_phrase(limit, now)
+                    ),
+                ));
+            }
             let request = Submit {
                 name: None,
-                destination: Destination::Existing(session.agent(&agent)?),
+                destination: Destination::Existing(agent),
                 prompt,
                 idempotency_key: retry.key(),
             };
-            submitted(&mut session, "agent.send", request, wait, show)
+            let mut output = submitted(&mut session, "agent.send", request, wait, show)?;
+            if let Some(limit) = limit {
+                let notice = format!(
+                    "Its provider last stopped at a usage limit ({}); the run fails the same way unless the limit has lifted, as when the conversation's account changed.",
+                    super::sessions::limit_phrase(&limit, now)
+                );
+                output.human = format!("{}\n{notice}", output.human);
+                output.data["notice"] = json!(notice);
+            }
+            Ok(output)
         }
         AgentCommand::Status { agent, show } => {
             let agent = session.agent(&agent)?;
@@ -1287,17 +1313,11 @@ fn submitted(
             data["messages"] = json!(messages);
         }
     }
-    // A run sent to a provider a usage limit stops fails until the limit
-    // resets; say so now rather than leave the caller to wait it out.
+    // A run that settled says what stops its provider now, and the account.
     let members = session.members(&[accepted.agent.id]);
     let member = member_of(&members, accepted.agent.id);
     if wait.wait {
         human = with_standing(human, member);
-    } else if let Some(limit) = member.and_then(|member| member.limit.as_ref()) {
-        human.push_str(&format!(
-            "\nIts provider is stopped by a usage limit ({}); the run cannot proceed until it resets.",
-            super::sessions::limit_phrase(limit, super::sessions::now_ms())
-        ));
     }
     standing_json(&mut data, member);
     Ok(CommandOutput {
@@ -2915,6 +2935,7 @@ mod tests {
                 status: None,
                 remaining: Vec::new(),
                 stale: false,
+                observed_at: None,
             }),
         };
         let members = [member];

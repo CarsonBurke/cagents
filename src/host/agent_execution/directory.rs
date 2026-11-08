@@ -316,7 +316,10 @@ pub(super) fn list(
             .as_deref()
             .zip(live.provider)
             .filter(|_| standing && !live.exited)
-            .and_then(|(failure, provider)| usage_limit(provider, failure, account.as_ref(), now));
+            .and_then(|(failure, provider)| {
+                let failed_at = live.chat.as_ref().and_then(|chat| chat.finished_at());
+                usage_limit(provider, failure, failed_at, account.as_ref(), now)
+            });
         let member = Member {
             session: entry,
             exited: live.exited,
@@ -484,16 +487,37 @@ fn exited_chats(host: &SharedHost) -> Vec<Live> {
         .collect()
 }
 
+/// The usage limit that stops a conversation now: the one its provider last
+/// reported, dated and lifted by the readings of the account it runs on.
+/// `account` is asked for only when the provider did report a limit, since
+/// reading accounts touches the registry and the usage cache.
+pub(in crate::host) fn chat_limit(
+    provider: Provider,
+    handle: &crate::chat::runtime::Handle,
+    account: impl FnOnce() -> Option<SessionAccount>,
+    now_ms: u64,
+) -> Option<UsageLimit> {
+    let failure = handle.failure()?;
+    let failed_at = handle.finished_at();
+    usage_limit(provider, &failure, failed_at, None, now_ms)?;
+    usage_limit(provider, &failure, failed_at, account().as_ref(), now_ms)
+}
+
 /// The usage limit a provider's reported `failure` names, while it holds.
 ///
 /// The provider's message says which limit and, in its own words, when it
-/// resets. The account's latest usage reading supplies the reset as a time:
-/// the latest reset among its exhausted windows, since the account is out
-/// until all of them have reset. A limit whose known reset has passed no
-/// longer holds, though the failure stays until the next turn starts.
+/// resets. The account's usage readings supply the reset as a time: the
+/// latest reset among its exhausted windows that falls after the failure,
+/// since the account is out until all of them have reset, and a reset
+/// before the failure cannot be the one that ends it. The limit no longer
+/// holds once that reset passes, or once a reading taken after the failure
+/// shows the account with allowance again, even though the failure itself
+/// stays until the next turn starts. `failed_at` is when the turn that
+/// reported it finished, in Unix milliseconds, where known.
 pub(in crate::host) fn usage_limit(
     provider: Provider,
     failure: &str,
+    failed_at: Option<u64>,
     account: Option<&SessionAccount>,
     now_ms: u64,
 ) -> Option<UsageLimit> {
@@ -508,12 +532,16 @@ pub(in crate::host) fn usage_limit(
             summary.truncate(stripped.len());
         }
     }
+    let after_failure = |at_ms: u64| failed_at.is_none_or(|failed| at_ms > failed);
+    // A window whose reset has since passed still dates the limit: that
+    // reset is what ends it.
     let resets_at = account.and_then(|account| {
         account
             .remaining
             .iter()
-            .filter(|window| window.remaining_fraction <= 0.0 && !window.reset_elapsed)
+            .filter(|window| window.remaining_fraction <= 0.0)
             .filter_map(|window| window.window.resets_at)
+            .filter(|at| *at >= 0 && after_failure((*at as u64).saturating_mul(1000)))
             .max()
     });
     let limit = UsageLimit {
@@ -521,7 +549,20 @@ pub(in crate::host) fn usage_limit(
         reset: failure.reset,
         resets_at,
     };
-    (!limit.has_reset(now_ms)).then_some(limit)
+    if limit.has_reset(now_ms) {
+        return None;
+    }
+    let recovered = limit.resets_at.is_none()
+        && failed_at.is_some()
+        && account.is_some_and(|account| {
+            !account.stale
+                && account.observed_at.is_some_and(after_failure)
+                && matches!(
+                    account.status,
+                    Some(crate::account::UsageStatus::Ok | crate::account::UsageStatus::Warning)
+                )
+        });
+    (!recovered).then_some(limit)
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views
@@ -555,49 +596,145 @@ fn session_scopes(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_usage_limit_is_dated_by_its_exhausted_window_until_that_window_resets() {
-        use crate::account::{UsageWindow, WindowKind, info::RemainingWindow};
-        let failure = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
-        let window = |key: &str, remaining: f32, resets_at: i64| RemainingWindow {
-            window: UsageWindow {
-                key: key.into(),
-                kind: WindowKind::Weekly,
-                label: key.into(),
-                used: 1.0 - remaining,
-                resets_at: Some(resets_at),
-                span_secs: None,
-                binding: false,
-            },
-            remaining_fraction: remaining,
-            reset_elapsed: false,
+    /// An account as [`super::super::account_info::Accounts::of`] reports
+    /// it at `now`: windows, staleness and all, from one usage reading.
+    fn account_reading(
+        status: crate::account::UsageStatus,
+        observed_at: u64,
+        windows: &[(&str, crate::account::WindowKind, f32, i64)],
+        now: u64,
+    ) -> SessionAccount {
+        use crate::account::{UsageSnapshot, UsageSource, UsageWindow, info::RemainingWindow};
+        let usage = UsageSnapshot {
+            windows: windows
+                .iter()
+                .map(|(key, kind, used, resets_at)| UsageWindow {
+                    key: (*key).into(),
+                    kind: *kind,
+                    label: (*key).into(),
+                    used: *used,
+                    resets_at: Some(*resets_at),
+                    span_secs: None,
+                    binding: false,
+                })
+                .collect(),
+            credits: None,
+            status,
+            ordinary_usage_allowed: None,
+            observed_at,
+            source: UsageSource::Live,
+            plan: None,
+            detail: None,
         };
-        let account = SessionAccount {
+        let remaining = RemainingWindow::of(&usage, now);
+        SessionAccount {
             id: "claude/system".parse().unwrap(),
             label: None,
-            status: Some(crate::account::UsageStatus::Limited),
-            // The window with allowance left does not date the reset.
-            remaining: vec![window("Session", 0.5, 9_000), window("Weekly", 0.0, 7_200)],
-            stale: false,
+            status: Some(status),
+            stale: RemainingWindow::stale(now.checked_sub(observed_at), &remaining),
+            remaining,
+            observed_at: Some(observed_at),
+        }
+    }
+
+    #[test]
+    fn a_usage_limit_is_dated_by_its_exhausted_window_until_that_window_resets() {
+        use crate::account::{UsageStatus, WindowKind};
+        let failure = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
+        // The turn failed at 1,000,000 s; the weekly window resets two hours
+        // later, the five-hour one later still, with allowance left.
+        let failed_at = 1_000_000_000;
+        let weekly_reset = 1_007_200;
+        let exhausted = |now| {
+            account_reading(
+                UsageStatus::Limited,
+                failed_at - 60_000,
+                &[
+                    ("Session", WindowKind::Session, 0.5, 1_009_000),
+                    ("Weekly", WindowKind::Weekly, 1.0, weekly_reset),
+                ],
+                now,
+            )
         };
-        let limit = usage_limit(Provider::Claude, failure, Some(&account), 3_600_000).unwrap();
-        assert_eq!(limit.summary, "Claude weekly limit reached");
+        let limit = |account: Option<&SessionAccount>, now| {
+            usage_limit(Provider::Claude, failure, Some(failed_at), account, now)
+        };
+        let soon = failed_at + 3_600_000;
+        let held = limit(Some(&exhausted(soon)), soon).unwrap();
+        assert_eq!(held.summary, "Claude weekly limit reached");
         assert_eq!(
-            limit.reset.as_deref(),
+            held.reset.as_deref(),
             Some("Nov 8, 8am (America/Vancouver)")
         );
-        assert_eq!(limit.resets_at, Some(7_200));
         assert_eq!(
-            usage_limit(Provider::Claude, failure, Some(&account), 7_200_000),
+            held.resets_at,
+            Some(weekly_reset),
+            "the window with allowance left does not date it"
+        );
+
+        // The same reading, read once its reset has passed, marks that window
+        // elapsed; the reset it names still ends the limit.
+        let after_reset = weekly_reset as u64 * 1000 + 1;
+        assert_eq!(
+            limit(Some(&exhausted(after_reset)), after_reset),
             None,
             "a reset that passed lifts the limit"
         );
-        let undated = usage_limit(Provider::Claude, failure, None, u64::MAX).unwrap();
-        assert_eq!(undated.resets_at, None, "only the provider's words date it");
+
+        // A reading taken after the reset no longer shows an exhausted window,
+        // but it was taken after the failure and shows allowance: lifted.
+        let refreshed = account_reading(
+            UsageStatus::Ok,
+            after_reset,
+            &[("Weekly", WindowKind::Weekly, 0.02, weekly_reset + 604_800)],
+            after_reset + 1_000,
+        );
+        assert_eq!(
+            limit(Some(&refreshed), after_reset + 1_000),
+            None,
+            "allowance read after the failure lifts it"
+        );
+        assert!(
+            usage_limit(
+                Provider::Claude,
+                failure,
+                None,
+                Some(&refreshed),
+                after_reset + 1_000
+            )
+            .is_some(),
+            "a failure of unknown time is not known to predate the reading"
+        );
+
+        // Allowance read before the failure says nothing about after it, and
+        // a window that reset before the failure is not the one that ends it.
+        let earlier = account_reading(
+            UsageStatus::Ok,
+            failed_at - 600_000,
+            &[
+                (
+                    "Session",
+                    WindowKind::Session,
+                    1.0,
+                    (failed_at / 1000) as i64 - 60,
+                ),
+                ("Weekly", WindowKind::Weekly, 0.9, weekly_reset),
+            ],
+            failed_at + 60_000,
+        );
+        let undated = limit(Some(&earlier), failed_at + 60_000).unwrap();
+        assert_eq!(undated.resets_at, None);
+
+        assert_eq!(
+            limit(None, u64::MAX).unwrap().resets_at,
+            None,
+            "only the provider's words date it"
+        );
         assert_eq!(
             usage_limit(
                 Provider::Claude,
                 "API Error: 500 Internal server error",
+                Some(failed_at),
                 None,
                 0
             ),

@@ -195,6 +195,8 @@ pub struct SessionAccount {
     /// The reading is too old, or one of its windows has reset since, so its
     /// figures are no basis for a plan.
     pub stale: bool,
+    /// Unix milliseconds at which the reading was taken; absent with it.
+    pub observed_at: Option<u64>,
 }
 
 impl SessionAccount {

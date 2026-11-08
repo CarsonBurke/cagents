@@ -721,6 +721,7 @@ mod tests {
             status: Some(crate::account::UsageStatus::Limited),
             remaining: Vec::new(),
             stale: true,
+            observed_at: None,
         });
         let notice = recipient_notice(&delivery).unwrap();
         assert!(

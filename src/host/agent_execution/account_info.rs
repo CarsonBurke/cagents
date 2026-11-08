@@ -327,6 +327,7 @@ impl Accounts {
                 &remaining,
             ),
             remaining,
+            observed_at: usage.map(|usage| usage.observed_at),
         })
     }
 }

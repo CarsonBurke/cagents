@@ -213,8 +213,9 @@ use crate::{
 /// An older client is refused the replies holding one.
 /// Version 160 appends the `Sessions` and `Send` agent operations and their
 /// replies, which report each session's usage limit and account, and extends
-/// the gated `Member` with them. 157 to 159 are reserved for parallel
-/// branches and are not adopted here.
+/// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
+/// which reaches every chat subscriber unasked. 157 to 159 are reserved for
+/// parallel branches and are not adopted here.
 pub const PROTOCOL_VERSION: u16 = 160;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
@@ -815,6 +816,14 @@ pub enum ServerMessage {
         conversation: TerminalId,
         revision: u64,
         pull_requests: Box<crate::work::ConversationPullRequests>,
+    },
+    /// The usage limit that stops a native chat now, or none: the daemon's one
+    /// judgement of it, which `cagents sessions` reports too. Delivered to
+    /// every subscriber whatever its visibility, whenever the judgement
+    /// changes and once to each new subscriber.
+    ChatLimit {
+        chat_id: TerminalId,
+        limit: Option<crate::agent_execution::directory::UsageLimit>,
     },
 }
 

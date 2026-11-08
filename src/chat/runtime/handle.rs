@@ -596,6 +596,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().failure.clone(),
         }
     }
+    /// When the latest turn finished, in daemon Unix milliseconds, which
+    /// dates the failure it may have ended with.
+    pub fn finished_at(&self) -> Option<u64> {
+        match &self.0 {
+            Owner::Local(local) => local.finished_at(),
+            Owner::Remote(remote) => remote.state().finished_at,
+        }
+    }
     pub fn owns_work(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.owns_work(),

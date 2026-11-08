@@ -1472,11 +1472,17 @@ impl Runtime {
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
-        // The reset is when the conversation can carry on, so a limit says it.
-        let limit_reset = active
+        // The reset is when the conversation can carry on, so a limit that
+        // still holds, as the daemon judges it, says it.
+        let limit_reset = self
+            .usage_limit
             .as_ref()
-            .filter(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
-            .and_then(|failure| failure.reset.as_deref())
+            .filter(|_| {
+                active
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
+            })
+            .and_then(|limit| limit.reset.as_deref())
             .map(|reset| format!("Account limit reached · resets {reset}"));
         let failure_label = active.as_ref().and_then(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
@@ -1626,15 +1632,6 @@ impl Runtime {
 
     /// The errors this conversation reports as its state: its own and its
     /// provider's, leaving out notices of things the agent carried on past.
-    /// Whether a provider usage limit stops this conversation: its latest
-    /// reported failure is one, and no turn has started since.
-    pub(super) fn usage_limited(&self) -> bool {
-        self.reported_errors().any(|message| {
-            chat::failure::Failure::parse(self.session.launch.provider, message)
-                .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
-        })
-    }
-
     pub(super) fn reported_errors(&self) -> impl Iterator<Item = &str> {
         self.error
             .as_deref()

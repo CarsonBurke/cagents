@@ -438,6 +438,7 @@ mod tests {
                 reset_elapsed: false,
             }],
             stale,
+            observed_at: None,
         }
     }
 

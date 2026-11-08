@@ -1941,6 +1941,12 @@
         [
           "stale",
           "Bool"
+        ],
+        [
+          "observed_at",
+          {
+            "Option": "U64"
+          }
         ]
       ]
     },
@@ -9555,6 +9561,25 @@
                 "pull_requests",
                 {
                   "Container": "cagents::work::ConversationPullRequests"
+                }
+              ]
+            ]
+          }
+        ],
+        [
+          "chat_limit",
+          {
+            "Struct": [
+              [
+                "chat_id",
+                "Bytes"
+              ],
+              [
+                "limit",
+                {
+                  "Option": {
+                    "Container": "cagents::agent_execution::directory::UsageLimit"
+                  }
                 }
               ]
             ]

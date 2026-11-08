@@ -8,12 +8,17 @@
 //! never interrupts a turn or answers a question meant for the user; a busy
 //! conversation receives it after its turn. It acts as an execution client,
 //! not as a person, so delivering never takes over a delegated agent.
+//!
+//! A conversation a usage limit stops is idle yet takes nothing, so the
+//! courier also judges which ones a limit stops. It holds their messages, and
+//! tells every surface showing such a conversation that it is limited and
+//! until when, so the daemon gives one account of a limit everywhere.
 
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
         AcceptanceError, Authority, Lineage, Origin,
-        directory::{Member, Scope},
+        directory::{Member, Scope, UsageLimit},
         mailbox::{
             Delivery, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To,
         },
@@ -22,7 +27,7 @@ use crate::{
     model::{MessageId, TerminalId},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -173,23 +178,6 @@ pub(in crate::host) fn post(
         sent: Sent { message, reach },
         recipient,
     })
-}
-
-/// Whether a usage limit stopped the conversation and still holds, so a
-/// message waits for its reset rather than becoming a prompt the provider
-/// refuses at once. The account is read only for a conversation whose
-/// provider reported a limit.
-fn limited(provider: crate::agent::Provider, handle: &chat::runtime::Handle) -> bool {
-    let Some(failure) = handle.failure() else {
-        return false;
-    };
-    let now = super::now();
-    if directory::usage_limit(provider, &failure, None, now).is_none() {
-        return false;
-    }
-    let account = super::account_info::Accounts::load(now)
-        .and_then(|accounts| accounts.of(provider, &handle.execution_environment().0));
-    directory::usage_limit(provider, &failure, account.as_ref(), now).is_some()
 }
 
 /// The session of `lineage` a message reaches, as the listing reports it: a
@@ -445,10 +433,19 @@ struct Inner {
     seal: Arc<Seal>,
     state: Mutex<WakeState>,
     changed: Condvar,
+    /// What each conversation's subscribers were last told of its limit.
+    limits: Mutex<BTreeMap<TerminalId, Told>>,
     #[cfg(test)]
     scanned_generation: Mutex<Option<u64>>,
     #[cfg(test)]
     scanned: Condvar,
+}
+
+/// A conversation's usage limit as the courier last judged it, and the
+/// subscribers that know it. A subscriber starts out knowing of no limit.
+struct Told {
+    limit: Option<UsageLimit>,
+    clients: BTreeSet<crate::host::state::ClientId>,
 }
 
 /// Wakes the courier. Cheap enough to call on every activity edge.
@@ -520,6 +517,7 @@ impl Courier {
             seal,
             state: Mutex::new(WakeState::default()),
             changed: Condvar::new(),
+            limits: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             scanned_generation: Mutex::new(None),
             #[cfg(test)]
@@ -629,9 +627,109 @@ impl Handle {
         Ok(())
     }
 
+    /// Judges which conversations a usage limit stops, telling every
+    /// subscriber of one whose judgement changed, and each new subscriber,
+    /// what it now is. Returns the limits, by conversation.
+    fn publish_limits(&self, host: &SharedHost, now: u64) -> BTreeMap<TerminalId, UsageLimit> {
+        let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .chats
+                .iter()
+                .filter(|(_, record)| !record.handle.is_completed())
+                .map(|(id, record)| (*id, record.session.launch.provider, record.handle.clone()))
+                .collect()
+        };
+        // Accounts are read once a scan, and only if a provider reported a
+        // limit; the judgement reads no transcript.
+        let mut accounts = None;
+        let limits: BTreeMap<_, _> = chats
+            .iter()
+            .filter_map(|(id, provider, handle)| {
+                directory::chat_limit(
+                    *provider,
+                    handle,
+                    || {
+                        accounts
+                            .get_or_insert_with(|| super::account_info::Accounts::load(now))
+                            .as_ref()
+                            .and_then(|accounts| {
+                                accounts.of(*provider, &handle.execution_environment().0)
+                            })
+                    },
+                    now,
+                )
+                .map(|limit| (*id, limit))
+            })
+            .collect();
+        let mut told = self.0.limits.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let proof = state.proof().clone();
+        let crate::host::state::HostState { chats, clients, .. } = &mut *state;
+        told.retain(|id, _| chats.contains_key(id));
+        for (id, record) in chats.iter() {
+            let limit = limits.get(id);
+            let known = told.entry(*id).or_insert_with(|| Told {
+                limit: None,
+                clients: record.subscribers.keys().copied().collect(),
+            });
+            if known.limit.as_ref() != limit {
+                known.limit = limit.cloned();
+                known.clients.clear();
+            }
+            known
+                .clients
+                .retain(|client| record.subscribers.contains_key(client));
+            for &client in record.subscribers.keys() {
+                if known.clients.contains(&client) {
+                    continue;
+                }
+                let Some(delivery) = clients.get(&client) else {
+                    continue;
+                };
+                let message = crate::terminal_ipc::ServerMessage::ChatLimit {
+                    chat_id: *id,
+                    limit: known.limit.clone(),
+                };
+                if delivery
+                    .push(crate::terminal_ipc::ServerEnvelope {
+                        version: crate::terminal_ipc::PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message,
+                    })
+                    .is_ok()
+                {
+                    known.clients.insert(client);
+                }
+            }
+        }
+        limits
+    }
+
     /// Gives each lineage with a live, idle conversation its oldest waiting
-    /// message. Returns when the next held reply is released.
+    /// message. Returns when the courier must look again: when the next held
+    /// reply is released or a known usage limit resets.
     fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
+        let limits = self.publish_limits(host, super::now());
+        let reset = limits
+            .values()
+            .filter_map(|limit| limit.resets_at)
+            .filter(|at| *at >= 0)
+            .map(|at| (at as u64).saturating_mul(1000))
+            .min();
+        let released = self.deliver_messages(host, &limits)?;
+        Ok(match (released, reset) {
+            (Some(released), Some(reset)) => Some(released.min(reset)),
+            (released, reset) => released.or(reset),
+        })
+    }
+
+    fn deliver_messages(
+        &self,
+        host: &SharedHost,
+        limits: &BTreeMap<TerminalId, UsageLimit>,
+    ) -> Result<Option<u64>, String> {
         let live = directory::live_sessions(host);
         let (pending, released, heads, pending_lineages, lineages) = {
             let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -690,10 +788,8 @@ impl Handle {
             let Some(recipient) = message.to.lineage else {
                 continue;
             };
-            let Some((session, _, handle)) = chats.iter().find(|(id, provider, handle)| {
-                lineages.get(id) == Some(&recipient)
-                    && handle.is_idle()
-                    && !limited(*provider, handle)
+            let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
+                lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
             }) else {
                 continue;
             };
@@ -779,6 +875,7 @@ mod tests {
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
             changed: Condvar::new(),
+            limits: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
@@ -899,6 +996,7 @@ mod tests {
                 seal: Arc::new(Seal::new([9; 32])),
                 state: Mutex::default(),
                 changed: Condvar::new(),
+                limits: Mutex::default(),
                 scanned_generation: Mutex::new(None),
                 scanned: Condvar::new(),
             }));
@@ -1007,6 +1105,7 @@ mod tests {
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
             changed: Condvar::new(),
+            limits: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));

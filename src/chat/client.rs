@@ -111,6 +111,9 @@ pub enum Wake {
     Activity,
     /// Consume the reports with `take_account_usage`.
     AccountUsage,
+    /// The daemon's judgement of the usage limit stopping the conversation
+    /// changed; read it with `limit`.
+    Limit,
     Disconnected(String),
 }
 #[derive(Clone)]
@@ -556,6 +559,7 @@ struct InnerPayload {
     activity: Arc<Mutex<ActivityObservation>>,
     observed: Arc<Mutex<OutputObservation>>,
     account_usage: Arc<Mutex<AccountUsage>>,
+    limit: Arc<Mutex<Option<crate::agent_execution::directory::UsageLimit>>>,
     next: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     visible: Arc<AtomicBool>,
@@ -1443,6 +1447,7 @@ impl ClientHandle {
                     })),
                     observed: Arc::new(Mutex::new(OutputObservation::default())),
                     account_usage: Arc::default(),
+                    limit: Arc::default(),
                     next: Arc::new(AtomicU64::new(1)),
                     alive: Arc::new(AtomicBool::new(true)),
                     visible: Arc::new(AtomicBool::new(true)),
@@ -1617,6 +1622,16 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(report, observed_at)
+    }
+
+    /// Records the daemon's judgement of a usage limit as the reader thread
+    /// would on its arrival.
+    #[cfg(test)]
+    pub(crate) fn judge_limit_for_test(
+        &self,
+        limit: Option<crate::agent_execution::directory::UsageLimit>,
+    ) {
+        *self.inner.limit.lock().unwrap_or_else(|p| p.into_inner()) = limit;
     }
 
     /// Records an activity edge as the reader thread would, and says whether
@@ -2108,6 +2123,7 @@ impl ClientHandle {
         let mut early_activity = None;
         let mut early_observed = OutputObservation::default();
         let mut early_usage = AccountUsage::default();
+        let mut early_limit = None;
         let (session, initial) = loop {
             #[cfg(feature = "ui")]
             let health_request = crate::daemon_health::begin();
@@ -2153,6 +2169,11 @@ impl ClientHandle {
                 } if chat_id == id && envelope.request_id.is_none() => {
                     early_usage.push(report, observed_at);
                 }
+                ServerMessage::ChatLimit { chat_id, limit }
+                    if chat_id == id && envelope.request_id.is_none() =>
+                {
+                    early_limit = limit;
+                }
                 ServerMessage::Response {
                     response: ServerResponse::ChatAttached { session, snapshot },
                 } if session.id == id && envelope.request_id == Some(attach_request) => {
@@ -2193,6 +2214,7 @@ impl ClientHandle {
         let activity = Arc::new(Mutex::new(activity));
         let observed = Arc::new(Mutex::new(early_observed));
         let account_usage = Arc::new(Mutex::new(early_usage));
+        let limit = Arc::new(Mutex::new(early_limit));
         // Attachment also serves non-UI callers that inspect the initial
         // publication directly. The UI immediately sets its actual visibility;
         // an unvisited hidden pane releases this body without preparing it.
@@ -2228,6 +2250,7 @@ impl ClientHandle {
                 activity: activity.clone(),
                 observed: observed.clone(),
                 account_usage: account_usage.clone(),
+                limit: limit.clone(),
                 next: next.clone(),
                 alive: alive.clone(),
                 wake: wake.clone(),
@@ -2395,6 +2418,15 @@ impl ClientHandle {
                         let first = account_usage.lock().unwrap_or_else(|p| p.into_inner())
                             .push(report, observed_at);
                         if first { wake(Wake::AccountUsage); }
+                    },
+                    ServerMessage::ChatLimit { chat_id, limit: judged } if chat_id == id => {
+                        let changed = {
+                            let mut known = limit.lock().unwrap_or_else(|p| p.into_inner());
+                            let changed = *known != judged;
+                            *known = judged;
+                            changed
+                        };
+                        if changed { wake(Wake::Limit); }
                     },
                     ServerMessage::Response { response: ServerResponse::ChatSnapshot { chat_id, snapshot: update } } if chat_id == id => {
                         read_pending = false;
@@ -2622,6 +2654,15 @@ impl ClientHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner());
         activity.take()
+    }
+    /// The usage limit that stops this conversation, as the daemon last
+    /// judged it.
+    pub fn limit(&self) -> Option<crate::agent_execution::directory::UsageLimit> {
+        self.inner
+            .limit
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
     /// Drains what the provider reported about the account this chat runs
     /// on, oldest first.

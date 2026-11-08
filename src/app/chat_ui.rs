@@ -2365,6 +2365,8 @@ pub(super) struct Runtime {
     connection: Connection,
     /// Set only by exact shared-view retirement, independently of transport failure.
     closed_elsewhere: bool,
+    /// The usage limit stopping the conversation, as the daemon judges it.
+    usage_limit: Option<crate::agent_execution::directory::UsageLimit>,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -3364,6 +3366,7 @@ impl Runtime {
             finished_stamp: None,
             connection,
             closed_elsewhere: false,
+            usage_limit: None,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -11032,7 +11035,8 @@ impl Cagents {
                             provider: runtime.session.launch.provider,
                             state: handle.take_activity(),
                         };
-                        let limited = runtime.usage_limited();
+                        runtime.usage_limit = handle.limit();
+                        let limited = runtime.usage_limit.is_some();
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
                         // Pane names use the same bounded observation cache as
@@ -11081,6 +11085,14 @@ impl Cagents {
                         handle.take_observed();
                         let session = runtime.session.clone();
                         self.commit_chat_session(target.card, session);
+                        return Task::none();
+                    }
+                    // A hidden conversation learns of its limit this way too,
+                    // without reading its transcript.
+                    Wake::Limit => {
+                        runtime.usage_limit = handle.limit();
+                        let limited = runtime.usage_limit.is_some();
+                        self.sidebar_state.set_card_limited(target.card, limited);
                         return Task::none();
                     }
                     Wake::Activity => {
@@ -15503,22 +15515,38 @@ mod tests {
     }
 
     #[test]
-    fn a_usage_limited_conversation_reads_limited_in_the_sidebar_until_a_turn_starts() {
+    fn a_usage_limit_the_daemon_judges_reads_limited_until_it_lifts_even_unseen() {
+        use crate::agent_execution::directory::UsageLimit;
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let failure = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
         let mut snapshot = (*handle.snapshot()).clone();
-        let mut publish = |app: &mut Cagents, error: Option<&str>| {
-            snapshot.generation += 1;
-            snapshot.error = error.map(str::to_owned);
-            handle.publish_snapshot_for_test(snapshot.clone());
-            drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        snapshot.generation += 1;
+        snapshot.error = Some(failure.into());
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        // The provider's words alone do not make it limited: the daemon,
+        // which knows the account's readings, judges that.
+        assert_eq!(app.sidebar_state.card_attention(card).limited, 0);
+        assert_eq!(
+            chat_runtime(&app, card).conversation_status(false).1,
+            "Account limit reached"
+        );
+        let mut judge = |app: &mut Cagents, limit: Option<UsageLimit>| {
+            handle.judge_limit_for_test(limit);
+            // Without a transcript read, as a hidden conversation hears of it.
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Limit)));
             app.sidebar_state.card_attention(card)
         };
-        let limited = publish(
+        let limited = judge(
             &mut app,
-            Some("You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)"),
+            Some(UsageLimit {
+                summary: "Claude weekly limit reached".into(),
+                reset: Some("Nov 8, 8am (America/Vancouver)".into()),
+                resets_at: None,
+            }),
         );
         assert_eq!(
             limited.state(),
@@ -15529,15 +15557,13 @@ mod tests {
             chat_runtime(&app, card).conversation_status(false).1,
             "Account limit reached · resets Nov 8, 8am (America/Vancouver)"
         );
-        // Another failure is not a usage limit.
-        let failed = publish(&mut app, Some("connection reset by peer"));
-        assert_eq!(failed.limited, 0);
-        publish(
-            &mut app,
-            Some("You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)"),
+        // Once the reset passes, the failure is still the last outcome, but
+        // nothing stops the conversation.
+        assert_eq!(judge(&mut app, None).limited, 0);
+        assert_eq!(
+            chat_runtime(&app, card).conversation_status(false).1,
+            "Account limit reached"
         );
-        // A turn that starts clears the provider's error, and the limit with it.
-        assert_eq!(publish(&mut app, None).limited, 0);
     }
 
     #[test]
@@ -31836,6 +31862,7 @@ mod tests {
             Wake::Observed,
             Wake::Activity,
             Wake::AccountUsage,
+            Wake::Limit,
             Wake::Disconnected("old connection retired".into()),
         ] {
             late_callback(wake);

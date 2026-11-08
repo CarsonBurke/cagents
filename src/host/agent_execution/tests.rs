@@ -4498,8 +4498,45 @@ fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
         delivery.sent.message.wait_until_ms, None,
         "no reply can come before the limit resets, so none is held for the asker"
     );
+    // A surface showing the conversation, hidden as most are, hears of its
+    // limit from the courier without reading the transcript.
+    let subscriber = 9_001;
+    let queue = {
+        let mut state = host.lock().unwrap();
+        let queue = state.register_client(subscriber);
+        state
+            .chats
+            .get_mut(&session)
+            .unwrap()
+            .subscribers
+            .insert(subscriber, false);
+        queue
+    };
+    let (limits, heard) = std::sync::mpsc::channel();
+    let reader = {
+        let queue = queue.clone();
+        std::thread::spawn(move || {
+            while let Some(outbound) = queue.pop() {
+                if let crate::terminal_ipc::ServerMessage::ChatLimit { chat_id, limit } =
+                    outbound.message
+                {
+                    limits.send((chat_id, limit)).unwrap();
+                }
+            }
+        })
+    };
     let courier = mailbox::Courier::start(&host).unwrap();
     courier.wake_and_wait_for_scan();
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (session, Some(limit.clone())),
+        "the subscriber is told of the limit"
+    );
+    courier.wake_and_wait_for_scan();
+    assert!(
+        heard.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a limit it was told of is not repeated"
+    );
     let stored = registry(&host)
         .unwrap()
         .lock()
@@ -4520,7 +4557,49 @@ fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
         1,
         "the limited provider received no courier prompt"
     );
+
+    // A limit of unknown end is no reason to refuse a follow-up run, which
+    // is what shows whether it still holds. This one succeeds, so the limit
+    // lifts, the subscriber hears so, and the held message is delivered.
+    let follow_up = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(accepted.agent.id),
+            prompt: "carry on".into(),
+            idempotency_key: "after-the-limit".into(),
+        },
+    )
+    .unwrap();
+    assert_eq!(settled(&host, follow_up.run.id).state, State::Succeeded);
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (session, None),
+        "the subscriber hears the limit lifted"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(delivery.sent.message.id)
+        .unwrap()
+        .unwrap()
+        .state
+        == Delivery::Pending
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the held message is delivered once the limit lifts"
+        );
+        courier.wake_and_wait_for_scan();
+        std::thread::sleep(Duration::from_millis(50));
+    }
     drop(courier);
+    queue.close_after_drain();
+    reader.join().unwrap();
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
 }
 
