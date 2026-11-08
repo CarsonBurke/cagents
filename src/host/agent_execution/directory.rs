@@ -317,7 +317,7 @@ pub(super) fn list(
             .and_then(|provider| {
                 stopping_limit(
                     provider,
-                    live.state,
+                    live.chat.as_ref().is_some_and(|chat| chat.turn_accepted()),
                     live.failure.as_deref(),
                     live.chat.as_ref().and_then(|chat| chat.finished_at()),
                     || account.clone(),
@@ -503,7 +503,7 @@ pub(in crate::host) fn chat_limit(
 ) -> Option<UsageLimit> {
     stopping_limit(
         provider,
-        handle.activity(),
+        handle.turn_accepted(),
         handle.failure().as_deref(),
         handle.finished_at(),
         account,
@@ -511,19 +511,20 @@ pub(in crate::host) fn chat_limit(
     )
 }
 
-/// The usage limit that stops a conversation in `state` whose provider last
-/// reported `failure`. One that is working or waiting had its turn accepted,
-/// so no limit stops it, though the provider's last error may outlive that
-/// turn's start.
+/// The usage limit that stops a conversation whose provider last reported
+/// `failure`. Once its own next turn is accepted (`turn_accepted`), no limit
+/// stops it, though the provider's last error may outlive that turn's start.
+/// Background children working on do not count: they keep a refused
+/// conversation looking busy without its taking a prompt.
 fn stopping_limit(
     provider: Provider,
-    state: ActivityState,
+    turn_accepted: bool,
     failure: Option<&str>,
     failed_at: Option<u64>,
     account: impl FnOnce() -> Option<SessionAccount>,
     now_ms: u64,
 ) -> Option<UsageLimit> {
-    if matches!(state, ActivityState::Working | ActivityState::Waiting) {
+    if turn_accepted {
         return None;
     }
     let failure = failure?;
@@ -540,7 +541,9 @@ fn stopping_limit(
 /// before the failure cannot be the one that ends it. The limit no longer
 /// holds once that reset passes, or once a reading taken after the failure
 /// shows the account with allowance again, even though the failure itself
-/// stays until the next turn starts. `failed_at` is when the turn that
+/// stays until the next turn starts. That reading is newer evidence than the
+/// failure however old it grows, and outranks the windows' dates, since a
+/// provider can permit usage with a window used up. `failed_at` is when the turn that
 /// reported it finished, in Unix milliseconds, where known.
 pub(in crate::host) fn usage_limit(
     provider: Provider,
@@ -580,11 +583,12 @@ pub(in crate::host) fn usage_limit(
     if limit.has_reset(now_ms) {
         return None;
     }
-    let recovered = limit.resets_at.is_none()
-        && failed_at.is_some()
+    // A reading taken after the failure is newer evidence than it, however
+    // old that reading has since grown, and it outranks the windows' dates:
+    // Codex can permit ordinary usage with a window used up.
+    let recovered = failed_at.is_some()
         && account.is_some_and(|account| {
-            !account.stale
-                && account.observed_at.is_some_and(after_failure)
+            account.observed_at.is_some_and(after_failure)
                 && matches!(
                     account.status,
                     Some(crate::account::UsageStatus::Ok | crate::account::UsageStatus::Warning)
@@ -734,6 +738,50 @@ mod tests {
             "a failure of unknown time is not known to predate the reading"
         );
 
+        // Allowance read soon after the failure stays evidence once that
+        // reading has grown stale, before any reset: the limit does not
+        // return without another refusal.
+        let recovered_early = |now| {
+            account_reading(
+                UsageStatus::Ok,
+                failed_at + 60_000,
+                &[("Weekly", WindowKind::Weekly, 0.5, weekly_reset)],
+                now,
+            )
+        };
+        let stale_later = failed_at + 3_000_000;
+        assert!(recovered_early(stale_later).stale);
+        assert_eq!(
+            limit(Some(&recovered_early(stale_later)), stale_later),
+            None,
+            "a recovery does not lapse as its reading ages"
+        );
+        // Codex can permit ordinary usage with a window used up; a reading
+        // after the failure that says so outranks that window's date.
+        let codex = |status| {
+            usage_limit(
+                Provider::Codex,
+                "Usage limit reached for this plan",
+                Some(failed_at),
+                Some(&account_reading(
+                    status,
+                    failed_at + 60_000,
+                    &[("Weekly", WindowKind::Weekly, 1.0, weekly_reset)],
+                    failed_at + 120_000,
+                )),
+                failed_at + 120_000,
+            )
+        };
+        assert_eq!(
+            codex(UsageStatus::Limited).unwrap().resets_at,
+            Some(weekly_reset)
+        );
+        assert_eq!(
+            codex(UsageStatus::Warning),
+            None,
+            "permission read after the failure lifts a dated limit"
+        );
+
         // Allowance read before the failure says nothing about after it, and
         // a window that reset before the failure is not the one that ends it.
         let earlier = account_reading(
@@ -773,28 +821,25 @@ mod tests {
     #[test]
     fn a_conversation_whose_turn_was_accepted_is_not_stopped_by_its_last_limit() {
         let failure = Some("You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)");
-        let limit = |state| {
+        let limit = |turn_accepted| {
             stopping_limit(
                 Provider::Claude,
-                state,
+                turn_accepted,
                 failure,
                 Some(1_000_000_000),
                 || None,
                 1_000_060_000,
             )
         };
-        for idle in [ActivityState::Idle, ActivityState::Unknown] {
-            assert!(limit(idle).is_some(), "{idle:?} holds the limit");
-        }
+        // Refused, though background children may still be working.
+        assert!(limit(false).is_some());
         // The error that refused the previous turn can outlive the next
-        // turn's start, as when a history error keeps it, so activity decides.
-        for accepted in [ActivityState::Working, ActivityState::Waiting] {
-            assert_eq!(limit(accepted), None, "{accepted:?} is not limited");
-        }
+        // turn's start, as when a history error keeps it.
+        assert_eq!(limit(true), None, "an accepted turn is not limited");
         assert_eq!(
             stopping_limit(
                 Provider::Claude,
-                ActivityState::Idle,
+                false,
                 None,
                 None,
                 || panic!("no account is read without a reported limit"),

@@ -238,8 +238,9 @@ fn refuse_limited(
         .map(|reset| format!(", resets {reset}"))
         .unwrap_or_default();
     Err(format!(
-        "This agent is stopped by a usage limit ({}{reset}), so the prompt was not sent. \
+        "{} ({}{reset}), so the prompt was not sent. \
          Send it once the limit resets, or leave it with `cagents send`, which holds it until then.",
+        crate::agent_execution::LIMITED_REFUSAL,
         limit.summary
     ))
 }

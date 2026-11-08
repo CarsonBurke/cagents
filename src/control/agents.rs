@@ -1044,26 +1044,17 @@ pub(super) fn execute_with_context(
             // Read before the run starts a turn, which clears the limit.
             let limit = member_of(&session.members(&[agent]), agent)
                 .and_then(|member| member.limit.clone());
-            let now = super::sessions::now_ms();
-            if let Some(limit) = limit
-                .as_ref()
-                .filter(|limit| !limit.has_reset(now) && limit.resets_at.is_some())
-            {
-                return Err(AppError::new(
-                    "agent_limited",
-                    format!(
-                        "This agent is stopped by a usage limit ({}), so the prompt was not sent. Send it once the limit resets, or leave it with `cagents send`, which holds it until then.",
-                        super::sessions::limit_phrase(limit, now)
-                    ),
-                ));
-            }
             let request = Submit {
                 name: None,
                 destination: Destination::Existing(agent),
                 prompt,
                 idempotency_key: retry.key(),
             };
-            let mut output = submitted(&mut session, "agent.send", request, wait, show)?;
+            // The daemon refuses an agent stopped until a known reset, after
+            // answering a retry of an accepted submission with its acceptance.
+            let mut output = submitted(&mut session, "agent.send", request, wait, show)
+                .map_err(limited_refusal)?;
+            let now = super::sessions::now_ms();
             if let Some(limit) = limit {
                 let notice = format!(
                     "Its provider last stopped at a usage limit ({}); the run fails the same way unless the limit has lifted, as when the conversation's account changed.",
@@ -1230,6 +1221,18 @@ pub(super) fn execute_with_context(
 }
 
 /// Reports an acceptance, after waiting on its run when asked to.
+/// The daemon's refusal of a follow-up for an agent a usage limit stops
+/// until a known reset, reported as `agent_limited`.
+fn limited_refusal(mut error: AppError) -> AppError {
+    if error
+        .message
+        .starts_with(crate::agent_execution::LIMITED_REFUSAL)
+    {
+        error.kind = "agent_limited";
+    }
+    error
+}
+
 fn submitted(
     session: &mut Session,
     command: &'static str,
@@ -1621,6 +1624,20 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_daemons_limit_refusal_reads_as_agent_limited() {
+        let refused = AppError::new(
+            "protocol",
+            format!(
+                "{} (Claude weekly limit reached, resets 3pm), so the prompt was not sent.; retry with --idempotency-key k to avoid starting the work twice",
+                crate::agent_execution::LIMITED_REFUSAL
+            ),
+        );
+        assert_eq!(limited_refusal(refused).kind, "agent_limited");
+        let other = AppError::new("protocol", "The agent is not running");
+        assert_eq!(limited_refusal(other).kind, "protocol");
+    }
 
     #[test]
     fn accepted_wait_recovery_keeps_device_routing_and_original_error_details() {

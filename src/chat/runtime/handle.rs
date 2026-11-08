@@ -616,6 +616,17 @@ impl Handle {
             Owner::Remote(remote) => remote.state().activity,
         }
     }
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children.
+    pub(crate) fn turn_accepted(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.turn_accepted(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                state.busy || state.waiting || !state.requests.is_empty()
+            }
+        }
+    }
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         match &self.0 {
             Owner::Local(local) => local.update_activity(),

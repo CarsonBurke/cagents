@@ -29,6 +29,9 @@ pub const MAX_CHILDREN: usize = 64;
 pub const MAX_PARENT_RUNNING: usize = 8;
 pub const MAX_RUNNING: usize = 32;
 pub const MAX_PARENT_DEPTH: usize = 8;
+/// How the daemon begins refusing a follow-up run for an agent that a usage
+/// limit stops until a known reset; the CLI reports it as `agent_limited`.
+pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
 
 /// Presentation routing only. Daemon ownership additionally requires its

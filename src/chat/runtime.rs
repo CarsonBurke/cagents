@@ -1377,6 +1377,17 @@ impl LocalHandle {
             .activity()
     }
 
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children: the states in which it takes no
+    /// prompt.
+    pub(crate) fn turn_accepted(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .turn_accepted()
+    }
+
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
@@ -4500,6 +4511,10 @@ mod tests {
         );
         assert_eq!(state.activity(), ActivityState::Waiting);
         assert!(state.is_working());
+        assert!(
+            !state.turn_accepted(),
+            "children at work leave a refused parent's own turn unaccepted"
+        );
         let error = state.error.clone();
         apply(
             &mut state,
