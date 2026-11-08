@@ -467,7 +467,7 @@ impl Publications {
 
     fn replace(
         &self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         body: &AtomicBool,
         sample_clock: bool,
         final_body: bool,
@@ -477,12 +477,14 @@ impl Publications {
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         }
-        let full = Publication::resident(
-            snapshot,
-            clock,
-            append::Lineage::default(),
-            base.source_thread.clone(),
-        );
+        // A full snapshot over a body this client kept shares every item that
+        // did not change, so the interface keeps what it prepared from them.
+        let mut lineage = append::Lineage::default();
+        if base.resident {
+            lineage = base.lineage.clone();
+            lineage.adopt(&base.snapshot, &mut snapshot);
+        }
+        let full = Publication::resident(snapshot, clock, lineage, base.source_thread.clone());
         let metadata = full
             .hidden
             .as_ref()
@@ -1658,6 +1660,15 @@ impl ClientHandle {
     #[cfg(test)]
     pub(crate) fn disconnect_for_test(&self) {
         self.inner.alive.store(false, Ordering::Release);
+    }
+
+    /// Deliver a full snapshot the way the reader thread takes a daemon's
+    /// `ChatSnapshot` reply, sharing unchanged items with a kept body.
+    #[cfg(test)]
+    pub(crate) fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
+        self.inner
+            .publication
+            .replace(snapshot, &self.inner.body_requested, false, false);
     }
 
     #[cfg(test)]
