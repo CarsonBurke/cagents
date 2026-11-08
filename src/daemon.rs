@@ -414,6 +414,35 @@ impl HostLease {
         Ok(false)
     }
 
+    /// Holds the daemon's exclusive lease while a development fixture seeds
+    /// the stores, so no daemon can start against them halfway. Unlike
+    /// maintenance, the instance may never have run: the runtime directory and
+    /// lock file are created as a starting daemon creates them.
+    #[cfg(all(feature = "host", any(debug_assertions, feature = "development")))]
+    pub(crate) fn acquire_for_seeding(paths: &RuntimePaths) -> Result<Self, PlatformError> {
+        prepare_runtime_directory(&paths.directory)?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(PRIVATE_FILE_MODE)
+            .custom_flags(LOCK_OPEN_FLAGS)
+            .open(&paths.lock)?;
+        validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+        // SAFETY: flock receives a live, validated descriptor and scalar flags.
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(PlatformError::AlreadyRunning {
+                path: paths.socket.clone(),
+            });
+        }
+        recover_stale_socket(&paths.socket)?;
+        Ok(Self {
+            socket_path: paths.socket.clone(),
+            lock,
+        })
+    }
+
     /// Holds the daemon's exclusive inventory lease without claiming a serving
     /// incarnation. Used only by explicit checkpoint maintenance while stopped.
     pub(crate) fn acquire_for_maintenance(paths: &RuntimePaths) -> Result<Self, PlatformError> {

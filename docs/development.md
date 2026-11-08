@@ -248,6 +248,9 @@ nested session cannot put a UI on the user's desktop. It requires a session's
 private `nh-*` runtime directory and no `DISPLAY` or `WAYLAND_SOCKET`, which is
 what `niri-harness exec` provides.
 
+To fill an instance with a realistic workspace before its first launch, see
+[Fixture workspaces](fixture-workspace.md#a-development-instance).
+
 Stopping a harness session deletes its runtime directory, so stop an instance
 with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains
@@ -1235,6 +1238,10 @@ scripts/native-evidence start after --width 1200
 # ...the same steps...
 scripts/native-evidence stop
 ```
+
+For a realistic workspace instead of an empty one, `scripts/native-evidence seed
+--profile realistic` generates one with [`scripts/fixture-workspace`](fixture-workspace.md)
+and saves it as the seed.
 
 Run `scripts/native-evidence --help` for every command. Beyond a hand-written
 harness, it provides:

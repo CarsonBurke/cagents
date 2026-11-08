@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -123,6 +124,20 @@ STUBS = {
     """,
     "fixture-cli": """
         #!/bin/bash
+        # What scripts/fixture-workspace apply runs: it writes the stores and
+        # reports them as one JSON line.
+        if [ "${1:-}" = --development-seed-workspace ]; then
+            printf '%s %s HOME=%s XDG_DATA_HOME=%s\n' "${0##*/}" "$*" "$HOME" "$XDG_DATA_HOME" >> "$STUB_LOG/seeded"
+            mkdir -p "$XDG_DATA_HOME/stores"
+            : > "$XDG_DATA_HOME/stores/${0##*/}"
+            if [ "${0##*/}" = cagentsd ]; then
+                printf '{"path":"p","identity":"6f9c2d0e-0000-4000-8000-000000000001","schema":1,"projects":3,'
+                printf '"channels":6,"views":18,"panes":9,"edits":40,"seconds":0}\n'
+            else
+                printf '{"path":"p","slot":"s","schema":13,"cards":1,"open":1,"channels":6,"projects":3,"seconds":0}\n'
+            fi
+            exit 0
+        fi
         if [ "${0##*/}" = cagents-ui ]; then printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"; exec sleep 300; fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
         if [ "$*" = '--no-start daemon preflight' ]; then printf 'capability'; exit 0; fi
@@ -966,6 +981,61 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "before")
         self.assertTrue((fixture / "home" / "seeded").exists())
         self.assertFalse((fixture / "home" / "changed-during-after").exists())
+
+    def with_generator(self, side: str = "after") -> Path:
+        """A built side whose checkout carries this tool's workspace generator."""
+        path = self.checkout(side)
+        shutil.copy2(REPOSITORY / "scripts" / "fixture-workspace", path / "scripts")
+        shutil.copytree(REPOSITORY / "scripts" / "fixture_workspace", path / "scripts" / "fixture_workspace",
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        git = ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
+        subprocess.run([*git, "add", "."], check=True, env=self.env)
+        subprocess.run([*git, "commit", "-qm", "generator"], check=True, env=self.env)
+        self.run_tool("build", side, str(path))
+        return path
+
+    def test_seed_generates_and_loads_a_workspace_that_every_start_restores(self) -> None:
+        self.with_generator("after")
+        self.built("before")
+        result = self.run_tool("seed", "--profile", "small", "--seed", "3")
+        self.assertIn("small workspace (seed 3) through after", result.stdout)
+        fixture, seed = self.task / "fixture", self.task / "fixture-seed"
+        plan = json.loads((seed / "plan.json").read_text())
+        self.assertEqual((plan["profile"], plan["seed"], plan["root"]), ("small", 3, str(fixture)))
+        # The daemon first, then each window, all in the fixture's directories.
+        seeded = (self.logs / "seeded").read_text().splitlines()
+        self.assertEqual([line.split()[0] for line in seeded], ["cagentsd", "cagents-ui", "cagents-ui"])
+        for line in seeded:
+            self.assertIn(f"HOME={fixture}/home XDG_DATA_HOME={fixture}/data", line)
+        self.assertTrue((seed / "data" / "stores" / "cagentsd").exists())
+        self.assertFalse(any(seed.glob(".rt-*")))
+
+        self.run_tool("start", "before")
+        self.assertEqual(json.loads((fixture / "plan.json").read_text())["seed"], 3)
+        self.assertTrue((fixture / "data" / "stores" / "cagents-ui").exists())
+        self.assertTrue((fixture / "bin" / "claude").exists())
+        refused = self.run_tool("seed", "--profile", "small", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("stop the session", refused.stderr)
+        self.run_tool("stop")
+
+    def test_seed_needs_a_side_whose_checkout_has_the_generator(self) -> None:
+        self.built("after")
+        result = self.run_tool("seed", "--profile", "small", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no scripts/fixture-workspace", result.stderr)
+        self.assertFalse((self.task / "fixture-seed").exists())
+        result = self.run_tool("seed", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--profile", result.stderr)
+
+    def test_a_failed_seed_keeps_the_saved_seed(self) -> None:
+        self.with_generator("after")
+        self.run_tool("seed", "--profile", "small")
+        result = self.run_tool("seed", "--profile", "no-such-profile", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("seed again", result.stderr)
+        self.assertEqual(json.loads((self.task / "fixture-seed" / "plan.json").read_text())["profile"], "small")
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()

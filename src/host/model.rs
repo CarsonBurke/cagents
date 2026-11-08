@@ -37,6 +37,8 @@ pub(super) mod channel_work;
 mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 mod execution;
+#[cfg(any(debug_assertions, feature = "development"))]
+pub(crate) mod fixture_seed;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;
@@ -263,6 +265,17 @@ impl Registry {
     /// The caller has already resolved the edit's repository key; this never
     /// touches the filesystem, so an edit is decided entirely from the store.
     pub(crate) fn apply(&mut self, edit: &ModelEdit) -> Result<Applied, String> {
+        let (sequence, changed) = self.commit(edit)?;
+        Ok(Applied {
+            model: self.model()?,
+            sequence,
+            changed,
+        })
+    }
+
+    /// [`Registry::apply`] without reading the whole model back afterwards:
+    /// this edit's sequence, and whether it changed anything.
+    fn commit(&mut self, edit: &ModelEdit) -> Result<(u64, bool), String> {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -504,11 +517,7 @@ impl Registry {
         transaction.commit().map_err(|error| error.to_string())?;
         #[cfg(test)]
         pause(Pause::AfterCommit);
-        Ok(Applied {
-            model: self.model()?,
-            sequence,
-            changed,
-        })
+        Ok((sequence, changed))
     }
 }
 
