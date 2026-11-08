@@ -85,6 +85,12 @@ pub enum RefusedWrite {
     NewConversation,
     Project,
     Worktree,
+    /// A reviewed repair of which pane owns a terminal.
+    TerminalRepair,
+    /// The read-only copy of a chat kept when its pane moves on.
+    RetainedChatCopy,
+    /// A chat pane's move to a recovered or upgraded conversation.
+    ConversationRecovery,
 }
 
 impl RefusedWrite {
@@ -96,6 +102,9 @@ impl RefusedWrite {
             Self::NewConversation => "the new conversation in pane",
             Self::Project => "project",
             Self::Worktree => "worktree",
+            Self::TerminalRepair => "the terminal ownership repair of pane",
+            Self::RetainedChatCopy => "the retained chat copy",
+            Self::ConversationRecovery => "the conversation recovery in pane",
         }
     }
 }
@@ -113,7 +122,9 @@ pub struct Check(String);
 const CHECK_BYTES: usize = 160;
 
 impl Check {
-    pub fn new(rule: &str) -> Self {
+    /// Only storage names a rule; it makes one from a
+    /// [`crate::persistence::RefusedCheck`], which never holds content.
+    pub(crate) fn new(rule: &str) -> Self {
         let mut text = rule.replace(char::is_control, " ");
         if text.len() > CHECK_BYTES {
             let mut end = CHECK_BYTES - '…'.len_utf8();
@@ -140,6 +151,12 @@ impl TryFrom<String> for Check {
         } else {
             Ok(Self(text))
         }
+    }
+}
+
+impl std::fmt::Display for Check {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
     }
 }
 
@@ -1629,21 +1646,33 @@ mod tests {
         assert!(check.as_str().ends_with('…'));
         assert!(!check.as_str().contains(char::is_control));
 
+        // JSON escapes a quote to two bytes, so a check of nothing else is
+        // the longest one a record can hold.
+        let quotes = Check::new(&"\"".repeat(CHECK_BYTES));
+        assert_eq!(quotes.as_str().len(), CHECK_BYTES);
+
         let (_root, path) = fixture();
         let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
-        recorder
-            .append(Event::StorageRefused {
-                write: RefusedWrite::NewConversation,
-                id: Some(Uuid::from_u128(u128::MAX)),
-                check: check.clone(),
-            })
-            .unwrap();
+        for check in [&quotes, &check] {
+            recorder
+                .append(Event::StorageRefused {
+                    write: RefusedWrite::RelaunchedTerminal,
+                    id: Some(Uuid::from_u128(u128::MAX)),
+                    check: check.clone(),
+                })
+                .unwrap();
+        }
         let report = inspect_at(path.clone()).unwrap();
         assert!(report.products[0].readable);
-        assert!(matches!(
-            &report.products[0].records[0].event,
-            Event::StorageRefused { check: read, .. } if *read == check
-        ));
+        let checks = report.products[0]
+            .records
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::StorageRefused { check, .. } => Some(check),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks, [&quotes, &check]);
 
         // A record that holds more than a check can is not evidence.
         let file = path.join(Product::Ui.filename(0));

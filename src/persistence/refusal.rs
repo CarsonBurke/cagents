@@ -187,6 +187,12 @@ impl fmt::Display for RefusedCheck<'_> {
     }
 }
 
+impl From<RefusedCheck<'_>> for crate::diagnostics::Check {
+    fn from(check: RefusedCheck<'_>) -> Self {
+        Self::new(&check.to_string())
+    }
+}
+
 /// Writes a format template with an ellipsis where each value would go:
 /// `chat card {card} changed source identity` reads `chat card … changed
 /// source identity`.

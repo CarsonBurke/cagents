@@ -903,9 +903,8 @@ fn quarantined_write_line<'a>(
         },
     };
     let mut line = format!(
-        "{subject} — {}: {} · since {}",
+        "{subject} — {} · since {}",
         write.category.label(),
-        write.check,
         unix_time_label(write.refused_at_unix_ms),
     );
     // Changing the card cannot supersede a refusal of the card
@@ -923,6 +922,9 @@ fn quarantined_write_line<'a>(
         1 => line.push_str(" · 1 worktree waits on it"),
         count => line.push_str(&format!(" · {count} worktrees wait on it")),
     }
+    // The rule is what to report; on its own line it stays apart from the
+    // remedies above, and from the next write's subject below.
+    line.push_str(&format!("\nRule: {}", write.check));
     line
 }
 
@@ -20683,7 +20685,9 @@ mod tests {
         let refused = |subject| QuarantinedWrite {
             subject,
             category: crate::session::SaveFailureCategory::InvalidData,
-            check: "chat card … changed conversation identity (identity)".into(),
+            check: crate::diagnostics::Check::new(
+                "chat card … changed conversation identity (identity)",
+            ),
             refused_at_unix_ms: 20,
             held_back: 0,
         };
@@ -20747,7 +20751,9 @@ mod tests {
         let write = |subject| QuarantinedWrite {
             subject,
             category: crate::session::SaveFailureCategory::InvalidData,
-            check: "chat card … changed conversation identity (identity)".into(),
+            check: crate::diagnostics::Check::new(
+                "chat card … changed conversation identity (identity)",
+            ),
             refused_at_unix_ms: 20,
             held_back: 0,
         };
@@ -20775,11 +20781,10 @@ mod tests {
         assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&pane, &untitled);
         assert!(line.starts_with("Latest changes to a pane ("), "{line}");
+        assert!(line.contains("— saved state is invalid · since"), "{line}");
         assert!(
-            line.contains(
-                "— saved state is invalid: chat card … changed conversation identity (identity) · since"
-            ),
-            "the rule storage refused it for is named: {line}"
+            line.ends_with("\nRule: chat card … changed conversation identity (identity)"),
+            "the rule storage refused it for is named on its own line: {line}"
         );
 
         let relaunch = write(WriteSubject::CardIdentity {

@@ -530,12 +530,7 @@ fn validate_terminal_ownership_recovery(
     base: SnapshotBase<'_>,
     recovery: TerminalPaneAdoption,
 ) -> Result<()> {
-    let invalid = |reason: &'static str| {
-        StoreError::InvalidState(Violation::new(
-            reason,
-            format!("terminal ownership recovery refused: {reason}"),
-        ))
-    };
+    let invalid = |check: &'static str| StoreError::InvalidState(Violation::new(check, check));
     if base.cards.contains_key(&recovery.canonical)
         || transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM cards WHERE card_id=?1)",
@@ -543,12 +538,16 @@ fn validate_terminal_ownership_recovery(
             |row| row.get::<_, bool>(0),
         )?
     {
-        return Err(invalid("the live pane has already been saved"));
+        return Err(invalid(
+            "terminal ownership recovery refused: the live pane has already been saved",
+        ));
     }
     if select_closed_terminal_adoption(transaction, state, recovery.canonical, recovery.terminal)?
         != Some(recovery)
     {
-        return Err(invalid("the exact closed owner changed"));
+        return Err(invalid(
+            "terminal ownership recovery refused: the exact closed owner changed",
+        ));
     }
     let source = state.cards.iter().find(|card| card.id == recovery.alias);
     let target = state
@@ -556,11 +555,15 @@ fn validate_terminal_ownership_recovery(
         .iter()
         .find(|card| card.id == recovery.canonical);
     let (Some(source), Some(target)) = (source, target) else {
-        return Err(invalid("both panes must remain in the window"));
+        return Err(invalid(
+            "terminal ownership recovery refused: both panes must remain in the window",
+        ));
     };
     let (CardKind::Terminal(archived), CardKind::Terminal(live)) = (&source.kind, &target.kind)
     else {
-        return Err(invalid("both panes must retain their terminal descriptors"));
+        return Err(invalid(
+            "terminal ownership recovery refused: both panes must retain their terminal descriptors",
+        ));
     };
     if !target.existence.is_open()
         || live.id != recovery.terminal
@@ -1646,10 +1649,9 @@ impl StateStore {
         let actual = select_generation(&transaction, SELECT_PROJECT_GENERATION, &project_id)?;
         check_generation("project", project.id, project.generation, actual)?;
         reject_tombstone_resurrection(
-            "project",
-            project.id,
             select_existence(&transaction, SELECT_PROJECT_EXISTENCE, &project_id)?,
             &project.existence,
+            || invalid_state!("tombstoned project {} cannot be resurrected", project.id),
         )?;
         let next = next_generation(project.generation, "project", project.id)?;
         transaction
@@ -3830,20 +3832,30 @@ const UPSERT_BROWSER_RESTORE: &str = "INSERT INTO browser_restore (
 
 /// A payload table whose primary identity a card owns for life.
 struct PayloadIdentity {
-    /// Column name, used only in diagnostics.
-    id_column: &'static str,
+    /// Refuses a payload identity another card already owns, given the
+    /// identity and that card.
+    claimed: fn(&str, &str) -> StoreError,
+    /// Refuses a card's replacement of its stable identity, given the card,
+    /// the identity it owns and the one it offered.
+    replaced: fn(&str, &str, &str) -> StoreError,
     card_by_payload: &'static str,
     payload_by_card: &'static str,
 }
 
 const TERMINAL_PAYLOAD_IDENTITY: PayloadIdentity = PayloadIdentity {
-    id_column: "terminal_id",
+    claimed: |payload, card| invalid_state!("terminal_id {payload} already belongs to card {card}"),
+    replaced: |card, stable, payload| {
+        invalid_state!("card {card} cannot replace stable terminal_id {stable} with {payload}")
+    },
     card_by_payload: "SELECT card_id FROM terminal_recipes WHERE terminal_id = ?1",
     payload_by_card: "SELECT terminal_id FROM terminal_recipes WHERE card_id = ?1",
 };
 
 const BROWSER_PAYLOAD_IDENTITY: PayloadIdentity = PayloadIdentity {
-    id_column: "browser_id",
+    claimed: |payload, card| invalid_state!("browser_id {payload} already belongs to card {card}"),
+    replaced: |card, stable, payload| {
+        invalid_state!("card {card} cannot replace stable browser_id {stable} with {payload}")
+    },
     card_by_payload: "SELECT card_id FROM browser_restore WHERE browser_id = ?1",
     payload_by_card: "SELECT browser_id FROM browser_restore WHERE card_id = ?1",
 };
@@ -3863,10 +3875,9 @@ fn save_workspace_transaction(
     let actual = select_generation(transaction, SELECT_WORKSPACE_GENERATION, &workspace_id)?;
     check_generation("workspace", state.id, base.workspace, actual)?;
     reject_tombstone_resurrection(
-        "workspace",
-        state.id,
         select_existence(transaction, SELECT_WORKSPACE_EXISTENCE, &workspace_id)?,
         &state.existence,
+        || invalid_state!("tombstoned workspace {} cannot be resurrected", state.id),
     )?;
     let next = next_generation(base.workspace, "workspace", state.id)?;
     let timestamp = now_unix_ms();
@@ -4491,13 +4502,13 @@ fn validate_chat_identity(
         )?;
         let stored: crate::chat::Session = from_json("chat card", &content)?;
         let changed = if stored.id != session.id {
-            Some("changed conversation identity (identity)")
+            Some("chat card {card} changed conversation identity (identity)")
         } else if stored.launch.provider != session.launch.provider {
-            Some("changed conversation identity (provider)")
+            Some("chat card {card} changed conversation identity (provider)")
         } else if stored.native_continuity.retains_provider()
             && stored.native_continuity != session.native_continuity
         {
-            Some("changed conversation identity (native continuity)")
+            Some("chat card {card} changed conversation identity (native continuity)")
         } else if stored.owned_codex_listener != session.owned_codex_listener
             && !(stored.owned_codex_listener.is_none()
                 && session.owns_codex_listener()
@@ -4506,7 +4517,7 @@ fn validate_chat_identity(
                     .as_ref()
                     .is_some_and(HostSessionProof::is_complete))
         {
-            Some("changed conversation identity (owned listener)")
+            Some("chat card {card} changed conversation identity (owned listener)")
         } else if stored.launch.recipe != session.launch.recipe
             // Before it begins, a chat's recipe holds only launch options -
             // account, model, permissions - and no conversation to protect.
@@ -4516,7 +4527,7 @@ fn validate_chat_identity(
             // endpoint where it had asked for one.
             && !stored.resolved_to_owned_codex_listener(session)
         {
-            Some("changed conversation identity (launch recipe)")
+            Some("chat card {card} changed conversation identity (launch recipe)")
         } else if stored.terminal != session.terminal
             && !session.retains_native_pair_from(&stored)
             && !(stored.terminal.is_none()
@@ -4525,19 +4536,19 @@ fn validate_chat_identity(
                     .as_ref()
                     .is_some_and(|view| codex_cli_view(session, view)))
         {
-            Some("changed conversation identity (source terminal)")
+            Some("chat card {card} changed conversation identity (source terminal)")
         } else if stored.launch.session_id != session.launch.session_id
             && (stored.launch.session_id.is_some() || stored.has_unnamed_retained_claude_actor())
             && (stored.proof.is_none() || stored.proof != session.proof)
         {
-            Some("changed conversation identity (provider conversation)")
+            Some("chat card {card} changed conversation identity (provider conversation)")
         } else {
             None
         };
-        if let Some(changed) = changed {
+        if let Some(check) = changed {
             return Err(StoreError::InvalidState(Violation::new(
-                changed,
-                format!("chat card {card} {changed}"),
+                check,
+                check.replace("{card}", &card.to_string()),
             )));
         }
     }
@@ -5219,16 +5230,13 @@ fn ensure_payload_identity(
     payload_id: &str,
     card_id: &str,
 ) -> Result<()> {
-    let id_column = identity.id_column;
     if let Some(existing_card) = transaction
         .prepare_cached(identity.card_by_payload)?
         .query_row([payload_id], |row| row.get::<_, String>(0))
         .optional()?
         && existing_card != card_id
     {
-        return Err(invalid_state!(
-            "{id_column} {payload_id} already belongs to card {existing_card}"
-        ));
+        return Err((identity.claimed)(payload_id, &existing_card));
     }
 
     if let Some(existing_id) = transaction
@@ -5237,9 +5245,7 @@ fn ensure_payload_identity(
         .optional()?
         && existing_id != payload_id
     {
-        return Err(invalid_state!(
-            "card {card_id} cannot replace stable {id_column} {existing_id} with {payload_id}"
-        ));
+        return Err((identity.replaced)(card_id, &existing_id, payload_id));
     }
     Ok(())
 }
@@ -5809,18 +5815,16 @@ fn select_existence(
         .transpose()
 }
 
+/// Refuses, with `refusal`, to reopen what storage holds closed.
 fn reject_tombstone_resurrection(
-    kind: &str,
-    id: impl std::fmt::Display,
     stored: Option<Existence>,
     incoming: &Existence,
+    refusal: impl FnOnce() -> StoreError,
 ) -> Result<()> {
     if matches!(stored, Some(Existence::Closed { .. }))
         && !matches!(incoming, Existence::Closed { .. })
     {
-        return Err(invalid_state!(
-            "tombstoned {kind} {id} cannot be resurrected"
-        ));
+        return Err(refusal());
     }
     Ok(())
 }
