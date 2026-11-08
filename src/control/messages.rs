@@ -253,12 +253,12 @@ fn recipient_notice(delivery: &Delivery) -> Option<String> {
     let id = member.session.id;
     if let Some(limit) = &member.limit {
         let held = if limit.resets_at.is_some() {
-            "The message waits until then"
+            "so the message is held until then"
         } else {
-            "The message waits until the limit resets or that conversation continues"
+            "so the message is held until the limit resets or that conversation continues"
         };
         return Some(format!(
-            "{id} is stopped by a usage limit ({}). {held}, and no reply can come before.",
+            "{id} is stopped by a usage limit ({}), {held}; no reply can come before.",
             super::sessions::limit_phrase(limit, now)
         ));
     }
@@ -701,7 +701,7 @@ mod tests {
         assert_eq!(
             notice,
             format!(
-                "{id} is stopped by a usage limit (Claude weekly limit reached, resets 3pm). The message waits until the limit resets or that conversation continues, and no reply can come before."
+                "{id} is stopped by a usage limit (Claude weekly limit reached, resets 3pm), so the message is held until the limit resets or that conversation continues; no reply can come before."
             )
         );
         let value = delivery_json(&delivery);
