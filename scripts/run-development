@@ -452,7 +452,7 @@ watch_instance_lifetime() {
             gone=${gone:-$(date +%s)}
         fi
         if reason=$(reap_reason "$record" "$gone"); then
-            reap_instance "$name" "$runtime" "$reason"
+            reap_instance "$name" "$runtime" "$reason" || :
             exit 0
         fi
     done
@@ -580,11 +580,14 @@ collect_instances() {
             printf '%s\n' "cannot tell which daemons host this session, so no instance can safely be stopped from it; run --gc from a terminal outside cagents" >&2
         return 0
     fi
-    if ! listing=$(niri-harness list 2>&1); then
+    list_errors=$(mktemp)
+    if ! listing=$(niri-harness list 2>"$list_errors"); then
         [ "$explicit" = false ] ||
-            printf '%s\n' "niri-harness list failed, so no instance was checked: $listing" >&2
+            printf '%s\n' "niri-harness list failed, so no instance was checked: $(cat "$list_errors")" >&2
+        rm -f -- "$list_errors"
         return 1
     fi
+    rm -f -- "$list_errors"
     sessions=$(printf '%s\n' "$listing" | awk '$1 ~ /^cagents-/')
     while read -r session state _backend _cpu session_root; do
         [ -n "$session" ] || continue
@@ -1262,7 +1265,8 @@ os.execv(sys.argv[1], sys.argv[1:])' "$@"
         fi
         # With the runtime directory sessions are made in, not this caller's:
         # stopping a session that this caller runs in must not end it.
-        XDG_RUNTIME_DIR=${XDG_RUNTIME_DIR%/nh-*} setsid "$@" </dev/null >/dev/null 2>&1 &
+        sessions_runtime=${XDG_RUNTIME_DIR-}
+        XDG_RUNTIME_DIR=${sessions_runtime%/nh-*} setsid "$@" </dev/null >/dev/null 2>&1 &
     fi
     instance_log "$instance" "started from $root by $(cat "/proc/$(owner_process)/comm" 2>/dev/null || echo unknown)"
     if [ "$keep_instance" = true ]; then
