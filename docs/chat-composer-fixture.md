@@ -164,7 +164,19 @@ frames, such as a background task's `task_started` and `task_notification`,
 are live only, as they are from Claude Code. A frame with `"_history": true` is
 only recorded, the way Claude Code records a queued notification as a
 `queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
-state can be captured.
+state can be captured. A line `{"_exit": STATUS}` makes the provider exit
+there with that status, mid-turn and without a result, as a crash does. Every
+turn that reaches the line exits again, including the turn the resumed
+provider replays. Add `"_once": true` to exit only the first time: the fixture
+records that in `fixture-frames.exited`, and removing that file arms the line
+again.
+
+To hold a conversation's provider at start-up, as a cold start does, create
+`home/.claude/fixture-slow-start`. The provider then waits before it reads
+anything: the number of seconds on the file's first line, or 5 if the file is
+empty. The app's account check is not delayed. Use this to capture the
+starting state, or to check what the app does when a prompt is sent before
+the provider answers.
 
 To run a real command, write it as the first line of
 `home/.claude/fixture-run-command`, such as `sleep 6001`. Every turn then runs

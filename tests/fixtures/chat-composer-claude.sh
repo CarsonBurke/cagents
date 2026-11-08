@@ -209,7 +209,10 @@ tools_turn() {
 # frames are, which Claude records in the subagent's own transcript. A line
 # {"_sleep": SECONDS} pauses, so a running state can be observed. A line
 # {"_end": true} ends the turn there: the frames supply its closing result,
-# such as a failed one, and the fixture adds no answer of its own.
+# such as a failed one, and the fixture adds no answer of its own. A line
+# {"_exit": STATUS} ends the provider there, as a crash does, mid-turn and
+# without a result; with "_once": true it does so only until it has once,
+# which fixture-frames.exited records, so the resumed provider goes on.
 frames_file=$config/fixture-frames.jsonl
 frames_ended=0
 frames_turn() {
@@ -224,6 +227,15 @@ frames_turn() {
         if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then
             frames_ended=1
             return
+        fi
+        status=$(printf '%s' "$spec" | jq -r '._exit // empty')
+        if [ -n "$status" ]; then
+            if [ "$(printf '%s' "$spec" | jq -r '._once // false')" = true ]; then
+                [ ! -e "$config/fixture-frames.exited" ] || continue
+                : >"$config/fixture-frames.exited"
+            fi
+            printf '%s\n' "fixture: the provider exited with status $status mid-turn" >&2
+            exit "$status"
         fi
         frame=$(printf '%s' "$spec" | jq -c --arg turn "$turn" 'walk(if type == "string" then gsub("@TURN@"; $turn) else . end)')
         if [ "$(printf '%s' "$frame" | jq -r '._history // false')" = true ]; then
@@ -281,6 +293,15 @@ stream_delay=0.25
 if fixture_switch "${CAGENTS_FIXTURE_STREAM_REPLY:-0}" fixture-stream-reply; then
     stream_reply=1
     if [ -s "$config/fixture-stream-reply" ]; then stream_delay=$(head -n 1 "$config/fixture-stream-reply"); fi
+fi
+
+# Optional slow start: while fixture-slow-start exists, a conversation's
+# provider waits before it reads anything, as a cold start does: the file's
+# first line in seconds, or 5. The account check is not held up.
+if [ "$probe" = false ] && [ -e "$config/fixture-slow-start" ]; then
+    start_delay=5
+    if [ -s "$config/fixture-slow-start" ]; then start_delay=$(head -n 1 "$config/fixture-slow-start"); fi
+    sleep "$start_delay"
 fi
 
 busy=false
