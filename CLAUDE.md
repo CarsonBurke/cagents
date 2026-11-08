@@ -5,6 +5,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 ## Deliver changes through pull requests
 
 - Use Issues, worktrees and PRs to manage your work.
+- Many agents share one GitHub account and its API limits. Poll CI and PR state at most every two minutes, keep at most one watch per PR, and prefer a single `gh` call that returns several fields over repeated calls. When GitHub reports a rate limit, wait for the reset shown by `gh api rate_limit` instead of retrying.
 - Do your work in PRs against `main`.
 - The lead owns the complete user outcome through implementation, independent review, validation and merge. Give parallel workers explicit boundaries; review the assembled experience before calling it ready. A subtask passing tests does not establish that the feature works well.
 - For a change people interact with, state the user's task and intended before/after behavior in the PR. Follow the latest approved design and corrections across the affected flow; preserve necessary controls and information when simplifying it.
