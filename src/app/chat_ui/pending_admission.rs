@@ -62,17 +62,7 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
-        if let Some(text) = self.chat_ui.drafts.remove(&card) {
-            runtime.replace_draft(text_editor::Content::with_text(&text));
-        }
-        if let Some(images) = self.chat_ui.draft_attachments.remove(&card) {
-            runtime.replace_attachments(
-                images
-                    .into_iter()
-                    .filter(|image| image.reference.is_some())
-                    .collect(),
-            );
-        }
+        self.restore_unsent_chat(card, &mut runtime);
         // Deliberately no provider connection, draft skill discovery, retirement,
         // or lifecycle job: this is only a local view of saved bytes.
         self.cards
@@ -317,6 +307,12 @@ impl Cagents {
             // actual Ready handler, which replaces only the connection.
             runtime.connection = Connection::Connecting;
             self.cards.insert(pane.id, CardRuntime::Chat(runtime));
+        }
+        if let (Some(CardKind::Chat(saved)), CardKind::Chat(canonical)) = (
+            self.card_state(pane.id).map(|card| card.kind.clone()),
+            &pane.kind,
+        ) {
+            self.adopt_shared_chat_identity(pane.id, &saved, canonical);
         }
         if let Some(card) = self.card_state_mut(pane.id) {
             card.kind = pane.kind.clone();

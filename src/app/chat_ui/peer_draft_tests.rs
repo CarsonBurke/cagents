@@ -1130,3 +1130,200 @@ fn escape_on_the_question_lets_the_next_close_ask() {
         assert!(!app.chat_close_owned(asked), "captured={captured}");
     }
 }
+
+/// Gives `peer` a store of its own holding the draft it shows, as each
+/// window's own sessions database does.
+fn with_own_store(peer: &mut Peer) -> Arc<crate::persistence::StateStore> {
+    let (writer, _) = crate::session::SessionRuntime::open(
+        peer._directory.path().join("window-b.sqlite3"),
+        crate::model::BootId::new("peer-own-store"),
+    )
+    .unwrap();
+    writer.snapshot(peer.app.persistent_workspace());
+    writer.flush(std::time::Duration::from_secs(5)).unwrap();
+    let store = writer.operation_store();
+    peer.app.session = Some(writer);
+    store
+}
+
+/// Saves what `peer` shows and returns the chat its own store then holds.
+fn saved_chat(peer: &Cagents, card: CardId, store: &crate::persistence::StateStore) -> chat::Session {
+    let writer = peer.session.as_ref().unwrap();
+    writer
+        .flush(std::time::Duration::from_secs(5))
+        .unwrap_or_else(|error| panic!("this window's store refused the pane: {error}"));
+    assert_eq!(writer.last_error(), None);
+    match store.load_card(card, None).unwrap().map(|card| card.kind) {
+        Some(CardKind::Chat(session)) => session,
+        other => panic!("expected a saved chat, found {other:?}"),
+    }
+}
+
+fn retained_claude(session: &chat::Session) -> chat::Session {
+    let mut retained = session.clone();
+    retained.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    retained.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    retained.proof = Some(crate::model::HostSessionProof {
+        host_session_id: "fixture-host".into(),
+        boot_id: "fixture-boot".into(),
+        host_incarnation: "fixture-incarnation".into(),
+    });
+    assert!(retained.has_valid_native_continuity());
+    retained
+}
+
+/// The other window's Send saves the draft under a new identity, which its
+/// own store records. This window only follows the shared view, and its own
+/// store would refuse every later write of the pane unless it takes that
+/// conversation too (#2176). So would a resume in the other window, which
+/// starts a successor conversation (#2402), and a start given up there, which
+/// returns the same conversation to a draft that no longer retains its
+/// provider (#2349).
+#[test]
+fn this_windows_store_follows_the_conversation_another_window_moves_the_pane_to() {
+    let mut peer = peer();
+    let store = with_own_store(&mut peer);
+    let mut candidate = peer.draft.clone();
+    candidate.id = TerminalId::new();
+    let accepted = retained_claude(&candidate);
+
+    for (step, kind) in [
+        ("first send", candidate.clone()),
+        ("started", accepted.clone()),
+        ("returned to the draft", candidate.clone()),
+        ("started again", accepted.clone()),
+        ("resumed", {
+            let mut successor = retained_claude(&accepted);
+            successor.id = TerminalId::new();
+            successor
+        }),
+    ] {
+        drop(project(
+            &mut peer.app,
+            peer.channel,
+            peer.card,
+            CardKind::Chat(kind.clone()),
+        ));
+        assert_eq!(saved_chat(&peer.app, peer.card, &store), kind, "{step}");
+    }
+}
+
+/// Unsent text in this window that only repeats the message the other window
+/// sent goes once the transcript shows that message; anything else stays.
+#[test]
+fn a_copy_of_the_first_message_leaves_the_composer_and_other_writing_stays() {
+    const SENT: &str = "Message from window A";
+    for (text, kept) in [
+        (SENT, ""),
+        ("  Message from window A\n", ""),
+        ("Notes typed in window B", "Notes typed in window B"),
+    ] {
+        let mut peer = peer();
+        write(&mut peer.app, peer.card, text);
+        let mut candidate = peer.draft.clone();
+        candidate.id = TerminalId::new();
+        drop(project(
+            &mut peer.app,
+            peer.channel,
+            peer.card,
+            CardKind::Chat(started(&candidate)),
+        ));
+        let target = attempt_target(&peer);
+        let handle =
+            super::tests::fixture_handle(&peer.app, peer.card, Some("provider-conversation"));
+        drop(peer.app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        ))));
+        let unsent = |peer: &Peer| match peer.app.cards.get(&peer.card) {
+            Some(CardRuntime::Chat(runtime)) if !runtime.is_draft() => runtime.unsent_text(),
+            _ => panic!("expected the attached conversation"),
+        };
+        assert_eq!(unsent(&peer), text, "{text:?}: kept until the transcript shows");
+
+        super::show_chat_snapshot_for_test(
+            &mut peer.app,
+            peer.card,
+            Snapshot {
+                session_id: Some("provider-conversation".into()),
+                items: vec![Arc::new(chat::Item {
+                    started_at: None,
+                    id: "first".into(),
+                    role: chat::Role::User,
+                    content: chat::ItemContent::Text {
+                        text: SENT.into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                    at: None,
+                })],
+                ..Snapshot::default()
+            },
+        );
+        assert_eq!(unsent(&peer), kept, "{text:?}");
+    }
+}
+
+/// A file choice under way when the other window's first send arrives under
+/// a new identity keeps the draft until it ends, and the chosen file, which a
+/// saved draft leaves out, comes along to the attached conversation.
+#[test]
+fn a_file_chosen_while_another_window_sends_comes_along() {
+    const FILE: &str = "/repo/notes.txt";
+    let mut peer = peer();
+    write(&mut peer.app, peer.card, "notes");
+    let ticket = {
+        let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) else {
+            panic!("expected a chat runtime");
+        };
+        let ticket = runtime.begin_attachment_insert();
+        runtime.attachment_chooser_pending = Some(ticket.id);
+        ticket
+    };
+    let target = draft_runtime(&peer.app, peer.card).target;
+    let mut candidate = peer.draft.clone();
+    candidate.id = TerminalId::new();
+    let accepted = started(&candidate);
+    drop(project(
+        &mut peer.app,
+        peer.channel,
+        peer.card,
+        CardKind::Chat(accepted.clone()),
+    ));
+    assert!(peer.app.chat_is_draft(peer.card), "the chooser holds the draft");
+
+    let _admission = super::attachment_draft::test_admission();
+    drop(peer.app.handle_chat_ui(Action::Attached(
+        target,
+        ticket.clone(),
+        Ok(Some(vec![std::path::PathBuf::from(FILE)])),
+    )));
+    assert!(peer.app.chat_is_draft(peer.card), "the file is still loading");
+    drop(peer.app.handle_chat_ui(Action::AttachmentsPrepared(
+        target,
+        ticket,
+        Ok(vec![Attachment::file(FILE)]),
+    )));
+    assert!(peer.app.chat_start_matches(peer.card, &accepted));
+    assert!(peer.app.chat_ui.retiring.is_empty());
+
+    let handle =
+        super::tests::fixture_handle(&peer.app, peer.card, Some("provider-conversation"));
+    drop(peer.app.update(Message::ChatUi(Action::Ready(
+        attempt_target(&peer),
+        Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+    ))));
+    let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get(&peer.card) else {
+        panic!("expected the attached conversation");
+    };
+    assert!(!runtime.is_draft());
+    assert_eq!(runtime.unsent_text(), "notes");
+    assert_eq!(
+        runtime
+            .attachments
+            .iter()
+            .map(|attachment| attachment.path.as_path())
+            .collect::<Vec<_>>(),
+        [std::path::Path::new(FILE)]
+    );
+}

@@ -7714,6 +7714,9 @@ impl Cagents {
     /// shared views it shows. An edit saved but not published is undone by
     /// the next shared projection, and storage refuses the snapshot that
     /// projection saves when it reverts what storage already holds.
+    ///
+    /// Conversations the shared views re-pointed chat cards to are recorded
+    /// with it, ahead of whichever write the caller makes with it.
     fn shared_window_snapshot(&mut self) -> Arc<WorkspaceState> {
         self.shared_window_snapshot_with(Self::publish_view_changes)
     }
@@ -7724,7 +7727,24 @@ impl Cagents {
     ) -> Arc<WorkspaceState> {
         self.snapshot_workspace_scope();
         publish(self);
-        self.persistent_workspace()
+        let saved = self.persistent_workspace();
+        self.record_shared_chat_identities();
+        saved
+    }
+
+    /// Queues the conversations shared views re-pointed chat cards to since
+    /// the last save. Every write of the window's state makes this first, then
+    /// queues itself behind them: storage refuses a write that re-points a
+    /// chat card unless the change is recorded.
+    pub(super) fn record_shared_chat_identities(&mut self) {
+        if self.shared_views.chat_adoptions.is_empty() {
+            return;
+        }
+        let Some(writer) = &self.session else {
+            return;
+        };
+        let adoptions = std::mem::take(&mut self.shared_views.chat_adoptions);
+        writer.adopt_chat_identities(adoptions.into_values());
     }
 
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {
