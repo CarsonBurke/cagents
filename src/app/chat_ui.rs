@@ -7587,8 +7587,6 @@ impl Cagents {
                     }),
             ),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Chat(session.clone()),
         };
         let (index, durable_index) = beside
@@ -7602,6 +7600,7 @@ impl Cagents {
         }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
+        self.set_presence(card_id, Exposure::Visible, Residency::Hot);
         if let Some(title) = user_title {
             self.chrome_ui.user_titles.insert(card_id, title);
         }
@@ -7707,9 +7706,7 @@ impl Cagents {
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
         // hibernate: the card is whole as it stands.
         self.lifecycle.remove(card);
-        if let Some(state) = self.card_state_mut(card) {
-            state.residency = Residency::Hot;
-        }
+        self.set_residency(card, Residency::Hot);
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
@@ -20946,7 +20943,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Offscreen)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.exposure(card), Exposure::Offscreen);
 
         open_work_over_chat(&mut app);
         answer_start(&mut app, target, Ok(handle.clone()));
@@ -21782,7 +21779,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
         app.set_workspace_surfaces_visible(false);
         preparation::retirement_barrier();
@@ -21809,7 +21806,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.visible.load(Ordering::Relaxed));
         preparation::drain_fixture(runtime);
@@ -21873,7 +21870,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
         app.set_workspace_surfaces_visible(false);
         let runtime = chat_runtime(&app, card);
@@ -21886,7 +21883,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.visible.load(Ordering::Relaxed));
         preparation::drain_fixture(runtime);
@@ -26937,7 +26934,7 @@ mod tests {
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let source = chat_runtime(&app, card).session.clone();
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(card), Residency::Hot);
         app.lifecycle
             .register(card, Exposure::Offscreen, Residency::Hot, Instant::now());
         // The writer and cached projections can retain a durable snapshot.
@@ -26966,22 +26963,15 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let source = chat_runtime(&app, card).session.clone();
-        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.set_residency(card, Residency::Cold);
         app.lifecycle
             .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
         let retained = app.durable.clone();
         assert_eq!(app.install_chat_session(card, source.clone()), None);
-        assert!(!Arc::ptr_eq(&retained, &app.durable));
-        assert_eq!(
-            retained
-                .cards
-                .iter()
-                .find(|state| state.id == card)
-                .unwrap()
-                .residency,
-            Residency::Cold
-        );
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        // Residency is this run's presence: promoting it neither copies nor
+        // changes the workspace.
+        assert!(Arc::ptr_eq(&retained, &app.durable));
+        assert_eq!(*app.residency(card), Residency::Hot);
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
         assert!(app.lifecycle.state(card).is_none());
     }
@@ -27006,7 +26996,7 @@ mod tests {
             CardKind::Chat(original)
         );
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(changed));
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(card), Residency::Hot);
     }
 
     #[test]
@@ -27018,7 +27008,7 @@ mod tests {
         assert!(!session.is_unstarted());
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
-        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.set_residency(card, Residency::Cold);
         app.lifecycle
             .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
         let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
@@ -27041,7 +27031,7 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert!(runtime.snapshot.busy);
         assert_eq!(runtime.session, session);
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(card), Residency::Hot);
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
         assert!(!app.chat_start_pending(card));
     }

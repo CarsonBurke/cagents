@@ -840,22 +840,29 @@ impl Cagents {
         // to a strip restores its actual offset, even if focus is offscreen.
         let offset = offset.unwrap_or_else(|| self.workspace.camera().target());
         self.workspace.native_scroll(offset, width);
+        // Only the cards whose place changes: those this strip shows and
+        // those the strip being left showed. Every other card stays where it
+        // was, offscreen.
         let transitions = self
             .durable
             .cards
             .iter()
             .filter(|card| card.existence.is_open())
-            .map(|card| VisibilityTransition {
-                id: card.id,
-                from: match card.exposure {
+            .filter_map(|card| {
+                let from = match self.exposure(card.id) {
                     Exposure::Visible => VisibilityClass::Visible,
                     Exposure::Prefetch => VisibilityClass::Overscan,
                     Exposure::Offscreen => VisibilityClass::Offscreen,
-                },
-                to: self
+                };
+                let to = self
                     .workspace
                     .visibility(card.id)
-                    .unwrap_or(VisibilityClass::Offscreen),
+                    .unwrap_or(VisibilityClass::Offscreen);
+                (from != to).then_some(VisibilityTransition {
+                    id: card.id,
+                    from,
+                    to,
+                })
             })
             .collect();
         let viewport = self.apply_viewport(
@@ -1157,8 +1164,6 @@ mod tests {
             title: path.into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Cold,
             kind: CardKind::Repository(RepositoryView {
                 selected_file: None,
                 project: ProjectId::new(),
@@ -1706,7 +1711,7 @@ mod tests {
         assert_eq!(app.workspace.camera().offset(), 0.0);
         assert!(
             a.iter()
-                .all(|card| app.card_state(card.id).unwrap().exposure == Exposure::Offscreen)
+                .all(|card| app.exposure(card.id) == Exposure::Offscreen)
         );
         let _ = app.update(Message::Viewport {
             generation: a_generation,
@@ -1773,7 +1778,7 @@ mod tests {
         register_worktrees(&mut app, &["/a", "/b"]);
         let _ = app.select_worktree("/a".into(), false);
         assert!(app.workspace.card(b.id).is_none());
-        assert_eq!(app.card_state(b.id).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.exposure(b.id), Exposure::Offscreen);
         assert_eq!(app.workspace.camera().offset(), 250.0);
         assert_eq!(app.workspace.focused(), Some(a[0].id));
     }
@@ -1942,10 +1947,7 @@ mod tests {
             register_worktrees(&mut app, &["/repo"]);
             let _ = app.select_worktree("/repo".into(), false);
             assert_eq!(app.workspace.order().collect::<Vec<_>>(), vec![parent.id]);
-            assert_eq!(
-                app.card_state(retained.id).unwrap().exposure,
-                Exposure::Offscreen
-            );
+            assert_eq!(app.exposure(retained.id), Exposure::Offscreen);
             assert!(app.card_state(retained.id).unwrap().existence.is_open());
         }
     }
@@ -2198,10 +2200,7 @@ mod tests {
             app.terminal_directory(),
             Some(PathBuf::from("/repo/nested"))
         );
-        assert_eq!(
-            app.card_state(a_focused.id).unwrap().exposure,
-            Exposure::Offscreen
-        );
+        assert_eq!(app.exposure(a_focused.id), Exposure::Offscreen);
         assert_eq!(
             app.sidebar_state.active_worktree().unwrap().canonical_path,
             PathBuf::from("/repo/nested")
@@ -2229,7 +2228,7 @@ mod tests {
             vec![a_first.id, a_focused.id]
         );
         assert_eq!(app.workspace.viewport_width(), 1_280.0);
-        assert_eq!(app.card_state(b.id).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.exposure(b.id), Exposure::Offscreen);
         assert_eq!(
             app.durable
                 .cards

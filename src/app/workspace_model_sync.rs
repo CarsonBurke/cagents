@@ -1262,8 +1262,6 @@ impl Cagents {
                 self.settings.default_column_fraction
             },
             existence: Existence::Open,
-            exposure: Exposure::Offscreen,
-            residency: Residency::Cold,
             kind,
         };
         let durable = Arc::make_mut(&mut self.durable);

@@ -4142,7 +4142,7 @@ impl Cagents {
                 Some(CardRuntime::Failed(_)) => ended.push(login.key),
                 // A card on the strip on screen follows its terminal.
                 Some(CardRuntime::Terminal(_) | CardRuntime::Completed) if on_screen => {
-                    if ended_terminal(self.card_state(card)).is_some() {
+                    if self.ended_terminal(card).is_some() {
                         ended.push(login.key);
                     }
                 }
@@ -4152,7 +4152,7 @@ impl Cagents {
                 // once it has taken the terminal on, since until then it has
                 // nothing to say about it.
                 _ => {
-                    if ended_terminal(self.card_state(card)).is_some() {
+                    if self.ended_terminal(card).is_some() {
                         ended.push(login.key);
                     } else if let Some(CardState {
                         kind: CardKind::Terminal(session),
@@ -4228,7 +4228,7 @@ impl Cagents {
                 self.close_offstrip_sign_in(card)
             }
             Some(card)
-                if ended_terminal(self.card_state(card)).is_some()
+                if self.ended_terminal(card).is_some()
                     || matches!(self.cards.get(&card), Some(CardRuntime::Failed(_))) =>
             {
                 cosmic::task::message(Message::CloseCard(card))

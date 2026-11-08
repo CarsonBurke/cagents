@@ -19,10 +19,10 @@ use thiserror::Error;
 use crate::{
     model::{
         BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-        Existence, Exposure, HostSessionProof, OperationId, ProjectChannel, ProjectId,
-        ProjectState, Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
-        TranscriptMetadata, WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId,
-        WorktreeState, normalize_project_channels,
+        Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
+        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
+        WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
+        normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
@@ -652,8 +652,6 @@ impl RefusedClosure {
             title,
             width_fraction,
             existence,
-            exposure: _,
-            residency: _,
             kind,
         } = &self.offered;
         // An open row still has the tombstone to take, so only a row that is
@@ -5575,8 +5573,6 @@ fn load_card_connection(
         title,
         width_fraction: width as f32,
         existence: from_json("card existence", &existence)?,
-        exposure: Exposure::Offscreen,
-        residency: Residency::Cold,
         kind,
     }))
 }
@@ -6105,8 +6101,6 @@ mod tests {
                 title: "terminal".into(),
                 width_fraction: 0.6,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
                     owned_codex_listener: None,
                     recovery_origin: None,
@@ -9180,11 +9174,6 @@ mod tests {
             }
             let mut card = card_template.clone();
             card.id = CardId::new();
-            card.exposure = if index == 0 {
-                Exposure::Visible
-            } else {
-                Exposure::Offscreen
-            };
             card.kind = CardKind::Chat(source);
             workspace
                 .chat_drafts
@@ -10883,8 +10872,6 @@ mod tests {
             title: "browser".into(),
             width_fraction: 0.4,
             existence: Existence::Open,
-            exposure: Exposure::Prefetch,
-            residency: Residency::Hibernated,
             kind: CardKind::Browser(BrowserSession {
                 id: BrowserId::new(),
                 current_url: Url::parse("https://example.com/two").unwrap(),
@@ -10914,13 +10901,6 @@ mod tests {
         assert_eq!(restored.active_worktree, workspace.active_worktree);
         assert_eq!(restored.worktree_focus, workspace.worktree_focus);
         assert_eq!(restored.project_order, workspace.project_order);
-        assert!(
-            restored
-                .cards
-                .iter()
-                .all(|card| card.exposure == Exposure::Offscreen
-                    && card.residency == Residency::Cold)
-        );
         let CardKind::Browser(browser) = &restored.cards[1].kind else {
             panic!("browser card expected");
         };
@@ -11836,8 +11816,6 @@ mod tests {
             title: "browser".into(),
             width_fraction: 0.4,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Browser(BrowserSession {
                 id: BrowserId::new(),
                 current_url: Url::parse("https://example.com/one").unwrap(),
@@ -11921,8 +11899,6 @@ mod tests {
             title: "repository".into(),
             width_fraction: 0.3,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(crate::model::RepositoryView {
                 selected_file: None,
                 project: ProjectId::new(),

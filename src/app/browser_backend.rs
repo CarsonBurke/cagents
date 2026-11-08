@@ -534,7 +534,7 @@ mod action_tests {
             let _ = app.browser_factory_task();
         }
         assert_eq!(app.card_state(card).unwrap().kind, saved.kind);
-        assert_eq!(app.card_state(card).unwrap().residency, saved.residency);
+        assert_eq!(*app.residency(card), saved.residency);
         assert_eq!(app.workspace.focused(), focus);
         assert!(app.browser_factory.is_none());
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));

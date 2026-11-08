@@ -5,6 +5,8 @@ mod automation_ui;
 mod branch_ui;
 #[cfg(feature = "integrated-browser")]
 mod browser_import_ui;
+#[cfg(test)]
+mod channel_open_workload;
 mod channel_ui;
 mod channel_work;
 mod chat_close;
@@ -1356,27 +1358,6 @@ fn terminal_completed(session: &TerminalSession) -> bool {
         if exit.code == Some(0) && exit.signal.is_none())
 }
 
-/// The terminal a card shows, once the card is not in the middle of starting
-/// one.
-///
-/// A relaunch carries the previous exit forward as metadata, so between
-/// pressing Restart and the daemon answering the session still reads as ended.
-/// Hydration is what tells the two apart.
-fn settled_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
-    let state = state?;
-    if matches!(state.residency, Residency::Hydrating { .. }) {
-        return None;
-    }
-    match &state.kind {
-        CardKind::Terminal(session) => Some(session),
-        _ => None,
-    }
-}
-
-fn completed_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
-    settled_terminal(state).filter(|session| terminal_completed(session))
-}
-
 /// Whether a terminal's process has ended, cleanly or not.
 ///
 /// An unclean exit is still an end, not a runtime failure: the surface holds
@@ -1390,10 +1371,6 @@ fn terminal_ended(session: &TerminalSession) -> bool {
             ..
         } | TerminalContinuity::Exited { .. }
     )
-}
-
-fn ended_terminal(state: Option<&CardState>) -> Option<&TerminalSession> {
-    settled_terminal(state).filter(|session| terminal_ended(session))
 }
 
 fn restored_runtime_residency(
@@ -1422,45 +1399,29 @@ fn restored_terminal_residency(
         .then(|| restored_runtime_residency(kind, exposure, durable_residency))
 }
 
-/// Applies only the durable part of a viewport update. Camera offset is
-/// transient, so callers use the result to avoid queueing an identical,
-/// potentially large workspace snapshot for every animation frame.
-fn apply_durable_viewport_update(
-    state: &mut WorkspaceState,
-    focused: Option<CardId>,
-    transitions: &[VisibilityTransition],
-) -> bool {
-    let mut changed = false;
-    for transition in transitions {
-        let exposure = transition.to.into();
-        if let Some(card) = state.cards.iter_mut().find(|card| card.id == transition.id)
-            && card.exposure != exposure
-        {
-            card.exposure = exposure;
-            changed = true;
-        }
-    }
-    if state.focused != focused {
-        state.focused = focused;
-        changed = true;
-    }
-    changed
+/// Where a pane is and what its runtime holds, for this window's run only.
+///
+/// Storage never kept either: a restored card is offscreen and cold until this
+/// run's lifecycle says otherwise. Keeping them out of [`WorkspaceState`]
+/// keeps every scroll, channel switch and hydration from copying and saving
+/// the whole workspace.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PanePresence {
+    exposure: Exposure,
+    residency: Residency,
 }
 
-/// Whether `transitions` change any card's durable exposure, which with a
-/// change of focus is all [`apply_durable_viewport_update`] can change.
-///
-/// Callers hold the workspace behind an `Arc`, and taking a mutable reference
-/// copies it while the writer thread still holds the last snapshot. Camera-only
-/// updates arrive every frame, so they must not reach that copy.
-fn exposure_update_pending(state: &WorkspaceState, transitions: &[VisibilityTransition]) -> bool {
-    transitions.iter().any(|transition| {
-        let exposure = Exposure::from(transition.to);
-        state
-            .cards
-            .iter()
-            .any(|card| card.id == transition.id && card.exposure != exposure)
-    })
+impl PanePresence {
+    const ABSENT: Self = Self {
+        exposure: Exposure::Offscreen,
+        residency: Residency::Cold,
+    };
+}
+
+impl Default for PanePresence {
+    fn default() -> Self {
+        Self::ABSENT
+    }
 }
 
 /// How long a change of focus alone waits to be saved. Focus moves in bursts -
@@ -1506,13 +1467,6 @@ fn deferred_terminal_session(
             CardKind::Terminal(session) => Some(session.clone()),
             _ => None,
         })
-}
-
-fn terminal_start_visibility(state: Option<&CardState>) -> Option<bool> {
-    state
-        .filter(|state| state.existence.is_open())
-        .filter(|state| matches!(&state.kind, CardKind::Terminal(_)))
-        .map(|state| state.exposure == Exposure::Visible)
 }
 
 #[cfg(feature = "integrated-browser")]
@@ -5198,6 +5152,11 @@ pub struct Cagents {
     navigation_cache: sidebar::NavigationCache,
     palette: palette_ui::State,
     recently_closed: Vec<(CardState, Option<WorkspaceDestination>)>,
+    /// Where each open pane is on screen and what its runtime holds. Both
+    /// describe this window's run only, so they live here rather than in the
+    /// durable workspace: changing them neither copies the workspace nor
+    /// saves it. A card with no entry is offscreen and cold.
+    presence: HashMap<CardId, PanePresence>,
     lifecycle: LifecycleManager,
     /// The shared language-server client. One manager serves every card; a
     /// session is per project root, not per card, so two cards in one worktree
@@ -5733,51 +5692,47 @@ impl Cagents {
                     matches!(self.cards.get(&card.id), Some(CardRuntime::Loading)),
                 )
             })
-            .map(|card| (card.id, card.exposure))
+            .map(|card| (card.id, self.exposure(card.id)))
             .collect::<Vec<_>>();
         let now = Instant::now();
         for (card, exposure) in pending {
             self.lifecycle
                 .register(card, exposure, Residency::Hibernated, now);
-            if let Some(state) = self.card_state_mut(card) {
-                state.residency = Residency::Hibernated;
-            }
+            self.set_residency(card, Residency::Hibernated);
         }
     }
 
     fn initialize_runtimes(&mut self) -> Task<Message> {
         let mut repository_tasks = Vec::new();
-        let initially_visible = self
+        let open_terminals_exposed = |exposure| {
+            self.durable
+                .cards
+                .iter()
+                .filter(|card| {
+                    card.existence.is_open()
+                        && self.exposure(card.id) == exposure
+                        && matches!(&card.kind, CardKind::Terminal(_))
+                })
+                .map(|card| card.id)
+                .collect::<HashSet<_>>()
+        };
+        let initially_visible = open_terminals_exposed(Exposure::Visible);
+        let initially_prefetch = open_terminals_exposed(Exposure::Prefetch);
+        // Closed cards keep their history in the workspace but start nothing.
+        let open = self
             .durable
             .cards
             .iter()
-            .filter(|card| {
-                card.existence.is_open()
-                    && card.exposure == Exposure::Visible
-                    && matches!(&card.kind, CardKind::Terminal(_))
-            })
-            .map(|card| card.id)
-            .collect::<HashSet<_>>();
-        let initially_prefetch = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| {
-                card.existence.is_open()
-                    && card.exposure == Exposure::Prefetch
-                    && matches!(&card.kind, CardKind::Terminal(_))
-            })
-            .map(|card| card.id)
-            .collect::<HashSet<_>>();
-        for card in self.durable.cards.clone() {
-            if !card.existence.is_open() {
-                continue;
-            }
+            .filter(|card| card.existence.is_open())
+            .cloned()
+            .collect::<Vec<_>>();
+        for card in open {
+            let exposure = self.exposure(card.id);
             let terminal_residency =
-                restored_terminal_residency(&card.kind, card.exposure, &card.residency);
+                restored_terminal_residency(&card.kind, exposure, self.residency(card.id));
             #[cfg(feature = "integrated-browser")]
             let runtime_residency =
-                restored_runtime_residency(&card.kind, card.exposure, &card.residency);
+                restored_runtime_residency(&card.kind, exposure, self.residency(card.id));
             match card.kind {
                 CardKind::Terminal(session) => {
                     if self.prepare_saved_terminal(card.id, &session) {
@@ -5788,13 +5743,11 @@ impl Cagents {
                         terminal_residency.expect("terminal restore has lifecycle residency");
                     self.lifecycle.register(
                         card.id,
-                        card.exposure,
+                        exposure,
                         terminal_residency.clone(),
                         Instant::now(),
                     );
-                    if let Some(state) = self.card_state_mut(card.id) {
-                        state.residency = terminal_residency;
-                    }
+                    self.set_residency(card.id, terminal_residency);
                     if terminal_ended(&session) {
                         // An ended terminal is restored the way it was left,
                         // however it ended. Its card states the outcome and
@@ -5835,9 +5788,7 @@ impl Cagents {
                 }
                 #[cfg(feature = "integrated-browser")]
                 CardKind::Browser(_) => {
-                    if let Some(state) = self.card_state_mut(card.id) {
-                        state.residency = runtime_residency;
-                    }
+                    self.set_residency(card.id, runtime_residency);
                     self.cards.insert(card.id, CardRuntime::Loading);
                 }
                 #[cfg(not(feature = "integrated-browser"))]
@@ -5864,9 +5815,7 @@ impl Cagents {
                 | CardKind::Accounts
                 | CardKind::Automations
                 | CardKind::Work) => {
-                    if let Some(state) = self.card_state_mut(card.id) {
-                        state.residency = Residency::Hot;
-                    }
+                    self.set_residency(card.id, Residency::Hot);
                     self.cards.insert(card.id, CardRuntime::utility(&kind));
                     if matches!(kind, CardKind::Automations) {
                         repository_tasks
@@ -6076,9 +6025,7 @@ impl Cagents {
                         Residency::Hibernated,
                         Instant::now(),
                     );
-                    if let Some(state) = self.card_state_mut(card) {
-                        state.residency = Residency::Hibernated;
-                    }
+                    self.set_residency(card, Residency::Hibernated);
                 }
                 task = self.attach_restored_agent(card, session);
                 break;
@@ -6179,15 +6126,13 @@ impl Cagents {
                 // as a closed visibility channel.
                 self.cards.insert(card, CardRuntime::Terminal(handle));
                 tasks.push(self.drain_terminal(card, 0));
-                if ended_terminal(self.card_state(card)).is_some() {
+                if self.ended_terminal(card).is_some() {
                     // The daemon can report a session that already
                     // ended without a queued event to drain, and a card
                     // registered as hydrating has nothing else left to
                     // resolve it.
                     self.lifecycle.remove(card);
-                    if let Some(state) = self.card_state_mut(card) {
-                        state.residency = Residency::Hibernated;
-                    }
+                    self.set_residency(card, Residency::Hibernated);
                     self.persist();
                     tasks.push(self.commit_terminal_handoffs());
                     tasks.push(self.finish_terminal_start(card));
@@ -6205,10 +6150,9 @@ impl Cagents {
                         "Could not apply terminal theme: {error}"
                     )));
                 }
-                let visible = terminal_start_visibility(
-                    self.durable.cards.iter().find(|state| state.id == card),
-                )
-                .expect("accepted terminal start has an open terminal card")
+                let visible = self
+                    .terminal_start_visibility(card)
+                    .expect("accepted terminal start has an open terminal card")
                     && self.workspace_surfaces_visible();
                 // A restored agent attached while its card stays
                 // hibernated keeps only the connection its row needs.
@@ -6257,7 +6201,7 @@ impl Cagents {
         if !hibernated
             && self
                 .card_state(card)
-                .is_some_and(|state| state.exposure == Exposure::Offscreen)
+                .is_some_and(|_| self.exposure(card) == Exposure::Offscreen)
         {
             tasks.push(self.lifecycle_sweep());
         }
@@ -6437,8 +6381,6 @@ impl Cagents {
                 .unwrap_or_else(|| "Terminal".into()),
             width_fraction: self.new_pane_fraction(self.settings.default_column_fraction),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hydrating { epoch: 1 },
             kind: CardKind::Terminal(session.clone()),
         };
         let (index, durable_index) = slot.unwrap_or_else(|| self.terminal_insertion_indices());
@@ -6463,11 +6405,10 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.cards.insert(card_id, CardRuntime::Loading);
-        self.lifecycle.register(
+        self.register_presence(
             card_id,
             Exposure::Visible,
             Residency::Hydrating { epoch: 1 },
-            Instant::now(),
         );
         if self.shared_views.creating_default {
             self.shared_views.defaults.insert(card_id, session.clone());
@@ -6542,8 +6483,7 @@ impl Cagents {
         card.id = CardId::new();
         card.existence = Existence::Open;
         card.generation = self.durable.generation;
-        card.exposure = Exposure::Visible;
-        card.residency = Residency::Hydrating { epoch: 1 };
+        let mut residency = Residency::Hydrating { epoch: 1 };
         match &mut card.kind {
             CardKind::Terminal(session) => {
                 if let Some(path) = self.terminal_working_directories.get(&source_id) {
@@ -6590,7 +6530,7 @@ impl Cagents {
                 session.id = crate::model::BrowserId::new();
             }
             CardKind::Repository(_) | CardKind::PullRequests(_) => {
-                card.residency = Residency::Hot;
+                residency = Residency::Hot;
             }
             CardKind::Settings | CardKind::Accounts | CardKind::Automations | CardKind::Work => {
                 unreachable!("utility panes are refused before cloning")
@@ -6634,8 +6574,7 @@ impl Cagents {
             self.chrome_ui.user_titles.insert(id, title);
         }
         self.register_channel_card(id);
-        self.lifecycle
-            .register(id, card.exposure, card.residency, Instant::now());
+        self.register_presence(id, Exposure::Visible, residency);
         let start = match card.kind {
             CardKind::Terminal(session) => {
                 self.cards.insert(id, CardRuntime::Loading);
@@ -7012,8 +6951,6 @@ impl Cagents {
             title: title.clone(),
             width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::PullRequests(view.clone()),
         };
         let durable = Arc::make_mut(&mut self.durable);
@@ -7027,6 +6964,7 @@ impl Cagents {
             durable.card_scopes.insert(card_id, scope.clone());
             self.worktree_owners.insert(card_id, scope);
         }
+        self.set_presence(card_id, Exposure::Visible, Residency::Hot);
         self.register_channel_card(card_id);
         let pane = self.pull_request_pane(&view);
         self.cards
@@ -7085,8 +7023,7 @@ impl Cagents {
         };
         match self.cards.get(&card) {
             Some(CardRuntime::Terminal(_))
-                if ended_terminal(self.card_state(card)).is_none()
-                    && !self.terminal_close_pending(card) =>
+                if self.ended_terminal(card).is_none() && !self.terminal_close_pending(card) =>
             {
                 workspace_widget::FocusedPane::Terminal
             }
@@ -7488,13 +7425,12 @@ impl Cagents {
             title: title.clone(),
             width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(view.clone()),
         };
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.push(card);
         durable.focused = Some(card_id);
+        self.set_presence(card_id, Exposure::Visible, Residency::Hot);
         self.register_channel_card(card_id);
         let load = self.attach_repository_pane(card_id, view);
         let index = self.workspace.cards().len();
@@ -7592,21 +7528,16 @@ impl Cagents {
                 .unwrap_or_else(|| "Browser".into()),
             width_fraction,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hydrating {
-                epoch: INITIAL_HYDRATION_EPOCH,
-            },
             kind: CardKind::Browser(session),
         });
         durable.focused = Some(card_id);
         self.register_channel_card(card_id);
-        self.lifecycle.register(
+        self.register_presence(
             card_id,
             Exposure::Visible,
             Residency::Hydrating {
                 epoch: INITIAL_HYDRATION_EPOCH,
             },
-            Instant::now(),
         );
         if let Some(error) = startup_error {
             self.fail_runtime(card_id, error);
@@ -7754,13 +7685,7 @@ impl Cagents {
         // A successful attachment completes hydration even when the provider
         // has not enriched the already-saved descriptor yet.
         self.lifecycle.remove(card);
-        if self
-            .card_state(card)
-            .is_some_and(|state| state.residency != Residency::Hot)
-            && let Some(state) = self.card_state_mut(card)
-        {
-            state.residency = Residency::Hot;
-        }
+        self.set_residency(card, Residency::Hot);
         if unchanged {
             return None;
         }
@@ -7785,7 +7710,6 @@ impl Cagents {
                 }
             }
             state.kind = CardKind::Chat(session);
-            state.residency = Residency::Hot;
         }
         self.card_chrome.remove(&card);
         Some(conversion)
@@ -7820,21 +7744,19 @@ impl Cagents {
         card: CardId,
         session: TerminalSession,
     ) -> Task<Message> {
-        let Some(state) = self
+        if !self
             .card_state(card)
-            .filter(|state| state.existence.is_open())
-            .cloned()
-        else {
+            .is_some_and(|state| state.existence.is_open())
+        {
             return Task::none();
-        };
+        }
         let residency = Residency::Hydrating {
             epoch: unix_millis().max(1) as u64,
         };
-        self.lifecycle
-            .register(card, state.exposure, residency.clone(), Instant::now());
+        let exposure = self.exposure(card);
+        self.register_presence(card, exposure, residency);
         if let Some(state) = self.card_state_mut(card) {
             state.kind = CardKind::Terminal(session.clone());
-            state.residency = residency;
         }
         self.closed_terminal_cards.remove(&card);
         self.proven_gone_cards.remove(&card);
@@ -7851,7 +7773,7 @@ impl Cagents {
         let attach = self.start_terminal(
             card,
             session,
-            state.exposure == Exposure::Visible && self.workspace_surfaces_visible(),
+            exposure == Exposure::Visible && self.workspace_surfaces_visible(),
             false,
         );
         Task::batch([commit, attach])
@@ -8188,6 +8110,97 @@ impl Cagents {
         Arc::make_mut(&mut self.durable).cards.get_mut(index)
     }
 
+    fn presence(&self, id: CardId) -> &PanePresence {
+        self.presence.get(&id).unwrap_or(&PanePresence::ABSENT)
+    }
+
+    fn exposure(&self, id: CardId) -> Exposure {
+        self.presence(id).exposure
+    }
+
+    fn residency(&self, id: CardId) -> &Residency {
+        &self.presence(id).residency
+    }
+
+    /// Records where a card of this workspace is on screen. A card the
+    /// workspace does not hold has no presence to record.
+    fn set_exposure(&mut self, id: CardId, exposure: Exposure) {
+        if let Some(presence) = self.presence_mut(id) {
+            presence.exposure = exposure;
+        }
+    }
+
+    /// Records what a card's runtime holds, as [`Self::set_exposure`] does.
+    fn set_residency(&mut self, id: CardId, residency: Residency) {
+        if let Some(presence) = self.presence_mut(id) {
+            presence.residency = residency;
+        }
+    }
+
+    fn set_presence(&mut self, id: CardId, exposure: Exposure, residency: Residency) {
+        if let Some(presence) = self.presence_mut(id) {
+            *presence = PanePresence {
+                exposure,
+                residency,
+            };
+        }
+    }
+
+    /// Places a card the workspace now holds and hands its runtime to the
+    /// lifecycle, which decides from here on what it keeps.
+    fn register_presence(&mut self, id: CardId, exposure: Exposure, residency: Residency) {
+        self.set_presence(id, exposure, residency.clone());
+        self.lifecycle
+            .register(id, exposure, residency, Instant::now());
+    }
+
+    fn presence_mut(&mut self, id: CardId) -> Option<&mut PanePresence> {
+        self.card_index(id)?;
+        Some(self.presence.entry(id).or_default())
+    }
+
+    /// The presence of every card still in the workspace. Runs whenever the
+    /// card index is rebuilt, which is after every change to the card list.
+    fn prune_presence(&mut self) {
+        self.presence
+            .retain(|id, _| self.card_indices.contains_key(id));
+    }
+
+    /// The terminal a card shows, once the card is not in the middle of
+    /// starting one.
+    ///
+    /// A relaunch carries the previous exit forward as metadata, so between
+    /// pressing Restart and the daemon answering the session still reads as
+    /// ended. Hydration is what tells the two apart.
+    fn settled_terminal(&self, id: CardId) -> Option<&TerminalSession> {
+        if matches!(self.residency(id), Residency::Hydrating { .. }) {
+            return None;
+        }
+        match &self.card_state(id)?.kind {
+            CardKind::Terminal(session) => Some(session),
+            _ => None,
+        }
+    }
+
+    /// Whether an open terminal card starts revealed, or `None` for any other
+    /// card.
+    fn terminal_start_visibility(&self, id: CardId) -> Option<bool> {
+        self.card_state(id)
+            .filter(|state| state.existence.is_open())
+            .filter(|state| matches!(&state.kind, CardKind::Terminal(_)))
+            .map(|_| self.exposure(id) == Exposure::Visible)
+    }
+
+    fn completed_terminal(&self, id: CardId) -> Option<&TerminalSession> {
+        self.settled_terminal(id)
+            .filter(|session| terminal_completed(session))
+    }
+
+    fn ended_terminal(&self, id: CardId) -> Option<&TerminalSession> {
+        self.settled_terminal(id)
+            .filter(|session| terminal_ended(session))
+    }
+
     /// Renames a card to the title its own runtime reported, and answers whether
     /// the durable state changed.
     ///
@@ -8240,6 +8253,7 @@ impl Cagents {
                 .enumerate()
                 .map(|(index, card)| (card.id, index)),
         );
+        self.prune_presence();
     }
 
     /// Builds chrome for cards that appeared or were renamed, drops entries for
@@ -8585,9 +8599,8 @@ impl Cagents {
             .lifecycle
             .state(card)
             .map(|(_, residency)| residency.clone())
-            && let Some(state) = self.card_state_mut(card)
         {
-            state.residency = residency;
+            self.set_residency(card, residency);
         }
         succeeded && offscreen_hot(&self.lifecycle, card)
     }
@@ -8612,9 +8625,7 @@ impl Cagents {
         };
         self.lifecycle
             .register(card, exposure, residency.clone(), Instant::now());
-        if let Some(state) = self.card_state_mut(card) {
-            state.residency = residency;
-        }
+        self.set_residency(card, residency);
     }
     fn fail_runtime(&mut self, card: CardId, message: String) {
         let mut failure = self.terminal_failure_payload(card, message.clone());
@@ -8644,7 +8655,7 @@ impl Cagents {
             | None => {}
         }
         self.mark_runtime_failed(card, message);
-        failure.enrich_assigned_failure(self.card_state(card).map(|state| &state.residency));
+        failure.enrich_assigned_failure(self.card_state(card).map(|_| self.residency(card)));
         self.cards.insert(card, CardRuntime::Failed(failure));
     }
 
@@ -8672,7 +8683,7 @@ impl Cagents {
         // first. A surface attached to a terminal that had already ended
         // replays that report; recording it again would move the exit to now
         // and announce it a second time.
-        let already_ended = ended_terminal(self.card_state(card)).is_some();
+        let already_ended = self.ended_terminal(card).is_some();
         if !already_ended
             && let Some(state) = self.card_state_mut(card)
             && let CardKind::Terminal(session) = &mut state.kind
@@ -8681,9 +8692,7 @@ impl Cagents {
         }
         self.lifecycle.remove(card);
         self.sidebar_state.clear_agent_activity(card);
-        if let Some(state) = self.card_state_mut(card) {
-            state.residency = Residency::Hibernated;
-        }
+        self.set_residency(card, Residency::Hibernated);
         if !already_ended && !intentional && (exit_code != 0 || signal.is_some()) {
             self.status = Some(TransientNotice::error(match signal {
                 Some(signal) => format!("terminal exited with {signal}"),
@@ -8695,7 +8704,7 @@ impl Cagents {
     fn completed_terminal_has_native_owner(&self, card: CardId) -> bool {
         // Only a clean finish hands the card to a native conversation. A
         // crashed agent has nothing to open; its card offers a restart.
-        completed_terminal(self.card_state(card)).is_some_and(|session| {
+        self.completed_terminal(card).is_some_and(|session| {
             self.chat_has_parked_runtime(card)
                 || chat_ui::conversion(session).is_ok_and(|chat| chat.owns_codex_listener())
         })
@@ -8764,12 +8773,14 @@ impl Cagents {
             None
         };
         let epoch = unix_millis().max(1) as u64;
-        let residency = Residency::Hydrating { epoch };
-        self.lifecycle
-            .register(card, state.exposure, residency.clone(), Instant::now());
-        if let Some(durable_state) = self.card_state_mut(card) {
+        let exposure = self.exposure(card);
+        self.register_presence(card, exposure, Residency::Hydrating { epoch });
+        if self
+            .card_state(card)
+            .is_some_and(|durable_state| durable_state.kind != state.kind)
+            && let Some(durable_state) = self.card_state_mut(card)
+        {
             durable_state.kind = state.kind.clone();
-            durable_state.residency = residency;
         }
         self.status = None;
         if let Some((expected_terminal_id, _)) = &terminal_replacement {
@@ -8794,7 +8805,7 @@ impl Cagents {
                 let task = self.start_terminal(
                     card,
                     session,
-                    state.exposure == Exposure::Visible && surfaces_visible,
+                    exposure == Exposure::Visible && surfaces_visible,
                     true,
                 );
                 if let Some(details) = retry_details {
@@ -8811,7 +8822,7 @@ impl Cagents {
                 };
                 match spawn_browser(
                     &session,
-                    state.exposure == Exposure::Visible && surfaces_visible,
+                    exposure == Exposure::Visible && surfaces_visible,
                     effective_surface_scale(self.window_scale_factor, self.settings.ui_scale),
                     Some(factory),
                 ) {
@@ -8980,7 +8991,7 @@ impl Cagents {
             Some(CardRuntime::Settings) => crate::settings_widgets::search_id(),
             // An ended card without its final screen answers the keyboard
             // with its primary action, which Enter then presses.
-            Some(CardRuntime::Completed) if ended_terminal(self.card_state(card)).is_some() => {
+            Some(CardRuntime::Completed) if self.ended_terminal(card).is_some() => {
                 card_control_id(card, "ended.relaunch")
             }
             _ => self.card_header_widget_id(card),
@@ -9090,16 +9101,12 @@ impl Cagents {
         // pane. Also revoke ownership when the terminal runtime is replaced.
         self.reconcile_terminal_review_owner();
         self.cancel_stale_pr_creations();
+        // Focus is the only part of the viewport the workspace keeps; the
+        // camera and what it exposes belong to this run.
         let focus_changed = self.durable.focused != focused;
-        let exposure_changed = exposure_update_pending(&self.durable, &update.transitions);
-        if focus_changed || exposure_changed {
-            apply_durable_viewport_update(
-                Arc::make_mut(&mut self.durable),
-                focused,
-                &update.transitions,
-            );
+        if focus_changed {
+            Arc::make_mut(&mut self.durable).focused = focused;
         }
-        let save_now = additional_durable_change || exposure_changed;
         let mut tasks = Vec::new();
         if focus_changed {
             tasks.push(self.acknowledge_active_pane());
@@ -9116,11 +9123,9 @@ impl Cagents {
         let surfaces_visible = self.workspace_surfaces_visible();
         for transition in update.transitions {
             tracing::debug!(target: "cagents::pane_open", stage = "visibility", card = ?transition.id, to = ?transition.to);
+            self.set_exposure(transition.id, transition.to.into());
             let browser_card = self
-                .durable
-                .cards
-                .iter()
-                .find(|card| card.id == transition.id)
+                .card_state(transition.id)
                 .is_some_and(|card| matches!(&card.kind, CardKind::Browser(_)));
             match self.cards.get_mut(&transition.id) {
                 Some(CardRuntime::Terminal(handle)) => {
@@ -9176,7 +9181,7 @@ impl Cagents {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
             tasks.push(self.request_lifecycle_sweep(delay));
         }
-        if save_now {
+        if additional_durable_change {
             self.persist();
         } else if focus_changed {
             // The durable state stays current; only handing it to the writer
@@ -9343,25 +9348,20 @@ impl Cagents {
         let actions = self
             .lifecycle
             .reconcile_in_flight(visible, passing, prefetch, now);
-        // Actions are only emitted for real transitions, so an empty sweep left
-        // the durable state untouched and needs no snapshot.
-        let durable_changed = !actions.is_empty();
+        // Exposure and residency are this run's presence, not the workspace's,
+        // so a sweep saves nothing of its own.
         let mut tasks = Vec::new();
         let mut schedule_sweep = false;
         for action in actions {
             match action {
                 LifecycleAction::SetExposure { card, exposure } => {
-                    if let Some(state) = self.card_state_mut(card) {
-                        state.exposure = exposure;
-                    }
+                    self.set_exposure(card, exposure);
                 }
                 LifecycleAction::Hydrate { card, epoch } => {
                     tracing::debug!(target: "cagents::lifecycle", action = "hydrate", ?card);
-                    if let Some(state) = self.card_state_mut(card) {
-                        state.residency = Residency::Hydrating { epoch };
-                    }
+                    self.set_residency(card, Residency::Hydrating { epoch });
                     let deferred_session = deferred_terminal_session(
-                        self.durable.cards.iter().find(|state| state.id == card),
+                        self.card_state(card),
                         matches!(self.cards.get(&card), Some(CardRuntime::Loading)),
                     );
                     if let Some(session) = deferred_session {
@@ -9378,12 +9378,8 @@ impl Cagents {
                     #[cfg(not(feature = "integrated-browser"))]
                     let deferred_browser_started = false;
                     #[cfg(feature = "integrated-browser")]
-                    let deferred_browser = self
-                        .durable
-                        .cards
-                        .iter()
-                        .find(|state| state.id == card)
-                        .and_then(|state| match &state.kind {
+                    let deferred_browser =
+                        self.card_state(card).and_then(|state| match &state.kind {
                             CardKind::Browser(session)
                                 if matches!(self.cards.get(&card), Some(CardRuntime::Loading)) =>
                             {
@@ -9452,9 +9448,7 @@ impl Cagents {
                     match result {
                         Ok(()) => {
                             self.lifecycle.hydration_finished(card, epoch, Ok(()));
-                            if let Some(state) = self.card_state_mut(card) {
-                                state.residency = Residency::Hot;
-                            }
+                            self.set_residency(card, Residency::Hot);
                             schedule_sweep |= offscreen_hot(&self.lifecycle, card);
                         }
                         Err(message) => {
@@ -9480,17 +9474,13 @@ impl Cagents {
                     match result {
                         Ok(()) => {
                             self.lifecycle.hibernation_finished(card, epoch);
-                            if let Some(state) = self.card_state_mut(card) {
-                                state.residency = Residency::Hibernated;
-                            }
+                            self.set_residency(card, Residency::Hibernated);
                         }
                         Err(message) => {
                             if let Some(residency) =
                                 rollback_failed_hibernation(&mut self.lifecycle, card, epoch, now)
                             {
-                                if let Some(state) = self.card_state_mut(card) {
-                                    state.residency = residency;
-                                }
+                                self.set_residency(card, residency);
                                 schedule_sweep = true;
                             }
                             self.status = Some(TransientNotice::error(message));
@@ -9498,9 +9488,6 @@ impl Cagents {
                     }
                 }
             }
-        }
-        if durable_changed {
-            self.persist();
         }
         if schedule_sweep {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
@@ -9538,7 +9525,7 @@ impl Cagents {
         let mut recovery = None;
         let mut clipboard_task = Task::none();
         if let Some(proof) = proof
-            && ended_terminal(self.card_state(card)).is_none()
+            && self.ended_terminal(card).is_none()
         {
             metadata_changed |= self.uncertain_terminal_proofs.remove(&card).is_some();
             let live = TerminalContinuity::Live {
@@ -9564,7 +9551,7 @@ impl Cagents {
                 // the end replays the activity it once reported, which must
                 // not bring a finished agent's row back to life.
                 TerminalEvent::AgentActivityChanged(activity) => {
-                    if ended_terminal(self.card_state(card)).is_none()
+                    if self.ended_terminal(card).is_none()
                         && self.sidebar_state.card_activity(card) != activity
                     {
                         metadata_changed = true;
@@ -9653,7 +9640,7 @@ impl Cagents {
                     // refused before effects. Its live terminal remains owned;
                     // retry is the reader's choice, never an automatic replay.
                     if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
-                        && ended_terminal(self.card_state(card)).is_none()
+                        && self.ended_terminal(card).is_none()
                         && !self.terminal_close_pending(card)
                     {
                         self.status = Some(TransientNotice::warning(format!(
@@ -9666,7 +9653,7 @@ impl Cagents {
                     // Preserve the live attachment without replaying input or
                     // treating an acknowledged nonfatal condition as failure.
                     if matches!(self.cards.get(&card), Some(CardRuntime::Terminal(_)))
-                        && ended_terminal(self.card_state(card)).is_none()
+                        && self.ended_terminal(card).is_none()
                         && !self.terminal_close_pending(card)
                     {
                         self.status = Some(TransientNotice::warning(message));
@@ -9691,7 +9678,7 @@ impl Cagents {
                     }
                     // Commands already in flight can lose the race with the
                     // process ending. They cannot turn an end into a failure.
-                    if ended_terminal(self.card_state(card)).is_some() {
+                    if self.ended_terminal(card).is_some() {
                         continue;
                     }
                     let message = format!("terminal {operation}: {message}");
@@ -9707,7 +9694,7 @@ impl Cagents {
                         && session.continuity.live_proof().is_some()
                     {
                         let session = session.clone();
-                        let visible = state.exposure == Exposure::Visible
+                        let visible = self.exposure(card) == Exposure::Visible
                             && self.workspace_surfaces_visible();
                         // Failing the runtime below forgets that it was
                         // hibernated, which decides how it recovers.
@@ -9728,7 +9715,7 @@ impl Cagents {
                 }
             }
         }
-        if ended_terminal(self.card_state(card)).is_none() {
+        if self.ended_terminal(card).is_none() {
             let activity = self.cards.get(&card).and_then(|runtime| match runtime {
                 CardRuntime::Terminal(handle) => handle.agent_activity(),
                 _ => None,
@@ -9757,9 +9744,7 @@ impl Cagents {
             {
                 self.lifecycle
                     .register(card, exposure, Residency::Hibernated, Instant::now());
-                if let Some(state) = self.card_state_mut(card) {
-                    state.residency = Residency::Hibernated;
-                }
+                self.set_residency(card, Residency::Hibernated);
                 self.cards.insert(card, CardRuntime::Loading);
                 self.restored_agent_attaches.push_back(card);
                 return (
@@ -9770,9 +9755,7 @@ impl Cagents {
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
             };
-            if let Some(state) = self.card_state_mut(card) {
-                state.residency = residency.clone();
-            }
+            self.set_residency(card, residency.clone());
             self.lifecycle.register(
                 card,
                 if visible {
@@ -10277,10 +10260,10 @@ impl Cagents {
                                 .unwrap_or_else(|| STARTING_DIRECTORY.clone()),
                         )
                         .read_only(
-                            ended_terminal(card).is_some() || self.terminal_close_pending(id),
+                            self.ended_terminal(id).is_some() || self.terminal_close_pending(id),
                         )
                         .on_read_only_submit(
-                            (ended_terminal(card).is_some() && !self.terminal_close_pending(id))
+                            (self.ended_terminal(id).is_some() && !self.terminal_close_pending(id))
                                 .then_some(Message::RelaunchFromEndedScreen(id)),
                         )
                         .id(chrome.map_or_else(
@@ -10327,7 +10310,7 @@ impl Cagents {
                     // A dialog over the workspace owns the pointer as well as the
                     // keyboard, so a drop aimed through it is refused rather than
                     // typed into a shell the reader cannot see.
-                    ended_terminal(card).is_none()
+                    self.ended_terminal(id).is_none()
                         && !self.terminal_close_pending(id)
                         && !self.workspace_inputs_blocked(),
                     move |payload| Message::TerminalDropped { card: id, payload },
@@ -10390,7 +10373,7 @@ impl Cagents {
             Some(CardRuntime::Automations) => self.automation_ui.view().map(Message::AutomationUi),
             Some(CardRuntime::Work) => self.work_ui.view().map(Message::WorkUi),
             Some(CardRuntime::Completed) => {
-                self.ended_terminal_placeholder(id, ended_terminal(card))
+                self.ended_terminal_placeholder(id, self.ended_terminal(id))
             }
             Some(CardRuntime::Failed(message)) => widget::container(
                 widget::container(
@@ -10576,7 +10559,7 @@ impl Cagents {
             rows.push(toolbar);
         }
         rows.push(content);
-        if let Some(session) = ended_terminal(card).filter(|_| !closing_terminal) {
+        if let Some(session) = self.ended_terminal(id).filter(|_| !closing_terminal) {
             // Under the final screen, where the reader's eye already is when
             // the output stops: the last lines it printed stay in view.
             rows.push(self.ended_terminal_footer(id, session));
@@ -12554,11 +12537,14 @@ impl Cagents {
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
         let visible_cards = self
-            .durable
-            .cards
+            .presence
             .iter()
-            .filter(|card| card.existence.is_open() && card.exposure == Exposure::Visible)
-            .map(|card| card.id)
+            .filter(|(_, presence)| presence.exposure == Exposure::Visible)
+            .map(|(id, _)| *id)
+            .filter(|id| {
+                self.card_state(*id)
+                    .is_some_and(|card| card.existence.is_open())
+            })
             .collect::<HashSet<_>>();
         let mut failures = Vec::new();
         for (id, runtime) in &mut self.cards {
@@ -13703,8 +13689,6 @@ impl Cagents {
             title: title.clone(),
             width_fraction: self.new_pane_fraction(self.settings.default_native_pane_fraction),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind,
         };
         let (index, durable_index) = self.terminal_insertion_indices();
@@ -13723,6 +13707,7 @@ impl Cagents {
         let durable = Arc::make_mut(&mut self.durable);
         durable.cards.insert(durable_index, card);
         durable.focused = Some(id);
+        self.set_presence(id, Exposure::Visible, Residency::Hot);
         self.register_channel_card(id);
         self.cards.insert(id, runtime);
         self.persist();
@@ -14562,6 +14547,7 @@ impl Application for Cagents {
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
+            presence: HashMap::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
@@ -15147,7 +15133,7 @@ impl Application for Cagents {
                 let Some(CardRuntime::Terminal(handle)) = self.cards.get(&card) else {
                     return Task::none();
                 };
-                if ended_terminal(self.card_state(card)).is_some()
+                if self.ended_terminal(card).is_some()
                     || self.terminal_close_pending(card)
                 {
                     return Task::none();
@@ -17202,7 +17188,7 @@ impl Application for Cagents {
             Message::OpenDocumentLink(card, uri) => self.open_document_link(Some(card), &uri),
             Message::PreviewLocalFile(card) => self.preview_local_file(card),
             Message::OpenTerminalOutput(card) => {
-                let url = ended_terminal(self.card_state(card))
+                let url = self.ended_terminal(card)
                     .and_then(|session| session.transcript_path.as_ref())
                     .and_then(|path| Url::from_file_path(path).ok());
                 match url {
@@ -19303,6 +19289,7 @@ impl Application for Cagents {
                     let model = inspector::model_for_card(
                         state,
                         self.inspector_runtime_status(card),
+                        self.residency(card),
                         &self.sidebar_model.projects,
                         repository.as_ref(),
                     );
@@ -22073,7 +22060,7 @@ mod tests {
         assert!(matches!(app.cards.get(&pane), Some(CardRuntime::Settings)));
         let state = app.card_state(pane).unwrap();
         assert_eq!(state.title, "Settings");
-        assert_eq!(state.residency, Residency::Hot);
+        assert_eq!(*app.residency(pane), Residency::Hot);
         assert!(
             app.lifecycle.state(pane).is_none(),
             "a settings pane never enters the hibernation budget"
@@ -22203,7 +22190,6 @@ mod tests {
         let mut pane = terminal_card_state();
         pane.kind = CardKind::Settings;
         pane.title = "Settings".into();
-        pane.residency = Residency::Hibernated;
         let id = pane.id;
         app.durable = Arc::new(WorkspaceState {
             focused: Some(id),
@@ -22213,7 +22199,7 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         let _ = app.initialize_runtimes();
         assert!(matches!(app.cards.get(&id), Some(CardRuntime::Settings)));
-        assert_eq!(app.card_state(id).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(id), Residency::Hot);
         assert!(app.lifecycle.state(id).is_none());
         // Retrying a pane that cannot fail only reinstalls it.
         app.cards.insert(id, CardRuntime::Failed("fixture".into()));
@@ -25869,12 +25855,10 @@ mod tests {
         );
     }
 
-    fn restored_live_terminal(program: &str, exposure: Exposure) -> CardState {
+    fn restored_live_terminal(program: &str) -> CardState {
         use crate::model::{BootId, HostIncarnation, HostSessionId};
 
         let mut card = terminal_card_state();
-        card.exposure = exposure;
-        card.residency = Residency::Hibernated;
         let CardKind::Terminal(session) = &mut card.kind else {
             unreachable!("terminal fixture");
         };
@@ -25891,18 +25875,19 @@ mod tests {
     #[test]
     fn restored_agents_attach_one_at_a_time_after_visible_cards_start() {
         let mut app = context_inspector_test_app(false);
-        let visible = restored_live_terminal("/bin/sh", Exposure::Visible);
+        let visible = restored_live_terminal("/bin/sh");
         let cards = [
             visible.clone(),
-            restored_live_terminal("/bin/sh", Exposure::Offscreen),
-            restored_live_terminal("/usr/bin/claude", Exposure::Offscreen),
-            restored_live_terminal("/usr/bin/codex", Exposure::Offscreen),
+            restored_live_terminal("/bin/sh"),
+            restored_live_terminal("/usr/bin/claude"),
+            restored_live_terminal("/usr/bin/codex"),
         ];
         app.durable = Arc::new(WorkspaceState {
             focused: Some(visible.id),
             cards: cards.to_vec(),
             ..WorkspaceState::default()
         });
+        app.set_exposure(visible.id, Exposure::Visible);
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         let focus = app.workspace.focused();
         let strip = app.workspace.order().collect::<Vec<_>>();
@@ -25937,7 +25922,7 @@ mod tests {
     fn startup_qualification_attaches_offscreen_shell_omp_and_custom_terminal_owners_serially() {
         let mut app = context_inspector_test_app(false);
         let terminals = ["/bin/sh", "/usr/bin/omp", "/fixture/custom-wrapper"]
-            .map(|program| restored_live_terminal(program, Exposure::Offscreen));
+            .map(|program| restored_live_terminal(program));
         app.durable = Arc::new(WorkspaceState {
             cards: terminals.to_vec(),
             ..WorkspaceState::default()
@@ -25964,7 +25949,7 @@ mod tests {
     #[test]
     fn a_queued_agent_attach_yields_to_the_cards_own_start() {
         let mut app = context_inspector_test_app(false);
-        let agent = restored_live_terminal("/usr/bin/claude", Exposure::Offscreen);
+        let agent = restored_live_terminal("/usr/bin/claude");
         app.durable = Arc::new(WorkspaceState {
             cards: vec![agent.clone()],
             ..WorkspaceState::default()
@@ -25988,7 +25973,7 @@ mod tests {
         continuity: Option<TerminalContinuity>,
     ) -> (Cagents, CardId, TerminalSession) {
         let mut app = context_inspector_test_app(false);
-        let mut agent = restored_live_terminal("/usr/bin/claude", Exposure::Offscreen);
+        let mut agent = restored_live_terminal("/usr/bin/claude");
         let CardKind::Terminal(session) = &mut agent.kind else {
             unreachable!("terminal fixture");
         };
@@ -26222,7 +26207,7 @@ mod tests {
             Some((&Exposure::Offscreen, &Residency::Hibernated))
         );
         assert_eq!(
-            app.card_state(card).map(|state| &state.residency),
+            app.card_state(card).map(|_| app.residency(card)),
             Some(&Residency::Hibernated)
         );
         assert_eq!(app.notices.entries.len(), notices);
@@ -26288,7 +26273,7 @@ mod tests {
                 .reconcile(&HashSet::from([card]), &HashSet::new(), Instant::now())
                 .is_empty()
         );
-        let session = ended_terminal(app.card_state(card)).unwrap();
+        let session = app.ended_terminal(card).unwrap();
         assert_eq!(session.id, identity);
         // Relaunch remains an explicit action with a fresh host identity.
         assert_ne!(fresh_terminal_relaunch(session).id, identity);
@@ -26727,11 +26712,11 @@ mod tests {
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
         assert!(app.lifecycle.state(card).is_none());
         assert_eq!(
-            app.card_state(card).map(|state| &state.residency),
+            app.card_state(card).map(|_| app.residency(card)),
             Some(&Residency::Hibernated)
         );
         assert!(app.status.is_some());
-        let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
+        let session = app.ended_terminal(card).expect("the terminal has ended");
         // A signalled exit is not a clean zero status, and it says so.
         assert!(!terminal_completed(session));
         assert_eq!(
@@ -26745,16 +26730,16 @@ mod tests {
         // moves, and it is not announced a second time.
         app.status = None;
         app.retire_ended_terminal(card, 3, None, false);
-        let session = ended_terminal(app.card_state(card)).expect("the terminal has ended");
+        let session = app.ended_terminal(card).expect("the terminal has ended");
         assert_eq!(session.continuity, recorded);
         assert!(app.status.is_none());
 
         // A relaunch carries the exit forward as metadata. While the card is
         // hydrating that is a starting terminal, not an ended one, and it must
         // not be read back as read-only scrollback with a Restart button.
-        app.card_state_mut(card).unwrap().residency = Residency::Hydrating { epoch: 1 };
-        assert!(ended_terminal(app.card_state(card)).is_none());
-        assert!(completed_terminal(app.card_state(card)).is_none());
+        app.set_residency(card, Residency::Hydrating { epoch: 1 });
+        assert!(app.ended_terminal(card).is_none());
+        assert!(app.completed_terminal(card).is_none());
     }
 
     #[test]
@@ -26810,7 +26795,7 @@ mod tests {
         });
         transition_terminal_to_relaunchable(session, terminal_exit(0, None));
         // The fixture starts a card mid-hydration; this one has finished.
-        app.card_state_mut(card).unwrap().residency = Residency::Hibernated;
+        app.set_residency(card, Residency::Hibernated);
         app.cards.insert(card, CardRuntime::Completed);
         assert!(app.completed_terminal_has_native_owner(card));
         // Dropping the task never connects to or launches a real agent.
@@ -27057,10 +27042,6 @@ mod tests {
             title: "Terminal".into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hydrating {
-                epoch: INITIAL_HYDRATION_EPOCH,
-            },
             kind: CardKind::Terminal(TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
@@ -27183,9 +27164,9 @@ mod tests {
                     worktree: self.root.clone(),
                     selected_file: fixed_file.then(|| "current.txt".into()),
                 };
+                app.set_residency(card, Residency::Hot);
                 let state = app.card_state_mut(card).unwrap();
                 state.kind = CardKind::Repository(view.clone());
-                state.residency = Residency::Hot;
                 let mut runtime = RepositoryRuntime::new(view.clone());
                 runtime.set_auto_save(false);
                 if selected {
@@ -27812,8 +27793,6 @@ mod tests {
             title: "Repository".into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(descriptor),
         });
         app.workspace
@@ -30501,6 +30480,7 @@ mod tests {
             navigation_cache: sidebar::NavigationCache::default(),
             palette: palette_ui::State::default(),
             recently_closed: Vec::new(),
+            presence: HashMap::new(),
             lifecycle: LifecycleManager::new(LifecycleBudget {
                 max_hot_cards: settings.max_hot_cards,
                 offscreen_grace: Duration::from_millis(settings.hibernation_delay_ms),
@@ -31947,75 +31927,55 @@ mod tests {
     }
 
     #[test]
-    fn camera_only_viewport_update_does_not_require_persistence() {
-        let card = terminal_card_state();
-        let mut durable = WorkspaceState {
-            focused: Some(card.id),
-            ..WorkspaceState::default()
-        };
-        durable.cards.push(card);
-        let before = durable.clone();
-        let camera_only = ViewportUpdate {
-            offset_changed: true,
-            transitions: Vec::new(),
-        };
-
-        assert!(!apply_durable_viewport_update(
-            &mut durable,
-            before.focused,
-            &camera_only.transitions,
+    fn moving_the_camera_and_exposing_panes_leave_the_workspace_uncopied() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.set_exposure(card, Exposure::Visible);
+        // The writer holds the last snapshot, as it does between saves.
+        let held = Arc::clone(&app.durable);
+        drop(app.apply_viewport(
+            ViewportUpdate {
+                offset_changed: true,
+                transitions: vec![VisibilityTransition {
+                    id: card,
+                    from: VisibilityClass::Visible,
+                    to: VisibilityClass::Offscreen,
+                }],
+            },
+            false,
+            false,
         ));
-        assert_eq!(durable, before);
+        assert_eq!(app.exposure(card), Exposure::Offscreen);
+        assert!(Arc::ptr_eq(&held, &app.durable));
     }
 
     #[test]
-    fn viewport_exposure_and_focus_changes_require_persistence() {
-        let mut card = terminal_card_state();
-        card.exposure = Exposure::Offscreen;
-        let card_id = card.id;
-        let mut durable = WorkspaceState {
-            focused: Some(card_id),
-            ..WorkspaceState::default()
-        };
-        durable.cards.push(card);
-        let exposure_change = VisibilityTransition {
-            id: card_id,
-            from: VisibilityClass::Offscreen,
-            to: VisibilityClass::Visible,
-        };
-
-        assert!(apply_durable_viewport_update(
-            &mut durable,
-            Some(card_id),
-            &[exposure_change],
-        ));
-        assert_eq!(durable.cards[0].exposure, Exposure::Visible);
-        assert!(!apply_durable_viewport_update(
-            &mut durable,
-            Some(card_id),
-            &[exposure_change],
-        ));
-        assert!(apply_durable_viewport_update(&mut durable, None, &[],));
-        assert_eq!(durable.focused, None);
+    fn a_change_of_focus_is_kept_in_the_workspace() {
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        Arc::make_mut(&mut app.durable).focused = None;
+        let held = Arc::clone(&app.durable);
+        drop(app.apply_viewport(ViewportUpdate::unchanged(), false, false));
+        assert_eq!(app.durable.focused, Some(card));
+        assert_eq!(held.focused, None);
     }
 
     #[test]
     fn restored_offscreen_terminal_waits_for_lifecycle_hydration() {
-        let mut state = terminal_card_state();
-        state.exposure = Exposure::Offscreen;
-        state.residency = Residency::Cold;
+        let state = terminal_card_state();
         let card = state.id;
         let expected_session = match &state.kind {
             CardKind::Terminal(session) => session.clone(),
             _ => unreachable!(),
         };
 
-        let restored = restored_runtime_residency(&state.kind, state.exposure, &state.residency);
+        let restored =
+            restored_runtime_residency(&state.kind, Exposure::Offscreen, &Residency::Cold);
         assert_eq!(restored, Residency::Hibernated);
 
         let now = Instant::now();
         let mut lifecycle = LifecycleManager::new(LifecycleBudget::default());
-        lifecycle.register(card, state.exposure, restored, now);
+        lifecycle.register(card, Exposure::Offscreen, restored, now);
         assert!(
             lifecycle
                 .reconcile(&HashSet::new(), &HashSet::new(), now)
@@ -32078,10 +32038,13 @@ mod tests {
         }
 
         let terminal = terminal_card_state();
-        let residency =
-            restored_terminal_residency(&terminal.kind, terminal.exposure, &terminal.residency)
-                .unwrap();
-        lifecycle.register(terminal.id, terminal.exposure, residency, now);
+        let residency = restored_terminal_residency(
+            &terminal.kind,
+            Exposure::Visible,
+            &Residency::Hydrating { epoch: 1 },
+        )
+        .unwrap();
+        lifecycle.register(terminal.id, Exposure::Visible, residency, now);
         let actions = lifecycle.reconcile(&HashSet::from([terminal.id]), &HashSet::new(), now);
 
         assert!(actions.iter().any(
@@ -32107,13 +32070,16 @@ mod tests {
 
     #[test]
     fn completed_terminal_start_uses_current_exposure_for_visibility() {
-        let mut state = terminal_card_state();
-        assert_eq!(terminal_start_visibility(Some(&state)), Some(true));
+        let mut app = context_inspector_test_app(true);
+        let card = app.workspace.focused().unwrap();
+        app.set_exposure(card, Exposure::Visible);
+        assert_eq!(app.terminal_start_visibility(card), Some(true));
 
-        state.exposure = Exposure::Prefetch;
-        assert_eq!(terminal_start_visibility(Some(&state)), Some(false));
-        state.exposure = Exposure::Offscreen;
-        assert_eq!(terminal_start_visibility(Some(&state)), Some(false));
+        app.set_exposure(card, Exposure::Prefetch);
+        assert_eq!(app.terminal_start_visibility(card), Some(false));
+        app.set_exposure(card, Exposure::Offscreen);
+        assert_eq!(app.terminal_start_visibility(card), Some(false));
+        assert_eq!(app.terminal_start_visibility(CardId::new()), None);
     }
 
     #[test]
@@ -32163,10 +32129,7 @@ mod tests {
             app.lifecycle.state(card),
             Some((_, Residency::Hibernated))
         ));
-        assert_eq!(
-            app.card_state_mut(card).unwrap().residency,
-            Residency::Hibernated
-        );
+        assert_eq!(*app.residency(card), Residency::Hibernated);
     }
 
     #[cfg(feature = "integrated-browser")]
@@ -32202,8 +32165,6 @@ mod tests {
             title: "Browser".into(),
             width_fraction: 0.9,
             existence: Existence::Open,
-            exposure: Exposure::Prefetch,
-            residency: Residency::Hibernated,
             kind,
         };
         assert!(can_register_deferred_browser(&state, true));
@@ -32685,8 +32646,6 @@ mod tests {
             title: title.to_owned(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(RepositoryView {
                 selected_file: None,
                 project: ProjectId::new(),

@@ -96,7 +96,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
     ] {
         let directory = tempfile::tempdir().unwrap();
         let (mut app, card, source) = fixture();
-        app.card_state_mut(card).unwrap().exposure = initial;
+        app.set_exposure(card, initial);
         assert!(app.prepare_saved_terminal(card, &source));
         drop(app.inspect_saved_terminal(card));
         assert!(matches!(
@@ -106,7 +106,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
         // Revealing while inspection is pending cannot launch a duplicate.
         drop(app.reconcile_lifecycle(&HashSet::from([card]), &HashSet::new(), &HashSet::new()));
         assert_eq!(app.terminal_starts_in_flight(), 1);
-        app.card_state_mut(card).unwrap().exposure = current;
+        app.set_exposure(card, current);
         let surface = crate::app::tests::unconnected_surface(directory.path(), source.id);
         complete_inspection(
             &mut app,
@@ -128,10 +128,7 @@ fn accepted_saved_attachment_uses_current_exposure_without_waking_offscreen_pane
             current == Exposure::Offscreen
         );
         assert_eq!(
-            matches!(
-                app.card_state(card).unwrap().residency,
-                Residency::Hibernated
-            ),
+            matches!(*app.residency(card), Residency::Hibernated),
             current == Exposure::Offscreen
         );
         assert!(!surface.is_unsized_spawn());
