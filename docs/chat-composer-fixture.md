@@ -1,5 +1,7 @@
 # Offline chat composer validation
 
+For how fixtures fit together and how to add a behaviour, see [Fixtures](fixtures.md).
+
 `tests/fixtures/chat-composer-claude.sh` is a fake Claude stream-json executable
 for native UI checks. It requires `jq`, makes no network requests, and uses a
 synthetic account. It advertises asynchronous message support, holds its first

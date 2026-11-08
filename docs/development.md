@@ -1364,6 +1364,9 @@ workloads are described in [Performance](performance.md).
 
 ## Native evidence
 
+For which fixture to use, how they fit together and how to extend or repair
+one, see [Fixtures](fixtures.md).
+
 `scripts/native-evidence` captures before/after screenshots of the actual native
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
