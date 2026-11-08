@@ -19,7 +19,7 @@ use std::{
 
 use crate::{
     model::{
-        HostSessionProof, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
+        CardId, HostSessionProof, TerminalContinuity, TerminalExit, TerminalId, TerminalSession,
         TranscriptMetadata,
     },
     terminal::{RenderSnapshot, TerminalConfig, TerminalEvent, TerminalHandle, TerminalSendError},

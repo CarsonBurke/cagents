@@ -361,6 +361,113 @@ mod tests {
     }
 
     #[test]
+    fn distinct_first_send_candidates_admit_exactly_one_provider() {
+        use std::os::unix::fs::PermissionsExt;
+        let mut fixture = Fixture::new();
+        let root = fixture._directory.path();
+        let executable = root.join("omp");
+        std::fs::write(&executable, r#"#!/usr/bin/python3
+import json, sys, uuid
+identity = str(uuid.uuid4())
+with open("launches", "a") as launches:
+    launches.write(identity + "\n")
+print(json.dumps({"type": "ready"}), flush=True)
+for line in sys.stdin:
+    request = json.loads(line)
+    data = {"sessionId": identity, "messages": []}
+    print(json.dumps({"type": "response", "id": request["id"], "command": request["type"], "success": True, "data": data}), flush=True)
+"#).unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        fixture.request.source.launch.recipe.program = executable.to_string_lossy().into_owned();
+        let model = fixture.model();
+        let before = model.views[0].panes[0].clone();
+        let mut pane = before.clone();
+        pane.kind = CardKind::Chat(fixture.request.source.clone());
+        crate::host::workspace::edit(
+            &fixture.host,
+            1,
+            ModelEdit::ChangeView {
+                scope: fixture.scope.clone(),
+                expected_revision: model.views[0].revision,
+                operation: uuid::Uuid::new_v4(),
+                change: Change::Update { before, pane },
+            },
+        )
+        .unwrap();
+        let mut admitted = Vec::new();
+        let mut outcomes = Vec::new();
+        // Deliver neither Ready response to the windows. Both requests retain
+        // the same original source, as two windows may genuinely observe it.
+        for client in [1, 2] {
+            let outcome = super::super::process(
+                &fixture.host,
+                client,
+                ClientRequest::ChatStartInPane {
+                    pane: fixture.request.clone(),
+                    session: fixture.candidate(),
+                    execution_environment: Default::default(),
+                },
+            );
+            if let Ok(ServerResponse::ChatAttached { session, .. }) = &outcome {
+                admitted.push((client, session.id));
+            }
+            outcomes.push(outcome);
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut executed = true;
+        while std::fs::read_to_string(root.join("launches"))
+            .unwrap_or_default()
+            .lines()
+            .count()
+            < admitted.len()
+        {
+            if Instant::now() >= deadline {
+                executed = false;
+                break;
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        let launches = std::fs::read_to_string(root.join("launches")).unwrap_or_default();
+        let count = admitted.len();
+        let live = fixture
+            .host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .filter(|record| record.handle.owns_work())
+            .count();
+        let mut close_errors = Vec::new();
+        for (client, chat_id) in admitted {
+            if let Err(error) =
+                super::super::process(&fixture.host, client, ClientRequest::ChatClose { chat_id })
+            {
+                close_errors.push(error);
+            }
+        }
+        assert!(executed, "admitted providers must execute");
+        assert!(
+            close_errors.is_empty(),
+            "provider cleanup failed: {close_errors:?}"
+        );
+        assert_eq!(
+            count, 1,
+            "one pane admitted distinct starts: {outcomes:?}; launches={launches}; live={live}"
+        );
+        assert_eq!(launches.lines().count(), 1);
+        assert_eq!(live, 1);
+        assert!(
+            outcomes[0].is_ok(),
+            "first claimant must start: {:?}",
+            outcomes[0]
+        );
+        assert!(
+            outcomes[1].is_err(),
+            "the stale second claimant must refuse"
+        );
+    }
+
+    #[test]
     fn a_peer_cannot_start_a_distinct_provider_in_the_unproved_candidate_gap() {
         let fixture = Fixture::new();
         let first = fixture.candidate();
