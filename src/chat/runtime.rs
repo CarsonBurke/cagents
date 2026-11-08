@@ -405,6 +405,21 @@ impl LocalHandle {
             let directory = socket
                 .parent()
                 .ok_or("Provider socket needs a parent directory")?;
+            // The allocation root under the daemon's runtime directory exists
+            // only once a listener has been allocated there. Only the
+            // conversation's own directory below it must be new or private.
+            if let Some(root) = directory.parent() {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(root)
+                    .map_err(|error| {
+                        format!(
+                            "Cannot create provider socket directory {}: {error}",
+                            root.display()
+                        )
+                    })?;
+            }
             let created = std::fs::DirBuilder::new().mode(0o700).create(directory);
             if let Err(error) = created {
                 use std::os::unix::fs::MetadataExt;

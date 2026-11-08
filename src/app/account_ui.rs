@@ -6237,7 +6237,7 @@ mod tests {
         let path = directory.path().join("daemon.sock");
         assert!(check_browser_login_host(&path).is_ok());
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(listener);
+        crate::daemon::shut_down_test_listener(listener);
         assert!(path.exists());
         assert!(check_browser_login_host(&path).is_ok());
     }

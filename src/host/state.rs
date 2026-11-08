@@ -255,6 +255,8 @@ pub(crate) struct HostState {
     /// subscriber's queue, and cloning three `String`s per subscriber per frame
     /// made per-frame allocation scale with the number of attached views.
     proof: Arc<HostSessionProof>,
+    /// Where this daemon allocates each Codex conversation's own listener.
+    pub(super) codex_listeners: super::chat::CodexListenerRoots,
     pub(super) terminals: BTreeMap<TerminalId, TerminalRecord>,
     pub(super) terminal_retirements: BTreeMap<TerminalId, Retirement>,
     spawning: BTreeSet<TerminalId>,
@@ -434,6 +436,7 @@ impl HostState {
             account_lifecycle: Default::default(),
             worktree_removals: Default::default(),
             proof: Arc::new(proof),
+            codex_listeners: super::chat::CodexListenerRoots::at(std::env::temp_dir()),
             terminals: BTreeMap::new(),
             terminal_retirements: BTreeMap::new(),
             spawning: BTreeSet::new(),

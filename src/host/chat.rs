@@ -9,6 +9,9 @@ mod lost_agent_close_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
+pub(super) use owned_listener::{
+    Roots as CodexListenerRoots, keep_legacy_listeners_fresh as keep_legacy_codex_listeners_fresh,
+};
 mod paired_close;
 pub(in crate::host) mod pane_start;
 pub(super) mod retained_actor;
@@ -1353,13 +1356,11 @@ fn start_with_execution(
     if session.launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&session.launch)?;
     }
-    let allocator = host
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .proof()
-        .clone();
-    let owned =
-        source.is_none() && session.claim_owned_codex_listener(&std::env::temp_dir(), &allocator);
+    let (allocator, listeners) = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        (state.proof().clone(), state.codex_listeners.clone())
+    };
+    let owned = source.is_none() && listeners.claim(&mut session, &allocator);
     let owned_socket = owned.then(|| {
         session
             .owned_codex_listener
@@ -2418,11 +2419,7 @@ fn codex_terminal_view(
 /// Client descriptors cannot expand allocation authority beyond this daemon's
 /// exact namespace or retained conversation. Checkpoint restore invokes `start`
 /// directly with the daemon-owned durable source instead.
-fn client_session(host: &SharedHost, session: Session) -> Session {
-    client_session_in(host, session, &std::env::temp_dir())
-}
-
-fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::Path) -> Session {
+fn client_session(host: &SharedHost, mut session: Session) -> Session {
     if session.native_continuity.retains_provider() {
         // This descriptor can only enter authenticated holder adoption, which
         // checks its full retained value. The caller's TMPDIR grants no authority.
@@ -2449,10 +2446,7 @@ fn client_session_in(host: &SharedHost, mut session: Session, root: &std::path::
     session.owned_codex_listener = retained.or_else(|| {
         session.owned_codex_listener.take().filter(|owned| {
             owned.matches(session.id, &session.launch.recipe)
-                && owned.socket
-                    == root
-                        .join(format!("cagents-codex-{}", session.id))
-                        .join("control.sock")
+                && state.codex_listeners.allocates(session.id, &owned.socket)
         })
     });
     if let Some(terminal) = &mut session.terminal {
@@ -6987,18 +6981,17 @@ done
             panic!("chat inventory")
         };
         assert_eq!(sessions, vec![session.clone()]);
-        let validated = client_session_in(&host, session.clone(), root);
+        host.lock().unwrap().codex_listeners = CodexListenerRoots::at(root.into());
+        let validated = client_session(&host, session.clone());
         assert_eq!(validated.owned_codex_listener, session.owned_codex_listener);
         assert_eq!(
             validated.owned_codex_listener.as_ref().unwrap().allocator,
             allocator
         );
 
-        let untrusted = client_session_in(
-            &host,
-            session.clone(),
-            std::path::Path::new("/another-daemon-root"),
-        );
+        host.lock().unwrap().codex_listeners =
+            CodexListenerRoots::at("/another-daemon-root".into());
+        let untrusted = client_session(&host, session.clone());
         assert!(untrusted.owned_codex_listener.is_none());
         assert_eq!(untrusted.launch.recipe, session.launch.recipe);
         assert!(!untrusted.owns_codex_listener());
@@ -7091,13 +7084,9 @@ done
                 },
             );
         }
+        host.lock().unwrap().codex_listeners = CodexListenerRoots::at("/another-root".into());
         assert_eq!(
-            client_session_in(
-                &host,
-                session.clone(),
-                std::path::Path::new("/another-root")
-            )
-            .owned_codex_listener,
+            client_session(&host, session.clone()).owned_codex_listener,
             session.owned_codex_listener
         );
         let view = |client, session, recipe| {
