@@ -64,7 +64,9 @@ fn kind(name: &str, index: usize) -> CardKind {
             predecessor: None,
             id: TerminalId::new(),
             launch: recipe(index, "/usr/bin/fish"),
-            transcript_path: Some(PathBuf::from(format!("/home/user/.local/share/cagents/transcripts/{index}.log"))),
+            transcript_path: Some(PathBuf::from(format!(
+                "/home/user/.local/share/cagents/transcripts/{index}.log"
+            ))),
             resume_hint: None,
             continuity: TerminalContinuity::RelaunchAvailable {
                 recipe: recipe(index, "/usr/bin/fish"),
@@ -156,6 +158,18 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
         .take(4)
         .map(|card| (card.id, "an unsent thought".to_owned()))
         .collect();
+    let worktree_focus = cards
+        .iter()
+        .filter(|card| card.existence.is_open())
+        .take(18)
+        .enumerate()
+        .map(|(index, card)| {
+            (
+                PathBuf::from(format!("/home/user/src/project-{index}")),
+                card.id,
+            )
+        })
+        .collect();
     WorkspaceState {
         schema_version: 1,
         id: WorkspaceId::new(),
@@ -167,7 +181,7 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
             .map(|card| card.id),
         cards,
         active_worktree: None,
-        worktree_focus: HashMap::new(),
+        worktree_focus,
         project_order: Vec::new(),
         channels: Vec::new(),
         active_channel: None,
@@ -216,10 +230,27 @@ fn changes(store: &StateStore) -> u64 {
 #[test]
 fn an_unchanged_flush_writes_only_the_workspace_generation() {
     let directory = tempfile::tempdir().unwrap();
-    let store = StateStore::open(directory.path().join("history.sqlite3"), BootId::new("scale")).unwrap();
-    let state = long_lived_workspace();
+    let store = StateStore::open(
+        directory.path().join("history.sqlite3"),
+        BootId::new("scale"),
+    )
+    .unwrap();
+    let mut state = long_lived_workspace();
     let mut lane = Lane::default();
     lane.save(&store, &state);
+    let before = changes(&store);
+    lane.save(&store, &state);
+    assert_eq!(changes(&store) - before, 1);
+
+    // The same navigation rebuilt in maps and sets that iterate in another
+    // order, as a restored window holds it, is still the stored navigation.
+    state.card_scopes = state.card_scopes.into_iter().collect();
+    state.chat_drafts = state.chat_drafts.into_iter().collect();
+    state.pending_chat_admissions = state.pending_chat_admissions.into_iter().collect();
+    state.worktree_focus = state.worktree_focus.into_iter().collect();
+    state.local_only_cards = state.cards.iter().take(40).map(|card| card.id).collect();
+    lane.save(&store, &state);
+    state.local_only_cards = state.local_only_cards.into_iter().collect();
     let before = changes(&store);
     lane.save(&store, &state);
     assert_eq!(changes(&store) - before, 1);
@@ -279,7 +310,10 @@ fn time_store_paths_at_long_lived_size() {
     let loads = (0..7)
         .map(|_| {
             let started = Instant::now();
-            store.load_workspace_restored(state.id, None).unwrap().unwrap();
+            store
+                .load_workspace_restored(state.id, None)
+                .unwrap()
+                .unwrap();
             started.elapsed().as_secs_f64() * 1e3
         })
         .collect();
