@@ -48,3 +48,8 @@ and scoped performance evidence require independent qualification. The
 upstream fix's merge/release status is not inferred from historical metadata;
 remove the temporary shape backport only when a selected release includes it,
 and assess the snapshot API separately rather than deleting its authority.
+
+FontMatchKey no longer carries variable_weight_match. FontSystem::matches_weight
+reads a face's wght axis when fallback first considers it and caches the range
+by face ID, cleared with the database; font/fallback/mod.rs asks it after the
+family test. Selection order and results are unchanged.

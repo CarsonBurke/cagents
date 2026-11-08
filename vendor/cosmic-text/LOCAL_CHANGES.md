@@ -54,3 +54,16 @@ End controls do not independently qualify every Start/Middle/Bidi geometry.
 The retained upstream oracles and final composed UI/native/cache qualification
 remain required. Prior separate PR1316/1473 execution is historical evidence,
 not a claim that this source union has been built or run. See PROVENANCE.md.
+
+Font matching without reading font files
+
+Upstream FontMatchKey::new opens every face whose weight differs from the
+requested one to read its wght axis, so the first match of each family, weight,
+style and stretch in a FontSystem reads every installed font file: about two
+thousand on an ordinary desktop, a few hundred milliseconds, on the thread that
+shapes. FontSystem now asks a face for its weight axis only when fallback
+considers that face, and remembers the answer per face until the database
+changes. Matching and fallback choose the same faces as before: a face of the
+requested weight, or a variable face whose wght range covers it, in the same
+order. src/font/system/weight_match_tests.rs checks that matching reads no font
+file and that the choices are unchanged.
