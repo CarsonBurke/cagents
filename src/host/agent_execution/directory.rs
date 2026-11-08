@@ -3,7 +3,7 @@
 
 use super::{SharedHost, caller, registry};
 use crate::{
-    account::{UsageStatus, WindowKind, info::RemainingWindow},
+    account::{UsageStatus, info::RemainingWindow},
     agent::{ActivityState, Provider},
     agent_execution::{
         Authority, Lineage, Origin,
@@ -578,12 +578,12 @@ pub(in crate::host) fn usage_limit(
     let after_failure = |at_ms: u64| failed_at.is_none_or(|failed| at_ms > failed);
     // A window used up until after the failure that bears on it. One whose
     // reset has since passed still counts: that reset is what ends the limit.
-    // A model's own window bears on it only when the provider named that
-    // model: one model's allowance running out leaves the others usable.
+    // A window scoped to one model, of any span, bears on it only when the
+    // provider named that model: one model's allowance running out leaves
+    // the others usable.
     let spent_past_failure = |window: &&RemainingWindow| {
         window.remaining_fraction <= 0.0
-            && (window.window.kind != WindowKind::Scoped
-                || names_model(&summary, &window.window.label))
+            && scope(&window.window.label).is_none_or(|model| names_model(&summary, model))
             && window
                 .window
                 .resets_at
@@ -596,7 +596,7 @@ pub(in crate::host) fn usage_limit(
             .filter(spent_past_failure)
     };
     let resets_at = spent().filter_map(|window| window.window.resets_at).max();
-    let model_spent = spent().any(|window| window.window.kind == WindowKind::Scoped);
+    let model_spent = spent().any(|window| scope(&window.window.label).is_some());
     let limit = UsageLimit {
         summary,
         reset: failure.reset,
@@ -623,13 +623,19 @@ pub(in crate::host) fn usage_limit(
     (!recovered).then_some(limit)
 }
 
-/// Whether a limit's summary names the model a window is scoped to, as
-/// "Claude Opus limit reached" names the window "Weekly · Opus".
-fn names_model(summary: &str, label: &str) -> bool {
+/// The model or bucket a window is scoped to, which both providers name
+/// after its span: "Weekly · Opus", "5h window · GPT-5.1-Codex-Max".
+fn scope(label: &str) -> Option<&str> {
     label
         .rsplit_once(" · ")
-        .map(|(_, model)| model.trim().to_lowercase())
-        .is_some_and(|model| !model.is_empty() && summary.to_lowercase().contains(&model))
+        .map(|(_, model)| model.trim())
+        .filter(|model| !model.is_empty())
+}
+
+/// Whether a limit's summary names a window's model, as "Claude Opus limit
+/// reached" names "Weekly · Opus".
+fn names_model(summary: &str, model: &str) -> bool {
+    summary.to_lowercase().contains(&model.to_lowercase())
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views
@@ -839,6 +845,30 @@ mod tests {
                 )
             }),
             failed_at + 120_000,
+        );
+        let codex_model_session = usage_limit(
+            Provider::Codex,
+            "Usage limit reached for this plan",
+            Some(failed_at),
+            Some(&account_reading(
+                UsageStatus::Ok,
+                failed_at + 60_000,
+                &[
+                    ("5h window", WindowKind::Session, 0.3, 1_009_000),
+                    (
+                        "5h window · GPT-5.1-Codex-Max",
+                        WindowKind::Session,
+                        1.0,
+                        weekly_reset,
+                    ),
+                ],
+                failed_at + 120_000,
+            )),
+            failed_at + 120_000,
+        );
+        assert_eq!(
+            codex_model_session, None,
+            "a model's own short window does not date a limit that did not name it"
         );
         assert_eq!(
             codex_model_spent, None,
