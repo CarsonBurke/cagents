@@ -170,7 +170,7 @@ impl Cagents {
         } else if intent.is_some_and(|intent| intent.certain) {
             "It is still working. Closing it stops it and closes it in every window."
         } else {
-            "It may still be working. Closing it stops anything it is doing and closes it in every window."
+            "It may still be working. Closing it stops it and closes it in every window."
         };
         dialog_ui::overlay(
             dialog_ui::surface(

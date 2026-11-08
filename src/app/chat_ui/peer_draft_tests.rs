@@ -1091,35 +1091,42 @@ fn a_chat_with_history_that_lost_its_provider_does_not_hold_a_message() {
 }
 
 /// Esc goes through update like the dialog's buttons, so the close waiting
-/// behind the question gets its turn straight away.
+/// behind the question gets its turn straight away. It answers the question
+/// even when the composer the question opened over captured it.
 #[test]
 fn escape_on_the_question_lets_the_next_close_ask() {
-    let mut app = crate::app::tests::context_inspector_test_app(false);
-    let mut working = |thread| {
-        let card = super::tests::live_chat_for_provider(&mut app, Provider::Claude, Some(thread));
-        let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
-            panic!("expected a chat runtime");
+    for captured in [false, true] {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut working = |thread| {
+            let card =
+                super::tests::live_chat_for_provider(&mut app, Provider::Claude, Some(thread));
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get(&card) else {
+                panic!("expected a chat runtime");
+            };
+            let handle = runtime.handle().unwrap();
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.busy = true;
+            handle.publish_snapshot_for_test(snapshot);
+            card
         };
-        let handle = runtime.handle().unwrap();
-        let mut snapshot = (*handle.snapshot()).clone();
-        snapshot.busy = true;
-        handle.publish_snapshot_for_test(snapshot);
-        card
-    };
-    let asked = working("asked-thread");
-    let next = working("next-thread");
-    drop(app.update(Message::CloseCard(asked)));
-    drop(app.begin_card_close(next));
-    assert!(app.chat_close_asked(asked));
+        let asked = working("asked-thread");
+        let next = working("next-thread");
+        drop(app.update(Message::CloseCard(asked)));
+        drop(app.begin_card_close(next));
+        assert!(app.chat_close_asked(asked));
 
-    let task = app.update(Message::KeyEvent {
-        event: crate::app::dialog_ui::tests::key_press(iced::keyboard::key::Named::Escape),
-        captured: false,
-    });
-    let cancel = crate::app::tests::task_app_message(task);
-    assert!(matches!(cancel, Message::CancelChatClose));
-    drop(app.update(cancel));
+        let task = app.update(Message::KeyEvent {
+            event: crate::app::dialog_ui::tests::key_press(iced::keyboard::key::Named::Escape),
+            captured,
+        });
+        let cancel = crate::app::tests::task_app_message(task);
+        assert!(
+            matches!(cancel, Message::CancelChatClose),
+            "captured={captured}"
+        );
+        drop(app.update(cancel));
 
-    assert!(app.chat_close_asked(next));
-    assert!(!app.chat_close_owned(asked));
+        assert!(app.chat_close_asked(next), "captured={captured}");
+        assert!(!app.chat_close_owned(asked), "captured={captured}");
+    }
 }

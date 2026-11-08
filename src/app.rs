@@ -17773,6 +17773,17 @@ impl Application for Cagents {
                 if is_escape_press(&event) && self.form_dialog_on_top() {
                     return self.cancel_form_dialog();
                 }
+                // A close question opens over the composer or terminal it asks
+                // about, which keeps its focus and captures Escape under the
+                // dialog. The question answers it all the same.
+                if is_escape_press(&event) && self.update_ui.confirmation.is_none() {
+                    if self.terminal_close_dialog_visible() {
+                        return self.cancel_terminal_close();
+                    }
+                    if self.chat_close_dialog_visible() {
+                        return cosmic::task::message(Message::CancelChatClose);
+                    }
+                }
                 if self.form_dialog_on_top()
                     && let Some(task) = self.resume_key_event(&event)
                 {
