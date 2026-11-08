@@ -157,12 +157,38 @@ end_with_connection() {
 LIFETIME
 )
 
-# Variables every script on HOST starts with.
+# Who a task on HOST belongs to: this machine and this task directory. The
+# host knows a task only by its directory's name, so two agents whose task
+# directories share a name would otherwise build, stop and clean each other's.
+owner="$(uname -n):$task"
+
+# What every script on HOST starts with: its variables, and the refusal of a
+# task that isn't this one's.
 remote_prelude=$(cat <<PRELUDE
 repository=$(printf '%q' "$repository")
 name=$(printf '%q' "$name")
+owner=$(printf '%q' "$owner")
 task=\$HOME/.local/state/cev/\$name
 tool=\$repository/.worktrees/cev-\$name-tool
+# A login profile there must not send these commands on again.
+unset CAGENTS_EVIDENCE_REMOTE CAGENTS_EVIDENCE_TASK
+if [ "\$owner" = "\$(uname -n):\$task" ]; then
+    echo "native-evidence-remote: this task directory is the host's own, so the host would overwrite and clean it; run scripts/native-evidence here without --remote" >&2
+    exit 3
+fi
+if [ -e "\$task/owner" ]; then
+    if [ "\$(cat -- "\$task/owner")" != "\$owner" ]; then
+        echo "native-evidence-remote: task \$name on \$(uname -n) belongs to \$(cat -- "\$task/owner"); give this task directory another name" >&2
+        exit 3
+    fi
+elif [ -e "\$task" ]; then
+    # Such as a task someone runs on the host directly, in the same place.
+    echo "native-evidence-remote: \$task on \$(uname -n) is not a task this route started; give this task directory another name" >&2
+    exit 3
+else
+    mkdir -p -- "\$task"
+    printf '%s\\n' "\$owner" >"\$task/owner"
+fi
 # In cli and env arguments, {fixture} stands for the fixture's root, in a
 # forwarded command and a steps file alike.
 evidence() {
@@ -189,6 +215,8 @@ snapshot() {
         return
     fi
     index=$(mktemp)
+    # This runs in a command substitution, so the trap is its own.
+    trap 'rm -f -- "$index"' EXIT
     # A copy of its index, so unchanged files need no rehashing.
     cp -- "$(git -C "$checkout" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || :
     GIT_INDEX_FILE=$index git -C "$checkout" add --all &&
@@ -288,7 +316,10 @@ cmd_build() {
     # Before its checkout is rewritten under a session started from it.
     if on_host "$remote_prelude"'
         [ -x "$tool/scripts/native-evidence" ] || exit 1
-        evidence status 2>/dev/null | grep -q "^session: $1,"
+        # Read whole: grep -q would end the pipe early, and status, killed
+        # by SIGPIPE under pipefail, would read as no session.
+        status=$(evidence status 2>/dev/null) || :
+        grep -q "^session: $1," <<<"$status"
     ' "$side"; then
         die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop"
     fi
@@ -306,8 +337,9 @@ cmd_build() {
 # screenshots here stay.
 cmd_clean() {
     on_host "$remote_prelude"'
-        if [ -x "$tool/scripts/native-evidence" ]; then
-            evidence stop >/dev/null 2>&1 || :
+        if [ -x "$tool/scripts/native-evidence" ] && ! evidence stop >/dev/null; then
+            echo "native-evidence-remote: the session did not stop, so nothing was removed" >&2
+            exit 1
         fi
         for role in before after tool; do
             checkout=$repository/.worktrees/cev-$name-$role
@@ -361,7 +393,7 @@ cmd_pair() {
             status=0
             SIDE=$side bash -euo pipefail "$steps" || status=$?
             trap - EXIT
-            evidence stop >/dev/null
+            evidence stop >/dev/null 2>&1
             exit "$status"
         ' "$side" "$(cat -- "$steps")" "${options[@]}" || status=$?
         fetch_shots

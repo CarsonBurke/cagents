@@ -1091,8 +1091,11 @@ REMOTE_TOOL = """
     mkdir -p "$task/shots"
     case $1 in
         start) printf '%s\\n' "$2" > "$task/side"; echo "session ready: $2" ;;
-        stop) rm -f "$task/side"; echo stopped ;;
-        status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none' ;;
+        stop) [ ! -e "$task/stop-fails" ] || exit 1; rm -f "$task/side"; echo stopped ;;
+        # More than one line, written apart, as the real status is: a reader
+        # that stops at the first ends it with SIGPIPE.
+        status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none'
+                sleep 0.2; echo "native lock: free" ;;
         shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
               printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
         build) printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2" ;;
@@ -1273,6 +1276,49 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("the after side is running on buildhost; stop it", result.stderr)
         built = self.remote_repository / ".worktrees/cev-mytask-after/src.rs"
         self.assertEqual(built.read_text(), "one\n")
+
+    def test_a_task_with_another_owner_on_the_host_is_left_alone(self) -> None:
+        checkout = self.repository("after", {"src.rs": "one\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.assertTrue((self.remote_task / "owner").read_text().endswith(f":{self.task}\n"))
+        # Another agent's task directory of the same name, elsewhere.
+        other = self.task
+        self.task = self.root / "elsewhere" / "mytask"
+        (checkout / "src.rs").write_text("two\n")
+        for command in (["build", "after", str(checkout)], ["start", "after"], ["clean"], ["status"]):
+            with self.subTest(command=command[0]):
+                result = self.run_tool(*command, check=False)
+                self.assertEqual(result.returncode, 3, result.stderr)
+                self.assertIn(f"task mytask on {os.uname().nodename} belongs to {os.uname().nodename}:{other}; "
+                              "give this task directory another name", result.stderr)
+        self.assertEqual((self.remote_repository / ".worktrees/cev-mytask-after/src.rs").read_text(), "one\n")
+        self.assertTrue(self.remote_task.exists())
+
+    def test_a_task_the_host_runs_directly_is_left_alone(self) -> None:
+        # Someone on the host runs native-evidence with a task of this name.
+        (self.remote_task / "shots").mkdir(parents=True)
+        result = self.run_tool("clean", check=False)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("is not a task this route started; give this task directory another name", result.stderr)
+        self.assertTrue((self.remote_task / "shots").exists())
+        self.assertFalse((self.remote_task / "owner").exists())
+
+    def test_the_hosts_own_task_directory_is_refused(self) -> None:
+        self.task = self.remote_task
+        result = self.run_tool("status", check=False)
+        self.assertEqual(result.returncode, 3, result.stderr)
+        self.assertIn("run scripts/native-evidence here without --remote", result.stderr)
+
+    def test_clean_keeps_everything_when_the_session_does_not_stop(self) -> None:
+        checkout = self.repository("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        (self.remote_task / "stop-fails").touch()
+        result = self.run_tool("clean", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("the session did not stop, so nothing was removed", result.stderr)
+        self.assertTrue((self.remote_repository / ".worktrees/cev-mytask-after").exists())
+        self.assertTrue(self.remote_task.exists())
 
     def test_clean_removes_the_task_from_the_host_and_keeps_the_shots_here(self) -> None:
         checkout = self.repository("after", {"src.rs": "\n"})

@@ -58,8 +58,9 @@ environment. To add one:
 1. Pick a file name `fixture-WHAT`. A file that exists switches the behaviour
    on; a file whose contents matter (a reply, a delay, frames) is read on every
    turn, so replacing it changes the next turn. A behaviour that should happen
-   once, such as a crash, removes its file before acting, so the resumed
-   provider behaves normally.
+   once, such as a crash, records that it has, as a `"_once": true` frames
+   line does in `fixture-frames.exited`, so the resumed provider behaves
+   normally; removing the record arms it again.
 2. Add it as a function beside the others in
    `tests/fixtures/chat-composer-claude.sh` and call it from the turn loop.
    Emit what Claude Code emits, and record assistant and user frames in the
@@ -76,7 +77,10 @@ environment. To add one:
 
 For anything beyond a few frames, `fixture-frames.jsonl` replays an exact
 stream with no code change: one frame per line, `@TURN@` for unique IDs,
-`{"_sleep": SECONDS}` to hold a running state.
+`{"_sleep": SECONDS}` to hold a running state, `{"_exit": STATUS}` to crash
+mid-turn, and `{"_end": true}` to end the turn on the frames' own result. A
+`fixture-slow-start` file holds a conversation's provider at start-up. See
+[the synthetic provider](chat-composer-fixture.md) for each.
 
 ## Adding a scene to evidence
 
