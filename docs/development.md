@@ -1410,8 +1410,11 @@ harness, it provides:
   settings alone. The app starts from an empty environment: nothing from your shell
   reaches it except locale and terminal settings, and where Cargo and rustup live. `claude` is the offline
   [synthetic provider](chat-composer-fixture.md), the same file on both sides, and
-  `gh` always fails. Files in `$CAGENTS_EVIDENCE_FIXTURE/home/.claude` switch fixture
-  behaviors. `env CMD` runs your own setup in this environment, with the fixture's
+  `gh` always fails unless `$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge`
+  exists, which makes it an offline, signed-in github.com with project avatars
+  seeded from `$CAGENTS_EVIDENCE_FIXTURE/avatars` (see
+  [Fixtures](fixtures.md#an-offline-github)); `curl` always fails. Files in
+  `$CAGENTS_EVIDENCE_FIXTURE/home/.claude` switch fixture behaviors. `env CMD` runs your own setup in this environment, with the fixture's
   root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
 - **Seeded chats reopen.** A chat records its provider home's device and inode
