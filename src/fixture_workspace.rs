@@ -427,7 +427,6 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::{Command, Event, ItemContent, Role};
 
     #[test]
     fn another_format_names_the_fix() {
@@ -449,124 +448,144 @@ mod tests {
         }
     }
 
-    /// Opens a conversation the way a restored chat card does, and pages
-    /// through all of it.
-    fn claude_history(plan: &Plan, session_id: &str, cwd: &str) -> Vec<crate::chat::Item> {
-        let launch = crate::chat::Launch {
-            provider: crate::agent::Provider::Claude,
-            session_id: Some(session_id.to_owned()),
-            recipe: LaunchRecipe {
-                program: "claude".into(),
-                arguments: Vec::new(),
-                working_directory: cwd.into(),
-                environment: BTreeMap::from([(
-                    "HOME".to_owned(),
-                    plan.home.to_string_lossy().into_owned(),
-                )]),
-                unset_environment: Default::default(),
-            },
-        };
-        let (_, mut adapter) = crate::chat::protocol::create_history(&launch)
-            .unwrap_or_else(|error| panic!("{session_id}: {error}"));
-        let mut pages = Vec::new();
-        let mut step = adapter.initialize().unwrap();
-        loop {
-            let mut earlier = false;
-            for event in step.events {
-                if let Event::History { items, has_earlier } = event {
-                    pages.push(items);
-                    earlier = has_earlier;
-                }
-            }
-            if !earlier {
-                break;
-            }
-            step = adapter.command(Command::LoadEarlier).unwrap();
-        }
-        pages.into_iter().rev().flatten().collect()
-    }
+    /// The providers' history readers live in the daemon.
+    #[cfg(feature = "host")]
+    mod history {
+        use super::*;
+        use crate::chat::{Command, Event, ItemContent, Role};
 
-    fn messages(items: &[crate::chat::Item]) -> usize {
-        items
-            .iter()
-            .filter(|item| {
-                matches!(item.role, Role::User | Role::Assistant)
-                    && matches!(
-                        &item.content,
-                        ItemContent::Text {
-                            thinking: false,
-                            ..
-                        }
-                    )
-            })
-            .count()
-    }
-
-    /// Every intact transcript the generator wrote reads back through the
-    /// resume reader with exactly the messages it meant to be visible: the
-    /// harness noise it adds (reminders, command output, compaction
-    /// summaries, task notifications) stays hidden, as it does for real
-    /// Claude Code transcripts.
-    #[test]
-    fn claude_transcripts_read_back_through_the_resume_reader() {
-        let directory = tempfile::tempdir().unwrap();
-        let plan = test_support::small(directory.path());
-        let mut read = 0;
-        for entry in plan.history["claude"].as_array().unwrap() {
-            // Damaged files and forks are what the resume reader's own
-            // tolerance tests cover; whether they read is that reader's call.
-            if !matches!(entry["edge"].as_str(), None | Some("sidechain")) {
-                continue;
-            }
-            let session_id = entry["session_id"].as_str().unwrap();
-            let items = claude_history(&plan, session_id, entry["cwd"].as_str().unwrap());
-            assert_eq!(
-                messages(&items),
-                entry["visible"].as_u64().unwrap() as usize,
-                "{session_id} at {}",
-                entry["file"]
-            );
-            read += 1;
-        }
-        assert!(read >= 15, "only {read} transcripts were intact");
-    }
-
-    /// Each rollout shows one prompt per turn, and an answer for every turn
-    /// that ended normally.
-    #[test]
-    fn codex_rollouts_read_back_through_the_rollout_reader() {
-        let directory = tempfile::tempdir().unwrap();
-        let plan = test_support::small(directory.path());
-        let edge = &plan.edge_cases;
-        let cut_short = [
-            edge["codex-interrupted-turn"]["thread_id"].as_str(),
-            edge["codex-usage-limit"]["thread_id"].as_str(),
-        ];
-        for entry in plan.history["codex"].as_array().unwrap() {
-            let thread = entry["thread_id"].as_str().unwrap();
-            let items = crate::chat::protocol::codex::rollout::read(std::path::Path::new(
-                entry["file"].as_str().unwrap(),
-            ))
-            .unwrap();
-            let count = |role: Role| {
-                items
-                    .iter()
-                    .filter(|item| {
-                        item.role == role
-                            && matches!(
-                                &item.content,
-                                ItemContent::Text {
-                                    thinking: false,
-                                    ..
-                                }
-                            )
-                    })
-                    .count()
+        /// Opens a conversation the way a restored chat card does, and pages
+        /// through all of it.
+        fn claude_history(plan: &Plan, session_id: &str, cwd: &str) -> Vec<crate::chat::Item> {
+            let launch = crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                session_id: Some(session_id.to_owned()),
+                recipe: LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: Vec::new(),
+                    working_directory: cwd.into(),
+                    environment: BTreeMap::from([(
+                        "HOME".to_owned(),
+                        plan.home.to_string_lossy().into_owned(),
+                    )]),
+                    unset_environment: Default::default(),
+                },
             };
-            let turns = entry["turns"].as_u64().unwrap() as usize;
-            assert_eq!(count(Role::User), turns, "{thread}");
-            let answered = turns - usize::from(cut_short.contains(&Some(thread)));
-            assert_eq!(count(Role::Assistant), answered, "{thread}");
+            let (_, mut adapter) = crate::chat::protocol::create_history(&launch)
+                .unwrap_or_else(|error| panic!("{session_id}: {error}"));
+            let mut pages = Vec::new();
+            let mut step = adapter.initialize().unwrap();
+            loop {
+                let mut earlier = false;
+                for event in step.events {
+                    if let Event::History { items, has_earlier } = event {
+                        pages.push(items);
+                        earlier = has_earlier;
+                    }
+                }
+                if !earlier {
+                    break;
+                }
+                step = adapter.command(Command::LoadEarlier).unwrap();
+            }
+            pages.into_iter().rev().flatten().collect()
+        }
+
+        fn messages(items: &[crate::chat::Item]) -> usize {
+            items
+                .iter()
+                .filter(|item| {
+                    matches!(item.role, Role::User | Role::Assistant)
+                        && matches!(
+                            &item.content,
+                            ItemContent::Text {
+                                thinking: false,
+                                ..
+                            }
+                        )
+                })
+                .count()
+        }
+
+        /// Every intact transcript the generator wrote reads back through the
+        /// resume reader with exactly the messages it meant to be visible: the
+        /// harness noise it adds (reminders, command output, compaction
+        /// summaries, task notifications) stays hidden, as it does for real
+        /// Claude Code transcripts.
+        #[test]
+        fn claude_transcripts_read_back_through_the_resume_reader() {
+            let directory = tempfile::tempdir().unwrap();
+            let plan = test_support::small(directory.path());
+            let mut read = 0;
+            let mut mismatched = Vec::new();
+            for entry in plan.history["claude"].as_array().unwrap() {
+                // Damaged files and forks are what the resume reader's own
+                // tolerance tests cover; whether they read is that reader's call.
+                if !matches!(entry["edge"].as_str(), None | Some("sidechain")) {
+                    continue;
+                }
+                let session_id = entry["session_id"].as_str().unwrap();
+                let items = claude_history(&plan, session_id, entry["cwd"].as_str().unwrap());
+                let expected = entry["visible"].as_u64().unwrap() as usize;
+                if messages(&items) != expected {
+                    let shown: Vec<String> = items
+                        .iter()
+                        .filter_map(|item| match &item.content {
+                            ItemContent::Text {
+                                text,
+                                thinking: false,
+                                ..
+                            } => Some(format!("{:?}: {:.60}", item.role, text)),
+                            _ => None,
+                        })
+                        .collect();
+                    mismatched.push(format!(
+                        "{session_id}: expected {expected}, shown {shown:#?}"
+                    ));
+                }
+                read += 1;
+            }
+            assert!(mismatched.is_empty(), "{}", mismatched.join("\n"));
+            assert!(read >= 15, "only {read} transcripts were intact");
+        }
+
+        /// Each rollout shows one prompt per turn, and an answer for every turn
+        /// that ended normally.
+        #[test]
+        fn codex_rollouts_read_back_through_the_rollout_reader() {
+            let directory = tempfile::tempdir().unwrap();
+            let plan = test_support::small(directory.path());
+            let edge = &plan.edge_cases;
+            let cut_short = [
+                edge["codex-interrupted-turn"]["thread_id"].as_str(),
+                edge["codex-usage-limit"]["thread_id"].as_str(),
+            ];
+            for entry in plan.history["codex"].as_array().unwrap() {
+                let thread = entry["thread_id"].as_str().unwrap();
+                let items = crate::chat::protocol::codex::rollout::read(std::path::Path::new(
+                    entry["file"].as_str().unwrap(),
+                ))
+                .unwrap();
+                let count = |role: Role| {
+                    items
+                        .iter()
+                        .filter(|item| {
+                            item.role == role
+                                && matches!(
+                                    &item.content,
+                                    ItemContent::Text {
+                                        thinking: false,
+                                        ..
+                                    }
+                                )
+                        })
+                        .count()
+                };
+                let turns = entry["turns"].as_u64().unwrap() as usize;
+                assert_eq!(count(Role::User), turns, "{thread}");
+                let answered = turns - usize::from(cut_short.contains(&Some(thread)));
+                assert_eq!(count(Role::Assistant), answered, "{thread}");
+            }
         }
     }
 }

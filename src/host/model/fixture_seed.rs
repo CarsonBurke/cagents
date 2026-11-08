@@ -9,7 +9,7 @@ use std::{path::Path, time::Instant};
 
 use crate::{
     fixture_workspace::Plan,
-    model::{CardId, ProjectKind},
+    model::{CardId, ChannelTitleSource, ProjectKind},
     workspace_model::{
         ModelEdit,
         views::{Change, Pane, Scope},
@@ -127,6 +127,25 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
         })?;
         edits += record_edits(&mut registry, plan, index, &scope, view)?;
     }
+    // A channel's automatic name follows its primary conversation, so seeding
+    // and rotating its panes cleared it. Name each one last, as the window
+    // does once it has read the conversation, or as the person did.
+    for channel in &plan.channels {
+        if channel.title.is_empty() {
+            continue;
+        }
+        registry.commit(&match channel.title_source {
+            ChannelTitleSource::Manual => ModelEdit::RetitleChannel {
+                id: channel.id,
+                title: channel.title.clone(),
+            },
+            source => ModelEdit::SuggestChannelTitle {
+                id: channel.id,
+                title: channel.title.clone(),
+                source,
+            },
+        })?;
+    }
     registry
         .db
         .pragma_update(None, "synchronous", "FULL")
@@ -236,6 +255,7 @@ mod tests {
         for (position, channel) in plan.channels.iter().enumerate() {
             let saved = model.channel(channel.id).unwrap();
             assert_eq!(saved.title, channel.title);
+            assert_eq!(saved.title_source, channel.title_source);
             assert_eq!(saved.ordinal, position as u32 + 1);
         }
         assert_eq!(model.views.len(), plan.views.len());

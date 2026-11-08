@@ -496,7 +496,8 @@ class Planner:
             closed = [c["id"] for c in self.cards if c["closed_at_ms"] is not None]
             keep = max(0, self.profile.second_window_cards - len(open_cards))
             subset = set(stream.sample(closed, min(len(closed), keep))) | {c["id"] for c in open_cards}
-            second = dict(primary, slot="second", workspace_id=stream.uuid4(),
+            # The name the app gives the second window it opens.
+            second = dict(primary, slot="window-2", workspace_id=stream.uuid4(),
                           cards=[c["id"] for c in self.cards if c["id"] in subset],
                           active_channel=channel_with_panes[-1]["id"] if channel_with_panes else None,
                           focused=channel_with_panes[-1]["focused"] if channel_with_panes else None,
