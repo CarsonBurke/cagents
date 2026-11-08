@@ -1138,7 +1138,7 @@ fi
 if [ "$STAGE_ONLY" -eq 1 ]; then
     printf 'Staged cagents %s; running windows and daemon were preserved. Run cagents daemon upgrade to apply it when ready.\n' "$VERSION"
 elif [ "$DAEMON_DEFERRED" -eq 1 ]; then
-    printf 'Installed cagents %s; running sessions were preserved. Run cagents daemon upgrade to finish updating its daemon.\n' "$VERSION"
+    printf 'Installed cagents %s; running sessions were preserved. Run cagents daemon upgrade to finish updating the daemon.\n' "$VERSION"
 elif [ "$DAEMON_STARTED" -eq 1 ]; then
     printf 'Installed cagents %s; the production daemon is running and will start at login.\n' "$VERSION"
 else

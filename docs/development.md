@@ -1313,9 +1313,9 @@ generation. Each build is incremental, so after the first one only changed
 code is recompiled. The script stages the archive with
 `install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
 affected session and asks before replacing anything. `--stage-only` stops
-after staging; finish later with `cagents daemon upgrade`. The update control
-of a window running an older build uses that build's own updater, which may
-refuse panes the staged build can carry.
+after staging; finish later with `cagents daemon upgrade`. A window on an
+older build may hand its update control's update to its own updater, which can
+refuse panes the staged build carries.
 
 The build runs in the repository's `.worktrees/.install-local`, a detached
 checkout the script owns, so its target directory stays warm and edits in your

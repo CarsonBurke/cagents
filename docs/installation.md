@@ -250,11 +250,13 @@ for idle, or you can explicitly choose interruption and exact resumption.
 Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
-including local builds, use this same flow. Whenever the newer build can
-upgrade the running daemon, its own updater performs the update, whichever
-window asks, so its own checks decide which sessions it carries. A window
-running a build older than that change still runs its own updater; finish a
-staged update from such a window with `cagents daemon upgrade` instead. Source trees and OS packages retain
+including local builds, use this same flow. When the newer build speaks the
+running daemon's protocol, or bootstraps that daemon's older protocol, its own
+updater performs the update whichever window asks, so its checks decide which
+sessions it carries. Otherwise the daemon's own updater, which can update
+across protocols, performs it. A window from an older build may still hand the
+update to its own updater; if that refuses sessions the newer build carries,
+run `cagents daemon upgrade` instead. Source trees and OS packages retain
 their own update method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
@@ -275,11 +277,11 @@ Rerun the installer for a compatible update: the existing daemon and its live
 PTYs keep running. By default the installer verifies the staged CLI against the
 running daemon before switching `current`. An incompatible build is installed
 without replacing the running daemon; saved windows reopen with that daemon's
-matching UI. Finish the staged update with `cagents daemon upgrade`, or from a
-window whose build already hands the update to the newer build's updater (see
-[In-app updates](#in-app-updates)). This command displays the same impact, asks for
-approval, and waits for completion. `--yes` skips the prompt; `--interrupt`
-additionally permits active native turns to stop. `--accept-unreopenable`
+matching UI. Finish the staged update with `cagents daemon upgrade`, or with
+the application's update control (see [In-app updates](#in-app-updates)). The
+command displays the same impact, asks for approval, and waits for completion.
+`--yes` skips the prompt; `--interrupt` additionally permits active native
+turns to stop. `--accept-unreopenable`
 carries saved panes whose ended Claude actor never recorded its conversation:
 the update otherwise refuses them, naming each pane. They stay in their windows
 but, unless their conversation can still be proved, will not resume or start
