@@ -1,0 +1,317 @@
+#!/bin/bash
+# scripts/native-evidence on another host, reached by plain SSH, from any
+# shell, including a session cagents hosts. See "Native evidence from a
+# cagents session" in docs/development.md.
+#
+# Nothing native runs here. This copies the sources to the host as Git
+# commits, runs scripts/native-evidence there in an SSH login, which carries
+# no agent authority, and brings the screenshots back. The host's own copy of
+# native-evidence still refuses inherited authority, so a forwarded
+# environment could not get a fixture past it.
+set -euo pipefail
+
+self=$(readlink -f "$0")
+tool_root=${self%/scripts/*}
+
+usage() {
+    cat <<'USAGE'
+Usage: scripts/native-evidence --remote HOST --task DIR COMMAND
+       scripts/native-evidence-remote --remote HOST --task DIR COMMAND
+
+Runs native-evidence on HOST, over SSH, and keeps the screenshots in DIR here.
+HOST may also come from CAGENTS_EVIDENCE_REMOTE, and DIR from
+CAGENTS_EVIDENCE_TASK. DIR's name, at most 18 letters, digits, dots, hyphens
+or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
+
+  pair --before SOURCE --after SOURCE --steps FILE [--width PX]
+                  The whole comparison in one command: build both sides, then
+                  for each side start a session, run FILE, stop it, and bring
+                  back its shots. FILE is a Bash script that runs on HOST with
+                  SIDE set and `evidence` standing for native-evidence there,
+                  as in `evidence drive click 'Open repository'`, `evidence
+                  shot channel-prs`. A session that FILE leaves running is
+                  stopped.
+  build SIDE SOURCE
+                  Copy SOURCE to HOST and build it there. SOURCE is a checkout
+                  directory, whose uncommitted and untracked files are
+                  included, or a revision such as origin/main.
+  shot NAME       Capture on HOST and bring back shots/SIDE-NAME.webp.
+  fetch           Bring back every shot and the manifest.
+  where           Print the task and checkouts on HOST.
+  start, stop, status, cli, env, drive, nested, save-seed
+                  As in native-evidence, run on HOST. In cli and env
+                  arguments, {fixture} stands for the fixture's root there.
+
+Each build records which local checkout and commit it came from in
+DIR/sources.tsv, beside shots/manifest.tsv, whose revisions are the commits
+copied to HOST.
+USAGE
+}
+
+die() {
+    printf 'native-evidence-remote: %s\n' "$1" >&2
+    exit "${2:-1}"
+}
+
+host=${CAGENTS_EVIDENCE_REMOTE:-}
+task=${CAGENTS_EVIDENCE_TASK:-}
+while [ "$#" -gt 0 ]; do
+    case $1 in
+        --remote) host=${2:-}; shift 2 || die '--remote needs a host' 2 ;;
+        --task) task=${2:-}; shift 2 || die '--task needs a directory' 2 ;;
+        --help | -h) usage; exit 0 ;;
+        *) break ;;
+    esac
+done
+command=${1:-}
+[ -n "$command" ] || { usage >&2; exit 2; }
+shift
+[ -n "$host" ] || die 'name the host with --remote or CAGENTS_EVIDENCE_REMOTE' 2
+[[ $host =~ ^[A-Za-z0-9][A-Za-z0-9._@-]*$ ]] || die "unsupported host name: $host" 2
+[ -n "$task" ] || die 'name a task directory with --task or CAGENTS_EVIDENCE_TASK' 2
+case $task in
+    '~') task=$HOME ;;
+    '~/'*) task=$HOME/${task#'~/'} ;;
+esac
+task=$(realpath -m -- "$task")
+name=${task##*/}
+[[ $name =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,17}$ ]] ||
+    die "the task directory's name must be 1-18 letters, digits, dots, hyphens or underscores, starting with a letter or digit: $name" 2
+
+# The repository on HOST that receives the sources. By default the same path
+# as this one, which is how the build host is set up.
+repository=${CAGENTS_EVIDENCE_REMOTE_REPOSITORY:-}
+if [ -z "$repository" ]; then
+    common=$(git -C "$tool_root" rev-parse --path-format=absolute --git-common-dir) ||
+        die "cannot find the repository of $tool_root; set CAGENTS_EVIDENCE_REMOTE_REPOSITORY"
+    repository=${common%/.git}
+fi
+[[ $repository =~ ^/[A-Za-z0-9._/-]+$ ]] || die "unsupported repository path on $host: $repository" 2
+# Whose native-evidence runs on HOST: this one's, so both sides get the same
+# tool and synthetic provider, as they do locally.
+tool_source=${CAGENTS_EVIDENCE_REMOTE_TOOL:-$tool_root}
+
+ssh_command=(ssh -o BatchMode=yes -o ConnectTimeout=20 -o ServerAliveInterval=30)
+
+# Runs a Bash script on HOST in a fresh SSH login, which inherits nothing from
+# this shell. The login shell there may be fish, so the script travels on
+# standard input to `bash -s`, never as a command line for that shell to
+# parse. One function holds it all: Bash reads it whole before running any
+# of it, and its commands read nothing more from that input.
+on_host() {
+    local script=$1
+    shift
+    local quoted='' argument
+    for argument in "$@"; do
+        quoted+=" $(printf '%q' "$argument")"
+    done
+    "${ssh_command[@]}" "$host" bash -s <<SCRIPT
+set -euo pipefail
+remote_main() {
+$script
+}
+remote_main$quoted </dev/null
+SCRIPT
+}
+
+# Variables every script on HOST starts with.
+remote_prelude=$(cat <<PRELUDE
+repository=$(printf '%q' "$repository")
+name=$(printf '%q' "$name")
+task=\$HOME/.local/state/cev/\$name
+tool=\$repository/.worktrees/cev-\$name-tool
+evidence() { "\$tool/scripts/native-evidence" --task "\$task" "\$@"; }
+PRELUDE
+)
+
+mkdir -p -- "$task/shots"
+
+# A commit holding exactly what a checkout's working tree holds, tracked or
+# not, without touching its index, branch or files. A clean checkout is its HEAD.
+snapshot() {
+    local checkout=$1 head index tree
+    head=$(git -C "$checkout" rev-parse --verify HEAD^{commit}) ||
+        die "$checkout has no commit to start from"
+    if [ -z "$(git -C "$checkout" status --porcelain=v1 --untracked-files=all)" ]; then
+        printf '%s\n' "$head"
+        return
+    fi
+    index=$(mktemp)
+    # A copy of its index, so unchanged files need no rehashing.
+    cp -- "$(git -C "$checkout" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || :
+    GIT_INDEX_FILE=$index git -C "$checkout" add --all &&
+        tree=$(GIT_INDEX_FILE=$index git -C "$checkout" write-tree) || {
+        rm -f -- "$index"
+        die "could not record the uncommitted state of $checkout"
+    }
+    rm -f -- "$index"
+    GIT_AUTHOR_NAME=native-evidence GIT_AUTHOR_EMAIL=native-evidence@localhost \
+        GIT_COMMITTER_NAME=native-evidence GIT_COMMITTER_EMAIL=native-evidence@localhost \
+        git -C "$checkout" commit-tree "$tree" -p "$head" -m "native-evidence: uncommitted state of $checkout"
+}
+
+# Resolves SOURCE to the checkout that sends it and the commit it is.
+resolve_source() {
+    local source=$1
+    if [ -d "$source" ]; then
+        source_checkout=$(cd -- "$source" && pwd -P)
+        source_commit=$(snapshot "$source_checkout")
+        source_head=$(git -C "$source_checkout" rev-parse HEAD)
+    else
+        # A revision of the repository this was run from.
+        source_checkout=$(git rev-parse --show-toplevel 2>/dev/null) || source_checkout=$tool_root
+        source_commit=$(git -C "$source_checkout" rev-parse --verify --quiet "$source^{commit}") ||
+            die "$source is neither a directory nor a revision in $source_checkout"
+        source_head=$source_commit
+    fi
+}
+
+# Puts COMMIT in a detached checkout on HOST, .worktrees/cev-NAME-ROLE, made
+# exactly that commit: untracked files left by an earlier copy are removed.
+sync_checkout() {
+    local role=$1 checkout=$2 commit=$3
+    git -C "$checkout" push --quiet --force --no-verify "ssh://$host$repository" \
+        "$commit:refs/native-evidence/$name/$role" ||
+        die "could not copy $commit to $host:$repository"
+    on_host "$remote_prelude"'
+        role=$1 commit=$2
+        checkout=$repository/.worktrees/cev-$name-$role
+        if [ -e "$checkout/.git" ]; then
+            git -C "$checkout" checkout --quiet --detach --force "$commit"
+            git -C "$checkout" clean -fdq
+        else
+            git -C "$repository" worktree prune
+            git -C "$repository" worktree add --quiet --detach "$checkout" "$commit"
+        fi
+        # Its Zig pin applies only once mise trusts it; the files are this commit.
+        if [ -e "$checkout/mise.toml" ] && command -v mise >/dev/null 2>&1; then
+            mise trust --quiet "$checkout/mise.toml" >/dev/null 2>&1 || :
+        fi
+        printf "%s\n" "$checkout"
+    ' "$role" "$commit"
+}
+
+sync_tool() {
+    local commit
+    commit=$(snapshot "$tool_source")
+    sync_checkout tool "$tool_source" "$commit" >/dev/null
+}
+
+# Brings back the task's shots directory, manifest included.
+fetch_shots() {
+    on_host "$remote_prelude"'
+        [ -d "$task/shots" ] || exit 0
+        tar -C "$task/shots" -cf - .
+    ' >"$task/.shots.tar" || {
+        rm -f -- "$task/.shots.tar"
+        die "could not bring back the shots from $host"
+    }
+    tar -C "$task/shots" -xf "$task/.shots.tar"
+    rm -f -- "$task/.shots.tar"
+}
+
+# Forwards a native-evidence command, with {fixture} replaced in cli and env.
+forward() {
+    on_host "$remote_prelude"'
+        [ -x "$tool/scripts/native-evidence" ] ||
+            { echo "native-evidence-remote: nothing is built for this task on this host yet; run build first" >&2; exit 1; }
+        command=$1
+        shift
+        case $command in
+            cli | env)
+                fixture=$task/fixture
+                set -- "${@//\{fixture\}/$fixture}"
+                ;;
+        esac
+        evidence "$command" "$@"
+    ' "$@"
+}
+
+record_source() {
+    local side=$1 sources=$task/sources.tsv
+    {
+        grep -v "^$side"$'\t' "$sources" 2>/dev/null || :
+        printf '%s\t%s\t%s\t%s\n' "$side" "$source_checkout" "$source_head" "$source_commit"
+    } >"$sources.new"
+    mv -- "$sources.new" "$sources"
+}
+
+cmd_build() {
+    local side=${1:-} source=${2:-} checkout
+    case $side in before | after) ;; *) die 'side must be before or after' 2 ;; esac
+    [ -n "$source" ] || die 'build needs a checkout or revision' 2
+    resolve_source "$source"
+    sync_tool
+    checkout=$(sync_checkout "$side" "$source_checkout" "$source_commit")
+    record_source "$side"
+    if [ "$source_commit" != "$source_head" ]; then
+        printf 'copied %s with its uncommitted changes as %s\n' "$source_checkout" "$source_commit"
+    fi
+    forward build "$side" "$checkout"
+}
+
+cmd_pair() {
+    local before='' after='' steps='' width=''
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --before) before=${2:-}; shift 2 || die '--before needs a source' 2 ;;
+            --after) after=${2:-}; shift 2 || die '--after needs a source' 2 ;;
+            --steps) steps=${2:-}; shift 2 || die '--steps needs a file' 2 ;;
+            --width) width=${2:-}; shift 2 || die '--width needs pixels' 2 ;;
+            *) die "unknown pair option: $1" 2 ;;
+        esac
+    done
+    [ -n "$before" ] && [ -n "$after" ] && [ -n "$steps" ] ||
+        die 'pair needs --before, --after and --steps' 2
+    [ -f "$steps" ] || die "no steps file: $steps" 2
+    [ -z "$width" ] || [[ $width =~ ^[0-9]+$ ]] || die 'width must be a whole number' 2
+    cmd_build before "$before"
+    cmd_build after "$after"
+    local side status=0
+    for side in before after; do
+        printf 'running %s on %s\n' "$side" "$host"
+        on_host "$remote_prelude"'
+            side=$1 width=$2
+            evidence start "$side" ${width:+--width "$width"}
+            steps=$task/steps-$side.sh
+            printf "%s\n" "$3" >"$steps"
+            # Its own Bash, so -e holds in it; a failed step still stops the
+            # session, which releases the native lock.
+            export -f evidence
+            export tool task
+            status=0
+            SIDE=$side bash -euo pipefail "$steps" || status=$?
+            evidence stop >/dev/null
+            exit "$status"
+        ' "$side" "$width" "$(cat -- "$steps")" || status=$?
+        fetch_shots
+        [ "$status" -eq 0 ] || die "the steps failed on the $side side (status $status); the shots taken so far are in $task/shots" "$status"
+    done
+    printf 'shots in %s\n' "$task/shots"
+}
+
+case $command in
+    pair) cmd_pair "$@" ;;
+    build) cmd_build "$@" ;;
+    shot)
+        [ "$#" -eq 1 ] || die 'shot needs a name' 2
+        forward shot "$1" >/dev/null
+        fetch_shots
+        side=$(forward status | sed -n 's/^session: \(before\|after\),.*/\1/p')
+        printf '%s\n' "$task/shots/${side:-*}-$1.webp"
+        ;;
+    fetch) fetch_shots; printf '%s\n' "$task/shots" ;;
+    where)
+        on_host "$remote_prelude"'
+            printf "host:     %s\n" "$(hostname)"
+            printf "task:     %s\n" "$task"
+            for role in tool before after; do
+                checkout=$repository/.worktrees/cev-$name-$role
+                [ -e "$checkout/.git" ] && printf "%-9s %s at %s\n" "$role:" "$checkout" "$(git -C "$checkout" rev-parse --short HEAD)"
+            done
+            :
+        '
+        ;;
+    start | stop | status | cli | env | drive | nested | save-seed) forward "$command" "$@" ;;
+    *) usage >&2; exit 2 ;;
+esac

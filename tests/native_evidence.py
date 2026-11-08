@@ -1039,5 +1039,221 @@ class Evidence(unittest.TestCase):
         self.assertTrue(self.lock_is_free(self.native_lock))
 
 
+REMOTE_SCRIPT = REPOSITORY / "scripts" / "native-evidence-remote"
+
+# Stands in for ssh to the build host: a login there starts from its own
+# environment, never this shell's, and runs the command its shell is given.
+REMOTE_STUBS = {
+    "ssh": """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> "$STUB_LOG/ssh"
+        while [ "$#" -gt 0 ]; do
+            case $1 in
+                -o | -p | -i | -l) shift 2 ;;
+                -*) shift ;;
+                *) break ;;
+            esac
+        done
+        host=$1
+        shift
+        [ "$host" = buildhost ] || { echo "ssh: unknown host $host" >&2; exit 255; }
+        exec env -i HOME="$STUB_REMOTE_HOME" PATH="$PATH" STUB_LOG="$STUB_LOG" \\
+            GIT_CONFIG_GLOBAL=/dev/null sh -c "$*"
+    """,
+}
+
+# The build host's native-evidence: records each command and what it ran with.
+REMOTE_TOOL = """
+    #!/bin/bash
+    [ "$1" = --task ] && task=$2 && shift 2
+    printf '%s\\t%s\\n' "$task" "$*" >> "$STUB_LOG/remote-tool"
+    env > "$STUB_LOG/remote-env"
+    mkdir -p "$task/shots"
+    case $1 in
+        start) printf '%s\\n' "$2" > "$task/side"; echo "session ready: $2" ;;
+        stop) rm -f "$task/side"; echo stopped ;;
+        status) [ -e "$task/side" ] && echo "session: $(cat "$task/side"), pid 1, ready" || echo 'session: none' ;;
+        shot) printf 'webp' > "$task/shots/$(cat "$task/side")-$2.webp"
+              printf '%s\\tREV\\n' "$(cat "$task/side")-$2.webp" >> "$task/shots/manifest.tsv" ;;
+        build) printf '%s\\n' "$3" > "$task/built-$2"; ls "$3" > "$task/files-$2" ;;
+        cli) printf '%s\\n' "$*" > "$task/cli" ;;
+    esac
+"""
+
+
+class RemoteEvidence(unittest.TestCase):
+    def setUp(self) -> None:
+        state = Path.home() / ".local" / "state"
+        state.mkdir(parents=True, exist_ok=True)
+        self.root = Path(tempfile.mkdtemp(prefix="ner-", dir=state))
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        self.logs = self.root / "logs"
+        self.logs.mkdir()
+        self.bin = self.root / "bin"
+        self.bin.mkdir()
+        for name, body in REMOTE_STUBS.items():
+            write_executable(self.bin / name, body, self.logs)
+        self.remote_home = self.root / "remote-home"
+        self.remote_home.mkdir()
+        self.task = self.root / "local" / "mytask"
+        self.env = {
+            "PATH": os.pathsep.join([str(self.bin), os.environ["PATH"]]),
+            "HOME": str(self.root / "home"),
+            "STUB_LOG": str(self.logs),
+            "STUB_REMOTE_HOME": str(self.remote_home),
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_CONFIG_NOSYSTEM": "1",
+            # As in a cagents session: none of it may reach the host.
+            "CAGENTS_AGENT_AUTHORITY": "inherited-token",
+        }
+        self.remote_repository = self.repository("remote-repo", {"README": "remote\n"})
+        self.tool = self.repository("tool", {"scripts/native-evidence": REMOTE_TOOL}, executable=True)
+        self.env.update({
+            "CAGENTS_EVIDENCE_REMOTE_REPOSITORY": str(self.remote_repository),
+            "CAGENTS_EVIDENCE_REMOTE_TOOL": str(self.tool),
+        })
+
+    def git(self, path: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(path), "-c", "user.name=t", "-c", "user.email=t@example.invalid", *args],
+            check=True, env=self.env, capture_output=True, text=True,
+        ).stdout.strip()
+
+    def repository(self, name: str, files: dict[str, str], executable: bool = False) -> Path:
+        path = self.root / name
+        for relative, body in files.items():
+            file = path / relative
+            file.parent.mkdir(parents=True, exist_ok=True)
+            if executable:
+                write_executable(file, body, self.logs)
+            else:
+                file.write_text(body)
+        subprocess.run(["git", "init", "-q", "--initial-branch=main", str(path)], check=True, env=self.env)
+        self.git(path, "add", ".")
+        self.git(path, "commit", "-qm", name)
+        return path
+
+    def run_tool(self, *args: str, check: bool = True, via: Path = SCRIPT,
+                 remote: bool = True, extra=None, cwd=None) -> subprocess.CompletedProcess:
+        prefix = ["--remote", "buildhost"] if remote else []
+        result = subprocess.run(
+            [str(via), *prefix, "--task", str(self.task), *args],
+            env={**self.env, **(extra or {})}, stdin=subprocess.DEVNULL, cwd=cwd,
+            capture_output=True, text=True, timeout=60,
+        )
+        if check and result.returncode:
+            self.fail(f"{args} exited {result.returncode}:\n{result.stdout}\n{result.stderr}")
+        return result
+
+    @property
+    def remote_task(self) -> Path:
+        return self.remote_home / ".local" / "state" / "cev" / "mytask"
+
+    def tool_calls(self) -> list[str]:
+        return [line.split("\t", 1)[1] for line in (self.logs / "remote-tool").read_text().splitlines()]
+
+    def test_a_hosted_shell_is_pointed_at_the_remote_route(self) -> None:
+        result = self.run_tool("status", check=False, remote=False)
+        self.assertEqual(result.returncode, 77)
+        self.assertIn("--remote fw16", result.stderr)
+
+    def test_a_hosted_shell_runs_it_on_the_host_without_its_authority(self) -> None:
+        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        self.run_tool("build", "after", str(checkout))
+        environment = (self.logs / "remote-env").read_text()
+        self.assertNotIn("CAGENTS_AGENT_AUTHORITY", environment)
+        self.assertNotIn("inherited-token", environment)
+        built = (self.remote_task / "built-after").read_text().strip()
+        self.assertEqual(built, str(self.remote_repository / ".worktrees" / "cev-mytask-after"))
+        self.assertEqual(self.git(Path(built), "rev-parse", "HEAD"), self.git(checkout, "rev-parse", "HEAD"))
+        # The host's login shell may not be Bash: every script travels on its input.
+        commands = {line.split(" buildhost ", 1)[-1] for line in (self.logs / "ssh").read_text().splitlines()
+                    if "receive-pack" not in line}
+        self.assertEqual(commands, {"bash -s"})
+
+    def test_uncommitted_and_untracked_files_are_built_without_touching_the_checkout(self) -> None:
+        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        head = self.git(checkout, "rev-parse", "HEAD")
+        (checkout / "src.rs").write_text("fn main() { changed(); }\n")
+        (checkout / "new.rs").write_text("fn new() {}\n")
+        (checkout / ".gitignore").write_text("ignored\n")
+        (checkout / "ignored").write_text("secret\n")
+        status = self.git(checkout, "status", "--porcelain")
+        self.run_tool("build", "after", str(checkout))
+        remote = self.remote_repository / ".worktrees" / "cev-mytask-after"
+        self.assertEqual((remote / "src.rs").read_text(), "fn main() { changed(); }\n")
+        self.assertTrue((remote / "new.rs").exists())
+        self.assertFalse((remote / "ignored").exists())
+        self.assertEqual(self.git(checkout, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.git(checkout, "status", "--porcelain"), status)
+        side, local, recorded_head, commit = (self.task / "sources.tsv").read_text().split()
+        self.assertEqual((side, local, recorded_head), ("after", str(checkout), head))
+        self.assertEqual(self.git(remote, "rev-parse", "HEAD"), commit)
+        # A later copy removes files the earlier one had.
+        (checkout / "new.rs").unlink()
+        self.run_tool("build", "after", str(checkout))
+        self.assertFalse((remote / "new.rs").exists())
+
+    def test_a_revision_is_copied_as_it_is(self) -> None:
+        self.git(self.tool, "tag", "base")
+        self.run_tool("build", "before", "base", cwd=self.tool)
+        remote = self.remote_repository / ".worktrees" / "cev-mytask-before"
+        self.assertEqual(self.git(remote, "rev-parse", "HEAD"), self.git(self.tool, "rev-parse", "base"))
+
+    def test_shots_come_back_with_their_manifest(self) -> None:
+        checkout = self.repository("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("start", "after")
+        result = self.run_tool("shot", "home")
+        self.assertEqual(result.stdout.strip(), str(self.task / "shots" / "after-home.webp"))
+        self.assertEqual((self.task / "shots" / "after-home.webp").read_text(), "webp")
+        self.assertIn("after-home.webp", (self.task / "shots" / "manifest.tsv").read_text())
+
+    def test_cli_arguments_name_the_fixture_on_the_host(self) -> None:
+        checkout = self.repository("after", {"src.rs": "\n"})
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("cli", "project", "open", "{fixture}/project", "it's quoted")
+        self.assertEqual((self.remote_task / "cli").read_text().strip(),
+                         f"cli project open {self.remote_task}/fixture/project it's quoted")
+
+    def test_pair_runs_the_steps_on_both_sides_and_brings_back_every_shot(self) -> None:
+        before = self.repository("before", {"src.rs": "old\n"})
+        after = self.repository("after", {"src.rs": "new\n"})
+        steps = self.root / "steps.sh"
+        steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
+        self.run_tool("pair", "--before", str(before), "--after", str(after),
+                      "--steps", str(steps), "--width", "1200")
+        self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
+        self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
+        calls = self.tool_calls()
+        self.assertIn("start before --width 1200", calls)
+        self.assertIn("drive click Open repository", calls)
+        self.assertEqual(calls.count("stop"), 2)
+
+    def test_a_failing_step_still_stops_its_session(self) -> None:
+        before = self.repository("before", {"src.rs": "old\n"})
+        steps = self.root / "steps.sh"
+        steps.write_text("evidence shot first\nfalse\nevidence shot never\n")
+        result = self.run_tool("pair", "--before", str(before), "--after", str(before),
+                               "--steps", str(steps), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("steps failed on the before side", result.stderr)
+        self.assertTrue((self.task / "shots" / "before-first.webp").exists())
+        self.assertFalse((self.task / "shots" / "before-never.webp").exists())
+        self.assertEqual(self.tool_calls()[-1], "stop")
+
+    def test_an_unknown_host_fails_plainly(self) -> None:
+        result = self.run_tool("status", check=False, extra={"CAGENTS_EVIDENCE_REMOTE": "elsewhere"},
+                               remote=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertNotEqual(result.returncode, 77)
+
+    def test_a_task_name_the_host_cannot_use_is_refused_before_anything_runs(self) -> None:
+        self.task = self.root / "local" / "a-name-much-too-long-for-sockets"
+        result = self.run_tool("status", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertFalse((self.logs / "ssh").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

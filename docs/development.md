@@ -1451,8 +1451,63 @@ harness, it provides:
   the pruner on its schedule and is refused when the disk is below its floor.
 
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
-that authority, so a hosted agent shell cannot use it. Remove the task directory
+that authority, so a hosted agent shell cannot run it locally; it runs it on the
+build host instead, as the next section describes. Remove the task directory
 when the PR merges.
+
+### Native evidence from a cagents session
+
+A terminal or chat that cagents hosts runs `native-evidence` on the build host
+over plain SSH. An SSH login there carries none of the session's agent
+authority, and the host's own copy of `native-evidence` still refuses any that
+reached it. Add `--remote HOST` (or set `CAGENTS_EVIDENCE_REMOTE`); every
+command is the same, and the screenshots come back here:
+
+```sh
+cat >~/.local/state/cev-steps/my-task.sh <<'STEPS'
+evidence cli project open '{fixture}/project'
+evidence drive click 'Open repository'
+evidence shot channel-prs
+STEPS
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/my-task \
+    pair --before origin/main --after . --steps ~/.local/state/cev-steps/my-task.sh --width 1200
+ls ~/.local/state/cev/my-task/shots   # before-channel-prs.webp after-channel-prs.webp manifest.tsv
+```
+
+`pair` builds both sides, then for each starts a session, runs the steps file
+on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
+stops the session even when a step fails, and brings back the shots. The
+individual commands work too, for a session you drive step by step:
+
+```sh
+export CAGENTS_EVIDENCE_REMOTE=fw16 CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-task
+scripts/native-evidence build before origin/main
+scripts/native-evidence build after .
+scripts/native-evidence start after --width 1200
+scripts/native-evidence drive observe
+scripts/native-evidence shot channel-prs    # prints the local path
+scripts/native-evidence stop
+```
+
+- **Sources.** `build SIDE SOURCE` takes a checkout directory or a revision of
+  the repository you run it from. A checkout's uncommitted and untracked files
+  are included, ignored ones are not, and the checkout, its index and its
+  branch are left alone: the tool records the working tree as a commit, pushes
+  it to `refs/native-evidence/TASK/SIDE` in the host's repository (the same path
+  as this one, or `CAGENTS_EVIDENCE_REMOTE_REPOSITORY`), and checks it out at
+  `.worktrees/cev-TASK-SIDE` there. `sources.tsv` in the task records each
+  side's local checkout, its HEAD, and the commit that was built, which is the
+  revision `shots/manifest.tsv` names.
+- **One tool.** Both sides run the `native-evidence` and synthetic provider of
+  the checkout you run it from, copied to `.worktrees/cev-TASK-tool`, as a local
+  run would.
+- **The task.** Its directory's name, 1–18 letters, digits, dots, hyphens or
+  underscores, names `~/.local/state/cev/NAME` on the host. Locally it holds only
+  `shots/` and `sources.tsv`. `where` prints the host's paths.
+- **Fixture paths.** `{fixture}` in `cli` and `env` arguments becomes the
+  fixture's root on the host.
+- **Login shells.** Every script travels to `bash -s` on standard input, so the
+  host's login shell may be fish. Commands get no standard input from here.
 
 ## Installer and package checks
 

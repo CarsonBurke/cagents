@@ -9,7 +9,9 @@ this fixture checks composer interactions, not provider delivery.
 
 From a shell without a desktop session, such as plain SSH,
 [`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
-you still open the project and start the conversation.
+you still open the project and start the conversation. From a session cagents
+hosts, add `--remote fw16` to run it on the build host
+([Native evidence from a cagents session](development.md#native-evidence-from-a-cagents-session)).
 By hand, use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
