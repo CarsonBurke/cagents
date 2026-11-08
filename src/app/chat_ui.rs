@@ -20925,6 +20925,16 @@ mod tests {
     /// issues is shown two controls the way a widget tree would show them:
     /// the one asked about, and another that holds the keyboard.
     fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+        task_focuses_from(task, control, &widget::Id::new("the control in use"))
+    }
+
+    /// Whether `task` focuses `control` while `holder` has the keyboard, and
+    /// whether `holder` still has it after, following chained operations.
+    fn task_focuses_from(
+        task: Task<Message>,
+        control: &widget::Id,
+        elsewhere: &widget::Id,
+    ) -> (bool, bool) {
         use cosmic::iced::advanced::widget::operation::Focusable;
         use cosmic::iced::futures::StreamExt;
 
@@ -20943,7 +20953,6 @@ mod tests {
 
         let mut asked = Control(false);
         let mut holder = Control(true);
-        let elsewhere = widget::Id::new("the control in use");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -20959,9 +20968,17 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(250), stream.next()).await
             {
                 if let cosmic::iced::runtime::Action::Widget(mut operation) = action {
-                    let bounds = cosmic::iced::Rectangle::default();
-                    operation.focusable(Some(control), bounds, &mut asked);
-                    operation.focusable(Some(&elsewhere), bounds, &mut holder);
+                    loop {
+                        let bounds = cosmic::iced::Rectangle::default();
+                        operation.focusable(Some(control), bounds, &mut asked);
+                        operation.focusable(Some(elsewhere), bounds, &mut holder);
+                        match operation.finish() {
+                            cosmic::iced::advanced::widget::operation::Outcome::Chain(next) => {
+                                operation = next;
+                            }
+                            _ => break,
+                        }
+                    }
                 }
             }
         });
@@ -21012,6 +21029,32 @@ mod tests {
         app.workspace.resize_viewport(1_600.0);
         assert_eq!(app.workspace.focused(), Some(card));
 
+        // While it starts, the pane's title holds the keyboard in the
+        // input's place, and hands it over once the input is drawn.
+        let handle = fixture_handle(&app, card, Some("focused"));
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert_eq!(
+            task_focuses_from(
+                task,
+                &card_control_id(card, "chat-composer"),
+                &app.card_header_widget_id(card),
+            ),
+            (true, false)
+        );
+    }
+
+    /// A control the person chose while the conversation was starting, such
+    /// as sidebar search, keeps the keyboard when it finishes attaching.
+    #[test]
+    fn an_attachment_in_the_focused_pane_leaves_a_chosen_control_alone() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(app.workspace.focused(), Some(card));
+
         let handle = fixture_handle(&app, card, Some("focused"));
         let task = app.update(Message::ChatUi(Action::Ready(
             target,
@@ -21019,7 +21062,7 @@ mod tests {
         )));
         assert_eq!(
             task_focuses(task, &card_control_id(card, "chat-composer")),
-            (true, false)
+            (false, true)
         );
     }
 

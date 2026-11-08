@@ -837,8 +837,9 @@ mod tests {
     fn interaction(tree: &Tree, cursor: mouse::Cursor, renderer: &Renderer) -> mouse::Interaction {
         let size = Size::new(WIDTH, 480.0);
         let mut element = element(Edge::Trailing);
+        let mut layout_tree = Tree::new(&element);
         let node = element.as_widget_mut().layout(
-            &mut Tree::new(&element),
+            &mut layout_tree,
             renderer,
             &layout::Limits::new(Size::ZERO, size),
         );
