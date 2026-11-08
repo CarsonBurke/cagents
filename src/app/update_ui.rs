@@ -242,21 +242,21 @@ impl State {
         }
     }
 
-    /// Whether the warning shown is why the last update was refused, rather
-    /// than how it failed.
-    fn refused(&self) -> bool {
+    /// What held the last update back, while the warning shown is that
+    /// refusal rather than how an update failed.
+    fn refusal(&self) -> Option<&crate::update::impact::Refusal> {
         self.job
             .as_ref()
             .filter(|job| job.phase == UpdatePhase::Failed)
             .and_then(|job| job.refusal.as_ref())
-            .is_some_and(|refusal| self.error.as_ref() == Some(&refusal.summary()))
+            .filter(|refusal| self.error.as_ref() == Some(&refusal.summary()))
     }
 
     /// The header's account of what went wrong with the last update, and
     /// the way on from it.
     fn problem(&self) -> Option<(String, Action)> {
         let error = self.error.as_ref()?;
-        let outcome = if self.refused() {
+        let outcome = if self.refusal().is_some() {
             "Update not installed"
         } else {
             "Update failed"
@@ -582,6 +582,10 @@ impl Cagents {
 
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
         let state = &self.update_ui;
+        // A refusal's summary only counts what held the update back; hovering
+        // names each conversation and why, for a window that never saw the
+        // notice that listed them.
+        let mut reasons = None;
         let (icon, label, action) = if state.updating() {
             (
                 Icon::Update,
@@ -608,6 +612,7 @@ impl Cagents {
                 Some(Message::UpdateUi(Action::Restart)),
             )
         } else if let Some((label, action)) = state.problem() {
+            reasons = state.refusal().map(|refusal| refusal.details().join("\n"));
             (Icon::Warning, label, Some(Message::UpdateUi(action)))
         } else if let Some(UpdateState::Available { release }) = &state.result {
             (
@@ -636,13 +641,14 @@ impl Cagents {
             None => label,
         };
         let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
-        Some(
-            crate::ui_controls::icon_button(icon, label)
-                .selected(true)
-                .on_press_maybe(enabled.then_some(action).flatten())
-                .id(widget::Id::new("application-update"))
-                .into(),
-        )
+        let control = crate::ui_controls::icon_button(icon, label)
+            .selected(true)
+            .on_press_maybe(enabled.then_some(action).flatten())
+            .id(widget::Id::new("application-update"));
+        Some(match reasons {
+            Some(reasons) => crate::interaction::tooltip(control, reasons),
+            None => control.into(),
+        })
     }
 
     /// Asks the release server whether a newer build exists. A check the
@@ -1205,6 +1211,8 @@ mod tests {
             app.update_ui.problem().unwrap().0,
             "Update not installed: 1 session needs attention. Check again"
         );
+        // Hovering the header names each conversation and why.
+        assert_eq!(app.update_ui.refusal(), Some(&refusal));
         // A window watching the review end says why, once.
         let mut reviewing = job.clone();
         reviewing.phase = UpdatePhase::AwaitingConfirmation;

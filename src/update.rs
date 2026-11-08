@@ -637,7 +637,7 @@ pub fn upgrade_installed(
                 && ended_for.as_ref() != Some(&confirmation.nonce)
             {
                 if submitted.is_some() {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                    close_review(&job.id, &confirmation.nonce, false);
                     return Err(invalid(
                         "Update impact changed after approval; review and retry the update.",
                     ));
@@ -679,7 +679,7 @@ pub fn upgrade_installed(
                         match ended {
                             Ok(true) => {}
                             Ok(false) => {
-                                decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                                close_review(&job.id, &confirmation.nonce, ended_any);
                                 return Err(invalid(if accept_unreopenable {
                                     "Resolve the displayed update blockers, then retry. --accept-unreopenable ends only conversations whose provider can no longer be carried."
                                 } else {
@@ -699,7 +699,7 @@ pub fn upgrade_installed(
                     }
                 }
                 if !yes && !confirm_on_terminal("Proceed with this update? [y/N] ")? {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                    close_review(&job.id, &confirmation.nonce, false);
                     return Err(UpdateError::Declined);
                 }
                 decide(&job.id, &confirmation.nonce, UpdateChoice::Confirm)?;
@@ -716,10 +716,12 @@ pub fn upgrade_installed(
 }
 
 /// Cancel the review this CLI showed, which records why the update was not
-/// installed. Once conversations were ended, the worker republishes the
-/// changed impact under a new nonce within a second; closing that one records
-/// what still blocks rather than what was just ended. A newer review someone
-/// already approved, in a window, is theirs to keep.
+/// installed. The worker may have republished it under a new nonce while the
+/// person read it; that review is closed instead, so it does not stay open
+/// until it expires. Once conversations were ended, the worker republishes the
+/// changed impact within a second; closing that one records what still
+/// blocks rather than what was just ended. A newer review someone already
+/// approved, in a window, is theirs to keep.
 fn close_review(job: &str, reviewed: &str, ended_any: bool) {
     let deadline = Instant::now() + Duration::from_secs(if ended_any { 5 } else { 0 });
     loop {
