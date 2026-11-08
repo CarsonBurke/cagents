@@ -252,7 +252,8 @@ fn delivery_lines(delivery: &Delivery) -> String {
 fn recipient_notice(delivery: &Delivery) -> Option<String> {
     let member = delivery.recipient.as_ref()?;
     let now = super::sessions::now_ms();
-    let id = member.session.id;
+    // As the sent line names it, so the two lines read as one.
+    let id = format!("session {}", short(member.session.id));
     if let Some(limit) = &member.limit {
         let held = if limit.resets_at.is_some() {
             "so it holds the message until then"
@@ -703,7 +704,8 @@ mod tests {
         assert_eq!(
             notice,
             format!(
-                "But {id} is stopped by a usage limit (Claude weekly limit reached, resets 3pm), so it holds the message until the limit resets or that conversation continues; no reply can come before."
+                "But session {} is stopped by a usage limit (Claude weekly limit reached, resets 3pm), so it holds the message until the limit resets or that conversation continues; no reply can come before.",
+                short(id)
             )
         );
         let value = delivery_json(&delivery);
@@ -726,7 +728,10 @@ mod tests {
         });
         let notice = recipient_notice(&delivery).unwrap();
         assert!(
-            notice.starts_with(&format!("{id}'s account is out of allowance as last read")),
+            notice.starts_with(&format!(
+                "session {}'s account is out of allowance as last read",
+                short(id)
+            )),
             "{notice}"
         );
         delivery.recipient.as_mut().unwrap().account = None;

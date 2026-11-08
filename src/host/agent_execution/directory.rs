@@ -576,10 +576,14 @@ pub(in crate::host) fn usage_limit(
         }
     }
     let after_failure = |at_ms: u64| failed_at.is_none_or(|failed| at_ms > failed);
-    // A window used up until after the failure. One whose reset has since
-    // passed still counts: that reset is what ends the limit.
+    // A window used up until after the failure that bears on it. One whose
+    // reset has since passed still counts: that reset is what ends the limit.
+    // A model's own window bears on it only when the provider named that
+    // model: one model's allowance running out leaves the others usable.
     let spent_past_failure = |window: &&RemainingWindow| {
         window.remaining_fraction <= 0.0
+            && (window.window.kind != WindowKind::Scoped
+                || names_model(&summary, &window.window.label))
             && window
                 .window
                 .resets_at
@@ -592,6 +596,7 @@ pub(in crate::host) fn usage_limit(
             .filter(spent_past_failure)
     };
     let resets_at = spent().filter_map(|window| window.window.resets_at).max();
+    let model_spent = spent().any(|window| window.window.kind == WindowKind::Scoped);
     let limit = UsageLimit {
         summary,
         reset: failure.reset,
@@ -603,10 +608,9 @@ pub(in crate::host) fn usage_limit(
     // A reading taken after the failure is newer evidence than it, however
     // old that reading has since grown. It lifts the limit when the provider
     // says the account may be used as usual, or else when it shows allowance
-    // and no window spent past the failure. Either way a model's own spent
-    // window still holds it: it leaves the account's status, and Codex's
-    // permission, untouched, yet stops a conversation on that model.
-    let model_spent = spent().any(|window| window.window.kind == WindowKind::Scoped);
+    // and no window spent past the failure. Either way the spent window of a
+    // model the failure named still holds it: it leaves the account's status,
+    // and Codex's permission, untouched, yet stops a conversation on that model.
     let recovered = failed_at.is_some()
         && !model_spent
         && account.is_some_and(|account| {
@@ -617,6 +621,15 @@ pub(in crate::host) fn usage_limit(
                 )
         });
     (!recovered).then_some(limit)
+}
+
+/// Whether a limit's summary names the model a window is scoped to, as
+/// "Claude Opus limit reached" names the window "Weekly · Opus".
+fn names_model(summary: &str, label: &str) -> bool {
+    label
+        .rsplit_once(" · ")
+        .map(|(_, model)| model.trim().to_lowercase())
+        .is_some_and(|model| !model.is_empty() && summary.to_lowercase().contains(&model))
 }
 
 /// Only exact live pane membership supplies a view. Multiple distinct views
@@ -816,16 +829,20 @@ mod tests {
                 ..account_reading(
                     UsageStatus::Warning,
                     failed_at + 60_000,
-                    &[("Model", WindowKind::Scoped, 1.0, weekly_reset)],
+                    &[(
+                        "Weekly · GPT-5.1-Codex-Max",
+                        WindowKind::Scoped,
+                        1.0,
+                        weekly_reset,
+                    )],
                     failed_at + 120_000,
                 )
             }),
             failed_at + 120_000,
         );
         assert_eq!(
-            codex_model_spent.map(|limit| limit.resets_at),
-            Some(Some(weekly_reset)),
-            "permission for ordinary usage does not lift a model's spent window"
+            codex_model_spent, None,
+            "a model's spent window does not hold a limit that did not name it"
         );
 
         // A model's own window used up leaves the account's status Ok, yet
@@ -841,7 +858,7 @@ mod tests {
                     failed_at + 60_000,
                     &[
                         ("Session", WindowKind::Session, 0.1, 1_009_000),
-                        ("Weekly Opus", WindowKind::Scoped, used, weekly_reset),
+                        ("Weekly · Opus", WindowKind::Scoped, used, weekly_reset),
                     ],
                     failed_at + 120_000,
                 )),
@@ -853,6 +870,43 @@ mod tests {
             Some(weekly_reset)
         );
         assert_eq!(opus(0.4), None, "that window with allowance lifts it");
+
+        // Another model's spent window says nothing of a session limit: the
+        // session window dates it, and a reading with allowance lifts it.
+        let session_reset = 1_003_600;
+        let session_limit = |session_used, now| {
+            usage_limit(
+                Provider::Claude,
+                "You've hit your session limit · resets 2pm",
+                Some(failed_at),
+                Some(&account_reading(
+                    UsageStatus::Warning,
+                    failed_at + 60_000,
+                    &[
+                        ("Session", WindowKind::Session, session_used, session_reset),
+                        ("Weekly · Opus", WindowKind::Scoped, 1.0, weekly_reset),
+                    ],
+                    now,
+                )),
+                now,
+            )
+        };
+        assert_eq!(
+            session_limit(1.0, failed_at + 120_000)
+                .expect("the spent session window holds it")
+                .resets_at,
+            Some(session_reset)
+        );
+        assert_eq!(
+            session_limit(1.0, session_reset as u64 * 1000 + 1),
+            None,
+            "the session reset lifts it, not the Opus one"
+        );
+        assert_eq!(
+            session_limit(0.2, failed_at + 120_000),
+            None,
+            "allowance read after the failure lifts it despite Opus"
+        );
 
         // Allowance read before the failure says nothing about after it, and
         // a window that reset before the failure is not the one that ends it.
