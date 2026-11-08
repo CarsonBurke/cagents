@@ -256,3 +256,44 @@ fn a_start_holding_the_allocation_keeps_the_refusal() {
     drop(reservation);
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
 }
+
+/// The state the report left: the same daemon, no record, no receipt, and the
+/// allocation itself already given back.
+#[test]
+fn a_pane_whose_allocation_is_already_gone_closes() {
+    let Some(root) = isolated("a_pane_whose_allocation_is_already_gone_closes") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    std::fs::remove_dir(fixture.socket().parent().unwrap()).unwrap();
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+}
+
+/// A process that names the conversation's listener, such as a server still
+/// starting there or a CLI attached to it, may yet write the conversation.
+#[test]
+fn a_process_naming_the_listener_keeps_the_refusal() {
+    let Some(root) = isolated("a_process_naming_the_listener_keeps_the_refusal") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    struct Killed(std::process::Child);
+    impl Drop for Killed {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let named = Killed(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "sleep 30; :"])
+            .arg(fixture.socket())
+            .spawn()
+            .unwrap(),
+    );
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(fixture.socket().parent().unwrap().exists());
+    drop(named);
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+}

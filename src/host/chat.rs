@@ -1105,12 +1105,16 @@ fn close_lost_codex_owner(host: &SharedHost, session: &Session) -> Result<bool, 
     if let Some(parent) = listener.socket.parent() {
         let _ = std::fs::remove_dir(parent);
     }
-    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-    state.native_closing.remove(&session.id);
-    state.native_adoption_failures.clear(session.id);
-    if let Some(notifications) = &state.notifications {
-        notifications.retire(session.id);
+    // What exact cleanup retires once it has closed an owner.
+    {
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        state.native_adoption_failures.clear(session.id);
+        if let Some(notifications) = &state.notifications {
+            notifications.retire(session.id);
+        }
     }
+    super::state::retire_unattached_upgrade_chat(host, session.id);
+    super::state::retire_recovered_upgrade_chat(host, session.id);
     Ok(true)
 }
 
