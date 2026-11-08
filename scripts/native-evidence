@@ -353,9 +353,20 @@ fixture_env() {
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
-        rm -rf -- "$fixture"
-        if [ -d "$seed" ]; then
-            cp -a --reflink=auto -- "$seed" "$fixture"
+        if [ -d "$seed" ] && [ -d "$fixture" ]; then
+            # Restore the seed into the fixture rather than replacing it: a
+            # chat records its provider home's identity, its device and
+            # inode, and refuses to reopen once that directory is replaced.
+            # Syncing keeps every directory both share, so a conversation
+            # saved in the seed reopens on either side.
+            rsync -aH --delete --force -- "$seed/" "$fixture/"
+        else
+            rm -rf -- "$fixture"
+            if [ -d "$seed" ]; then
+                # The session runs detached; start shows this once it is ready.
+                printf '%s\n' 'the fixture was removed after its seed was saved; chats in the seed recorded the removed provider home and will not reopen, so recreate them and save-seed again' >>"$state/notice"
+                cp -a --reflink=auto -- "$seed" "$fixture"
+            fi
         fi
     fi
     mkdir -p "$fixture"/{bin,home/.claude,data,config,cache,state,project}
@@ -700,11 +711,14 @@ cmd_start() {
         die 'width, lock wait and session limit must be whole numbers' 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     live_session && die 'a session is already running for this task; stop it first'
+    if [ "$keep_state" = false ] && [ -d "$seed" ] && ! command -v rsync >/dev/null 2>&1; then
+        die 'restoring the seed needs rsync, which keeps the directories its chats recorded; install rsync'
+    fi
     # Before anything reads it: the pruner leaves a target written meanwhile.
     mark_used
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"
-    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit"
+    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
@@ -734,6 +748,9 @@ cmd_start() {
     fi
     printf 'session ready: %s at %s, width %s, stopping itself after %s seconds\n' \
         "$side" "$built_revision" "$width" "$limit"
+    if [ -s "$state/notice" ]; then
+        sed 's/^/native-evidence: /' "$state/notice" >&2
+    fi
 }
 
 nested_session_env() {

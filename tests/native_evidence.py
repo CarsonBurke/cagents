@@ -967,6 +967,38 @@ class Evidence(unittest.TestCase):
         self.assertTrue((fixture / "home" / "seeded").exists())
         self.assertFalse((fixture / "home" / "changed-during-after").exists())
 
+    def test_a_seeded_chat_keeps_the_provider_home_it_recorded(self) -> None:
+        # A chat records its provider home's device and inode and refuses to
+        # reopen once that directory is replaced, so restoring a seed must
+        # keep the directories, not recreate them.
+        self.built("after")
+        self.built("before")
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        provider_home = fixture / "home" / ".claude"
+        recorded = provider_home.stat()
+        (provider_home / "session.jsonl").write_text("seeded\n")
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+
+        self.run_tool("start", "before")
+        (provider_home / "session.jsonl").write_text("changed by before\n")
+        (provider_home / "left-by-before").write_text("data")
+        self.run_tool("stop")
+        result = self.run_tool("start", "after")
+        restored = provider_home.stat()
+        self.assertEqual((restored.st_dev, restored.st_ino), (recorded.st_dev, recorded.st_ino))
+        self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
+        self.assertFalse((provider_home / "left-by-before").exists())
+        self.assertNotIn("will not reopen", result.stderr)
+        self.run_tool("stop")
+
+        # A fixture removed meanwhile can't keep them, and the start says so.
+        shutil.rmtree(fixture)
+        result = self.run_tool("start", "before")
+        self.assertIn("chats in the seed recorded the removed provider home", result.stderr)
+        self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
+
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
         self.run_tool("start", "after", "--limit", "1")

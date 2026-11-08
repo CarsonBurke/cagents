@@ -1248,6 +1248,12 @@ harness, it provides:
   behaviors. `env CMD` runs your own setup in this environment, with the fixture's
   root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
+- **Seeded chats reopen.** A chat records its provider home's device and inode
+  and won't reopen once that directory is replaced, so `start` restores the
+  seed into the existing fixture with `rsync --delete` instead of recreating
+  it. A chat saved in the seed therefore reopens on both sides. If the fixture
+  directory is removed after `save-seed`, `start` says the seed's chats will
+  not reopen; recreate them and save the seed again.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
   width and size, so a pair can be compared and named in the PR.
