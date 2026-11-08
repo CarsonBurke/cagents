@@ -227,11 +227,12 @@ fn record_edits(
                 before: Some(idle),
             }
         };
+        let expected_revision = views::read(&registry.db, scope)?.revision;
         seed_commit(
             registry,
             &ModelEdit::ChangeView {
                 scope: scope.clone(),
-                expected_revision: views::read(&registry.db, scope)?.revision,
+                expected_revision,
                 operation: operation(plan, index, number),
                 change,
             },
