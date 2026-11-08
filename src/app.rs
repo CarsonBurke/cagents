@@ -903,8 +903,9 @@ fn quarantined_write_line<'a>(
         },
     };
     let mut line = format!(
-        "{subject} — {} · since {}",
+        "{subject} — {}: {} · since {}",
         write.category.label(),
+        write.check,
         unix_time_label(write.refused_at_unix_ms),
     );
     // Changing the card cannot supersede a refusal of the card
@@ -20682,6 +20683,7 @@ mod tests {
         let refused = |subject| QuarantinedWrite {
             subject,
             category: crate::session::SaveFailureCategory::InvalidData,
+            check: "chat card … changed conversation identity (identity)".into(),
             refused_at_unix_ms: 20,
             held_back: 0,
         };
@@ -20745,6 +20747,7 @@ mod tests {
         let write = |subject| QuarantinedWrite {
             subject,
             category: crate::session::SaveFailureCategory::InvalidData,
+            check: "chat card … changed conversation identity (identity)".into(),
             refused_at_unix_ms: 20,
             held_back: 0,
         };
@@ -20772,6 +20775,12 @@ mod tests {
         assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&pane, &untitled);
         assert!(line.starts_with("Latest changes to a pane ("), "{line}");
+        assert!(
+            line.contains(
+                "— saved state is invalid: chat card … changed conversation identity (identity) · since"
+            ),
+            "the rule storage refused it for is named: {line}"
+        );
 
         let relaunch = write(WriteSubject::CardIdentity {
             card,

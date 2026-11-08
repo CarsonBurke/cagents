@@ -1,6 +1,7 @@
 //! Durable setup choices, independent of execution or UI state.
 
 use super::*;
+use crate::persistence::{Violation, invalid_state};
 
 /// Exact configuration reviewed for one creation. Execution still reloads and
 /// verifies this snapshot through `worktree_setup` before preparing commands.
@@ -31,11 +32,8 @@ pub struct WorktreeSetupIntent {
 
 fn settled_setup_journal(operation: &PendingOperation) -> Result<WorktreeJournal, StoreError> {
     let creation_id = operation.id;
-    let invalid = || {
-        StoreError::InvalidState(format!(
-            "worktree creation {creation_id} is not a valid settled creation"
-        ))
-    };
+    let invalid =
+        || invalid_state!("worktree creation {creation_id} is not a valid settled creation");
     let journal: WorktreeJournal = serde_json::from_value(operation.payload.clone())?;
     let paths = [
         &journal.common_dir,
@@ -97,7 +95,12 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         };
         let journal = settled_setup_journal(&operation)?;
         self.validate_created_pr_checkout(&journal)
-            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            .map_err(|error| {
+                StoreError::InvalidState(Violation::new(
+                    "created pull request checkout failed validation",
+                    error.to_string(),
+                ))
+            })?;
         Ok(Some(journal.report(operation.created_at_unix_ms)))
     }
 
@@ -113,16 +116,19 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     ) -> Result<WorktreeOperationReport, StoreError> {
         let operation = store
             .journaled_worktree_operation(creation_id)?
-            .ok_or_else(|| {
-                StoreError::InvalidState(format!("worktree creation {creation_id} is missing"))
-            })?;
+            .ok_or_else(|| invalid_state!("worktree creation {creation_id} is missing"))?;
         let mut journal = settled_setup_journal(&operation)?;
         self.validate_created_pr_checkout(&journal)
-            .map_err(|error| StoreError::InvalidState(error.to_string()))?;
+            .map_err(|error| {
+                StoreError::InvalidState(Violation::new(
+                    "created pull request checkout failed validation",
+                    error.to_string(),
+                ))
+            })?;
         if journal.request.setup_intent.as_ref() != expected {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "stale setup intent for worktree creation {creation_id}"
-            )));
+            ));
         }
         journal.request.setup_intent = Some(updated);
         journal.persist(store, &operation.payload)?;

@@ -29,8 +29,12 @@ use crate::{
     },
 };
 
+mod refusal;
 #[cfg(feature = "ui")]
 mod review_cache;
+
+pub(crate) use refusal::invalid_state;
+pub use refusal::{RefusedCheck, Violation};
 
 // Format 12 introduces retained Claude descriptors that older readers cannot
 // decode safely. Admission must reject them before partial workspace loading
@@ -76,8 +80,9 @@ pub enum StoreError {
         expected: u64,
         actual: u64,
     },
+    /// A write that breaks one of storage's rules; see [`invalid_state!`].
     #[error("invalid state: {0}")]
-    InvalidState(String),
+    InvalidState(Violation),
     /// Data decoded from storage, rather than content supplied by a writer.
     #[error("corrupt stored {field}: {reason}")]
     CorruptRow { field: String, reason: String },
@@ -105,11 +110,8 @@ impl StoreError {
     }
 
     /// Whether storage refuses a write because of what the write contains, so
-    /// offering the same content again can only fail the same way.
-    ///
-    /// Everything else is a condition of storage itself - a lock, a full disk,
-    /// a read-only or corrupt file, a base generation that fell behind - which
-    /// a retry can outlast and which every other write would hit too.
+    /// offering the same content again can only fail the same way; see
+    /// [`StoreError::refused_check`].
     ///
     /// A foreign-key violation is a refusal too. The only parent a caller can
     /// send a write ahead of is a worktree's project, and the session writer
@@ -117,25 +119,7 @@ impl StoreError {
     /// never deleted, since closing one stores a tombstone. A missing parent
     /// anywhere else is a fault in the write itself.
     pub fn refuses_content(&self) -> bool {
-        use rusqlite::ErrorCode;
-
-        match self {
-            Self::Card { error, .. } => error.refuses_content(),
-            Self::InvalidState(_) | Self::Serialization(_) => true,
-            Self::Sqlite(rusqlite::Error::SqliteFailure(error, _)) => matches!(
-                error.code,
-                ErrorCode::ConstraintViolation | ErrorCode::TooBig | ErrorCode::TypeMismatch
-            ),
-            // Decode/missing-row failures describe storage, not this write's
-            // content. Quarantining the write would silently strand valid edits.
-            Self::Sqlite(_) | Self::CorruptRow { .. } | Self::InvalidUuid { .. } => false,
-            Self::Io(_)
-            | Self::UnsupportedSchema { .. }
-            | Self::StaleGeneration { .. }
-            | Self::InvalidBusyTimeout { .. }
-            | Self::MutexPoisoned
-            | Self::Closed => false,
-        }
+        self.refused_check().is_some()
     }
 
     /// Attributes this error to `card`. A stale generation stays as it is:
@@ -362,21 +346,24 @@ impl RetainedChatCopy {
             || !self.source.has_valid_native_continuity()
             || (self.source.owned_codex_listener.is_some() && !self.source.owns_codex_listener())
         {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy changed its captured source".into(),
+            return Err(invalid_state!(
+                "Retained chat copy changed its captured source"
             ));
         }
         let mut identities = std::collections::HashSet::new();
         for attachment in &self.attachments {
             let reference = attachment.reference.as_ref().ok_or_else(|| {
-                StoreError::InvalidState(
-                    "Retained image copies require explicit image identity".into(),
-                )
+                invalid_state!("Retained image copies require explicit image identity")
             })?;
-            reference.validate().map_err(StoreError::InvalidState)?;
+            reference.validate().map_err(|message| {
+                StoreError::InvalidState(Violation::new(
+                    "Retained image copy has an invalid image reference",
+                    message,
+                ))
+            })?;
             if !identities.insert((reference.device, reference.id)) {
-                return Err(StoreError::InvalidState(
-                    "Retained image copy repeats an image identity".into(),
+                return Err(invalid_state!(
+                    "Retained image copy repeats an image identity"
                 ));
             }
         }
@@ -388,8 +375,8 @@ impl RetainedChatCopy {
     pub(crate) fn project(&self, state: &mut WorkspaceState) -> Result<()> {
         self.validate()?;
         if state.id != self.workspace {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy belongs to another workspace".into(),
+            return Err(invalid_state!(
+                "Retained chat copy belongs to another workspace"
             ));
         }
         if let Some(card) = state.cards.iter().find(|card| card.id == self.copy.id) {
@@ -397,8 +384,8 @@ impl RetainedChatCopy {
                 return Ok(());
             }
             if card.kind != self.copy.kind {
-                return Err(StoreError::InvalidState(
-                    "Retained chat copy source changed before saving".into(),
+                return Err(invalid_state!(
+                    "Retained chat copy source changed before saving"
                 ));
             }
         } else {
@@ -409,8 +396,8 @@ impl RetainedChatCopy {
             .get(&self.copy.id)
             .is_some_and(|draft| draft != &self.draft)
         {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy text changed before saving".into(),
+            return Err(invalid_state!(
+                "Retained chat copy text changed before saving"
             ));
         }
         if state
@@ -418,8 +405,8 @@ impl RetainedChatCopy {
             .get(&self.copy.id)
             .is_some_and(|attachments| attachments != &self.attachments)
         {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy images changed before saving".into(),
+            return Err(invalid_state!(
+                "Retained chat copy images changed before saving"
             ));
         }
         state.chat_drafts.insert(self.copy.id, self.draft.clone());
@@ -543,8 +530,11 @@ fn validate_terminal_ownership_recovery(
     base: SnapshotBase<'_>,
     recovery: TerminalPaneAdoption,
 ) -> Result<()> {
-    let invalid = |reason: &str| {
-        StoreError::InvalidState(format!("terminal ownership recovery refused: {reason}"))
+    let invalid = |reason: &'static str| {
+        StoreError::InvalidState(Violation::new(
+            reason,
+            format!("terminal ownership recovery refused: {reason}"),
+        ))
     };
     if base.cards.contains_key(&recovery.canonical)
         || transaction.query_row(
@@ -684,7 +674,7 @@ impl StateStore {
         enforce_private_database(source)?;
         let parent = destination
             .parent()
-            .ok_or_else(|| StoreError::InvalidState("window database has no parent".into()))?;
+            .ok_or_else(|| invalid_state!("window database has no parent"))?;
         prepare_private_directory(parent)?;
         let temporary = tempfile::Builder::new()
             .prefix(".window-")
@@ -721,9 +711,7 @@ impl StateStore {
 
     pub fn save_dismissed_update(&self, identity: &str) -> Result<()> {
         if identity.is_empty() || identity.len() > 4096 {
-            return Err(StoreError::InvalidState(
-                "invalid update notice identity".into(),
-            ));
+            return Err(invalid_state!("invalid update notice identity"));
         }
         let mut inner = self.lock_inner()?;
         ensure_open(&inner)?;
@@ -755,9 +743,7 @@ impl StateStore {
         options: StoreOptions,
     ) -> Result<Self> {
         if boot_id.as_str().is_empty() {
-            return Err(StoreError::InvalidState(
-                "current boot ID must not be empty".into(),
-            ));
+            return Err(invalid_state!("current boot ID must not be empty"));
         }
         if options.busy_timeout.is_zero() || options.busy_timeout > MAX_BUSY_TIMEOUT {
             return Err(StoreError::InvalidBusyTimeout {
@@ -899,18 +885,14 @@ impl StateStore {
         expected_historical_launch: Option<&crate::model::LaunchRecipe>,
     ) -> Result<Option<WorkspaceCommit>> {
         let CardKind::Terminal(session) = &canonical.kind else {
-            return Err(StoreError::InvalidState(
-                "canonical pane must be a terminal".into(),
-            ));
+            return Err(invalid_state!("canonical pane must be a terminal"));
         };
         if !canonical.existence.is_open()
             || !canonical.width_fraction.is_finite()
             || canonical.width_fraction <= 0.0
             || boot_id.as_str().is_empty()
         {
-            return Err(StoreError::InvalidState(
-                "invalid canonical pane repair".into(),
-            ));
+            return Err(invalid_state!("invalid canonical pane repair"));
         }
         let mut connection = Connection::open_with_flags(
             path,
@@ -922,15 +904,11 @@ impl StateStore {
         connection.pragma_update(None, "foreign_keys", "ON")?;
         let version: u32 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         if version != CURRENT_SCHEMA_VERSION {
-            return Err(StoreError::InvalidState(
-                "repair requires the current store schema".into(),
-            ));
+            return Err(invalid_state!("repair requires the current store schema"));
         }
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         if metadata(&transaction, "last_boot_id")?.as_deref() != Some(boot_id.as_str()) {
-            return Err(StoreError::InvalidState(
-                "repair requires the store's current boot".into(),
-            ));
+            return Err(invalid_state!("repair requires the store's current boot"));
         }
         let workspace_id = workspace.to_string();
         let actual = select_generation(&transaction, SELECT_WORKSPACE_GENERATION, &workspace_id)?;
@@ -938,9 +916,7 @@ impl StateStore {
         if !select_existence(&transaction, SELECT_WORKSPACE_EXISTENCE, &workspace_id)?
             .is_some_and(|existence| existence.is_open())
         {
-            return Err(StoreError::InvalidState(
-                "repair requires an open workspace".into(),
-            ));
+            return Err(invalid_state!("repair requires an open workspace"));
         }
         let owner: Option<(String, String)> = transaction
             .query_row(
@@ -951,14 +927,10 @@ impl StateStore {
             )
             .optional()?;
         let Some((owner, owner_workspace)) = owner else {
-            return Err(StoreError::InvalidState(
-                "terminal has no historical owner".into(),
-            ));
+            return Err(invalid_state!("terminal has no historical owner"));
         };
         if owner_workspace != workspace_id {
-            return Err(StoreError::InvalidState(
-                "terminal belongs to another workspace".into(),
-            ));
+            return Err(invalid_state!("terminal belongs to another workspace"));
         }
         let alias: CardId = parse_id("terminal owner", &owner)?;
         let stored = existing_cards(&transaction, &workspace_id)?;
@@ -970,8 +942,8 @@ impl StateStore {
         if !matches!(source.existence, Existence::Closed { .. })
             || source.kind != PersistedCardKind::Terminal
         {
-            return Err(StoreError::InvalidState(
-                "repair requires an already-closed terminal owner".into(),
+            return Err(invalid_state!(
+                "repair requires an already-closed terminal owner"
             ));
         }
         check_generation(
@@ -982,15 +954,13 @@ impl StateStore {
         )?;
         if let Some(target) = stored.get(&canonical.id) {
             if !target.existence.is_open() || target.kind != PersistedCardKind::Terminal {
-                return Err(StoreError::InvalidState(
-                    "repair cannot replace or resurrect a canonical pane".into(),
+                return Err(invalid_state!(
+                    "repair cannot replace or resurrect a canonical pane"
                 ));
             }
             let target_session = load_terminal_record(&transaction, canonical.id)?;
             if target_session.id != session.id {
-                return Err(StoreError::InvalidState(
-                    "canonical pane owns a different terminal".into(),
-                ));
+                return Err(invalid_state!("canonical pane owns a different terminal"));
             }
         }
         let expected_target = base.cards.get(&canonical.id).copied().unwrap_or(0);
@@ -1002,8 +972,8 @@ impl StateStore {
         )?;
         let archived = load_terminal_record(&transaction, alias)?;
         if expected_historical_launch.is_some_and(|expected| archived.launch != *expected) {
-            return Err(StoreError::InvalidState(
-                "historical launch changed since offline repair review".into(),
+            return Err(invalid_state!(
+                "historical launch changed since offline repair review"
             ));
         }
         let reviewed_offline_recipe = expected_historical_launch.is_some_and(|expected|
@@ -1012,8 +982,8 @@ impl StateStore {
                 && matches!(&session.continuity,TerminalContinuity::RelaunchAvailable {recipe,..} if recipe==&session.launch)
         );
         if expected_historical_launch.is_some() && !reviewed_offline_recipe {
-            return Err(StoreError::InvalidState(
-                "reviewed recipe repair requires the same directory and offline continuity".into(),
+            return Err(invalid_state!(
+                "reviewed recipe repair requires the same directory and offline continuity"
             ));
         }
         if (archived.launch != session.launch && !reviewed_offline_recipe)
@@ -1023,9 +993,8 @@ impl StateStore {
             || archived.resume_hint != session.resume_hint
             || archived.transcript_path != session.transcript_path
         {
-            return Err(StoreError::InvalidState(
+            return Err(invalid_state!(
                 "canonical pane must preserve the historical terminal's identity and transcript"
-                    .into(),
             ));
         }
         let timestamp = now_unix_ms();
@@ -1051,8 +1020,8 @@ impl StateStore {
             params![canonical.id.to_string(), workspace_id],
             |row| row.get(0),
         )?;
-        let ordinal = usize::try_from(ordinal)
-            .map_err(|_| StoreError::InvalidState("invalid card ordinal".into()))?;
+        let ordinal =
+            usize::try_from(ordinal).map_err(|_| invalid_state!("invalid card ordinal"))?;
         let target_generation = save_card(
             &transaction,
             &workspace_id,
@@ -1157,7 +1126,7 @@ impl StateStore {
             if !state.cards.iter().any(|card| card.id == restoration.canonical
                 && card.existence.is_open()
                 && matches!(&card.kind, CardKind::Terminal(session) if session.id == restoration.terminal)) {
-                return Err(StoreError::InvalidState("terminal restoration needs its exact open canonical pane".into()));
+                return Err(invalid_state!("terminal restoration needs its exact open canonical pane"));
             }
             if let Some(adoption) = select_closed_terminal_adoption(
                 &transaction,
@@ -1174,25 +1143,20 @@ impl StateStore {
                 .cards
                 .iter()
                 .find(|card| card.id == adoption.alias)
-                .ok_or_else(|| {
-                    StoreError::InvalidState("pane adoption needs its closed alias".into())
-                })?;
+                .ok_or_else(|| invalid_state!("pane adoption needs its closed alias"))?;
             let target = state
                 .cards
                 .iter()
                 .find(|card| card.id == adoption.canonical)
-                .ok_or_else(|| {
-                    StoreError::InvalidState("pane adoption needs its canonical pane".into())
-                })?;
+                .ok_or_else(|| invalid_state!("pane adoption needs its canonical pane"))?;
             if adoption.alias == adoption.canonical
                 || source.existence.is_open()
                 || !target.existence.is_open()
                 || !matches!(&source.kind, CardKind::Terminal(session) if session.id == adoption.terminal)
                 || !matches!(&target.kind, CardKind::Terminal(session) if session.id == adoption.terminal)
             {
-                return Err(StoreError::InvalidState(
+                return Err(invalid_state!(
                     "pane adoption must retain an exact terminal identity and retire its alias"
-                        .into(),
                 ));
             }
             let owner: Option<String> = transaction
@@ -1214,9 +1178,7 @@ impl StateStore {
                 .optional()?;
             let Some((workspace, generation)) = row else {
                 if owner.is_some() {
-                    return Err(StoreError::InvalidState(
-                        "terminal is owned by an unrelated pane".into(),
-                    ));
+                    return Err(invalid_state!("terminal is owned by an unrelated pane"));
                 }
                 // Inventory discovery may not have been written yet. There is
                 // no historical row to archive or resurrect in this case.
@@ -1226,8 +1188,8 @@ impl StateStore {
             if workspace != state.id.to_string()
                 || owner.as_deref() != Some(&adoption.alias.to_string())
             {
-                return Err(StoreError::InvalidState(
-                    "pane adoption cannot take another pane's resource".into(),
+                return Err(invalid_state!(
+                    "pane adoption cannot take another pane's resource"
                 ));
             }
             let expected = base.cards.get(&adoption.alias).copied().unwrap_or(0);
@@ -1250,8 +1212,8 @@ impl StateStore {
                 ],
             )?;
             if moved != 1 {
-                return Err(StoreError::InvalidState(
-                    "terminal ownership changed during pane adoption".into(),
+                return Err(invalid_state!(
+                    "terminal ownership changed during pane adoption"
                 ));
             }
             transaction.execute(INVALIDATE_CARD_HASH, [adoption.canonical.to_string()])?;
@@ -1404,8 +1366,8 @@ impl StateStore {
                 .as_ref()
                 .is_some_and(HostSessionProof::is_complete)
         {
-            return Err(StoreError::InvalidState(
-                "Account recovery has no exact confirmed conversation".into(),
+            return Err(invalid_state!(
+                "Account recovery has no exact confirmed conversation"
             ));
         }
         self.rebind_chat_descriptor(card_id, source, replacement)
@@ -1422,8 +1384,8 @@ impl StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<()> {
         if !crate::chat::is_retained_resume_commit(source, replacement) {
-            return Err(StoreError::InvalidState(
-                "The resumed conversation is not the exact successor of the saved one".into(),
+            return Err(invalid_state!(
+                "The resumed conversation is not the exact successor of the saved one"
             ));
         }
         self.rebind_chat_descriptor(card_id, source, replacement)
@@ -1449,8 +1411,8 @@ impl StateStore {
         ) || !(crate::chat::is_upgrade_recovery(source, replacement)
             || crate::chat::is_upgrade_identity_learning(source, replacement))
         {
-            return Err(StoreError::InvalidState(
-                "Upgrade recovery changed the saved conversation configuration or lacks complete distinct ownership proofs".into(),
+            return Err(invalid_state!(
+                "Upgrade recovery changed the saved conversation configuration or lacks complete distinct ownership proofs"
             ));
         }
         self.rebind_chat_descriptor(card_id, source, replacement)
@@ -1465,8 +1427,8 @@ impl StateStore {
         recovery: &crate::chat::client::UpgradeRecovery,
     ) -> Result<()> {
         if !recovery.validate() {
-            return Err(StoreError::InvalidState(
-                "Invalid authenticated chat recovery witness".into(),
+            return Err(invalid_state!(
+                "Invalid authenticated chat recovery witness"
             ));
         }
         self.rebind_chat_descriptor(card_id, recovery.source(), recovery.replacement())
@@ -1492,8 +1454,8 @@ impl StateStore {
         if kind != PersistedCardKind::Chat.as_str()
             || !from_json::<Existence>("card existence", &existence)?.is_open()
         {
-            return Err(StoreError::InvalidState(
-                "The recovery card is no longer an open chat".into(),
+            return Err(invalid_state!(
+                "The recovery card is no longer an open chat"
             ));
         }
         let stored: crate::chat::Session = from_json(
@@ -1507,8 +1469,8 @@ impl StateStore {
             return Ok(());
         }
         if &stored != source {
-            return Err(StoreError::InvalidState(
-                "The saved conversation changed before recovery committed".into(),
+            return Err(invalid_state!(
+                "The saved conversation changed before recovery committed"
             ));
         }
         transaction.execute(
@@ -1533,15 +1495,11 @@ impl StateStore {
         require_current_descriptor_write(&transaction)?;
         let workspace = copy.workspace.to_string();
         let generation = select_generation(&transaction, SELECT_WORKSPACE_GENERATION, &workspace)?
-            .ok_or_else(|| {
-                StoreError::InvalidState("Retained chat copy needs its existing workspace".into())
-            })?;
+            .ok_or_else(|| invalid_state!("Retained chat copy needs its existing workspace"))?;
         if !select_existence(&transaction, SELECT_WORKSPACE_EXISTENCE, &workspace)?
             .is_some_and(|existence| existence.is_open())
         {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy workspace is closed".into(),
-            ));
+            return Err(invalid_state!("Retained chat copy workspace is closed"));
         }
         let owner: Option<String> = transaction
             .query_row(
@@ -1551,8 +1509,8 @@ impl StateStore {
             )
             .optional()?;
         if owner.as_deref() != Some(workspace.as_str()) {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy origin is outside this workspace".into(),
+            return Err(invalid_state!(
+                "Retained chat copy origin is outside this workspace"
             ));
         }
         let receipt_key = format!("workspace:{workspace}:retained_chat_copy:{}", copy.copy.id);
@@ -1561,9 +1519,7 @@ impl StateStore {
         // draft text or account configuration after an explicit discard.
         let digest = format!("{:x}", sha2::Sha256::digest(to_json(copy)?.as_bytes()));
         let mut manifest = load_workspace_manifest_connection(&transaction, copy.workspace)?
-            .ok_or_else(|| {
-                StoreError::InvalidState("Retained chat copy workspace disappeared".into())
-            })?;
+            .ok_or_else(|| invalid_state!("Retained chat copy workspace disappeared"))?;
         let existing = existing_cards(&transaction, &workspace)?;
         if let Some(receipt) = metadata(&transaction, &receipt_key)? {
             if receipt != digest
@@ -1587,8 +1543,8 @@ impl StateStore {
                         .iter()
                         .any(|channel| channel.cards.contains(&copy.copy.id)))
             {
-                return Err(StoreError::InvalidState(
-                    "Retained chat copy retry changed its committed payload".into(),
+                return Err(invalid_state!(
+                    "Retained chat copy retry changed its committed payload"
                 ));
             }
             return Ok(WorkspaceCommit {
@@ -1607,8 +1563,8 @@ impl StateStore {
             .optional()?
             .is_some()
         {
-            return Err(StoreError::InvalidState(
-                "Retained chat copy identity is already occupied".into(),
+            return Err(invalid_state!(
+                "Retained chat copy identity is already occupied"
             ));
         }
         let ordinal: usize = transaction.query_row(
@@ -1982,9 +1938,7 @@ impl StateStore {
                 let (id, title, content, existence, updated_at_unix_ms) = row?;
                 let session: crate::chat::Session = from_json("saved conversation", &content)?;
                 if !session.has_valid_native_continuity() {
-                    return Err(StoreError::InvalidState(
-                        "Invalid saved native continuity".into(),
-                    ));
+                    return Err(invalid_state!("Invalid saved native continuity"));
                 }
                 if session.launch.session_id.is_none() {
                     return Ok(None);
@@ -2212,8 +2166,8 @@ impl StateStore {
 
     pub fn begin_operation(&self, operation: &PendingOperation) -> Result<()> {
         if operation.status != PendingOperationStatus::Pending {
-            return Err(StoreError::InvalidState(
-                "new journal operations must have pending status".into(),
+            return Err(invalid_state!(
+                "new journal operations must have pending status"
             ));
         }
         let mut inner = self.lock_inner()?;
@@ -2232,9 +2186,7 @@ impl StateStore {
                 |row| row.get(0),
             )?;
             if occupied {
-                return Err(StoreError::InvalidState(
-                    "worktree operation lease is occupied".into(),
-                ));
+                return Err(invalid_state!("worktree operation lease is occupied"));
             }
         }
         transaction.execute(
@@ -2267,8 +2219,8 @@ impl StateStore {
             resolution,
             PendingOperationStatus::Applied | PendingOperationStatus::RolledBack
         ) {
-            return Err(StoreError::InvalidState(
-                "journal resolution must be applied or rolled_back".into(),
+            return Err(invalid_state!(
+                "journal resolution must be applied or rolled_back"
             ));
         }
         let inner = self.lock_inner()?;
@@ -2280,9 +2232,9 @@ impl StateStore {
             params![resolution.as_str(), now_unix_ms(), id.to_string()],
         )?;
         if changed == 0 {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "operation {id} is missing or already resolved"
-            )));
+            ));
         }
         Ok(())
     }
@@ -2300,9 +2252,9 @@ impl StateStore {
             params![id.to_string()],
         )?;
         if changed == 0 {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "operation {id} is not an applied worktree creation"
-            )));
+            ));
         }
         Ok(())
     }
@@ -2332,9 +2284,7 @@ impl StateStore {
             ],
         )?;
         if changed != 1 {
-            return Err(StoreError::InvalidState(format!(
-                "stale or resolved operation {id}"
-            )));
+            return Err(invalid_state!("stale or resolved operation {id}"));
         }
         Ok(())
     }
@@ -2685,8 +2635,8 @@ impl MigrationInspectionBudget {
 
     fn check_deadline(&self) -> Result<()> {
         if Instant::now() >= self.deadline {
-            return Err(StoreError::InvalidState(
-                "Saved pane inspection exceeded its bounded budget".into(),
+            return Err(invalid_state!(
+                "Saved pane inspection exceeded its bounded budget"
             ));
         }
         Ok(())
@@ -2695,8 +2645,8 @@ impl MigrationInspectionBudget {
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         self.check_deadline()?;
         if self.remaining_rows == 0 || bytes > self.remaining_bytes {
-            return Err(StoreError::InvalidState(
-                "Saved pane inventory exceeds the migration inspection limit".into(),
+            return Err(invalid_state!(
+                "Saved pane inventory exceeds the migration inspection limit"
             ));
         }
         self.remaining_rows -= 1;
@@ -2741,19 +2691,18 @@ pub(crate) fn read_open_migration_sessions_with_budget(
             return Ok(T::default());
         };
         if bytes > 4 * 1024 * 1024 {
-            return Err(StoreError::InvalidState(
-                "Saved pane admission metadata exceeds the migration inspection limit".into(),
+            return Err(invalid_state!(
+                "Saved pane admission metadata exceeds the migration inspection limit"
             ));
         }
         if bytes > budget.remaining_bytes {
-            return Err(StoreError::InvalidState(
-                "Saved pane inventory exceeds the migration inspection limit".into(),
+            return Err(invalid_state!(
+                "Saved pane inventory exceeds the migration inspection limit"
             ));
         }
         budget.remaining_bytes -= bytes;
-        let value = metadata(transaction, &key)?.ok_or_else(|| {
-            StoreError::InvalidState("Saved pane admission metadata disappeared".into())
-        })?;
+        let value = metadata(transaction, &key)?
+            .ok_or_else(|| invalid_state!("Saved pane admission metadata disappeared"))?;
         let value = from_json("saved pane admission metadata", &value)?;
         budget.check_deadline()?;
         Ok(value)
@@ -2835,8 +2784,8 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                 if !source.has_valid_native_continuity()
                     || (source.owned_codex_listener.is_some() && !source.owns_codex_listener())
                 {
-                    return Err(StoreError::InvalidState(
-                        "Retained saved pane has invalid native continuity".into(),
+                    return Err(invalid_state!(
+                        "Retained saved pane has invalid native continuity"
                     ));
                 }
                 continue;
@@ -2899,8 +2848,8 @@ pub(crate) fn read_migration_session_at(
                 })?,
         )
         .map(CardKind::Chat),
-        _ => Err(StoreError::InvalidState(
-            "Migration inspection requires a saved native or terminal pane".into(),
+        _ => Err(invalid_state!(
+            "Migration inspection requires a saved native or terminal pane"
         )),
     }
 }
@@ -2964,10 +2913,11 @@ pub fn read_project_session_owners(path: &Path) -> Result<Vec<(TerminalId, Saved
                     projects
                         .get(&channel.project_id)
                         .ok_or_else(|| {
-                            StoreError::InvalidState(format!(
+                            invalid_state!(
                                 "channel {} refers to missing project {}",
-                                channel.id, channel.project_id
-                            ))
+                                channel.id,
+                                channel.project_id
+                            )
                         })?
                         .clone(),
                 ));
@@ -3110,16 +3060,16 @@ fn prune_transcript_directory(
     let mut report = TranscriptPruneReport::default();
     match std::fs::symlink_metadata(directory) {
         Ok(metadata) if metadata.file_type().is_symlink() => {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "transcript directory {} is a symbolic link",
                 directory.display()
-            )));
+            ));
         }
         Ok(metadata) if !metadata.is_dir() => {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "transcript path {} is not a directory",
                 directory.display()
-            )));
+            ));
         }
         Ok(_) => {}
         // Nothing has ever written a transcript here. Not an error.
@@ -3310,23 +3260,23 @@ fn verify_connection_profile(connection: &Connection) -> Result<()> {
     let foreign_keys: i64 =
         connection.pragma_query_value(None, "foreign_keys", |row| row.get(0))?;
     if foreign_keys != 1 {
-        return Err(StoreError::InvalidState(
-            "SQLite foreign key enforcement could not be enabled".into(),
+        return Err(invalid_state!(
+            "SQLite foreign key enforcement could not be enabled"
         ));
     }
     let journal_mode: String =
         connection.pragma_query_value(None, "journal_mode", |row| row.get(0))?;
     if !journal_mode.eq_ignore_ascii_case("wal") {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "SQLite journal mode is `{journal_mode}`, but write-ahead logging is required"
-        )));
+        ));
     }
     // 0 = OFF, 1 = NORMAL, 2 = FULL, 3 = EXTRA.
     let synchronous: i64 = connection.pragma_query_value(None, "synchronous", |row| row.get(0))?;
     if synchronous != 1 {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "SQLite synchronous mode is {synchronous}, but NORMAL (1) is required"
-        )));
+        ));
     }
     Ok(())
 }
@@ -3339,8 +3289,8 @@ fn verify_connection_profile(connection: &Connection) -> Result<()> {
 // this helper until they explicitly adopt it.
 fn require_current_descriptor_write(transaction: &Transaction<'_>) -> Result<()> {
     if transaction.transaction_state(Some("main"))? != rusqlite::TransactionState::Write {
-        return Err(StoreError::InvalidState(
-            "Descriptor replacement requires the main StateStore writer reservation".into(),
+        return Err(invalid_state!(
+            "Descriptor replacement requires the main StateStore writer reservation"
         ));
     }
     let found: u32 = transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
@@ -3351,9 +3301,9 @@ fn require_current_descriptor_write(transaction: &Transaction<'_>) -> Result<()>
         });
     }
     if found != CURRENT_SCHEMA_VERSION {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "Descriptor replacement requires current StateStore schema {CURRENT_SCHEMA_VERSION}, found {found}"
-        )));
+        ));
     }
     verify_connection_profile(transaction)
 }
@@ -3491,9 +3441,7 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .next()?
             .is_some();
         if violation {
-            return Err(StoreError::InvalidState(
-                "migration violates foreign keys".into(),
-            ));
+            return Err(invalid_state!("migration violates foreign keys"));
         }
         transaction.pragma_update(None, "user_version", CURRENT_SCHEMA_VERSION)?;
         transaction.commit()?;
@@ -4201,9 +4149,9 @@ fn save_card(
             .optional()?
             && other != workspace_id
         {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "card {card_id} already belongs to workspace {other}"
-            )));
+            ));
         }
     }
 
@@ -4211,9 +4159,9 @@ fn save_card(
         if matches!(stored.existence, Existence::Closed { .. })
             && !matches!(card.existence, Existence::Closed { .. })
         {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "tombstoned card {card_id} cannot be resurrected"
-            )));
+            ));
         }
         if expected != stored.generation {
             return Err(StoreError::StaleGeneration {
@@ -4397,12 +4345,7 @@ fn validate_card_conversion(
     card: &CardState,
     previous: PersistedCardKind,
 ) -> Result<()> {
-    let invalid = || {
-        StoreError::InvalidState(format!(
-            "card {} has an invalid chat/terminal conversion",
-            card.id
-        ))
-    };
+    let invalid = || invalid_state!("card {} has an invalid chat/terminal conversion", card.id);
     match (previous, &card.kind) {
         (PersistedCardKind::Terminal, CardKind::Chat(session)) => {
             let source = session.terminal.as_ref().ok_or_else(invalid)?;
@@ -4524,23 +4467,21 @@ fn validate_chat_identity(
     previous: Option<PersistedCardKind>,
 ) -> Result<()> {
     if !session.has_valid_native_continuity() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "chat card {card} has invalid native continuity evidence"
-        )));
+        ));
     }
     if session.owned_codex_listener.is_some() && !session.owns_codex_listener() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "chat card {card} has invalid owned listener evidence"
-        )));
+        ));
     }
     if session
         .terminal
         .as_ref()
         .is_some_and(|source| source.id != session.id)
     {
-        return Err(StoreError::InvalidState(format!(
-            "chat card {card} changed source identity"
-        )));
+        return Err(invalid_state!("chat card {card} changed source identity"));
     }
     if previous == Some(PersistedCardKind::Chat) {
         let content: String = transaction.query_row(
@@ -4550,13 +4491,13 @@ fn validate_chat_identity(
         )?;
         let stored: crate::chat::Session = from_json("chat card", &content)?;
         let changed = if stored.id != session.id {
-            Some("identity")
+            Some("changed conversation identity (identity)")
         } else if stored.launch.provider != session.launch.provider {
-            Some("provider")
+            Some("changed conversation identity (provider)")
         } else if stored.native_continuity.retains_provider()
             && stored.native_continuity != session.native_continuity
         {
-            Some("native continuity")
+            Some("changed conversation identity (native continuity)")
         } else if stored.owned_codex_listener != session.owned_codex_listener
             && !(stored.owned_codex_listener.is_none()
                 && session.owns_codex_listener()
@@ -4565,7 +4506,7 @@ fn validate_chat_identity(
                     .as_ref()
                     .is_some_and(HostSessionProof::is_complete))
         {
-            Some("owned listener")
+            Some("changed conversation identity (owned listener)")
         } else if stored.launch.recipe != session.launch.recipe
             // Before it begins, a chat's recipe holds only launch options -
             // account, model, permissions - and no conversation to protect.
@@ -4575,7 +4516,7 @@ fn validate_chat_identity(
             // endpoint where it had asked for one.
             && !stored.resolved_to_owned_codex_listener(session)
         {
-            Some("launch recipe")
+            Some("changed conversation identity (launch recipe)")
         } else if stored.terminal != session.terminal
             && !session.retains_native_pair_from(&stored)
             && !(stored.terminal.is_none()
@@ -4584,18 +4525,19 @@ fn validate_chat_identity(
                     .as_ref()
                     .is_some_and(|view| codex_cli_view(session, view)))
         {
-            Some("source terminal")
+            Some("changed conversation identity (source terminal)")
         } else if stored.launch.session_id != session.launch.session_id
             && (stored.launch.session_id.is_some() || stored.has_unnamed_retained_claude_actor())
             && (stored.proof.is_none() || stored.proof != session.proof)
         {
-            Some("provider conversation")
+            Some("changed conversation identity (provider conversation)")
         } else {
             None
         };
         if let Some(changed) = changed {
-            return Err(StoreError::InvalidState(format!(
-                "chat card {card} changed conversation identity ({changed})"
+            return Err(StoreError::InvalidState(Violation::new(
+                changed,
+                format!("chat card {card} {changed}"),
             )));
         }
     }
@@ -4656,9 +4598,9 @@ impl<'card> CardWrite<'card> {
             && terminal.owned_codex_listener.is_some()
             && !terminal.owns_codex_listener()
         {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "terminal card {card_id} has invalid owned listener evidence"
-            )));
+            ));
         }
         let existence_json = to_json(&card.existence)?;
         let content_json = match &card.kind {
@@ -4701,8 +4643,8 @@ impl<'card> CardWrite<'card> {
                         BrowserRestoreFidelity::HistoryAndScroll => "history_and_scroll",
                         BrowserRestoreFidelity::UrlOnly => "url_only",
                         BrowserRestoreFidelity::ExactLive => {
-                            return Err(StoreError::InvalidState(
-                                "exact-live browser fidelity is not durable".into(),
+                            return Err(invalid_state!(
+                                "exact-live browser fidelity is not durable"
                             ));
                         }
                     },
@@ -4937,9 +4879,7 @@ fn replace_chat_identity_transaction(
         return Ok(());
     };
     if kind != PersistedCardKind::Chat.as_str() {
-        return Err(StoreError::InvalidState(format!(
-            "card {card_id} is not a chat card"
-        )));
+        return Err(invalid_state!("card {card_id} is not a chat card"));
     }
     let content = content.ok_or_else(|| {
         StoreError::corrupt_row("chat payload", format!("card {card_id} has no payload"))
@@ -4949,18 +4889,18 @@ fn replace_chat_identity_transaction(
         return Ok(());
     }
     if stored.id != expected_id {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "chat card {card_id} expected conversation {expected_id}, found {}",
             stored.id
-        )));
+        ));
     }
     // Only a conversation that has not begun replaces another this way. One
     // that names a native session, or a daemon that proved it, has to reach
     // storage through a snapshot, which checks that proof.
     if replacement.launch.session_id.is_some() || replacement.proof.is_some() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "chat card {card_id} can only be replaced by a conversation that has not begun"
-        )));
+        ));
     }
     // It may keep the CLI the card already pairs with, launched the same way
     // under the same identity, but never gain one.
@@ -4970,9 +4910,9 @@ fn replace_chat_identity_transaction(
             || replacement.launch.provider != stored.launch.provider
             || replacement.launch.recipe != stored.launch.recipe)
     {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "chat card {card_id} cannot take a source terminal with a new conversation"
-        )));
+        ));
     }
     transaction.execute(
         "UPDATE cards SET content_json = ?1, updated_at_unix_ms = ?2 WHERE card_id = ?3",
@@ -4991,21 +4931,21 @@ fn replace_terminal_identity_transaction(
     replacement: &TerminalSession,
 ) -> Result<()> {
     if replacement.id == expected_terminal_id {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "terminal relaunch for card {card_id} must use a fresh terminal identity"
-        )));
+        ));
     }
     let TerminalContinuity::RelaunchAvailable { recipe, .. } = &replacement.continuity else {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "replacement terminal {} must be relaunchable",
             replacement.id
-        )));
+        ));
     };
     if recipe != &replacement.launch {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "replacement terminal {} has mismatched launch recipes",
             replacement.id
-        )));
+        ));
     }
 
     let archived_owner = if let Some((existing_card, existence)) = transaction
@@ -5020,10 +4960,10 @@ fn replace_terminal_identity_transaction(
     {
         let existence: Existence = from_json("card existence", &existence)?;
         if !matches!(existence, Existence::Closed { .. }) {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "terminal_id {} already belongs to card {existing_card}",
                 replacement.id
-            )));
+            ));
         }
         Some(parse_id::<CardId>("card", &existing_card)?)
     } else {
@@ -5039,9 +4979,9 @@ fn replace_terminal_identity_transaction(
         .optional()?
     else {
         if archived_owner.is_some() {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "terminal card {card_id} must be saved before adopting a closed card's terminal"
-            )));
+            ));
         }
         // A terminal can exit before its first debounced workspace snapshot.
         // The ordered snapshot following this operation establishes the fresh
@@ -5049,9 +4989,7 @@ fn replace_terminal_identity_transaction(
         return Ok(());
     };
     if kind != PersistedCardKind::Terminal.as_str() {
-        return Err(StoreError::InvalidState(format!(
-            "card {card_id} is not a terminal card"
-        )));
+        return Err(invalid_state!("card {card_id} is not a terminal card"));
     }
 
     let (actual_terminal_id, generation) = transaction
@@ -5071,9 +5009,9 @@ fn replace_terminal_identity_transaction(
         return Ok(());
     }
     if actual_terminal_id != expected_terminal_id.to_string() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "terminal card {card_id} expected identity {expected_terminal_id}, found {actual_terminal_id}"
-        )));
+        ));
     }
     let recipe_json = to_json(&replacement.launch)?;
     let continuity_json = to_json(&replacement.continuity)?;
@@ -5095,9 +5033,9 @@ fn replace_terminal_identity_transaction(
         params![expected_terminal_id.to_string(), card_id.to_string()],
     )?;
     if deleted != 1 {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "terminal identity {expected_terminal_id} changed during relaunch"
-        )));
+        ));
     }
     // A closed historical owner has just been archived. Updating this same
     // terminal row transfers ownership without dropping its transcript metadata.
@@ -5145,16 +5083,18 @@ pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
     let mut ids = BTreeSet::new();
     for card in &state.cards {
         if !card.width_fraction.is_finite() || card.width_fraction <= 0.0 {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "card {} has invalid width fraction {}",
-                card.id, card.width_fraction
-            )));
+                card.id,
+                card.width_fraction
+            ));
         }
         if !ids.insert(card.id) {
-            return Err(StoreError::InvalidState(format!(
+            return Err(invalid_state!(
                 "workspace {} contains duplicate card {}",
-                state.id, card.id
-            )));
+                state.id,
+                card.id
+            ));
         }
     }
     if let Some(focused) = state.focused
@@ -5163,26 +5103,24 @@ pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
             .iter()
             .any(|card| card.id == focused && card.existence.is_open())
     {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "workspace {} focuses missing or closed card {}",
-            state.id, focused
-        )));
+            state.id,
+            focused
+        ));
     }
     let mut channel_ids = BTreeSet::new();
     let mut owned = BTreeSet::new();
     for channel in &state.channels {
         if !channel_ids.insert(channel.id) {
-            return Err(StoreError::InvalidState(format!(
-                "duplicate channel {}",
-                channel.id
-            )));
+            return Err(invalid_state!("duplicate channel {}", channel.id));
         }
         for id in &channel.cards {
             if !ids.contains(id) || !owned.insert(*id) {
-                return Err(StoreError::InvalidState(format!(
+                return Err(invalid_state!(
                     "channel {} references missing or multiply owned card {id}",
                     channel.id
-                )));
+                ));
             }
         }
         if channel.focused.is_some_and(|id| {
@@ -5192,17 +5130,14 @@ pub(crate) fn validate_workspace(state: &WorkspaceState) -> Result<()> {
                     .iter()
                     .any(|card| card.id == id && card.existence.is_open())
         }) {
-            return Err(StoreError::InvalidState(format!(
-                "channel {} has invalid focus",
-                channel.id
-            )));
+            return Err(invalid_state!("channel {} has invalid focus", channel.id));
         }
     }
     if state
         .active_channel
         .is_some_and(|id| !channel_ids.contains(&id))
     {
-        return Err(StoreError::InvalidState("active channel is missing".into()));
+        return Err(invalid_state!("active channel is missing"));
     }
     Ok(())
 }
@@ -5291,9 +5226,9 @@ fn ensure_payload_identity(
         .optional()?
         && existing_card != card_id
     {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "{id_column} {payload_id} already belongs to card {existing_card}"
-        )));
+        ));
     }
 
     if let Some(existing_id) = transaction
@@ -5302,9 +5237,9 @@ fn ensure_payload_identity(
         .optional()?
         && existing_id != payload_id
     {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "card {card_id} cannot replace stable {id_column} {existing_id} with {payload_id}"
-        )));
+        ));
     }
     Ok(())
 }
@@ -5813,24 +5748,24 @@ fn load_browser(connection: &Connection, card_id: CardId) -> Result<BrowserSessi
 
 fn validate_browser_descriptor(browser: &BrowserSession) -> Result<()> {
     if browser.history.is_empty() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "browser {} has empty durable history",
             browser.id
-        )));
+        ));
     }
     if browser.history_index >= browser.history.len() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "browser {} history index {} exceeds history length {}",
             browser.id,
             browser.history_index,
             browser.history.len()
-        )));
+        ));
     }
     if !browser.scroll_x.is_finite() || !browser.scroll_y.is_finite() {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "browser {} has non-finite scroll coordinates",
             browser.id
-        )));
+        ));
     }
     Ok(())
 }
@@ -5883,9 +5818,9 @@ fn reject_tombstone_resurrection(
     if matches!(stored, Some(Existence::Closed { .. }))
         && !matches!(incoming, Existence::Closed { .. })
     {
-        return Err(StoreError::InvalidState(format!(
+        return Err(invalid_state!(
             "tombstoned {kind} {id} cannot be resurrected"
-        )));
+        ));
     }
     Ok(())
 }
@@ -5908,9 +5843,9 @@ fn check_generation(
 }
 
 fn next_generation(expected: u64, kind: &str, id: impl std::fmt::Display) -> Result<u64> {
-    expected.checked_add(1).ok_or_else(|| {
-        StoreError::InvalidState(format!("{kind} {id} exhausted its generation counter"))
-    })
+    expected
+        .checked_add(1)
+        .ok_or_else(|| invalid_state!("{kind} {id} exhausted its generation counter"))
 }
 
 fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
@@ -5958,13 +5893,11 @@ fn now_unix_ms() -> i64 {
 }
 
 fn u64_to_i64(value: u64, kind: &str) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| StoreError::InvalidState(format!("{kind} exceeds SQLite INTEGER range")))
+    i64::try_from(value).map_err(|_| invalid_state!("{kind} exceeds SQLite INTEGER range"))
 }
 
 fn usize_to_i64(value: usize, kind: &str) -> Result<i64> {
-    i64::try_from(value)
-        .map_err(|_| StoreError::InvalidState(format!("{kind} exceeds SQLite INTEGER range")))
+    i64::try_from(value).map_err(|_| invalid_state!("{kind} exceeds SQLite INTEGER range"))
 }
 
 fn i64_to_u64(value: i64, kind: &str) -> Result<u64> {
@@ -9723,7 +9656,7 @@ mod tests {
             let mut workspace = workspace.clone();
             workspace.cards[0].kind = CardKind::Chat(session);
             match card_refusal(lane.save(&reopened, &workspace), card) {
-                StoreError::InvalidState(message) => message,
+                StoreError::InvalidState(violation) => violation.message().to_owned(),
                 other => panic!("expected a refused identity, got {other:?}"),
             }
         };
@@ -9817,8 +9750,8 @@ mod tests {
             commit.refused.as_slice(),
             [StoreError::Card { card: refused, error }]
                 if *refused == card
-                    && matches!(&**error, StoreError::InvalidState(message)
-                        if message.contains("(identity)"))
+                    && matches!(&**error, StoreError::InvalidState(violation)
+                        if violation.message().contains("(identity)"))
         ));
         drop(store);
         let store = StateStore::open(&database, boot("chat-boot")).unwrap();
@@ -9948,7 +9881,7 @@ mod tests {
         ] {
             assert!(matches!(
                 card_refusal(save(&started(remote)), workspace.cards[0].id),
-                StoreError::InvalidState(message) if message.contains("launch recipe")
+                StoreError::InvalidState(violation) if violation.message().contains("launch recipe")
             ));
         }
         let mut other_option = own.clone();
