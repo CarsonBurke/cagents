@@ -276,11 +276,25 @@ impl Registry {
     /// [`Registry::apply`] without reading the whole model back afterwards:
     /// this edit's sequence, and whether it changed anything.
     fn commit(&mut self, edit: &ModelEdit) -> Result<(u64, bool), String> {
+        self.commit_checked(edit, true)
+    }
+
+    /// [`Registry::commit`], checking the store's schema and layout first
+    /// unless `check_schema` is false: only for a caller that holds the
+    /// store alone and checked it once already, since another process could
+    /// otherwise have migrated it between edits.
+    fn commit_checked(
+        &mut self,
+        edit: &ModelEdit,
+        check_schema: bool,
+    ) -> Result<(u64, bool), String> {
         let transaction = self
             .db
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
-        schema::require_current(&transaction)?;
+        if check_schema {
+            schema::require_current(&transaction)?;
+        }
         let changed = match edit {
             ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,

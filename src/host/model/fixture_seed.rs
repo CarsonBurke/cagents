@@ -79,6 +79,10 @@ fn refuse_existing(path: &Path) -> Result<(), String> {
 pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
     let started = Instant::now();
     let mut registry = Registry::at(path)?;
+    // The seed holds the store alone, under the instance's lease, so its
+    // schema cannot change between edits: check it once here rather than in
+    // each of tens of thousands of transactions.
+    super::schema::require_current(&registry.db)?;
     // Tens of thousands of single-edit transactions would otherwise each wait
     // for an fsync. Nothing reads the store until the seed exits, and the
     // checkpoint below makes the result durable, so the bytes are the same.
@@ -87,7 +91,8 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
         .pragma_update(None, "synchronous", "OFF")
         .map_err(|error| error.to_string())?;
     for project in &plan.projects {
-        registry.commit(
+        seed_commit(
+            &mut registry,
             &ModelEdit::OpenProject {
                 repository: project.repository.clone(),
                 name: project.name.clone(),
@@ -97,12 +102,15 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
         )?;
     }
     for channel in &plan.channels {
-        registry.commit(&ModelEdit::CreateChannel {
-            id: channel.id,
-            repository: plan.project(channel.project)?.repository.clone(),
-            title: channel.title.clone(),
-            title_source: channel.title_source,
-        })?;
+        seed_commit(
+            &mut registry,
+            &ModelEdit::CreateChannel {
+                id: channel.id,
+                repository: plan.project(channel.project)?.repository.clone(),
+                title: channel.title.clone(),
+                title_source: channel.title_source,
+            },
+        )?;
     }
     let mut panes = 0;
     let mut edits = 0;
@@ -120,11 +128,14 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
             seeded.push(pane);
         }
         panes += seeded.len();
-        registry.commit(&ModelEdit::SeedView {
-            scope: scope.clone(),
-            panes: seeded,
-            closed: view.retired.clone(),
-        })?;
+        seed_commit(
+            &mut registry,
+            &ModelEdit::SeedView {
+                scope: scope.clone(),
+                panes: seeded,
+                closed: view.retired.clone(),
+            },
+        )?;
         edits += record_edits(&mut registry, plan, index, &scope, view)?;
     }
     // A channel's automatic name follows its primary conversation, so seeding
@@ -134,17 +145,20 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
         if channel.title.is_empty() {
             continue;
         }
-        registry.commit(&match channel.title_source {
-            ChannelTitleSource::Manual => ModelEdit::RetitleChannel {
-                id: channel.id,
-                title: channel.title.clone(),
+        seed_commit(
+            &mut registry,
+            &match channel.title_source {
+                ChannelTitleSource::Manual => ModelEdit::RetitleChannel {
+                    id: channel.id,
+                    title: channel.title.clone(),
+                },
+                source => ModelEdit::SuggestChannelTitle {
+                    id: channel.id,
+                    title: channel.title.clone(),
+                    source,
+                },
             },
-            source => ModelEdit::SuggestChannelTitle {
-                id: channel.id,
-                title: channel.title.clone(),
-                source,
-            },
-        })?;
+        )?;
     }
     registry
         .db
@@ -166,6 +180,10 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
         edits,
         seconds: started.elapsed().as_secs_f64(),
     })
+}
+
+fn seed_commit(registry: &mut Registry, edit: &ModelEdit) -> Result<(u64, bool), String> {
+    registry.commit_checked(edit, false)
 }
 
 /// Records `view.edits` operations on the view, leaving its panes as seeded.
@@ -209,12 +227,15 @@ fn record_edits(
                 before: Some(idle),
             }
         };
-        registry.commit(&ModelEdit::ChangeView {
-            scope: scope.clone(),
-            expected_revision: views::read(&registry.db, scope)?.revision,
-            operation: operation(plan, index, number),
-            change,
-        })?;
+        seed_commit(
+            registry,
+            &ModelEdit::ChangeView {
+                scope: scope.clone(),
+                expected_revision: views::read(&registry.db, scope)?.revision,
+                operation: operation(plan, index, number),
+                change,
+            },
+        )?;
     }
     Ok(view.edits)
 }
