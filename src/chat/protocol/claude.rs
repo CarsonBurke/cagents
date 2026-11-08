@@ -5665,14 +5665,23 @@ impl std::ops::Deref for HistoryRecord {
 }
 struct HistoryNode {
     parent: Option<String>,
-    /// The record a compaction boundary continues. Compaction starts a new
-    /// parent chain, so only this link leads back to the turns it summarised.
-    logical_parent: Option<String>,
+    /// Where a compaction boundary leads back to. Compaction starts a new
+    /// parent chain, so only this leads to the turns it summarised.
+    compaction: Option<Compaction>,
     visible: bool,
     message: bool,
     range: (u64, u64, usize),
     order: usize,
     tool_refs: Vec<(String, usize, bool)>,
+}
+struct Compaction {
+    /// The record Claude Code names as the boundary's predecessor.
+    logical_parent: Option<String>,
+    /// The main conversation's newest record before the boundary. Claude
+    /// Code sometimes names a logical parent recorded after its boundary,
+    /// within the new chain, or none it kept; this is where the summarised
+    /// turns continue then.
+    preceding: Option<String>,
 }
 impl History {
     fn open(launch: &Launch, id: &str) -> Result<Self, String> {
@@ -5760,6 +5769,7 @@ impl History {
         // after a stop, would otherwise overwrite their terminal outcome.
         let mut ended_agent_tools = HashMap::<String, ToolStatus>::new();
         let mut call_outcomes = HashMap::<String, TaskOutcome>::new();
+        let mut main_record: Option<String> = None;
         let mut position = 0;
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
@@ -5914,15 +5924,20 @@ impl History {
             if let Some(parent) = &parent {
                 parents.insert(parent.clone());
             }
-            let logical_parent = parent
-                .is_none()
-                .then(|| value["logicalParentUuid"].as_str().map(str::to_owned))
-                .flatten();
+            let compaction = (parent.is_none()
+                && string(&value, "type") == "system"
+                && string(&value, "subtype") == "compact_boundary")
+                .then(|| Compaction {
+                    logical_parent: value["logicalParentUuid"].as_str().map(str::to_owned),
+                    preceding: main_record.clone(),
+                });
             let message = matches!(string(&value, "type"), "user" | "assistant");
-            let visible = message
-                && !model_only(&value)
-                && value["isSidechain"].as_bool() != Some(true)
+            let main = value["isSidechain"].as_bool() != Some(true)
                 && value["teamName"].as_str().is_none_or(str::is_empty);
+            if main {
+                main_record = Some(uuid.to_owned());
+            }
+            let visible = message && !model_only(&value) && main;
             let message_id = value["message"]["id"].as_str().unwrap_or(uuid);
             let base = nodes
                 .get(uuid)
@@ -5972,7 +5987,7 @@ impl History {
                 uuid.into(),
                 HistoryNode {
                     parent,
-                    logical_parent,
+                    compaction,
                     visible,
                     message,
                     range,
@@ -6033,10 +6048,21 @@ impl History {
                 chain_tools.push((node.range, &node.tool_refs));
             }
             // A compaction boundary has no parent: the turns it summarised
-            // continue through its logical parent instead.
+            // continue through its logical parent, when that was recorded
+            // before it, and otherwise from the record that preceded it.
             leaf = node.parent.as_deref().or_else(|| {
-                compacted |= node.logical_parent.is_some();
-                node.logical_parent.as_deref()
+                let compaction = node.compaction.as_ref()?;
+                compacted = true;
+                compaction
+                    .logical_parent
+                    .as_deref()
+                    .filter(|previous| {
+                        !seen.contains(previous)
+                            && nodes
+                                .get(*previous)
+                                .is_some_and(|previous| previous.order < node.order)
+                    })
+                    .or(compaction.preceding.as_deref())
             });
         }
         chain.reverse();
@@ -14822,6 +14848,40 @@ mod tests {
             read = earlier;
         }
         assert_eq!(read, prompts, "every turn, in order, once");
+    }
+
+    #[test]
+    fn a_compaction_naming_no_earlier_parent_continues_from_the_record_before_it() {
+        // Claude Code sometimes names a logical parent recorded after its
+        // boundary, inside the new chain, or one it never kept.
+        let id = "00000000-0000-4000-8000-000000000001";
+        for logical in [json!("tail"), json!("absent")] {
+            let mut file = tempfile::tempfile().unwrap();
+            for value in [
+                json!({"type":"user","uuid":"question","parentUuid":null,"sessionId":id,"message":{"content":"Question"}}),
+                json!({"type":"assistant","uuid":"answer","parentUuid":"question","sessionId":id,"message":{"content":"Answer"}}),
+                json!({"type":"assistant","uuid":"side","parentUuid":"answer","isSidechain":true,"sessionId":id,"message":{"content":"private sidechain"}}),
+                json!({"type":"attachment","uuid":"context","parentUuid":"answer","sessionId":id}),
+                json!({"type":"system","subtype":"compact_boundary","uuid":"compact","parentUuid":null,"logicalParentUuid":logical,"sessionId":id}),
+                json!({"type":"user","uuid":"summary","parentUuid":"compact","isCompactSummary":true,"sessionId":id,"message":{"content":"summary"}}),
+                json!({"type":"attachment","uuid":"tail","parentUuid":"summary","sessionId":id}),
+                json!({"type":"user","uuid":"next","parentUuid":"tail","sessionId":id,"message":{"content":"Next"}}),
+            ] {
+                writeln!(file, "{value}").unwrap();
+            }
+            file.rewind().unwrap();
+            let mut history = History::index(file, id).unwrap();
+            assert_eq!(
+                history
+                    .page()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v["uuid"].as_str().unwrap())
+                    .collect::<Vec<_>>(),
+                vec!["question", "answer", "summary", "next"],
+                "{logical}"
+            );
+        }
     }
 
     #[test]
