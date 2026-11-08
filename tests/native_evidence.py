@@ -872,6 +872,25 @@ class Evidence(unittest.TestCase):
         self.assertIn("lost session", self.run_tool("stop").stdout)
         self.assertEqual(self.fixture_process_count(), 0)
 
+    def test_a_portal_runs_inside_the_session_only_when_asked(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        self.run_tool("stop")
+        self.run_tool("start", "after", "--portal", "gtk")
+        self.run_tool("stop")
+        starts = [line for line in (self.logs / "harness").read_text().splitlines()
+                  if line.startswith("session start")]
+        self.assertEqual(len(starts), 2, starts)
+        self.assertNotIn("--portal", starts[0])
+        self.assertIn("--portal gtk", starts[1])
+
+    def test_an_unknown_portal_is_refused_before_the_lock(self) -> None:
+        self.built()
+        result = self.run_tool("start", "after", "--portal", "xdg", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown portal backend: xdg; use gtk, kde, gnome or cosmic", result.stderr)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
     def test_start_reports_a_busy_lock_without_starting(self) -> None:
         self.built()
         with open(self.native_lock, "a") as lock:
@@ -1222,11 +1241,11 @@ class RemoteEvidence(unittest.TestCase):
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
-                      "--steps", str(steps), "--width", "1200")
+                      "--steps", str(steps), "--width", "1200", "--portal", "gtk")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
-        self.assertIn("start before --width 1200", calls)
+        self.assertIn("start before --width 1200 --portal gtk", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 

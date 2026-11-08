@@ -23,14 +23,15 @@ HOST may also come from CAGENTS_EVIDENCE_REMOTE, and DIR from
 CAGENTS_EVIDENCE_TASK. DIR's name, at most 18 letters, digits, dots, hyphens
 or underscores, names the task on HOST: ~/.local/state/cev/NAME there.
 
-  pair --before SOURCE --after SOURCE --steps FILE [--width PX]
+  pair --before SOURCE --after SOURCE --steps FILE [START OPTIONS]
                   The whole comparison in one command: build both sides, then
                   for each side start a session, run FILE, stop it, and bring
                   back its shots. FILE is a Bash script that runs on HOST with
                   SIDE set and `evidence` standing for native-evidence there,
                   as in `evidence drive click 'Open repository'`, `evidence
                   shot channel-prs`. A session that FILE leaves running is
-                  stopped.
+                  stopped. START OPTIONS, such as --width PX or --portal gtk,
+                  go to each side's start.
   build SIDE SOURCE
                   Copy SOURCE to HOST and build it there. SOURCE is a checkout
                   directory, whose uncommitted and untracked files are
@@ -251,30 +252,35 @@ cmd_build() {
 }
 
 cmd_pair() {
-    local before='' after='' steps='' width=''
+    local before='' after='' steps='' options=()
     while [ "$#" -gt 0 ]; do
         case $1 in
             --before) before=${2:-}; shift 2 || die '--before needs a source' 2 ;;
             --after) after=${2:-}; shift 2 || die '--after needs a source' 2 ;;
             --steps) steps=${2:-}; shift 2 || die '--steps needs a file' 2 ;;
-            --width) width=${2:-}; shift 2 || die '--width needs pixels' 2 ;;
+            --width | --portal | --limit | --wait-lock)
+                [ "$#" -ge 2 ] || die "$1 needs a value" 2
+                options+=("$1" "$2")
+                shift 2
+                ;;
+            --keep-state) options+=("$1"); shift ;;
             *) die "unknown pair option: $1" 2 ;;
         esac
     done
     [ -n "$before" ] && [ -n "$after" ] && [ -n "$steps" ] ||
         die 'pair needs --before, --after and --steps' 2
     [ -f "$steps" ] || die "no steps file: $steps" 2
-    [ -z "$width" ] || [[ $width =~ ^[0-9]+$ ]] || die 'width must be a whole number' 2
     cmd_build before "$before"
     cmd_build after "$after"
     local side status=0
     for side in before after; do
         printf 'running %s on %s\n' "$side" "$host"
         on_host "$remote_prelude"'
-            side=$1 width=$2
-            evidence start "$side" ${width:+--width "$width"}
+            side=$1 body=$2
+            shift 2
+            evidence start "$side" "$@"
             steps=$task/steps-$side.sh
-            printf "%s\n" "$3" >"$steps"
+            printf "%s\n" "$body" >"$steps"
             # Its own Bash, so -e holds in it; a failed step still stops the
             # session, which releases the native lock.
             export -f evidence
@@ -283,7 +289,7 @@ cmd_pair() {
             SIDE=$side bash -euo pipefail "$steps" || status=$?
             evidence stop >/dev/null
             exit "$status"
-        ' "$side" "$width" "$(cat -- "$steps")" || status=$?
+        ' "$side" "$(cat -- "$steps")" "${options[@]}" || status=$?
         fetch_shots
         [ "$status" -eq 0 ] || die "the steps failed on the $side side (status $status); the shots taken so far are in $task/shots" "$status"
     done
