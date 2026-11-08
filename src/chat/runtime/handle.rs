@@ -684,6 +684,18 @@ impl Handle {
             Owner::Remote(remote) => remote.preserve(),
         }
     }
+    /// Decides, before any close, whether it leaves running the work the
+    /// provider had already detached from itself, such as a server a command
+    /// started with `nohup`. Closes that have not decided stop it.
+    pub(crate) fn decide_detached_work(
+        &self,
+        detached: crate::daemon::owned_children::DetachedWork,
+    ) {
+        match &self.0 {
+            Owner::Local(local) => local.decide_detached_work(detached),
+            Owner::Remote(remote) => remote.decide_detached_work(detached),
+        }
+    }
     pub(crate) fn close_for_resume(&self) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.close_for_resume(),

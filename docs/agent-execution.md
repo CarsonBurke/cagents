@@ -44,8 +44,21 @@ background task that starts after your status check remains protected. To stop
 just one task, use its subagent Stop action in chat instead. The provider console
 uses `/interrupt` with the same safeguard; `/interrupt --including-subagents`
 explicitly permits stopping the background work. Stopped background tasks do not
-resume automatically. Closing an agent stops the entire owned conversation and
-its background tasks.
+resume automatically. Closing an agent ends the entire owned conversation, and
+the provider ends its background subagents as it quits.
+
+Closing a chat, or stopping the daemon, ends its provider the way quitting the
+provider's own CLI does, and cagents stops nothing more. Whatever the provider
+leaves running keeps running, such as a server an agent started with `setsid`,
+`nohup` or `tmux`. Claude Code stops the commands it was still running as it
+quits; how Codex treats its running commands hasn't been checked. An update
+that carries a chat over doesn't close it, so its processes keep running too.
+These cases stop everything the provider started instead:
+- an automation's agent, or one another session started, until a person takes
+  part in it;
+- a provider something outside cagents killed, such as the system for memory;
+- a close that hands the chat elsewhere, such as returning it to its terminal,
+  closing it with its paired terminal, or switching accounts.
 
 Daemon Stop confirmation counts running background subagents as well as hosted
 sessions. If those tasks change before confirmation is accepted, refresh the

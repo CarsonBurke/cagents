@@ -247,6 +247,8 @@ pub(in crate::host) fn reconcile_agent_run_under_control(
             return Ok(Reconciliation::Idle);
         }
         if let Some(generation) = idle_generation {
+            // An automation nobody took part in leaves nothing running.
+            handle.decide_detached_work(super::detached_work_on_close(host, source.id));
             if !handle.try_close_if_idle(generation)? {
                 return Ok(Reconciliation::Busy);
             }

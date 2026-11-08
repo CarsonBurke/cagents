@@ -738,6 +738,7 @@ fn finish_chat_shutdown(host: &SharedHost) -> Result<(), String> {
         let closed = if upgrading && chat.native_continuity().retains_provider() {
             chat.preserve_for_restart()
         } else {
+            chat.decide_detached_work(agent_execution::detached_work_on_close(host, session.id));
             chat.close().and_then(|()| {
                 if !upgrading {
                     // Closing the provider leaves its retained helper alive

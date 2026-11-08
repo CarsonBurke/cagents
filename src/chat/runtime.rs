@@ -5,6 +5,7 @@ use super::{
 };
 use crate::account::LiveReport;
 use crate::agent::ActivityState;
+use crate::daemon::owned_children::DetachedWork;
 use std::{
     collections::{BTreeMap, VecDeque},
     io::{Read, Write},
@@ -220,6 +221,9 @@ struct Inner {
     preserve_native: Arc<AtomicBool>,
     release_native: Arc<AtomicBool>,
     retain_cleanup_receipt: Arc<AtomicBool>,
+    /// What closing does with the work the provider already detached, once
+    /// its owner decides. See [`DetachedDecision`].
+    detached_work: Arc<DetachedDecision>,
     detached_native: Arc<Mutex<Option<super::native_holder::Detached>>>,
     retained_native: Arc<Mutex<Option<super::native_holder::Holder>>>,
     native_installed: Arc<AtomicBool>,
@@ -457,6 +461,7 @@ impl LocalHandle {
         let preserve_native = Arc::new(AtomicBool::new(false));
         let release_native = Arc::new(AtomicBool::new(false));
         let retain_cleanup_receipt = Arc::new(AtomicBool::new(false));
+        let detached_work = Arc::new(DetachedDecision::default());
         let detached_native = Arc::new(Mutex::new(None));
         let retained_native = Arc::new(Mutex::new(None));
         let notify: Arc<dyn Fn(Update) + Send + Sync> = Arc::new(notify);
@@ -481,6 +486,7 @@ impl LocalHandle {
             preserve_native: preserve_native.clone(),
             release_native: release_native.clone(),
             retain_cleanup_receipt: retain_cleanup_receipt.clone(),
+            detached_work: detached_work.clone(),
             detached_native: detached_native.clone(),
             retained_native: retained_native.clone(),
             native_installed: native_installed.clone(),
@@ -635,7 +641,12 @@ impl LocalHandle {
                         .ok()
                         .flatten()
                         .and_then(|s| s.code());
-                    if let Err(error) = child.terminate() {
+                    child.stop_detached = detached_work.get() == Some(DetachedWork::Stop);
+                    let result = child.terminate();
+                    if child.force_stopped == Some(true) {
+                        detached_work.force_stopped();
+                    }
+                    if let Err(error) = result {
                         direct_closed = false;
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(format!("Provider cleanup is unconfirmed: {error}"));
@@ -647,9 +658,10 @@ impl LocalHandle {
                         *detached_native.lock().unwrap_or_else(|p| p.into_inner()) =
                             Some(holder.preserve());
                         true
-                    } else if let Err(error) =
-                        holder.close_inner(retain_cleanup_receipt.load(Ordering::Acquire))
-                    {
+                    } else if let Err(error) = holder.close_inner(
+                        retain_cleanup_receipt.load(Ordering::Acquire),
+                        detached_work.holder(),
+                    ) {
                         *failure.lock().unwrap_or_else(|p| p.into_inner()) = Some(error);
                         *retained_native.lock().unwrap_or_else(|p| p.into_inner()) = Some(holder);
                         false
@@ -1445,6 +1457,18 @@ impl LocalHandle {
         self.close()
     }
 
+    /// Decides, before the close, whether it leaves running the work the
+    /// provider had already detached from itself. See [`DetachedWork`].
+    pub(crate) fn decide_detached_work(&self, detached: DetachedWork) {
+        self.0.detached_work.decide(detached);
+    }
+
+    /// Whether teardown found the provider killed by something outside
+    /// cagents. Known once the provider's teardown has run.
+    pub(crate) fn provider_was_force_stopped(&self) -> bool {
+        self.0.detached_work.was_force_stopped()
+    }
+
     pub fn close(&self) -> Result<(), String> {
         if self.0.native_installed.load(Ordering::Acquire) {
             self.0.release_native.store(true, Ordering::Release);
@@ -1478,7 +1502,10 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(holder) = retained.as_mut() {
-                holder.close_inner(self.0.retain_cleanup_receipt.load(Ordering::Acquire))?;
+                holder.close_inner(
+                    self.0.retain_cleanup_receipt.load(Ordering::Acquire),
+                    self.0.detached_work.holder(),
+                )?;
                 retained.take();
                 self.0.completed.store(true, Ordering::Release);
             }
@@ -1490,11 +1517,10 @@ impl LocalHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             if let Some(owner) = detached.as_ref() {
-                if self.0.retain_cleanup_receipt.load(Ordering::Acquire) {
-                    owner.close_retaining_receipt()?;
-                } else {
-                    owner.close()?;
-                }
+                owner.close_with(
+                    self.0.retain_cleanup_receipt.load(Ordering::Acquire),
+                    self.0.detached_work.holder(),
+                )?;
                 detached.take();
             }
         }
@@ -1763,6 +1789,43 @@ fn spawn_provider(
 
 /// Sole reaper of the provider leader. Observations retain its zombie until
 /// every group signal is finished, so its numeric PID/PGID cannot be recycled.
+/// An owner's decision about the work its provider detached. Until it
+/// decides, each teardown keeps what it did before decisions existed: a
+/// direct provider's leaves that work running unless the provider was
+/// force-stopped, and a native holder stops it with the provider.
+#[derive(Default)]
+struct DetachedDecision(std::sync::atomic::AtomicU8, AtomicBool);
+impl DetachedDecision {
+    /// Something outside cagents killed the provider, such as the system
+    /// for memory: what it left would hold that memory, so nothing is spared.
+    fn force_stopped(&self) {
+        self.1.store(true, Ordering::Release);
+    }
+    fn was_force_stopped(&self) -> bool {
+        self.1.load(Ordering::Acquire)
+    }
+    const STOP: u8 = 1;
+    const SPARE: u8 = 2;
+    fn decide(&self, detached: DetachedWork) {
+        self.0.store(
+            match detached {
+                DetachedWork::Stop => Self::STOP,
+                DetachedWork::Spare => Self::SPARE,
+            },
+            Ordering::Release,
+        );
+    }
+    fn get(&self) -> Option<DetachedWork> {
+        match self.0.load(Ordering::Acquire) {
+            Self::STOP => Some(DetachedWork::Stop),
+            Self::SPARE => Some(DetachedWork::Spare),
+            _ => None,
+        }
+    }
+    fn holder(&self) -> DetachedWork {
+        self.get().unwrap_or(DetachedWork::Stop)
+    }
+}
 struct ChildGuard {
     child: Child,
     identity: OwnedFd,
@@ -1773,6 +1836,9 @@ struct ChildGuard {
     /// Whether the provider had been force-stopped, settled by the first
     /// teardown: a retry must not take cagents' own `SIGKILL` for one.
     force_stopped: Option<bool>,
+    /// Whether teardown also ends the commands the provider detached, as
+    /// when its owner decided to stop them.
+    stop_detached: bool,
     // Dropped after `Drop::drop` has run the final reap in `terminate`.
     _registration: crate::daemon::adopted_orphans::Registration,
 }
@@ -1860,6 +1926,7 @@ impl ChildGuard {
             identity,
             terminated: false,
             force_stopped: None,
+            stop_detached: false,
             directory: None,
             scope: None,
             _registration: registration,
@@ -1961,9 +2028,10 @@ impl ChildGuard {
         signal_group(libc::SIGKILL)?;
         // Commands in process groups of their own outlive that signal. A
         // force-stopped provider's would hold memory the system needed, with
-        // no agent left to use them, so they end with it. Otherwise they
-        // outlive the chat, as a process the agent detached asked to.
-        if force_stopped
+        // no agent left to use them, so they end with it, as do those of an
+        // owner that decided to stop them. Otherwise they outlive the chat,
+        // as a process the agent detached asked to.
+        if (force_stopped || self.stop_detached)
             && let Some(scope) = self.scope.as_mut()
             && let Err(error) = scope.end()
         {
@@ -9198,7 +9266,8 @@ for line in sys.stdin:
 
     /// A process the agent detached, such as a dev server, outlives a chat
     /// the user closes and a provider that finishes, as it asked to: only a
-    /// force-stopped provider's leftovers are ended.
+    /// force-stopped provider's leftovers are ended, or those of a provider
+    /// whose owner decided to stop them, such as an unattended agent's.
     #[test]
     fn a_detached_command_outlives_a_closed_or_finished_provider() {
         use std::io::{BufRead, Write};
@@ -9207,11 +9276,12 @@ for line in sys.stdin:
                 stat.rsplit_once(") ").unwrap().1.starts_with('Z')
             })
         }
-        for (case, before, after) in [
-            ("closed", "", ""),
+        for (case, before, after, stop) in [
+            ("closed", "", "", false),
             // cagents' own escalation to SIGKILL is not a forced stop.
-            ("closed while ignoring SIGTERM", "trap '' TERM; ", ""),
-            ("finished", "", "; exit 0"),
+            ("closed while ignoring SIGTERM", "trap '' TERM; ", "", false),
+            ("finished", "", "; exit 0", false),
+            ("closed by an owner stopping it", "", "", true),
         ] {
             let spec = ProcessSpec {
                 stdout_noise: None,
@@ -9257,13 +9327,27 @@ for line in sys.stdin:
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
+            provider.stop_detached = stop;
             provider.terminate().unwrap();
-            // Give a scope kill, were there one, time to land.
-            std::thread::sleep(Duration::from_millis(200));
-            let survived = !ended(detached);
+            let survived = if stop {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ended(detached) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                !ended(detached)
+            } else {
+                // Give a scope kill, were there one, time to land.
+                std::thread::sleep(Duration::from_millis(200));
+                !ended(detached)
+            };
             // SAFETY: a plain signal to the test's own detached command.
             unsafe { libc::kill(detached as i32, libc::SIGKILL) };
-            assert!(survived, "a detached command ended with a {case} provider");
+            assert_eq!(
+                survived,
+                !stop,
+                "a detached command {} with a {case} provider",
+                if stop { "survived" } else { "ended" }
+            );
         }
     }
 

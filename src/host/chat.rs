@@ -3591,6 +3591,9 @@ pub(super) fn close_captured(
     };
     super::agent_execution::preflight_retirement(host, &source).map_err(unavailable)?;
     target.require_current(host)?;
+    handle.decide_detached_work(super::agent_execution::detached_work_on_close(
+        host, source.id,
+    ));
     handle.close_for_resume().map_err(unavailable)?;
     let snapshot = handle.snapshot(None).ok_or_else(|| {
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")

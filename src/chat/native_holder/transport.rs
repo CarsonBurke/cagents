@@ -7,7 +7,10 @@ use crate::{
         Session,
         protocol::{LaunchCleanup, LaunchOutcome, ProcessSpec, TransportSpec},
     },
-    daemon::holder_registry::{self as registry, Kind, Process, Record},
+    daemon::{
+        holder_registry::{self as registry, Kind, Process, Record},
+        owned_children::DetachedWork,
+    },
     model::HostSessionProof,
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -156,7 +159,11 @@ enum Request {
         application: Option<String>,
     },
     PinnedLaunchDirectory,
+    /// Stop the provider and every child of the holder.
     Release,
+    /// Stop the provider but leave running the work it had already detached.
+    /// Sent only to a holder reporting `sparing_release`.
+    ReleaseSparing,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -166,6 +173,8 @@ enum Report {
         record: Record,
         #[serde(default)]
         directory_pin: bool,
+        #[serde(default)]
+        sparing_release: bool,
     },
     Confirmed,
     SourceUpdated,
@@ -177,6 +186,8 @@ enum Report {
         exited: bool,
         #[serde(default)]
         directory_pin: bool,
+        #[serde(default)]
+        sparing_release: bool,
     },
     Adopted(Recovery),
     Failed(String),
@@ -189,6 +200,8 @@ pub(crate) struct Holder {
     release_on_drop: bool,
     durable: bool,
     directory_pin: bool,
+    /// Whether the holder accepts `ReleaseSparing`.
+    sparing_release: bool,
     control_peer: Process,
     control_poisoned: bool,
     identity: super::Detached,
@@ -338,10 +351,15 @@ impl Holder {
     }
 
     pub fn close(&mut self) -> Result<(), String> {
-        self.close_inner(false)
+        self.close_inner(false, DetachedWork::Stop)
     }
 
-    pub(in crate::chat) fn close_inner(&mut self, retain: bool) -> Result<(), String> {
+    /// A holder too old to spare detached work stops it, as it always did.
+    pub(in crate::chat) fn close_inner(
+        &mut self,
+        retain: bool,
+        detached: DetachedWork,
+    ) -> Result<(), String> {
         if self.identity.receipt(retain)? {
             self.control.take();
             self.release_on_drop = false;
@@ -351,13 +369,14 @@ impl Holder {
             self.control.take();
         }
         let Some(control) = self.control.as_ref() else {
-            return if retain {
-                self.identity.close_retaining_receipt()
-            } else {
-                self.identity.close()
-            };
+            return self.identity.close_with(retain, detached);
         };
-        send(control, &Request::Release, TIMEOUT)?;
+        let request = if detached == DetachedWork::Spare && self.sparing_release {
+            Request::ReleaseSparing
+        } else {
+            Request::Release
+        };
+        send(control, &request, TIMEOUT)?;
         match receive(control, TIMEOUT)? {
             Some(Report::Released) => {
                 if !self.identity.receipt(retain)? {
@@ -565,6 +584,7 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                 protocol,
                 record,
                 directory_pin,
+                sparing_release,
             }) if protocol == PROTOCOL
                 && record.holder.pid == pid
                 && record.holder.is_current() =>
@@ -573,18 +593,25 @@ pub(crate) fn spawn(mut spec: ProcessSpec, source: Session) -> Result<Holder, St
                     record.holder.pid as u32,
                     record.root.pid as u32,
                 );
-                Ok((record, directory_pin))
+                Ok((
+                    record,
+                    Capabilities {
+                        directory_pin,
+                        sparing_release,
+                    },
+                ))
             }
             Some(Report::Failed(error)) => Err(error),
             _ => Err("Native holder did not acknowledge its server".into()),
         }
     })();
     match result {
-        Ok((record, directory_pin)) => Ok(Holder {
+        Ok((record, capabilities)) => Ok(Holder {
             control: Some(control),
             release_on_drop: true,
             durable: false,
-            directory_pin,
+            directory_pin: capabilities.directory_pin,
+            sparing_release: capabilities.sparing_release,
             control_peer,
             control_poisoned: false,
             identity: super::Detached {
@@ -629,13 +656,20 @@ pub(crate) fn inspect(
     record: &Record,
     proof: &HostSessionProof,
 ) -> Result<(Recovery, bool), String> {
-    inspect_with_directory_pin(record, proof).map(|(recovery, exited, _)| (recovery, exited))
+    inspect_with_capabilities(record, proof).map(|(recovery, exited, _)| (recovery, exited))
 }
 
-fn inspect_with_directory_pin(
+/// What a holder reports it supports beyond its protocol version.
+#[derive(Clone, Copy)]
+struct Capabilities {
+    directory_pin: bool,
+    sparing_release: bool,
+}
+
+fn inspect_with_capabilities(
     record: &Record,
     proof: &HostSessionProof,
-) -> Result<(Recovery, bool, bool), String> {
+) -> Result<(Recovery, bool, Capabilities), String> {
     let control = connect(record)?;
     send(
         &control,
@@ -651,9 +685,17 @@ fn inspect_with_directory_pin(
             recovery,
             exited,
             directory_pin,
+            sparing_release,
         }) if matches!(protocol, 2 | PROTOCOL) && actual == *record => {
             recovery.validate_original_role(&record.boot, &record.application)?;
-            Ok((recovery, exited, directory_pin))
+            Ok((
+                recovery,
+                exited,
+                Capabilities {
+                    directory_pin,
+                    sparing_release,
+                },
+            ))
         }
         Some(Report::Failed(error)) => Err(error),
         _ => Err("Native holder did not return its exact discovery evidence".into()),
@@ -668,7 +710,7 @@ pub(crate) fn adopt(
     // Inspect is read-only. A candidate role does not authorize Adopt: first
     // authenticate this live holder's complete issued source on its own lease-
     // checked channel, and retain the exact original Record through cleanup.
-    let (original, _, directory_pin) = inspect_with_directory_pin(record, proof)?;
+    let (original, _, capabilities) = inspect_with_capabilities(record, proof)?;
     if &original.source != source && !original.previous_sources.contains(source) {
         return Err("Native role transition does not recognize the exact issued source".into());
     }
@@ -708,7 +750,8 @@ pub(crate) fn adopt(
                     control: Some(control),
                     release_on_drop: false,
                     durable: true,
-                    directory_pin,
+                    directory_pin: capabilities.directory_pin,
+                    sparing_release: capabilities.sparing_release,
                     control_peer: record.holder.clone(),
                     control_poisoned: false,
                     identity: super::Detached {
@@ -947,13 +990,28 @@ impl Residence {
                 continue;
             }
             let response = match request {
-                Request::Release => match self.release() {
-                    Ok(()) => {
-                        let _ = send(&control, &Report::Released, TIMEOUT);
-                        return false;
+                Request::Release | Request::ReleaseSparing => {
+                    let detached = if matches!(request, Request::ReleaseSparing) {
+                        DetachedWork::Spare
+                    } else {
+                        DetachedWork::Stop
+                    };
+                    // A server its launcher started is the provider's own.
+                    let server: Vec<Process> =
+                        self.recovery.server_process.iter().cloned().collect();
+                    match self
+                        .child
+                        .decide_detached(detached, &server)
+                        .map_err(|error| error.to_string())
+                        .and_then(|()| self.release())
+                    {
+                        Ok(()) => {
+                            let _ = send(&control, &Report::Released, TIMEOUT);
+                            return false;
+                        }
+                        Err(error) => Report::Failed(error),
                     }
-                    Err(error) => Report::Failed(error),
-                },
+                }
                 Request::Confirm {
                     thread,
                     identity,
@@ -964,7 +1022,9 @@ impl Residence {
                         .and_then(|()| pin_provider_process(&process))
                         .and_then(|pidfd| {
                             let server = process.pid as u32;
+                            let watched = process.clone();
                             self.recovery.confirm(thread, identity, process)?;
+                            self.child.watch_server(watched);
                             self.provider_pidfd = pidfd;
                             self.keep_commands_apart(server);
                             Ok(())
@@ -1082,6 +1142,7 @@ impl Residence {
                             recovery: self.recovery.clone(),
                             exited: self.exited(),
                             directory_pin: true,
+                            sparing_release: true,
                         },
                         TIMEOUT,
                     );
@@ -1494,6 +1555,7 @@ extern "C" fn serve_if_requested() {
                 protocol: PROTOCOL,
                 record: residence.record.clone(),
                 directory_pin: true,
+                sparing_release: true,
             },
             START_TIMEOUT,
         )?;
@@ -2405,16 +2467,17 @@ exec /bin/sleep 60
             protocol: PROTOCOL,
             record: record.clone(),
             directory_pin: true,
+            sparing_release: true,
         })
         .unwrap();
-        legacy["Started"]
-            .as_object_mut()
-            .unwrap()
-            .remove("directory_pin");
+        let started = legacy["Started"].as_object_mut().unwrap();
+        started.remove("directory_pin");
+        started.remove("sparing_release");
         assert!(matches!(
             serde_json::from_value::<Report>(legacy).unwrap(),
             Report::Started {
                 directory_pin: false,
+                sparing_release: false,
                 ..
             }
         ));
@@ -2754,6 +2817,89 @@ exec /bin/sleep 60
                 .unwrap()
                 .contains("length")
         );
+    }
+
+    #[test]
+    fn an_ordinary_release_leaves_what_the_provider_leaves() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_SPARING_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::an_ordinary_release_leaves_what_the_provider_leaves", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let fixture =
+            crate::daemon::owned_children::tests::provider_with_detached_work(working.path());
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context.clone()),
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            program: fixture.get_program().to_str().unwrap().into(),
+            arguments: fixture
+                .get_args()
+                .map(|argument| argument.to_str().unwrap().into())
+                .collect(),
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut holder = spawn(spec, source).unwrap();
+        context.installed();
+        assert!(holder.sparing_release);
+        let holder_pid = holder.identity.record.holder.pid;
+        let work =
+            crate::daemon::owned_children::tests::detached_work_under(working.path(), holder_pid);
+        let (detached, running, left) = (work.detached, work.running, work.left);
+        let detached = Process::read(detached).unwrap();
+        let running = Process::read(running).unwrap();
+        let left = Process::read(left).unwrap();
+        let holder_process = holder.identity.record.holder.clone();
+        holder.close_inner(false, DetachedWork::Spare).unwrap();
+        // Through the holder's own exit, after its last teardown.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while holder_process.is_current() {
+            assert!(Instant::now() < deadline, "the holder did not exit");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            running.reaped(),
+            "the provider stopped its own command as it quit"
+        );
+        assert!(
+            [&detached, &left].into_iter().all(|process| {
+                process.is_current() && crate::daemon::owned_children::tests::alive(process.pid)
+            }),
+            "what the provider leaves running keeps running"
+        );
+        for process in [detached, left] {
+            unsafe { libc::kill(process.pid, libc::SIGKILL) };
+        }
     }
 
     #[test]
