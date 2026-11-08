@@ -312,13 +312,17 @@ pub(super) fn list(
                 accounts.of(provider, &chat.execution_environment().0)
             });
         let limit = live
-            .failure
-            .as_deref()
-            .zip(live.provider)
+            .provider
             .filter(|_| standing && !live.exited)
-            .and_then(|(failure, provider)| {
-                let failed_at = live.chat.as_ref().and_then(|chat| chat.finished_at());
-                usage_limit(provider, failure, failed_at, account.as_ref(), now)
+            .and_then(|provider| {
+                stopping_limit(
+                    provider,
+                    live.state,
+                    live.failure.as_deref(),
+                    live.chat.as_ref().and_then(|chat| chat.finished_at()),
+                    || account.clone(),
+                    now,
+                )
             });
         let member = Member {
             session: entry,
@@ -497,10 +501,34 @@ pub(in crate::host) fn chat_limit(
     account: impl FnOnce() -> Option<SessionAccount>,
     now_ms: u64,
 ) -> Option<UsageLimit> {
-    let failure = handle.failure()?;
-    let failed_at = handle.finished_at();
-    usage_limit(provider, &failure, failed_at, None, now_ms)?;
-    usage_limit(provider, &failure, failed_at, account().as_ref(), now_ms)
+    stopping_limit(
+        provider,
+        handle.activity(),
+        handle.failure().as_deref(),
+        handle.finished_at(),
+        account,
+        now_ms,
+    )
+}
+
+/// The usage limit that stops a conversation in `state` whose provider last
+/// reported `failure`. One that is working or waiting had its turn accepted,
+/// so no limit stops it, though the provider's last error may outlive that
+/// turn's start.
+fn stopping_limit(
+    provider: Provider,
+    state: ActivityState,
+    failure: Option<&str>,
+    failed_at: Option<u64>,
+    account: impl FnOnce() -> Option<SessionAccount>,
+    now_ms: u64,
+) -> Option<UsageLimit> {
+    if matches!(state, ActivityState::Working | ActivityState::Waiting) {
+        return None;
+    }
+    let failure = failure?;
+    usage_limit(provider, failure, failed_at, None, now_ms)?;
+    usage_limit(provider, failure, failed_at, account().as_ref(), now_ms)
 }
 
 /// The usage limit a provider's reported `failure` names, while it holds.
@@ -737,6 +765,40 @@ mod tests {
                 Some(failed_at),
                 None,
                 0
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn a_conversation_whose_turn_was_accepted_is_not_stopped_by_its_last_limit() {
+        let failure = Some("You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)");
+        let limit = |state| {
+            stopping_limit(
+                Provider::Claude,
+                state,
+                failure,
+                Some(1_000_000_000),
+                || None,
+                1_000_060_000,
+            )
+        };
+        for idle in [ActivityState::Idle, ActivityState::Unknown] {
+            assert!(limit(idle).is_some(), "{idle:?} holds the limit");
+        }
+        // The error that refused the previous turn can outlive the next
+        // turn's start, as when a history error keeps it, so activity decides.
+        for accepted in [ActivityState::Working, ActivityState::Waiting] {
+            assert_eq!(limit(accepted), None, "{accepted:?} is not limited");
+        }
+        assert_eq!(
+            stopping_limit(
+                Provider::Claude,
+                ActivityState::Idle,
+                None,
+                None,
+                || panic!("no account is read without a reported limit"),
+                0,
             ),
             None
         );

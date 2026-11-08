@@ -4559,25 +4559,52 @@ fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
     );
 
     // A limit of unknown end is no reason to refuse a follow-up run, which
-    // is what shows whether it still holds. This one succeeds, so the limit
-    // lifts, the subscriber hears so, and the held message is delivered.
+    // is what shows whether it still holds. While that run works, the
+    // provider's last error is not its fate: the session is not limited, and
+    // the subscriber hears so. The run succeeds, so the limit stays lifted
+    // and the held message is delivered.
     let follow_up = submit(
         &host,
         &Authority::default(),
         Submit {
             name: None,
             destination: Destination::Existing(accepted.agent.id),
-            prompt: "carry on".into(),
+            prompt: "carry on HOLD_CLEANUP_BUSY".into(),
             idempotency_key: "after-the-limit".into(),
         },
     )
     .unwrap();
-    assert_eq!(settled(&host, follow_up.run.id).state, State::Succeeded);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("cleanup-busy").exists() {
+        assert!(Instant::now() < deadline, "the follow-up turn starts");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let Reply::Sessions(listing) = process(
+        &host,
+        Authority::default(),
+        Operation::Sessions(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("sessions reply");
+    };
+    let working = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session)
+        .expect("the working session is listed");
+    assert_eq!(working.limit, None, "a working session is not limited");
     courier.wake_and_wait_for_scan();
     assert_eq!(
         heard.recv_timeout(Duration::from_secs(5)).unwrap(),
         (session, None),
-        "the subscriber hears the limit lifted"
+        "the subscriber hears the limit lifted while the turn works"
+    );
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, follow_up.run.id).state, State::Succeeded);
+    courier.wake_and_wait_for_scan();
+    assert!(
+        heard.try_recv().is_err(),
+        "a lifted limit that stays lifted is not told again"
     );
     let deadline = Instant::now() + Duration::from_secs(10);
     while registry(&host)
