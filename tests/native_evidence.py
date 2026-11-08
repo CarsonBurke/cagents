@@ -1059,6 +1059,10 @@ class Evidence(unittest.TestCase):
         offline = self.fixture_shell("curl -q --url https://avatars.githubusercontent.com/octo", check=False)
         self.assertEqual(offline.returncode, 7)
         self.assertIn("no network access", offline.stderr)
+        # Nor can git: a project's github.com remote is only for the forge to name.
+        fetch = self.fixture_shell("git ls-remote https://github.com/octo-org/app", check=False)
+        self.assertNotEqual(fetch.returncode, 0)
+        self.assertIn("transport 'https' not allowed", fetch.stderr)
 
         # Read on every call: a step can switch it on in a running session.
         self.switch_forge_on()
@@ -1084,7 +1088,8 @@ class Evidence(unittest.TestCase):
         self.assertEqual(missing.returncode, 1)
         self.assertIn("Could not resolve to a PullRequest with the number of 7.", missing.stderr)
 
-        # The review-request poll, behind the headers --include asks for.
+        # The review-request poll, behind the headers --include asks for. Text
+        # mode reads gh's CRLF header lines as LF.
         page = self.fixture_shell(
             "gh api graphql --include --hostname github.com "
             "-f 'query=query($owner:String!,$name:String!,$cursor:String){viewer{id login} "
@@ -1097,6 +1102,17 @@ class Evidence(unittest.TestCase):
         self.assertEqual(data["viewer"]["login"], "fixture")
         self.assertEqual(data["repository"]["pullRequests"],
                          {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}})
+        # The pull request browser and its search find nothing to list.
+        browser = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query($owner:String!,$name:String!,$cursor:String)"
+            "{repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN)"
+            "{nodes{id} pageInfo{hasNextPage endCursor}}}}' -f owner=octo-org -f name=app").stdout)
+        self.assertEqual(browser["data"], {"repository": {"pullRequests": data["repository"]["pullRequests"]}})
+        search = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query($searchText:String!,$cursor:String)"
+            "{search(type:ISSUE,query:$searchText,first:50,after:$cursor){nodes{... on PullRequest{id}} "
+            "pageInfo{hasNextPage endCursor}}}' -f 'searchText=repo:octo-org/app is:pr fix'").stdout)
+        self.assertEqual(search["data"]["search"]["nodes"], [])
         releases = self.fixture_shell(
             "gh api --hostname github.com --method GET repos/o/r/releases?per_page=100&page=1")
         self.assertEqual(json.loads(releases.stdout), [])
@@ -1108,6 +1124,8 @@ class Evidence(unittest.TestCase):
         write = self.fixture_shell("gh pr create -R github.com/o/r --title t --body-file -", check=False)
         self.assertEqual(write.returncode, 1)
         self.assertIn("`gh pr create`", write.stderr)
+        dangling = self.fixture_shell("gh pr list --json", check=False)
+        self.assertEqual((dangling.returncode, dangling.stderr), (1, "flag needs an argument: --json\n"))
 
     def test_the_forge_names_the_repository_of_a_github_remote(self) -> None:
         self.built()
@@ -1184,6 +1202,11 @@ class Evidence(unittest.TestCase):
         checks = self.fixture_shell(f"gh pr checks 7 {selector} --json name", check=False)
         self.assertEqual((checks.returncode, checks.stderr), (1, "no checks reported on the 'feature' branch\n"))
         self.assertEqual(self.fixture_shell(f"gh pr view 9 {selector} --json number", check=False).returncode, 1)
+        # A malformed seed fails in gh, naming the file, rather than as bad JSON in the app.
+        (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text('{"number": 7}')
+        malformed = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
+        self.assertEqual(malformed.returncode, 1)
+        self.assertIn("fixture-forge-prs.json must be a JSON array", malformed.stderr)
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()

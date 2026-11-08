@@ -1,0 +1,135 @@
+//! The native-evidence fixture's offline forge, `tests/fixtures/fixture-gh.sh`,
+//! must answer every read the sidebar, review-request poll and pull request
+//! browser make in shapes these parsers accept. Its own contract suite compares
+//! against copied strings; this runs the script through the real service.
+use super::*;
+use std::process::Command;
+
+struct Forge {
+    _root: tempfile::TempDir,
+    gh: PathBuf,
+    switch: PathBuf,
+    project: PathBuf,
+}
+
+fn forge() -> Forge {
+    let root = tempfile::tempdir().unwrap();
+    let gh = root.path().join("bin/gh");
+    std::fs::create_dir_all(gh.parent().unwrap()).unwrap();
+    std::fs::copy(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/fixture-gh.sh"),
+        &gh,
+    )
+    .unwrap();
+    let switch = root.path().join("home/.config/fixture-forge");
+    std::fs::create_dir_all(switch.parent().unwrap()).unwrap();
+    std::fs::write(&switch, "").unwrap();
+    let project = root.path().join("project");
+    std::fs::create_dir(&project).unwrap();
+    for arguments in [
+        &["init", "--quiet", "--initial-branch=main"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:Fixture-Owner/fixture-app.git",
+        ],
+    ] {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&project)
+            .args(arguments)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+    }
+    Forge {
+        _root: root,
+        gh,
+        switch,
+        project,
+    }
+}
+
+#[test]
+fn the_fixture_forge_reaches_ready_and_lists_nothing() {
+    let forge = forge();
+    let service = GitHubService::system(&forge.gh);
+    let cancellation = CancellationToken::new();
+
+    let key = service
+        .resolve_repository(&forge.project, &[], &cancellation)
+        .unwrap();
+    assert_eq!(
+        key,
+        GitHubRepoKey::new("github.com", None, "Fixture-Owner", "fixture-app").unwrap()
+    );
+    let auth = service.auth_status(&key, &cancellation).unwrap();
+    assert_eq!(auth.state, GhAuthState::Authenticated);
+    assert_eq!(auth.login.as_deref(), Some("fixture"));
+
+    for state in [PullRequestStateFilter::Open, PullRequestStateFilter::All] {
+        let request = ListPullRequestsRequest {
+            repository: key.clone(),
+            state,
+            limit: 30,
+        };
+        assert!(service.list(&request, &cancellation).unwrap().is_empty());
+    }
+    for review in [false, true] {
+        let request = AuthoredPullRequestsRequest {
+            repository: key.clone(),
+            state: PullRequestStateFilter::Open,
+            limit: 30,
+            review,
+        };
+        assert!(
+            service
+                .list_authored(&request, &cancellation)
+                .unwrap()
+                .is_empty()
+        );
+    }
+    let head = "a".repeat(40);
+    assert!(
+        service
+            .resolve_branch_head(&key, &key, "main", &head, &cancellation)
+            .unwrap()
+            .is_none()
+    );
+
+    let requests = service
+        .review_request_page(&key, None, &cancellation)
+        .unwrap();
+    assert_eq!(requests.viewer.login, "fixture");
+    assert!(requests.entries.is_empty() && requests.next_cursor.is_none());
+    let api: &dyn GitHubReviewApi = &service;
+    let page = api.pull_request_page(&key, None, &cancellation).unwrap();
+    assert!(page.pull_requests.is_empty() && page.next_cursor.is_none());
+    let found = api
+        .search_pull_requests(&key, "fix", None, &cancellation)
+        .unwrap();
+    assert!(found.pull_requests.is_empty() && found.next_cursor.is_none());
+
+    // A pull request the forge does not have is gh's not-found failure.
+    let missing = PullRequestKey::new(key, 7).unwrap();
+    assert!(service.view(&missing, &cancellation).is_err());
+}
+
+#[test]
+fn without_its_switch_the_fixture_forge_refuses() {
+    let forge = forge();
+    std::fs::remove_file(&forge.switch).unwrap();
+    let service = GitHubService::system(&forge.gh);
+    let error = service
+        .resolve_repository(&forge.project, &[], &CancellationToken::new())
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("the fixture has no forge access"),
+        "{error}"
+    );
+}

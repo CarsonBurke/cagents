@@ -28,6 +28,14 @@ login=fixture
 viewer_id=U_kgDOFixture
 pull_requests=$config/fixture-forge-prs.json
 
+# gh's refusal of a value flag given last, with no value.
+need() {
+    [ "$1" -ge 2 ] || {
+        printf 'flag needs an argument: %s\n' "$2" >&2
+        exit 1
+    }
+}
+
 unsupported() {
     printf 'gh: the fixture forge does not support `gh %s`; it only answers what the app reads\n' "$*" >&2
     exit 1
@@ -60,16 +68,25 @@ repository_json() {
     printf '{"nameWithOwner":"%s","url":"https://github.com/%s"}\n' "$1" "$1"
 }
 
+# The app's cache directory is its storage name, lower-cased by the
+# directories crate; it accepts a cached image younger than seven days.
 seed_avatars() {
     [ -d "$fixture/avatars" ] || return 0
-    instance=${CAGENTS_DEVELOPMENT_INSTANCE:+-$CAGENTS_DEVELOPMENT_INSTANCE}
-    cache=${XDG_CACHE_HOME:-$HOME/.cache}/cagents-development$instance/github-avatars
+    storage=$(printf 'cagents-development%s' "${CAGENTS_DEVELOPMENT_INSTANCE:+-$CAGENTS_DEVELOPMENT_INSTANCE}" |
+        tr '[:upper:]' '[:lower:]')
+    cache=${XDG_CACHE_HOME:-${HOME:-}/.cache}/$storage/github-avatars
     for image in "$fixture"/avatars/*.image; do
         [ -f "$image" ] || continue
         owner=$(basename -- "$image" .image | tr '[:upper:]' '[:lower:]')
+        cached=$cache/github.com-$owner.image
         mkdir -p -- "$cache"
-        cp -- "$image" "$cache/github.com-$owner.image"
-        touch -- "$cache/github.com-$owner.image"
+        if cmp -s -- "$image" "$cached"; then
+            touch -- "$cached"
+        else
+            # Published whole: the app may be reading the previous copy.
+            cp -- "$image" "$cached.$$"
+            mv -f -- "$cached.$$" "$cached"
+        fi
     done
 }
 
@@ -78,7 +95,7 @@ repo_view() {
     slug=
     while [ "$#" -gt 0 ]; do
         case $1 in
-            --json | -q | --jq | -t | --template | -b | --branch) shift ;;
+            --json | -q | --jq | -t | --template | -b | --branch) need "$#" "$1"; shift ;;
             --json=* | --jq=* | --template=* | --branch=* | -w | --web) ;;
             -*) ;;
             *) slug=$1 ;;
@@ -115,9 +132,9 @@ auth_status() {
     host= json=
     while [ "$#" -gt 0 ]; do
         case $1 in
-            --hostname | -h) shift; host=${1:-} ;;
+            --hostname | -h) need "$#" "$1"; shift; host=${1:-} ;;
             --hostname=*) host=${1#*=} ;;
-            --json) shift; json=${1:-} ;;
+            --json) need "$#" "$1"; shift; json=${1:-} ;;
             --json=*) json=${1#*=} ;;
         esac
         shift
@@ -163,6 +180,16 @@ select_fields() {
         if type == "array" then map(pick) else pick end'
 }
 
+# A seed that is not an array of pull requests fails here, not in the app.
+check_seed() {
+    [ -f "$pull_requests" ] || return 0
+    if ! jq -e 'type == "array" and all(.[]; type == "object" and (.url | type) == "string"
+            and (.number | type) == "number")' "$pull_requests" >/dev/null 2>&1; then
+        printf 'gh: %s must be a JSON array of pull requests, each with a number and url\n' "$pull_requests" >&2
+        exit 1
+    fi
+}
+
 pr_not_found() {
     printf 'GraphQL: Could not resolve to a PullRequest with the number of %s. (repository.pullRequest)\n' "$1" >&2
     exit 1
@@ -170,17 +197,17 @@ pr_not_found() {
 
 pr() {
     subcommand=${1:-}
-    shift || :
+    [ "$#" -eq 0 ] || shift
     slug= state=open head= author= limit=30 fields= number=
     while [ "$#" -gt 0 ]; do
         case $1 in
-            -R | --repo) shift; slug=${1#github.com/} ;;
-            -s | --state) shift; state=$1 ;;
-            -H | --head) shift; head=$1 ;;
-            -A | --author) shift; author=$1 ;;
-            -L | --limit) shift; limit=$1 ;;
-            --json) shift; fields=$1 ;;
-            -S | --search | -B | --base | -l | --label | -a | --assignee | --app | -q | --jq | -t | --template) shift ;;
+            -R | --repo) need "$#" "$1"; shift; slug=${1#github.com/} ;;
+            -s | --state) need "$#" "$1"; shift; state=$1 ;;
+            -H | --head) need "$#" "$1"; shift; head=$1 ;;
+            -A | --author) need "$#" "$1"; shift; author=$1 ;;
+            -L | --limit) need "$#" "$1"; shift; limit=$1 ;;
+            --json) need "$#" "$1"; shift; fields=$1 ;;
+            -S | --search | -B | --base | -l | --label | -a | --assignee | --app | -q | --jq | -t | --template) need "$#" "$1"; shift ;;
             -*) ;;
             *) number=$1 ;;
         esac
@@ -196,6 +223,7 @@ pr() {
             ;;
         *) unsupported pr "$subcommand" ;;
     esac
+    check_seed
     case $subcommand in
         list)
             case $state in
@@ -244,9 +272,10 @@ api() {
     while [ "$#" -gt 0 ]; do
         case $1 in
             -i | --include) include=true ;;
-            -X | --method) shift; method=$1 ;;
-            --hostname | -H | --header | --input | -q | --jq | -t | --template | --cache) shift ;;
+            -X | --method) need "$#" "$1"; shift; method=$1 ;;
+            --hostname | -H | --header | --input | -q | --jq | -t | --template | --cache) need "$#" "$1"; shift ;;
             -f | --raw-field | -F | --field)
+                need "$#" "$1"
                 shift
                 case $1 in
                     query=*) query=${1#query=} ;;
@@ -265,11 +294,19 @@ api() {
     fi
     if [ "$endpoint" = graphql ]; then
         case $query in
-            *'viewer{id login}'*'pullRequests(first:'*)
-                # The review-request poll: nobody asked for a review.
-                body='{"data":{"viewer":{"id":"'$viewer_id'","login":"'$login'"},"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}'
+            *'pullRequests(first:'*)
+                # The pull request browser, and the review-request poll, which
+                # also asks who is reading: no open pull requests to list.
+                viewer=
+                case $query in
+                    *'viewer{id login}'*) viewer='"viewer":{"id":"'$viewer_id'","login":"'$login'"},' ;;
+                esac
                 ! "$include" || headers '200 OK' graphql
-                printf '%s\n' "$body"
+                printf '{"data":{%s"repository":{"pullRequests":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}}\n' "$viewer"
+                ;;
+            *'search(type:ISSUE'*)
+                ! "$include" || headers '200 OK' graphql
+                printf '%s\n' '{"data":{"search":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}'
                 ;;
             *'pullRequest(number:'*)
                 # GitHub answers 200 with an error; gh prints it and fails.
