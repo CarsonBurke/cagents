@@ -91,17 +91,26 @@ fn publish_decision(
 pub(super) fn wait(
     state: &Path,
     job: &mut UpdateJob,
+    observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
+) -> Result<impact::Preview, UpdateError> {
+    wait_for(state, job, CONFIRMATION_LIFETIME, observe)
+}
+
+fn wait_for(
+    state: &Path,
+    job: &mut UpdateJob,
+    lifetime: Duration,
     mut observe: impl FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>,
 ) -> Result<impact::Preview, UpdateError> {
-    let deadline = Instant::now() + CONFIRMATION_LIFETIME;
-    let expires = now_ms().saturating_add(CONFIRMATION_LIFETIME.as_millis() as u64);
+    let deadline = Instant::now() + lifetime;
+    let expires = now_ms().saturating_add(lifetime.as_millis() as u64);
     let mut policy = impact::Policy::WhenIdle;
     let mut approved = false;
     let mut preview = observe(policy)?;
     let mut nonce = uuid::Uuid::new_v4().to_string();
     loop {
         if Instant::now() >= deadline {
-            return Err(refused(&preview).unwrap_or_else(|| {
+            return Err(refused(&preview, true).unwrap_or_else(|| {
                 invalid("Update preview expired without installation; review the update again")
             }));
         }
@@ -138,7 +147,7 @@ pub(super) fn wait(
                     // A blocked preview offers nothing but closing it, so
                     // closing it is the refusal its blockers caused.
                     Choice::Cancel => {
-                        return Err(refused(&preview).unwrap_or(UpdateError::Declined));
+                        return Err(refused(&preview, false).unwrap_or(UpdateError::Declined));
                     }
                     Choice::Confirm => approved = true,
                     Choice::Policy(next) => {
@@ -172,9 +181,12 @@ pub(super) fn wait(
     }
 }
 
-fn refused(preview: &impact::Preview) -> Option<UpdateError> {
+fn refused(preview: &impact::Preview, expired: bool) -> Option<UpdateError> {
     let refusal = preview.daemon.as_ref()?.refusal()?;
-    Some(UpdateError::Refused(Box::new(refusal)))
+    Some(UpdateError::Refused(Box::new(impact::Refusal {
+        expired,
+        ..refusal
+    })))
 }
 
 #[cfg(test)]
@@ -288,11 +300,14 @@ mod tests {
     fn closing_a_blocked_review_records_what_refused_the_update() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().to_owned();
+        // One inventory: a fresh fixture each look would be a changed one.
+        let blocked = impact::tests::blocked();
+        let observed = blocked.clone();
         let worker = thread::spawn(move || {
             let mut job = job(&path);
             wait(&path, &mut job, |_| {
                 Ok(impact::Preview {
-                    daemon: Some(impact::tests::blocked()),
+                    daemon: Some(observed.clone()),
                     ..preview(false)
                 })
             })
@@ -308,6 +323,36 @@ mod tests {
         let Err(UpdateError::Refused(refusal)) = worker.join().unwrap() else {
             panic!("a blocked review closed as something other than a refusal");
         };
-        assert_eq!(Some(*refusal), impact::tests::blocked().refusal());
+        assert_eq!(Some(*refusal), blocked.refusal());
+    }
+
+    /// A review left blocked until it expires was refused by the same
+    /// reasons, and says that it expired.
+    #[test]
+    fn a_blocked_review_that_expires_records_its_reasons() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = job(directory.path());
+        let blocked = impact::tests::blocked();
+        let result = wait_for(directory.path(), &mut job, Duration::ZERO, |_| {
+            Ok(impact::Preview {
+                daemon: Some(blocked.clone()),
+                ..preview(false)
+            })
+        });
+        let Err(UpdateError::Refused(refusal)) = result else {
+            panic!("a blocked review expired as something other than a refusal");
+        };
+        assert!(refusal.expired);
+        assert!(
+            refusal
+                .message()
+                .starts_with("Update not installed: the review expired while ")
+        );
+        let unblocked = wait_for(directory.path(), &mut job, Duration::ZERO, |_| {
+            Ok(preview(false))
+        });
+        assert!(
+            matches!(unblocked, Err(UpdateError::Invalid(message)) if message.contains("expired"))
+        );
     }
 }

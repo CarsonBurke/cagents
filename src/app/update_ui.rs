@@ -929,10 +929,11 @@ impl Cagents {
                             .filter(|_| job.phase == UpdatePhase::Failed)
                         {
                             let summary = refusal.summary();
-                            // Later checks find the same record; the reasons
-                            // are said once, and the header keeps them.
-                            if self.update_ui.job.as_ref().is_none_or(|shown| {
-                                shown.id != job.id || !shown.phase.is_terminal()
+                            // Said as this window watches the review end; the
+                            // header keeps the reasons for every later look,
+                            // including a window opened after it ended.
+                            if self.update_ui.job.as_ref().is_some_and(|shown| {
+                                shown.id == job.id && !shown.phase.is_terminal()
                             }) {
                                 self.status = Some(
                                     TransientNotice::warning(format!(
@@ -1185,6 +1186,7 @@ mod tests {
                 reason: crate::update::impact::STOPPED_WITH_UNSETTLED_WORK.into(),
             }],
             blockers: Vec::new(),
+            expired: false,
         };
         let job = UpdateJob {
             id: uuid::Uuid::new_v4().to_string(),
@@ -1193,9 +1195,23 @@ mod tests {
             message: refusal.message(),
             log_path: "/nonexistent/update.log".into(),
             confirmation: None,
-            refusal: Some(refusal),
+            refusal: Some(refusal.clone()),
         };
+        // A window opened after the refusal finds it in the header, without
+        // the reasons raised again at every launch.
         drop(app.update_update_ui(Action::Polled(None, Ok(Some(job.clone())))));
+        assert!(app.status.is_none());
+        assert_eq!(
+            app.update_ui.problem().unwrap().0,
+            "Update not installed: 1 session needs attention. Check again"
+        );
+        // A window watching the review end says why, once.
+        let mut reviewing = job.clone();
+        reviewing.phase = UpdatePhase::AwaitingConfirmation;
+        reviewing.refusal = None;
+        app.update_ui.job = Some(reviewing);
+        app.update_ui.error = None;
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job.clone())))));
         let notice = app.status.take().expect("the refusal is reported");
         assert_eq!(notice.severity, NoticeSeverity::Warning);
         assert_eq!(
@@ -1218,6 +1234,20 @@ mod tests {
         drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job)))));
         assert!(app.status.is_none());
         assert!(app.has_update_control());
+        // A window that predates the refusal field reads the same record as
+        // a failure, still with every reason.
+        let earlier = startup_gate::update_failure(&job.message);
+        assert_eq!(
+            earlier.summary,
+            "Update not installed: 1 session needs attention"
+        );
+        assert!(
+            earlier
+                .notice
+                .details
+                .as_deref()
+                .is_some_and(|details| details.starts_with("Claude: Its provider stopped"))
+        );
         // A failure that follows is still worded as one.
         app.update_ui.error = Some("Could not start update".into());
         assert_eq!(

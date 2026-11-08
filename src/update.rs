@@ -65,7 +65,7 @@ pub enum UpdateError {
     Cancelled,
     /// The person, or the CLI on their behalf, closed a review that nothing
     /// blocked. The verified download is discarded; nothing was installed.
-    #[error("Update cancelled before installing; nothing was changed")]
+    #[error("Update cancelled; nothing was installed")]
     Declined,
     /// The reviewed preview could not be approved. Unlike a cancellation,
     /// this names what held the update back.
@@ -664,8 +664,15 @@ pub fn upgrade_installed(
                         for blocker in &daemon.blockers {
                             eprintln!("  {blocker}");
                         }
+                        let mut ended_any = false;
                         let ended = if accept_unreopenable && ended_for.is_none() {
-                            end_unreachable_source_chats(&job.id, &confirmation.nonce, daemon, yes)
+                            end_unreachable_source_chats(
+                                &job.id,
+                                &confirmation.nonce,
+                                daemon,
+                                yes,
+                                &mut ended_any,
+                            )
                         } else {
                             Ok(false)
                         };
@@ -682,11 +689,7 @@ pub fn upgrade_installed(
                             Err(error) => {
                                 // Never leave the reviewed preview pending: the
                                 // worker would hold it until it expires.
-                                close_review(
-                                    &job.id,
-                                    &confirmation.nonce,
-                                    !matches!(error, UpdateError::Declined),
-                                );
+                                close_review(&job.id, &confirmation.nonce, ended_any);
                                 return Err(error);
                             }
                         }
@@ -712,27 +715,32 @@ pub fn upgrade_installed(
     }
 }
 
-/// Cancel the review the worker holds, which records why the update was not
-/// installed. When some conversations may have just been ended, the worker
-/// republishes the changed impact under a new nonce within a second; closing
-/// that one records what still blocks rather than what was ended.
-fn close_review(job: &str, reviewed: &str, impact_may_change: bool) {
-    let deadline = Instant::now() + Duration::from_secs(if impact_may_change { 5 } else { 0 });
+/// Cancel the review this CLI showed, which records why the update was not
+/// installed. Once conversations were ended, the worker republishes the
+/// changed impact under a new nonce within a second; closing that one records
+/// what still blocks rather than what was just ended. A newer review someone
+/// already approved, in a window, is theirs to keep.
+fn close_review(job: &str, reviewed: &str, ended_any: bool) {
+    let deadline = Instant::now() + Duration::from_secs(if ended_any { 5 } else { 0 });
     loop {
         let Ok(current) = status() else {
             let _ = decide(job, reviewed, UpdateChoice::Cancel);
             return;
         };
-        let Some(nonce) = current
-            .filter(|current| current.id == job)
-            .as_ref()
-            .and_then(UpdateJob::active_confirmation)
-            .map(|active| active.nonce.clone())
-        else {
+        let Some(current) = current.filter(|current| current.id == job) else {
             return;
         };
-        if nonce != reviewed || Instant::now() >= deadline {
-            let _ = decide(job, &nonce, UpdateChoice::Cancel);
+        let Some(active) = current.active_confirmation() else {
+            return;
+        };
+        if active.nonce != reviewed {
+            if current.phase == UpdatePhase::AwaitingConfirmation {
+                let _ = decide(job, &active.nonce, UpdateChoice::Cancel);
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            let _ = decide(job, reviewed, UpdateChoice::Cancel);
             return;
         }
         thread::sleep(Duration::from_millis(250));
@@ -760,6 +768,7 @@ fn end_unreachable_source_chats(
     nonce: &str,
     daemon: &impact::DaemonImpact,
     yes: bool,
+    ended_any: &mut bool,
 ) -> Result<bool, UpdateError> {
     let Some(ending) = unreachable_source_chats(daemon)? else {
         return Ok(false);
@@ -792,7 +801,7 @@ fn end_unreachable_source_chats(
             "The conversations to end changed while you decided; nothing more was ended. Review and retry the update.",
         ));
     }
-    end_source_chats(daemon, ending)?;
+    end_source_chats(daemon, ending, ended_any)?;
     Ok(true)
 }
 
@@ -867,6 +876,7 @@ fn select_unreachable_chats(
 fn end_source_chats(
     daemon: &impact::DaemonImpact,
     ending: Vec<EndedChat>,
+    ended_any: &mut bool,
 ) -> Result<(), UpdateError> {
     let mut client = source_client_for(daemon)?;
     // One the source cannot end does not keep the rest: each was approved
@@ -874,7 +884,10 @@ fn end_source_chats(
     let mut failed = Vec::new();
     for (title, _, session) in ending {
         match client.close_chat(session) {
-            Ok(()) => eprintln!("  Ended {title}"),
+            Ok(()) => {
+                *ended_any = true;
+                eprintln!("  Ended {title}");
+            }
             Err(error) => {
                 eprintln!("  Could not end {title}: {error}");
                 failed.push(title);
@@ -3730,10 +3743,7 @@ finally:
         finish_job(&mut job, &Err(UpdateError::Declined));
         assert_eq!(job.phase, UpdatePhase::Cancelled);
         assert_eq!(job.refusal, None);
-        assert_eq!(
-            job.message,
-            "Update cancelled before installing; nothing was changed"
-        );
+        assert_eq!(job.message, "Update cancelled; nothing was installed");
         let unrefused = serde_json::to_value(&job).unwrap();
         assert!(
             unrefused.get("refusal").is_none(),

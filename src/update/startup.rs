@@ -107,7 +107,7 @@ impl Snapshot {
         if self.helper_lock == LockState::Free && self.can_open() {
             return match self.job.as_ref() {
                 Some(job) if job.phase == UpdatePhase::Failed && job.refused =>
-                    "Some sessions needed attention, so nothing was changed. Open cagents to review them, then update again.".into(),
+                    "Something held the update back, so nothing was installed. Open cagents to see what, then update again.".into(),
                 Some(job) if job.phase == UpdatePhase::Failed && job.daemon_timeout =>
                     "The daemon did not finish starting. Open cagents to review recovery, or check diagnostics before trying again.".into(),
                 Some(job) if !job.phase.is_terminal() =>

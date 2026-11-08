@@ -98,6 +98,7 @@ impl DaemonImpact {
                 })
                 .collect(),
             blockers: self.blockers.clone(),
+            expired: false,
         })
     }
 
@@ -158,8 +159,12 @@ impl DaemonImpact {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Refusal {
     pub sessions: Vec<RefusedSession>,
-    /// Reasons that belong to the terminal service rather than one session.
+    /// Reasons that belong to no one session: work still settling, such as
+    /// agent launches or accepted provider work.
     pub blockers: Vec<String>,
+    /// Nobody closed the review; it expired while these still held it back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -173,16 +178,24 @@ pub struct RefusedSession {
 const DETAILS_LABEL: &str = " Details: ";
 
 impl Refusal {
-    /// "1 session needs attention", "2 sessions and the terminal service
-    /// need attention".
+    /// "1 session needs attention", "2 sessions need attention and other
+    /// work must finish first".
     pub fn summary(&self) -> String {
-        let service = !self.blockers.is_empty();
-        match (self.sessions.len(), service) {
-            (0, _) => "the terminal service needs attention".to_owned(),
-            (1, false) => "1 session needs attention".to_owned(),
-            (1, true) => "1 session and the terminal service need attention".to_owned(),
-            (count, false) => format!("{count} sessions need attention"),
-            (count, true) => format!("{count} sessions and the terminal service need attention"),
+        let sessions = match self.sessions.len() {
+            0 => None,
+            1 => Some("1 session needs attention".to_owned()),
+            count => Some(format!("{count} sessions need attention")),
+        };
+        let work = (!self.blockers.is_empty()).then_some("other work must finish first");
+        let held = match (sessions, work) {
+            (Some(sessions), Some(work)) => format!("{sessions} and {work}"),
+            (Some(sessions), None) => sessions,
+            (None, work) => work.unwrap_or_default().to_owned(),
+        };
+        if self.expired {
+            format!("the review expired while {held}")
+        } else {
+            held
         }
     }
 
@@ -342,11 +355,11 @@ pub(super) mod tests {
         );
         assert_eq!(
             refusal.summary(),
-            "1 session and the terminal service need attention"
+            "1 session needs attention and other work must finish first"
         );
         assert_eq!(
             refusal.message(),
-            "Update not installed: 1 session and the terminal service need attention. \
+            "Update not installed: 1 session needs attention and other work must finish first. \
              Details: Claude: Its provider stopped but may still hold unfinished work. \
              Close this conversation to release it; \
              Additional agent launches must settle before updating."
@@ -355,7 +368,7 @@ pub(super) mod tests {
         service.sessions.clear();
         assert_eq!(
             service.refusal().unwrap().summary(),
-            "the terminal service needs attention"
+            "other work must finish first"
         );
         let mut sessions = blocked();
         sessions.blockers.clear();
@@ -363,6 +376,14 @@ pub(super) mod tests {
         assert_eq!(
             sessions.refusal().unwrap().summary(),
             "2 sessions need attention"
+        );
+        let expired = Refusal {
+            expired: true,
+            ..sessions.refusal().unwrap()
+        };
+        assert_eq!(
+            expired.summary(),
+            "the review expired while 2 sessions need attention"
         );
     }
 }
