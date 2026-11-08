@@ -17,6 +17,7 @@ keep_instance=false
 instance_ttl=
 collect_garbage=false
 storage_days=
+watch_instance=false
 while [ "$#" -gt 0 ]; do
     case "$1" in
         # Internal: the watcher an instance's launch leaves behind.
@@ -59,8 +60,8 @@ while [ "$#" -gt 0 ]; do
             ;;
         --gc) collect_garbage=true ;;
         --storage)
-            if [ "$#" -lt 2 ] || ! printf '%s' "$2" | grep -Eqx '[0-9]+'; then
-                printf '%s\n' "--storage requires a whole number of days" >&2
+            if [ "$#" -lt 2 ] || ! printf '%s' "$2" | grep -Eqx '[1-9][0-9]*'; then
+                printf '%s\n' "--storage requires a whole number of days, at least 1" >&2
                 exit 2
             fi
             shift
@@ -134,7 +135,6 @@ USAGE
     esac
     shift
 done
-[ "${watch_instance:-false}" = true ] || watch_instance=false
 
 if [ -n "$storage_days" ] && [ "$collect_garbage" = false ]; then
     printf '%s\n' "--storage only goes with --gc" >&2
@@ -262,7 +262,8 @@ record_value() {
 # same moment, so a later process given that ID does not count.
 owner_alive() {
     owner=$(record_value "$1" owner)
-    [ -n "$owner" ] && [ "$(process_start "$owner")" = "$(record_value "$1" owner_start)" ]
+    owner_start=$(record_value "$1" owner_start)
+    [ -n "$owner" ] && [ -n "$owner_start" ] && [ "$(process_start "$owner")" = "$owner_start" ]
 }
 
 # Why the instance whose record this is should stop now, if it should. A
@@ -281,10 +282,14 @@ reap_reason() {
     ! owner_alive "$record" || return 1
     grace=$(record_value "$record" grace)
     grace=${grace:-$(instance_grace)}
-    gone=${2:-$started_at}
-    if [ -n "$gone" ]; then
-        [ $((now - gone)) -ge "$grace" ] || return 1
+    if [ -n "${2-}" ]; then
+        [ $((now - $2)) -ge "$grace" ] || return 1
         printf '%s (pid %s), which started it, ended over %s seconds ago\n' \
+            "$(record_value "$record" owner_name)" "$(record_value "$record" owner)" "$grace"
+    elif [ -n "$started_at" ]; then
+        # Nothing saw when it ended, only that the instance is older than that.
+        [ $((now - started_at)) -ge "$grace" ] || return 1
+        printf '%s (pid %s), which started it, has ended, and it started over %s seconds ago\n' \
             "$(record_value "$record" owner_name)" "$(record_value "$record" owner)" "$grace"
     else
         printf '%s (pid %s), which started it, has ended\n' \
@@ -296,7 +301,11 @@ reap_reason() {
 # nothing for no such session. `env` also answers for a dead session, and
 # `exec` would wake a sleeping one.
 session_state() {
-    niri-harness list 2>/dev/null | awk -v session="$1" '$1 == session { print $2; exit }'
+    listing=$(niri-harness list 2>/dev/null) || {
+        printf '%s\n' unknown
+        return 0
+    }
+    printf '%s\n' "$listing" | awk -v session="$1" '$1 == session { print $2; exit }'
 }
 
 session_live() {
@@ -335,28 +344,34 @@ instance_log() {
 # runtime directory. Only processes started with that private directory carry
 # it in their environment. A killed FUSE server can leave its mount behind
 # until the kernel notices, so detach any that remain before removing it.
-sweep_instance_runtime() {
+# Whether a directory is a harness session's private runtime directory, the
+# only kind an instance is stopped or swept by: never this caller's own. A
+# caller inside another session has that session's runtime, beside the ones
+# it may stop.
+private_runtime() {
+    base=${XDG_RUNTIME_DIR:?}
+    base=${base%/nh-*}
     case $1 in
-        */*/nh-*/*|*/..*) return 0 ;;
-        "${XDG_RUNTIME_DIR:?}"/nh-?*) ;;
-        *) return 0 ;;
+        */*/nh-*/* | */..* | "$XDG_RUNTIME_DIR") return 1 ;;
+        "$base"/nh-?*) return 0 ;;
     esac
-    for environment in /proc/[0-9]*/environ; do
-        if tr '\0' '\n' 2>/dev/null <"$environment" | grep -qxF "XDG_RUNTIME_DIR=$1"; then
-            process=${environment#/proc/}
-            kill "${process%/environ}" 2>/dev/null || :
-        fi
-    done
-    [ -d "$1" ] || return 0
-    awk -v runtime="$1" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
+    return 1
+}
+
+sweep_instance_runtime() {
+    sweep_name=$1
+    private_runtime "$2" || return 0
+    signal_runtime TERM "$2"
+    [ -d "$2" ] || return 0
+    awk -v runtime="$2" 'index($5, runtime "/") == 1 && $(NF - 2) ~ /^fuse/ { print $5 }' \
         /proc/self/mountinfo | while IFS= read -r mount; do
         fusermount3 -u -z "$mount" 2>/dev/null || fusermount -u -z "$mount" 2>/dev/null || :
     done
-    if awk -v runtime="$1" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; then
-        printf '%s\n' "instance $instance runtime retained at $1: a filesystem is still mounted there" >&2
+    if awk -v runtime="$2" '$5 == runtime || index($5, runtime "/") == 1 { found = 1 } END { exit !found }' /proc/self/mountinfo; then
+        printf '%s\n' "instance $sweep_name runtime retained at $2: a filesystem is still mounted there" >&2
         return 0
     fi
-    rm -rf -- "$1"
+    rm -rf -- "$2"
 }
 
 # Stops an instance without its CLI: every process started with its private
@@ -366,27 +381,38 @@ sweep_instance_runtime() {
 # no longer be able to tell its hosts, which the CLI needs.
 reap_instance() {
     reap_name=$1 reap_runtime=$2 reason=$3
+    private_runtime "$reap_runtime" || return 0
     instance_log "$reap_name" "stopped: $reason"
     signal_runtime TERM "$reap_runtime"
-    remaining=20
-    while [ -n "$(runtime_processes "$reap_runtime")" ] && [ "$remaining" -gt 0 ]; do
-        remaining=$((remaining - 1))
+    deadline=$(($(date +%s) + 10))
+    while [ -n "$(runtime_processes "$reap_runtime")" ] && [ "$(date +%s)" -lt "$deadline" ]; do
         sleep 0.5
     done
     signal_runtime KILL "$reap_runtime"
-    niri-harness --session "cagents-$reap_name" stop </dev/null >/dev/null 2>&1 || :
-    instance=$reap_name sweep_instance_runtime "$reap_runtime"
+    # Only the session that still has this runtime: a later launch may have
+    # given the name to another.
+    if [ "$(session_runtime "cagents-$reap_name")" = "$reap_runtime" ]; then
+        niri-harness --session "cagents-$reap_name" stop </dev/null >/dev/null 2>&1 || :
+    fi
+    sweep_instance_runtime "$reap_name" "$reap_runtime"
 }
 
+# Every process started with a runtime directory, other than this one and the
+# processes it runs under, which a stop must not end.
 runtime_processes() {
-    for environment in /proc/[0-9]*/environ; do
-        process=${environment#/proc/}
-        process=${process%/environ}
-        [ "$process" != $$ ] || continue
-        if tr '\0' '\n' 2>/dev/null <"$environment" | grep -qxF "XDG_RUNTIME_DIR=$1"; then
-            printf '%s\n' "$process"
-        fi
+    ancestors=" "
+    process=$$
+    while [ "${process:-0}" -gt 1 ]; do
+        ancestors="$ancestors$process "
+        process=$(process_parent "$process") || break
     done
+    grep -lzxF "XDG_RUNTIME_DIR=$1" /proc/[0-9]*/environ 2>/dev/null |
+        sed -n 's|^/proc/\([0-9]*\)/environ$|\1|p' | while read -r process; do
+            case $ancestors in
+                *" $process "*) ;;
+                *) printf '%s\n' "$process" ;;
+            esac
+        done
 }
 
 signal_runtime() {
@@ -399,12 +425,24 @@ signal_runtime() {
 # reap_reason says so. It ends with the session, however that ends.
 watch_instance_lifetime() {
     name=$1 runtime=$2
+    for descriptor in 3 4 5 6 7 8 9; do
+        eval "exec $descriptor>&-"
+    done
     record=$runtime/$owner_record
     printf 'watcher=%s\nwatcher_start=%s\n' "$$" "$(process_start $$)" >>"$record"
+    interval=${CAGENTS_INSTANCE_WATCH_SECONDS:-30}
+    case $interval in
+        '' | *[!0-9.]* | *.*.* | . | 0 | 0.0*) interval=30 ;;
+    esac
     gone=
-    while sleep "${CAGENTS_INSTANCE_WATCH_SECONDS:-30}"; do
+    while sleep "$interval"; do
         [ -f "$record" ] || exit 0
-        session_live "cagents-$name" || exit 0
+        # A listing that fails once, such as while the harness is busy,
+        # says nothing about the session.
+        case $(session_state "cagents-$name") in
+            live | asleep | unknown) ;;
+            *) exit 0 ;;
+        esac
         if owner_alive "$record"; then
             gone=
         else
@@ -483,7 +521,8 @@ list_development_instances() {
             owner=$(sed -n 's/^owner=//p' "$record" 2>/dev/null) || owner=
             owner_name=$(sed -n 's/^owner_name=//p' "$record" 2>/dev/null) || owner_name=
             owner_start=$(sed -n 's/^owner_start=//p' "$record" 2>/dev/null) || owner_start=
-            if [ -n "$owner" ] && [ "$(process_start "$owner")" = "$owner_start" ]; then
+            if [ -n "$owner" ] && [ -n "$owner_start" ] &&
+                [ "$(process_start "$owner")" = "$owner_start" ]; then
                 started_by="$owner_name (pid $owner), still running"
             else
                 started_by="$owner_name (pid $owner), which has ended"
@@ -492,8 +531,6 @@ list_development_instances() {
                 started_by="$started_by, in a cagents session"
             fi
             lifetime=$(describe_lifetime "$record")
-        else
-            lifetime='not recorded: it runs until stopped'
         fi
         if printf '%s\n' "$hosts" | grep -qxF "$directory"; then
             stop='not from here: it hosts this session, or one that started it'
@@ -568,7 +605,6 @@ collect_instances() {
     done <<SESSIONS
 $sessions
 SESSIONS
-    niri-harness gc >/dev/null 2>&1 || :
 }
 
 # Storage of named instances that are not running and that nothing touched
@@ -590,7 +626,8 @@ collect_storage() {
             [ -d "$path" ] && printf '%s\n' "${path##*/cagents-development-}"
         done
     done | sort -u)
-    for name in $names; do
+    while IFS= read -r name; do
+        [ -n "$name" ] || continue
         case $name in
             [!A-Za-z0-9]* | *[!A-Za-z0-9-]*) continue ;;
         esac
@@ -606,7 +643,9 @@ collect_storage() {
         rm -rf -- "$@"
         printf 'removed the storage of instance %s (%s), unused for %s days\n' "$name" "${size:-?}" "$days"
         removed=true
-    done
+    done <<NAMES
+$names
+NAMES
     [ "$removed" = true ] || printf 'no instance storage has gone unused for %s days\n' "$days"
 }
 
@@ -1122,7 +1161,7 @@ stop_instance_session() {
     # The harness reports a runtime it could not remove; the sweep below
     # removes it, so only a failure that leaves it behind is worth showing.
     harness_output=$(niri-harness --session "$harness_session" stop 2>&1 >/dev/null) || :
-    sweep_instance_runtime "$runtime"
+    sweep_instance_runtime "$instance" "$runtime"
     if [ -n "$harness_output" ] && [ -e "$runtime" ]; then
         printf '%s\n' "$harness_output" >&2
     fi
@@ -1186,11 +1225,19 @@ if [ -n "$instance" ]; then
         niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
         ${capped:+"$capped" --name cagents-ui} "$products/cagents-ui" "$@"
     instance_runtime=$(session_runtime "$harness_session") || instance_runtime=
-    if [ -n "$instance_runtime" ] && record_owner "$instance_runtime"; then
-        # Detached, with nothing of this launch's output, so it outlives this
-        # shell without holding a terminal or pipe open.
-        setsid "$root/scripts/run-development" __watch-instance "$instance" "$instance_runtime" \
-            </dev/null >/dev/null 2>&1 &
+    if [ -n "$instance_runtime" ] && record_owner "$instance_runtime" &&
+        { [ "$keep_instance" = false ] || [ -n "$instance_ttl" ]; }; then
+        # Detached, with nothing of this launch's files, so it outlives this
+        # shell without holding a terminal or a caller's pipe open.
+        set -- "$root/scripts/run-development" __watch-instance "$instance" "$instance_runtime"
+        if [ -x /usr/bin/python3 ]; then
+            # A shell can only close the descriptors it can name, 0 to 9.
+            # shellcheck disable=SC2016 # Python, not shell
+            set -- /usr/bin/python3 -I -c 'import os, sys
+os.closerange(3, os.sysconf("SC_OPEN_MAX"))
+os.execv(sys.argv[1], sys.argv[1:])' "$@"
+        fi
+        setsid "$@" </dev/null >/dev/null 2>&1 &
     fi
     instance_log "$instance" "started from $root by $(cat "/proc/$(owner_process)/comm" 2>/dev/null || echo unknown)"
     if [ "$keep_instance" = true ]; then

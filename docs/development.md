@@ -325,9 +325,11 @@ instance lock they hold, so it also lists those built outside a checkout's
 
 An instance stops by itself 10 minutes after the session that started it ends:
 the agent's provider process for a hosted caller, otherwise the shell that ran
-the runner. That covers a provider restarting without leaving instances behind
-when an agent finishes or is stopped. `CAGENTS_INSTANCE_GRACE_SECONDS` changes
-the 10 minutes for the instances a launch starts.
+the runner. The grace period is meant to leave an instance alone while its
+agent moves on to its next step. A restarted provider is a new process,
+though, so the instance doesn't pass to it: it still stops 10 minutes after the
+first one ended. `CAGENTS_INSTANCE_GRACE_SECONDS` changes the 10 minutes for
+the instances a launch starts.
 
 - `--keep` keeps it until someone stops it, so another agent or a person can
   go on using it. Use it when you start an instance for someone else, or
@@ -339,9 +341,15 @@ the 10 minutes for the instances a launch starts.
 A watcher that the launch leaves detached applies this every 30 seconds, and
 ends with the session however that ends. Each stop is logged, with its
 reason, in `~/.local/state/cagents-development-NAME/run-development.log`. The
-watcher stops the daemon and everything started in the instance's runtime as
-`--stop-instance` does: `TERM`, which `daemon stop-for-rebuild` also sends, then
-`KILL` after 10 seconds, then the harness session and its runtime directory.
+watcher doesn't ask the daemon to stop, as `--stop-instance` does, because the
+CLI that would ask may no longer be able to tell its hosts. Instead it sends
+`TERM`, the signal `daemon stop-for-rebuild` sends, to every process started
+with the instance's runtime directory. Ten seconds later it sends `KILL` to
+what remains, then stops the harness session and removes the runtime
+directory. Jobs the daemon started in systemd scopes of their own are found
+the same way, by that directory in their environment. Their scopes are not
+stopped as units, so a job that cleared its environment is missed. An instance started with
+`--keep` and no `--ttl` has no watcher.
 
 The next `--instance` launch and `--gc` repair what a watcher could not:
 

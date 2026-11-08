@@ -1130,7 +1130,7 @@ exit 1
         result = self.run_runner("--gc")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("instance ended: stopping it because ended-agent", result.stderr)
-        self.assertIn("which started it, ended over 50 seconds ago", result.stderr)
+        self.assertIn("which started it, has ended, and it started over 50 seconds ago", result.stderr)
         self.assert_stopped(runtime, process)
         self.assertFalse((self.sessions / "cagents-ended").exists())
         log = (self.root / "state/cagents-development-ended/run-development.log").read_text()
@@ -1213,6 +1213,51 @@ exit 1
                 Path(f"/proc/{watcher}/stat").read_text().rsplit(") ", 1)[1][0] != "Z":
             self.assertLess(time.monotonic(), deadline, "the watcher outlived its session")
             time.sleep(0.05)
+
+    def test_a_kept_launch_without_a_ttl_leaves_no_watcher(self):
+        result = self.run_runner("--browserless", "--instance", "forever", "--keep")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("it runs until you stop it.", result.stdout)
+        time.sleep(0.5)
+        record = self.sessions / "cagents-forever.runtime/cagents-run-development.owner"
+        self.assertIn("lifetime=kept\n", record.read_text())
+        self.assertNotIn("watcher=", record.read_text())
+
+    def test_a_starter_whose_start_was_not_recorded_counts_as_ended(self):
+        record = self.living_owner() | {"lifetime": "owner", "grace": 0, "started_at": 1}
+        record["owner_start"] = ""
+        runtime, process = self.session("unstarted", record=record)
+        result = self.run_runner("--gc")
+        self.assertIn("instance unstarted: stopping it because living-agent", result.stderr)
+        self.assert_stopped(runtime, process)
+
+    def test_a_stop_never_ends_the_processes_it_runs_under(self):
+        # A caller started with the instance's runtime, as a shell inside it
+        # would be, that runs the runner with another.
+        runtime, process = self.session("parent", record=self.ended_owner() | {
+            "lifetime": "owner", "grace": 0, "started_at": 1})
+        result = subprocess.run(
+            ["sh", "-c", 'XDG_RUNTIME_DIR="$1" "$2" --gc; echo caller-survived', "sh",
+             str(self.runtime_root), str(self.runner)],
+            cwd=self.root, env=self.env | {"XDG_RUNTIME_DIR": str(runtime)},
+            capture_output=True, text=True, timeout=30)
+        self.assertIn("caller-survived", result.stdout, result.stderr)
+        self.assert_stopped(runtime, process)
+
+    def test_only_a_private_session_runtime_is_stopped_or_swept(self):
+        shared = self.root / "shared-runtime"
+        shared.mkdir()
+        (self.sessions / "cagents-odd").write_text(f"dead {shared}\n")
+        root = self.sessions / "cagents-odd.d root"
+        root.mkdir()
+        os.utime(root, (time.time() - 120, time.time() - 120))
+        process = subprocess.Popen(["sleep", "60"], env={"XDG_RUNTIME_DIR": str(shared)})
+        self.addCleanup(lambda: (process.kill(), process.wait()))
+        result = self.run_runner("--gc")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        time.sleep(0.5)
+        self.assertIsNone(process.poll())
+        self.assertTrue(shared.exists())
 
     def test_a_live_session_still_refuses_a_second_launch(self):
         self.session("busy", record=self.living_owner() | {"lifetime": "owner", "grace": 600,
