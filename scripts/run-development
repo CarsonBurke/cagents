@@ -349,10 +349,12 @@ instance_log() {
 # caller inside another session has that session's runtime, beside the ones
 # it may stop.
 private_runtime() {
-    base=${XDG_RUNTIME_DIR:?}
+    # From cron, or an ssh login without a user session, the variable may be
+    # unset; the user's runtime directory is where systemd puts it.
+    base=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}
     base=${base%/nh-*}
     case $1 in
-        */*/nh-*/* | */..* | "$XDG_RUNTIME_DIR") return 1 ;;
+        */*/nh-*/* | */..* | "${XDG_RUNTIME_DIR:-$base}") return 1 ;;
         "$base"/nh-?*) return 0 ;;
     esac
     return 1

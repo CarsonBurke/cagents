@@ -328,7 +328,10 @@ the agent's provider process for a hosted caller, otherwise the shell that ran
 the runner. The grace period is meant to leave an instance alone while its
 agent moves on to its next step. A restarted provider is a new process,
 though, so the instance doesn't pass to it: it still stops 10 minutes after the
-first one ended. `CAGENTS_INSTANCE_GRACE_SECONDS` changes the 10 minutes for
+first one ended. Outside a cagents session the starter is the runner's parent
+process. A tool that runs each command in a shell of its own, as an agent in a
+plain terminal does, ends that shell as soon as the command returns, so its
+instance stops 10 minutes later; start it with `--keep` or `--ttl` instead. `CAGENTS_INSTANCE_GRACE_SECONDS` changes the 10 minutes for
 the instances a launch starts.
 
 - `--keep` keeps it until someone stops it, so another agent or a person can

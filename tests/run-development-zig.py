@@ -1281,6 +1281,22 @@ exit 1
         self.assertIsNone(process.poll())
         self.assertTrue(shared.exists())
 
+    def test_gc_from_a_shell_without_a_runtime_directory_checks_the_users(self):
+        # Cron, or an ssh login without a user session, has no XDG_RUNTIME_DIR.
+        shared = self.root / "shared-runtime"
+        shared.mkdir()
+        (self.sessions / "cagents-odd").write_text(f"dead {shared}\n")
+        root = self.sessions / "cagents-odd.d root"
+        root.mkdir()
+        os.utime(root, (time.time() - 120, time.time() - 120))
+        environment = {key: value for key, value in self.env.items() if key != "XDG_RUNTIME_DIR"}
+        result = subprocess.run([str(self.runner), "--gc"], cwd=self.root, env=environment,
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("XDG_RUNTIME_DIR", result.stderr)
+        # Outside the user's runtime directory, so not a session's own.
+        self.assertTrue(shared.exists())
+
     def test_gc_says_so_and_fails_when_the_harness_cannot_list(self):
         harness = self.root / "bin/niri-harness"
         harness.write_text("#!/bin/sh\necho 'state directory is locked' >&2\nexit 3\n")
