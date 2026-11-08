@@ -1562,6 +1562,7 @@ mod tests {
 
     #[test]
     fn codex_pane_with_a_surviving_server_or_holder_is_live_work() {
+        use std::io::Read;
         // Other tests must not fork while this test owns a listener whose
         // final descriptor close is meant to remove its /proc/net/unix row.
         #[cfg(target_os = "linux")]
@@ -1574,22 +1575,35 @@ mod tests {
             let holders = tempfile::tempdir_in("/var/tmp").unwrap();
             // A server still naming the pane's listener, as `codex app-server
             // --listen unix://<socket>` does.
-            let mut server = std::process::Command::new("sh")
-                .args(["-c", "sleep 60; :", "server", "app-server", "--listen"])
+            let mut server = std::process::Command::new("/bin/sh")
+                .args([
+                    "-c",
+                    "printf ready; IFS= read -r release",
+                    "server",
+                    "app-server",
+                    "--listen",
+                ])
                 .arg(format!("unix://{}", socket.display()))
+                .stdin(std::process::Stdio::piped())
+                .stdout(std::process::Stdio::piped())
                 .spawn()
                 .unwrap();
-            let published = std::path::PathBuf::from(format!("/proc/{}/cmdline", server.id()));
-            while !std::fs::read(&published)
+            let mut ready = [0; 5];
+            server
+                .stdout
+                .as_mut()
                 .unwrap()
-                .windows(b"app-server".len())
-                .any(|window| window == b"app-server")
-            {
-                std::thread::sleep(Duration::from_millis(5));
-            }
+                .read_exact(&mut ready)
+                .unwrap();
+            assert_eq!(&ready, b"ready");
             let named = evidence(holders.path(), Vec::new()).classify(&card);
-            server.kill().unwrap();
-            server.wait().unwrap();
+            server
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(b"release\n")
+                .unwrap();
+            assert!(server.wait().unwrap().success());
             assert_eq!(named, SavedExecution::Running);
             // A server under another name still bound to the listener path.
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
