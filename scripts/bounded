@@ -143,22 +143,31 @@ def members(identity, leader=None):
 def stop(identity, leader=None):
     """TERM, then KILL after the grace period, to every member. True if
     anything had to be killed."""
+    # Members this user may not signal, such as a setuid program, are left
+    # to end with the rest rather than waited for.
+    refused = set()
+
+    def remaining():
+        return [pid for pid in members(identity, leader) if pid not in refused]
+
     def signal_all(number):
-        for pid in members(identity, leader):
+        for pid in remaining():
             try:
                 os.kill(pid, number)
+            except PermissionError:
+                refused.add(pid)
             except OSError:
                 pass
     signal_all(signal.SIGTERM)
     deadline = time.monotonic() + GRACE
-    while time.monotonic() < deadline and members(identity, leader):
+    while time.monotonic() < deadline and remaining():
         time.sleep(0.2)
-    killed = bool(members(identity, leader))
+    killed = bool(remaining())
     if killed:
         signal_all(signal.SIGKILL)
         # KILL takes effect on the way back from the kernel, not at once.
         deadline = time.monotonic() + 5
-        while time.monotonic() < deadline and members(identity, leader):
+        while time.monotonic() < deadline and remaining():
             time.sleep(0.05)
     return killed
 
@@ -209,19 +218,22 @@ def run(arguments):
     leader = None
     try:
         write_record(identity, record)
+        if reason is not None:
+            say(f"did not start {record['name']}: {reason}")
+            return status
         try:
             child = subprocess.Popen(arguments.command, env=os.environ | {MARK: marks},
                                      start_new_session=True, preexec_fn=as_child)
         except OSError as error:
             say(f"cannot run {arguments.command[0]}: {error.strerror}")
             return 127 if error.errno == errno.ENOENT else 126
-        # Its pidfd says when it exits, without reaping it: until it is
-        # reaped, its ID, and so its group's, cannot pass to another process.
-        exited = os.pidfd_open(child.pid)
         found = stat(child.pid)
         leader = (child.pid, found[4] if found else 0)
         record["leader"], record["leader_start"] = leader
         write_record(identity, record)
+        # Its pidfd says when it exits, without reaping it: until it is
+        # reaped, its ID, and so its group's, cannot pass to another process.
+        exited = os.pidfd_open(child.pid)
         while reason is None:
             ready, _, _ = select.select([exited, wake_read], [], [], POLL)
             if exited in ready:
@@ -245,6 +257,11 @@ def run(arguments):
         say(f"stopped {record['name']} after {time.time() - started:.0f}s: {reason}"
             + ("; it ignored TERM, so it was killed" if killed else ""))
         return status
+    except BaseException:
+        # Whatever went wrong here, the workload must not outlive it.
+        if leader is not None:
+            stop(identity, leader)
+        raise
     finally:
         try:
             os.unlink(record_path(identity))

@@ -976,8 +976,9 @@ process that left the group but still carries the workload's `CAGENTS_BOUNDED`
 environment mark. When the command exits by itself, whatever it left running
 in the background goes too. The exit status is the command's own. It is 124
 when `--ttl` stopped the workload, 143 when the owner ended or the wrapper was
-stopped, and 127 or 126 when the command could not be run. A stop always prints
-its reason.
+stopped, and 127 or 126 when the command could not be run. A stop for any of
+those reasons prints why. Clearing up after a command that exited by itself
+prints nothing.
 
 `scripts/bounded --list` shows what runs bounded on the host: whose it is, how
 long it has left, and how to stop it. If the wrapper itself was killed with
