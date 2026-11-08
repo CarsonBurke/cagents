@@ -14,6 +14,47 @@ struct LocalViews {
     panes: HashMap<Scope, Vec<Pane>>,
 }
 
+/// Each open card's worktree during one projection, with how many cards
+/// each path holds, so a view no card resolves to is known without a scan.
+#[derive(Default)]
+struct CardWorktrees {
+    paths: HashMap<CardId, PathBuf>,
+    counts: HashMap<PathBuf, usize>,
+}
+
+impl CardWorktrees {
+    fn get(&self, card: CardId) -> Option<&PathBuf> {
+        self.paths.get(&card)
+    }
+
+    fn holds(&self, path: &Path) -> bool {
+        self.counts.contains_key(path)
+    }
+
+    fn insert(&mut self, card: CardId, path: PathBuf) {
+        self.remove(card);
+        *self.counts.entry(path.clone()).or_default() += 1;
+        self.paths.insert(card, path);
+    }
+
+    fn remove(&mut self, card: CardId) {
+        let Some(path) = self.paths.remove(&card) else {
+            return;
+        };
+        if let Some(count) = self.counts.get_mut(&path) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(&path);
+            }
+        }
+    }
+}
+
+struct ScopeDiscovery<'a> {
+    scopes: Vec<Scope>,
+    worktree_cards: Vec<(&'a CardState, &'a Path)>,
+}
+
 /// Whole descriptors can contain concurrently changed metadata even for the
 /// same process. Retry only while the complete base is still authoritative;
 /// the daemon must also enforce this fence when it applies the operation.
@@ -578,15 +619,20 @@ impl Cagents {
         &self,
         card: CardId,
         source: &TerminalSession,
+        views_ready: &mut Option<bool>,
     ) -> bool {
-        self.shared_terminal_attach_hold(card, source).is_none()
+        self.shared_terminal_attach_hold(card, source, views_ready)
+            .is_none()
     }
 
-    /// Why a queued row may not attach `source` yet.
+    /// Why a queued row may not attach `source` yet. `views_ready` remembers
+    /// whether every view is admitted, so a caller asking about each of many
+    /// rows while nothing changes discovers the views only once.
     pub(super) fn shared_terminal_attach_hold(
         &self,
         card: CardId,
         source: &TerminalSession,
+        views_ready: &mut Option<bool>,
     ) -> Option<&'static str> {
         if self.shared_views.defaults.contains_key(&card)
             || self.durable.pending_terminal_creations.contains(&card)
@@ -611,7 +657,7 @@ impl Cagents {
         let Some((view, pane)) = owners.next() else {
             // Once every view is admitted, no view will list it: it is this
             // window's own and attaches from its descriptor.
-            return (!self.shared_views_ready_for_startup())
+            return (!*views_ready.get_or_insert_with(|| self.shared_views_ready_for_startup()))
                 .then_some("the shared workspace does not list its pane");
         };
         if owners.next().is_some() {
@@ -633,43 +679,122 @@ impl Cagents {
     }
 
     fn local_view_scopes(&self) -> Vec<Scope> {
+        self.discover_view_scopes().scopes
+    }
+
+    /// Every scope this window shows, and the worktree each card outside a
+    /// channel resolves to. A large workspace holds thousands of cards and
+    /// historical worktrees, so each card and path is resolved by lookup
+    /// rather than by comparing it with every root or project worktree.
+    fn discover_view_scopes(&self) -> ScopeDiscovery<'_> {
+        let roots = self.indexed_worktree_roots();
+        let channel_cards = self
+            .durable
+            .channels
+            .iter()
+            .flat_map(|channel| channel.cards.iter().copied())
+            .collect::<HashSet<_>>();
+        // Preserve the first matching project's authority, just as
+        // worktree_view_scope does, without searching every worktree per path.
+        let mut repositories = HashMap::new();
+        for project in &self.sidebar_model.projects {
+            for path in project
+                .worktrees
+                .iter()
+                .map(|worktree| worktree.path.as_path())
+                .chain(std::iter::once(project.repository.as_path()))
+                .chain(
+                    project
+                        .repository
+                        .file_name()
+                        .is_some_and(|name| name == ".git")
+                        .then(|| project.repository.parent())
+                        .flatten(),
+                )
+            {
+                repositories.entry(path).or_insert(&project.repository);
+            }
+        }
+        let worktree_cards = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| !channel_cards.contains(&card.id))
+            .filter_map(|card| {
+                self.unchanneled_card_worktree_indexed(card, &roots)
+                    .map(|path| (card, path))
+            })
+            .collect::<Vec<_>>();
         let mut scopes = self
             .durable
             .channels
             .iter()
             .map(|channel| Scope::Channel(channel.id))
             .collect::<Vec<_>>();
-        for scope in self.workspace_model.views.iter().map(|view| &view.scope) {
-            if let Scope::Worktree { repository, .. } = scope {
-                if self
-                    .sidebar_model
-                    .projects
-                    .iter()
-                    .any(|project| &project.repository == repository)
-                {
-                    scopes.push(scope.clone());
-                }
-            }
-        }
-        let paths = self
+        let project_repositories = self
+            .sidebar_model
+            .projects
+            .iter()
+            .map(|project| &project.repository)
+            .collect::<HashSet<_>>();
+        scopes.extend(
+            self.workspace_model
+                .views
+                .iter()
+                .filter_map(|view| match &view.scope {
+                    Scope::Worktree { repository, .. }
+                        if project_repositories.contains(repository) =>
+                    {
+                        Some(view.scope.clone())
+                    }
+                    _ => None,
+                }),
+        );
+        for path in self
             .known_worktree_roots
             .iter()
             .map(PathBuf::as_path)
             .chain(self.active_workspace.as_deref())
-            .chain(
-                self.durable
-                    .cards
-                    .iter()
-                    .filter_map(|card| self.card_worktree(card)),
-            );
-        for path in paths {
-            if let Some(scope) = self.worktree_view_scope(path) {
-                scopes.push(scope);
+            .chain(worktree_cards.iter().map(|(_, path)| *path))
+        {
+            if let Some(repository) = repositories.get(path) {
+                scopes.push(Scope::Worktree {
+                    repository: (*repository).clone(),
+                    path: path.to_owned(),
+                });
             }
         }
         let mut seen = HashSet::new();
         scopes.retain(|scope| seen.insert(scope.clone()));
+        ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        }
+    }
+
+    /// The local views that list `card`, as `local_view_cards` would,
+    /// without resolving every view's cards to find one.
+    fn local_scopes_listing(&self, card: CardId) -> Vec<Scope> {
+        let ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        } = self.discover_view_scopes();
+        let worktree = worktree_cards
+            .iter()
+            .find(|(state, _)| state.id == card)
+            .filter(|(state, _)| state.existence.is_open() && !state.kind.is_utility())
+            .map(|(_, path)| *path);
         scopes
+            .into_iter()
+            .filter(|scope| match scope {
+                Scope::Channel(id) => self
+                    .durable
+                    .channels
+                    .iter()
+                    .any(|channel| channel.id == *id && channel.cards.contains(&card)),
+                Scope::Worktree { path, .. } => worktree == Some(path.as_path()),
+            })
+            .collect()
     }
 
     fn local_view_cards(&self, scope: &Scope) -> Vec<CardId> {
@@ -767,91 +892,16 @@ impl Cagents {
         self.shared_views
             .local_projection_count
             .set(self.shared_views.local_projection_count.get() + 1);
-        let roots = self.indexed_worktree_roots();
         let cards = self
             .durable
             .cards
             .iter()
             .map(|card| (card.id, card))
             .collect::<HashMap<_, _>>();
-        let channel_cards = self
-            .durable
-            .channels
-            .iter()
-            .flat_map(|channel| channel.cards.iter().copied())
-            .collect::<HashSet<_>>();
-        // Preserve the first matching project's authority, just as
-        // worktree_view_scope does, without searching every worktree per path.
-        let mut repositories = HashMap::new();
-        for project in &self.sidebar_model.projects {
-            for path in project
-                .worktrees
-                .iter()
-                .map(|worktree| worktree.path.as_path())
-                .chain(std::iter::once(project.repository.as_path()))
-                .chain(
-                    project
-                        .repository
-                        .file_name()
-                        .is_some_and(|name| name == ".git")
-                        .then(|| project.repository.parent())
-                        .flatten(),
-                )
-            {
-                repositories.entry(path).or_insert(&project.repository);
-            }
-        }
-        let worktree_cards = self
-            .durable
-            .cards
-            .iter()
-            .filter(|card| !channel_cards.contains(&card.id))
-            .filter_map(|card| {
-                self.unchanneled_card_worktree_indexed(card, &roots)
-                    .map(|path| (card, path))
-            })
-            .collect::<Vec<_>>();
-        let mut scopes = self
-            .durable
-            .channels
-            .iter()
-            .map(|channel| Scope::Channel(channel.id))
-            .collect::<Vec<_>>();
-        let project_repositories = self
-            .sidebar_model
-            .projects
-            .iter()
-            .map(|project| &project.repository)
-            .collect::<HashSet<_>>();
-        scopes.extend(
-            self.workspace_model
-                .views
-                .iter()
-                .filter_map(|view| match &view.scope {
-                    Scope::Worktree { repository, .. }
-                        if project_repositories.contains(repository) =>
-                    {
-                        Some(view.scope.clone())
-                    }
-                    _ => None,
-                }),
-        );
-        for path in self
-            .known_worktree_roots
-            .iter()
-            .map(PathBuf::as_path)
-            .chain(self.active_workspace.as_deref())
-            .chain(worktree_cards.iter().map(|(_, path)| *path))
-        {
-            if let Some(repository) = repositories.get(path) {
-                scopes.push(Scope::Worktree {
-                    repository: (*repository).clone(),
-                    path: path.to_owned(),
-                });
-            }
-        }
-        let mut seen = HashSet::new();
-        scopes.retain(|scope| seen.insert(scope.clone()));
+        let ScopeDiscovery {
+            scopes,
+            worktree_cards,
+        } = self.discover_view_scopes();
         let mut by_path = HashMap::<&Path, Vec<CardId>>::new();
         for (card, path) in worktree_cards {
             if card.existence.is_open() && !card.kind.is_utility() {
@@ -1241,6 +1291,12 @@ impl Cagents {
             cards,
             mut panes,
         } = projected;
+        // Publishing only queues edits, so the model's views stay put: find
+        // each scope's first view by lookup rather than a scan per scope.
+        let mut view_indices = HashMap::new();
+        for (index, view) in self.workspace_model.views.iter().enumerate() {
+            view_indices.entry(view.scope.clone()).or_insert(index);
+        }
         let previous_owners = self
             .shared_views
             .baseline
@@ -1267,12 +1323,9 @@ impl Cagents {
                         destination: destination.clone(),
                         before,
                     };
-                    let expected_revision = self
-                        .workspace_model
-                        .views
-                        .iter()
-                        .find(|view| view.scope == source)
-                        .map(|view| view.revision)
+                    let expected_revision = view_indices
+                        .get(&source)
+                        .map(|&index| self.workspace_model.views[index].revision)
                         .unwrap_or(0);
                     self.shared_views
                         .pending
@@ -1308,11 +1361,9 @@ impl Cagents {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
                     // tombstones and utility panes are unrelated client state.
-                    let closed = self
-                        .workspace_model
-                        .views
-                        .iter()
-                        .find(|view| view.scope == scope)
+                    let closed = view_indices
+                        .get(&scope)
+                        .map(|&index| &self.workspace_model.views[index])
                         .map(|view| {
                             view.panes
                                 .iter()
@@ -1352,12 +1403,9 @@ impl Cagents {
                 .get(&scope)
                 .cloned()
                 .unwrap_or_default();
-            let revision = self
-                .workspace_model
-                .views
-                .iter()
-                .find(|view| view.scope == scope)
-                .map(|view| view.revision)
+            let revision = view_indices
+                .get(&scope)
+                .map(|&index| self.workspace_model.views[index].revision)
                 .unwrap_or(0);
             for change in views::changes(&previous, &panes) {
                 // A Remove is every window's instruction to close the pane. A
@@ -1654,21 +1702,23 @@ impl Cagents {
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
         self.prepare_shared_aliases(&views, &owned);
-        // Root discovery is immutable during this projection. Keep only owned
-        // paths across mutable view updates, and refresh the panes each view
-        // changes before visiting the next one.
-        let mut local_worktrees = {
-            let roots = self.indexed_worktree_roots();
-            self.durable
-                .cards
-                .iter()
-                .filter(|card| card.existence.is_open())
-                .filter_map(|card| {
-                    self.unchanneled_card_worktree_indexed(card, &roots)
-                        .map(|path| (card.id, path.to_owned()))
-                })
-                .collect::<HashMap<_, _>>()
-        };
+        // Root discovery is immutable during this projection, so index it once
+        // over owned paths that outlive each mutable view update. Keep only
+        // owned card paths too, and refresh the panes each view changes before
+        // visiting the next one.
+        let root_paths = self.worktree_root_paths();
+        let roots = worktree_ui::WorktreeRoots::new(root_paths.iter().map(PathBuf::as_path));
+        let mut local_worktrees = CardWorktrees::default();
+        for card in self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open())
+        {
+            if let Some(path) = self.unchanneled_card_worktree_indexed(card, &roots) {
+                local_worktrees.insert(card.id, path.to_owned());
+            }
+        }
         let mut projected_scopes = Vec::new();
         for mut view in views {
             if self.shared_views.blocked.contains(&view.scope) {
@@ -1688,6 +1738,8 @@ impl Cagents {
             }
             let current = match &view.scope {
                 Scope::Channel(_) => self.local_view_cards(&view.scope),
+                // Most views are historical: no card resolves to them at all.
+                Scope::Worktree { path, .. } if !local_worktrees.holds(path) => Vec::new(),
                 Scope::Worktree { path, .. } => {
                     let channel_cards = self
                         .durable
@@ -1702,7 +1754,7 @@ impl Cagents {
                             card.existence.is_open()
                                 && !card.kind.is_utility()
                                 && !channel_cards.contains(&card.id)
-                                && local_worktrees.get(&card.id) == Some(path)
+                                && local_worktrees.get(card.id) == Some(path)
                         })
                         .map(|card| card.id)
                         .collect()
@@ -1710,7 +1762,6 @@ impl Cagents {
             };
             tasks.push(self.project_shared_view_with_cards(&view, &owned, current));
             if !view.panes.is_empty() {
-                let roots = self.indexed_worktree_roots();
                 for pane in &view.panes {
                     if let Some(path) = self
                         .card_state(pane.id)
@@ -1718,7 +1769,7 @@ impl Cagents {
                     {
                         local_worktrees.insert(pane.id, path.to_owned());
                     } else {
-                        local_worktrees.remove(&pane.id);
+                        local_worktrees.remove(pane.id);
                     }
                 }
             }
@@ -1794,9 +1845,8 @@ impl Cagents {
                                 .any(|project| &project.repository == repository),
                         };
                     if !ready {
-                        for scope in self.local_view_scopes() {
-                            if scope != view.scope && self.local_view_cards(&scope).contains(&alias)
-                            {
+                        for scope in self.local_scopes_listing(alias) {
+                            if scope != view.scope {
                                 self.shared_views.blocked.insert(scope);
                             }
                         }
@@ -1810,10 +1860,8 @@ impl Cagents {
                     };
                     if !can_adopt {
                         self.shared_views.blocked.insert(view.scope.clone());
-                        for scope in self.local_view_scopes() {
-                            if self.local_view_cards(&scope).contains(&alias) {
-                                self.shared_views.blocked.insert(scope);
-                            }
+                        for scope in self.local_scopes_listing(alias) {
+                            self.shared_views.blocked.insert(scope);
                         }
                         self.status = Some(TransientNotice::warning(
                             "A shared pane has a new identity. Finish or discard its local draft before adopting it.",
@@ -4305,6 +4353,46 @@ mod tests {
         );
     }
 
+    /// Scope discovery by scanning every root and project worktree per card
+    /// and path: the definition the indexed discovery must reproduce.
+    fn reference_view_scopes(app: &Cagents) -> Vec<Scope> {
+        let mut scopes = app
+            .durable
+            .channels
+            .iter()
+            .map(|channel| Scope::Channel(channel.id))
+            .collect::<Vec<_>>();
+        scopes.extend(app.workspace_model.views.iter().filter_map(|view| {
+            match &view.scope {
+                Scope::Worktree { repository, .. }
+                    if app
+                        .sidebar_model
+                        .projects
+                        .iter()
+                        .any(|project| &project.repository == repository) =>
+                {
+                    Some(view.scope.clone())
+                }
+                _ => None,
+            }
+        }));
+        let paths = app
+            .known_worktree_roots
+            .iter()
+            .map(PathBuf::as_path)
+            .chain(app.active_workspace.as_deref())
+            .chain(
+                app.durable
+                    .cards
+                    .iter()
+                    .filter_map(|card| app.card_worktree(card)),
+            );
+        scopes.extend(paths.filter_map(|path| app.worktree_view_scope(path)));
+        let mut seen = HashSet::new();
+        scopes.retain(|scope| seen.insert(scope.clone()));
+        scopes
+    }
+
     #[test]
     fn batched_projection_preserves_large_workspace_history_and_pending_starts() {
         let (mut app, channel, _, pane) = fixture();
@@ -4396,14 +4484,23 @@ mod tests {
         let batched = app.local_views();
         let batched_elapsed = started.elapsed();
         let started = Instant::now();
-        let scopes = app.local_view_scopes();
+        let scopes = reference_view_scopes(&app);
         let reference = scopes
             .iter()
             .map(|scope| (scope.clone(), app.local_view_panes(scope)))
             .collect::<HashMap<_, _>>();
         let reference_elapsed = started.elapsed();
         assert_eq!(batched.scopes, scopes);
+        assert_eq!(app.local_view_scopes(), scopes);
         assert_eq!(batched.panes, reference);
+        for card in app.durable.cards.iter().step_by(17) {
+            let listing = scopes
+                .iter()
+                .filter(|scope| app.local_view_cards(scope).contains(&card.id))
+                .cloned()
+                .collect::<Vec<_>>();
+            assert_eq!(app.local_scopes_listing(card.id), listing);
+        }
         assert!(batched.panes[&Scope::Channel(channel)][0].pending_terminal_start);
         assert!(
             batched.panes[&Scope::Worktree {
