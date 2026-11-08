@@ -71,6 +71,7 @@ pub(super) fn perform(
     state: &Path,
     job: &mut UpdateJob,
     root: &Path,
+    accept_unreopenable: bool,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, source_proof) = source::inspect_identity(None)?;
@@ -122,7 +123,7 @@ pub(super) fn perform(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    reconcile_saved_sources(staged.identity.protocol)?;
+    reconcile_saved_sources(staged.identity.protocol, accept_unreopenable)?;
     let confirmed = confirmation::wait(state, job, observe)?;
     set_phase(
         state,
@@ -134,7 +135,7 @@ pub(super) fn perform(
     crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
         crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
+            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, accept_unreopenable)?;
         let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
             .map_err(io::Error::other)?;
         if !confirmed.preserves_consent(&latest) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
