@@ -946,6 +946,7 @@ impl ChangeToken {
             chat::ToolStatus::Failed => 2,
             chat::ToolStatus::Denied => 3,
             chat::ToolStatus::Stopped => 4,
+            chat::ToolStatus::Waiting => 5,
         }
     }
     /// Folds a number into a digest so a field that is not a string still
@@ -1198,6 +1199,7 @@ fn status_word(status: chat::ToolStatus) -> &'static str {
         chat::ToolStatus::Failed => "Failed",
         chat::ToolStatus::Denied => "Denied",
         chat::ToolStatus::Stopped => "Stopped",
+        chat::ToolStatus::Waiting => "Waiting on background work",
     }
 }
 

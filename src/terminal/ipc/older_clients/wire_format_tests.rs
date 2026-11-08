@@ -61,6 +61,9 @@ struct Comparison<'a> {
     /// Variants of the named enum that the connection refuses, so their
     /// contents need not match. Their positions still must.
     refused: Vec<(&'static str, &'static [&'static str])>,
+    /// Appended variants of the named enum that the older client is sent as
+    /// one it knows.
+    restated: Vec<(&'static str, &'static str)>,
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,
 }
@@ -128,7 +131,13 @@ impl Comparison<'_> {
                         _ => self.differ(&path, "variant was not traced".into()),
                     }
                 }
-                if new.len() > old.len() && direction == Direction::Reply && gate.is_none() {
+                let appended = new.iter().skip(old.len()).any(|(name, _)| {
+                    !self
+                        .restated
+                        .iter()
+                        .any(|restated| *restated == (current, name.as_str()))
+                });
+                if appended && direction == Direction::Reply && gate.is_none() {
                     self.differ(
                         path,
                         "appended variants the older client cannot decode".into(),
@@ -204,12 +213,14 @@ fn differences(
     current: &Shapes,
     gated: Vec<(&'static str, usize)>,
     refused: Vec<(&'static str, &'static [&'static str])>,
+    restated: Vec<(&'static str, &'static str)>,
 ) -> Vec<String> {
     let mut comparison = Comparison {
         older,
         current,
         gated,
         refused,
+        restated,
         visited: BTreeSet::new(),
         differences: Vec::new(),
     };
@@ -258,8 +269,14 @@ fn this_protocols_wire_format_is_recorded() {
         return;
     }
     let recorded = recorded(PROTOCOL_VERSION);
-    let mut changed = differences(&recorded, &current, Vec::new(), Vec::new());
-    changed.extend(differences(&current, &recorded, Vec::new(), Vec::new()));
+    let mut changed = differences(&recorded, &current, Vec::new(), Vec::new(), Vec::new());
+    changed.extend(differences(
+        &current,
+        &recorded,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+    ));
     assert!(
         changed.is_empty(),
         "the wire format differs from protocol {PROTOCOL_VERSION}'s recording. Postcard is \
@@ -313,6 +330,11 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             } else {
                 Vec::new()
             },
+            RESTATED_VARIANTS
+                .iter()
+                .filter(|(.., since)| client.protocol < *since)
+                .map(|(container, variant, _)| (*container, *variant))
+                .collect(),
         );
         assert!(
             differences.is_empty(),

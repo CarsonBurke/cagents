@@ -1395,7 +1395,13 @@ impl LocalHandle {
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         (
-            state.is_working() || state.waiting || !state.requests.is_empty(),
+            state.is_working()
+                || state.waiting
+                || !state.requests.is_empty()
+                || state
+                    .subagents
+                    .iter()
+                    .any(|agent| agent.status == ToolStatus::Waiting),
             state.ready,
         )
     }
@@ -1419,7 +1425,7 @@ impl LocalHandle {
         state
             .subagents
             .iter()
-            .filter(|agent| agent.background && agent.status == ToolStatus::Running)
+            .filter(|agent| agent.background && agent.status.is_live())
             .map(|agent| agent.id.clone())
             .collect()
     }
@@ -4020,6 +4026,13 @@ fn apply_projected_event(
         Event::Exited { .. } => {
             state.prompt_suggestion = None;
             state.exited = true;
+            for agent in &mut state.subagents {
+                if agent.status == ToolStatus::Waiting {
+                    agent.status = ToolStatus::Stopped;
+                    agent.detail =
+                        "The provider exited before its background work reported back".to_owned();
+                }
+            }
             state.waiting = false;
             state.busy = false;
             state.ready = false;
@@ -4039,9 +4052,10 @@ fn apply_projected_event(
     child_text_copy::finish(state, child_copy_update);
 }
 
-/// Marks the steps still running as stopped, copying only those items.
-/// Nothing a provider that ended was doing outlives it; a step it left
-/// running would otherwise read as still working.
+/// Marks the steps still running or waiting as stopped, copying only those
+/// items. Nothing a provider that ended was doing outlives it; a step it left
+/// going would otherwise read as still working. A subagent waiting on its
+/// background work is ended by [`Event::Exited`], which says why.
 fn stop_snapshot_steps(state: &mut Snapshot) {
     stop_running_steps(&mut state.items);
     for agent in &mut state.subagents {
@@ -4056,7 +4070,7 @@ fn stop_snapshot_steps(state: &mut Snapshot) {
 fn stop_running_steps(items: &mut [Arc<Item>]) {
     let now = observed_at();
     for item in items {
-        if item.content.status() == Some(ToolStatus::Running) {
+        if item.content.status().is_some_and(ToolStatus::is_live) {
             let item = Arc::make_mut(item);
             if let Some(status) = item.content.status_mut() {
                 *status = ToolStatus::Stopped;
@@ -4078,7 +4092,7 @@ fn trim_subagents(state: &mut Snapshot) {
         let Some(finished) = state
             .subagents
             .iter()
-            .position(|agent| agent.status != ToolStatus::Running)
+            .position(|agent| !agent.status.is_live())
         else {
             break;
         };
@@ -5306,6 +5320,11 @@ mod tests {
             &mut indices,
             Event::Item(tool("done", ToolStatus::Succeeded)),
         );
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Item(tool("waiting", ToolStatus::Waiting)),
+        );
         let finished = Arc::clone(&state.items[1]);
         let agent = subagent(&mut state, "scout");
         agent.waiting = true;
@@ -5322,7 +5341,11 @@ mod tests {
             .collect();
         assert_eq!(
             statuses,
-            [Some(ToolStatus::Stopped), Some(ToolStatus::Succeeded)]
+            [
+                Some(ToolStatus::Stopped),
+                Some(ToolStatus::Succeeded),
+                Some(ToolStatus::Stopped)
+            ]
         );
         assert!(
             Arc::ptr_eq(&finished, &state.items[1]),
@@ -6065,6 +6088,57 @@ mod tests {
         apply_event(&mut state, &mut indices, Event::TurnStarted);
         assert_eq!(state.turn_generation, 3);
         assert_eq!(state.generation, 0, "publication generation is independent");
+    }
+
+    #[test]
+    fn the_provider_exiting_closes_an_agent_waiting_on_its_background_work() {
+        let mut state = Snapshot::default();
+        let mut indices = Default::default();
+        for (id, status) in [
+            ("waiting", ToolStatus::Waiting),
+            ("done", ToolStatus::Succeeded),
+        ] {
+            apply_event(
+                &mut state,
+                &mut indices,
+                Event::Subagent {
+                    id: id.into(),
+                    kind: String::new(),
+                    description: String::new(),
+                    status: Some(status),
+                    background: Some(true),
+                    model: None,
+                    waiting: None,
+                    detail: Some("may be interim".into()),
+                },
+            );
+        }
+        apply_event(&mut state, &mut indices, Event::Exited { code: None });
+        assert_eq!(state.subagents[0].status, ToolStatus::Stopped);
+        assert!(state.subagents[0].detail.contains("provider exited"));
+        assert_eq!(state.subagents[1].status, ToolStatus::Succeeded);
+    }
+
+    #[test]
+    fn a_waiting_agent_outlives_the_finished_stamp_and_is_counted_as_background_work() {
+        let mut state = Snapshot::default();
+        let mut indices = Default::default();
+        apply_event(
+            &mut state,
+            &mut indices,
+            Event::Subagent {
+                id: "tool".into(),
+                kind: String::new(),
+                description: String::new(),
+                status: Some(ToolStatus::Waiting),
+                background: Some(true),
+                model: None,
+                waiting: None,
+                detail: None,
+            },
+        );
+        assert_eq!(state.activity(), ActivityState::Idle);
+        assert!(state.subagents[0].status.is_live());
     }
 
     /// Readiness is what a sender waits on, so it ends with the provider.
