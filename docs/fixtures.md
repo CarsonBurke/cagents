@@ -96,7 +96,10 @@ evidence shot channel-prs
 `--width 1200` or `--portal gtk`, for a scene that attaches a file through the
 real file chooser, go to each side's `start`. Prepare data that both
 sides need once, then `save-seed` it, rather than repeating slow setup in each
-side's steps.
+side's steps. `{fixture}` in a steps file means the fixture's root on the
+host. `pair` can wait 30 minutes for the native lock, so run it in the
+background rather than under a short command timeout, and run `clean` once the
+PR merges to remove the task's checkouts from the host.
 
 ## When a fixture fails
 
@@ -112,6 +115,7 @@ Every refusal names its cause and the next command. The common ones:
 | `the native lock stayed busy` | Another session is running. `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows whose. |
 | `memory-capped: stopped` | The session exceeded its memory limit; the log names the process. |
 | `session: lost` in `status` | Its supervisor was killed. `stop` ends what remains. |
+| `the SIDE side is running on HOST; stop it before rebuilding` | A side's checkout can't change under its session. Run the `stop` it names, then build. |
 
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
