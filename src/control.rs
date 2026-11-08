@@ -289,6 +289,9 @@ pub enum DaemonCommand {
         interrupt: bool,
         /// Carry saved panes whose ended actor never recorded its
         /// conversation; they stay in their windows but will not reopen.
+        /// Also end conversations the running daemon cannot carry: a Codex
+        /// chat whose server can no longer be reached, or a provider that
+        /// stopped without confirming its work finished.
         #[arg(long)]
         accept_unreopenable: bool,
     },

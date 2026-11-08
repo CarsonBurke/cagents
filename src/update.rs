@@ -724,8 +724,17 @@ fn unreachable_source_chats(
     if !daemon.blockers.is_empty() {
         return Ok(None);
     }
-    let mut client = source_client_for(daemon)?;
-    let listed = client.list_chats()?;
+    let listed = source_client_for(daemon)?.list_chats()?;
+    Ok(select_unreachable_chats(daemon, &listed))
+}
+
+fn select_unreachable_chats(
+    daemon: &impact::DaemonImpact,
+    listed: &[crate::chat::Session],
+) -> Option<Vec<EndedChat>> {
+    if !daemon.blockers.is_empty() {
+        return None;
+    }
     let mut ending = Vec::new();
     for session in daemon
         .sessions
@@ -733,10 +742,10 @@ fn unreachable_source_chats(
         .filter(|session| session.disposition == impact::Disposition::Blocked)
     {
         let Some(source) = listed.iter().find(|listed| listed.id == session.id) else {
-            return Ok(None);
+            return None;
         };
         let loss = if session.kind != impact::SessionKind::NativeChat {
-            return Ok(None);
+            return None;
         } else if source.launch.provider == crate::agent::Provider::Codex
             && source.owns_codex_listener()
             && source
@@ -751,11 +760,11 @@ fn unreachable_source_chats(
         } else if session.reason == impact::STOPPED_WITH_UNSETTLED_WORK {
             "its provider stopped without confirming its work finished; any unfinished work it held is lost. Its conversation stays on disk and can be reopened with Resume."
         } else {
-            return Ok(None);
+            return None;
         };
         ending.push((session.title.clone(), loss, source.clone()));
     }
-    Ok((!ending.is_empty()).then_some(ending))
+    (!ending.is_empty()).then_some(ending)
 }
 
 fn end_source_chats(
@@ -2085,6 +2094,124 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
+    fn codex_chat(root: &Path) -> crate::chat::Session {
+        let id = crate::model::TerminalId::new();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("source-host"),
+            boot_id: crate::model::BootId::new("source-boot"),
+            host_incarnation: crate::model::HostIncarnation::new("source-incarnation"),
+        };
+        let socket = root.join(format!("cagents-codex-{id}/control.sock"));
+        crate::chat::Session {
+            id,
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: crate::model::LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec!["--remote".into(), format!("unix://{}", socket.display())],
+                    working_directory: root.to_owned(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("thread".into()),
+            },
+            proof: Some(proof.clone()),
+            terminal: None,
+            native_continuity: Default::default(),
+            owned_codex_listener: Some(crate::chat::OwnedCodexListener {
+                socket,
+                allocator: proof,
+            }),
+        }
+    }
+
+    fn blocked(session: &crate::chat::Session, reason: &str) -> impact::SessionImpact {
+        impact::SessionImpact {
+            id: session.id,
+            kind: impact::SessionKind::NativeChat,
+            title: format!("chat {}", session.id),
+            identity: "identity".into(),
+            disposition: impact::Disposition::Blocked,
+            reason: reason.into(),
+            interrupted_subagents: Vec::new(),
+        }
+    }
+
+    fn daemon_impact(sessions: Vec<impact::SessionImpact>) -> impact::DaemonImpact {
+        impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: crate::model::HostSessionProof {
+                    host_session_id: crate::model::HostSessionId::new("source-host"),
+                    boot_id: crate::model::BootId::new("source-boot"),
+                    host_incarnation: crate::model::HostIncarnation::new("source-incarnation"),
+                },
+                token: "preview".into(),
+                inventory_generation: 1,
+                live_terminals: 0,
+                background_subagents: 0,
+                background_identity: "none".into(),
+                expires_at_unix_ms: 100,
+            },
+            policy: impact::Policy::WhenIdle,
+            sessions,
+            blockers: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn only_conversations_the_source_cannot_carry_are_ended_on_acceptance() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let lost = codex_chat(root.path());
+        let reachable = codex_chat(root.path());
+        let socket = &reachable.owned_codex_listener.as_ref().unwrap().socket;
+        fs::create_dir(socket.parent().unwrap()).unwrap();
+        let _server = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let mut stopped = codex_chat(root.path());
+        stopped.launch.provider = crate::agent::Provider::Claude;
+        stopped.owned_codex_listener = None;
+        let listed = [lost.clone(), reachable.clone(), stopped.clone()];
+        let unreachable = blocked(&lost, "Cannot join existing Codex daemon");
+        let unsettled = blocked(&stopped, impact::STOPPED_WITH_UNSETTLED_WORK);
+
+        let ending = select_unreachable_chats(
+            &daemon_impact(vec![unreachable.clone(), unsettled.clone()]),
+            &listed,
+        )
+        .unwrap();
+        let ended = ending
+            .iter()
+            .map(|(_, _, session)| session.id)
+            .collect::<Vec<_>>();
+        assert_eq!(ended, [lost.id, stopped.id]);
+        assert!(ending[0].1.contains("can be reopened with Resume"));
+        assert!(ending[1].1.contains("unfinished work it held is lost"));
+
+        // A Codex server still reachable at its listener is carried or waited
+        // for, never ended to clear a blocker it does not cause.
+        for refused in [
+            vec![
+                unreachable.clone(),
+                blocked(&reachable, "Cannot join existing Codex daemon"),
+            ],
+            vec![blocked(&stopped, "Its provider is not ready yet.")],
+            vec![impact::SessionImpact {
+                kind: impact::SessionKind::Terminal,
+                ..unsettled.clone()
+            }],
+        ] {
+            assert!(select_unreachable_chats(&daemon_impact(refused), &listed).is_none());
+        }
+        // A conversation the source no longer lists cannot be ended here.
+        assert!(select_unreachable_chats(&daemon_impact(vec![unreachable.clone()]), &[]).is_none());
+        // Any other blocker still needs the person.
+        let mut other = daemon_impact(vec![unreachable]);
+        other
+            .blockers
+            .push("Wait for starting sessions to finish opening.".into());
+        assert!(select_unreachable_chats(&other, &listed).is_none());
+        // Nothing blocked: nothing to end.
+        assert!(select_unreachable_chats(&daemon_impact(Vec::new()), &listed).is_none());
+    }
 
     #[test]
     fn streaming_capture_failure_cleans_fresh_original_before_returning_error() {
