@@ -12,6 +12,9 @@ use crate::{
 #[cfg(any(feature = "host", feature = "ui"))]
 pub mod schedule;
 
+mod proposal_delivery;
+pub use proposal_delivery::{PROPOSAL_PAGE_SIZE, ProposalDelivery, ProposalPage, ProposalReview};
+
 pub const MAX_NAME_BYTES: usize = 160;
 pub const MAX_PRECHECK_BYTES: usize = 16 * 1024;
 pub const MAX_HISTORY_PAGE: usize = 100;
@@ -98,6 +101,25 @@ pub enum Request {
         before: Option<u64>,
         limit: usize,
     },
+    /// User-only global metadata. Existing request variants retain their wire order.
+    AllPendingProposals {
+        identity: Option<Uuid>,
+        sequence: Option<u64>,
+        after: Option<Uuid>,
+        limit: usize,
+    },
+    /// User-only coherent count/clock and first bounded page.
+    ProposalDelivery,
+    /// Global consent reads and decisions are fenced to the reviewed registry.
+    ReviewProposal {
+        identity: Uuid,
+        id: Uuid,
+    },
+    ResolveReviewedProposal {
+        identity: Uuid,
+        proposal: Box<Proposal>,
+        approved: bool,
+    },
 }
 
 impl Request {
@@ -128,6 +150,9 @@ pub enum Response {
     Proposal(Box<Proposal>),
     Proposals(Vec<ProposalSummary>),
     Audit(LifecyclePage),
+    ProposalDelivery(ProposalDelivery),
+    ProposalPage(ProposalPage),
+    ProposalReview(ProposalReview),
 }
 
 /// Actor classes describe the admitted operation, never a guessed person.

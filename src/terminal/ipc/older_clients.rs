@@ -49,18 +49,24 @@ pub struct OlderClient {
     /// Variants of `agent_execution::Reply`. A later one answers only an
     /// operation the older client cannot encode.
     agent_replies: u32,
+    automation_responses: u32,
+    notification_targets: u32,
+    notification_kinds: u32,
 }
 
 /// The install candidate line, 0.1.3+local.c68275e94. Its chats are carried
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 156,
+    proven_at: 157,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
     work_responses: 6,
     agent_replies: 11,
+    automation_responses: 10,
+    notification_targets: 5,
+    notification_kinds: 9,
 };
 
 const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
@@ -98,6 +104,9 @@ impl OlderClient {
             server_responses,
             work_responses: u32::MAX,
             agent_replies: u32::MAX,
+            automation_responses: u32::MAX,
+            notification_targets: u32::MAX,
+            notification_kinds: u32::MAX,
         }
     }
 
@@ -141,8 +150,17 @@ impl OlderClient {
                         variant_index(work).is_some_and(|index| index < self.work_responses)
                     }
                     ServerResponse::Automation(automation) => {
-                        self.protocol >= FIRING_WITH_SKIPPED_OCCURRENCES
-                            || !holds_a_firing(automation)
+                        variant_index(automation)
+                            .is_some_and(|index| index < self.automation_responses)
+                            && (self.protocol >= FIRING_WITH_SKIPPED_OCCURRENCES
+                                || !holds_a_firing(automation))
+                    }
+                    ServerResponse::Notifications { snapshot } => {
+                        snapshot.notices.iter().all(|notice| {
+                            self.reads_target(&notice.event.target)
+                                && variant_index(&notice.event.evidence.kind)
+                                    .is_some_and(|index| index < self.notification_kinds)
+                        })
                     }
                     ServerResponse::Agent(reply) => {
                         variant_index(reply).is_some_and(|index| index < self.agent_replies)
@@ -151,8 +169,13 @@ impl OlderClient {
                 };
                 nested && variant_index(response).is_some_and(|index| index < self.server_responses)
             }
+            ServerMessage::NotificationActivated { target } => self.reads_target(target),
             _ => true,
         }
+    }
+
+    fn reads_target(&self, target: &crate::notifications::Target) -> bool {
+        variant_index(target).is_some_and(|index| index < self.notification_targets)
     }
 
     /// Answers a request this client may not make, or whose reply it cannot
@@ -479,6 +502,45 @@ mod tests {
     }
 
     #[test]
+    fn an_automation_reply_after_the_older_protocol_is_refused() {
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let reply = ServerMessage::Response {
+            response: ServerResponse::Automation(crate::automations::Response::ProposalPage(
+                crate::automations::ProposalPage {
+                    identity: uuid::Uuid::nil(),
+                    automation_proposal_sequence: 0,
+                    after: None,
+                    proposals: Vec::new(),
+                },
+            )),
+        };
+        assert!(!client.admits_message(&reply));
+    }
+
+    #[test]
+    fn a_proposal_notification_is_withheld_or_refused_for_the_older_protocol() {
+        use crate::notifications::Target;
+
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let proposal = Target::AutomationProposal {
+            registry: uuid::Uuid::nil(),
+            id: uuid::Uuid::nil(),
+            revision: 0,
+        };
+        assert!(!client.admits_message(&ServerMessage::NotificationActivated { target: proposal }));
+        assert!(
+            client.admits_message(&ServerMessage::NotificationActivated {
+                target: Target::AgentRun(crate::model::RunId::new()),
+            })
+        );
+        assert!(client.admits_message(&ServerMessage::Response {
+            response: ServerResponse::Notifications {
+                snapshot: crate::notifications::Snapshot::default(),
+            },
+        }));
+    }
+
+    #[test]
     fn a_request_answered_with_a_firing_is_turned_away_before_it_changed() {
         use crate::{agent_execution::Authority, automations::Request};
         use uuid::Uuid;
@@ -549,6 +611,9 @@ mod tests {
             server_responses: detached,
             work_responses: u32::MAX,
             agent_replies: u32::MAX,
+            automation_responses: u32::MAX,
+            notification_targets: u32::MAX,
+            notification_kinds: u32::MAX,
         };
         assert!(!client.admits_request(&ClientRequest::List));
         assert!(client.admits_request(&ClientRequest::Connect {

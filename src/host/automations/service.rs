@@ -60,6 +60,78 @@ pub(in crate::host) fn process_under_control(
                 .pending_automation_proposals(&repository, after, limit)
                 .map(Response::Proposals);
         }
+        Request::AllPendingProposals {
+            identity,
+            sequence,
+            after,
+            limit,
+        } => {
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .pending_automation_proposals_page(identity, sequence, after, limit)
+                .map(Response::ProposalPage);
+        }
+        Request::ProposalDelivery => {
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .automation_proposal_delivery()
+                .map(Response::ProposalDelivery);
+        }
+        Request::ReviewProposal { identity, id } => {
+            return registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .review_automation_proposal(identity, id)
+                .map(Response::ProposalReview);
+        }
+        Request::ResolveReviewedProposal {
+            identity,
+            proposal,
+            approved,
+        } => {
+            let current = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .review_automation_proposal(identity, proposal.id)?;
+            if current.proposal.revision != proposal.revision {
+                return Err(
+                    "The automation proposal changed; review its current definition".into(),
+                );
+            }
+            if current.proposal.state != crate::automations::ProposalState::Pending {
+                return Ok(Response::ProposalReview(current));
+            }
+            if current.proposal != proposal {
+                return Err("The automation proposal changed; review it again".into());
+            }
+            let _directory = if approved {
+                Some(validate_target(
+                    host,
+                    &proposal.definition,
+                    &proposal.target_identity,
+                )?)
+            } else {
+                None
+            };
+            let next = if approved {
+                handle()?;
+                agent_execution::selected_account(&proposal.definition.agent)?;
+                Some(Compiled::new(&proposal.definition.schedule)?.next_after(now()?)?)
+            } else {
+                None
+            };
+            let resolved = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .resolve_automation_proposal_in_registry(identity, &proposal, next, now()?)?;
+            super::proposal_delivery::publish(host, &registry);
+            Response::ProposalReview(crate::automations::ProposalReview {
+                identity,
+                proposal: Box::new(resolved),
+            })
+        }
         Request::ResolveProposal {
             id,
             revision,
@@ -94,12 +166,12 @@ pub(in crate::host) fn process_under_control(
             } else {
                 None
             };
-            Response::Proposal(Box::new(
-                registry
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .resolve_automation_proposal(&proposal, next, now()?)?,
-            ))
+            let resolved = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .resolve_automation_proposal(&proposal, next, now()?)?;
+            super::proposal_delivery::publish(host, &registry);
+            Response::Proposal(Box::new(resolved))
         }
         Request::List { after, limit } => {
             return registry
@@ -207,34 +279,54 @@ fn process_hosted(
             request,
             definition,
         } => {
-            if let Some(previous) = registry
+            let previous = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .automation_proposal(*request, Some(&owner))?
-            {
+                .automation_proposal(*request, Some(&owner))?;
+            if let Some(previous) = previous {
                 if previous.requested != *definition {
                     return Err(
                         "This request ID belongs to another saved definition; use a new request ID"
                             .into(),
                     );
                 }
+                // Exact receipt retry also retries the best-effort model hint.
+                // It never inserts a proposal or changes consent. Wake only
+                // the existing coordinator so durable attention can advance.
+                super::proposal_delivery::publish(host, &registry);
+                super::wake(host);
                 return Ok(Response::Proposal(Box::new(previous)));
             }
         }
         _ => {}
     }
-    let directory = {
+    let (directory, requester) = {
         let host = host.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(chat) = host.chats.get(&source) {
-            chat.session.launch.recipe.working_directory.clone()
+            // Optional resident metadata only: never wait for naming, open the
+            // transcript, or make naming availability an admission condition.
+            let requester = if matches!(&request, Request::Propose { .. }) {
+                chat.handle.conversation_title_prefix().ok().flatten()
+            } else {
+                None
+            };
+            (
+                chat.session.launch.recipe.working_directory.clone(),
+                requester,
+            )
         } else {
-            host.terminals
+            let terminal = host
+                .terminals
                 .get(&source)
-                .ok_or("The requesting session is no longer live")?
-                .session
-                .launch
-                .working_directory
-                .clone()
+                .ok_or("The requesting session is no longer live")?;
+            (
+                terminal.session.launch.working_directory.clone(),
+                if matches!(&request, Request::Propose { .. }) {
+                    terminal.conversation_title().map(str::to_owned)
+                } else {
+                    None
+                },
+            )
         }
     };
     let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -263,7 +355,9 @@ fn process_hosted(
                 Ok::<_, String>(channel.title.clone())
             }).transpose()?;
             let proposal = registry.lock().unwrap_or_else(|p| p.into_inner())
-                .propose_automation(request, owner, requested, definition, identity, channel_title, now()?)?;
+                .propose_automation_with_requester(request, owner, requested, definition, identity, channel_title, requester.as_deref(), now()?)?;
+            super::proposal_delivery::publish(host, &registry);
+            super::wake(host);
             Ok(Response::Proposal(Box::new(proposal)))
         }
         Request::List { after, limit } => registry.lock().unwrap_or_else(|p| p.into_inner())

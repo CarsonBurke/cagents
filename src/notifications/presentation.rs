@@ -31,6 +31,7 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
         Kind::MessageReceived => "Messages waiting",
         Kind::AutomationPaused => "Automation pause recorded",
         Kind::AutomationBlocked => "Automation block recorded",
+        Kind::ProposalCreated => "Automation request created",
     };
     let inbox = matches!(event.target, Target::SessionInbox(_));
     let context = if inbox {
@@ -72,6 +73,7 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
             Target::PullRequest(_) => "Open review",
             Target::SessionInbox(_) => "Open terminal",
             Target::Automation { .. } => "Open history",
+            Target::AutomationProposal { .. } => "Review request",
             _ => "Open conversation",
         },
         needs_input: matches!(
@@ -81,6 +83,7 @@ pub fn message(event: &super::Event, previews: bool) -> Message {
                 | Kind::MessageReceived
                 | Kind::AutomationPaused
                 | Kind::AutomationBlocked
+                | Kind::ProposalCreated
         ),
     }
 }

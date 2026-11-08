@@ -211,7 +211,9 @@ use crate::{
 /// parallel branches and are not adopted.
 /// Version 156 appends the exact skipped-occurrence count and range to Firing.
 /// An older client is refused the replies holding one.
-pub const PROTOCOL_VERSION: u16 = 156;
+/// Version 157 adds global proposal delivery, review and decision requests and
+/// proposal-created notification targets. An update exchanges none of them.
+pub const PROTOCOL_VERSION: u16 = 157;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
