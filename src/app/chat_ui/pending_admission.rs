@@ -336,18 +336,8 @@ impl Cagents {
         }
         let task = match &pane.kind {
             CardKind::Chat(session) if session.is_unstarted() => {
-                if let Some(CardRuntime::Chat(runtime)) = self.cards.remove(&pane.id) {
-                    self.chat_ui.drafts.insert(pane.id, runtime.unsent_text());
-                    let images = runtime
-                        .unsent_attachments()
-                        .iter()
-                        .filter(|image| image.reference.is_some())
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    if !images.is_empty() {
-                        self.chat_ui.draft_attachments.insert(pane.id, images);
-                    }
-                }
+                self.stash_unsent_chat(pane.id);
+                self.cards.remove(&pane.id);
                 self.open_chat(pane.id, session.clone(), chat::Intent::Restore)
             }
             CardKind::Chat(session) => {

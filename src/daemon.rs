@@ -1014,6 +1014,17 @@ pub(crate) fn termination_requested() -> bool {
 }
 
 #[cfg(test)]
+pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener) {
+    // Concurrent tests may fork before CLOEXEC closes an inherited copy.
+    // Shut down the shared socket so every retained descriptor refuses connections.
+    // SAFETY: the listener owns this live socket descriptor.
+    assert_eq!(
+        unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
+        0
+    );
+}
+
+#[cfg(test)]
 mod tests {
     #[cfg(feature = "host")]
     use std::os::unix::fs::symlink;
@@ -1672,12 +1683,7 @@ mod tests {
 
     fn leave_stale_socket(path: &Path) {
         let listener = UnixListener::bind(path).unwrap();
-        // Concurrent tests may fork before CLOEXEC closes an inherited copy.
-        // Shut down the shared socket so dropping this owner is deterministic.
-        assert_eq!(
-            unsafe { libc::shutdown(listener.as_raw_fd(), libc::SHUT_RDWR) },
-            0
-        );
+        shut_down_test_listener(listener);
     }
 
     #[test]

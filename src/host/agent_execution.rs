@@ -506,12 +506,11 @@ fn dispatch(
             .recipe
             .arguments
             .extend(launch_options(&accepted.agent.spec));
-        let proof = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .proof()
-            .clone();
-        session.claim_owned_codex_listener(&std::env::temp_dir(), &proof);
+        let (proof, listeners) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            (state.proof().clone(), state.codex_listeners.clone())
+        };
+        listeners.claim(&mut session, &proof);
         session.proof = Some(proof);
         registry
             .lock()
