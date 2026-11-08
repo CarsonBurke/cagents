@@ -74,10 +74,14 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// fixed, so the two constants have to agree with what the editor draws.
 /// iced's default line height, 1.4 em, at the editor's prose size.
 const COMPOSER_LINE_HEIGHT: f32 = design::TEXT_PROSE * 1.4;
-const COMPOSER_PADDING: f32 = crate::tab_strip::EDGE_INSET + space::S;
-// Icon hit targets include their own centered inset; align the visible glyph.
-const COMPOSER_TOOLBAR_PADDING: f32 =
-    COMPOSER_PADDING - (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
+/// Where the composer's glyphs and captions start: the `+` glyph, and the
+/// suggestion hint and footer aligned beneath it.
+const COMPOSER_PADDING: f32 =
+    COMPOSER_TOOLBAR_PADDING + (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
+/// The controls' inset from the composer's sides, the same as from its foot,
+/// so the hover square of `+` or send sits evenly in the composer's corner,
+/// concentric with it.
+const COMPOSER_TOOLBAR_PADDING: f32 = COMPOSER_CONTROL_INSET;
 /// The editor's vertical inset in the composer row.
 ///
 /// A single line of text is then as tall as a control with a small margin on
@@ -321,8 +325,8 @@ fn composer_editor_style(
     iced::widget::text_editor::Style {
         background: iced::Background::Color(iced::Color::TRANSPARENT),
         border: iced::Border::default(),
-        placeholder: design::muted_color(theme),
-        value: cosmic.palette.neutral_9.into(),
+        placeholder: design::field_placeholder_color(theme),
+        value: design::field_text_color(theme),
         selection: cosmic.accent.base.into(),
     }
 }

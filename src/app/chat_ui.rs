@@ -7643,13 +7643,9 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([
-            skills,
-            self.apply_viewport(update, true, false),
-            iced::widget::operation::focus(card_control_id(card_id, "chat-composer"))
-                .map(cosmic::Action::App),
-            title,
-        ])
+        // The new pane's input takes the keyboard through the workspace's
+        // focus request, now if it is drawn or once it starts.
+        Task::batch([skills, self.apply_viewport(update, true, false), title])
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -10669,10 +10665,6 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // Reports that raced the attachment woke nothing.
                         let usage = self.take_chat_account_usage(target);
-                        let control = match self.cards.get(&target.card) {
-                            Some(CardRuntime::Chat(runtime)) => runtime.focus_control(),
-                            _ => "chat-composer",
-                        };
                         let submitted = automatic_submit
                             .and_then(|(revision, mode)| match self.cards.get(&target.card) {
                                 Some(CardRuntime::Chat(runtime))
@@ -10684,20 +10676,19 @@ impl Cagents {
                             })
                             .map(|mode| self.handle_chat_ui(Action::Submit(target, mode)))
                             .unwrap_or_else(Task::none);
-                        // An attachment that finishes behind another pane
-                        // leaves the keyboard with the one in use.
-                        let focus = if self.card_holds_keyboard(target.card) {
-                            iced::widget::operation::focus(card_control_id(target.card, control))
-                                .map(cosmic::Action::App)
-                        } else {
-                            Task::none()
-                        };
+                        // The focused pane's input takes the keyboard once it
+                        // is drawn, unless the person chose another control
+                        // while it attached. An attachment that finishes
+                        // behind another pane leaves the keyboard with the
+                        // one in use.
+                        if self.workspace.focused() == Some(target.card) {
+                            self.keyboard_owed = Some(target.card);
+                        }
                         return Task::batch([
                             submitted,
                             usage,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
-                            focus,
                         ]);
                     }
                     Err(failure)

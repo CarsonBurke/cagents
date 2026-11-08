@@ -553,10 +553,9 @@ impl Cagents {
                 // Whatever was being prepared is abandoned with the picker.
                 self.resume_ui.loading = false;
                 self.resume_ui.generation = self.resume_ui.generation.wrapping_add(1);
-                self.workspace.focused().map_or_else(Task::none, |card| {
-                    iced::widget::operation::focus(self.card_keyboard_focus(card))
-                        .map(cosmic::Action::App)
-                })
+                self.workspace
+                    .focused()
+                    .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
             }
             Action::Query(query) => {
                 self.resume_ui.query = query;

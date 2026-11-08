@@ -379,7 +379,15 @@ impl Cagents {
                 .filter(|card| card.existence.is_open() && channel.cards.contains(&card.id))
                 .map(|card| card.id))
         {
-            return Task::none();
+            // Choosing the channel already open still means going to it: the
+            // keyboard returns to its focused pane unless something inside
+            // that pane already holds it.
+            return match self.workspace.focused() {
+                Some(card) if self.card_holds_keyboard(card) => {
+                    self.focus_pane_keyboard_after_press(card)
+                }
+                _ => Task::none(),
+            };
         }
         self.snapshot_workspace_scope();
         let discarded = if self.durable.active_channel != Some(id) {

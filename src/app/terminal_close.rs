@@ -663,13 +663,11 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            iced::widget::operation::focus(
-                self.workspace
-                    .focused()
-                    .map(|card| self.card_keyboard_focus(card))
-                    .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-            )
-            .map(cosmic::Action::App)
+            match self.workspace.focused() {
+                Some(card) => self.focus_pane_keyboard(card),
+                None => iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                    .map(cosmic::Action::App),
+            }
         } else {
             Task::none()
         };
@@ -709,11 +707,11 @@ impl Cagents {
         if let Some(card) = card {
             let _ = self.workspace.focus(card);
         }
-        iced::widget::operation::focus(
-            card.map(|card| self.card_keyboard_focus(card))
-                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-        )
-        .map(cosmic::Action::App)
+        match card {
+            Some(card) => self.focus_pane_keyboard(card),
+            None => iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                .map(cosmic::Action::App),
+        }
         .chain(self.next_queued_card_close())
     }
 

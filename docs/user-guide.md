@@ -142,8 +142,16 @@ determine which models and permission modes are available.
   when the window is resized. New panes default to half the viewport.
 - Mouse-wheel and trackpad scrolling stay inside pane content; they do not pan
   the workspace strip.
-- **Activate panes on hover** is off by default. When enabled, it previews the
-  pane under the pointer after a 300 ms dwell; typing cancels a pending activation.
+- **Focus follows mouse** is on by default: resting the pointer on a pane for
+  300 ms focuses it, without scrolling, and puts the keyboard in its message
+  input, terminal or editor. Typing, clicking or dragging during the dwell
+  cancels it, and an open menu, dialog or palette suppresses it. Turn it off in
+  **Settings > Workspace > Pane focus** to focus panes only by clicking them or
+  with pane navigation.
+- Focusing a chat pane in any way, by clicking it, navigating to it, switching
+  channel or opening a new or resumed chat, puts the keyboard in its message
+  input with the draft and caret where you left them. Typing while a chat pane
+  is focused but its input is not sends the text to the input.
 - Hold **Alt+Tab** to switch workspace. Recently used worktrees and channels
   come first, then the rest in sidebar order; a quick tap goes back to the
   previous one. **Tab**, **Shift+Tab** and the arrow keys move the selection;

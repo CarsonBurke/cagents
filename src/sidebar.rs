@@ -9783,8 +9783,8 @@ fn commit_description_style(
                 cosmic::iced::widget::text_editor::Status::Focused { .. }
             ),
         ),
-        placeholder: design::muted_color(theme),
-        value: theme.cosmic().palette.neutral_9.into(),
+        placeholder: design::field_placeholder_color(theme),
+        value: design::field_text_color(theme),
         selection: design::accent_color(theme),
     }
 }
