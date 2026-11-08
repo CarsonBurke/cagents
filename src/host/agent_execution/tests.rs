@@ -1,6 +1,7 @@
 mod automation_removal;
 #[cfg(target_os = "linux")]
 mod owned_late_decision;
+mod queued_prompt;
 #[cfg(target_os = "linux")]
 mod retained_automation;
 mod transcript;
@@ -1276,7 +1277,10 @@ fn interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt() {
         },
     )
     .unwrap();
-    assert!(matches!(reply, Reply::Requests(requests) if requests.is_empty()));
+    assert!(matches!(
+        reply,
+        Reply::Interrupted { interrupted: false, withdrawn: Some(run), .. } if run == accepted.run.id
+    ));
     assert_withdrawn(&host, accepted.run.id);
 
     std::fs::write(root.join("initialize-release"), "").unwrap();
@@ -1290,6 +1294,51 @@ fn interrupting_a_run_whose_provider_is_starting_withdraws_its_prompt() {
         std::fs::read_to_string(root.join("prompts")).unwrap(),
         "prompt\n",
         "only the follow-up reached the provider"
+    );
+}
+
+#[test]
+fn withdrawing_only_the_prompt_reaches_one_whose_provider_is_starting() {
+    if isolated("withdrawing_only_the_prompt_reaches_one_whose_provider_is_starting").is_some() {
+        return;
+    }
+    let (host, request, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    hold_provider_initialization(&root);
+    let owner = Authority::default();
+    let accepted = submit(&host, &owner, request).unwrap();
+    await_undelivered(&host, &accepted);
+    let reply = process(
+        &host,
+        owner,
+        Operation::Control {
+            agent: accepted.agent.id,
+            command: Control::WithdrawQueued,
+        },
+    )
+    .unwrap();
+    assert!(matches!(
+        reply,
+        Reply::Interrupted { interrupted: false, withdrawn: Some(run), .. } if run == accepted.run.id
+    ));
+    assert_withdrawn(&host, accepted.run.id);
+
+    std::fs::write(root.join("initialize-release"), "").unwrap();
+    let hang_guard = Instant::now() + Duration::from_secs(60);
+    while agent_gate(&host, accepted.agent.id)
+        .lock()
+        .unwrap()
+        .is_some()
+    {
+        assert!(
+            Instant::now() < hang_guard,
+            "dispatch never reclaimed its claim"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert!(
+        !root.join("prompts").exists(),
+        "the withdrawn prompt never reached the provider"
     );
 }
 
@@ -3522,7 +3571,7 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
     let agent = accepted.agent.id;
     let control = |command| -> Result<Vec<chat::Request>, String> {
         match process(&host, owner.clone(), Operation::Control { agent, command })? {
-            Reply::Requests(requests) => Ok(requests),
+            Reply::Requests(requests) | Reply::Interrupted { requests, .. } => Ok(requests),
             reply => panic!("{reply:?}"),
         }
     };
@@ -3561,11 +3610,12 @@ fn an_owner_declines_a_background_request_its_settled_run_left_but_cannot_approv
 
     let error = control(answer(&asked.id, "allow")).unwrap_err();
     assert!(error.contains("only decline"), "{error}");
-    let error = control(Control::Interrupt {
+    // Waiting on the answer keeps the provider's turn busy, so an interrupt
+    // reaches it, and that is not an answer.
+    control(Control::Interrupt {
         including_subagents: true,
     })
-    .unwrap_err();
-    assert!(error.contains("no active run"), "{error}");
+    .unwrap();
     let root = path.parent().unwrap();
     assert!(!root.join("decisions").exists(), "nothing was approved");
 

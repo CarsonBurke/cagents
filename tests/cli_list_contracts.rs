@@ -74,6 +74,8 @@ impl Listing {
                             view_scope: None,
                             channel_repository: None,
                             state: cagents::agent::ActivityState::Working,
+                            background_agents: 0,
+                            waiting_agents: 0,
                             directory: Some("/fixture".into()),
                             worktree: Some("/fixture".into()),
                             project: Some("/fixture/.git".into()),
@@ -161,6 +163,7 @@ impl Listing {
                         },
                         run: "12345678-0000-4000-8000-000000000001".parse().unwrap(),
                         state: State::Waiting,
+                        provider: None,
                     }]
                 } else {
                     vec![]
@@ -449,6 +452,7 @@ fn accepted_wait_output(
             started_ms: None,
             finished_ms: None,
             provider_key: None,
+            queued_ms: None,
             result: ResultSummary::default(),
         },
         created: supplied_key.is_none(),
@@ -578,6 +582,7 @@ fn accepted_wait_output(
                                 Reply::Status {
                                     agent: accepted.agent.clone(),
                                     run,
+                                    provider: None,
                                 }
                             }
                         }

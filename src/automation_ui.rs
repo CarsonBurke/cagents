@@ -7688,6 +7688,7 @@ mod tests {
                 started_ms: Some(100),
                 finished_ms: None,
                 provider_key: None,
+                queued_ms: None,
                 result: Default::default(),
             });
             value

@@ -53,9 +53,9 @@ impl Outbound {
         }
     }
 
-    /// This message as `client` receives it: in its envelope version, with a
-    /// reply it cannot decode replaced by a refusal. A notification it cannot
-    /// decode is withheld.
+    /// This message as `client` receives it: in its envelope version, restated
+    /// as it knows it, and with a reply it cannot decode replaced by a refusal.
+    /// A notification it cannot decode is withheld.
     fn for_older(mut self, client: OlderClient) -> Option<Self> {
         // Older peers must be checked against the actual response variant.
         // Only this upgrade compatibility path needs to decode a relay payload.
@@ -65,6 +65,7 @@ impl Outbound {
                 Err(_) => ServerMessage::Error(client.refusal()),
             };
         }
+        client.restate(&mut self.message);
         if !client.admits_message(&self.message) {
             self.request_id?;
             tracing::debug!(

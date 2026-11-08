@@ -236,7 +236,7 @@ fn members_human(members: &Members, now: u64) -> String {
 /// One listed session, with what a member view adds to it.
 pub(super) struct Row<'a> {
     entry: &'a Entry,
-    state: &'static str,
+    state: String,
     failure: Option<&'a str>,
     active_at: Option<u64>,
     limit: Option<&'a UsageLimit>,
@@ -247,7 +247,18 @@ impl<'a> From<&'a Member> for Row<'a> {
     fn from(member: &'a Member) -> Self {
         Self {
             entry: &member.session,
-            state: member.state_label(),
+            // An exit or a usage limit outranks what the provider last
+            // reported; otherwise its turn and its agents are told apart.
+            state: if member.exited || member.limit.is_some() {
+                member.state_label().into()
+            } else {
+                crate::agent_execution::ProviderActivity {
+                    turn: member.session.state,
+                    background_agents: member.session.background_agents,
+                    waiting_agents: member.session.waiting_agents,
+                }
+                .label()
+            },
             failure: member.failure.as_deref(),
             active_at: member.active_at,
             limit: member.limit.as_ref(),
@@ -327,7 +338,7 @@ pub(super) fn list_human<'a>(
                 [
                     entry.id.to_string(),
                     entry.provider.map_or("shell", |p| p.executable()).into(),
-                    row.state.into(),
+                    row.state,
                     context.join("; "),
                 ]
             })
@@ -392,6 +403,8 @@ mod tests {
             }),
             channel_repository: None,
             state: ActivityState::Waiting,
+            background_agents: 0,
+            waiting_agents: 0,
             directory: Some("/fixture/linked".into()),
             worktree: Some("/fixture/linked".into()),
             project: Some("/fixture/.git".into()),
@@ -591,6 +604,30 @@ mod tests {
         }
         assert!(!human.contains('\u{1b}'));
         assert_eq!(serde_json::to_value(&entry).unwrap(), before);
+    }
+
+    #[test]
+    fn a_session_row_separates_its_idle_turn_from_its_background_agents() {
+        let mut member = live(entry());
+        member.session.state = ActivityState::Idle;
+        member.session.background_agents = 2;
+        let human = list_human(std::iter::once(Row::from(&member)), None, 0);
+        assert!(human.contains("idle; 2 background agents"), "{human}");
+        member.session.state = ActivityState::Working;
+        member.session.background_agents = 1;
+        let human = list_human(std::iter::once(Row::from(&member)), None, 0);
+        assert!(human.contains("working; 1 background agent "), "{human}");
+        // A limit still outranks the agents still going.
+        member.limit = Some(UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: None,
+            resets_at: None,
+        });
+        let human = list_human(std::iter::once(Row::from(&member)), None, 0);
+        assert!(
+            human.lines().nth(1).unwrap().contains(" limited "),
+            "{human}"
+        );
     }
 
     #[test]

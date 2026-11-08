@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 166,
+    proven_at: 167,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -79,12 +79,52 @@ const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
 /// an agent is running, which is what it was before: it hasn't finished.
 pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
 
+/// The first protocol whose agent replies say what a live provider is doing
+/// and whether a prompt is still queued, and whose interrupt answers with what
+/// it did. An older client is sent those replies without the new fields, and
+/// an interrupt's pending requests as it was before.
+pub(crate) const PROVIDER_ACTIVITY: u16 = 167;
+
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
 /// added it. The wire format proof accepts exactly these.
 #[cfg(test)]
 const RESTATED_VARIANTS: &[(&str, &str, u16)] =
     &[("cagents::chat::ToolStatus", "Waiting", WAITING_TOOL_STATUS)];
+
+/// Fields a later protocol added that a client from before it is sent
+/// without: the struct's type name, or an enum's and its variant's, the field,
+/// and the protocol that added it. Each one skips serializing with
+/// [`new_in_provider_activity`] or its like, which a test checks against this
+/// list; the wire format proof accepts exactly these.
+#[cfg(test)]
+const OMITTED_FIELDS: &[(&str, &str, u16)] = &[
+    (
+        "cagents::agent_execution::Run",
+        "queued_ms",
+        PROVIDER_ACTIVITY,
+    ),
+    (
+        "cagents::agent_execution::Summary",
+        "provider",
+        PROVIDER_ACTIVITY,
+    ),
+    (
+        "cagents::agent_execution::Reply::Status",
+        "provider",
+        PROVIDER_ACTIVITY,
+    ),
+    (
+        "cagents::agent_execution::directory::Entry",
+        "background_agents",
+        PROVIDER_ACTIVITY,
+    ),
+    (
+        "cagents::agent_execution::directory::Entry",
+        "waiting_agents",
+        PROVIDER_ACTIVITY,
+    ),
+];
 
 thread_local! {
     /// The older protocol this thread is encoding a message for.
@@ -115,6 +155,11 @@ pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
 /// Whether the value being encoded goes to a client from before `protocol`.
 pub(crate) fn encoding_before(protocol: u16) -> bool {
     ENCODING_FOR.get().is_some_and(|older| older < protocol)
+}
+
+/// Skips a field [`PROVIDER_ACTIVITY`] added, encoding for a client before it.
+pub(crate) fn new_in_provider_activity<T>(_: &T) -> bool {
+    encoding_before(PROVIDER_ACTIVITY)
 }
 
 /// The older protocol a client opened its connection with, when this daemon
@@ -168,6 +213,21 @@ impl OlderClient {
                     ..
                 }
             )
+    }
+
+    /// Restates a reply a later protocol replaced as the one this client knows.
+    /// An interrupt answered what it did; before that, its pending requests.
+    pub fn restate(&self, message: &mut ServerMessage) {
+        use crate::agent_execution::Reply;
+        if self.protocol < PROVIDER_ACTIVITY
+            && let ServerMessage::Response {
+                response: ServerResponse::Agent(reply),
+            } = message
+            && let Reply::Interrupted { requests, .. } = reply
+        {
+            let requests = std::mem::take(requests);
+            *reply = Reply::Requests(requests);
+        }
     }
 
     /// Whether the client can decode this message.
@@ -480,6 +540,100 @@ mod tests {
         // The scope ends with the encoding it was entered for.
         assert!(!encoding_before(PROTOCOL_VERSION + 1));
         assert_eq!(encode(ToolStatus::Waiting), waiting);
+    }
+
+    #[test]
+    fn an_older_client_is_sent_agent_replies_without_what_it_cannot_read() {
+        use std::collections::BTreeSet;
+
+        use crate::agent_execution::{Reply, Run, Summary, directory::Entry};
+        use wire_shape::invent;
+
+        fn fields(value: serde_json::Value, variant: Option<&str>) -> BTreeSet<String> {
+            let value = match variant {
+                Some(variant) => value[variant].clone(),
+                None => value,
+            };
+            value.as_object().unwrap().keys().cloned().collect()
+        }
+        // Exactly the listed fields are in this protocol's encoding and not in
+        // the older client's.
+        fn check<T: Serialize>(
+            checked: &mut BTreeSet<String>,
+            container: &str,
+            variant: Option<&str>,
+            value: &T,
+        ) {
+            let name = variant.map_or_else(
+                || container.to_owned(),
+                |variant| format!("{container}::{variant}"),
+            );
+            let omitted: BTreeSet<String> = OMITTED_FIELDS
+                .iter()
+                .filter(|(listed, ..)| *listed == name)
+                .map(|(_, field, _)| (*field).to_owned())
+                .collect();
+            let json = || serde_json::to_value(value).unwrap();
+            let current = fields(json(), variant);
+            let older = fields(encoding_for(CANDIDATE_LINE_PROTOCOL, json), variant);
+            assert!(older.is_subset(&current), "{name}");
+            assert_eq!(&current - &older, omitted, "{name}");
+            checked.insert(name);
+        }
+        let mut checked = BTreeSet::new();
+        let run: Run = invent().unwrap();
+        check(&mut checked, "cagents::agent_execution::Run", None, &run);
+        check(
+            &mut checked,
+            "cagents::agent_execution::Summary",
+            None,
+            &invent::<Summary>().unwrap(),
+        );
+        check(
+            &mut checked,
+            "cagents::agent_execution::directory::Entry",
+            None,
+            &invent::<Entry>().unwrap(),
+        );
+        let status = Reply::Status {
+            agent: invent().unwrap(),
+            run,
+            provider: None,
+        };
+        check(
+            &mut checked,
+            "cagents::agent_execution::Reply",
+            Some("Status"),
+            &status,
+        );
+        let listed: BTreeSet<String> = OMITTED_FIELDS
+            .iter()
+            .map(|(name, ..)| (*name).to_owned())
+            .collect();
+        assert_eq!(checked, listed);
+    }
+
+    #[test]
+    fn an_older_client_is_answered_an_interrupt_with_its_pending_requests() {
+        use crate::agent_execution::Reply;
+        let interrupted = || ServerMessage::Response {
+            response: ServerResponse::Agent(Reply::Interrupted {
+                requests: Vec::new(),
+                interrupted: true,
+                withdrawn: None,
+            }),
+        };
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        assert!(!client.admits_message(&interrupted()));
+        let mut message = interrupted();
+        client.restate(&mut message);
+        assert_eq!(
+            message,
+            ServerMessage::Response {
+                response: ServerResponse::Agent(Reply::Requests(Vec::new())),
+            }
+        );
+        assert!(client.admits_message(&message));
     }
 
     #[test]

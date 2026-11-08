@@ -672,6 +672,8 @@ mod tests {
             view_scope: None,
             channel_repository: None,
             state: crate::agent::ActivityState::Idle,
+            background_agents: 0,
+            waiting_agents: 0,
             directory: None,
             worktree: None,
             project: None,

@@ -1533,6 +1533,14 @@ impl Snapshot {
                 .any(|agent| agent.status == ToolStatus::Running)
     }
     pub fn activity(&self) -> ActivityState {
+        match self.turn_activity() {
+            ActivityState::Idle if self.is_working() => ActivityState::Working,
+            activity => activity,
+        }
+    }
+    /// The main turn apart from delegated work, which a question from a
+    /// subagent still interrupts.
+    pub fn turn_activity(&self) -> ActivityState {
         if self.exited {
             ActivityState::Unknown
         } else if self.waiting
@@ -1543,11 +1551,29 @@ impl Snapshot {
                 .any(|agent| agent.waiting && agent.status == ToolStatus::Running)
         {
             ActivityState::Waiting
-        } else if self.is_working() {
+        } else if self.busy {
             ActivityState::Working
         } else {
             ActivityState::Idle
         }
+    }
+    /// Delegated work running apart from the main turn. A subagent still
+    /// running after its turn ended is one, whatever it was launched as.
+    pub fn background_agents(&self) -> u32 {
+        let running = self
+            .subagents
+            .iter()
+            .filter(|agent| agent.status.is_live() && (agent.background || !self.busy));
+        u32::try_from(running.count()).unwrap_or(u32::MAX)
+    }
+
+    /// How many delegated agents are waiting on background work of their own.
+    pub fn waiting_agents(&self) -> u32 {
+        let waiting = self
+            .subagents
+            .iter()
+            .filter(|agent| agent.status == ToolStatus::Waiting);
+        u32::try_from(waiting.count()).unwrap_or(u32::MAX)
     }
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
