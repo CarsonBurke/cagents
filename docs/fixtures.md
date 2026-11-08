@@ -66,13 +66,15 @@ no pull requests and no review requests:
 | `gh auth status --json hosts`, with or without `--hostname` | a successful `fixture` account for github.com; `{"hosts":{}}` for any other host |
 | `gh repo view --json nameWithOwner,url` | the repository of the checkout's first github.com remote, in gh's order (`upstream`, `github`, `origin`, then the rest), or gh's own error when there is none |
 | `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below |
-| `gh pr view N`, `gh pr checks N` | a seeded pull request, or gh's error for an unknown number |
-| `gh api graphql` | an empty review-request page; a not-found error for a pull request's own queries |
+| `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
+| `gh pr checks N` | gh's `no checks reported` for a seeded pull request, which the app reads as no checks |
+| `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
 | `gh api repos/OWNER/NAME/releases` | `[]`; any other REST endpoint is `404 Not Found` |
 
 Anything else, including every write, fails and names the command. A project
 shows as connected to GitHub only when its checkout has a github.com remote,
-so add one: `git remote add origin https://github.com/OWNER/NAME`.
+so add one: `git remote add origin https://github.com/OWNER/NAME`. The fixture
+sets `GIT_ALLOW_PROTOCOL=file`, so Git never fetches from or pushes to it.
 
 Avatars never come from the network: the fixture's `curl` always fails. Put an
 image at `$CAGENTS_EVIDENCE_FIXTURE/avatars/OWNER.image`, PNG, JPEG, GIF or
@@ -80,24 +82,29 @@ WebP, at most 1 MiB and 1024×1024 pixels. Each time the app resolves a
 repository, the forge copies every seed into the app's avatar cache,
 `$XDG_CACHE_HOME/cagents-development/github-avatars/github.com-OWNER.image`
 with the owner in lower case, and gives it a fresh modification time, so the
-app reads it instead of downloading. Write the seed before the project opens:
-the app loads each owner's avatar once.
+app reads it instead of downloading. Write the seed first, as below. The app
+loads each owner's avatar once, as soon as an open project has both the remote
+and the switch, and remembers a missing one until it restarts.
 
 For pull request rows, `home/.config/fixture-forge-prs.json` holds an array in
 the shape `gh pr list --json` prints; copy the fields of `PR_VIEW_FIELDS` in
 `src/github.rs` and the examples in its tests. Each repository lists the
 entries whose `url` is under `https://github.com/OWNER/NAME/pull/`, filtered by
-`--state`, `--head`, `--author` and `--limit`. Opening a pull request's review
-needs its conversation queries, which the forge doesn't answer.
+`--state`, `--head`, `--author` and `--limit`. Reading the file needs `jq`.
+The pull request browser still lists none of them. Opening one's review needs
+its conversation queries, which the forge answers as not found; like any failed
+GitHub read, that pauses the app's GitHub refreshes for a while.
 
 A steps file for a sidebar with an avatar:
 
 ```sh
-evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge"'
-evidence env git -C '{fixture}/project' remote add origin https://github.com/octo-org/fixture-app
 evidence env sh -c 'mkdir -p "$CAGENTS_EVIDENCE_FIXTURE/avatars" &&
-    magick -size 64x64 xc:"#2f6feb" "png:$CAGENTS_EVIDENCE_FIXTURE/avatars/octo-org.image"'
+    magick -size 64x64 gradient:"#2f6feb"-"#a371f7" "png:$CAGENTS_EVIDENCE_FIXTURE/avatars/octo-org.image"'
+evidence env git -C '{fixture}/project' remote add origin https://github.com/octo-org/fixture-app
+evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge"'
 evidence cli project open '{fixture}/project'
+# The app reads GitHub in the background; give it time before the shot.
+sleep 12
 evidence shot sidebar-avatar
 ```
 

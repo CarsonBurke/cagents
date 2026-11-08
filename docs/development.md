@@ -1413,9 +1413,10 @@ harness, it provides:
   `gh` always fails unless `$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge`
   exists, which makes it an offline, signed-in github.com with project avatars
   seeded from `$CAGENTS_EVIDENCE_FIXTURE/avatars` (see
-  [Fixtures](fixtures.md#an-offline-github)); `curl` always fails. Files in
-  `$CAGENTS_EVIDENCE_FIXTURE/home/.claude` switch fixture behaviors. `env CMD` runs your own setup in this environment, with the fixture's
-  root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
+  [Fixtures](fixtures.md#an-offline-github)); `curl` always fails, and Git
+  reaches only local repositories. Files in `$CAGENTS_EVIDENCE_FIXTURE/home/.claude`
+  switch fixture behaviors. `env CMD` runs your own setup in this environment,
+  with the fixture's root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
 - **Seeded chats reopen.** A chat records its provider home's device and inode
   and won't reopen once that directory is replaced, and a transcript's
