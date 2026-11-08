@@ -101,9 +101,9 @@ pub(super) fn wait(
     let mut nonce = uuid::Uuid::new_v4().to_string();
     loop {
         if Instant::now() >= deadline {
-            return Err(invalid(
-                "Update preview expired without installation; review the update again",
-            ));
+            return Err(refused(&preview).unwrap_or_else(|| {
+                invalid("Update preview expired without installation; review the update again")
+            }));
         }
         job.confirmation = Some(Confirmation {
             nonce: nonce.clone(),
@@ -135,7 +135,11 @@ pub(super) fn wait(
                 }
                 fs::remove_file(&path)?;
                 match decision.choice {
-                    Choice::Cancel => return Err(UpdateError::Cancelled),
+                    // A blocked preview offers nothing but closing it, so
+                    // closing it is the refusal its blockers caused.
+                    Choice::Cancel => {
+                        return Err(refused(&preview).unwrap_or(UpdateError::Declined));
+                    }
                     Choice::Confirm => approved = true,
                     Choice::Policy(next) => {
                         policy = next;
@@ -168,6 +172,11 @@ pub(super) fn wait(
     }
 }
 
+fn refused(preview: &impact::Preview) -> Option<UpdateError> {
+    let refusal = preview.daemon.as_ref()?.refusal()?;
+    Some(UpdateError::Refused(Box::new(refusal)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -180,6 +189,7 @@ mod tests {
             message: String::new(),
             log_path: directory.join("worker.log"),
             confirmation: None,
+            refusal: None,
         }
     }
 
@@ -269,9 +279,35 @@ mod tests {
             Choice::Cancel,
         )
         .unwrap();
-        assert!(matches!(
-            worker.join().unwrap(),
-            Err(UpdateError::Cancelled)
-        ));
+        assert!(matches!(worker.join().unwrap(), Err(UpdateError::Declined)));
+    }
+
+    /// Closing a blocked review is the only way out of it, so it records
+    /// what blocked the update instead of a cancelled download.
+    #[test]
+    fn closing_a_blocked_review_records_what_refused_the_update() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            wait(&path, &mut job, |_| {
+                Ok(impact::Preview {
+                    daemon: Some(impact::tests::blocked()),
+                    ..preview(false)
+                })
+            })
+        });
+        let current = published(directory.path(), None);
+        publish_decision(
+            directory.path(),
+            &current.id,
+            &current.confirmation.as_ref().unwrap().nonce,
+            Choice::Cancel,
+        )
+        .unwrap();
+        let Err(UpdateError::Refused(refusal)) = worker.join().unwrap() else {
+            panic!("a blocked review closed as something other than a refusal");
+        };
+        assert_eq!(Some(*refusal), impact::tests::blocked().refusal());
     }
 }

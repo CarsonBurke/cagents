@@ -242,6 +242,34 @@ impl State {
         }
     }
 
+    /// Whether the warning shown is why the last update was refused, rather
+    /// than how it failed.
+    fn refused(&self) -> bool {
+        self.job
+            .as_ref()
+            .filter(|job| job.phase == UpdatePhase::Failed)
+            .and_then(|job| job.refusal.as_ref())
+            .is_some_and(|refusal| self.error.as_ref() == Some(&refusal.summary()))
+    }
+
+    /// The header's account of what went wrong with the last update, and
+    /// the way on from it.
+    fn problem(&self) -> Option<(String, Action)> {
+        let error = self.error.as_ref()?;
+        let outcome = if self.refused() {
+            "Update not installed"
+        } else {
+            "Update failed"
+        };
+        Some(match &self.result {
+            Some(UpdateState::Available { release }) => (
+                format!("{outcome}: {error}. Retry update to {}", release.version),
+                Action::Apply,
+            ),
+            _ => (format!("{outcome}: {error}. Check again"), Action::CheckNow),
+        })
+    }
+
     fn updating(&self) -> bool {
         self.applying
             || self
@@ -579,22 +607,8 @@ impl Cagents {
                 "A newer build is installed; reopen windows to use it".to_owned(),
                 Some(Message::UpdateUi(Action::Restart)),
             )
-        } else if let Some(error) = &state.error {
-            match &state.result {
-                Some(UpdateState::Available { release }) => (
-                    Icon::Warning,
-                    format!(
-                        "Update failed: {error}. Retry update to {}",
-                        release.version
-                    ),
-                    Some(Message::UpdateUi(Action::Apply)),
-                ),
-                _ => (
-                    Icon::Warning,
-                    format!("Update failed: {error}. Check again"),
-                    Some(Message::UpdateUi(Action::CheckNow)),
-                ),
-            }
+        } else if let Some((label, action)) = state.problem() {
+            (Icon::Warning, label, Some(Message::UpdateUi(action)))
         } else if let Some(UpdateState::Available { release }) = &state.result {
             (
                 Icon::Update,
@@ -909,7 +923,26 @@ impl Cagents {
                     Ok(Some(job)) => {
                         self.update_ui.poll_retry = false;
                         self.update_ui.error = None;
-                        if matches!(job.phase, UpdatePhase::Failed) {
+                        if let Some(refusal) = job
+                            .refusal
+                            .as_ref()
+                            .filter(|_| job.phase == UpdatePhase::Failed)
+                        {
+                            let summary = refusal.summary();
+                            // Later checks find the same record; the reasons
+                            // are said once, and the header keeps them.
+                            if self.update_ui.job.as_ref().is_none_or(|shown| {
+                                shown.id != job.id || !shown.phase.is_terminal()
+                            }) {
+                                self.status = Some(
+                                    TransientNotice::warning(format!(
+                                        "Update not installed: {summary}."
+                                    ))
+                                    .with_details(refusal.details().join("\n")),
+                                );
+                            }
+                            self.update_ui.error = Some(summary);
+                        } else if matches!(job.phase, UpdatePhase::Failed) {
                             let failure = startup_gate::update_failure(&job.message);
                             self.update_ui.error = Some(failure.summary);
                             // This window has already said the same thing.
@@ -1131,6 +1164,7 @@ mod tests {
                 message,
                 log_path: "/nonexistent/update.log".into(),
                 confirmation: None,
+                refusal: None,
             };
             app.update_ui.job = Some(job.clone());
             app.status = None;
@@ -1138,6 +1172,58 @@ mod tests {
             assert_eq!(app.status.is_some(), shown, "{:?}", app.status);
             assert!(app.update_ui.error.is_some());
         }
+    }
+
+    /// A refusal names what held the update back, once, and the header keeps
+    /// reading as a refusal rather than a failure or a cancelled download.
+    #[test]
+    fn a_refused_update_shows_its_reasons_not_a_cancellation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let refusal = crate::update::impact::Refusal {
+            sessions: vec![crate::update::impact::RefusedSession {
+                title: "Claude".into(),
+                reason: crate::update::impact::STOPPED_WITH_UNSETTLED_WORK.into(),
+            }],
+            blockers: Vec::new(),
+        };
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "9.8.7".into(),
+            phase: UpdatePhase::Failed,
+            message: refusal.message(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+            refusal: Some(refusal),
+        };
+        drop(app.update_update_ui(Action::Polled(None, Ok(Some(job.clone())))));
+        let notice = app.status.take().expect("the refusal is reported");
+        assert_eq!(notice.severity, NoticeSeverity::Warning);
+        assert_eq!(
+            notice.message,
+            "Update not installed: 1 session needs attention."
+        );
+        assert_eq!(
+            notice.details.as_deref(),
+            Some(
+                "Claude: Its provider stopped but may still hold unfinished work. \
+                 Close this conversation to release it."
+            )
+        );
+        assert_eq!(
+            app.update_ui.problem().unwrap().0,
+            "Update not installed: 1 session needs attention. Check again"
+        );
+        // The next check finds the same record: the header keeps it, but the
+        // reasons are not raised again.
+        drop(app.update_update_ui(Action::Polled(Some(job.id.clone()), Ok(Some(job)))));
+        assert!(app.status.is_none());
+        assert!(app.has_update_control());
+        // A failure that follows is still worded as one.
+        app.update_ui.error = Some("Could not start update".into());
+        assert_eq!(
+            app.update_ui.problem().unwrap().0,
+            "Update failed: Could not start update. Check again"
+        );
     }
 
     #[test]
@@ -1150,6 +1236,7 @@ mod tests {
             message: "installed daemon startup failed".into(),
             log_path: "/nonexistent/update.log".into(),
             confirmation: None,
+            refusal: None,
         });
         app.update_ui.error = Some("installed daemon startup failed".into());
         drop(app.update_update_ui(Action::Polled(Some("historical-failure".into()), Ok(None))));
@@ -1266,6 +1353,7 @@ mod tests {
             message: "Ready".into(),
             log_path: "/fixture/update.log".into(),
             confirmation: Some(confirmation.clone()),
+            refusal: None,
         };
         app.update_ui.job = Some(job.clone());
         app.update_ui.confirmation = Some(confirmation);
@@ -1397,6 +1485,7 @@ mod tests {
                 message: "Helper exited".into(),
                 log_path: "/nonexistent/update.log".into(),
                 confirmation,
+                refusal: None,
             })),
         )));
         assert!(app.update_ui.confirmation.is_none());
@@ -1463,6 +1552,7 @@ mod tests {
             message: "Ready".into(),
             log_path: "/fixture/update.log".into(),
             confirmation: Some(confirmation.clone()),
+            refusal: None,
         }
     }
 

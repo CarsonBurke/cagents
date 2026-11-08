@@ -26,6 +26,7 @@ fn job(phase: UpdatePhase) -> UpdateJob {
         message: "PRIVATE_ERROR_SENTINEL /private/path CONFIRMATION_SENTINEL".into(),
         log_path: "/private/LOG_SENTINEL".into(),
         confirmation: None,
+        refusal: None,
     }
 }
 fn write(state: &Path, job: &UpdateJob) {
@@ -42,6 +43,7 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
             waiting: 0,
             blocked: 0,
             daemon_timeout: false,
+            refused: false,
         }),
     }
 }
@@ -149,6 +151,10 @@ fn failed_or_terminal_status_does_not_override_real_held_or_unknown_ownership() 
             .explanation()
             .contains("daemon did not finish starting")
     );
+    let mut refused = projected(UpdatePhase::Failed, LockState::Free, LockState::Free);
+    refused.job.as_mut().unwrap().refused = true;
+    assert_eq!(refused.heading(), "The update was not installed");
+    assert!(refused.explanation().contains("nothing was changed"));
 }
 
 #[test]
