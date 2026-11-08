@@ -111,9 +111,43 @@ set -euo pipefail
 remote_main() {
 $script
 }
-remote_main$quoted </dev/null
+$remote_lifetime
+# Its own process group, which the connection's end can signal.
+set -m
+remote_main$quoted </dev/null &
+main=\$!
+set +m
+end_with_connection "\$main"
+status=0
+wait "\$main" || status=\$?
+exit "\$status"
 SCRIPT
 }
+
+# What HOST runs started by a connection ends with it. When the client goes,
+# sshd's session process exits but nothing tells what it started, which would
+# build or hold the native lock for nobody; a watcher sends that work's
+# process group TERM instead. A session that `start` detached on purpose
+# outlives it, which is why pair stops its own on TERM.
+remote_lifetime=$(cat <<'LIFETIME'
+end_with_connection() {
+    local main=$1 connection=$$
+    while [ "$connection" -gt 1 ]; do
+        case $(cat "/proc/$connection/comm" 2>/dev/null) in
+            sshd*) break ;;
+        esac
+        connection=$(sed 's/.*) //' "/proc/$connection/stat" 2>/dev/null | cut -d ' ' -f 2) || return 0
+        [ -n "$connection" ] || return 0
+    done
+    [ "$connection" -gt 1 ] || return 0
+    (
+        while kill -0 "$connection" 2>/dev/null && kill -0 "$main" 2>/dev/null; do sleep 2; done
+        kill -0 "$main" 2>/dev/null || exit 0
+        kill -TERM -- "-$main" 2>/dev/null || :
+    ) </dev/null >/dev/null 2>&1 &
+}
+LIFETIME
+)
 
 # Variables every script on HOST starts with.
 remote_prelude=$(cat <<PRELUDE
@@ -278,6 +312,9 @@ cmd_pair() {
         on_host "$remote_prelude"'
             side=$1 body=$2
             shift 2
+            # A lost connection sends TERM; the session still stops.
+            trap "evidence stop >/dev/null 2>&1 || :" EXIT
+            trap "exit 143" TERM HUP
             evidence start "$side" "$@"
             steps=$task/steps-$side.sh
             printf "%s\n" "$body" >"$steps"
@@ -287,6 +324,7 @@ cmd_pair() {
             export tool task
             status=0
             SIDE=$side bash -euo pipefail "$steps" || status=$?
+            trap - EXIT
             evidence stop >/dev/null
             exit "$status"
         ' "$side" "$(cat -- "$steps")" "${options[@]}" || status=$?

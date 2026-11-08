@@ -1261,6 +1261,20 @@ class RemoteEvidence(unittest.TestCase):
         self.assertFalse((self.task / "shots" / "before-never.webp").exists())
         self.assertEqual(self.tool_calls()[-1], "stop")
 
+    def test_a_lost_connection_still_stops_the_session(self) -> None:
+        before = self.repository("before", {"src.rs": "old\n"})
+        steps = self.root / "steps.sh"
+        # What the host's watcher sends once the connection has gone: TERM
+        # to the work's process group, which the steps run in.
+        steps.write_text("evidence shot first\n"
+                         "kill -TERM -- \"-$(ps -o pgid= -p $$ | tr -d ' ')\"\n"
+                         "sleep 5\nevidence shot never\n")
+        result = self.run_tool("pair", "--before", str(before), "--after", str(before),
+                               "--steps", str(steps), check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.tool_calls()[-1], "stop")
+        self.assertNotIn("shot never", self.tool_calls())
+
     def test_an_unknown_host_fails_plainly(self) -> None:
         result = self.run_tool("status", check=False, extra={"CAGENTS_EVIDENCE_REMOTE": "elsewhere"},
                                remote=False)
