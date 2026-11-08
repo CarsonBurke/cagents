@@ -592,6 +592,9 @@ pub fn upgrade_installed(
     };
     let mut submitted = None;
     let mut policy_requested = None;
+    // The preview whose unreachable conversations were ended; the worker
+    // publishes the changed impact under a new nonce.
+    let mut ended_for: Option<String> = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     loop {
         let job = status()?
@@ -617,7 +620,9 @@ pub fn upgrade_installed(
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
                     policy_requested = Some(confirmation.nonce.clone());
                 }
-            } else if submitted.as_ref() != Some(&confirmation.nonce) {
+            } else if submitted.as_ref() != Some(&confirmation.nonce)
+                && ended_for.as_ref() != Some(&confirmation.nonce)
+            {
                 if submitted.is_some() {
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
                     return Err(invalid(
@@ -646,21 +651,38 @@ pub fn upgrade_installed(
                         for blocker in &daemon.blockers {
                             eprintln!("  {blocker}");
                         }
-                        decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                        return Err(invalid(
-                            "Resolve the displayed update blockers, then retry.",
-                        ));
+                        let ending = if accept_unreopenable && ended_for.is_none() {
+                            unreachable_source_chats(daemon)?
+                        } else {
+                            None
+                        };
+                        let Some(ending) = ending else {
+                            decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                            return Err(invalid(if accept_unreopenable {
+                                "Resolve the displayed update blockers, then retry. --accept-unreopenable ends only conversations whose provider can no longer be carried."
+                            } else {
+                                "Resolve the displayed update blockers, then retry."
+                            }));
+                        };
+                        eprintln!(
+                            "--accept-unreopenable ends these conversations, which this update cannot carry:"
+                        );
+                        for (title, loss, _) in &ending {
+                            eprintln!("  {title}: {loss}");
+                        }
+                        if !yes && !confirm_on_terminal("End them and continue? [y/N] ")? {
+                            decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                            return Err(UpdateError::Cancelled);
+                        }
+                        end_source_chats(daemon, ending)?;
+                        ended_for = Some(confirmation.nonce.clone());
+                        thread::sleep(Duration::from_millis(250));
+                        continue;
                     }
                 }
-                if !yes {
-                    eprint!("Proceed with this update? [y/N] ");
-                    io::stderr().flush()?;
-                    let mut answer = String::new();
-                    io::stdin().read_line(&mut answer)?;
-                    if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
-                        decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                        return Err(UpdateError::Cancelled);
-                    }
+                if !yes && !confirm_on_terminal("Proceed with this update? [y/N] ")? {
+                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                    return Err(UpdateError::Cancelled);
                 }
                 decide(&job.id, &confirmation.nonce, UpdateChoice::Confirm)?;
                 submitted = Some(confirmation.nonce.clone());
@@ -673,6 +695,94 @@ pub fn upgrade_installed(
         }
         thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn confirm_on_terminal(question: &str) -> io::Result<bool> {
+    eprint!("{question}");
+    io::stderr().flush()?;
+    let mut answer = String::new();
+    io::stdin().read_line(&mut answer)?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+/// A blocked source conversation that only ending it resolves, with what
+/// ending it loses. Every blocked conversation must be one, and nothing else
+/// may block, or the update still needs the person to resolve it.
+type EndedChat = (String, &'static str, crate::chat::Session);
+
+/// The source cannot carry a Codex conversation whose server it can no longer
+/// reach: its listener is gone, so no successor can join that server, and the
+/// server still writes the thread, so none may resume it beside the server.
+/// A provider that stopped without confirming its work settled is refused
+/// for the same reason, and the source itself asks for it to be closed.
+fn unreachable_source_chats(
+    daemon: &impact::DaemonImpact,
+) -> Result<Option<Vec<EndedChat>>, UpdateError> {
+    if !daemon.blockers.is_empty() {
+        return Ok(None);
+    }
+    let mut client = source_client_for(daemon)?;
+    let listed = client.list_chats()?;
+    let mut ending = Vec::new();
+    for session in daemon
+        .sessions
+        .iter()
+        .filter(|session| session.disposition == impact::Disposition::Blocked)
+    {
+        let Some(source) = listed.iter().find(|listed| listed.id == session.id) else {
+            return Ok(None);
+        };
+        let loss = if session.kind != impact::SessionKind::NativeChat {
+            return Ok(None);
+        } else if source.launch.provider == crate::agent::Provider::Codex
+            && source.owns_codex_listener()
+            && source
+                .owned_codex_listener
+                .as_ref()
+                .is_some_and(|listener| {
+                    fs::metadata(&listener.socket)
+                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
+                })
+        {
+            "its Codex server can no longer be reached, so ending it stops that server and any turn it is running. Its thread stays on disk and can be reopened with Resume."
+        } else if session.reason == impact::STOPPED_WITH_UNSETTLED_WORK {
+            "its provider stopped without confirming its work finished; any unfinished work it held is lost. Its conversation stays on disk and can be reopened with Resume."
+        } else {
+            return Ok(None);
+        };
+        ending.push((session.title.clone(), loss, source.clone()));
+    }
+    Ok((!ending.is_empty()).then_some(ending))
+}
+
+fn end_source_chats(
+    daemon: &impact::DaemonImpact,
+    ending: Vec<EndedChat>,
+) -> Result<(), UpdateError> {
+    let mut client = source_client_for(daemon)?;
+    for (title, _, session) in ending {
+        client
+            .close_chat(session)
+            .map_err(|error| invalid(format!("Could not end {title}: {error}")))?;
+        eprintln!("  Ended {title}");
+    }
+    Ok(())
+}
+
+/// The reviewed source, authenticated again: a preview never authorizes
+/// acting on a different owner.
+fn source_client_for(daemon: &impact::DaemonImpact) -> Result<source::Client, UpdateError> {
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let client = source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+    if *client.proof() != daemon.capability.proof {
+        return Err(invalid(
+            "The source changed since its update impact was reviewed",
+        ));
+    }
+    Ok(client)
 }
 
 fn running_installation() -> Result<Installation, UpdateError> {
