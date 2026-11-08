@@ -66,11 +66,17 @@ mkdir -p "$(dirname "$history")"
 parent=null
 turn=0
 if [ -f "$history" ]; then
-    parent=$(jq -sr 'last.uuid // null' "$history")
+    # As Claude Code does, skip a line that isn't a record, such as one a
+    # crash cut short, rather than refusing the whole transcript.
+    records=$(jq -cnR '[inputs | fromjson? | objects]' "$history")
+    parent=$(printf '%s' "$records" | jq -r 'last.uuid // null')
     # Count the prompts handled, not assistant records: a failed turn
     # writes none and a delivered one writes two.
-    turn=$(jq -s '[.[] | select(.type == "user" and (.origin.kind // "") != "task-notification"
-        and ((.message.content | type) == "string" or any(.message.content[]; .type != "tool_result")))] | length' "$history")
+    turn=$(printf '%s' "$records" | jq '[.[] | select(.type == "user" and (.origin.kind // "") != "task-notification"
+        and ((.message.content | type) == "string" or ((.message.content | type) == "array"
+            and any(.message.content[]; .type != "tool_result"))))] | length')
+    # A line cut short has no newline, and the next record must not join it.
+    if [ -n "$(tail -c 1 -- "$history")" ]; then printf '\n' >>"$history"; fi
 fi
 persist_record() {
     record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \

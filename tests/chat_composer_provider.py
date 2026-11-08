@@ -45,6 +45,27 @@ class Provider(unittest.TestCase):
         return [block.get("text") for frame in output if frame.get("type") == "assistant"
                 for block in frame["message"]["content"] if block.get("type") == "text"]
 
+    def test_a_resumed_transcript_with_damaged_lines_is_read_past_them(self):
+        session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        mangled = "".join(c if c.isalnum() else "-" for c in str(self.project.resolve()))
+        history = self.config / "projects" / mangled / f"{session}.jsonl"
+        history.parent.mkdir(parents=True)
+        good = {**prompt(0), "sessionId": session, "parentUuid": None}
+        # A record that parses, one that doesn't, a value that isn't a record,
+        # a record without content, and a last line a crash cut short.
+        history.write_text(json.dumps(good) + "\n" + '{"type": "assistant", "uuid": \n'
+                           + "42\n" + json.dumps({"type": "user", "uuid": "bare"}) + "\n"
+                           + '{"type": "user", "uuid": "cut')
+        result, output, _ = self.run_provider("--resume", session)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(any(frame.get("type") == "result" for frame in output), output)
+        lines = history.read_text().splitlines()
+        self.assertEqual(lines[4], '{"type": "user", "uuid": "cut')
+        appended = [json.loads(line) for line in lines[5:]]
+        self.assertTrue(appended, lines)
+        # It goes on from the last record it could read.
+        self.assertEqual(appended[0]["parentUuid"], "bare")
+
     def test_an_exit_line_ends_the_provider_mid_turn_without_a_result(self):
         self.frames({"type": "assistant", "uuid": "partial-@TURN@",
                      "message": {"id": "partial-@TURN@", "role": "assistant",

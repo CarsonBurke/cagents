@@ -117,6 +117,11 @@ To see a resume that fails, create `fixture-fail-resume` too: the next
 resumed start exits before it answers, and the card offers **Try again**. The
 file is removed first, so pressing it resumes normally.
 
+A resumed transcript may be damaged, as a crash leaves one. The provider
+skips each line that isn't a JSON record, as Claude Code does, and goes on
+from the last record it could read. A last line cut short without a newline
+is ended first, so the next record starts its own line.
+
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
