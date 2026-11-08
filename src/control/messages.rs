@@ -235,10 +235,12 @@ fn delivery_json(delivery: &Delivery) -> Value {
 }
 
 /// The sent line, then what keeps the recipient from acting on the message.
+/// The sent line says a live conversation takes a message once idle; a
+/// limited one is idle yet takes nothing, so the notice reads as a correction.
 fn delivery_lines(delivery: &Delivery) -> String {
     let line = sent_line(&delivery.sent);
     match recipient_notice(delivery) {
-        Some(notice) => format!("{line}\n{notice}"),
+        Some(notice) => format!("{line}\nBut {notice}"),
         None => line,
     }
 }
@@ -253,9 +255,9 @@ fn recipient_notice(delivery: &Delivery) -> Option<String> {
     let id = member.session.id;
     if let Some(limit) = &member.limit {
         let held = if limit.resets_at.is_some() {
-            "so the message is held until then"
+            "so it holds the message until then"
         } else {
-            "so the message is held until the limit resets or that conversation continues"
+            "so it holds the message until the limit resets or that conversation continues"
         };
         return Some(format!(
             "{id} is stopped by a usage limit ({}), {held}; no reply can come before.",
@@ -701,12 +703,12 @@ mod tests {
         assert_eq!(
             notice,
             format!(
-                "{id} is stopped by a usage limit (Claude weekly limit reached, resets 3pm), so the message is held until the limit resets or that conversation continues; no reply can come before."
+                "But {id} is stopped by a usage limit (Claude weekly limit reached, resets 3pm), so it holds the message until the limit resets or that conversation continues; no reply can come before."
             )
         );
         let value = delivery_json(&delivery);
         assert_eq!(value["recipient"]["state"], "Limited");
-        assert_eq!(value["notice"], notice);
+        assert_eq!(value["notice"], notice.strip_prefix("But ").unwrap());
         assert_eq!(value["message"]["id"], json!(delivery.sent.message.id));
 
         // A reading that shows the account spent only warns, since it can be
