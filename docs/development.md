@@ -427,8 +427,64 @@ the last 10 seconds in which some task waited for a CPU) is below 60%
 (`CAGENTS_BUILD_CPU_PRESSURE`; `0` disables this check and the next), and not
 within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
-host that does not report pressure is treated as having room. Each build has an
-expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
+host that does not report pressure is treated as having room.
+
+When a build starts waiting for CPU, the gate says what holds the CPUs. Once
+it has released its admission decision, it samples the host's processes for
+about a second. It reports how many CPUs the running builds use and how many
+everything else uses. It then names up to three process sessions outside the
+builds that use at least half a CPU each, and the kernel's own threads when
+they do. For each session it gives the command that started it and how long
+ago, the CPUs it uses, how many processes it has and its busiest process. If
+the session's leader has exited, it says so. Other sessions are summed. The
+message ends with how to look at the first session, `ps -s SESSION`, and to
+end it, `pkill -s SESSION`. It never offers `pkill` for a session holding
+cagents itself, such as the installed daemon that hosts every terminal and
+agent; for the session of the wait or of anything that started it, such as
+the waiting agent; or for the system's session, one started from the desktop
+or a terminal's. It says which it is instead. The process count is
+everything in the session, as `pkill -s` would end it. The message points at
+`scripts/bounded --list` when the checkout has that script. Sampling gives up
+after 10 seconds, as reading a process stuck on a hung mount can block:
+
+```
+cargo-gate: builds use 6.2 CPUs and everything else 9.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 8.9 CPUs in 11 processes, most in pid 2272069 (python3 -I stress.py --workers 8); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
+```
+
+When no other session uses half a CPU, and everything else together uses
+less than one CPU, or less than a quarter of what the builds use when that is
+more, the message begins `nothing else uses much; the running builds hold
+them` instead. It begins `nothing uses much at the moment` when the builds
+use less than half a CPU, less than everything else, or, with everything
+else, less than half the host's CPUs: pressure is a ten-second average, so a
+wait can follow a burst that has already ended. When everything else uses more than that, but no
+session half a CPU, it ends `though no session outside them uses half a
+CPU`.
+
+A session is what one login, ssh command or terminal started. A loop that
+keeps starting short-lived commands is one session, and the time of the
+commands it has reaped counts as its own. The builds are:
+
+- the processes below a running build's holder, or below a process holding
+  a slot lock, which includes one taken by a plain `flock`. The slot locks
+  are the waiting family's, those the build registry names, and on the host
+  each `/var/tmp/cagents-*.lock` slot family with a `.queue` beside it; other
+  locks there, such as a native-evidence session's, are not builds;
+- processes whose environment marks them as a running build's:
+  `CAGENTS_BUILD_SLOT_HELD` for a gated command, `CAGENTS_OFFLOAD_SLOT` for an
+  offloaded one;
+- processes working in a leased offload slot, as its file copies do.
+
+A process in an offload slot, or with its mark, that started before the
+process holding the slot's lock is left from an earlier build, and it is
+named.
+Whatever a gated command detaches stays below the gate's command supervisor,
+which is a subreaper. A plain `flock` holder's command carries no mark, so
+whatever it detaches without the lock's descriptor is named as something else.
+An offloaded build's wait says the same about the build host, whose commands
+it says to run `there`.
+
+Each build has an expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
 GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
 script and 9 GiB for an `exec --hold` one such as the development runner's; a
 slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
