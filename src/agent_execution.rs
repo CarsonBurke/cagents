@@ -32,6 +32,9 @@ pub const MAX_PARENT_DEPTH: usize = 8;
 /// How the daemon begins refusing a follow-up run for an agent that a usage
 /// limit stops until a known reset; the CLI reports it as `agent_limited`.
 pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
+/// What the refusal advises doing with the prompt instead.
+pub const LIMITED_ADVICE: &str =
+    "Send it once the limit resets, or leave it with `cagents send`, which holds it until then.";
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
 
 /// Presentation routing only. Daemon ownership additionally requires its

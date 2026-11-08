@@ -197,6 +197,10 @@ pub struct SessionAccount {
     pub stale: bool,
     /// Unix milliseconds at which the reading was taken; absent with it.
     pub observed_at: Option<u64>,
+    /// The provider's own word, in that reading, on whether the account may
+    /// be used as usual, where it gives one (Codex does). It outranks the
+    /// windows: Codex can permit usage with a window used up.
+    pub ordinary_usage_allowed: Option<bool>,
 }
 
 impl SessionAccount {

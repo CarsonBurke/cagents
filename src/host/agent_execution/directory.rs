@@ -304,7 +304,7 @@ pub(super) fn list(
             relation,
             lineage: lineage(live.id),
         };
-        let account = accounts
+        let mut account = accounts
             .as_ref()
             .zip(live.chat.as_ref())
             .zip(live.provider)
@@ -324,6 +324,17 @@ pub(super) fn list(
                     now,
                 )
             });
+        // Allowance read before the provider refused a turn is no basis for a
+        // plan: the refusal is newer evidence.
+        if limit.is_some()
+            && let Some(account) = account.as_mut()
+            && account
+                .observed_at
+                .zip(live.chat.as_ref().and_then(|chat| chat.finished_at()))
+                .is_none_or(|(observed, failed)| observed <= failed)
+        {
+            account.stale = true;
+        }
         let member = Member {
             session: entry,
             exited: live.exited,
@@ -584,15 +595,27 @@ pub(in crate::host) fn usage_limit(
         return None;
     }
     // A reading taken after the failure is newer evidence than it, however
-    // old that reading has since grown, and it outranks the windows' dates:
-    // Codex can permit ordinary usage with a window used up.
+    // old that reading has since grown. It lifts the limit when the provider
+    // says the account may be used, or else when it shows allowance and no
+    // window in it still used up until after the failure: a model's own
+    // window leaves the account's status untouched, yet stops a conversation
+    // on that model.
     let recovered = failed_at.is_some()
         && account.is_some_and(|account| {
             account.observed_at.is_some_and(after_failure)
-                && matches!(
-                    account.status,
-                    Some(crate::account::UsageStatus::Ok | crate::account::UsageStatus::Warning)
-                )
+                && match account.ordinary_usage_allowed {
+                    Some(allowed) => allowed,
+                    None => {
+                        limit.resets_at.is_none()
+                            && matches!(
+                                account.status,
+                                Some(
+                                    crate::account::UsageStatus::Ok
+                                        | crate::account::UsageStatus::Warning
+                                )
+                            )
+                    }
+                }
         });
     (!recovered).then_some(limit)
 }
@@ -666,6 +689,7 @@ mod tests {
             stale: RemainingWindow::stale(now.checked_sub(observed_at), &remaining),
             remaining,
             observed_at: Some(observed_at),
+            ordinary_usage_allowed: None,
         }
     }
 
@@ -758,29 +782,58 @@ mod tests {
         );
         // Codex can permit ordinary usage with a window used up; a reading
         // after the failure that says so outranks that window's date.
-        let codex = |status| {
+        let codex = |status, allowed| {
             usage_limit(
                 Provider::Codex,
                 "Usage limit reached for this plan",
                 Some(failed_at),
+                Some(&SessionAccount {
+                    ordinary_usage_allowed: allowed,
+                    ..account_reading(
+                        status,
+                        failed_at + 60_000,
+                        &[("Weekly", WindowKind::Weekly, 1.0, weekly_reset)],
+                        failed_at + 120_000,
+                    )
+                }),
+                failed_at + 120_000,
+            )
+        };
+        assert_eq!(
+            codex(UsageStatus::Limited, Some(false)).unwrap().resets_at,
+            Some(weekly_reset)
+        );
+        assert_eq!(
+            codex(UsageStatus::Warning, Some(true)),
+            None,
+            "permission read after the failure lifts a dated limit"
+        );
+
+        // A model's own window used up leaves the account's status Ok, yet
+        // stops a conversation on that model until it resets: a reading after
+        // the failure that still shows it used up does not lift the limit.
+        let opus = |used| {
+            usage_limit(
+                Provider::Claude,
+                "You've hit your Opus limit · resets Nov 8, 8am (America/Vancouver)",
+                Some(failed_at),
                 Some(&account_reading(
-                    status,
+                    UsageStatus::Ok,
                     failed_at + 60_000,
-                    &[("Weekly", WindowKind::Weekly, 1.0, weekly_reset)],
+                    &[
+                        ("Session", WindowKind::Session, 0.1, 1_009_000),
+                        ("Weekly Opus", WindowKind::Scoped, used, weekly_reset),
+                    ],
                     failed_at + 120_000,
                 )),
                 failed_at + 120_000,
             )
         };
         assert_eq!(
-            codex(UsageStatus::Limited).unwrap().resets_at,
+            opus(1.0).expect("a used-up model window holds").resets_at,
             Some(weekly_reset)
         );
-        assert_eq!(
-            codex(UsageStatus::Warning),
-            None,
-            "permission read after the failure lifts a dated limit"
-        );
+        assert_eq!(opus(0.4), None, "that window with allowance lifts it");
 
         // Allowance read before the failure says nothing about after it, and
         // a window that reset before the failure is not the one that ends it.

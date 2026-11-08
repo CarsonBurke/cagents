@@ -1947,6 +1947,12 @@
           {
             "Option": "U64"
           }
+        ],
+        [
+          "ordinary_usage_allowed",
+          {
+            "Option": "Bool"
+          }
         ]
       ]
     },

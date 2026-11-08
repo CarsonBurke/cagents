@@ -439,6 +439,7 @@ mod tests {
             }],
             stale,
             observed_at: None,
+            ordinary_usage_allowed: None,
         }
     }
 

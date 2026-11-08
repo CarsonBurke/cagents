@@ -238,10 +238,10 @@ fn refuse_limited(
         .map(|reset| format!(", resets {reset}"))
         .unwrap_or_default();
     Err(format!(
-        "{} ({}{reset}), so the prompt was not sent. \
-         Send it once the limit resets, or leave it with `cagents send`, which holds it until then.",
+        "{} ({}{reset}), so the prompt was not sent. {}",
         crate::agent_execution::LIMITED_REFUSAL,
-        limit.summary
+        limit.summary,
+        crate::agent_execution::LIMITED_ADVICE,
     ))
 }
 

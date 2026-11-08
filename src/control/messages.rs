@@ -722,6 +722,7 @@ mod tests {
             remaining: Vec::new(),
             stale: true,
             observed_at: None,
+            ordinary_usage_allowed: None,
         });
         let notice = recipient_notice(&delivery).unwrap();
         assert!(

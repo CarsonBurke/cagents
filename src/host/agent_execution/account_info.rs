@@ -328,6 +328,7 @@ impl Accounts {
             ),
             remaining,
             observed_at: usage.map(|usage| usage.observed_at),
+            ordinary_usage_allowed: usage.and_then(|usage| usage.ordinary_usage_allowed),
         })
     }
 }

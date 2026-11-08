@@ -5,7 +5,7 @@ use crate::{
     agent_execution::{
         Accepted, Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit,
         Summary, Surface, Target,
-        directory::{Member, Scope},
+        directory::{Member, Scope, UsageLimit},
     },
     model::{AgentId, RunId},
 };
@@ -1052,9 +1052,9 @@ pub(super) fn execute_with_context(
             };
             // The daemon refuses an agent stopped until a known reset, after
             // answering a retry of an accepted submission with its acceptance.
-            let mut output = submitted(&mut session, "agent.send", request, wait, show)
-                .map_err(limited_refusal)?;
             let now = super::sessions::now_ms();
+            let mut output = submitted(&mut session, "agent.send", request, wait, show)
+                .map_err(|error| limited_refusal(error, limit.as_ref(), now))?;
             if let Some(limit) = limit {
                 let notice = format!(
                     "Its provider last stopped at a usage limit ({}); the run fails the same way unless the limit has lifted, as when the conversation's account changed.",
@@ -1220,19 +1220,33 @@ pub(super) fn execute_with_context(
     }
 }
 
-/// Reports an acceptance, after waiting on its run when asked to.
 /// The daemon's refusal of a follow-up for an agent a usage limit stops
-/// until a known reset, reported as `agent_limited`.
-fn limited_refusal(mut error: AppError) -> AppError {
-    if error
-        .message
-        .starts_with(crate::agent_execution::LIMITED_REFUSAL)
-    {
-        error.kind = "agent_limited";
+/// until a known reset, reported as `agent_limited`. The refusal names the
+/// reset in the provider's words; the limit read before submitting dates it
+/// where the account's usage readings do.
+fn limited_refusal(mut error: AppError, limit: Option<&UsageLimit>, now: u64) -> AppError {
+    if !is_limited_refusal(&error) {
+        return error;
+    }
+    error.kind = "agent_limited";
+    if let Some(limit) = limit.filter(|limit| limit.resets_at.is_some()) {
+        error.message = format!(
+            "{} ({}), so the prompt was not sent. {}",
+            crate::agent_execution::LIMITED_REFUSAL,
+            super::sessions::limit_phrase(limit, now),
+            crate::agent_execution::LIMITED_ADVICE,
+        );
     }
     error
 }
 
+fn is_limited_refusal(error: &AppError) -> bool {
+    error
+        .message
+        .starts_with(crate::agent_execution::LIMITED_REFUSAL)
+}
+
+/// Reports an acceptance, after waiting on its run when asked to.
 fn submitted(
     session: &mut Session,
     command: &'static str,
@@ -1250,6 +1264,10 @@ fn submitted(
     // Whether a failed submission was accepted is unknown, so the key that
     // makes retrying it safe goes with the error.
     let (reply, retried) = session.submit(request).map_err(|mut error| {
+        // A limit's refusal is definite: nothing was accepted to retry.
+        if is_limited_refusal(&error) {
+            return error;
+        }
         error.message = format!(
             "{}; retry with --idempotency-key {key} to avoid starting the work twice",
             error.message
@@ -1626,17 +1644,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn only_the_daemons_limit_refusal_reads_as_agent_limited() {
-        let refused = AppError::new(
-            "protocol",
+    fn only_the_daemons_limit_refusal_reads_as_agent_limited_and_names_its_reset() {
+        use crate::agent_execution::{LIMITED_ADVICE, LIMITED_REFUSAL};
+        // As the daemon words it: the provider's reset wording, if any.
+        let refused = || {
+            AppError::new(
+                "protocol",
+                format!(
+                    "{LIMITED_REFUSAL} (Claude weekly limit reached), so the prompt was not sent. {LIMITED_ADVICE}"
+                ),
+            )
+        };
+        let now = 1_000_000_000;
+        let dated = UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: None,
+            resets_at: Some(1_000_000 + 3 * 3600),
+        };
+        let error = limited_refusal(refused(), Some(&dated), now);
+        assert_eq!(error.kind, "agent_limited");
+        assert_eq!(
+            error.message,
             format!(
-                "{} (Claude weekly limit reached, resets 3pm), so the prompt was not sent.; retry with --idempotency-key k to avoid starting the work twice",
-                crate::agent_execution::LIMITED_REFUSAL
+                "{LIMITED_REFUSAL} (Claude weekly limit reached, resets in 3 hr), so the prompt was not sent. {LIMITED_ADVICE}"
             ),
+            "the reset the account's readings date is named, and no retry is offered"
         );
-        assert_eq!(limited_refusal(refused).kind, "agent_limited");
+        // Without a dated limit read beforehand, the daemon's words stand.
+        let undated = limited_refusal(refused(), None, now);
+        assert_eq!(undated.kind, "agent_limited");
+        assert_eq!(undated.message, refused().message);
         let other = AppError::new("protocol", "The agent is not running");
-        assert_eq!(limited_refusal(other).kind, "protocol");
+        let other = limited_refusal(other, Some(&dated), now);
+        assert_eq!(other.kind, "protocol");
+        assert_eq!(other.message, "The agent is not running");
     }
 
     #[test]
@@ -2953,6 +2994,7 @@ mod tests {
                 remaining: Vec::new(),
                 stale: false,
                 observed_at: None,
+                ordinary_usage_allowed: None,
             }),
         };
         let members = [member];
