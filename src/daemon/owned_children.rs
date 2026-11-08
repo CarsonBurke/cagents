@@ -381,6 +381,11 @@ record "$3" $left; record "$2" $running
         stat[stat.rfind(')')? + 2..].split(' ').nth(1)?.parse().ok()
     }
 
+    fn session(pid: i32) -> Option<i32> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        stat[stat.rfind(')')? + 2..].split(' ').nth(3)?.parse().ok()
+    }
+
     /// The provider's work, once its detached process is adopted by `owner`
     /// and it is ready to stop its command.
     pub(crate) fn detached_work_under(root: &Path, owner: i32) -> Work {
@@ -393,9 +398,14 @@ record "$3" $left; record "$2" $running
                     .parse::<i32>()
                     .ok()
             };
+            // Each is out of the provider's group only once it has called
+            // setsid, which may come after its pid is recorded.
             if let (Some(detached), Some(running), Some(left)) =
                 (pid("detached"), pid("running"), pid("left"))
                 && parent(detached) == Some(owner)
+                && [detached, running, left]
+                    .into_iter()
+                    .all(|pid| session(pid) == Some(pid))
             {
                 return Work {
                     detached,

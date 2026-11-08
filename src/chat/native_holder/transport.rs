@@ -2870,26 +2870,10 @@ exec /bin/sleep 60
         let mut holder = spawn(spec, source).unwrap();
         context.installed();
         assert!(holder.sparing_release);
-        let pid = |name: &str| -> i32 {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                if let Some(pid) = std::fs::read_to_string(working.path().join(name))
-                    .ok()
-                    .and_then(|pid| pid.trim().parse().ok())
-                {
-                    return pid;
-                }
-                assert!(Instant::now() < deadline, "the provider did not detach");
-                std::thread::sleep(Duration::from_millis(10));
-            }
-        };
-        let (detached, running, left) = (pid("detached"), pid("running"), pid("left"));
         let holder_pid = holder.identity.record.holder.pid;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while crate::daemon::owned_children::tests::parent(detached) != Some(holder_pid) {
-            assert!(Instant::now() < deadline, "the holder did not adopt it");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        let work =
+            crate::daemon::owned_children::tests::detached_work_under(working.path(), holder_pid);
+        let (detached, running, left) = (work.detached, work.running, work.left);
         let detached = Process::read(detached).unwrap();
         let running = Process::read(running).unwrap();
         let left = Process::read(left).unwrap();
