@@ -1329,6 +1329,37 @@ mod tests {
         }
     }
 
+    /// Real kernel process and socket data, restricted to this fixture's
+    /// explicitly owned processes. An unrelated exec is not part of its input.
+    struct LiveProcesses(tempfile::TempDir);
+
+    impl LiveProcesses {
+        fn new() -> Self {
+            let processes = Self(tempfile::tempdir_in("/var/tmp").unwrap());
+            std::fs::create_dir(processes.0.path().join("net")).unwrap();
+            std::os::unix::fs::symlink("/proc/net/unix", processes.0.path().join("net/unix"))
+                .unwrap();
+            processes.include(std::process::id());
+            processes
+        }
+
+        fn include(&self, pid: u32) {
+            std::os::unix::fs::symlink(format!("/proc/{pid}"), self.0.path().join(pid.to_string()))
+                .unwrap();
+        }
+
+        fn remove(&self, pid: u32) {
+            std::fs::remove_file(self.0.path().join(pid.to_string())).unwrap();
+        }
+
+        fn evidence(&self, holders: &Path) -> ExecutionEvidence {
+            ExecutionEvidence {
+                processes: self.0.path().into(),
+                ..evidence(holders, Vec::new())
+            }
+        }
+    }
+
     /// A Codex pane served on its own daemon-allocated listener under `root`.
     fn codex_card(root: &Path, continuity: NativeContinuity) -> Session {
         let mut card = session();
@@ -1534,9 +1565,10 @@ mod tests {
     fn codex_pane_whose_server_is_gone_has_nothing_to_preserve() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let live_processes = LiveProcesses::new();
         for card in codex_cards(root.path()) {
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Ended,
                 "{:?}",
                 card.native_continuity
@@ -1546,7 +1578,7 @@ mod tests {
                 .create(holders.path())
                 .unwrap();
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Ended
             );
             // Discovery refuses a record of another boot; that proves nothing.
@@ -1555,7 +1587,7 @@ mod tests {
             let holders = tempfile::tempdir_in("/var/tmp").unwrap();
             older.create(holders.path()).unwrap();
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Unproved
             );
         }
@@ -1691,6 +1723,7 @@ mod tests {
         for card in codex_cards(root.path()) {
             let socket = card.owned_codex_listener.clone().unwrap().socket;
             let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+            let live_processes = LiveProcesses::new();
             // A server still naming the pane's listener, as `codex app-server
             // --listen unix://<socket>` does.
             let mut server = std::process::Command::new("/bin/sh")
@@ -1714,7 +1747,8 @@ mod tests {
                 .read_exact(&mut ready)
                 .unwrap();
             assert_eq!(&ready, b"ready");
-            let named = evidence(holders.path(), Vec::new()).classify(&card);
+            live_processes.include(server.id());
+            let named = live_processes.evidence(holders.path()).classify(&card);
             server
                 .stdin
                 .take()
@@ -1722,17 +1756,18 @@ mod tests {
                 .write_all(b"release\n")
                 .unwrap();
             assert!(server.wait().unwrap().success());
+            live_processes.remove(server.id());
             assert_eq!(named, SavedExecution::Running);
             // A server under another name still bound to the listener path.
             std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
             let bound = std::os::unix::net::UnixListener::bind(&socket).unwrap();
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Running
             );
             drop(bound);
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Ended,
                 "a socket file nobody listens on is no server"
             );
@@ -1744,13 +1779,13 @@ mod tests {
             std::os::unix::fs::symlink(&target, &socket).unwrap();
             let bound = std::os::unix::net::UnixListener::bind(&target).unwrap();
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Running,
                 "a server bound behind the published listener"
             );
             drop(bound);
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Ended
             );
             std::fs::remove_dir_all(socket.parent().unwrap()).unwrap();
@@ -1763,7 +1798,7 @@ mod tests {
                     .create(holders.path())
                     .unwrap();
                 assert_eq!(
-                    evidence(holders.path(), Vec::new()).classify(&card),
+                    live_processes.evidence(holders.path()).classify(&card),
                     SavedExecution::Running,
                     "a registered holder or its server survives"
                 );
@@ -1776,6 +1811,7 @@ mod tests {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let [card, _] = codex_cards(root.path());
+        let live_processes = LiveProcesses::new();
         let mut paired = card.clone();
         paired.terminal = Some(
             crate::terminal_ipc::TerminalDescriptor::relaunchable(
@@ -1801,7 +1837,7 @@ mod tests {
         };
         for card in [paired, unowned, foreign, unproved, console.clone()] {
             assert_eq!(
-                evidence(holders.path(), Vec::new()).classify(&card),
+                live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Unproved
             );
         }
@@ -1813,14 +1849,14 @@ mod tests {
             host_incarnation: console_proof.host_incarnation,
         };
         assert_eq!(
-            evidence(holders.path(), Vec::new()).classify(&console),
+            live_processes.evidence(holders.path()).classify(&console),
             SavedExecution::Ended
         );
-        let mut unreadable = evidence(holders.path(), Vec::new());
+        let mut unreadable = live_processes.evidence(holders.path());
         unreadable.native_holders = Err("unavailable".into());
         assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
         // A process table that cannot be read proves nothing.
-        let mut absent = evidence(holders.path(), Vec::new());
+        let mut absent = live_processes.evidence(holders.path());
         absent.processes = root.path().join("absent");
         assert_eq!(absent.classify(&card), SavedExecution::Unproved);
         // A process that has not published its arguments might be the
@@ -1841,7 +1877,7 @@ mod tests {
         let uid = crate::daemon::current_uid();
         let user = |uid: u32| format!("Name:\tcodex\nUid:\t{uid}\t{uid}\t{uid}\t{uid}\n");
         std::fs::write(process.join("status"), user(uid)).unwrap();
-        let mut table = evidence(holders.path(), Vec::new());
+        let mut table = live_processes.evidence(holders.path());
         table.processes = processes.path().into();
         let thread = |tid: u32, state: char, flags: u64, pending: (u64, u64)| {
             let thread = process.join("task").join(tid.to_string());
@@ -1991,7 +2027,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            evidence(holders.path(), Vec::new()).classify(&card),
+            live_processes.evidence(holders.path()).classify(&card),
             SavedExecution::Unproved
         );
     }
