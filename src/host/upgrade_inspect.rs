@@ -1562,6 +1562,12 @@ mod tests {
 
     #[test]
     fn codex_pane_with_a_surviving_server_or_holder_is_live_work() {
+        // Other tests must not fork while this test owns a listener whose
+        // final descriptor close is meant to remove its /proc/net/unix row.
+        #[cfg(target_os = "linux")]
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         for card in codex_cards(root.path()) {
             let socket = card.owned_codex_listener.clone().unwrap().socket;
