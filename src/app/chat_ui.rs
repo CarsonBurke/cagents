@@ -6928,26 +6928,12 @@ impl Cagents {
         // A conversation another window started is not a launch option; it
         // is attached, or recovered, as the conversation it is. An operation
         // already under way on the card keeps the launch it began with.
-        if self.chat_start_pending(card) {
+        if !session.is_unstarted() || self.chat_start_pending(card) {
             return Task::none();
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
-        if !session.is_unstarted() {
-            if runtime.session.id == session.id
-                && runtime.session.is_unstarted()
-                && runtime.is_draft()
-            {
-                // A peer may first see the winner's unproved candidate and
-                // later its proof without an identity change. Its unsent text
-                // still belongs to this reader, never the winning first turn.
-                self.stash_unsent_chat(card);
-                self.cards.remove(&card);
-                return self.open_chat(card, session.clone(), chat::Intent::Restore);
-            }
-            return Task::none();
-        }
         if !runtime.choosing() || runtime.session.id != session.id || runtime.session == *session {
             return Task::none();
         }

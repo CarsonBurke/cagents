@@ -118,33 +118,6 @@ fn no_starter(app: &Cagents, card: CardId) {
 }
 
 #[test]
-fn a_proven_candidate_with_the_same_id_attaches_without_sending_the_peer_draft() {
-    let (mut app, _directory, card, _) = fixture();
-    let images = runtime(&app, card).attachments.clone();
-    let source = runtime(&app, card).session.clone();
-    let mut accepted = source;
-    accepted.proof = Some(HostSessionProof {
-        host_session_id: "owner".into(),
-        boot_id: "boot".into(),
-        host_incarnation: "host".into(),
-    });
-    accepted.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
-    // Exercise the adoption boundary directly. The private-wire passive-peer
-    // tests below cover delivery through a complete authoritative shared model.
-    drop(app.adopt_shared_draft_session(card, &accepted));
-    assert!(
-        app.chat_start_matches(card, &accepted),
-        "proof must schedule attachment even for the same ID"
-    );
-    assert!(app.chat_ui.retiring.is_empty());
-    assert_eq!(
-        app.chat_ui.drafts.get(&card).map(String::as_str),
-        Some("First prompt remains local")
-    );
-    assert_eq!(app.chat_ui.draft_attachments[&card], images);
-}
-
-#[test]
 fn first_start_waits_for_real_identity_and_prompt_checkpoint_before_publishing_or_starting() {
     let (mut app, _directory, card, target) = fixture();
     let source = runtime(&app, card).session.clone();
