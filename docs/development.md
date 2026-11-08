@@ -427,7 +427,15 @@ the last 10 seconds in which some task waited for a CPU) is below 60%
 (`CAGENTS_BUILD_CPU_PRESSURE`; `0` disables this check and the next), and not
 within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
-host that does not report pressure is treated as having room. Each build has an
+host that does not report pressure is treated as having room. When a build
+starts waiting for CPU, the gate names what else holds the CPUs: the process
+sessions other than the running builds that used the most CPU over a second,
+with their share, how many processes, the command that started each session
+and how long ago, such as `besides builds, the CPUs go to 1690% from 17
+processes of session 2270967 (bash -s, started 1d12h ago)`. A session is what
+one login, ssh command or terminal started, so a loop that keeps starting
+children counts as one. An offloaded build's wait says the same about the
+build host. Each build has an
 expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
 GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
 script and 9 GiB for an `exec --hold` one such as the development runner's; a
