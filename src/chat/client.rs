@@ -1805,6 +1805,27 @@ impl ClientHandle {
         )
     }
 
+    pub fn connect_in_pane(
+        pane: ipc::PaneChatStart,
+        session: Session,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
+        let stream = connect_daemon(&socket).map_err(|error| error.to_string())?;
+        Self::connect_on_with_pane(
+            stream,
+            session,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(pane),
+            wake,
+        )
+    }
+
     /// Attach only the exact canonical replacement authenticated from this
     /// saved source. Unlike ordinary restore, this never starts a provider.
     pub fn connect_upgrade(
@@ -1898,6 +1919,31 @@ impl ClientHandle {
     }
 
     fn connect_on(
+        stream: UnixStream,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+        terminate_source: bool,
+        selection: Option<String>,
+        account_recovery: Option<(Session, Option<u64>)>,
+        upgrade_expected: Option<Session>,
+        wake: impl Fn(Wake) + Send + Sync + 'static,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on_with_pane(
+            stream,
+            session,
+            intent,
+            source,
+            terminate_source,
+            selection,
+            account_recovery,
+            upgrade_expected,
+            None,
+            wake,
+        )
+    }
+
+    fn connect_on_with_pane(
         mut stream: UnixStream,
         session: Session,
         intent: Intent,
@@ -1906,6 +1952,7 @@ impl ClientHandle {
         selection: Option<String>,
         account_recovery: Option<(Session, Option<u64>)>,
         upgrade_expected: Option<Session>,
+        pane: Option<ipc::PaneChatStart>,
         wake: impl Fn(Wake) + Send + Sync + 'static,
     ) -> Result<Self, StartFailure> {
         let retirement = ClientRetirement::for_client(session.id)?;
@@ -2066,11 +2113,18 @@ impl ClientHandle {
             }
         } else if intent == Intent::Start {
             let execution_environment = native_environment(&session, source.is_none());
-            ClientRequest::ChatStart {
-                session,
-                source,
-                terminate_source,
-                execution_environment,
+            match pane {
+                Some(pane) => ClientRequest::ChatStartInPane {
+                    pane,
+                    session,
+                    execution_environment,
+                },
+                None => ClientRequest::ChatStart {
+                    session,
+                    source,
+                    terminate_source,
+                    execution_environment,
+                },
             }
         } else {
             restore(
@@ -2091,6 +2145,10 @@ impl ClientHandle {
             // allocated for it, never the stranded allocation's.
             id = session.id;
         }
+        let pane_retry =
+            matches!(&request, ClientRequest::ChatStartInPane { .. }).then(|| request.clone());
+        let pane_deadline = Instant::now() + Duration::from_secs(15);
+        let mut pane_wait = Duration::from_millis(50);
         codec
             .write(
                 &mut stream,
@@ -2163,6 +2221,29 @@ impl ClientHandle {
                 ServerMessage::Error(error) if envelope.request_id == Some(attach_request) => {
                     #[cfg(feature = "ui")]
                     crate::daemon_health::frame(&stream, None, health_request);
+                    if error.code == ipc::ProtocolErrorCode::QueueFull
+                        && error.retryable
+                        && Instant::now() < pane_deadline
+                        && let Some(request) = &pane_retry
+                    {
+                        // The model publisher may still be registering the pane.
+                        // This correlated refusal started nothing; retry this exact
+                        // candidate off the UI thread, never a fresh identity.
+                        thread::sleep(pane_wait);
+                        pane_wait = (pane_wait * 2).min(Duration::from_millis(200));
+                        codec
+                            .write(
+                                &mut stream,
+                                &ClientEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id: attach_request,
+                                    proof: Some(proof.clone()),
+                                    request: request.clone(),
+                                },
+                            )
+                            .map_err(|error| error.to_string())?;
+                        continue;
+                    }
                     return Err(start_failure(error));
                 }
                 _ => return Err("Daemon did not attach the exact native chat".into()),
@@ -3667,6 +3748,90 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new(incarnation),
         }
+    }
+
+    #[test]
+    fn pane_first_send_keeps_its_basis_and_candidate_while_publication_is_pending() {
+        use ipc::{
+            ClientEnvelope, ProtocolError, ProtocolErrorCode, ServerEnvelope, ServerMessage,
+            ServerResponse, read_frame, write_frame,
+        };
+        let source = omp_card(None, None);
+        let mut candidate = source.clone();
+        candidate.id = TerminalId::new();
+        let pane = ipc::PaneChatStart {
+            registry: crate::workspace_model::NO_REGISTRY,
+            card: crate::model::CardId::new(),
+            source,
+            allow_local: false,
+        };
+        let expected_pane = pane.clone();
+        let expected_candidate = candidate.clone();
+        let (stream, mut peer) = UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = thread::spawn(move || {
+            let proof = host_proof("pane-start");
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            write_frame(
+                &mut peer,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(hello.request_id),
+                    proof: proof.clone(),
+                    message: ServerMessage::Response {
+                        response: ServerResponse::Connected {
+                            proof: proof.clone(),
+                            resumed: vec![],
+                        },
+                    },
+                },
+            )
+            .unwrap();
+            for (code, retryable, message) in [
+                (ProtocolErrorCode::QueueFull, true, "Pane not yet published"),
+                (
+                    ProtocolErrorCode::InvalidRequest,
+                    false,
+                    "Pane claimed elsewhere",
+                ),
+            ] {
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert!(
+                    matches!(request.request, ClientRequest::ChatStartInPane { pane, session, .. }
+                    if pane == expected_pane && session == expected_candidate)
+                );
+                write_frame(
+                    &mut peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: proof.clone(),
+                        message: ServerMessage::Error(ProtocolError::new(code, message, retryable)),
+                    },
+                )
+                .unwrap();
+            }
+            assert!(
+                read_frame::<ClientEnvelope>(&mut peer).unwrap().is_none(),
+                "a definitive lost claim must not be retried"
+            );
+        });
+        let failure = ClientHandle::connect_on_with_pane(
+            stream,
+            candidate,
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(pane),
+            |_| {},
+        )
+        .err()
+        .expect("the fixture refuses admission");
+        assert_eq!(failure.message, "Pane claimed elsewhere");
+        server.join().unwrap();
     }
 
     /// The live installation's own card: a native OMP conversation whose

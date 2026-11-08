@@ -1548,6 +1548,7 @@ pub(super) fn process_request(
             Ok((ServerResponse::Accepted, Vec::new(), false))
         }
         request @ (ClientRequest::ChatStart { .. }
+        | ClientRequest::ChatStartInPane { .. }
         | ClientRequest::ChatPrepareResume { .. }
         | ClientRequest::ChatRecoverAccount { .. }
         | ClientRequest::ChatPreview { .. }

@@ -79,6 +79,13 @@ pub(super) fn edit(
             return state.edit_model(origin, edit);
         }
     }
+    if super::chat::pane_start::requires_edit_check(&edit) {
+        super::chat::pane_start::validate_edit(
+            host,
+            &registry.model().map_err(unavailable)?,
+            &edit,
+        )?;
+    }
     let applied = apply(&mut registry, &edit)?;
     if applied.changed {
         let waiting = Instant::now();

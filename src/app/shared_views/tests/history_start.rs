@@ -221,7 +221,8 @@ impl Daemon {
                                 assert!(admitted.lock().unwrap().contains(&source));
                                 ServerResponse::ChatResumePrepared { session: source }
                             }
-                            ClientRequest::ChatStart { mut session, .. } => {
+                            ClientRequest::ChatStart { mut session, .. }
+                            | ClientRequest::ChatStartInPane { mut session, .. } => {
                                 let count = {
                                     let mut starts = recorded.lock().unwrap();
                                     starts.push(session.clone());

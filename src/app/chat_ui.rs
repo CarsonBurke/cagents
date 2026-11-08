@@ -6899,12 +6899,26 @@ impl Cagents {
         // A conversation another window started is not a launch option; it
         // is attached, or recovered, as the conversation it is. An operation
         // already under way on the card keeps the launch it began with.
-        if !session.is_unstarted() || self.chat_start_pending(card) {
+        if self.chat_start_pending(card) {
             return Task::none();
         }
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return Task::none();
         };
+        if !session.is_unstarted() {
+            if runtime.session.id == session.id
+                && runtime.session.is_unstarted()
+                && runtime.is_draft()
+            {
+                // A peer may first see the winner's unproved candidate and
+                // later its proof without an identity change. Its unsent text
+                // still belongs to this reader, never the winning first turn.
+                self.stash_unsent_chat(card);
+                self.cards.remove(&card);
+                return self.open_chat(card, session.clone(), chat::Intent::Restore);
+            }
+            return Task::none();
+        }
         if !runtime.choosing() || runtime.session.id != session.id || runtime.session == *session {
             return Task::none();
         }
@@ -8450,7 +8464,7 @@ impl Cagents {
         if self.chat_awaiting_admission(card) {
             return Task::none();
         }
-        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None)
+        self.start_chat_with_upgrade(card, session, intent, source, terminate_source, None, None)
     }
 
     pub(in crate::app) fn start_shared_chat_upgrade(
@@ -8466,6 +8480,7 @@ impl Cagents {
             None,
             false,
             Some(canonical),
+            None,
         )
     }
 
@@ -8477,6 +8492,7 @@ impl Cagents {
         source: Option<HostSessionProof>,
         terminate_source: bool,
         upgrade_admission: Option<chat::Session>,
+        pane_start: Option<crate::terminal_ipc::PaneChatStart>,
     ) -> Task<Message> {
         if intent == chat::Intent::Start
             && source.is_none()
@@ -8525,14 +8541,17 @@ impl Cagents {
                             Some(canonical) => {
                                 ClientHandle::connect_upgrade(session, canonical, wake)
                             }
-                            None => ClientHandle::connect(
-                                session,
-                                intent,
-                                source,
-                                terminate_source,
-                                selection,
-                                wake,
-                            ),
+                            None => match pane_start {
+                                Some(pane) => ClientHandle::connect_in_pane(pane, session, wake),
+                                None => ClientHandle::connect(
+                                    session,
+                                    intent,
+                                    source,
+                                    terminate_source,
+                                    selection,
+                                    wake,
+                                ),
+                            },
                         }
                         .map(|handle| {
                             // Background restorations must not queue full bodies
@@ -9068,12 +9087,21 @@ impl Cagents {
         // Only the accepted checkpoint authorizes B's public projection and
         // the first provider handshake. No fallback or first prompt precedes it.
         self.commit_chat_session(target.card, pending.candidate.clone());
-        self.start_chat(
+        let pane_start = Some(crate::terminal_ipc::PaneChatStart {
+            registry: pending.registry,
+            card: target.card,
+            source: pending.source,
+            allow_local: pending.scope.is_none()
+                || self.durable.local_only_cards.contains(&target.card),
+        });
+        self.start_chat_with_upgrade(
             target.card,
             pending.candidate,
             chat::Intent::Start,
             None,
             false,
+            None,
+            pane_start,
         )
     }
 
