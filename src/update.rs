@@ -825,13 +825,26 @@ fn end_source_chats(
     ending: Vec<EndedChat>,
 ) -> Result<(), UpdateError> {
     let mut client = source_client_for(daemon)?;
+    // One the source cannot end does not keep the rest: each was approved
+    // on its own, and ending it releases what it held either way.
+    let mut failed = Vec::new();
     for (title, _, session) in ending {
-        client
-            .close_chat(session)
-            .map_err(|error| invalid(format!("Could not end {title}: {error}")))?;
-        eprintln!("  Ended {title}");
+        match client.close_chat(session) {
+            Ok(()) => eprintln!("  Ended {title}"),
+            Err(error) => {
+                eprintln!("  Could not end {title}: {error}");
+                failed.push(title);
+            }
+        }
     }
-    Ok(())
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(invalid(format!(
+            "The update still cannot carry {}; it was not started.",
+            failed.join(", ")
+        )))
+    }
 }
 
 /// The reviewed source, authenticated again: a preview never authorizes
