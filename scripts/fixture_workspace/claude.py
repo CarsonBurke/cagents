@@ -88,8 +88,6 @@ class Conversation:
                                 isMeta=False, level="info",
                                 compactMetadata={"trigger": "auto", "preTokens": 167000}))
         self.emit(self.base("user", message={"role": "user", "content": text}, **fields))
-        if name in content.VISIBLE_NOISE and not self.sidechain:
-            self.visible += 1
 
     def assistant(self, block, message_id, usage=True):
         self.tick(1, 20)

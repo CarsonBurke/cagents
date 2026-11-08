@@ -194,10 +194,6 @@ NOISE = {
                         "refresh race. The read now happens inside the lock and a regression test covers it."),
 }
 
-# Noise the reader shows: the user typed /clear, which a resumed conversation
-# keeps. Every other kind is the harness talking to the model.
-VISIBLE_NOISE = {"clear-command"}
-
 AGENTS_MD = "# AGENTS.md instructions for {cwd}\n\n<INSTRUCTIONS>\n- Keep commits small.\n- Run the tests before you commit.\n</INSTRUCTIONS>"
 ENVIRONMENT_CONTEXT = ("<environment_context>\n  <cwd>{cwd}</cwd>\n  <approval_policy>on-request</approval_policy>\n"
                        "  <sandbox_mode>workspace-write</sandbox_mode>\n  <shell>bash</shell>\n</environment_context>")
