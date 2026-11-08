@@ -6,6 +6,8 @@ mod account_recovery_target_tests;
 pub(super) mod capacity;
 #[cfg(test)]
 mod lost_agent_close_tests;
+#[cfg(test)]
+mod lost_codex_owner_close_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -1026,7 +1028,90 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
         }
         return Ok(());
     }
-    close_retained_native(host, session)
+    close_retained_native(host, session).or_else(|refused| {
+        // Exact cleanup failing is the expected way to learn an owner is
+        // lost. Anything this check cannot establish keeps that refusal.
+        if close_lost_codex_owner(host, session).unwrap_or(false) {
+            Ok(())
+        } else {
+            Err(refused)
+        }
+    })
+}
+
+/// Settles the Close of a Codex conversation whose native owner is gone for
+/// good, which exact cleanup cannot do.
+///
+/// A holder that dies - killed, crashed, or taken down with its provider -
+/// writes no close receipt, and discovery deletes its record once the holder
+/// process has gone. Exact cleanup then has neither a holder to adopt nor a
+/// receipt to retire, and refused every Close of the pane again, so the pane
+/// could never be closed.
+///
+/// The owner is lost only when, held under the fence a lost Claude close
+/// uses, no resident, start, handoff, close, paired terminal or agent claims
+/// the conversation, no receipt exists, and nothing of it can still run by
+/// the evidence an upgrade requires before replacing its service: any holder
+/// record names a holder and provider gone with their process group and
+/// session, no process names the conversation's listener, and nothing is
+/// bound where it listens.
+fn close_lost_codex_owner(host: &SharedHost, session: &Session) -> Result<bool, String> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let Some(listener) = session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener())
+    else {
+        return Ok(false);
+    };
+    let proof = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .proof()
+        .clone();
+    if chat::native_holder::closed_source(session, &proof)?.is_some() {
+        return Ok(false);
+    }
+    // A record whose holder and provider are gone with their process group
+    // and session names nothing; discovery would delete it. Any other record
+    // keeps its owner, and the fence below refuses while one remains.
+    let directory = registry::directory(Kind::Native)?;
+    if let Some(record) =
+        registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)?
+        && record.application == crate::instance::APPLICATION_ID
+        && crate::chat::runtime::retained_actor_abandoned(&record.holder, &record.root)?
+    {
+        record.remove(&directory);
+    }
+    let Ok(_fence) = reserve_quiet_allocation(host, session, None) else {
+        return Ok(false);
+    };
+    {
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.agent_for_session(session.id)?.is_some()
+            || registry.has_agent_launch_for_session(session.id)?
+        {
+            return Ok(false);
+        }
+    }
+    if !super::upgrade_inspect::codex_execution_ended(session, &proof.boot_id) {
+        return Ok(false);
+    }
+    // Give back the allocation: its stale endpoint, then the directory.
+    if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? {
+        return Ok(false);
+    }
+    if let Some(parent) = listener.socket.parent() {
+        let _ = std::fs::remove_dir(parent);
+    }
+    let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state.native_closing.remove(&session.id);
+    state.native_adoption_failures.clear(session.id);
+    if let Some(notifications) = &state.notifications {
+        notifications.retire(session.id);
+    }
+    Ok(true)
 }
 
 pub(super) fn require_unreserved_terminals(

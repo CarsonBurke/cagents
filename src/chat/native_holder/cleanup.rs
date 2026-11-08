@@ -135,7 +135,7 @@ impl Detached {
         {
             return Err("Native cleanup caller no longer owns the daemon lease".into());
         }
-        if self.receipt(retain)? {
+        if self.receipt(retain)? || self.retire_exited() {
             return Ok(());
         }
         let (recovery, _) = super::transport::inspect(&self.record, &self.proof)?;
@@ -146,6 +146,30 @@ impl Detached {
         }
         let (mut holder, _) = super::transport::adopt(&self.record, &self.source, &self.proof)?;
         holder.close_inner(retain, detached)
+    }
+
+    /// Settles cleanup of an owner that ended without its receipt - killed,
+    /// crashed, or taken down with its provider - and so can neither be
+    /// adopted nor release anything. It has ended only when its holder and
+    /// provider are gone with everything in their process group and session,
+    /// the evidence an abandoned retained actor gives. Its record is then
+    /// retired as discovery would. Refusing instead would refuse the
+    /// conversation's Close for good, with nothing left a retry could stop.
+    pub(super) fn retire_exited(&self) -> bool {
+        if self.record.application != crate::instance::APPLICATION_ID
+            || !crate::chat::runtime::retained_actor_abandoned(
+                &self.record.holder,
+                &self.record.root,
+            )
+            .unwrap_or(false)
+        {
+            return false;
+        }
+        let Ok(directory) = registry::directory(Kind::Native) else {
+            return false;
+        };
+        self.record.remove(&directory);
+        true
     }
 
     pub fn consume_receipt(&self) -> Result<bool, String> {

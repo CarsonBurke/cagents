@@ -460,6 +460,21 @@ impl ExecutionEvidence {
         }
     }
 
+    /// This daemon's own evidence about a Codex pane of its boot, which
+    /// [`Self::classify_codex`] reads without the source census.
+    fn codex(boot: &crate::model::BootId) -> Self {
+        Self {
+            boot: boot.clone(),
+            native_holders: crate::daemon::holder_registry::directory(
+                crate::daemon::holder_registry::Kind::Native,
+            ),
+            census: Err("A Codex pane has no census".into()),
+            retired: Err("A Codex pane has no census".into()),
+            processes: "/proc".into(),
+            exec_settle: EXEC_SETTLE,
+        }
+    }
+
     /// A kernel boot change ends every process of the saved boot. Within this
     /// boot a Codex pane is judged by its own listener (`classify_codex`).
     /// Among Claude panes only a retained actor has an owner roster: each helper
@@ -657,6 +672,13 @@ impl ExecutionEvidence {
             Err(_) => SavedExecution::Unproved,
         }
     }
+}
+
+/// Whether nothing of a Codex pane of `boot` can still run, by the evidence
+/// an upgrade requires before it replaces the service that ran it.
+pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootId) -> bool {
+    source.launch.provider == crate::agent::Provider::Codex
+        && ExecutionEvidence::codex(boot).classify_codex(source) == SavedExecution::Ended
 }
 
 /// Whether any process of this user names a Codex pane's listener directory
