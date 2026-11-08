@@ -2288,6 +2288,46 @@ class CpuPressureAdmission(TwoSlots):
         self.assertIsNone(self.holder.poll())
         self.assertIn("CPUs busy (60% pressure, limit 60%)", waiter.stderr.read())
 
+    def spinner(self):
+        """A runaway loop in its own session, as an abandoned ssh command's."""
+        spinner = subprocess.Popen(
+            [sys.executable, "-c", "while True: pass", "runaway-fixture"], start_new_session=True)
+        self.addCleanup(lambda: (spinner.kill(), spinner.wait()))
+        return spinner
+
+    def test_the_wait_names_what_else_holds_the_cpus(self):
+        shutil.copy2(ROOT / "scripts/cargo-offload", self.root / "cargo-offload")
+        self.spinner()
+        self.report("60.00")
+        self.hold(1)
+        waiter = self.scope.popen(
+            [str(self.gate), "exec", "true"],
+            env=self.env | {"CAGENTS_BUILD_COST_GIB": "1", "CAGENTS_OFFLOAD_BUSIEST_SHOWN": "1000"},
+            cwd=self.root, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(waiter.stderr.close)
+        with self.assertRaises(subprocess.TimeoutExpired):
+            waiter.wait(timeout=4)
+        self.report("12.50")
+        self.assertEqual(waiter.wait(timeout=10), 0)
+        stderr = waiter.stderr.read()
+        self.assertIn("CPUs busy (60% pressure, limit 60%)", stderr)
+        self.assertIn("cargo-gate: besides builds, the CPUs go to ", stderr)
+        self.assertRegex(stderr, r"\d+% from 1 process of session \d+ "
+                                 r"\([^)]*runaway-fixture, started \d+m ago\)")
+
+    def test_the_running_builds_are_not_named_as_what_holds_the_cpus(self):
+        spinner = self.spinner()
+        offload = [sys.executable, str(ROOT / "scripts/cargo-offload"), "--busiest"]
+        environment = os.environ | {"CAGENTS_OFFLOAD_BUSIEST_SHOWN": "1000"}
+        named = subprocess.run(offload, capture_output=True, text=True, timeout=30, env=environment)
+        self.assertEqual(named.returncode, 0, named.stderr)
+        self.assertIn("runaway-fixture", named.stdout)
+        # A build's holder, and everything below it, is a build.
+        excluded = subprocess.run([*offload, str(spinner.pid)], capture_output=True, text=True,
+                                  timeout=30, env=environment)
+        self.assertEqual(excluded.returncode, 0, excluded.stderr)
+        self.assertNotIn("runaway-fixture", excluded.stdout)
+
     def test_a_lone_build_starts_whatever_the_pressure(self):
         self.report("100.00")
         result = self.build(1, timeout=10)

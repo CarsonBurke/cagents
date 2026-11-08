@@ -1857,7 +1857,12 @@ class RemoteRun(unittest.TestCase):
                 write_figures(stand_in, **figures)
                 self.hold(base, 0, {"cost": 1, "pid": None})
                 _, lines = self.lease(base, figures=stand_in)
-                self.assertEqual(lines.next(10), reason)
+                line = lines.next(10)
+                if reason.startswith("wait cpu "):
+                    # Followed by what else holds the CPUs, when anything does.
+                    self.assertRegex(line, rf"^{reason}( -- .+)?$")
+                else:
+                    self.assertEqual(line, reason)
                 with self.assertRaises(TimeoutError):
                     lines.next(1.5)
                 write_figures(stand_in)

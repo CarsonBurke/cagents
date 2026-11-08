@@ -411,6 +411,14 @@ cpu_allows() {
     if [ "$pressure_announced" = false ]; then
         printf '%s: CPUs busy (%s%% pressure, limit %s%%); waiting to start beside the running builds\n' \
             "$program" "$some" "$pressure_limit" >&2
+        # What else holds them, once: a runaway loop otherwise looks like
+        # builds. The running builds' holders are in `claims`.
+        culprits=
+        if [ -x "$here/cargo-offload" ]; then
+            # shellcheck disable=SC2086 # One PID per word.
+            culprits=$("$here/cargo-offload" --busiest $(printf '%s\n' $claims | cut -d : -f 1) 2>/dev/null) || culprits=
+        fi
+        [ -z "$culprits" ] || printf '%s: besides builds, the CPUs go to %s\n' "$program" "$culprits" >&2
         pressure_announced=true
     fi
     return 1
