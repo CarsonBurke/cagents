@@ -69,10 +69,33 @@ class Provider(unittest.TestCase):
         resumed, output, _ = self.run_provider("--resume", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
         self.assertEqual(resumed.returncode, 0, resumed.stderr)
         self.assertTrue(any(frame.get("type") == "result" for frame in output), output)
+        # Each once-only line exits once: a second goes on until it has.
+        self.frames({"_exit": 1, "_once": True}, {"_exit": 4, "_once": True})
+        (self.config / "fixture-frames.exited").unlink()
+        self.assertEqual(self.run_provider()[0].returncode, 1)
+        self.assertEqual(self.run_provider()[0].returncode, 4)
+        self.assertEqual(self.run_provider()[0].returncode, 0)
+        self.frames({"_exit": 1, "_once": True})
         # Removing the record arms it again.
         (self.config / "fixture-frames.exited").unlink()
         rearmed, _, _ = self.run_provider()
         self.assertEqual(rearmed.returncode, 1)
+
+    def test_a_status_that_is_not_one_is_refused_with_its_line(self):
+        for status in ("x", 256, -1, 1.5):
+            with self.subTest(status=status):
+                self.frames({"type": "assistant", "uuid": "u", "message": {
+                    "id": "u", "role": "assistant", "content": []}}, {"_exit": status})
+                result, _, _ = self.run_provider()
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("line 2 of", result.stderr)
+                self.assertIn("_exit must be a status from 0 to 255", result.stderr)
+
+    def test_a_slow_start_that_is_not_seconds_is_refused(self):
+        (self.config / "fixture-slow-start").write_text("soon\n")
+        result, _, _ = self.run_provider()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("fixture-slow-start must hold seconds", result.stderr)
 
     def test_a_slow_start_holds_a_conversation_but_not_the_account_check(self):
         (self.config / "fixture-slow-start").write_text("1.5\n")

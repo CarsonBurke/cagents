@@ -211,13 +211,16 @@ tools_turn() {
 # {"_end": true} ends the turn there: the frames supply its closing result,
 # such as a failed one, and the fixture adds no answer of its own. A line
 # {"_exit": STATUS} ends the provider there, as a crash does, mid-turn and
-# without a result; with "_once": true it does so only until it has once,
-# which fixture-frames.exited records, so the resumed provider goes on.
+# without a result; with "_once": true each such line does so only once,
+# which fixture-frames.exited records by line number, so the resumed
+# provider goes on.
 frames_file=$config/fixture-frames.jsonl
 frames_ended=0
 frames_turn() {
     frames_ended=0
+    frame_line=0
     while IFS= read -r spec; do
+        frame_line=$((frame_line + 1))
         [ -n "$spec" ] || continue
         delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
         if [ -n "$delay" ]; then
@@ -230,9 +233,17 @@ frames_turn() {
         fi
         status=$(printf '%s' "$spec" | jq -r '._exit // empty')
         if [ -n "$status" ]; then
+            case $status in
+                [0-9] | [1-9][0-9] | 1[0-9][0-9] | 2[0-4][0-9] | 25[0-5]) ;;
+                *)
+                    printf '%s\n' "fixture: line $frame_line of $frames_file: _exit must be a status from 0 to 255, not $status" >&2
+                    exit 2
+                    ;;
+            esac
             if [ "$(printf '%s' "$spec" | jq -r '._once // false')" = true ]; then
-                [ ! -e "$config/fixture-frames.exited" ] || continue
-                : >"$config/fixture-frames.exited"
+                # The lines that have exited once, by number.
+                ! grep -qxF "$frame_line" "$config/fixture-frames.exited" 2>/dev/null || continue
+                printf '%s\n' "$frame_line" >>"$config/fixture-frames.exited"
             fi
             printf '%s\n' "fixture: the provider exited with status $status mid-turn" >&2
             exit "$status"
@@ -301,6 +312,12 @@ fi
 if [ "$probe" = false ] && [ -e "$config/fixture-slow-start" ]; then
     start_delay=5
     if [ -s "$config/fixture-slow-start" ]; then start_delay=$(head -n 1 "$config/fixture-slow-start"); fi
+    case $start_delay in
+        '' | *[!0-9.]* | *.*.* | .)
+            printf '%s\n' "fixture: fixture-slow-start must hold seconds, such as 5 or 1.5, not '$start_delay'" >&2
+            exit 2
+            ;;
+    esac
     sleep "$start_delay"
 fi
 
