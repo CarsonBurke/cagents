@@ -1608,6 +1608,7 @@ mod tests {
         let listener = &card.owned_codex_listener.as_ref().unwrap().socket;
         let control = crate::daemon::holder_registry::socket(holders.path(), card.id);
         let stop = Arc::new(AtomicBool::new(false));
+        let (started, ready) = std::sync::mpsc::sync_channel(0);
         let churn = {
             let stop = stop.clone();
             std::thread::spawn(move || -> io::Result<usize> {
@@ -1618,10 +1619,17 @@ mod tests {
                         return Err(io::Error::other(format!("exec churn failed: {status}")));
                     }
                     spawned += 1;
+                    if spawned == 1 {
+                        started.send(()).map_err(io::Error::other)?;
+                    }
                 }
                 Ok(spawned)
             })
         };
+        if let Err(error) = ready.recv() {
+            let result = churn.join().unwrap();
+            panic!("exec churn did not start: {error}; {result:?}");
+        }
         let mut absent = 0;
         let mut unpublished = 0;
         let mut unexpected = std::collections::BTreeMap::<String, usize>::new();
