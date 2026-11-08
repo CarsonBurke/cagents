@@ -1088,7 +1088,13 @@ REMOTE_TOOL = """
     [ "$1" = --task ] && task=$2 && shift 2
     printf '%s\\t%s\\n' "$task" "$*" >> "$STUB_LOG/remote-tool"
     env > "$STUB_LOG/remote-env"
+    # As the real one: a task directory holds only its own files.
+    if [ -d "$task" ] && [ ! -e "$task/.native-evidence" ] && [ -n "$(ls -A "$task")" ]; then
+        echo "native-evidence: not a native-evidence task directory, and not empty: $task" >&2
+        exit 2
+    fi
     mkdir -p "$task/shots"
+    : > "$task/.native-evidence"
     case $1 in
         start) printf '%s\\n' "$2" > "$task/side"; echo "session ready: $2" ;;
         stop) [ ! -e "$task/stop-fails" ] || exit 1; rm -f "$task/side"; echo stopped ;;
@@ -1280,7 +1286,8 @@ class RemoteEvidence(unittest.TestCase):
     def test_a_task_with_another_owner_on_the_host_is_left_alone(self) -> None:
         checkout = self.repository("after", {"src.rs": "one\n"})
         self.run_tool("build", "after", str(checkout))
-        self.assertTrue((self.remote_task / "owner").read_text().endswith(f":{self.task}\n"))
+        owner = self.remote_home / ".local/state/cev-owners/mytask"
+        self.assertTrue(owner.read_text().endswith(f":{self.task}\n"))
         # Another agent's task directory of the same name, elsewhere.
         other = self.task
         self.task = self.root / "elsewhere" / "mytask"
@@ -1301,7 +1308,7 @@ class RemoteEvidence(unittest.TestCase):
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("is not a task this route started; give this task directory another name", result.stderr)
         self.assertTrue((self.remote_task / "shots").exists())
-        self.assertFalse((self.remote_task / "owner").exists())
+        self.assertFalse((self.remote_home / ".local/state/cev-owners/mytask").exists())
 
     def test_the_hosts_own_task_directory_is_refused(self) -> None:
         self.task = self.remote_task
@@ -1327,6 +1334,7 @@ class RemoteEvidence(unittest.TestCase):
         self.run_tool("shot", "home")
         self.run_tool("clean")
         self.assertFalse(self.remote_task.exists())
+        self.assertFalse((self.remote_home / ".local/state/cev-owners/mytask").exists())
         self.assertFalse((self.remote_repository / ".worktrees/cev-mytask-after").exists())
         self.assertFalse((self.remote_repository / ".worktrees/cev-mytask-tool").exists())
         self.assertEqual(self.git(self.remote_repository, "for-each-ref", "refs/native-evidence/"), "")
