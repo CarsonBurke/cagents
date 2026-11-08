@@ -98,6 +98,7 @@ select_task() {
     mkdir -p -- "$task"
     fixture=$task/fixture
     seed=$task/fixture-seed
+    seed_home=$task/fixture-seed.home
     runtime=$task/rt
     state=$task/session
     logs=$task/logs
@@ -350,23 +351,35 @@ fixture_env() {
         "$@"
 }
 
+# The provider home a seed's chats recorded, as device and inode: the
+# fixture's when the seed was saved, kept in $seed_home.
+seeded_home_identity() {
+    stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
+}
+
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
         if [ -d "$seed" ] && [ -d "$fixture" ]; then
             # Restore the seed into the fixture rather than replacing it: a
             # chat records its provider home's identity, its device and
-            # inode, and refuses to reopen once that directory is replaced.
-            # Syncing keeps every directory both share, so a conversation
-            # saved in the seed reopens on either side.
-            rsync -aH --delete --force -- "$seed/" "$fixture/"
+            # inode, and refuses to reopen once that directory is replaced,
+            # and a transcript's location records its file's. Syncing in
+            # place keeps every directory and file both share, so a
+            # conversation saved in the seed reopens on either side.
+            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+                printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
+                return 1
+            fi
         else
             rm -rf -- "$fixture"
             if [ -d "$seed" ]; then
-                # The session runs detached; start shows this once it is ready.
-                printf '%s\n' 'the fixture was removed after its seed was saved; chats in the seed recorded the removed provider home and will not reopen, so recreate them and save-seed again' >>"$state/notice"
                 cp -a --reflink=auto -- "$seed" "$fixture"
             fi
+        fi
+        # The session runs detached; start shows this once it is ready.
+        if [ -d "$seed" ] && [ "$(seeded_home_identity)" != "$(cat -- "$seed_home" 2>/dev/null)" ]; then
+            printf '%s\n' 'the provider home is not the one the seed was saved from, so chats in the seed will not reopen; recreate them and save-seed again' >>"$state/notice"
         fi
     fi
     mkdir -p "$fixture"/{bin,home/.claude,data,config,cache,state,project}
@@ -711,7 +724,7 @@ cmd_start() {
         die 'width, lock wait and session limit must be whole numbers' 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     live_session && die 'a session is already running for this task; stop it first'
-    if [ "$keep_state" = false ] && [ -d "$seed" ] && ! command -v rsync >/dev/null 2>&1; then
+    if [ "$keep_state" = false ] && [ -d "$seed" ] && [ -d "$fixture" ] && ! command -v rsync >/dev/null 2>&1; then
         die 'restoring the seed needs rsync, which keeps the directories its chats recorded; install rsync'
     fi
     # Before anything reads it: the pruner leaves a target written meanwhile.
@@ -878,8 +891,9 @@ case $command in
     save-seed)
         live_session && die 'stop the session before saving its fixture'
         [ -d "$fixture" ] || die 'there is no fixture to save yet'
-        rm -rf -- "$seed"
+        rm -rf -- "$seed" "$seed_home"
         cp -a --reflink=auto -- "$fixture" "$seed"
+        seeded_home_identity >"$seed_home"
         printf 'saved %s\n' "$seed"
         ;;
     status) cmd_status ;;

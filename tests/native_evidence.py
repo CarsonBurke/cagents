@@ -980,6 +980,7 @@ class Evidence(unittest.TestCase):
         (provider_home / "session.jsonl").write_text("seeded\n")
         self.run_tool("stop")
         self.run_tool("save-seed")
+        session_file = (provider_home / "session.jsonl").stat().st_ino
 
         self.run_tool("start", "before")
         (provider_home / "session.jsonl").write_text("changed by before\n")
@@ -993,11 +994,28 @@ class Evidence(unittest.TestCase):
         self.assertNotIn("will not reopen", result.stderr)
         self.run_tool("stop")
 
-        # A fixture removed meanwhile can't keep them, and the start says so.
+        # A transcript keeps its file, which its location records.
+        self.assertEqual((provider_home / "session.jsonl").stat().st_ino, session_file)
+
+        # A fixture removed meanwhile can't keep them, and every start says so
+        # until the seed is saved again.
         shutil.rmtree(fixture)
-        result = self.run_tool("start", "before")
-        self.assertIn("chats in the seed recorded the removed provider home", result.stderr)
-        self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
+        for _ in range(2):
+            result = self.run_tool("start", "before")
+            self.assertIn("the provider home is not the one the seed was saved from", result.stderr)
+            self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
+            self.run_tool("stop")
+        self.run_tool("save-seed")
+        self.assertNotIn("will not reopen", self.run_tool("start", "after").stderr)
+
+    def test_a_seed_saved_before_its_home_was_recorded_is_said_not_to_reopen(self) -> None:
+        self.built("after")
+        self.run_tool("start", "after")
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+        (self.task / "fixture-seed.home").unlink()
+        result = self.run_tool("start", "after")
+        self.assertIn("chats in the seed will not reopen", result.stderr)
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
