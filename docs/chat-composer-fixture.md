@@ -117,6 +117,11 @@ To see a resume that fails, create `fixture-fail-resume` too: the next
 resumed start exits before it answers, and the card offers **Try again**. The
 file is removed first, so pressing it resumes normally.
 
+To see a first start that takes longer than the start timeout, write a
+number of seconds, such as `40`, to `fixture-start-delay`. The next start of a
+new conversation waits that long before answering anything. The file is
+removed first, so the start after it answers at once.
+
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
