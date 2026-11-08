@@ -1,4 +1,5 @@
 //! Descendant cleanup for dedicated process owners, never the daemon itself.
+use crate::daemon::holder_registry::Process;
 use std::{
     io,
     os::fd::{FromRawFd, OwnedFd},
@@ -22,16 +23,23 @@ pub(crate) enum DetachedWork {
 /// Processes pinned by pidfd, so a process that later reuses one's pid is
 /// never signalled in its place.
 #[derive(Default)]
-struct Pinned(Vec<OwnedFd>);
+struct Pinned {
+    fds: Vec<OwnedFd>,
+    pids: Vec<i32>,
+}
 
 impl Pinned {
-    /// Pins each of `pids` that is still running.
-    fn pin(pids: &[i32]) -> io::Result<Self> {
-        let mut pinned = Vec::new();
-        for &pid in pids {
+    /// Pins each of `processes` that is still that exact process, exited or
+    /// not; one whose pid now names another process is skipped.
+    fn pin(processes: &[Process]) -> io::Result<Self> {
+        let mut pinned = Self::default();
+        for process in processes {
+            if !process.is_current() {
+                continue;
+            }
             // SAFETY: pidfd_open takes scalar arguments and returns a new
             // owned descriptor or -1 without writing through any pointer.
-            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+            let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, process.pid, 0) };
             if fd == -1 {
                 let error = io::Error::last_os_error();
                 if error.raw_os_error() == Some(libc::ESRCH) {
@@ -40,9 +48,30 @@ impl Pinned {
                 return Err(error);
             }
             // SAFETY: a successful pidfd_open returned this fresh descriptor.
-            pinned.push(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+            let fd = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            // The pid may have been reused between the check and the open.
+            if process.is_current() {
+                pinned.fds.push(fd);
+                pinned.pids.push(process.pid);
+            }
         }
-        Ok(Self(pinned))
+        Ok(pinned)
+    }
+
+    /// Whether every pinned process has exited, reaped or not.
+    fn exited(&self) -> bool {
+        use std::os::fd::AsRawFd;
+        self.fds.iter().all(|fd| {
+            let mut event = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            // SAFETY: one live pollfd; a pidfd is readable once its process
+            // has exited.
+            let ready = unsafe { libc::poll(&mut event, 1, 0) };
+            ready == 1
+        })
     }
 
     /// Sends `signal` to each pinned process; signal 0 only reports which
@@ -50,7 +79,7 @@ impl Pinned {
     fn signal(&self, signal: libc::c_int) -> bool {
         use std::os::fd::AsRawFd;
         let mut any = false;
-        for fd in &self.0 {
+        for fd in &self.fds {
             // SAFETY: the descriptor is live, and a null siginfo with zero
             // flags is supported.
             any |= unsafe {
@@ -100,30 +129,30 @@ impl OwnedChildren {
     pub(crate) fn decide_detached(
         &mut self,
         detached: DetachedWork,
-        provider: &[i32],
+        provider: &[Process],
     ) -> io::Result<()> {
         // Stopping can follow a sparing teardown; sparing can't follow one.
         if detached == DetachedWork::Spare && self.group_signalled {
             return Ok(());
         }
-        self.detached = if self.killed(provider) {
+        self.provider = Pinned::pin(provider)?;
+        self.detached = if self.killed() {
             DetachedWork::Stop
         } else {
             detached
         };
-        self.provider = Pinned::pin(provider)?;
         Ok(())
     }
 
     /// Whether the provider, or one of its `provider` processes this process
     /// adopted, has exited by `SIGKILL`. Before teardown has signalled it,
     /// that came from outside this process.
-    fn killed(&self, provider: &[i32]) -> bool {
+    fn killed(&self) -> bool {
         let Some(child) = &self.child else {
             return false;
         };
         std::iter::once(child.id() as i32)
-            .chain(provider.iter().copied())
+            .chain(self.provider.pids.iter().copied())
             .any(|pid| {
                 let mut status: libc::siginfo_t = unsafe { std::mem::zeroed() };
                 // SAFETY: the buffer is live and writable; WNOWAIT leaves the
@@ -196,20 +225,21 @@ impl OwnedChildren {
     }
 
     pub(crate) fn terminate(&mut self, timeout: Duration) -> io::Result<bool> {
-        let deadline = Instant::now() + timeout;
         if !self.group_signalled {
             if self.detached == DetachedWork::Spare {
                 // Let the provider end its own session, as quitting its CLI
                 // would, before anything is forced.
                 self.signal_provider(libc::SIGTERM);
                 let grace = Instant::now() + crate::chat::TERMINATE_GRACE.min(timeout);
-                while !self.exited() && Instant::now() < grace {
+                while !(self.exited() && self.provider.exited()) && Instant::now() < grace {
                     std::thread::sleep(Duration::from_millis(10));
                 }
             }
             self.signal_provider(libc::SIGKILL);
             self.group_signalled = true;
         }
+        // The grace above is the provider's own; reaping gets the timeout.
+        let deadline = Instant::now() + timeout;
         match self.detached {
             DetachedWork::Stop => self.stop_children(deadline),
             DetachedWork::Spare => self.end_provider(deadline),
@@ -386,6 +416,12 @@ record "$3" $left; record "$2" $running
         Path::new(&format!("/proc/{pid}")).exists()
     }
 
+    /// Whether `pid` is still running: neither gone nor an unreaped zombie.
+    pub(crate) fn alive(pid: i32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .is_ok_and(|stat| !stat[stat.rfind(')').unwrap() + 2..].starts_with('Z'))
+    }
+
     /// Whether `pid` is gone once `reap` has collected what has exited: a
     /// signalled process exits, and is adopted here, only shortly after.
     pub(crate) fn ends(pid: i32, mut reap: impl FnMut()) -> bool {
@@ -438,7 +474,7 @@ record "$3" $left; record "$2" $running
         children.decide_detached(DetachedWork::Spare, &[]).unwrap();
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
         assert!(
-            exists(work.detached) && exists(work.left),
+            alive(work.detached) && alive(work.left),
             "what the provider left keeps running"
         );
         assert!(
@@ -464,11 +500,14 @@ record "$3" $left; record "$2" $running
         let work = detached_work(root.path());
         let mut children = OwnedChildren::new(provider);
         children
-            .decide_detached(DetachedWork::Spare, &[work.detached])
+            .decide_detached(
+                DetachedWork::Spare,
+                &[Process::read(work.detached).unwrap()],
+            )
             .unwrap();
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
         assert!(!exists(work.detached), "the server ends with its provider");
-        assert!(exists(work.left));
+        assert!(alive(work.left));
         children.decide_detached(DetachedWork::Stop, &[]).unwrap();
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
     }
@@ -518,7 +557,7 @@ record "$3" $left; record "$2" $running
             std::thread::sleep(Duration::from_millis(10));
         }
         children
-            .decide_detached(DetachedWork::Spare, &[server])
+            .decide_detached(DetachedWork::Spare, &[Process::read(server).unwrap()])
             .unwrap();
         assert!(children.terminate(Duration::from_secs(10)).unwrap());
         assert!(!exists(detached) && !exists(work.left) && !exists(server));

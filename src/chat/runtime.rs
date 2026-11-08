@@ -9329,9 +9329,17 @@ for line in sys.stdin:
             }
             provider.stop_detached = stop;
             provider.terminate().unwrap();
-            // Give a scope kill, were there one, time to land.
-            std::thread::sleep(Duration::from_millis(200));
-            let survived = !ended(detached);
+            let survived = if stop {
+                let deadline = Instant::now() + Duration::from_secs(10);
+                while !ended(detached) && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                !ended(detached)
+            } else {
+                // Give a scope kill, were there one, time to land.
+                std::thread::sleep(Duration::from_millis(200));
+                !ended(detached)
+            };
             // SAFETY: a plain signal to the test's own detached command.
             unsafe { libc::kill(detached as i32, libc::SIGKILL) };
             assert_eq!(

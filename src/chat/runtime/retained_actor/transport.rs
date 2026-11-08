@@ -3272,20 +3272,24 @@ impl Server {
                 // quits. A daemon that sends no decision stops everything, as
                 // before.
                 if self.closed_snapshot.is_none() {
-                    self.detached = if request.args.get(0).and_then(Value::as_bool) == Some(true) {
+                    let mut detached = if request.args.get(0).and_then(Value::as_bool) == Some(true)
+                    {
                         DetachedWork::Spare
                     } else {
                         DetachedWork::Stop
                     };
                     // The provider's scope holds what it detached, too.
-                    self.actor.decide_detached_work(self.detached);
+                    self.actor.decide_detached_work(detached);
                     self.actor.close()?;
                     // A provider something else killed, such as the system
                     // for memory, leaves nothing running: what it left would
                     // hold the memory it needed.
                     if self.actor.provider_was_force_stopped() {
-                        self.detached = DetachedWork::Stop;
+                        detached = DetachedWork::Stop;
                     }
+                    // Only once the provider is gone: until then, the helper's
+                    // exit must prove it is by stopping everything.
+                    self.detached = detached;
                     reap_orphans(self.detached)?;
                     self.finish_inputs();
                 }
@@ -4225,9 +4229,8 @@ while IFS= read -r frame; do :; done
             "the provider stopped its own command as it quit, and it is reaped"
         );
         for pid in [work.detached, work.left] {
-            assert_eq!(
-                children::parent(pid),
-                Some(std::process::id() as i32),
+            assert!(
+                children::alive(pid) && children::parent(pid) == Some(std::process::id() as i32),
                 "what the provider leaves running keeps running"
             );
         }

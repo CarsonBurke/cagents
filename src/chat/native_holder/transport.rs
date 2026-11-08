@@ -997,12 +997,8 @@ impl Residence {
                         DetachedWork::Stop
                     };
                     // A server its launcher started is the provider's own.
-                    let server: Vec<i32> = self
-                        .recovery
-                        .server_process
-                        .iter()
-                        .map(|server| server.pid)
-                        .collect();
+                    let server: Vec<Process> =
+                        self.recovery.server_process.iter().cloned().collect();
                     match self
                         .child
                         .decide_detached(detached, &server)
@@ -2906,11 +2902,13 @@ exec /bin/sleep 60
             std::thread::sleep(Duration::from_millis(10));
         }
         assert!(
-            !running.is_current(),
+            running.reaped(),
             "the provider stopped its own command as it quit"
         );
         assert!(
-            detached.is_current() && left.is_current(),
+            [&detached, &left].into_iter().all(|process| {
+                process.is_current() && crate::daemon::owned_children::tests::alive(process.pid)
+            }),
             "what the provider leaves running keeps running"
         );
         for process in [detached, left] {
