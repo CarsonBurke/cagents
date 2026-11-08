@@ -949,6 +949,44 @@ result as a held approval rather than a slow command.
 Where no scope can be made, as without a user manager, the command runs without a
 limit and says so.
 
+### Time limits for stress and repro workloads
+
+A workload started over SSH outlives the connection: sshd's per-connection
+process exits when the client goes, but nothing tells the shell and loop it
+started. One probe loop kept FW16's CPUs about 71% busy for 36 hours, and every
+build waited behind it. Run a stress loop, a reproduction, a soak or a
+measurement under `scripts/bounded`:
+
+```sh
+scripts/bounded --ttl 1800 --name terminal-close-probe -- ./probe-loop
+```
+
+It stops the workload when the first of these happens:
+
+- its owner ends. That is the nearest SSH connection above it. Failing that, it
+  is the process a cagents daemon runs for the session above it, such as an
+  agent's provider. Failing both, it is the shell that ran it. `--owner PID`
+  names another process.
+- `--ttl` seconds pass. The default is 3600.
+- the wrapper itself gets TERM, INT or HUP.
+
+It sends TERM to everything the workload started, then KILL after 10 seconds.
+That covers the workload's process group and any process that left the group
+but still carries the workload's `CAGENTS_BOUNDED` environment mark. When the
+command exits by itself, whatever it left running in the background goes too.
+The exit status is the command's, or 124 when `--ttl` stopped it and 143 when
+the owner ended or the wrapper was stopped. Either way, it prints the reason.
+
+`scripts/bounded --list` shows what runs bounded on the host: whose it is, how
+long it has left, and how to stop it. If the wrapper itself was killed with
+KILL, its workload has lost its watcher. `--list` says so, and
+`scripts/bounded --reap` stops what it left.
+
+A process that clears its environment, such as one started with `env -i`,
+loses the mark. If it has also left the group, the wrapper cannot find it. Cap
+memory as well by nesting the two:
+`scripts/bounded --ttl 1800 -- scripts/memory-capped ./probe-loop`.
+
 ### Process scope isolation
 
 Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
