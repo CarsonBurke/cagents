@@ -701,25 +701,16 @@ fn codex_listener_survives(
     // The arguments a process shows, or None once it can no longer run.
     let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
         let deadline = Instant::now() + settle;
-        loop {
-            let argv = match std::fs::read(path.join("cmdline")) {
-                Ok(argv) => argv,
-                Err(error) if gone(&error) => return Ok(None),
-                Err(error) => return Err(format!("Cannot inspect a process: {error}")),
-            };
-            if !argv.is_empty() {
-                return Ok(Some(argv));
-            }
-            match threads(path)? {
-                Threads::Ended => return Ok(None),
-                Threads::Arguments(argv) => return Ok(Some(argv)),
-                Threads::Unsettled => {}
-            }
-            if Instant::now() >= deadline {
-                return Err("A process has not published its arguments yet".into());
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
+        settled_process_arguments(
+            || process_arguments(path),
+            || {
+                if Instant::now() >= deadline {
+                    return Err("A process has not published its arguments yet".into());
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                Ok(())
+            },
+        )
     };
     let entries = std::fs::read_dir(processes)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
@@ -783,6 +774,32 @@ enum Threads {
     Arguments(Vec<u8>),
     /// One may still run but shows no arguments yet, as during `execve`.
     Unsettled,
+}
+
+/// One observation of a process that may be publishing or releasing its memory.
+/// Absence of arguments alone does not establish that it has ended.
+fn process_arguments(process: &Path) -> Result<Threads, String> {
+    match std::fs::read(process.join("cmdline")) {
+        Ok(argv) if argv.is_empty() => threads(process),
+        Ok(argv) => Ok(Threads::Arguments(argv)),
+        Err(error) if gone(&error) => Ok(Threads::Ended),
+        Err(error) => Err(format!("Cannot inspect a process: {error}")),
+    }
+}
+
+/// Read again only when a runnable process has not published its arguments.
+/// The caller owns the wait budget; exhausting it cannot establish absence.
+fn settled_process_arguments(
+    mut observe: impl FnMut() -> Result<Threads, String>,
+    mut wait: impl FnMut() -> Result<(), String>,
+) -> Result<Option<Vec<u8>>, String> {
+    loop {
+        match observe()? {
+            Threads::Ended => return Ok(None),
+            Threads::Arguments(argv) => return Ok(Some(argv)),
+            Threads::Unsettled => wait()?,
+        }
+    }
 }
 
 /// Reads every thread of a process. It has ended once none can run again:
@@ -1544,42 +1561,121 @@ mod tests {
         }
     }
 
-    /// A process between `execve` and publishing its new arguments shows
-    /// none for a moment. Any process of this user starting while the update
-    /// inspects must not turn an ended Codex pane into an unproved one.
     #[test]
-    fn processes_starting_during_inspection_do_not_unprove_an_ended_codex_pane() {
-        use std::sync::{
-            Arc,
-            atomic::{AtomicBool, Ordering},
-        };
+    fn process_publication_and_exit_preserve_exact_codex_execution_evidence() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let processes = tempfile::tempdir_in("/var/tmp").unwrap();
+        std::fs::create_dir(processes.path().join("net")).unwrap();
+        std::fs::write(
+            processes.path().join("net/unix"),
+            "Num       RefCount Protocol Flags    Type St Inode Path\n",
+        )
+        .unwrap();
+        let process = processes.path().join("4242");
+        let thread = process.join("task/4242");
+        std::fs::create_dir_all(&thread).unwrap();
+        let uid = crate::daemon::current_uid();
+        std::fs::write(
+            process.join("status"),
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        std::fs::write(process.join("cmdline"), b"").unwrap();
+        std::fs::write(thread.join("cmdline"), b"").unwrap();
+        std::fs::write(
+            thread.join("stat"),
+            "4242 (true) R 1 4242 4242 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1",
+        )
+        .unwrap();
+        std::fs::write(
+            thread.join("status"),
+            "SigPnd:\t0000000000000000\nShdPnd:\t0000000000000000\n",
+        )
+        .unwrap();
         let [card, _] = codex_cards(root.path());
-        let stop = Arc::new(AtomicBool::new(false));
-        let churn = {
-            let stop = stop.clone();
-            std::thread::spawn(move || {
-                while !stop.load(Ordering::Relaxed) {
-                    let _ = std::process::Command::new("true").status();
-                }
-            })
-        };
-        // It checks that an exec in flight is read again, not how soon the
-        // kernel finishes one, which reclaim can stall well past the bound.
         let evidence = ExecutionEvidence {
-            exec_settle: Duration::from_secs(2),
+            processes: processes.path().into(),
+            // A runnable process is allowed to stay between exec and argument
+            // publication indefinitely. Exercise the exhausted budget directly,
+            // without assuming anything about how soon the host schedules it.
+            exec_settle: Duration::ZERO,
             ..evidence(holders.path(), Vec::new())
         };
-        let unproved = (0..300)
-            .filter(|_| evidence.classify(&card) != SavedExecution::Ended)
-            .count();
-        stop.store(true, Ordering::Relaxed);
-        churn.join().unwrap();
-        assert_eq!(
-            unproved, 0,
-            "an exec in progress is read again, not absence"
+        assert!(matches!(
+            process_arguments(&process).unwrap(),
+            Threads::Unsettled
+        ));
+        assert_eq!(evidence.classify(&card), SavedExecution::Unproved);
+
+        // Publish an unrelated process's actual arguments. The exact Ended
+        // assertion must hold once that process no longer needs settlement.
+        let unrelated = b"true\0";
+        let mut waits = 0;
+        let argv = settled_process_arguments(
+            || process_arguments(&process),
+            || {
+                assert_eq!(
+                    waits, 0,
+                    "publication needs exactly one further observation"
+                );
+                waits += 1;
+                std::fs::write(process.join("cmdline"), unrelated).unwrap();
+                Ok(())
+            },
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(waits, 1);
+        assert_eq!(argv, unrelated);
+        let Threads::Arguments(argv) = process_arguments(&process).unwrap() else {
+            panic!("published arguments were not observed");
+        };
+        assert_eq!(argv, unrelated);
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+
+        let listener = &card.owned_codex_listener.as_ref().unwrap().socket;
+        let server = format!(
+            "codex\0app-server\0--listen\0unix://{}\0",
+            listener.display()
         );
+        std::fs::write(process.join("cmdline"), &server).unwrap();
+        assert_eq!(evidence.classify(&card), SavedExecution::Running);
+
+        // A leader that released its memory can still have a live thread.
+        // Publication through that thread provides the same exact evidence.
+        std::fs::write(process.join("cmdline"), b"").unwrap();
+        std::fs::write(
+            thread.join("stat"),
+            "4242 (true) Z 1 4242 4242 0 0 4 0 0 0 0 0 0 0 0 20 0 1 0 1",
+        )
+        .unwrap();
+        let worker = process.join("task/4243");
+        std::fs::create_dir(&worker).unwrap();
+        std::fs::write(
+            worker.join("stat"),
+            "4243 (true) R 1 4242 4242 0 0 0 0 0 0 0 0 0 0 0 20 0 1 0 1",
+        )
+        .unwrap();
+        std::fs::copy(thread.join("status"), worker.join("status")).unwrap();
+        std::fs::write(worker.join("cmdline"), unrelated).unwrap();
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        std::fs::write(worker.join("cmdline"), &server).unwrap();
+        assert_eq!(evidence.classify(&card), SavedExecution::Running);
+
+        // Exit makes an empty argument list conclusive, unlike the live exec.
+        std::fs::remove_dir_all(worker).unwrap();
+        assert!(matches!(
+            process_arguments(&process).unwrap(),
+            Threads::Ended
+        ));
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
+        std::fs::remove_dir_all(&process).unwrap();
+        assert!(matches!(
+            process_arguments(&process).unwrap(),
+            Threads::Ended
+        ));
+        assert_eq!(evidence.classify(&card), SavedExecution::Ended);
     }
 
     #[test]
