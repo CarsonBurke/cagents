@@ -461,6 +461,10 @@ fn semantic_metadata_wakes_after_confirmation_without_hidden_body_ticks() {
         fn receive(&mut self, frame: Value) -> Result<Step, String> {
             let events = if frame["body"] == true {
                 vec![
+                    chat::Event::Session {
+                        id: format!("identity-{}", self.0),
+                        title: None,
+                    },
                     chat::Event::TextDelta {
                         id: "body".into(),
                         role: chat::Role::Assistant,

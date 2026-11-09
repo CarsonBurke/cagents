@@ -3338,17 +3338,35 @@ impl Actor {
         content: Option<crate::notifications::Content>,
         preview_observed: bool,
     ) {
-        // The Store consumes parent bodies. Child body projections can still
-        // reach here; they must keep their existing hidden coalescing.
-        self.resident_dirty |= !matches!(
-            &event,
-            Event::Item(_)
+        // The Store consumes parent bodies. Child bodies still project here,
+        // and Claude repeats the same identity on ordinary body frames.
+        // Neither should turn hidden streaming into metadata RPCs.
+        if self.resident_changed.is_some() {
+            self.resident_dirty |= match &event {
+                Event::Item(_)
                 | Event::TextDelta { .. }
                 | Event::OutputDelta { .. }
                 | Event::SubagentItem { .. }
                 | Event::SubagentTextDelta { .. }
-                | Event::SubagentOutputDelta { .. }
-        );
+                | Event::SubagentOutputDelta { .. } => false,
+                Event::Session { id, title } => {
+                    let state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+                    let changed = state.session_id.as_deref() != Some(id.as_str())
+                        || title
+                            .as_ref()
+                            .is_some_and(|title| state.title.as_ref() != Some(title));
+                    drop(state);
+                    changed
+                        || self
+                            .confirmed_session
+                            .lock()
+                            .unwrap_or_else(|p| p.into_inner())
+                            .as_deref()
+                            != Some(id.as_str())
+                }
+                _ => true,
+            };
+        }
         let child_changed = matches!(
             &event,
             Event::Subagent { .. }
