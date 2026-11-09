@@ -1545,7 +1545,7 @@ pub(crate) fn companion_namespace(executable: &Path) -> Result<String, UpdateErr
         &["--json", "daemon", "status"],
         Some(&isolated),
         CEDITOR_COMPANION,
-        "editor companion protocol check",
+        "editor companion instance check",
     )?;
     match envelope
         .get("data")
@@ -3533,24 +3533,32 @@ finally:
             None
         ));
         // The staged worker refuses a source without a complete proof, so
-        // such a bootstrapped source stays with this window's worker.
+        // such a bootstrapped source stays with this window's worker, even
+        // when the daemon belongs to a third build; an ordinary same-protocol
+        // source stays with its daemon owner's worker.
         let incomplete = crate::model::HostSessionProof {
             host_session_id: "partial-source".into(),
             boot_id: "".into(),
             host_incarnation: "partial-incarnation".into(),
         };
-        assert_eq!(
-            installed_update_worker(
-                &old,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                Some(&old),
-                candidate_line,
-                Some(&incomplete)
-            )
-            .unwrap(),
-            "old"
-        );
+        let elder = layout("elder");
+        for (source_protocol, expected) in [
+            (candidate_line, "old"),
+            (crate::terminal_ipc::PROTOCOL_VERSION, "elder"),
+        ] {
+            assert_eq!(
+                installed_update_worker(
+                    &old,
+                    &new.version_root,
+                    Some(crate::terminal_ipc::PROTOCOL_VERSION),
+                    Some(&elder),
+                    source_protocol,
+                    Some(&incomplete)
+                )
+                .unwrap(),
+                expected
+            );
+        }
         // A bootstrapped source goes to the staged worker only when it shares
         // this window's protocol, and so the list of sources it bootstraps.
         assert_eq!(

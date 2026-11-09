@@ -250,14 +250,15 @@ for idle, or you can explicitly choose interruption and exact resumption.
 Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
-including local builds, use this same flow. When the newer build speaks the
-running daemon's protocol, or shares the window's protocol and bootstraps the
-daemon's older one, its own updater performs the update whichever window asks,
-so its checks decide which sessions it carries. Otherwise the running daemon's
-or the window's own updater performs it. A window from an older build may
-still run its own updater; if that refuses sessions the newer build carries,
-run `cagents daemon upgrade` instead. Source trees and OS packages retain
-their own update method; browserless builds do not download full releases.
+including local builds, use this same flow. Whichever window you update
+from, the newer build's own updater performs the update whenever it can carry
+the running sessions, so its checks decide what continues. When it cannot,
+such as across an incompatible protocol, an older updater (the running
+daemon's or the window's own) performs it and may refuse sessions the newer
+build would carry. Windows from builds that predate this behavior always use
+their own updater; run `cagents daemon upgrade` to start the update from the
+newer build instead. Source trees and OS packages retain their own update
+method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
 downloaded bytes, and asks every open window to save. Dirty editors, unsent
