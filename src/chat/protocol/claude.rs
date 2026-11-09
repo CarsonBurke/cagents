@@ -14524,6 +14524,37 @@ mod tests {
         );
     }
 
+    /// The transcript Claude Code 2.1.296 wrote for a background agent that
+    /// waited on its own `sleep`, then ended once it finished. Its first text
+    /// notice says `completed` and "finished", and only its note says the
+    /// result may be interim; its second carries no tool-use ID.
+    #[test]
+    fn history_reads_a_recorded_waiting_notice_as_waiting() {
+        let transcript =
+            include_str!("../../../tests/fixtures/claude-waiting-agent-transcript.jsonl");
+        let agent = "toolu_01VrQveZbGZEUCiSU4FZuvpD";
+        let session = "fa624331-5627-46b4-a036-8bb33d191149";
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{session}.jsonl"));
+        let read = |lines: &str| {
+            std::fs::write(&file, lines).unwrap();
+            let mut history = History::index(std::fs::File::open(&file).unwrap(), session).unwrap();
+            history.settle_stopped();
+            history.agent_status.get(agent).copied()
+        };
+        assert_eq!(read(transcript), Some(ToolStatus::Succeeded));
+        // Reopened before the agent's work finished: the process it waited in
+        // is gone, so it ends stopped rather than finished.
+        let second = transcript
+            .match_indices("\"type\": \"user\"")
+            .map(|(at, _)| at)
+            .filter(|&at| transcript[at..].contains("The subagent ended without"))
+            .last()
+            .unwrap();
+        let start = transcript[..second].rfind('\n').map_or(0, |at| at + 1);
+        assert_eq!(read(&transcript[..start]), Some(ToolStatus::Stopped));
+    }
+
     #[test]
     fn two_notifications_in_one_frame_settle_both_agents() {
         let mut adapter = Claude::default();

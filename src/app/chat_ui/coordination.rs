@@ -866,9 +866,8 @@ impl Runtime {
         let indicator = match background
             .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
         {
-            Some(BackgroundState::Waiting | BackgroundState::OnBackgroundWork) => {
-                muted_glyph(Icon::AgentWaiting)
-            }
+            Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
+            Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
             Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
             None => self.card_indicator(status, Icon::Agent),
         };

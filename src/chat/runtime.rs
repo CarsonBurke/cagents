@@ -1394,16 +1394,7 @@ impl LocalHandle {
     /// Update preflights need activity without loading the transcript window.
     pub(crate) fn update_activity(&self) -> (bool, bool) {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
-        (
-            state.is_working()
-                || state.waiting
-                || !state.requests.is_empty()
-                || state
-                    .subagents
-                    .iter()
-                    .any(|agent| agent.status == ToolStatus::Waiting),
-            state.ready,
-        )
+        (state.holds_work(), state.ready)
     }
     /// Whether the conversation would take a prompt now without interrupting
     /// a turn or passing over a question it put to the user.
@@ -3017,7 +3008,7 @@ impl Actor {
     fn update_readiness(&self, state: &Snapshot) -> UpdateReadiness {
         if !state.ready || state.exited || !self.pending.is_empty() || !self.output.is_empty() {
             UpdateReadiness::Unready
-        } else if state.is_working() || state.waiting || !state.requests.is_empty() {
+        } else if state.holds_work() {
             UpdateReadiness::Busy
         } else {
             UpdateReadiness::Idle

@@ -127,7 +127,8 @@ fn tool_verb(status: ToolStatus, noun: &str) -> String {
             ToolStatus::Failed => "failed",
             ToolStatus::Denied => "denied",
             ToolStatus::Stopped => "stopped",
-            ToolStatus::Waiting => "waiting",
+            // Not "waiting", which reads as the reader being needed.
+            ToolStatus::Waiting => "waiting on background work",
         }
     )
 }

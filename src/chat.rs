@@ -1469,6 +1469,12 @@ impl Snapshot {
     pub fn turn_accepted(&self) -> bool {
         self.busy || self.waiting || !self.requests.is_empty()
     }
+    /// Whether closing the conversation now would end or abandon something:
+    /// its turn, a question to the user, or a subagent working or waiting on
+    /// its own background work.
+    pub fn holds_work(&self) -> bool {
+        self.turn_accepted() || self.subagents.iter().any(|agent| agent.status.is_live())
+    }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy
@@ -2952,6 +2958,9 @@ mod tests {
             items: Vec::new(),
         });
         assert!(!snapshot.is_working());
+        // Closing the conversation would end it, so an update or a cleanup
+        // that waits for idle waits for it too.
+        assert!(snapshot.holds_work());
         // `Waiting` means the person is needed, and nothing here needs them.
         assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
         // An interrupt kills it, as recorded from Claude Code, so a person is
@@ -3001,8 +3010,10 @@ mod tests {
         assert!(!snapshot.busy);
         assert!(snapshot.is_working());
         assert_eq!(snapshot.activity(), super::ActivityState::Working);
+        assert!(snapshot.holds_work());
         snapshot.subagents[0].status = super::ToolStatus::Succeeded;
         assert_eq!(snapshot.activity(), super::ActivityState::Idle);
+        assert!(!snapshot.holds_work());
     }
 
     use super::*;

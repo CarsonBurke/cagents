@@ -1586,7 +1586,7 @@ impl Runtime {
         if let Some(agent) = selected {
             if agent.status == chat::ToolStatus::Waiting {
                 return Some((
-                    Icon::AgentWaiting,
+                    Icon::AgentBackground,
                     Self::native_child_status(agent).to_owned(),
                 ));
             }
@@ -1628,7 +1628,7 @@ impl Runtime {
                 .iter()
                 .any(|agent| agent.status == chat::ToolStatus::Waiting) =>
             {
-                Some((Icon::AgentWaiting, label))
+                Some((Icon::AgentBackground, label))
             }
             _ => None,
         }
@@ -7629,14 +7629,14 @@ mod tests {
         assert_eq!(
             runtime.timeline_activity(false, None),
             Some((
-                Icon::AgentWaiting,
+                Icon::AgentBackground,
                 "1 subagent waiting on background work".into()
             ))
         );
         let child = runtime.snapshot.subagents[0].clone();
         assert_eq!(
             runtime.timeline_activity(false, Some(&child)),
-            Some((Icon::AgentWaiting, "Waiting on background work".into()))
+            Some((Icon::AgentBackground, "Waiting on background work".into()))
         );
     }
 
