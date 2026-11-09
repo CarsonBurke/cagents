@@ -313,10 +313,10 @@ fn card_row_reads(statements: &[String]) -> Vec<&String> {
 }
 
 /// An unchanged flush learns everything it needs about each stored card from
-/// the one query over the window's cards: the 45 open chats skip their
-/// identity comparison and the 580 closed terminals their archived-descriptor
-/// check, which each cost a query per card. A chat that did change is still
-/// compared with its stored row.
+/// the one query over the window's cards. Its 895 chats, open and closed, skip
+/// their identity comparison and its 580 closed terminals their
+/// archived-descriptor check; before, each cost a query of its own. A chat that
+/// did change is still compared with its stored row.
 #[test]
 fn an_unchanged_flush_reads_no_card_row_on_its_own() {
     let directory = tempfile::tempdir().unwrap();
@@ -338,7 +338,18 @@ fn an_unchanged_flush_reads_no_card_row_on_its_own() {
             .any(|sql| sql.contains("FROM cards WHERE workspace_id")),
         "the trace sees the flush's statements"
     );
-    assert_eq!(card_row_reads(&unchanged), Vec::<&String>::new());
+    let reads = card_row_reads(&unchanged);
+    let identity = reads
+        .iter()
+        .filter(|sql| sql.contains("SELECT content_json FROM cards"))
+        .count();
+    let archived = reads
+        .iter()
+        .filter(|sql| sql.contains("content_json IS NOT NULL"))
+        .count();
+    assert_eq!(identity, 0, "unchanged chats compare no stored identity");
+    assert_eq!(archived, 0, "closed terminals read no row of their own");
+    assert_eq!(reads, Vec::<&String>::new(), "nor does any other card");
 
     let chat = state
         .cards

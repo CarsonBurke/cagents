@@ -2408,8 +2408,7 @@ mod tests {
         for case in 0..13 {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
-            // Archival looks for the conversation's pane in occupied views only.
-            super::super::views::plant_unreadable_emptied_view(&mut registry);
+            let emptied = super::super::views::EmptiedView::plant(&mut registry);
             let HostedSession::Chat(mut current) = source() else {
                 unreachable!()
             };
@@ -2572,8 +2571,10 @@ mod tests {
             let authority = registry
                 .retained_agent_authority_source(current.id)
                 .unwrap();
-            let result =
-                registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current);
+            // Archival looks for the conversation's pane in occupied views only.
+            let result = emptied.unreadable_during(&mut registry, |registry| {
+                registry.archive_previous_boot_execution(&ownership, &boot, &issued, &current)
+            });
             match case {
                 7 => assert!(
                     result.unwrap_err().contains("fixture archive failure"),
@@ -2652,8 +2653,7 @@ mod tests {
             for case in 0..9 {
                 let (mut registry, directory, request) = fixture();
                 let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
-                // Both lookups search occupied views only for the history's pane.
-                super::super::views::plant_unreadable_emptied_view(&mut registry);
+                let emptied = super::super::views::EmptiedView::plant(&mut registry);
                 let HostedSession::Chat(mut current) = source() else {
                     unreachable!()
                 };
@@ -2749,10 +2749,13 @@ mod tests {
                 registry
                     .retire_agent_process(&HostedSession::Chat(current.clone()), 4)
                     .unwrap();
-                let witness = registry
-                    .archived_history(&current, &ownership, &retirement, &boot)
-                    .unwrap()
-                    .unwrap();
+                // The lookup searches occupied views only for the history's pane.
+                let witness = emptied.unreadable_during(&mut registry, |registry| {
+                    registry
+                        .archived_history(&current, &ownership, &retirement, &boot)
+                        .unwrap()
+                        .unwrap()
+                });
                 assert!(witness.matches(&current, &ownership, &retirement));
                 match case {
                     0 => {}
