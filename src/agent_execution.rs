@@ -29,6 +29,12 @@ pub const MAX_CHILDREN: usize = 64;
 pub const MAX_PARENT_RUNNING: usize = 8;
 pub const MAX_RUNNING: usize = 32;
 pub const MAX_PARENT_DEPTH: usize = 8;
+/// How the daemon begins refusing a follow-up run for an agent that a usage
+/// limit stops until a known reset; the CLI reports it as `agent_limited`.
+pub const LIMITED_REFUSAL: &str = "This agent is stopped by a usage limit";
+/// What the refusal advises doing with the prompt instead.
+pub const LIMITED_ADVICE: &str =
+    "Send it once the limit resets, or leave it with `cagents send`, which holds it until then.";
 pub const AUTHORITY_ENV: &str = "CAGENTS_AGENT_AUTHORITY";
 
 /// Presentation routing only. Daemon ownership additionally requires its
@@ -516,6 +522,14 @@ pub enum Operation {
     Transcript(transcript::Query),
     /// List the sessions in this channel, or in the caller's own when absent.
     Members(Option<crate::model::ChannelId>),
+    /// Read the caller and the sessions in a scope as members, with each
+    /// one's usage limit and account. `Directory` is this read without them,
+    /// as older CLIs make it. Grants no control.
+    Sessions(directory::Scope),
+    /// Leave a message for another session, or answer one, and learn what
+    /// its recipient can do with it now. `SendMessage` is this as older CLIs
+    /// send it.
+    Send(mailbox::Outgoing),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -582,6 +596,8 @@ pub enum Reply {
     InboxAcknowledged,
     Transcript(transcript::Page),
     Members(directory::Members),
+    Sessions(directory::Sessions),
+    Delivered(mailbox::Delivery),
 }
 
 /// Already correlated to one accepted RunId by the provider adapter. A late

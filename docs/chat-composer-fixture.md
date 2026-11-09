@@ -1,5 +1,7 @@
 # Offline chat composer validation
 
+For how fixtures fit together and how to add a behaviour, see [Fixtures](fixtures.md).
+
 `tests/fixtures/chat-composer-claude.sh` is a fake Claude stream-json executable
 for native UI checks. It requires `jq`, makes no network requests, and uses a
 synthetic account. It advertises asynchronous message support, holds its first
@@ -9,7 +11,9 @@ this fixture checks composer interactions, not provider delivery.
 
 From a shell without a desktop session, such as plain SSH,
 [`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
-you still open the project and start the conversation.
+you still open the project and start the conversation. From a session cagents
+hosts, add `--remote fw16` to run it on the build host
+([Native evidence from a cagents session](development.md#native-evidence-from-a-cagents-session)).
 By hand, use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
@@ -117,6 +121,12 @@ To see a resume that fails, create `fixture-fail-resume` too: the next
 resumed start exits before it answers, and the card offers **Try again**. The
 file is removed first, so pressing it resumes normally.
 
+A resumed transcript may be damaged, as a crash leaves one. The provider
+skips each line that isn't a JSON record, as Claude Code does. It then
+goes on from the last record it could read, a simplification: Claude Code
+follows the `parentUuid` chain to its leaf. A last line cut short without a newline
+is ended first, so the next record starts its own line.
+
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
@@ -164,7 +174,21 @@ frames, such as a background task's `task_started` and `task_notification`,
 are live only, as they are from Claude Code. A frame with `"_history": true` is
 only recorded, the way Claude Code records a queued notification as a
 `queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
-state can be captured.
+state can be captured. A line `{"_exit": STATUS}` makes the provider exit
+there with that status, from 0 to 255, mid-turn and without a result, as a
+crash does. Every turn that reaches the line exits again: the app doesn't
+resend the interrupted prompt, but the next prompt sent after it reconnects
+replays the same frames. Add `"_once": true` to exit only the first time a
+turn reaches that line: the fixture records each such line's number in
+`fixture-frames.exited`, so the reconnected provider goes on, and removing
+that file arms them all again.
+
+To hold a conversation's provider at start-up, as a cold start does, create
+`home/.claude/fixture-slow-start`. The provider then waits before it reads
+anything: the number of seconds on the file's first line, such as `1.5`, or
+5 if the file is empty. Anything else makes it exit with status 2 and say so. The app's account check is not delayed. Use this to capture the
+starting state, or to check what the app does when a prompt is sent before
+the provider answers.
 
 To run a real command, write it as the first line of
 `home/.claude/fixture-run-command`, such as `sleep 6001`. Every turn then runs

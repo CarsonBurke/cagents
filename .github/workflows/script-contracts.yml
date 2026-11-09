@@ -224,6 +224,8 @@ jobs:
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
               ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
               ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
+              ("workload time limit", "scripts/bounded", "tests/bounded.py"),
+              ("synthetic Claude provider", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_provider.py"),
               ("local install head check", "scripts/install-local", "tests/install_local.py"),
           ):
               source_present = present(Path(source))
@@ -241,9 +243,13 @@ jobs:
                   if result.returncode:
                       raise SystemExit(result.returncode)
               if source in ("scripts/native-evidence", "scripts/install-local"):
-                  result = subprocess.run(["bash", "-n", source])
-                  if result.returncode:
-                      raise SystemExit(result.returncode)
+                  shells = [source]
+                  if source == "scripts/native-evidence" and present(Path("scripts/native-evidence-remote")):
+                      shells.append("scripts/native-evidence-remote")
+                  for shell in shells:
+                      result = subprocess.run(["bash", "-n", shell])
+                      if result.returncode:
+                          raise SystemExit(result.returncode)
               result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
               if result.returncode:
                   raise SystemExit(result.returncode)

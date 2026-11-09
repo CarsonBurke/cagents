@@ -712,6 +712,7 @@ mod tests {
             super::super::super::installed_update_worker(
                 &current,
                 &current.version_root,
+                Some(crate::terminal_ipc::PROTOCOL_VERSION),
                 Some(&previous),
                 client.protocol(),
                 Some(client.proof()),
@@ -926,6 +927,7 @@ mod tests {
             super::super::super::installed_update_worker(
                 &current,
                 &current.version_root,
+                Some(crate::terminal_ipc::PROTOCOL_VERSION),
                 Some(&previous),
                 client.protocol(),
                 Some(client.proof()),

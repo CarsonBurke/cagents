@@ -2390,8 +2390,6 @@ mod tests {
             title: "Fix the parser".into(),
             width_fraction: 0.5,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Chat(crate::chat::Session {
                 native_continuity: Default::default(),
                 owned_codex_listener: None,

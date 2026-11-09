@@ -280,6 +280,7 @@ impl Cagents {
                 .queued_card_closes
                 .iter()
                 .any(|queued| queued.card == card)
+            || self.chat_close_asked(card)
     }
 
     /// The daemon has been asked to close this pane's terminal and hasn't said
@@ -336,6 +337,15 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        // Any pane waits behind a chat's question, so no second dialog opens
+        // underneath it and takes its keys.
+        if self.chat_close_asked(card) {
+            return Task::none();
+        }
+        if self.chat_close_dialog_visible() {
+            self.queue_card_close(card, unasked);
+            return Task::none();
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -360,7 +370,7 @@ impl Cagents {
         {
             return Task::none();
         }
-        if let Some(session) = ended_terminal(self.card_state(card)).cloned() {
+        if let Some(session) = self.ended_terminal(card).cloned() {
             self.completed_release = Some(card);
             return cosmic::task::future(async move {
                 let source = session.clone();
@@ -430,6 +440,9 @@ impl Cagents {
                 return close_focus(0);
             }
             return self.start_terminal_close(allow_active);
+        }
+        if !unasked && let Some(asked) = self.ask_before_chat_close(card) {
+            return asked;
         }
         self.request_card_removal(card)
     }
@@ -1173,8 +1186,8 @@ mod tests {
     fn retry_close_fixture() -> (Cagents, CardId) {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
+        app.set_residency(card, Residency::Hot);
         let state = app.card_state_mut(card).unwrap();
-        state.residency = Residency::Hot;
         let CardKind::Terminal(session) = &mut state.kind else {
             unreachable!();
         };
@@ -1719,8 +1732,8 @@ mod tests {
         let other = queued_terminal(&mut app, first);
         let _ = app.workspace.focus(first);
         app.workspace.take_widget_focus_request();
+        app.set_residency(other, Residency::Hot);
         let state = app.card_state_mut(other).unwrap();
-        state.residency = Residency::Hot;
         let CardKind::Terminal(session) = &mut state.kind else {
             unreachable!();
         };
@@ -1783,13 +1796,13 @@ mod tests {
         app.retire_ended_terminal(queued, 0, None, false);
         app.cards.insert(queued, CardRuntime::Completed);
         let source = terminal_source(&app, queued);
-        let residency = app.card_state(queued).unwrap().residency.clone();
-        assert!(ended_terminal(app.card_state(queued)).is_some());
+        let residency = app.residency(queued).clone();
+        assert!(app.ended_terminal(queued).is_some());
         assert!(app.pane_close_owned(queued));
         assert!(!app.terminal_start_in_flight(queued));
         drop(app.update(Message::RetryCard(queued)));
         assert_eq!(terminal_source(&app, queued), source);
-        assert_eq!(app.card_state(queued).unwrap().residency, residency);
+        assert_eq!(*app.residency(queued), residency);
         assert!(matches!(
             app.cards.get(&queued),
             Some(CardRuntime::Completed)
@@ -1936,7 +1949,7 @@ mod tests {
     fn completed_close_waits_for_receipt_and_ignores_a_replaced_card() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        app.set_residency(card, Residency::Hot);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!();
         };
@@ -1976,7 +1989,7 @@ mod tests {
     fn completed_terminal_with_live_conversation_uses_fenced_close_confirmation() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        app.set_residency(card, Residency::Hot);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!()
         };
@@ -2024,7 +2037,7 @@ mod tests {
     fn close_dialog_over_a_popup_restores_the_readers_keyboard_nav() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        app.set_residency(card, Residency::Hot);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!()
         };
@@ -2074,7 +2087,7 @@ mod tests {
     fn completed_confirmation_cannot_close_a_relaunched_card() {
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        app.set_residency(card, Residency::Hot);
         let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
             unreachable!()
         };

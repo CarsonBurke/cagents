@@ -6606,16 +6606,29 @@ mod tests {
         std::fs::create_dir(&foreground_directory).unwrap();
         let mut launch = LaunchRecipe::shell(directory.path().to_owned()).unwrap();
         launch.program = "/bin/false".into();
-        let mut child = std::process::Command::new("/bin/sleep")
-            .arg("5")
+        // A successful spawn can precede Linux publishing the new /proc comm.
+        // A builtin readiness message proves the shell has reached userspace;
+        // its builtin read keeps that same process alive until inspection ends.
+        let mut child = std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; IFS= read -r release || :"])
             .current_dir(&foreground_directory)
             .process_group(0)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap();
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
         let title = super::foreground_process_title(Some(child.id() as libc::pid_t), &launch);
-        let _ = child.kill();
-        child.wait().unwrap();
-        assert_eq!(title, "sleep · alpha");
+        child.stdin.take().unwrap().write_all(b"release\n").unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(title, "sh · alpha");
     }
 
     #[test]

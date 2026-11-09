@@ -1566,11 +1566,14 @@ pub(super) fn process_request(
         | ClientRequest::ChatCapacityInspect
         | ClientRequest::ChatCapacitySet { .. }
         | ClientRequest::ChatReleaseInspect { .. }
-        | ClientRequest::ChatRelease { .. }) => Ok((
-            super::chat::process(host, client_id, request)?,
-            Vec::new(),
-            false,
-        )),
+        | ClientRequest::ChatRelease { .. }) => {
+            let response = super::chat::process(host, client_id, request)?;
+            // The courier tells a new subscriber the conversation's usage limit.
+            if matches!(response, ServerResponse::ChatAttached { .. }) {
+                super::agent_execution::mailbox::wake(host);
+            }
+            Ok((response, Vec::new(), false))
+        }
         ClientRequest::Connect { .. } => Err(ProtocolError::new(
             ProtocolErrorCode::AlreadyConnected,
             "this client stream already completed its handshake",

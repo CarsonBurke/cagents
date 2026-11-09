@@ -316,6 +316,13 @@ pub fn error_status(error: &Value) -> Option<UsageStatus> {
     }
 }
 
+/// The bucket a window belongs to, where it is not the account's own: its
+/// name, as the label shows it after the span, else the bucket's id.
+pub fn window_scope(window: &UsageWindow) -> Option<&str> {
+    let (id, _) = window.key.split_once(':')?;
+    (id != DEFAULT_LIMIT_ID).then(|| window.label.split_once(" · ").map_or(id, |(_, name)| name))
+}
+
 fn bucket_windows(id: &str, bucket: &Value) -> Vec<UsageWindow> {
     let name = bucket["limitName"]
         .as_str()
@@ -441,6 +448,8 @@ mod tests {
             labels,
             ["5h window", "Weekly", "5h window · GPT-5.3-Codex-Spark"]
         );
+        let scopes: Vec<_> = usage.windows.iter().map(window_scope).collect();
+        assert_eq!(scopes, [None, None, Some("GPT-5.3-Codex-Spark")]);
         assert_eq!(usage.windows[0].kind, WindowKind::Session);
         assert_eq!(usage.windows[1].kind, WindowKind::Weekly);
         assert!((usage.windows[0].used - 0.42).abs() < 1e-6);

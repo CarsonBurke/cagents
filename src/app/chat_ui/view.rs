@@ -1472,7 +1472,19 @@ impl Runtime {
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
-        let failure_label = active.and_then(|failure| match failure.kind {
+        // The reset is when the conversation can carry on, so a limit that
+        // still holds, as the daemon judges it, says it.
+        let limit_reset = self
+            .usage_limit
+            .as_ref()
+            .filter(|_| {
+                active
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
+            })
+            .and_then(|limit| limit.reset.as_deref())
+            .map(|reset| format!("Account limit reached · resets {reset}"));
+        let failure_label = active.as_ref().and_then(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
             chat::failure::FailureKind::Authentication => Some("Sign-in required"),
             chat::failure::FailureKind::Capacity => Some("Provider at capacity"),
@@ -1484,8 +1496,8 @@ impl Runtime {
             chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
         });
         let mut parts = Vec::new();
-        if let Some(label) = failure_label {
-            parts.push(label.to_owned());
+        if let Some(label) = limit_reset.as_deref().or(failure_label) {
+            parts.push(Self::short_description(label, 72));
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
@@ -2259,15 +2271,21 @@ impl Runtime {
                     self.disconnected || self.paging().is_some(),
                 ));
             }
-            if self.turns.is_empty() && self.queued.is_none() {
+            if self.turns.is_empty() && self.queued.is_none() && !self.closed_elsewhere {
                 // The empty state says what to do. It used to show whatever the
                 // adapter's last status detail was, which meant an empty
                 // conversation greeted the reader with a connection state instead
                 // of an invitation; the status line is where a state belongs.
+                // A conversation another window started is not asking for a
+                // first message, so it does not invite one while it comes up.
                 transcript.push(
                     widget::container(
-                        design::body("Your conversation appears here. Send a message to begin.")
-                            .class(cosmic::theme::Text::Custom(design::muted_text)),
+                        design::body(if self.provider_coming_up() {
+                            "This conversation is starting."
+                        } else {
+                            "Your conversation appears here. Send a message to begin."
+                        })
+                        .class(cosmic::theme::Text::Custom(design::muted_text)),
                     )
                     .center_x(Length::Fill)
                     .padding(space::XXL)
@@ -3096,7 +3114,8 @@ impl Runtime {
                                 design::muted_icon_color
                             }))
                             .on_press_maybe(
-                                available.then(|| action(Action::SubmitControl(target, mode))),
+                                (available && !self.provider_coming_up())
+                                    .then(|| action(Action::SubmitControl(target, mode))),
                             )
                             .into()
                     }

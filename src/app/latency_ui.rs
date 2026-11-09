@@ -224,14 +224,6 @@ impl Cagents {
                     },
                 }),
                 existence: Existence::Open,
-                exposure: Exposure::Offscreen,
-                residency: Residency::Failed {
-                    typed_error: RuntimeError {
-                        code: "fixture".into(),
-                        message: "Synthetic latency workload; no terminal process".into(),
-                    },
-                    retryable: false,
-                },
                 width_fraction: 0.7,
             });
         }

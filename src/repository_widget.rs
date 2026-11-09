@@ -12475,8 +12475,6 @@ mod tests {
             title: "Folder".into(),
             width_fraction: 1.0,
             existence: crate::model::Existence::Open,
-            exposure: crate::model::Exposure::Visible,
-            residency: crate::model::Residency::Cold,
             kind: CardKind::Repository(view.clone()),
         });
         workspace

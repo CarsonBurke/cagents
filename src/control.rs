@@ -1900,6 +1900,7 @@ impl ControlClient {
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
+            | ServerMessage::ChatLimit { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
@@ -2123,6 +2124,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
         | ServerMessage::ConversationPullRequests { .. }
+        | ServerMessage::ChatLimit { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -2143,6 +2145,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
+        ServerMessage::ChatLimit { .. } => "chat_limit",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",
@@ -5532,13 +5535,17 @@ mod tests {
             io::ErrorKind::NotFound
         );
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        drop(listener);
+        // A forked child can retain this socket description until it execs.
+        // Keep that interleaving present while checking the refused endpoint.
+        let inherited_listener = listener.try_clone().unwrap();
+        crate::daemon::shut_down_test_listener(listener);
         assert_eq!(
             connect_control_socket(&path, Duration::from_secs(1))
                 .unwrap_err()
                 .kind(),
             io::ErrorKind::ConnectionRefused
         );
+        drop(inherited_listener);
     }
 
     fn proof(session: &str, boot: &str, incarnation: &str) -> HostSessionProof {

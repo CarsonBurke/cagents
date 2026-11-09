@@ -60,6 +60,41 @@ offload = load_offload()
 os.environ["CAGENTS_BUILD_REGISTRY"] = ""
 
 
+def setUpModule():
+    """Fails the suite if it leaves anything in the runtime directories'
+    `cof`, where the build host's agent puts each slot's temporary files by
+    default: the one this environment names, and the login session's, which
+    the loopback gives the agent. A test's agent keeps them in its own
+    directory through CAGENTS_OFFLOAD_TEMPORARY_ROOT."""
+    roots = {Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "cof"),
+             Path(f"/run/user/{os.getuid()}", "cof")}
+
+    def names(root):
+        with contextlib.suppress(FileNotFoundError):
+            return {path.name for path in root.iterdir()}
+        return set()
+
+    def real_slots(root):
+        """The names this host's own slots take there: a build using a slot
+        for the first time while the suite runs adds one."""
+        temporary_directory = agent_function("temporary_directory")
+        with patch.dict(os.environ, {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(root)}):
+            return {os.path.basename(temporary_directory(str(slot))) for slot in
+                    Path("~/.cache/cagents-offload").expanduser().glob("*/slot-*")}
+
+    before = {root: names(root) for root in roots}
+
+    def unchanged():
+        left = {}
+        for root, known in before.items():
+            if new := names(root) - known:
+                if new := new - real_slots(root):
+                    left[str(root)] = sorted(new)
+        if left:
+            raise AssertionError(f"the tests left temporary directories outside their own: {left}")
+    unittest.addModuleCleanup(unchanged)
+
+
 def write_figures(directory, *, available_gib=1024, cpu=0, memory=0):
     """A build host's memory and CPU figures, standing in for /proc. Unless a
     test is about them, an idle, roomy host: admission otherwise holds builds
@@ -255,10 +290,13 @@ class RemoteCommand(unittest.TestCase):
 
 
 def agent_function(name):
+    """The build host's agent's top-level function `name`, on its own, with
+    the modules its functions use."""
+    import hashlib, stat
     tree = ast.parse(offload.REMOTE_AGENT)
     function = next(node for node in tree.body
                     if isinstance(node, ast.FunctionDef) and node.name == name)
-    scope = {"os": os}
+    scope = {"os": os, "hashlib": hashlib, "shutil": shutil, "stat": stat, "sys": sys}
     exec(compile(ast.Module([function], []), "agent", "exec"), scope)
     return scope[name]
 
@@ -271,6 +309,172 @@ class Resident(unittest.TestCase):
             held = agent_function("resident")([os.getpid(), 999999999])
             self.assertGreater(held[os.getpid()], 64 << 20)
             self.assertEqual(held[999999999], 0)
+
+
+def agent_scope():
+    """The host agent's definitions, as its commands run them."""
+    scope = {"__name__": "cargo-offload-agent"}
+    with patch.object(sys, "argv", ["cargo-offload", "test", "~"]):
+        exec(compile(offload.REMOTE_AGENT.split("\nif command == ")[0], "agent", "exec"), scope)
+    return scope
+
+
+class Busiest(unittest.TestCase):
+    """What holds the CPUs, from two process tables standing in for /proc's
+    a second apart. Their PIDs are beyond any the kernel gives, so nothing of
+    theirs is in /proc: each command is the name it was sampled with."""
+
+    TICKS = os.sysconf("SC_CLK_TCK")
+
+    def process(self, pid, *, parent=1, session=None, terminal=0, own=0.0, reaped=0.0, age=30,
+                name="spin"):
+        return pid, self.scope["Process"](
+            parent, pid if session is None else session, terminal, round(own * self.TICKS),
+            round(reaped * self.TICKS), round((self.up - age - 0.5) * self.TICKS), name)
+
+    def busiest(self, first, second, *, seconds=1.0, **options):
+        """`busiest` over tables of CPU seconds, `seconds` apart by the clock
+        it reads around its own sleep."""
+        tables = iter([dict(first), dict(second)])
+        clock = iter([0.0, 0.0, seconds, seconds])
+        self.scope["process_table"] = lambda: next(tables)
+        self.scope["time"] = type("Clock", (), {"monotonic": staticmethod(lambda: next(clock)),
+                                                "sleep": staticmethod(lambda _: None)})
+        return self.scope["busiest"](**options)
+
+    def setUp(self):
+        self.scope = agent_scope()
+        # A host of two CPUs, whatever this one has.
+        self.scope["host_cpus"] = lambda: 2
+        self.up = float(Path("/proc/uptime").read_text().split()[0])
+
+    def test_a_loop_of_short_lived_commands_is_named_by_what_it_reaps(self):
+        loop, child = 5_000_001, 5_000_002
+        text = self.busiest(
+            [self.process(loop, own=1, reaped=5, name="sh"),
+             self.process(child, parent=loop, session=loop, own=10)],
+            # The child ended after 0.5 more seconds, another lived 0.4 of
+            # them, and the loop itself used 0.1: only what the sample saw.
+            [self.process(loop, own=1.1, reaped=5 + 10.5 + 0.4, name="sh")])
+        self.assertRegex(text, rf"; besides builds, the CPUs go to session {loop} "
+                               rf"\(sh, started 3\ds ago\): 1\.0 CPU in 1 process\. ")
+        self.assertTrue(text.endswith(f". `ps -s {loop}` lists session {loop}'s processes, "
+                                      f"and `pkill -s {loop}` ends them"), text)
+
+    def test_what_ended_within_the_sample_is_taken_off_the_ancestor_that_outlived_it(self):
+        # A shell runs make, which runs a compiler an hour in; both end.
+        shell, make, compiler = 5_000_003, 5_000_004, 5_000_005
+        text = self.busiest(
+            [self.process(shell, name="sh"), self.process(make, parent=shell, session=shell, own=2),
+             self.process(compiler, parent=make, session=shell, own=3600)],
+            [self.process(shell, reaped=2 + 3600 + 0.5, name="sh")])
+        self.assertIn(f"session {shell} (sh, started 30s ago): 0.5 CPUs in 1 process", text)
+        # Nothing is said to use more than every CPU, however its ticks came.
+        text = self.busiest([self.process(shell, name="sh")],
+                            [self.process(shell, reaped=10**6, name="sh")])
+        self.assertIn(": 2.0 CPUs in 1 process", text)
+
+    def test_a_session_whose_leader_has_exited_says_so(self):
+        session, orphan = 5_000_010, 5_000_011
+        text = self.busiest([self.process(orphan, session=session, age=45, name="runaway")],
+                            [self.process(orphan, session=session, own=1, age=45, name="runaway")])
+        self.assertIn(f"session {session}, whose leader has exited: 1.0 CPU in 1 process, "
+                      f"most in pid {orphan} (runaway, started 45s ago)", text)
+
+    def test_a_command_reaches_the_terminal_without_its_control_characters(self):
+        loop = 5_000_012
+        name = "spin\x1b]0;owned\x07\x1b[2Jloop"
+        text = self.busiest([self.process(loop, name=name)],
+                            [self.process(loop, own=1, name=name)])
+        self.assertIn("(spin ]0;owned [2Jloop, started", text)
+        self.assertFalse(any(not char.isprintable() for char in text), repr(text))
+
+    def test_the_running_builds_holding_the_cpus_is_said_outright(self):
+        build, detached, other = 5_000_020, 5_000_021, 5_000_022
+        first = [self.process(build), self.process(detached, parent=build), self.process(other)]
+        second = [self.process(build, own=2), self.process(detached, parent=build, own=1),
+                  self.process(other, own=0.1)]
+        self.assertEqual(self.busiest(first, second, pids=[build]),
+                         "nothing else uses much; the running builds hold them: "
+                         "builds use 3.0 CPUs and everything else 0.1 CPUs")
+        # One build compiling a crate on one CPU holds them as surely.
+        self.assertEqual(self.busiest(first, [self.process(build, own=1.0)], pids=[build]),
+                         "nothing else uses much; the running builds hold them: "
+                         "builds use 1.0 CPU and everything else 0.0 CPUs")
+        self.assertEqual(self.busiest(first, [self.process(other, own=0.1)]),
+                         "nothing uses much at the moment: builds use 0.0 CPUs and everything else "
+                         "0.1 CPUs, of 2 in all")
+        # Pressure averages ten seconds, so it can outlast a burst: builds
+        # leaving most CPUs idle don't hold them.
+        self.scope["host_cpus"] = lambda: 16
+        self.assertEqual(self.busiest(first, [self.process(build, own=3)], pids=[build]),
+                         "nothing uses much at the moment: builds use 3.0 CPUs and everything else "
+                         "0.0 CPUs, of 16 in all")
+
+    def test_the_rate_is_over_the_time_the_sample_took(self):
+        sessions = [5_000_030 + index for index in range(5)]
+        first = [self.process(pid) for pid in sessions]
+        # Four sessions use 2 CPU seconds each and one 0.6, over 2 seconds.
+        second = [self.process(pid, own=2) for pid in sessions[:4]] + [self.process(sessions[4], own=0.6)]
+        with patch.dict(os.environ, {"CAGENTS_OFFLOAD_BUSIEST_SHOWN": "a few",
+                                     "CAGENTS_OFFLOAD_BUSIEST_LEAST": "nan"}):
+            text = self.busiest(first, second, seconds=2.0, there=True)
+        self.assertTrue(text.startswith("builds use 0.0 CPUs and everything else 4.3 CPUs; "), text)
+        # Settings that are not numbers show the default three of at least
+        # half a CPU.
+        self.assertEqual(text.count(": 1.0 CPU in 1 process"), 3, text)
+        self.assertIn("; and 2 more sessions using 1.3 CPUs. `ps -s ", text)
+        self.assertRegex(text, r"`ps -s \d+` there lists session \d+'s processes, and `pkill -s \d+` ends them$")
+
+    def test_no_session_a_person_works_in_is_offered_to_end_whole(self):
+        def idle(name, **env):
+            """A real process, for what busiest reads of it from /proc."""
+            directory = Path(tempfile.mkdtemp(prefix="cagents-busiest-"))
+            self.addCleanup(shutil.rmtree, directory, True)
+            program = directory / name
+            shutil.copy2(shutil.which("sleep"), program)
+            process = subprocess.Popen([program, "60"], env=os.environ | env)
+            self.addCleanup(lambda: (process.kill(), process.wait()))
+            return process.pid
+
+        terminal, own, kernel, starter, leaderless = 5_000_060, 5_000_061, 5_000_062, 5_000_063, 5_000_064
+        desktop = idle("sleep", XDG_SESSION_TYPE="wayland")
+        daemon = idle("cagentsd")
+        cases = (
+            ([self.process(terminal, terminal=34816, name="bash")], terminal, "a terminal's"),
+            ([self.process(own, session=os.getsid(0))], os.getsid(0), "the one this wait runs in"),
+            # What started this wait, such as the agent waiting, in a session of its own.
+            ([(os.getpid(), self.scope["Process"](starter, os.getsid(0), 0, 0, 0, 0, "python3")),
+              self.process(starter, session=starter, name="agent")], starter, "the one this wait runs in"),
+            # A daemon whose leader has exited, started from the desktop.
+            ([self.process(desktop, session=leaderless)], leaderless, "one started from the desktop"),
+            # cagents' own daemon, whatever started it.
+            ([self.process(daemon, session=leaderless)], leaderless, "cagents' own"),
+        )
+        for table, session, why in cases:
+            with self.subTest(why):
+                busy = [(pid, entry._replace(own=entry.own + self.TICKS)) for pid, entry in table]
+                text = self.busiest(table, busy)
+                self.assertIn(f". Session {session} is {why}: `ps -s {session}` lists its processes, "
+                              f"to end only what you recognise", text)
+                self.assertNotIn("pkill", text)
+        # The kernel's threads are named, though no one can end them.
+        text = self.busiest([self.process(kernel, parent=2, session=0, name="kswapd0")],
+                            [self.process(kernel, parent=2, session=0, own=1.5, name="kswapd0")])
+        self.assertEqual(text, "builds use 0.0 CPUs and everything else 1.5 CPUs; besides builds, "
+                               "the CPUs go to the kernel's own threads: 1.5 CPUs")
+
+    def test_a_session_using_under_half_a_cpu_is_not_named(self):
+        quiet, builds = 5_000_040, 5_000_041
+        text = self.busiest([self.process(quiet), self.process(builds)],
+                            [self.process(quiet, own=0.4), self.process(builds, own=1)], pids=[builds])
+        self.assertEqual(text, "nothing else uses much; the running builds hold them: "
+                               "builds use 1.0 CPU and everything else 0.4 CPUs")
+        many = [5_000_050 + index for index in range(10)]
+        text = self.busiest([self.process(pid) for pid in many],
+                            [self.process(pid, own=0.3) for pid in many])
+        self.assertEqual(text, "builds use 0.0 CPUs and everything else 3.0 CPUs, "
+                               "though no session outside them uses half a CPU")
 
 
 # Sockets bind under these tests' directories, whose paths must stay short
@@ -340,30 +544,22 @@ class SharedConnection(unittest.TestCase):
 
 class EnclosingCheckout(unittest.TestCase):
     def test_a_git_marker_in_any_ancestor_is_found(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "enclosing_checkout")
-        scope = {"os": os}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        enclosing_checkout = agent_function("enclosing_checkout")
         with tempfile.TemporaryDirectory() as root:
             deep = Path(root, "a", "b", "c")
             deep.mkdir(parents=True)
-            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            self.assertIsNone(enclosing_checkout(str(deep)))
             Path(root, "a", ".git").mkdir()
-            self.assertEqual(scope["enclosing_checkout"](str(deep)), str(Path(root, "a", ".git")))
+            self.assertEqual(enclosing_checkout(str(deep)), str(Path(root, "a", ".git")))
             # The directory itself is not its own ancestor.
             Path(root, "a", ".git").rmdir()
             Path(deep, ".git").write_text("gitdir: x")
-            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            self.assertIsNone(enclosing_checkout(str(deep)))
 
 
 class Clear(unittest.TestCase):
     def test_directories_left_without_permissions_are_removed(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "clear")
-        scope = {"os": os, "shutil": shutil, "sys": sys}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        clear = agent_function("clear")
         with tempfile.TemporaryDirectory() as root:
             locked = Path(root, "t", "a", "target")
             (locked / "deep").mkdir(parents=True)
@@ -373,7 +569,7 @@ class Clear(unittest.TestCase):
             locked.chmod(0)
             Path(root, "t").chmod(0)
             Path(root).chmod(0o755)
-            scope["clear"](str(Path(root, "t")))
+            clear(str(Path(root, "t")))
             self.assertFalse(Path(root, "t").exists())
             # Outside the tree, nothing changed.
             self.assertEqual(Path(root).stat().st_mode & 0o777, 0o755)
@@ -381,13 +577,7 @@ class Clear(unittest.TestCase):
 
 class TemporaryDirectory(unittest.TestCase):
     def scope(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "temporary_directory")
-        import hashlib, stat
-        scope = {"os": os, "stat": stat, "hashlib": hashlib}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
-        return scope["temporary_directory"]
+        return agent_function("temporary_directory")
 
     def test_the_base_stays_within_the_fixtures_budget(self):
         temporary_directory = self.scope()
@@ -626,10 +816,12 @@ cd "$HOME"
 ulimit -Sn 256
 # Its Cargo keeps intermediates outside the slot, as a build-dir setting in
 # its configuration would, and inside the stand-in's home, which the test
-# removes.
+# removes. A test may have it name every session that holds its CPUs.
 exec env -i CAGENTS_BUILD_REGISTRY= HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
-    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" \
+    CAGENTS_OFFLOAD_BUSIEST_SHOWN="${CAGENTS_OFFLOAD_BUSIEST_SHOWN-}" \
+    CAGENTS_OFFLOAD_BUSIEST_LEAST="${CAGENTS_OFFLOAD_BUSIEST_LEAST-}" sh -c "$*"
 """
 
 
@@ -1287,10 +1479,19 @@ class StandInHost(unittest.TestCase):
 
     def test_a_program_run_inside_exec_cannot_compile_through_absolute_cargo(self):
         self.shell_program()
+        # The program's $CARGO is the first `cargo` on this host's PATH. A
+        # shim such as mise's, outside a directory where it manages Rust,
+        # looks `cargo` up on PATH again, finds the gate's and builds on the
+        # build host, so nothing reaches the guard. rustup's Cargo, first
+        # here as on the build host, compiles here.
+        cargo = os.path.join(self.env["CARGO_HOME"], "bin", "cargo")
+        env = self.remote_env() | self.logging_rustc_wrapper()
+        env["PATH"] = os.pathsep.join([os.path.dirname(cargo), env["PATH"]])
         result = self.gate_run(
             "exec", "cargo", "run", "--quiet", "--", "-ec",
-            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; "$CARGO" build --bin probe',
-            env=self.remote_env() | self.logging_rustc_wrapper())
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; printf %s "$CARGO"; "$CARGO" build --bin probe',
+            env=env)
+        self.assertEqual(result.stdout, cargo, result.stderr)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("would compile on this host", result.stderr)
         self.assertEqual([path for path in (self.root / "local-build").rglob("probe*")
@@ -1582,6 +1783,35 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("waiting", result.stderr)
 
+    def test_a_wait_for_the_build_hosts_cpus_names_what_holds_them(self):
+        other = self.host_home / ".cache/cagents-offload/crate/slot-1"
+        other.mkdir(parents=True)
+        # Another build's lease holds a slot: a process of its own, which
+        # what this test starts is not below.
+        lease = self.scope.popen(
+            [sys.executable, "-c", "import fcntl, sys, time\nlock = open(sys.argv[1], 'a')\n"
+             "fcntl.flock(lock, fcntl.LOCK_EX)\nprint(flush=True)\ntime.sleep(600)", str(other / "lock")],
+            stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (lease.kill(), lease.wait(), lease.stdout.close()))
+        lease.stdout.readline()
+        write_figures(self.host_home / "figures", cpu=90)
+        # A runaway loop on the build host, in a session of its own.
+        runaway = self.scope.popen([f"runaway-{os.getpid()}", "-c", "while True: pass"],
+                                   executable=sys.executable, start_new_session=True)
+        self.addCleanup(lambda: (runaway.kill(), runaway.wait()))
+        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "4",
+                                   "CAGENTS_OFFLOAD_BUSIEST_SHOWN": "1000",
+                                   "CAGENTS_OFFLOAD_BUSIEST_LEAST": "0.05"}
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertRegex(result.stderr, r"waiting for CPU on stand-in: its CPU pressure is 90%, at or "
+                                        r"above the 40% limit; builds use \d+\.\d CPUs? and everything "
+                                        r"else \d+\.\d CPUs?; besides builds, the CPUs go to ")
+        self.assertRegex(result.stderr, rf"session {runaway.pid} \(runaway-{os.getpid()} -c while True: pass, "
+                                        rf"started \d+s ago\): \d+\.\d CPUs? in 1 process")
+        self.assertRegex(result.stderr, r"`ps -s \d+` there lists session \d+'s processes, and "
+                                        r"`pkill -s \d+` ends them|Session \d+ is ")
+
     def test_remote_commands_leave_no_core_dumps_unless_asked(self):
         (self.crate / "src/main.rs").write_text(textwrap.dedent("""
             fn main() {}
@@ -1692,16 +1922,23 @@ class RemoteRun(unittest.TestCase):
     """The build host's end of a command: it ends what it started when the
     connection to this host closes, outside any supervisor here."""
 
+    def agent(self, scope, *arguments, env=None, **options):
+        """Starts the build host's agent in `scope`, as ssh would there. Its
+        temporary directories go in the scope: by default they would go in
+        the runtime directory, which the host's own builds share."""
+        return scope.popen(
+            [sys.executable, "-c", offload.REMOTE_AGENT, *arguments],
+            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(scope.name, "cof"))}
+            | (env or {}), **options)
+
     def test_a_released_slot_waits_for_its_command_to_end(self):
         # A cancelled build closes the lease and the command's connections
         # together; the next build must not start in the slot while the
         # command's process group is still being ended.
         with FixtureDirectory() as scope:
             base = scope.name
-            lease = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
+            lease = self.agent(scope, "lease", base, "1", "key", "0", "",
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             self.assertRegex(offload.Lines(lease.stdout).next(10), r'^slot \{"index": 0, ')
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
@@ -1718,8 +1955,7 @@ class RemoteRun(unittest.TestCase):
             stale.write_text("")
             with open(Path(base, "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                prune = scope.popen([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base],
-                                         stdin=subprocess.PIPE)
+                prune = self.agent(scope, "prune", base, stdin=subprocess.PIPE)
                 prune.stdin.close()
                 with self.assertRaises(subprocess.TimeoutExpired):
                     prune.wait(timeout=1)
@@ -1734,10 +1970,8 @@ class RemoteRun(unittest.TestCase):
             Path(base, "slot-0").mkdir()
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                lease = scope.popen(
-                    [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                    env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
+                lease = self.agent(scope, "lease", base, "1", "key", "0", "",
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 lines = offload.Lines(lease.stdout)
                 # It says it is waiting, so a long wait is not taken for a
                 # host that does not answer.
@@ -1761,14 +1995,12 @@ class RemoteRun(unittest.TestCase):
         if figures is None:
             figures = Path(base, "figures")
             write_figures(figures)
-        lease = self.scope.popen(
-            [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, str(slots), "key", "0", "",
-             "", build],
+        lease = self.agent(
+            self.scope, "lease", base, str(slots), "key", "0", "", "", build,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
-                              "CAGENTS_BUILD_REGISTRY": str(registry),
-                              "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
-                              "CAGENTS_OFFLOAD_FIGURES": str(figures)} | (env or {}))
+            env={"CAGENTS_BUILD_REGISTRY": str(registry),
+                 "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
+                 "CAGENTS_OFFLOAD_FIGURES": str(figures)} | (env or {}))
         return lease, offload.Lines(lease.stdout)
 
     def hold(self, base, index, claim=None):
@@ -1857,7 +2089,14 @@ class RemoteRun(unittest.TestCase):
                 write_figures(stand_in, **figures)
                 self.hold(base, 0, {"cost": 1, "pid": None})
                 _, lines = self.lease(base, figures=stand_in)
-                self.assertEqual(lines.next(10), reason)
+                line = lines.next(10)
+                if reason.startswith("wait cpu "):
+                    # Followed by what holds the CPUs; the other slot's
+                    # holder here is the test, which spins on nothing.
+                    self.assertRegex(line, rf"^{reason} -- (nothing (else )?uses much|builds use "
+                                           rf"\d+\.\d CPUs? and everything else \d+\.\d CPUs?)")
+                else:
+                    self.assertEqual(line, reason)
                 with self.assertRaises(TimeoutError):
                     lines.next(1.5)
                 write_figures(stand_in)
@@ -1998,8 +2237,8 @@ class RemoteRun(unittest.TestCase):
     def run_agent(self, scope, base, command):
         Path(base, "src").mkdir(exist_ok=True)
         # Its standard input stays open: closing it cancels the command.
-        agent = scope.popen([sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                                  *command], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        agent = self.agent(scope, "run", base, ".", *command,
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         agent.stdin.write(b'{"environment": {}}\n')
         agent.stdin.flush()
         output = agent.stdout.read()
@@ -2043,9 +2282,8 @@ class RemoteRun(unittest.TestCase):
                         "CAGENTS_BUILD_REGISTRY": str(registry)}
             if least is not None:
                 settings["CAGENTS_OFFLOAD_TEST_LEAST_BYTES"] = str(least)
-            agent = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "run", str(base), ".", *command],
-                stdin=subprocess.PIPE, env=os.environ | settings)
+            agent = self.agent(scope, "run", str(base), ".", *command,
+                               stdin=subprocess.PIPE, env=settings)
             # A relocatable Python finds its library by its own path, which
             # its copies do not share.
             request = {"environment": {"PYTHONHOME": sys.base_prefix}}
@@ -2134,10 +2372,9 @@ class RemoteRun(unittest.TestCase):
             base = scope.name
             Path(base, "src").mkdir()
             marker = Path(base, "pid")
-            agent = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                 "sh", "-c", f"sleep 120 & echo $! >{marker}; wait"],
-                stdin=subprocess.PIPE, start_new_session=True)
+            agent = self.agent(scope, "run", base, ".",
+                               "sh", "-c", f"sleep 120 & echo $! >{marker}; wait",
+                               stdin=subprocess.PIPE, start_new_session=True)
             agent.stdin.write(b'{"environment": {}}\n')
             agent.stdin.flush()
             deadline = time.monotonic() + 10
@@ -2166,10 +2403,8 @@ class RemoteRun(unittest.TestCase):
             base = scope.name
             Path(base, "src").mkdir()
             # The connection stays open, as it does while the gate waits.
-            agent = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                 "sh", "-c", 'test "$PROBE" = x && exit 7'],
-                stdin=subprocess.PIPE)
+            agent = self.agent(scope, "run", base, ".", "sh", "-c", 'test "$PROBE" = x && exit 7',
+                               stdin=subprocess.PIPE)
             agent.stdin.write(b'{"environment": {"PROBE": "x"}}\n')
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
@@ -2183,9 +2418,8 @@ class RemoteRun(unittest.TestCase):
                 base = scope.name
                 Path(base, "src").mkdir()
                 # The agent starts low, as an ssh session's 1024 does.
-                agent = scope.popen(
-                    [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                     "sh", "-c", "ulimit -Sn"],
+                agent = self.agent(
+                    scope, "run", base, ".", "sh", "-c", "ulimit -Sn",
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard)))
                 # The connection stays open, as it does while the gate waits.

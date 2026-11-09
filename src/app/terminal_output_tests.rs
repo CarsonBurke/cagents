@@ -307,8 +307,6 @@ fn grid_output_keeps_workspace_and_protection_preparation_idle() {
     for index in 0..200 {
         let mut cold = template.clone();
         cold.id = CardId::new();
-        cold.exposure = Exposure::Offscreen;
-        cold.residency = Residency::Cold;
         Arc::make_mut(&mut app.durable).cards.push(cold);
         app.known_worktree_roots
             .insert(PathBuf::from(format!("/output-fixture/root-{index}")));
@@ -371,7 +369,7 @@ fn semantic_terminal_changes_invalidate_but_identical_reports_do_not() {
         }),
     );
     assert_eq!(counts(), (1, 1));
-    assert!(ended_terminal(app.card_state(card)).is_some());
+    assert!(app.ended_terminal(card).is_some());
 }
 
 fn title(text: &str) -> Option<WireTerminalEvent> {
@@ -477,7 +475,7 @@ fn a_title_with_a_semantic_change_still_projects_and_saves_everything() {
     assert_eq!(PERSISTS.get(), 1, "the completion is saved with the title");
     assert!(app.reported_title_save.cards.is_empty());
     assert_eq!(app.card_state(card).unwrap().title, "finished");
-    assert!(ended_terminal(app.card_state(card)).is_some());
+    assert!(app.ended_terminal(card).is_some());
 }
 
 /// Timers that only repaint elapsed time or progress change nothing the
@@ -597,7 +595,7 @@ fn root_exit_keeps_the_live_descendant_surface_and_controls() {
         }),
     );
     assert_eq!(counts(), (0, 0));
-    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.ended_terminal(card).is_none());
     assert!(matches!(
         app.cards.get(&card),
         Some(CardRuntime::Terminal(_))
@@ -1018,8 +1016,6 @@ fn refused_optimistic_channel_title_is_restored_by_equal_authoritative_read() {
         let repository = PathBuf::from("/title-refusal-fixture/.git");
         let mut chat = app.durable.cards[0].clone();
         chat.id = CardId::new();
-        chat.exposure = Exposure::Offscreen;
-        chat.residency = Residency::Cold;
         chat.kind = CardKind::Chat(crate::chat::Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -1326,7 +1322,7 @@ fn rejected_paste_keeps_the_actual_app_surface_proof_output_and_next_control() {
         matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
         if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
     );
-    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.ended_terminal(card).is_none());
     assert!(app.notices.entries.iter().any(|entry| {
         entry.notice.severity == NoticeSeverity::Warning
             && entry.notice.message.contains("input queue is full")
@@ -1416,7 +1412,7 @@ fn delayed_input_rejection_cannot_replace_a_newer_fatal_or_completed_terminal_ou
         app.status = Some(TransientNotice::warning("preserve existing notice"));
         drop(app.update(Message::TerminalWake { card, generation }));
         if completed {
-            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert!(app.ended_terminal(card).is_some());
             assert!(
                 app.notices
                     .entries
@@ -1484,7 +1480,7 @@ fn input_notice_preserves_the_actual_live_app_original_and_next_input() {
             if surface.terminal_id() == peer.handle.terminal_id()
                 && surface.host_proof() == Some(proof.clone())
     ));
-    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.ended_terminal(card).is_none());
     assert!(app.notices.entries.iter().any(|entry| {
         entry.notice.severity == NoticeSeverity::Warning && entry.notice.message == MESSAGE
     }));
@@ -1588,7 +1584,7 @@ fn late_input_notice_cannot_replace_a_fatal_or_completed_original() {
         }));
         drop(app.update(Message::TerminalWake { card, generation }));
         if completed {
-            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert!(app.ended_terminal(card).is_some());
             assert!(app.notices.entries.iter().any(|entry| {
                 entry.notice.severity == NoticeSeverity::Error
                     && entry.notice.message == "terminal exited with status 7"
@@ -1682,7 +1678,7 @@ fn local_relaunch_retires_old_unread_without_acknowledging_it_or_same_session_re
                     intentional: false,
                 }),
             );
-            assert!(ended_terminal(app.card_state(card)).is_some());
+            assert!(app.ended_terminal(card).is_some());
             assert_eq!(app.sidebar_state.card_activity(card), None);
             assert!(app.sidebar_state.has_card_update(card));
         }
@@ -1695,10 +1691,7 @@ fn local_relaunch_retires_old_unread_without_acknowledging_it_or_same_session_re
             panic!("retry keeps the terminal pane");
         };
         assert!(matches!(app.cards.get(&card), Some(CardRuntime::Loading)));
-        assert!(matches!(
-            app.card_state(card).unwrap().residency,
-            Residency::Hydrating { .. }
-        ));
+        assert!(matches!(*app.residency(card), Residency::Hydrating { .. }));
         assert_eq!(app.workspace.focused(), focused);
         assert_eq!(app.durable.focused, durable_focused);
         assert_eq!(current.launch, original.launch);
@@ -1811,7 +1804,7 @@ fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() 
         );
         assert_eq!(terminal_continuity(app.card_state(card)), Some(&continuity));
         assert!(
-            ended_terminal(app.card_state(card)).is_none(),
+            app.ended_terminal(card).is_none(),
             "a refusal is not an exit receipt"
         );
         assert_eq!(app.terminal_recovery_attempts, recovery_attempts);
@@ -1834,7 +1827,7 @@ fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() 
             }),
         );
         assert!(matches!(
-            &ended_terminal(app.card_state(card)).unwrap().continuity,
+            &app.ended_terminal(card).unwrap().continuity,
             TerminalContinuity::RelaunchAvailable { last_exit: Some(exit), .. }
                 if exit.code == Some(23) && exit.signal.is_none()
         ));
@@ -1842,10 +1835,7 @@ fn refused_key_before_completion_keeps_the_actual_app_surface_and_exit_status() 
             matches!(app.cards.get(&card), Some(CardRuntime::Terminal(surface))
             if surface.terminal_id() == peer.handle.terminal_id() && surface.host_proof() == Some(proof.clone()))
         );
-        assert_eq!(
-            app.card_state(card).unwrap().residency,
-            Residency::Hibernated
-        );
+        assert_eq!(*app.residency(card), Residency::Hibernated);
         assert!(
             app.notices
                 .entries
@@ -1886,7 +1876,7 @@ fn worker_closed_wording_in_a_real_wire_error_remains_fatal() {
         }),
     );
     assert!(matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))));
-    assert!(ended_terminal(app.card_state(card)).is_none());
+    assert!(app.ended_terminal(card).is_none());
     assert!(app.notices.entries.iter().any(|entry| {
         entry.notice.severity == NoticeSeverity::Error
             && entry
