@@ -916,6 +916,13 @@ impl PublishedState {
         self.archive_ready.notify_all();
     }
 
+    fn frozen(&self) -> bool {
+        matches!(
+            *self.archive.lock().unwrap_or_else(|p| p.into_inner()),
+            ArchivePhase::Frozen { .. }
+        )
+    }
+
     /// Whether `snapshot`, read from this state, is the screen the worker is
     /// showing now rather than one from before it was last hidden.
     fn presents(&self, snapshot: &RenderSnapshot) -> bool {
@@ -1314,8 +1321,13 @@ impl TerminalHandle {
         match receive.recv_timeout(Duration::from_secs(3)) {
             Ok(result) => result,
             // A completed terminal whose history could not be kept reports
-            // that as an event and keeps what it published.
-            Err(RecvTimeoutError::Disconnected) if !drawn || default_view => Ok(self.snapshot()),
+            // that as an event and keeps what it published. Only its archive
+            // drops a read unanswered; anything else that does is a failure.
+            Err(RecvTimeoutError::Disconnected)
+                if !drawn || (default_view && self.inner.published.frozen()) =>
+            {
+                Ok(self.snapshot())
+            }
             Err(error) => Err(error.to_string()),
         }
     }
