@@ -1732,7 +1732,8 @@ mod tests {
     #[test]
     fn work_watcher_reconnect_preserves_failed_backoff_but_refreshes_healthy_stale_data() {
         let handle = polling_handle();
-        let selected = vec![(PathBuf::from("/fixture/repo"), "repo".into())];
+        let selected: Vec<(PathBuf, String)> =
+            vec![(PathBuf::from("/fixture/repo"), "repo".into())];
         let deadline = {
             let mut shared = handle.shared();
             let tracked = shared.track(&selected[0].0, &selected[0].1);
