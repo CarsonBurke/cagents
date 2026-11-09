@@ -78,8 +78,11 @@ struct Row {
     summary: Option<Arc<scan::Summary>>,
     bytes: Option<u64>,
     /// What a query is matched against, lowercased once: the title and
-    /// place first, then everything else a reader may remember it by.
+    /// place first, each on its own so that where a word falls in one does
+    /// not depend on the other, then everything else a reader may remember
+    /// it by.
     title_key: String,
+    place_key: String,
     content_key: String,
     source: Source,
 }
@@ -106,6 +109,7 @@ impl Row {
             summary: None,
             bytes: None,
             title_key: String::new(),
+            place_key: String::new(),
             content_key: String::new(),
             source: Source::Saved(Box::new(entry)),
         };
@@ -126,6 +130,7 @@ impl Row {
             summary: Some(found.summary.clone()),
             bytes: Some(found.bytes),
             title_key: String::new(),
+            place_key: String::new(),
             content_key: String::new(),
             source: Source::Found(found),
         };
@@ -134,7 +139,8 @@ impl Row {
     }
 
     fn index(&mut self) {
-        self.title_key = format!("{} {}", self.title, self.place).to_lowercase();
+        self.title_key = self.title.to_lowercase();
+        self.place_key = self.place.to_lowercase();
         let summary = self.summary.as_deref();
         self.content_key = [
             self.provider.label(),
@@ -1889,7 +1895,11 @@ fn resume_matches(rows: &[Row], query: &str, scope: Option<&Scope>) -> (Vec<usiz
         .enumerate()
         .filter_map(|(index, row)| {
             let score = words.iter().try_fold(0, |total, word| {
-                let score = match crate::search_match::score(&row.title_key, word) {
+                let named = [&row.title_key, &row.place_key]
+                    .into_iter()
+                    .filter_map(|key| crate::search_match::score(key, word))
+                    .min();
+                let score = match named {
                     // A loose title match is weaker than the word itself
                     // anywhere in the conversation.
                     Some(score) if score < 4_000 => score,
@@ -2518,7 +2528,6 @@ mod tests {
     #[test]
     fn search_ranks_the_title_over_what_was_said_over_a_loose_match() {
         let directory = tempfile::tempdir().unwrap();
-        let mut app = crate::app::tests::context_inspector_test_app(false);
         let row = |title: &str, asked: &str, updated_at_unix_ms| {
             let mut found = found(directory.path(), title, updated_at_unix_ms);
             found.summary = Arc::new(scan::Summary {
@@ -2527,30 +2536,50 @@ mod tests {
             });
             Row::found(found, Provider::Claude, String::new(), "project".into())
         };
-        app.resume_ui.rows = vec![
+        let rows = vec![
             row("Rename the parser", "", 4),
             row("Sweep warnings", "the parser panics on empty input", 3),
             row("Port a rewrite", "", 2),
             row("Parser recovery", "", 1),
             row("Unrelated", "", 0),
         ];
-        let titles = |query: &str| {
-            let (visible, _) = resume_matches(&app.resume_ui.rows, query, None);
+        let titles = |rows: &[Row], query: &str| {
+            let (visible, _) = resume_matches(rows, query, None);
             visible
                 .into_iter()
-                .map(|index| app.resume_ui.rows[index].title.as_str())
+                .map(|index| rows[index].title.clone())
                 .collect::<Vec<_>>()
         };
         assert_eq!(
-            titles("parser"),
+            titles(&rows, "parser"),
             ["Parser recovery", "Rename the parser", "Sweep warnings"]
         );
-        assert_eq!(titles("prt rwrt"), ["Port a rewrite"]);
-        assert_eq!(titles("empty parser"), ["Sweep warnings"]);
+        assert_eq!(titles(&rows, "prt rwrt"), ["Port a rewrite"]);
+        assert_eq!(titles(&rows, "empty parser"), ["Sweep warnings"]);
         assert_eq!(
-            titles("").len(),
+            titles(&rows, "").len(),
             5,
             "an empty search lists everything, newest first"
+        );
+
+        // A word that names only where conversations ran matches them all
+        // alike, so they stay newest first rather than shortest title first.
+        let place = |title: &str, place: &str, updated_at_unix_ms| {
+            let found = found(directory.path(), title, updated_at_unix_ms);
+            Row::found(found, Provider::Claude, String::new(), place.into())
+        };
+        let rows = vec![
+            place(
+                "Move the billing exports to the new queue",
+                "old-migration",
+                3,
+            ),
+            place("Profile", "old-migration", 2),
+            place("Draft the release notes", "main", 1),
+        ];
+        assert_eq!(
+            titles(&rows, "old-migration"),
+            ["Move the billing exports to the new queue", "Profile"]
         );
     }
 
