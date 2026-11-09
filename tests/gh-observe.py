@@ -209,6 +209,21 @@ sys.exit(42)
         self.assertEqual(result.returncode, 42)
         self.assertEqual(result.stderr, b"gh: forbidden\n")
 
+    def test_attempt_is_logged_before_wait_and_one_notice_precedes_real_output(self):
+        state = Path(self.env["XDG_STATE_HOME"]) / "cagents/gh-observe"
+        state.mkdir(parents=True)
+        (state / "coordination.enabled").touch()
+        guard = observe.coordinator()
+        with guard.locked(state, "github.com") as data:
+            data["cooldown_until"] = __import__("time").time() + 0.3
+        result = self.invoke({**self.env, "CAGENTS_GH_COORDINATE": "1", "CAGENTS_GH_NONBLOCKING": "0"})
+        self.assertEqual(result.returncode, 42)
+        self.assertEqual(result.stderr.count(b"cagents-gh: waiting"), 1)
+        self.assertIn(b" UTC.\n", result.stderr)
+        self.assertTrue(result.stderr.endswith(b"gh: forbidden\n"))
+        events = [row["event"] for row in self.rows()]
+        self.assertEqual(events[:3], ["attempt", "waiting", "invocation"])
+
     def test_nonblocking_cooldown_exits_before_real_gh(self):
         state = Path(self.env["XDG_STATE_HOME"]) / "cagents/gh-observe"
         state.mkdir(parents=True)

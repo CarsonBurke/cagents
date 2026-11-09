@@ -1477,7 +1477,7 @@ names and endpoint paths can identify private repositories; keep raw logs
 local and publish only the needed aggregates. Remove old daily logs when the
 measurement no longer needs them.
 
-The wrapper execs the real gh with its original arguments, stdin and stdout;
+With coordination disabled, the wrapper execs the real gh with its original arguments, stdin and stdout;
 it filters injected HTTP debug from stderr. Explicit debug and interactive
 stderr retain their behavior and log invocations only, which the report marks
 as a coverage gap. Absolute gh paths, other hosts, connectors and Git's own
@@ -1496,6 +1496,11 @@ scripts/gh-observe coordinate off
 
 The coordinator honors `Retry-After`, exhausted-primary reset times and
 exponential secondary-limit backoff across new gh invocations on this host.
+Waiting shells receive one notice with the deadline, and attempts are logged
+before admission. Local diagnostics, configuration and credential helpers can
+still run. App requests opt into immediate deferral, so a long cooldown does
+not consume a process timeout or turn an unsubmitted write into an unknown
+outcome.
 It serializes recognized content-writing commands with eight seconds between
 starts, adding no automatic retries. A write's outcome remains gh's outcome.
 One gh invocation can send several content requests; aliases, extensions and

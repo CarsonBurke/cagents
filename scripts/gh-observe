@@ -252,11 +252,20 @@ def shim(real, args):
     if os.environ.get("CAGENTS_GH_OBSERVE") == "0":
         os.execv(real, [real, *args])
     metadata = context(args)
+    append({**metadata, "event": "attempt", "timestamp": stamp()})
     guard = coordinator()
     content_fd = None
     if guard is not None:
+        def waiting(details):
+            append({**metadata, **details, "event": "waiting", "timestamp": stamp()})
+            if details["reason"] == "rate_limit":
+                deadline = datetime.datetime.fromtimestamp(details["retry_at"], datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                message = f"cagents-gh: waiting for GitHub rate limit until {deadline}.\n"
+            else:
+                message = "cagents-gh: waiting for another GitHub content change or its spacing interval.\n"
+            os.write(2, message.encode())
         try:
-            content_fd = guard.before(state_dir(), args)
+            content_fd = guard.before(state_dir(), args, on_wait=waiting)
         except guard.Deferred as error:
             append({**metadata, "event": "invocation", "timestamp": stamp(), "detailed": False, "deferred": True, "retry_after": error.retry_after})
             os.write(2, error.stderr())

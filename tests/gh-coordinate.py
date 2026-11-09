@@ -118,10 +118,30 @@ class CoordinationTests(unittest.TestCase):
             state["cooldown_until"] = time.time() + 3600
             state["next_write"] = time.time() + 3600
         with patch.dict(os.environ, {"CAGENTS_GH_NONBLOCKING": "1"}):
-            for args in [["--version"], ["help", "pr"], ["completion"], ["auth", "token"], ["config", "set", "editor", "vi"], ["alias", "set", "x", "pr view"]]:
+            for args in [["--version"], ["help", "pr"], ["completion"], ["auth", "token"], ["auth", "git-credential", "get"], ["auth", "setup-git"], ["auth", "switch"], ["auth", "logout"], ["config", "set", "editor", "vi"], ["alias", "set", "x", "pr view"]]:
                 self.assertIsNone(coordinate.before(self.root, args), args)
         self.assertFalse(coordinate.local_command(["pr", "comment", "1", "--body", "--help"]))
         self.assertTrue(coordinate.is_write(["pr", "comment", "1", "--body", "--help"]))
+
+    def test_wait_callback_runs_once_per_block_with_fake_clock(self):
+        with coordinate.locked(self.root, "github.com") as state:
+            state["cooldown_until"] = 103
+        notices = []
+        with patch.object(coordinate.time, "time", side_effect=[100, 101, 102, 103]), patch.object(coordinate.time, "sleep") as sleep:
+            self.assertIsNone(coordinate.before(self.root, ["pr", "view", "1"], on_wait=notices.append))
+        self.assertEqual(notices, [{"reason": "rate_limit", "retry_at": 103}])
+        self.assertEqual(sleep.call_count, 3)
+
+    def test_local_credential_helpers_remain_silent_and_network_auth_does_not_bypass(self):
+        with coordinate.locked(self.root, "github.com") as state:
+            state["cooldown_until"] = time.time() + 3600
+        notices = []
+        with patch.dict(os.environ, {"CAGENTS_GH_NONBLOCKING": "1"}):
+            self.assertIsNone(coordinate.before(self.root, ["auth", "git-credential", "get"], on_wait=notices.append))
+            for verb in ("status", "login", "refresh"):
+                with self.assertRaises(coordinate.Deferred):
+                    coordinate.before(self.root, ["auth", verb], on_wait=notices.append)
+        self.assertEqual(notices, [])
 
     def test_nonblocking_server_cooldown_is_explicit_and_cleans_ticket(self):
         with coordinate.locked(self.root, "github.com") as state:

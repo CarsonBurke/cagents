@@ -127,7 +127,7 @@ def local_command(args):
         elif arg in {"--help", "-h", "--version"}:
             return True
     words = positionals(args)
-    return bool(words and (words[0] in {"help", "version", "completion", "config", "alias"} or words[:2] == ["auth", "token"]))
+    return bool(words and (words[0] in {"help", "version", "completion", "config", "alias"} or (len(words) > 1 and words[0] == "auth" and words[1] in {"token", "git-credential", "setup-git", "switch", "logout"})))
 
 
 def is_write(args):
@@ -242,7 +242,7 @@ def observed(root, row, now=None):
         pass
 
 
-def before(root, args):
+def before(root, args, on_wait=None):
     """Wait before a new invocation; return an exec-inheritable content lock.
 
     The caller must close this fd in the telemetry child so only real gh owns
@@ -257,6 +257,7 @@ def before(root, args):
     directory, key = paths(root, host)
     ticket = None
     content_fd = None
+    announced = False
     try:
         if write:
             ticket = directory / f"{key}.{time.time_ns()}.{os.getpid()}.ticket"
@@ -268,6 +269,7 @@ def before(root, args):
             with locked(root, host) as state:
                 now = time.time()
                 until = state.get("cooldown_until", 0)
+                waiting = {"reason": "rate_limit", "retry_at": until} if until > now else {"reason": "content"}
                 if nonblocking and until > now:
                     raise Deferred("GitHub requests are paused by the shared rate limit.", math.ceil(until - now))
                 if write:
@@ -302,6 +304,13 @@ def before(root, args):
                     raise Deferred("Another GitHub content change is waiting or in progress.")
                 if until > now:
                     delay = min(1.0, max(0.1, until - now))
+            if not announced and on_wait is not None:
+                # Emit outside the admission lock: stderr may be a slow pipe.
+                announced = True
+                try:
+                    on_wait(waiting)
+                except OSError:
+                    pass
             time.sleep(delay)
     finally:
         if ticket is not None:
