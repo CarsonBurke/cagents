@@ -579,6 +579,13 @@ at a time, under the registry's `.decision` lock. A slot held by a plain
 `flock`, by a gate from before the registry or by an offload agent sent from
 such a checkout writes no record, so only its own family prices it.
 
+When room refuses a build whose own slot is free, the gate names the build
+host and reports the available memory, the memory still reserved for running
+builds, and this build's expected cost. A slot/queue message still describes a
+slot/queue wait. Memory diagnostics use the same snapshot as the admission
+decision and print after releasing its registry lock, once per memory-wait
+episode.
+
 So that no build waits forever behind smaller ones from other families that
 keep fitting, a build refused room while it holds a free slot records itself
 as waiting. Once refused for 120 seconds (`CAGENTS_BUILD_WAIT_PRIORITY_SECS`,
@@ -588,6 +595,18 @@ pressure. Only one such build ramps up at a time: while one admitted that way
 started less than 10 minutes ago and its holder lives, the next waits. Time
 spent queued behind its own family, or waiting for one of its slots, does not
 count, and a build no longer refused for 10 seconds loses its place.
+
+Set `CAGENTS_BUILD_PRIORITY=urgent` for urgent work (`normal` is the default).
+It changes only the order among room waiters that have already passed their
+overdue age: urgent first, then refusal age and PID. It does not skip a family's
+FIFO queue, grant ordinary resource admission, reduce the overdue age or bypass
+the current overdue build's 600-second ramp. An urgent waiter that is still too
+young cannot block an eligible normal one. Offload carries the priority to the
+build host; legacy one-line waiter records count as normal. The gate does not
+infer urgency from a lock file's name.
+
+UI builds retain their 9 GiB expected cost. A warm incremental result alone
+cannot price a future command whose dependencies may have changed.
 
 The first slot is the plain lock file `/var/tmp/cagents-cargo.lock`, so a
 command still run under `flock --close /var/tmp/cagents-cargo.lock` takes exactly

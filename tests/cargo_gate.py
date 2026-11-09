@@ -1990,6 +1990,45 @@ class HostRegistry(TwoSlots):
         self.other = self.env | {"CAGENTS_BUILD_LOCK": str(self.root / "other.lock"),
                                  "CAGENTS_BUILD_SLOTS": "1"}
 
+    def test_memory_wait_names_host_and_all_reservations_with_a_free_slot(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "0"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        with self.assertRaises(subprocess.TimeoutExpired) as expired:
+            self.build(1, timeout=2, env=env)
+        errors = expired.exception.stderr or ""
+        if isinstance(errors, bytes):
+            errors = errors.decode()
+        self.assertIn("waiting for memory on", errors)
+        self.assertIn("GiB available, running builds reserve", errors)
+        self.assertIn("this build expects 1.0 GiB", errors)
+        self.assertEqual(errors.count("waiting for memory on"), 1)
+
+    def test_legacy_waiter_records_keep_normal_fifo_priority(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        other = self.registry / "wait-offload-legacy"
+        identity = f"{os.getpid()} {start_time(os.getpid())}"
+        other.write_text(f"{identity} {uptime() - 60} {uptime()}\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+
+    def test_urgent_rank_applies_only_to_eligible_room_waiters(self):
+        env = self.with_memory(8) | {"CAGENTS_BUILD_WAIT_PRIORITY_SECS": "1"}
+        self.held_elsewhere(f"{os.getpid()} {8 * 2**20}\n0\n{{lock}}\n")
+        other = self.registry / "wait-offload-other"
+        identity = f"{os.getpid()} {start_time(os.getpid())}"
+        # Urgent wins against an older ordinary waiter without bypassing its age.
+        other.write_text(f"{identity} {uptime() - 60} {uptime()}\nnormal\n")
+        result = self.build(1, timeout=10, env=env | {"CAGENTS_BUILD_PRIORITY": "urgent"})
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # An eligible urgent waiter blocks an ordinary one even when newer.
+        other.write_text(f"{identity} {uptime() - 2} {uptime()}\nurgent\n")
+        with self.assertRaises(subprocess.TimeoutExpired):
+            self.build(1, timeout=3, env=env)
+        # A not-yet-eligible urgent record cannot block an eligible ordinary one.
+        other.write_text(f"{identity} {uptime() + 60} {uptime()}\nurgent\n")
+        self.assertEqual(self.build(1, timeout=10, env=env).returncode, 0)
+
     def test_a_build_in_another_family_is_priced_beside_this_one(self):
         self.hold(1, env=self.other)
         [entry] = records(self.registry)

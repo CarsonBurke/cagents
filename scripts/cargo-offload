@@ -1791,7 +1791,7 @@ def uptime():
         return int(float(file.read().split()[0]))
 
 
-def record_refusal(slot, since, now):
+def record_refusal(slot, since, now, priority="normal"):
     """Records the build in `slot` as refused room since `since` and again at
     `now`, so that another family's build can tell which of them has been
     refused longest."""
@@ -1799,7 +1799,7 @@ def record_refusal(slot, since, now):
         try:
             pid = os.getpid()
             write_record(registry_entry(slot, "wait-offload-"),
-                         f"{pid} {start_time(pid)} {since} {now}\n")
+                         f"{pid} {start_time(pid)} {since} {now}\n{priority}\n")
         except OSError:
             pass
 
@@ -1812,7 +1812,7 @@ def forget_wait(slot):
             pass
 
 
-def overdue(slot, since):
+def overdue(slot, since, priority="normal"):
     """Whether the build in `slot`, refused room since `since`, has been
     refused for the priority time, longer than every other build refused on
     the host now, and no build admitted that way may still be ramping up."""
@@ -1840,7 +1840,9 @@ def overdue(slot, since):
                 other, started, other_since, last = (int(field) for field in text[0].split())
             except ValueError:
                 continue
-            if (now - last <= WAIT_FRESH and (other_since, other) < (since, pid)
+            rank = lambda value: 0 if value == "urgent" else 1
+            if (now - last <= WAIT_FRESH and now - other_since >= WAIT_PRIORITY
+                    and (rank(text[1]), other_since, other) < (rank(priority), since, pid)
                     and start_time(other) == started):
                 return False
         elif name.startswith(("gate-", "offload-")) and text[3] == "overdue":
@@ -1907,6 +1909,9 @@ if command == "lease":
     # The checkout and Cargo command this build is: another request for the
     # same one waits for its slot rather than build it again elsewhere.
     build = sys.argv[8] if len(sys.argv) > 8 else ""
+    priority = sys.argv[10] if len(sys.argv) > 10 else "normal"
+    if priority not in ("normal", "urgent"):
+        sys.exit("CAGENTS_BUILD_PRIORITY must be normal or urgent")
     # The most incremental compilation state the slot keeps, in GiB.
     budget = int(sys.argv[9]) * GIB if len(sys.argv) > 9 and sys.argv[9] else INCREMENTAL_BUDGET
     os.makedirs(base, exist_ok=True)
@@ -2036,7 +2041,7 @@ if command == "lease":
         with deciding():
             why = room(base, slot, cost)
             late = (why is not None and refused_since is not None
-                    and uptime() - refused_last <= WAIT_FRESH and overdue(slot, refused_since))
+                    and uptime() - refused_last <= WAIT_FRESH and overdue(slot, refused_since, priority))
             if why is None or late:
                 register(slot, cost, None, overdue=late)
                 forget_wait(slot)
@@ -2045,7 +2050,7 @@ if command == "lease":
             if refused_since is None or now - refused_last > WAIT_FRESH:
                 refused_since = now
             refused_last = now
-            record_refusal(slot, refused_since, now)
+            record_refusal(slot, refused_since, now, priority)
         if why.split()[0] != waiting:
             if why.startswith("cpu "):
                 # Named once, as the wait starts, outside the decision:
@@ -2453,6 +2458,10 @@ class Offload:
                 raise Refusal(f"offloaded tests require memory-capped beside cargo-offload: {error}") from error
         self.plan = plan
         self.environment = environment
+        self.priority = environment.get("CAGENTS_BUILD_PRIORITY", "normal")
+        if self.priority not in ("normal", "urgent"):
+            say("CAGENTS_BUILD_PRIORITY must be normal or urgent")
+            sys.exit(2)
         self.slots = positive(environment, "CAGENTS_BUILD_REMOTE_SLOTS", 8)
         # Unset: the host shares its CPUs among the builds running there.
         self.jobs = positive(environment, "CAGENTS_BUILD_REMOTE_JOBS", 0) or None
@@ -2759,7 +2768,7 @@ class Offload:
             self.remote("lease", base, self.slots, f"{os.uname().nodename}:{top}", self.floor,
                         profile_config(os.path.expanduser("~/.cargo/config.toml")), self.cost,
                         self.build_identity(os.path.relpath(os.path.realpath(os.getcwd()), top)),
-                        self.incremental),
+                        self.incremental, self.priority),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
         )
         lines = Lines(lease.stdout)

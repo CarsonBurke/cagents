@@ -34,7 +34,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=23
+gate_version=24
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -79,10 +79,21 @@ fail() {
     exit 2
 }
 
+# Urgency changes only which already-overdue room waiter gets the next ramp.
+build_priority=${CAGENTS_BUILD_PRIORITY-normal}
+case $build_priority in
+    normal|urgent) ;;
+    *) fail 'CAGENTS_BUILD_PRIORITY must be normal or urgent' ;;
+esac
+
 usage() {
     cat <<'EOF'
 Usage: scripts/cargo-gate [cargo] SUBCOMMAND [ARGS...]
        scripts/cargo-gate exec [--hold] COMMAND [ARGS...]
+
+CAGENTS_BUILD_PRIORITY=urgent ranks an already-overdue room waiter ahead of
+ordinary overdue waiters (default: normal). It bypasses neither the slot FIFO,
+ordinary resource admission, the overdue age nor the single-overdue ramp.
 
 Rust compiles only on the build host in CAGENTS_BUILD_REMOTE, through
 scripts/cargo-offload: in one of its build slots, with this checkout's
@@ -614,7 +625,7 @@ record_refusal() {
     [ -z "$refused_written" ] || [ $((now - refused_written)) -ge 2 ] || return 0
     refused_written=$now
     entry=$(wait_entry)
-    if { printf '%s %s %s %s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" >"$entry.new" &&
+    if { printf '%s %s %s %s\n%s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" "$build_priority" >"$entry.new" &&
         mv -f -- "$entry.new" "$entry"; } 2>/dev/null; then
         wait_recorded=yes
     fi
@@ -658,8 +669,15 @@ overdue() {
         read -r pid started since last <"$entry" 2>/dev/null || continue
         case $pid:$started:$since:$last in *[!0-9:]*|*::*|:*|*:) continue ;; esac
         [ $((now - last)) -le "$wait_fresh" ] || continue
-        [ "$since" -lt "$refused_since" ] ||
-            { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        [ $((now - since)) -ge "$priority_secs" ] || continue
+        other_priority=$(sed -n 2p "$entry" 2>/dev/null) || other_priority=normal
+        case $other_priority in normal|urgent) ;; *) other_priority=normal ;; esac
+        if [ "$other_priority" != "$build_priority" ]; then
+            [ "$other_priority" = urgent ] || continue
+        else
+            [ "$since" -lt "$refused_since" ] ||
+                { [ "$since" -eq "$refused_since" ] && [ "$pid" -lt "$$" ]; } || continue
+        fi
         [ "$(start_time "$pid")" = "$started" ] || continue
         return 1
     done
@@ -676,6 +694,7 @@ overdue() {
 # number of other builds. Only gated waiters take the extra slots, and they
 # hold the queue lock while choosing one.
 fits() {
+    room_notice=
     running=0
     claims=
     newest=
@@ -726,7 +745,22 @@ memory_fits() {
             print total
         }') || outstanding=
     [ -n "$outstanding" ] || outstanding=$((running * 9 * gib))
-    [ $(($(available_kib) - outstanding)) -ge "$cost" ]
+    room_available=$(available_kib)
+    [ $((room_available - outstanding)) -lt "$cost" ] || return 0
+    room_notice="$room_available $outstanding $cost"
+    return 1
+}
+
+name_memory_wait() {
+    if [ -n "${room_notice:-}" ]; then
+        if [ "${room_announced:-}" != yes ]; then
+            printf '%s\n' "$room_notice" | awk -v host="$(hostname)" -v program="$program" '
+                { printf "%s: waiting for memory on %s: %.1f GiB available, running builds reserve %.1f GiB, this build expects %.1f GiB\n", program, host, $1/1048576, $2/1048576, $3/1048576 }' >&2
+            room_announced=yes
+        fi
+    else
+        room_announced=
+    fi
 }
 
 # Holds a slot on descriptor 9 until release. Gated waiters line up on a
@@ -792,6 +826,7 @@ acquire() {
             fi
             record_refusal
             decided
+            name_memory_wait
             flock -u 9
             exec 9>&-
             name_culprits
@@ -834,6 +869,7 @@ acquire() {
         done
         [ "$fit" != no ] || record_refusal
         decided
+        name_memory_wait
         name_culprits
         announce
         sleep 0.2
@@ -890,7 +926,11 @@ admitted() {
     fi
     decided
     if [ -n "$late" ]; then
-        printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
+        if [ "$build_priority" = urgent ]; then
+            printf '%s: urgent build is overdue; starting beside the running builds\n' "$program" >&2
+        else
+            printf '%s: refused room longest on this host; starting beside the running builds\n' "$program" >&2
+        fi
     fi
     exec 8>&-
     # Each build gets a share of the CPUs among the builds running once it

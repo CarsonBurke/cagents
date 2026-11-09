@@ -315,6 +315,41 @@ def agent_function(name):
     return scope[name]
 
 
+class OverduePriority(unittest.TestCase):
+    def test_priority_only_reorders_eligible_waiters_and_preserves_ramp(self):
+        with tempfile.TemporaryDirectory() as root:
+            registry = Path(root)
+            slot = str(registry / "slot")
+            scope = agent_scope()
+            scope.update(REGISTRY=root, WAIT_PRIORITY=10, WAIT_FRESH=10, OVERDUE_RAMP=600,
+                         uptime=lambda: 1000, start_time=lambda pid: 123,
+                         leased_lock=lambda path: True)
+            other = registry / "wait-gate-other"
+            def refused(priority, since, *, started=123, last=1000):
+                other.write_text(f"{os.getpid()} {started} {since} {last}\n{priority}\n")
+            refused("normal", 800)
+            self.assertTrue(scope["overdue"](slot, 900, "urgent"))
+            self.assertFalse(scope["overdue"](slot, 900, "normal"))
+            refused("urgent", 950)
+            self.assertFalse(scope["overdue"](slot, 900, "normal"))
+            refused("urgent", 999)
+            self.assertTrue(scope["overdue"](slot, 900, "normal"))
+            refused("urgent", 800, started=124)
+            self.assertTrue(scope["overdue"](slot, 900, "normal"))
+            refused("urgent", 800, last=980)
+            self.assertTrue(scope["overdue"](slot, 900, "normal"))
+            lock = registry / "running.lock"
+            lock.touch()
+            (registry / "gate-running").write_text(f"{os.getpid()} 1\n990\n{lock}\noverdue\n")
+            self.assertFalse(scope["overdue"](slot, 900, "urgent"))
+
+    def test_invalid_priority_is_refused_before_a_lease(self):
+        for value in ("", "high", "URGENT"):
+            with self.subTest(value=value), self.assertRaises(SystemExit) as error:
+                offload.Offload("fw16", None, {"CAGENTS_BUILD_PRIORITY": value})
+            self.assertEqual(error.exception.code, 2)
+
+
 class Resident(unittest.TestCase):
     def test_a_process_tree_holds_its_descendants_memory(self):
         with FixtureDirectory() as scope:
