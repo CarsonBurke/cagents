@@ -69,6 +69,10 @@ pub struct Plan {
     /// Where the plan was read from, resolved.
     #[serde(skip)]
     pub path: PathBuf,
+    /// The SHA-256 of the plan's bytes, which names this workspace: a plan
+    /// generated again at the same path is another workspace.
+    #[serde(skip)]
+    pub digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -223,19 +227,61 @@ impl PlanScope {
 }
 
 /// What every seeded recipe points inside the root, as HOME is.
-const PROVIDER_HOMES: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+/// Where a launch finds its configuration, logins and state: the person's
+/// own unless the recipe names the fixture's.
+const FIXTURE_HOMES: [&str; 7] = [
+    "HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_STATE_HOME",
+    "XDG_CACHE_HOME",
+];
 
-/// The credentials a provider would prefer over its (fixture) login. A seeded
-/// launch removes them, so it never runs on the person's keys.
-fn unset_credentials() -> std::collections::BTreeSet<String> {
+/// What else the app's own environment may carry that reaches the person's
+/// accounts or desktop: forge tokens, the SSH agent, askpass helpers, the
+/// display and the session bus.
+const PERSONAL: [&str; 11] = [
+    "GH_TOKEN",
+    "GITHUB_TOKEN",
+    "GH_ENTERPRISE_TOKEN",
+    "GITHUB_ENTERPRISE_TOKEN",
+    "SSH_AUTH_SOCK",
+    "SSH_AGENT_PID",
+    "SSH_ASKPASS",
+    "GIT_ASKPASS",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+];
+
+/// What a seeded launch removes from the environments the app layers under
+/// it: the credentials a provider would prefer over its (fixture) login, and
+/// [`PERSONAL`].
+fn unset_personal() -> std::collections::BTreeSet<String> {
     [
         crate::agent::Provider::Claude,
         crate::agent::Provider::Codex,
     ]
     .into_iter()
     .flat_map(crate::account::credential_overrides)
+    .chain(PERSONAL.iter())
     .map(|variable| (*variable).to_owned())
     .collect()
+}
+
+/// Whether `path` names something inside `root` as written, with no `.` or
+/// `..` that could lead out of it.
+fn inside(root: &Path, path: &Path) -> bool {
+    path.is_absolute()
+        && path.starts_with(root)
+        && path.components().all(|component| {
+            matches!(
+                component,
+                std::path::Component::RootDir | std::path::Component::Normal(_)
+            )
+        })
 }
 
 impl Plan {
@@ -243,6 +289,13 @@ impl Plan {
     pub fn load(path: &Path) -> Result<Self, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|error| format!("Cannot read the plan {}: {error}", path.display()))?;
+        let digest = {
+            use sha2::Digest as _;
+            sha2::Sha256::digest(text.as_bytes())
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
         let header: serde_json::Value = serde_json::from_str(&text)
             .map_err(|error| format!("{} is not a plan: {error}", path.display()))?;
         let format = header["format"].as_u64().unwrap_or(0);
@@ -261,6 +314,7 @@ impl Plan {
                 path.display()
             )
         })?;
+        plan.digest = digest;
         plan.path = path
             .canonicalize()
             .map_err(|error| format!("Cannot resolve {}: {error}", path.display()))?;
@@ -274,6 +328,22 @@ impl Plan {
                 path.display(),
                 plan.root.display()
             ));
+        }
+        // An owner names the avatar's file in the plan and in the cache.
+        for project in &plan.projects {
+            if let Some(avatar) = &project.avatar
+                && (avatar.owner.is_empty()
+                    || !avatar
+                        .owner
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-'))
+            {
+                return Err(format!(
+                    "{} names the avatar owner {:?}, which is not a GitHub login.",
+                    path.display(),
+                    avatar.owner
+                ));
+            }
         }
         Ok(plan)
     }
@@ -308,10 +378,10 @@ impl Plan {
         // Each layer the app adds sits under the recipe: the daemon's and the
         // window's own environments, which may name the person's provider
         // homes or credentials. A seeded launch must only reach the fixture's.
-        for variable in PROVIDER_HOMES {
+        for variable in FIXTURE_HOMES {
             if !environment
                 .get(variable)
-                .is_some_and(|path| Path::new(path).starts_with(&self.root))
+                .is_some_and(|path| inside(&self.root, Path::new(path)))
             {
                 return Err(format!(
                     "The plan's environment {name} does not set {variable} inside {}. Generate it \
@@ -325,7 +395,7 @@ impl Plan {
             arguments: arguments.to_vec(),
             working_directory: cwd.to_owned(),
             environment,
-            unset_environment: unset_credentials(),
+            unset_environment: unset_personal(),
         })
     }
 
@@ -506,7 +576,7 @@ mod tests {
                 }) => recipe.clone(),
                 _ => continue,
             };
-            for variable in PROVIDER_HOMES {
+            for variable in FIXTURE_HOMES {
                 let path = Path::new(&recipe.environment[variable]);
                 assert!(
                     path.starts_with(&plan.root),
@@ -527,12 +597,47 @@ mod tests {
                 "CLAUDE_CODE_OAUTH_TOKEN",
                 "OPENAI_API_KEY",
                 "CODEX_API_KEY",
+                "GH_TOKEN",
+                "SSH_AUTH_SOCK",
+                "DBUS_SESSION_BUS_ADDRESS",
             ] {
                 assert!(recipe.unset_environment.contains(key), "{key}");
             }
             launches += 1;
         }
         assert!(launches > 10, "{launches}");
+    }
+
+    #[test]
+    fn a_home_that_climbs_out_of_the_root_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut plan = test_support::small(directory.path());
+        let escaped = format!("{}/../../.claude", plan.root.display());
+        for environment in plan.environments.values_mut() {
+            environment.insert("CLAUDE_CONFIG_DIR".into(), escaped.clone());
+        }
+        let chat = plan
+            .cards
+            .iter()
+            .find(|card| matches!(card.kind, Kind::Chat { .. }))
+            .unwrap();
+        let error = plan.card_state(chat).unwrap_err();
+        assert!(error.contains("CLAUDE_CONFIG_DIR"), "{error}");
+    }
+
+    #[test]
+    fn an_avatar_owner_that_names_a_path_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let mut text: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&plan.path).unwrap()).unwrap();
+        text["projects"][0]["avatar"] = serde_json::json!({
+            "owner": "../../escape",
+            "color": [0, 0, 0],
+        });
+        std::fs::write(&plan.path, serde_json::to_vec(&text).unwrap()).unwrap();
+        let error = Plan::load(&plan.path).unwrap_err();
+        assert!(error.contains("not a GitHub login"), "{error}");
     }
 
     #[test]

@@ -110,10 +110,12 @@ class Planner:
 
     def environment(self, stream, size):
         """A launch's inherited environment. It points at the fixture's own
-        home, provider homes and state, never the person's, and carries no
-        display or session bus address. The app layers it over its own
-        environment, so the provider homes are named here even though they are
-        the defaults under HOME; the appliers also unset provider credentials."""
+        home, provider homes and state, never the person's. The app layers it
+        over its own environment, so the provider homes are named here even
+        though they are the defaults under HOME, and the appliers unset what
+        that environment may carry to the person's accounts and desktop:
+        provider and forge credentials, the SSH agent, the display and the
+        session bus."""
         base = {
             "HOME": self.home,
             "CLAUDE_CONFIG_DIR": f"{self.home}/.claude",
