@@ -2656,7 +2656,7 @@ impl Cagents {
         Task::batch(
             updates
                 .into_iter()
-                .map(|update| self.apply_viewport(update, false, false))
+                .map(|update| self.apply_viewport(update, false, DurableChange::None))
                 .chain(std::iter::once(lifecycle)),
         )
     }
@@ -5299,7 +5299,7 @@ mod tests {
         app.workspace_model.views = vec![view.clone()];
         drop(app.reconcile_shared_views());
         let update = app.workspace.focus(second.id).unwrap();
-        drop(app.apply_viewport(update, false, false));
+        drop(app.apply_viewport(update, false, DurableChange::None));
         assert_eq!(app.durable.focused, Some(second.id));
         crate::persistence::validate_workspace(&app.persistent_workspace()).unwrap();
 

@@ -7846,7 +7846,11 @@ impl Cagents {
         };
         // The new pane's input takes the keyboard through the workspace's
         // focus request, now if it is drawn or once it starts.
-        Task::batch([skills, self.apply_viewport(update, true, false), title])
+        Task::batch([
+            skills,
+            self.apply_viewport(update, true, DurableChange::None),
+            title,
+        ])
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -10122,7 +10126,7 @@ impl Cagents {
             self.workspace
                 .focus(*card)
                 .ok()
-                .map(|update| self.apply_viewport(update, true, false))
+                .map(|update| self.apply_viewport(update, true, DurableChange::None))
         } else {
             None
         };
@@ -21592,7 +21596,7 @@ mod tests {
         let first = live_chat(&mut app, Some("menu-first"));
         let second = live_chat(&mut app, Some("menu-second"));
         let update = app.workspace.resize_viewport(3_000.0);
-        let _ = app.apply_viewport(update, false, true);
+        let _ = app.apply_viewport(update, false, DurableChange::Content);
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::PointerRested(second),
@@ -23694,12 +23698,9 @@ mod tests {
         snapshot.queued_messages.remove(0);
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
-        let saves = crate::app::terminal_output_tests::persist_count();
+        let saves = crate::app::terminal_output_tests::persists();
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-        assert_eq!(
-            crate::app::terminal_output_tests::persist_count(),
-            saves + 1
-        );
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
         assert_eq!(
             app.persistent_workspace().chat_waiting_messages[&card].messages,
             &saved_queue()[1..]
@@ -23709,10 +23710,7 @@ mod tests {
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-        assert_eq!(
-            crate::app::terminal_output_tests::persist_count(),
-            saves + 1
-        );
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
         provider_drops(&mut app, target, &handle, "queued-2", None);
         assert!(
             !app.persistent_workspace()
@@ -23760,9 +23758,9 @@ mod tests {
                 .map(|draft| draft.trim()),
             Some("first task\nstill typing")
         );
-        let saves = crate::app::terminal_output_tests::persist_count();
+        let saves = crate::app::terminal_output_tests::persists();
         settle(&mut app, card, Ok(()));
-        assert!(crate::app::terminal_output_tests::persist_count() > saves);
+        assert!(crate::app::terminal_output_tests::persists() > saves);
         assert_eq!(
             app.persistent_workspace()
                 .chat_drafts
@@ -23795,21 +23793,15 @@ mod tests {
         snapshot.queued_messages.remove(0);
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
-        let saves = crate::app::terminal_output_tests::persist_count();
+        let saves = crate::app::terminal_output_tests::persists();
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-        assert_eq!(
-            crate::app::terminal_output_tests::persist_count(),
-            saves + 1
-        );
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
         assert_eq!(
             app.persistent_workspace().chat_waiting_messages[&card].messages,
             &saved_queue()[1..]
         );
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
-        assert_eq!(
-            crate::app::terminal_output_tests::persist_count(),
-            saves + 1
-        );
+        assert_eq!(crate::app::terminal_output_tests::persists(), saves + 1);
     }
 
     /// An open conversation whose daemon went away, or whose provider ended,

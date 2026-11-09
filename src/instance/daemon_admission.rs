@@ -844,7 +844,7 @@ mod tests {
             libc::LOCK_EX | libc::LOCK_NB,
         )
         .unwrap();
-        publish_capability(&mut lease.0).unwrap();
+        publish_capability(lease.file_mut()).unwrap();
         assert!(admit_windows(runtime.path()).is_ok());
         let mut capability = WindowCapability {
             format: 1,

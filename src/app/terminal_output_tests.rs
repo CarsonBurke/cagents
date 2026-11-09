@@ -46,8 +46,8 @@ pub(super) fn record_card_index() {
 pub(super) fn record_persist() {
     PERSISTS.set(PERSISTS.get() + 1);
 }
-/// How many times this thread's windows have saved their workspace.
-pub(super) fn persist_count() -> usize {
+/// How many times this thread has handed the workspace to the writer.
+pub(super) fn persists() -> usize {
     PERSISTS.get()
 }
 fn counts() -> (usize, usize) {
@@ -495,8 +495,15 @@ fn repaint_ticks_skip_the_projection_tail() {
     }
     assert_eq!((counts(), CHROME_SYNCS.get()), ((0, 0), 0));
     assert!(Arc::ptr_eq(&durable, &app.durable));
+    // So does a navigation save timer whose burst another save carried.
+    assert!(!app.navigation_save_pending);
+    drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+    assert_eq!(
+        (counts(), CHROME_SYNCS.get(), PERSISTS.get()),
+        ((0, 0), 0, 0)
+    );
     // Any other message still projects.
-    drop(app.update(Message::FocusSaveDue));
+    drop(app.update(Message::ReportedTitleSaveDue));
     assert_eq!((counts(), CHROME_SYNCS.get()), ((1, 1), 1));
 }
 
@@ -508,7 +515,7 @@ fn card_indices_rebuild_only_for_a_changed_workspace() {
     drop(app.sync_chrome());
     reset();
     drop(app.sync_chrome());
-    drop(app.update(Message::FocusSaveDue));
+    drop(app.update(Message::ReportedTitleSaveDue));
     assert_eq!(CHROME_SYNCS.get(), 2);
     assert_eq!(
         CARD_INDEXES.get(),

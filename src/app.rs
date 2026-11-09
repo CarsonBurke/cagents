@@ -1427,12 +1427,28 @@ impl Default for PanePresence {
     }
 }
 
-/// How long a change of focus alone waits to be saved. Focus moves in bursts -
-/// a held navigation key, a pointer resting on one pane after another - and
-/// each save copies the workspace and every chat draft on the UI thread, so a
-/// burst is saved once, at its first move plus this delay. Any other save in
-/// between carries the focus with it.
-const FOCUS_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// How long a change of where this window is - its focus, channel or
+/// worktree - waits to be saved. Navigation comes in bursts: a held key, a
+/// pointer resting on one pane after another, a person clicking down the
+/// sidebar. Each save projects every shared view and copies the workspace and
+/// every chat draft on the UI thread, so a burst is saved once, at its first
+/// move plus this delay. Any other save in between carries it along, and
+/// nothing outside this window reads it before then.
+const NAVIGATION_SAVE_DELAY: Duration = Duration::from_secs(1);
+
+/// What an update changed in the durable workspace beside focus, which decides
+/// when [`Cagents::apply_viewport`] hands the workspace to the writer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableChange {
+    /// Nothing: a change of focus alone is saved within
+    /// [`NAVIGATION_SAVE_DELAY`].
+    None,
+    /// The channel or worktree this window shows, saved within
+    /// [`NAVIGATION_SAVE_DELAY`] like focus.
+    Navigation,
+    /// Anything else, saved now.
+    Content,
+}
 
 /// How long the modifier is held before the workspace switcher is drawn. A
 /// tap that toggles between the two most recent workspaces ends sooner, and
@@ -4446,8 +4462,9 @@ pub enum Message {
     /// A sweep timer fired, carrying the generation it was armed for; a
     /// generation that has since been superseded is discarded.
     LifecycleSweepElapsed(u64),
-    /// The delay on saving a change of focus alone has passed.
-    FocusSaveDue,
+    /// The delay on saving a change of navigation alone has passed, for the
+    /// save armed with this generation; a superseded one is discarded.
+    NavigationSaveDue(u64),
     /// The delay on saving runtime-reported card titles has passed.
     ReportedTitleSaveDue,
     /// The hold that began at this instant has lasted long enough to draw the
@@ -5188,8 +5205,11 @@ pub struct Cagents {
     // the stale delivery be dropped.
     lifecycle_sweep_deadline: Option<Instant>,
     lifecycle_sweep_generation: u64,
-    /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
-    focus_save_pending: bool,
+    /// A save of navigation alone is scheduled; see [`NAVIGATION_SAVE_DELAY`].
+    navigation_save_pending: bool,
+    /// Which timer is the scheduled save's: one armed for a burst that a save
+    /// already wrote must not cut the next burst short.
+    navigation_save_generation: u64,
     /// A focused chat pane whose message input was not drawn when the pane
     /// was focused, which takes the keyboard once it is; see
     /// [`Cagents::focus_pane_keyboard`].
@@ -5444,7 +5464,7 @@ impl Cagents {
 
     fn focus_workspace_card(&mut self, id: CardId) -> Task<Message> {
         match self.workspace.focus(id) {
-            Ok(update) => self.apply_viewport(update, true, false),
+            Ok(update) => self.apply_viewport(update, true, DurableChange::None),
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -6425,7 +6445,7 @@ impl Cagents {
         self.persist();
         Task::batch([
             self.start_terminal(card_id, session, true, false),
-            self.apply_viewport(update, true, false),
+            self.apply_viewport(update, true, DurableChange::None),
         ])
     }
 
@@ -6606,7 +6626,7 @@ impl Cagents {
             }
         };
         self.persist();
-        let viewport = self.apply_viewport(update, true, false);
+        let viewport = self.apply_viewport(update, true, DurableChange::None);
         let title = if save_title {
             self.save_settings_task(false)
         } else {
@@ -6999,7 +7019,10 @@ impl Cagents {
         let source = self.ensure_pull_request_source(card_id);
         (
             card_id,
-            Task::batch([self.apply_viewport(update, true, false), source]),
+            Task::batch([
+                self.apply_viewport(update, true, DurableChange::None),
+                source,
+            ]),
         )
     }
 
@@ -7460,7 +7483,7 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        Task::batch([self.apply_viewport(update, true, false), load])
+        Task::batch([self.apply_viewport(update, true, DurableChange::None), load])
     }
     fn open_link(&mut self, url: Url) -> Task<Message> {
         self.open_link_in(url, self.settings.link_open_destination)
@@ -7569,7 +7592,7 @@ impl Cagents {
                 ViewportUpdate::unchanged()
             });
         self.persist();
-        self.apply_viewport(update, true, false)
+        self.apply_viewport(update, true, DurableChange::None)
     }
 
     #[cfg(not(feature = "integrated-browser"))]
@@ -7634,7 +7657,7 @@ impl Cagents {
                 .pending_terminal_creations
                 .retain(|id| open.contains(id));
         }
-        self.focus_save_pending = false;
+        self.navigation_save_pending = false;
         #[cfg(test)]
         terminal_output_tests::record_persist();
         let saved = self.shared_window_snapshot_with(publish);
@@ -9260,7 +9283,7 @@ impl Cagents {
             });
         }
         // Runtime objects and focus never move out of their ID-indexed maps.
-        let viewport = self.apply_viewport(update, true, true);
+        let viewport = self.apply_viewport(update, true, DurableChange::Content);
         // Focus did not change, so nothing above follows the active tab to
         // wherever the new order put it. Dragging some other tab leaves the
         // strip where the drag has it.
@@ -9275,7 +9298,7 @@ impl Cagents {
         &mut self,
         update: ViewportUpdate,
         synchronize_scroll: bool,
-        additional_durable_change: bool,
+        durable_change: DurableChange,
     ) -> Task<Message> {
         let context_overlay_task = self.sync_context_overlay_state();
         let focused = self.workspace.focused();
@@ -9360,27 +9383,50 @@ impl Cagents {
             let delay = Duration::from_millis(self.settings.hibernation_delay_ms);
             tasks.push(self.request_lifecycle_sweep(delay));
         }
-        if additional_durable_change {
-            self.persist();
-        } else if focus_changed {
-            // The durable state stays current; only handing it to the writer
-            // waits, and that is the expensive part.
-            self.snapshot_workspace_scope();
-            tasks.push(self.save_focus_soon());
+        match durable_change {
+            DurableChange::Content => self.persist(),
+            DurableChange::Navigation => {
+                // The durable state stays current; only handing it to the
+                // writer waits, and that is the expensive part.
+                self.snapshot_workspace_scope();
+                tasks.push(self.save_navigation_soon());
+            }
+            DurableChange::None if focus_changed => {
+                self.snapshot_workspace_scope();
+                tasks.push(self.save_navigation_soon());
+            }
+            DurableChange::None => {}
         }
         Task::batch(tasks)
     }
 
-    /// Saves a change of focus alone within [`FOCUS_SAVE_DELAY`], together
-    /// with whatever else changes by then.
-    fn save_focus_soon(&mut self) -> Task<Message> {
-        if std::mem::replace(&mut self.focus_save_pending, true) {
+    /// Saves a change of navigation alone, such as focus or the open channel
+    /// or worktree, within [`NAVIGATION_SAVE_DELAY`], together with whatever
+    /// else changes by then.
+    fn save_navigation_soon(&mut self) -> Task<Message> {
+        if std::mem::replace(&mut self.navigation_save_pending, true) {
             return Task::none();
         }
-        cosmic::task::future(async {
-            tokio::time::sleep(FOCUS_SAVE_DELAY).await;
-            Message::FocusSaveDue
+        self.navigation_save_generation = self.navigation_save_generation.wrapping_add(1);
+        let generation = self.navigation_save_generation;
+        cosmic::task::future(async move {
+            tokio::time::sleep(NAVIGATION_SAVE_DELAY).await;
+            Message::NavigationSaveDue(generation)
         })
+    }
+
+    /// Whether the navigation save timer armed for `generation` still has a
+    /// burst to save: another save may have carried it already, or a later
+    /// burst armed its own timer.
+    fn navigation_save_due(&self, generation: u64) -> bool {
+        self.navigation_save_pending && generation == self.navigation_save_generation
+    }
+
+    /// A navigation save timer with nothing left to save changes nothing a
+    /// projection reads, so it skips the sidebar and chrome rebuild.
+    fn navigation_save_is_stale(&self, message: &Message) -> bool {
+        matches!(message, Message::NavigationSaveDue(generation)
+            if !self.navigation_save_due(*generation))
     }
 
     /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
@@ -11535,7 +11581,7 @@ impl Cagents {
                 let focus = self
                     .workspace
                     .focus(card)
-                    .map(|update| self.apply_viewport(update, true, false))
+                    .map(|update| self.apply_viewport(update, true, DurableChange::None))
                     .unwrap_or_else(|_| Task::none());
                 Task::batch([
                     focus,
@@ -13849,7 +13895,7 @@ impl Cagents {
         let focus = match self.workspace.focus(id) {
             // Focusing also hands the pane the keyboard, even when it was
             // already the focused card.
-            Ok(update) => self.apply_viewport(update, true, false),
+            Ok(update) => self.apply_viewport(update, true, DurableChange::None),
             Err(error) => {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -13890,7 +13936,7 @@ impl Cagents {
         self.register_channel_card(id);
         self.cards.insert(id, runtime);
         self.persist();
-        self.apply_viewport(update, true, false)
+        self.apply_viewport(update, true, DurableChange::None)
     }
 
     /// Moves an open utility pane into the strip on screen, beside the
@@ -13935,7 +13981,7 @@ impl Cagents {
             }
         };
         self.persist();
-        self.apply_viewport(update, true, true)
+        self.apply_viewport(update, true, DurableChange::Content)
     }
 
     fn prune_pane_title_overrides(&mut self) {
@@ -14907,7 +14953,8 @@ impl Application for Cagents {
             status: status.map(TransientNotice::error),
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
-            focus_save_pending: false,
+            navigation_save_pending: false,
+            navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -15189,7 +15236,7 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut projection = if repaint_tick(&message) {
+        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -16082,7 +16129,7 @@ impl Application for Cagents {
                         } else {
                             saved.remove(&card);
                         }
-                        tasks.push(self.save_focus_soon());
+                        tasks.push(self.save_navigation_soon());
                     }
                 }
                 // A queued refresh discards this result and advances the list
@@ -16268,9 +16315,9 @@ impl Application for Cagents {
                         repository,
                     } => {
                         let directory = self.project_entry_directory(project_id, &repository);
-                        self.select_worktree(directory, true)
+                        self.navigate_to_worktree(directory)
                     }
-                    SidebarAction::OpenWorktree { path, .. } => self.select_worktree(path, true),
+                    SidebarAction::OpenWorktree { path, .. } => self.navigate_to_worktree(path),
                     SidebarAction::BrowsePullRequests { project_id } => self.browse_pull_requests(project_id),
                     SidebarAction::OpenPullRequest {
                         project_id,
@@ -16715,7 +16762,7 @@ impl Application for Cagents {
                         if let Some(state) = self.card_state_mut(card) {
                             state.width_fraction = fraction;
                         }
-                        self.apply_viewport(update, true, false)
+                        self.apply_viewport(update, true, DurableChange::None)
                     }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
@@ -16741,7 +16788,7 @@ impl Application for Cagents {
                         {
                             state.width_fraction = fraction;
                         }
-                        self.apply_viewport(update, true, true)
+                        self.apply_viewport(update, true, DurableChange::Content)
                     }
                     Err(error) => {
                         self.status = Some(TransientNotice::error(error.to_string()));
@@ -17192,7 +17239,7 @@ impl Application for Cagents {
                 let previous_width = self.workspace.viewport_width();
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
-                let task = self.apply_viewport(update, false, false);
+                let task = self.apply_viewport(update, false, DurableChange::None);
                 let keyboard = match event {
                     WorkspaceViewportEvent::PointerRested(card)
                         if self.workspace.focused() == Some(card) =>
@@ -17235,7 +17282,7 @@ impl Application for Cagents {
                     return inspector_task;
                 }
                 let update = self.workspace.tick(elapsed);
-                Task::batch([inspector_task, self.apply_viewport(update, true, false)])
+                Task::batch([inspector_task, self.apply_viewport(update, true, DurableChange::None)])
             }
             Message::LifecycleSweep => self.lifecycle_sweep(),
             Message::LifecycleSweepElapsed(generation) => self.lifecycle_sweep_elapsed(generation),
@@ -17271,8 +17318,8 @@ impl Application for Cagents {
                 self.chrome_ui.workspace_switcher_shown = true;
                 self.reveal_workspace_selection()
             }
-            Message::FocusSaveDue => {
-                if self.focus_save_pending {
+            Message::NavigationSaveDue(generation) => {
+                if self.navigation_save_due(generation) {
                     self.persist();
                 }
                 Task::none()
@@ -17933,7 +17980,7 @@ impl Application for Cagents {
                             .step(&available, self.workspace.focused(), backwards)
                         && let Ok(update) = self.workspace.focus(id)
                     {
-                        return self.apply_viewport(update, true, false);
+                        return self.apply_viewport(update, true, DurableChange::None);
                     }
                     return Task::none();
                 }
@@ -18194,7 +18241,7 @@ impl Application for Cagents {
                 let previous = self.workspace.focused();
                 match self.workspace.focus_adjacent(direction) {
                     Ok(update) => {
-                        let task = self.apply_viewport(update, true, false);
+                        let task = self.apply_viewport(update, true, DurableChange::None);
                         if previous != self.workspace.focused() {
                             self.latency.commit(crate::performance::Action::CardFocus);
                             self.latency_focus = self.workspace.focused();
@@ -25003,7 +25050,7 @@ mod tests {
             assert_eq!(app.sidebar_state.has_card_update(target), !window_focused);
             assert!(app.sidebar_state.has_card_update(unrelated));
             let update = app.workspace.tick(Duration::from_secs(1));
-            let _ = app.apply_viewport(update, true, false);
+            let _ = app.apply_viewport(update, true, DurableChange::None);
             assert_eq!(
                 app.workspace.visibility(target),
                 Some(VisibilityClass::Visible)
@@ -25186,7 +25233,7 @@ mod tests {
         let other_id = other.id;
         app.workspace.add_card(other, 1, false).unwrap();
         let update = app.workspace.focus(other_id).unwrap();
-        drop(app.apply_viewport(update, true, false));
+        drop(app.apply_viewport(update, true, DurableChange::None));
         assert_eq!(app.terminal_review_card, None);
         assert_eq!(app.terminal_review_revision, acknowledged + 1);
     }
@@ -30188,7 +30235,7 @@ mod tests {
             app.card_keyboard_focus(pane),
             repository_widget::editor_focus_id(pane)
         );
-        let startup = app.apply_viewport(update, false, false);
+        let startup = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(
             focused(&app, startup),
             Some(repository_widget::editor_focus_id(pane))
@@ -30216,12 +30263,12 @@ mod tests {
         app.window_width = 900.0;
         app.context_inspector_open = true;
         let update = app.workspace.resize_viewport(500.0);
-        let initial = app.apply_viewport(update, false, false);
+        let initial = app.apply_viewport(update, false, DurableChange::None);
         assert!(app.context_inspector_overlay_active);
         assert_eq!(focused(&app, initial), Some(context_inspector_toggle_id()));
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
-        let ready = app.apply_viewport(update, false, false);
+        let ready = app.apply_viewport(update, false, DurableChange::None);
         assert!(!app.context_inspector_overlay_active);
         assert_eq!(
             focused(&app, ready),
@@ -30257,7 +30304,7 @@ mod tests {
             .insert(pane, CardRuntime::Repository(Box::new(runtime)));
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
-        drop(app.apply_viewport(update, false, false));
+        drop(app.apply_viewport(update, false, DurableChange::None));
         assert!(app.card_holds_keyboard(pane));
         let placeholder = app.card_header_widget_id(pane);
         let (completed_read, tasks) = settle_repository_read(&mut app, pane, load);
@@ -30307,7 +30354,7 @@ mod tests {
         app.cards
             .insert(pane, CardRuntime::Repository(Box::new(runtime)));
         let update = app.workspace.resize_viewport(1200.0);
-        let initial = app.apply_viewport(update, false, false);
+        let initial = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(
             focused(&app, initial),
             Some(app.card_header_widget_id(pane))
@@ -30315,7 +30362,7 @@ mod tests {
         app.window_width = 900.0;
         app.context_inspector_open = true;
         let update = app.workspace.resize_viewport(500.0);
-        drop(app.apply_viewport(update, false, false));
+        drop(app.apply_viewport(update, false, DurableChange::None));
         assert!(!app.card_holds_keyboard(pane));
         let (completed_read, _) = settle_repository_read(&mut app, pane, load);
         assert!(
@@ -30324,7 +30371,7 @@ mod tests {
         );
         app.window_width = 1900.0;
         let update = app.workspace.resize_viewport(1200.0);
-        let ready = app.apply_viewport(update, false, false);
+        let ready = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(
             focused(&app, ready),
             Some(repository_widget::editor_focus_id(pane))
@@ -30705,7 +30752,8 @@ mod tests {
             next_lsp_document: 0,
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
-            focus_save_pending: false,
+            navigation_save_pending: false,
+            navigation_save_generation: 0,
             keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
@@ -30938,8 +30986,8 @@ mod tests {
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         // Every pane fits, so moving focus exposes nothing new.
         let update = app.workspace.resize_viewport(3_000.0);
-        let _ = app.apply_viewport(update, false, true);
-        assert!(!app.focus_save_pending);
+        let _ = app.apply_viewport(update, false, DurableChange::Content);
+        assert!(!app.navigation_save_pending);
 
         for card in [second_id, third_id] {
             let _ = app.update(Message::Viewport {
@@ -30947,19 +30995,19 @@ mod tests {
                 event: WorkspaceViewportEvent::PointerRested(card),
             });
             assert_eq!(app.durable.focused, Some(card));
-            assert!(app.focus_save_pending, "the save waits for the burst");
+            assert!(app.navigation_save_pending, "the save waits for the burst");
         }
-        let _ = app.update(Message::FocusSaveDue);
-        assert!(!app.focus_save_pending);
+        let _ = app.update(Message::NavigationSaveDue(app.navigation_save_generation));
+        assert!(!app.navigation_save_pending);
 
         // A change that must be saved now takes the pending focus with it.
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::PointerRested(second_id),
         });
-        assert!(app.focus_save_pending);
-        let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, true);
-        assert!(!app.focus_save_pending);
+        assert!(app.navigation_save_pending);
+        let _ = app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::Content);
+        assert!(!app.navigation_save_pending);
     }
 
     /// Seen means seen by the user. The focused pane of a window in the
@@ -31058,7 +31106,7 @@ mod tests {
         Arc::make_mut(&mut app.durable).cards.push(second);
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         let update = app.workspace.focus(second_id).unwrap();
-        let _ = app.apply_viewport(update, false, false);
+        let _ = app.apply_viewport(update, false, DurableChange::None);
         assert_eq!(app.durable.focused, Some(second_id));
 
         // The strip closes the focused pane and its update goes unapplied.
@@ -31943,7 +31991,7 @@ mod tests {
         );
         assert_eq!(app.workspace.focused(), Some(id));
         assert_eq!(app.workspace.take_widget_focus_request(), None);
-        let _ = app.apply_viewport(update, true, false);
+        let _ = app.apply_viewport(update, true, DurableChange::None);
         assert_ne!(app.workspace.focused(), Some(first));
     }
 
@@ -32159,7 +32207,7 @@ mod tests {
                 }],
             },
             false,
-            false,
+            DurableChange::None,
         ));
         assert_eq!(app.exposure(card), Exposure::Offscreen);
         assert!(Arc::ptr_eq(&held, &app.durable));
@@ -32171,7 +32219,7 @@ mod tests {
         let card = app.workspace.focused().unwrap();
         Arc::make_mut(&mut app.durable).focused = None;
         let held = Arc::clone(&app.durable);
-        drop(app.apply_viewport(ViewportUpdate::unchanged(), false, false));
+        drop(app.apply_viewport(ViewportUpdate::unchanged(), false, DurableChange::None));
         assert_eq!(app.durable.focused, Some(card));
         assert_eq!(held.focused, None);
     }

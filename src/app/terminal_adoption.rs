@@ -412,7 +412,7 @@ impl Cagents {
             // A card the strip shows at once hydrates instead, which the
             // queued attach then skips.
             Ok(update) => {
-                let viewport = self.apply_viewport(update, true, false);
+                let viewport = self.apply_viewport(update, true, DurableChange::None);
                 Task::batch([viewport, self.attach_next_restored_agent()])
             }
             Err(error) => {
