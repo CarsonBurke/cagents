@@ -614,11 +614,26 @@ pub struct StoredGenerations {
 struct StoreInner {
     connection: Connection,
     closed: bool,
-    refused_closures: RefusedClosures,
+    closed_cards: ClosedCards,
 }
 
-/// The closed cards whose final content storage has refused, by card.
-type RefusedClosures = HashMap<CardId, RefusedClosure>;
+/// What this connection has learned about the closed cards a window offers in
+/// every snapshot it saves, by card.
+///
+/// A long-lived window holds far more closed cards than open ones, and a
+/// closed card rarely changes again. Remembering how each one was settled is
+/// what keeps every flush from offering all of them to storage once more.
+///
+/// Neither half is persisted. A store opened afresh remembers nothing, so its
+/// first snapshot offers every closed card on its merits, as any snapshot did
+/// before this was remembered.
+#[derive(Default)]
+struct ClosedCards {
+    /// Closed cards whose final content storage refused.
+    refused: HashMap<CardId, RefusedClosure>,
+    /// Closed cards whose final content storage holds.
+    settled: HashMap<CardId, SettledClosure>,
+}
 
 /// A closed card's final content as storage refused it, with the generation
 /// storage held for the card once the refusal was settled.
@@ -657,6 +672,73 @@ impl RefusedClosure {
             && self.generation == stored.map_or(0, |stored| stored.generation)
             && *title == card.title
             && *width_fraction == card.width_fraction
+            && *existence == card.existence
+            && *kind == card.kind
+    }
+}
+
+/// A closed card's final content as a write by this connection left it, with
+/// the fingerprint that write stored.
+///
+/// Skipping a card whose fingerprint storage already holds is what
+/// [`save_card`] does for every card; computing that fingerprint is most of
+/// what such a card costs, because it serializes the whole card. This keeps the
+/// fingerprint with the card it was computed from, so an offer equal to that
+/// card can be checked against storage without computing it again.
+///
+/// Nothing here is trusted without storage: the row's own fingerprint has to
+/// match. Every path that changes a card row or its payload outside
+/// [`save_card`] clears that fingerprint (see [`INVALIDATE_CARD_HASH`]), and
+/// [`save_card`] writes a new one, so a row that still carries this one still
+/// holds exactly this content, whatever was committed or rolled back since.
+struct SettledClosure {
+    workspace: WorkspaceId,
+    ordinal: usize,
+    card: CardState,
+    content_hash: i64,
+}
+
+impl SettledClosure {
+    /// Whether offering `card` at `ordinal` over `stored`, against the base
+    /// generation `expected`, would leave storage as it is.
+    ///
+    /// That is the case when [`save_card`] would find the fingerprint it
+    /// computes for the offer already stored, and its checks before that would
+    /// pass. The fingerprint covers the workspace, the card's position and
+    /// every value [`CardWrite`] binds, so each input to it is compared here,
+    /// and a stale base is left for [`save_card`] to report.
+    ///
+    /// `kind` is compared by value, which equates a few spellings that
+    /// serialize differently, such as a path with a redundant separator or a
+    /// negative zero scroll offset. Such an offer keeps the equivalent bytes
+    /// already stored, as [`RefusedClosure::repeats`] does for a refusal.
+    fn holds(
+        &self,
+        workspace: WorkspaceId,
+        ordinal: usize,
+        card: &CardState,
+        expected: u64,
+        stored: &ExistingCard,
+    ) -> bool {
+        // Destructured in full so that a field added to `CardState` has to be
+        // classified here: what a card write stores is compared, and what
+        // only describes the running window is not.
+        let CardState {
+            id: _,
+            generation: _,
+            title,
+            width_fraction,
+            existence,
+            kind,
+        } = &self.card;
+        !stored.existence.is_open()
+            && stored.generation == expected
+            && stored.content_hash == Some(self.content_hash)
+            && self.workspace == workspace
+            && self.ordinal == ordinal
+            && *title == card.title
+            // By bits, as the fingerprint reads it: `-0.0 == 0.0`.
+            && width_fraction.to_bits() == card.width_fraction.to_bits()
             && *existence == card.existence
             && *kind == card.kind
     }
@@ -773,7 +855,7 @@ impl StateStore {
 
         Ok(Self {
             inner: Mutex::new(StoreInner {
-                refused_closures: RefusedClosures::new(),
+                closed_cards: ClosedCards::default(),
                 connection,
                 closed: false,
             }),
@@ -815,11 +897,11 @@ impl StateStore {
         ensure_open(&inner)?;
         let StoreInner {
             connection,
-            refused_closures,
+            closed_cards,
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let commit = save_workspace_transaction(&transaction, state, base, refused_closures, true)?;
+        let commit = save_workspace_transaction(&transaction, state, base, closed_cards, true)?;
         // A conversion defers its foreign keys, so a violation it caused would
         // surface here, attributed to no card. It cannot arise in practice:
         // the terminal and its transcript metadata move together.
@@ -945,8 +1027,7 @@ impl StateStore {
             return Ok(None);
         }
         let source = &stored[&alias];
-        if !matches!(source.existence, Existence::Closed { .. })
-            || source.kind != PersistedCardKind::Terminal
+        if source.existence != StoredExistence::Closed || source.kind != PersistedCardKind::Terminal
         {
             return Err(invalid_state!(
                 "repair requires an already-closed terminal owner"
@@ -1036,7 +1117,8 @@ impl StateStore {
             expected_target,
             stored.get(&canonical.id),
             timestamp,
-        )?;
+        )?
+        .generation;
         let generation = next_generation(base.workspace, "workspace", workspace)?;
         transaction.execute(
             "UPDATE workspaces SET generation=?1,updated_at_unix_ms=?2 WHERE workspace_id=?3",
@@ -1116,7 +1198,7 @@ impl StateStore {
         ensure_open(&inner)?;
         let StoreInner {
             connection,
-            refused_closures,
+            closed_cards,
             ..
         } = &mut *inner;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1233,7 +1315,7 @@ impl StateStore {
                 workspace: base.workspace,
                 cards: &generations,
             },
-            refused_closures,
+            closed_cards,
             false,
         )?;
         transaction.commit()?;
@@ -1615,7 +1697,8 @@ impl StateStore {
             0,
             None,
             now_unix_ms(),
-        )?;
+        )?
+        .generation;
         // Merge navigation from the current transaction, never from a captured
         // UI snapshot that could replace the canonical pane or unrelated edits.
         manifest
@@ -3899,7 +3982,7 @@ fn save_workspace_transaction(
     transaction: &Transaction<'_>,
     state: &WorkspaceState,
     base: SnapshotBase<'_>,
-    refused_closures: &mut RefusedClosures,
+    closed_cards: &mut ClosedCards,
     isolate_refused_cards: bool,
 ) -> Result<WorkspaceCommit> {
     validate_workspace(state)?;
@@ -4050,16 +4133,17 @@ fn save_workspace_transaction(
                 stored,
                 timestamp,
             )
+            .map(|saved| saved.generation)
         } else {
             save_closed_card(
                 transaction,
-                &workspace_id,
+                (state.id, &workspace_id),
                 ordinal,
                 card,
                 expected,
                 stored,
                 timestamp,
-                refused_closures,
+                closed_cards,
             )
         }
         .map_err(|error| error.in_card(card.id))?;
@@ -4094,6 +4178,7 @@ fn save_workspace_transaction(
         };
         let generation = tombstone_card(transaction, *card_id, stored, &tombstone, timestamp)?;
         card_generations.insert(*card_id, generation);
+        closed_cards.settled.remove(card_id);
     }
 
     Ok(WorkspaceCommit {
@@ -4158,7 +4243,8 @@ fn save_open_card(
             expected,
             None,
             timestamp,
-        );
+        )
+        .map(|saved| saved.generation);
     };
     savepoint(transaction, "SAVEPOINT open_card")?;
     match save_card(
@@ -4178,13 +4264,20 @@ fn save_open_card(
         }
         written => {
             savepoint(transaction, "RELEASE open_card")?;
-            written
+            written.map(|saved| saved.generation)
         }
     }
 }
 
-/// Writes one card of a workspace snapshot, returning the generation storage
-/// holds for it afterwards.
+/// A card row as [`save_card`] left it.
+struct SavedCard {
+    generation: u64,
+    /// The fingerprint the row carries, which describes the card just offered.
+    content_hash: i64,
+}
+
+/// Writes one card of a workspace snapshot, returning what storage holds for it
+/// afterwards.
 fn save_card(
     transaction: &Transaction<'_>,
     workspace_id: &str,
@@ -4193,7 +4286,7 @@ fn save_card(
     expected: u64,
     stored: Option<&ExistingCard>,
     timestamp: i64,
-) -> Result<u64> {
+) -> Result<SavedCard> {
     let kind = card_kind(&card.kind);
     let card_id = card.id.to_string();
 
@@ -4215,7 +4308,7 @@ fn save_card(
     }
 
     if let Some(stored) = stored {
-        if matches!(stored.existence, Existence::Closed { .. })
+        if stored.existence == StoredExistence::Closed
             && !matches!(card.existence, Existence::Closed { .. })
         {
             return Err(invalid_state!(
@@ -4257,7 +4350,10 @@ fn save_card(
         )?;
     }
     if unchanged {
-        return Ok(expected);
+        return Ok(SavedCard {
+            generation: expected,
+            content_hash: write.content_hash,
+        });
     }
 
     let card_generation = next_generation(expected, "card", card.id)?;
@@ -4275,7 +4371,10 @@ fn save_card(
         timestamp,
     ])?;
     save_card_payload(transaction, &card_id, &write, card_generation, timestamp)?;
-    Ok(card_generation)
+    Ok(SavedCard {
+        generation: card_generation,
+        content_hash: write.content_hash,
+    })
 }
 
 /// Writes a card the snapshot holds closed.
@@ -4288,20 +4387,32 @@ fn save_card(
 /// keep the rest of the window from saving, and closing is the remedy offered
 /// for exactly that refusal.
 ///
-/// The window goes on offering the card in every later snapshot. A refusal is
-/// therefore remembered in `refused_closures`, and the same content offered
-/// over the same row is neither written nor reported a second time.
+/// The window goes on offering the card in every later snapshot, so how each
+/// offer was settled is remembered in `closed_cards`. The same content offered
+/// over the row it settled is neither written, nor serialized to be compared,
+/// nor, when it was refused, reported a second time.
 #[allow(clippy::too_many_arguments)]
 fn save_closed_card(
     transaction: &Transaction<'_>,
-    workspace_id: &str,
+    (workspace, workspace_id): (WorkspaceId, &str),
     ordinal: usize,
     card: &CardState,
     expected: u64,
     stored: Option<&ExistingCard>,
     timestamp: i64,
-    refused_closures: &mut RefusedClosures,
+    closed_cards: &mut ClosedCards,
 ) -> Result<u64> {
+    if let Some(stored) = stored
+        && closed_cards
+            .settled
+            .get(&card.id)
+            .is_some_and(|settled| settled.holds(workspace, ordinal, card, expected, stored))
+    {
+        // What a write that found its fingerprint stored would have done, as
+        // the acceptance it is.
+        closed_cards.refused.remove(&card.id);
+        return Ok(expected);
+    }
     if let Some(stored) = stored
         && stored.kind == PersistedCardKind::Terminal
         && stored.has_content
@@ -4318,7 +4429,7 @@ fn save_closed_card(
         // reclaim that live identity or erase the archive.
         return tombstone_card(transaction, card.id, stored, &card.existence, timestamp);
     }
-    if let Some(refused) = refused_closures.get(&card.id)
+    if let Some(refused) = closed_cards.refused.get(&card.id)
         && refused.repeats(card, stored)
     {
         return Ok(refused.generation);
@@ -4352,7 +4463,7 @@ fn save_closed_card(
             // Recorded before the transaction commits, which is sound: a
             // rollback leaves the row at an earlier generation or still open,
             // and neither matches what is remembered here.
-            refused_closures.insert(
+            closed_cards.refused.insert(
                 card.id,
                 RefusedClosure {
                     offered: card.clone(),
@@ -4363,10 +4474,21 @@ fn save_closed_card(
         }
         written => {
             savepoint(transaction, "RELEASE closed_card")?;
-            if written.is_ok() {
-                refused_closures.remove(&card.id);
-            }
-            written
+            let saved = written?;
+            closed_cards.refused.remove(&card.id);
+            // Recorded before the transaction commits, which is sound for the
+            // reason `SettledClosure` gives: it is trusted only while the row
+            // carries the fingerprint written here.
+            closed_cards.settled.insert(
+                card.id,
+                SettledClosure {
+                    workspace,
+                    ordinal,
+                    card: card.clone(),
+                    content_hash: saved.content_hash,
+                },
+            );
+            Ok(saved.generation)
         }
     }
 }
@@ -4627,6 +4749,13 @@ struct CardWrite<'card> {
     content_hash: i64,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many [`CardWrite`]s this thread has built: what a flush pays per
+    /// card it offers to storage, whether or not the card is then written.
+    static CARD_WRITES_BUILT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 enum CardPayloadWrite<'card> {
     Terminal {
         terminal_id: String,
@@ -4661,6 +4790,8 @@ impl<'card> CardWrite<'card> {
         card: &'card CardState,
         kind: PersistedCardKind,
     ) -> Result<Self> {
+        #[cfg(test)]
+        CARD_WRITES_BUILT.with(|built| built.set(built.get() + 1));
         let ordinal = usize_to_i64(ordinal, "card ordinal")?;
         if let CardKind::Terminal(terminal) = &card.kind
             && terminal.owned_codex_listener.is_some()
@@ -5282,10 +5413,53 @@ fn retarget_dropped_cards(state: &mut WorkspaceState) {
     normalize_project_channels(&mut state.channels, &mut state.active_channel, &open);
 }
 
+/// Which [`Existence`] state a stored card row is in, without the tombstone
+/// it carries.
+///
+/// The save path reads this for every row a workspace owns on every flush, and
+/// nearly all of those rows are closed. It needs the state alone, so it reads
+/// the state alone: an open row is recognized by its bytes, and any other row
+/// is checked for well-formed JSON naming a known state rather than decoded
+/// into a tombstone nothing on that path looks at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoredExistence {
+    Open,
+    Closing,
+    Closed,
+}
+
+impl StoredExistence {
+    fn parse(json: &str) -> Result<Self> {
+        /// `Existence`'s external tags, with the content of each skipped.
+        #[derive(serde::Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        enum Tag {
+            Open,
+            Closing(serde::de::IgnoredAny),
+            Closed(serde::de::IgnoredAny),
+        }
+        if json == OPEN_EXISTENCE_JSON {
+            return Ok(Self::Open);
+        }
+        Ok(match from_json::<Tag>("card existence", json)? {
+            Tag::Open => Self::Open,
+            Tag::Closing(_) => Self::Closing,
+            Tag::Closed(_) => Self::Closed,
+        })
+    }
+
+    fn is_open(self) -> bool {
+        self == Self::Open
+    }
+}
+
+/// How `Existence::Open` is stored, which `list_workspaces` also counts by.
+const OPEN_EXISTENCE_JSON: &str = "\"open\"";
+
 /// The stored shape of a card, as far as the save path needs to know it.
 struct ExistingCard {
     kind: PersistedCardKind,
-    existence: Existence,
+    existence: StoredExistence,
     generation: u64,
     /// Whether the row holds `content_json`. A terminal row that does holds the
     /// archived descriptor of a terminal another card has taken over.
@@ -5322,7 +5496,7 @@ fn existing_cards(
             parse_id("card", &id)?,
             ExistingCard {
                 kind: PersistedCardKind::parse(&kind)?,
-                existence: from_json("card existence", &existence)?,
+                existence: StoredExistence::parse(&existence)?,
                 generation: i64_to_u64(generation, "card generation")?,
                 has_content,
                 content_hash,
@@ -10588,7 +10762,7 @@ mod tests {
                 workspace: 0,
                 cards: &BTreeMap::new(),
             },
-            &mut RefusedClosures::new(),
+            &mut ClosedCards::default(),
             false,
         )
         .unwrap();
@@ -10674,7 +10848,7 @@ mod tests {
                 workspace: 0,
                 cards: &BTreeMap::new(),
             },
-            &mut RefusedClosures::new(),
+            &mut ClosedCards::default(),
             false,
         )
         .unwrap();
@@ -12013,6 +12187,322 @@ mod tests {
         assert_eq!(restored.cards[0].title, "renamed");
         assert_eq!(restored.cards[0].generation, 3);
         assert_eq!(restored.cards[1].generation, 1);
+    }
+
+    /// How many cards `body` serialized to offer to storage, on this thread.
+    fn card_writes_built(body: impl FnOnce()) -> usize {
+        let before = CARD_WRITES_BUILT.with(std::cell::Cell::get);
+        body();
+        CARD_WRITES_BUILT.with(std::cell::Cell::get) - before
+    }
+
+    fn closed_browser(page: &str) -> CardState {
+        let url = Url::parse(&format!("https://example.com/{page}")).unwrap();
+        CardState {
+            id: CardId::new(),
+            generation: 0,
+            title: page.into(),
+            width_fraction: 0.5,
+            existence: closed_by_user(),
+            kind: CardKind::Browser(BrowserSession {
+                id: BrowserId::new(),
+                current_url: url.clone(),
+                history: vec![url],
+                history_index: 0,
+                scroll_x: 0.0,
+                scroll_y: 0.0,
+                fidelity: BrowserRestoreFidelity::HistoryAndScroll,
+            }),
+        }
+    }
+
+    /// A window with one open terminal and three closed panes, saved until
+    /// storage has settled every closed one.
+    fn settled_closed_history(store: &StateStore, boot_id: &BootId) -> (WorkspaceState, SaveLane) {
+        let mut workspace = workspace_with_terminal(boot_id);
+        workspace
+            .cards
+            .extend(["one", "two", "three"].map(closed_browser));
+        let mut lane = SaveLane::default();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(store, &workspace).unwrap();
+            }),
+            4
+        );
+        (workspace, lane)
+    }
+
+    #[test]
+    fn unchanged_closed_cards_are_settled_once() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("state.sqlite3");
+        let boot_id = boot("boot-a");
+        let store = StateStore::open(&path, boot_id.clone()).unwrap();
+        let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let rows = workspace.cards[1..]
+            .iter()
+            .map(|card| stored_card_row(&store, card.id))
+            .collect::<Vec<_>>();
+
+        let changes = store.lock_inner().unwrap().connection.total_changes();
+        let built = card_writes_built(|| {
+            for _ in 0..3 {
+                lane.save(&store, &workspace).unwrap();
+            }
+        });
+        assert_eq!(built, 3, "only the open card is offered on each flush");
+        assert_eq!(
+            store.lock_inner().unwrap().connection.total_changes() - changes,
+            3,
+            "each flush writes its workspace row and nothing else"
+        );
+        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+            assert_eq!(&stored_card_row(&store, card.id), row);
+            assert_eq!(lane.cards[&card.id], row.0.cast_unsigned());
+        }
+
+        // A restarted window remembers nothing, so its first flush offers
+        // every closed card once more, and leaves each as it is.
+        store.shutdown().unwrap();
+        let store = StateStore::open(&path, boot_id).unwrap();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            4
+        );
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            1
+        );
+        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+            assert_eq!(&stored_card_row(&store, card.id), row);
+        }
+    }
+
+    #[test]
+    fn a_closed_card_changed_after_it_settled_is_written() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let card = workspace.cards[2].id;
+        let before = stored_card_row(&store, card);
+
+        workspace.cards[2].title = "renamed after closing".into();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            2
+        );
+        assert_eq!(stored_card_row(&store, card).0, before.0 + 1);
+        assert_eq!(
+            store.load_card(card, None).unwrap().unwrap().title,
+            "renamed after closing"
+        );
+        // The new content is what is settled now.
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            1
+        );
+        assert_eq!(stored_card_row(&store, card).0, before.0 + 1);
+    }
+
+    /// A card's position is stored with it and fingerprinted, though it is not
+    /// part of the card, so a closed card that moves is written where it now is.
+    #[test]
+    fn a_closed_card_that_moves_is_written_at_its_new_position() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        workspace.cards.swap(1, 3);
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            3
+        );
+        let restored = store.load_workspace(workspace.id, None).unwrap().unwrap();
+        assert_eq!(
+            restored
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>(),
+            workspace
+                .cards
+                .iter()
+                .map(|card| card.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// A path that changes a card row outside the snapshot lane clears its
+    /// fingerprint, and the next flush then writes the snapshot's content over
+    /// it, as it would have before closed cards were remembered.
+    #[test]
+    fn a_settled_closed_card_whose_fingerprint_was_cleared_is_written_again() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let card = workspace.cards[2].id;
+        let before = stored_card_row(&store, card);
+        {
+            let inner = store.lock_inner().unwrap();
+            inner
+                .connection
+                .execute(
+                    "UPDATE cards SET title = 'written elsewhere' WHERE card_id = ?1",
+                    [card.to_string()],
+                )
+                .unwrap();
+            inner
+                .connection
+                .execute(INVALIDATE_CARD_HASH, [card.to_string()])
+                .unwrap();
+        }
+
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            2
+        );
+        let after = stored_card_row(&store, card);
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.2, before.2, "the snapshot's content is stored again");
+        assert_eq!(store.load_card(card, None).unwrap().unwrap().title, "two");
+    }
+
+    /// A write the store makes outside the snapshot lane, here a closed
+    /// terminal's transcript metadata, leaves the next flush writing that card.
+    #[test]
+    fn transcript_metadata_for_a_settled_closed_terminal_is_followed_by_a_write() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            0,
+            "every card is closed and settled"
+        );
+        let card = workspace.cards[0].id;
+        let CardKind::Terminal(terminal) = &workspace.cards[0].kind else {
+            unreachable!("the fixture's first card is a terminal");
+        };
+        let before = stored_card_row(&store, card);
+        store
+            .save_transcript_metadata(
+                terminal.id,
+                &TranscriptMetadata {
+                    path: terminal.transcript_path.clone().unwrap(),
+                    byte_len: 123,
+                    durable_offset: 100,
+                    updated_at_unix_ms: 42,
+                    location: None,
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(stored_card_row(&store, card).2, None);
+
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            1
+        );
+        let after = stored_card_row(&store, card);
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.2, before.2, "the snapshot's content is stored again");
+    }
+
+    /// A closed card remembered from a flush that rolled back is written by
+    /// the next flush that offers it, since storage never held it.
+    #[test]
+    fn a_closed_card_from_a_rolled_back_flush_is_written_again() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let renamed = workspace.cards[1].id;
+        let stale = workspace.cards[3].id;
+        let before = stored_card_row(&store, renamed);
+        let shift_generation = |delta: i64| {
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute(
+                    "UPDATE cards SET generation = generation + ?1 WHERE card_id = ?2",
+                    params![delta, stale.to_string()],
+                )
+                .unwrap();
+        };
+
+        // The renamed card is written before the later card's stale base
+        // rolls the whole flush back.
+        workspace.cards[1].title = "renamed in a failed flush".into();
+        shift_generation(1);
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+        assert_eq!(stored_card_row(&store, renamed), before);
+
+        shift_generation(-1);
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(stored_card_row(&store, renamed).0, before.0 + 1);
+        assert_eq!(
+            store.load_card(renamed, None).unwrap().unwrap().title,
+            "renamed in a failed flush"
+        );
+    }
+
+    /// Remembering a settled card never hides that storage moved past the
+    /// writer's base.
+    #[test]
+    fn a_settled_closed_card_still_reports_a_stale_base() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let card = workspace.cards[3].id;
+        store
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "UPDATE cards SET generation = generation + 1 WHERE card_id = ?1",
+                [card.to_string()],
+            )
+            .unwrap();
+        let error = lane.save(&store, &workspace).unwrap_err();
+        assert!(
+            matches!(&error, StoreError::StaleGeneration { entity, expected: 1, actual: 2 }
+                if *entity == format!("card {card}")),
+            "{error:?}"
+        );
     }
 
     #[test]
