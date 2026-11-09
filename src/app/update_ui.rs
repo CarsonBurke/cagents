@@ -252,6 +252,14 @@ impl State {
             .filter(|refusal| self.error.as_ref() == Some(&refusal.summary()))
     }
 
+    /// Each conversation or other work that held the last update back, one
+    /// per line, for the header control's tooltip: its summary only counts
+    /// them, and a window that never watched the review has no notice that
+    /// names them.
+    fn held_back(&self) -> Option<String> {
+        self.refusal().map(|refusal| refusal.details().join("\n"))
+    }
+
     /// The header's account of what went wrong with the last update, and
     /// the way on from it.
     fn problem(&self) -> Option<(String, Action)> {
@@ -582,10 +590,7 @@ impl Cagents {
 
     pub(super) fn update_control(&self) -> Option<Element<'_, Message>> {
         let state = &self.update_ui;
-        // A refusal's summary only counts what held the update back; hovering
-        // names each conversation and why, for a window that never saw the
-        // notice that listed them.
-        let mut reasons = None;
+        let mut held_back = None;
         let (icon, label, action) = if state.updating() {
             (
                 Icon::Update,
@@ -606,13 +611,24 @@ impl Cagents {
                 None,
             )
         } else if state.superseded.is_some() {
+            // Reopening retries the installed update. When a review refused
+            // it, this outranks the warning that names why, so carry that.
+            held_back = state
+                .refusal()
+                .zip(state.held_back())
+                .map(|(refusal, reasons)| {
+                    format!(
+                        "The last update was not installed: {}.\n{reasons}",
+                        refusal.summary()
+                    )
+                });
             (
                 Icon::Update,
                 "A newer build is installed; reopen windows to use it".to_owned(),
                 Some(Message::UpdateUi(Action::Restart)),
             )
         } else if let Some((label, action)) = state.problem() {
-            reasons = state.refusal().map(|refusal| refusal.details().join("\n"));
+            held_back = state.held_back();
             (Icon::Warning, label, Some(Message::UpdateUi(action)))
         } else if let Some(UpdateState::Available { release }) = &state.result {
             (
@@ -640,15 +656,19 @@ impl Cagents {
             Some(reason) => format!("{label} — {reason}"),
             None => label,
         };
+        // The label is also the control's tooltip.
+        let label = match held_back {
+            Some(held_back) => format!("{label}\n{held_back}"),
+            None => label,
+        };
         let enabled = !self.modal_is_open() && action.is_some() && blocker.is_none();
-        let control = crate::ui_controls::icon_button(icon, label)
-            .selected(true)
-            .on_press_maybe(enabled.then_some(action).flatten())
-            .id(widget::Id::new("application-update"));
-        Some(match reasons {
-            Some(reasons) => crate::interaction::tooltip(control, reasons),
-            None => control.into(),
-        })
+        Some(
+            crate::ui_controls::icon_button(icon, label)
+                .selected(true)
+                .on_press_maybe(enabled.then_some(action).flatten())
+                .id(widget::Id::new("application-update"))
+                .into(),
+        )
     }
 
     /// Asks the release server whether a newer build exists. A check the
@@ -1212,7 +1232,13 @@ mod tests {
             "Update not installed: 1 session needs attention. Check again"
         );
         // Hovering the header names each conversation and why.
-        assert_eq!(app.update_ui.refusal(), Some(&refusal));
+        assert_eq!(
+            app.update_ui.held_back().as_deref(),
+            Some(
+                "Claude: Its provider stopped but may still hold unfinished work. \
+                 Close this conversation to release it."
+            )
+        );
         // A window watching the review end says why, once.
         let mut reviewing = job.clone();
         reviewing.phase = UpdatePhase::AwaitingConfirmation;
