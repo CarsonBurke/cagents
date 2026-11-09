@@ -4516,6 +4516,7 @@ pub fn view<'a>(
         modal_open,
         None,
         &crate::settings::KeyboardShortcuts::default(),
+        false,
     )
 }
 
@@ -4827,6 +4828,10 @@ mod cached_projects {
     }
 }
 
+/// `window_rounded` says the window draws rounded corners, as a floating
+/// window does and a maximized or tiled one does not: the pane's top-left
+/// corner is the window's, and follows it.
+#[allow(clippy::too_many_arguments)]
 pub fn view_cached<'a>(
     model: &'a SidebarModel,
     state: &'a SidebarState,
@@ -4835,6 +4840,7 @@ pub fn view_cached<'a>(
     modal_open: bool,
     cache: &'a NavigationCache,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    window_rounded: bool,
 ) -> Element<'a, SidebarAction> {
     view_inner(
         model,
@@ -4844,6 +4850,7 @@ pub fn view_cached<'a>(
         modal_open,
         Some(cache),
         shortcuts,
+        window_rounded,
     )
 }
 
@@ -4855,6 +4862,7 @@ fn view_inner<'a>(
     modal_open: bool,
     cache: Option<&'a NavigationCache>,
     shortcuts: &crate::settings::KeyboardShortcuts,
+    window_rounded: bool,
 ) -> Element<'a, SidebarAction> {
     let compact = mode == SidebarMode::Compact;
     let width = effective_width(mode, persisted_width);
@@ -4926,7 +4934,7 @@ fn view_inner<'a>(
         .height(Length::Fill)
         .into(),
     ))
-    .class(design::docked_primary())
+    .class(design::docked_primary(window_rounded))
     .width(Length::Fixed(width))
     .height(Length::Fill)
     .into()
@@ -5900,7 +5908,7 @@ fn compact_operation_rows<'a>(
                 grid.rail(
                     operation_icon(operation.phase, rail::CHILD_GLYPH),
                     match operation.phase {
-                        WorktreeOperationPhase::Working => rail::Badges::busy(rail::Tone::Muted),
+                        WorktreeOperationPhase::Working => rail::Badges::busy(),
                         WorktreeOperationPhase::Failed => rail::Badges::default(),
                     },
                 ),
@@ -6037,7 +6045,7 @@ fn unreachable_project<'a>(
         let (initials, color) = project_identity(&project.name);
         grid.rail(
             rail::project_chip(project.avatar.as_ref(), initials, color, true),
-            rail::Badges::alert(rail::Tone::Warning),
+            rail::Badges::warning(),
         )
     } else {
         grid.content(
@@ -6822,9 +6830,19 @@ fn rail_deletion_badges(
     attention: AttentionSummary,
 ) -> rail::Badges {
     match deletion {
-        Some(RowDeletion::Deleting) => rail::Badges::busy(rail::Tone::Muted),
-        Some(RowDeletion::Failed(_)) => rail::Badges::alert(rail::Tone::Warning),
+        Some(RowDeletion::Deleting) => rail::Badges::busy(),
+        Some(RowDeletion::Failed(_)) => rail::Badges::warning(),
         None => rail::Badges::attention(attention),
+    }
+}
+
+/// A row's tooltip. The rail has no room for the expanded row's "Deleting…"
+/// caption or its failure badge, so its tooltip says what they would.
+fn rail_tooltip(tooltip: &str, deletion: Option<&RowDeletion>, compact: bool) -> String {
+    match deletion.filter(|_| compact) {
+        Some(RowDeletion::Deleting) => format!("{tooltip}\nDeleting…"),
+        Some(RowDeletion::Failed(reason)) => format!("{tooltip}\nCould not delete: {reason}"),
+        None => tooltip.to_owned(),
     }
 }
 
@@ -6949,7 +6967,7 @@ fn channel_view(
             inert,
         ));
     let action = row_quick_delete(
-        crate::interaction::tooltip(action, channel.tooltip.to_string()),
+        crate::interaction::tooltip(action, rail_tooltip(&channel.tooltip, deletion, compact)),
         &channel.delete_name,
         gated(
             SidebarAction::DeleteChannel {
@@ -7328,7 +7346,8 @@ fn worktree_view<'a>(
     } else {
         crate::interaction::hover(action)
     };
-    let action = crate::interaction::tooltip(action, chrome.tooltip.to_string());
+    let action =
+        crate::interaction::tooltip(action, rail_tooltip(&chrome.tooltip, deletion, compact));
     let action = if !primary
         && worktree
             .pull_request()
@@ -15860,6 +15879,7 @@ pub(crate) mod tests {
                 false,
                 navigation,
                 &crate::settings::KeyboardShortcuts::default(),
+                false,
             ),
             bounds,
             cache,
@@ -21570,6 +21590,7 @@ pub(crate) mod tests {
                 false,
                 None,
                 &shortcuts,
+                false,
             ),
             file_panel(&model, &state, width, false),
             git_panel(&model, &state, width, false),

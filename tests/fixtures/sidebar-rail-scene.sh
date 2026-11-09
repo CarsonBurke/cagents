@@ -24,6 +24,9 @@
 #   failed    an error result ends the turn
 #   waiting   a tool permission request, held open
 #
+# It also locks one worktree, so deleting it from the sidebar fails, and moves
+# one project's folder away, so the project is unreachable.
+#
 # The result frames carry no session_id: the app refuses a result from any
 # conversation but the agent's own, and the fixture names that one itself.
 #
@@ -190,10 +193,12 @@ spawn() {
 }
 
 cmd_live() {
-    # Unread counts: three in one channel, one elsewhere.
-    spawn unread billing-service "Invoice rounding"
-    spawn unread billing-service "Invoice rounding"
-    spawn unread billing-service "Invoice rounding"
+    # Unread counts: two digits in one channel, one elsewhere. A finished run
+    # leaves the daemon's cap on running agents, so these may be many.
+    local n
+    for n in $(seq 12); do
+        spawn unread billing-service "Invoice rounding"
+    done
     spawn unread journal "Markdown export"
     spawn failed glacier-ml "Eval harness"
     spawn failed glacier-ml "Eval harness"
@@ -207,6 +212,12 @@ cmd_live() {
     spawn unread edge-proxy "TLS renewals"
     spawn working edge-proxy "TLS renewals"
     rm -f -- "$frames"
+    # A locked worktree refuses removal, so deleting it from the sidebar
+    # leaves its row with a failed deletion to show.
+    evidence env git -C "$projects/billing-service" worktree lock \
+        --reason "fixture: refuses deletion" "$projects/billing-service-fix-proration"
+    # A project whose folder has gone is unreachable.
+    evidence env mv "$projects/harbor" "$projects/harbor.away"
 }
 
 cmd_theme() {

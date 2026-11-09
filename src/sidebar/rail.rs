@@ -1,5 +1,5 @@
 //! The compact navigation rail's cell: one glyph, centred, with its status as
-//! badges pinned to the glyph's corners.
+//! badges pinned to the cell's corners.
 //!
 //! The rail used to reuse the expanded row's grid: a glyph slot followed by a
 //! status slot, left-aligned in whatever width the rail left over. An unread
@@ -8,7 +8,11 @@
 //! Every rail row is now one fixed cell, and its status can only appear at one
 //! of two fixed corners: news at the top right, activity at the bottom right.
 //! Badges are drawn over the cell rather than laid out in it, so they never
-//! move the glyph and never wrap.
+//! move the glyph and never wrap. Each kind of news has its own shape as well
+//! as its own colour, the shapes the expanded sidebar uses for the same
+//! states, so waiting and failed stay apart where the theme's warning and
+//! destructive colours are close, and for a reader who cannot tell them
+//! apart by colour.
 
 use cosmic::{
     Element,
@@ -17,7 +21,7 @@ use cosmic::{
     widget::{self, button},
 };
 
-use super::{AttentionSummary, COMPACT_WIDTH, SidebarAction};
+use super::{AttentionSummary, COMPACT_WIDTH, Icon, SidebarAction};
 use crate::design;
 
 /// One rail cell: the rail less an equal gutter each side. The right gutter is
@@ -27,10 +31,6 @@ pub(super) const CELL_WIDTH: f32 = COMPACT_WIDTH - 2.0 * design::SCROLLBAR_GUTTE
 /// Every rail row is the same height, projects included, so the rail scrolls
 /// in a steady rhythm.
 pub(super) const CELL_HEIGHT: f32 = design::ROW_HEIGHT;
-/// The square each glyph is centred in and each badge is pinned to. It is the
-/// same for a project's chip and a channel's glyph, so badges form one column
-/// down the rail.
-const FRAME: f32 = 30.0;
 /// A project's identity: its avatar or initials.
 pub(super) const PROJECT_CHIP: f32 = 22.0;
 /// A channel, worktree or operation inside a project.
@@ -41,62 +41,38 @@ const PILL_HEIGHT: f32 = 14.0;
 /// sits on, so it reads as attached to the glyph rather than drawn on top of
 /// it.
 const RING: f32 = 2.0;
-/// A news badge with no count to show, ring included.
+/// Unread news with no count to show, ring included.
 const DOT: f32 = 10.0;
+/// A status glyph's backing disc, ring included: the warning triangle, the
+/// error mark and the spinner.
+const DISC: f32 = 14.0;
+const STATUS_GLYPH: u16 = 12;
 const SPINNER: f32 = 10.0;
-/// The spinner's backing disc, ring included.
-const SPINNER_DISC: f32 = SPINNER + RING;
 
-const _: () = assert!(FRAME <= CELL_WIDTH && FRAME <= CELL_HEIGHT);
+const _: () = assert!(PILL_HEIGHT <= DISC && DOT <= DISC);
+const _: () = assert!(DISC <= CELL_HEIGHT / 2.0);
 
-/// What a badge's colour says.
+/// The top-right badge: the one piece of news most worth acting on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum Tone {
-    /// Unread news.
-    Accent,
-    /// An agent waiting for input, or working.
+pub(super) enum News {
+    /// Unread updates: an accent pill with their count, or a dot when there
+    /// is none to give.
+    Unread(Option<usize>),
+    /// Something needs the user before it can go on: an agent waiting for
+    /// input, a deletion that failed, a project that cannot be reached. The
+    /// expanded sidebar's warning triangle.
     Warning,
-    /// A failed update.
-    Danger,
-    /// The application's own work: a deletion or a worktree being created.
-    Muted,
+    /// An agent's update failed. The expanded sidebar's error mark.
+    Failed,
 }
 
-impl Tone {
-    fn fill(self, theme: &cosmic::Theme) -> Color {
-        match self {
-            Self::Accent => design::accent_color(theme),
-            Self::Warning => design::warning_color(theme),
-            Self::Danger => design::destructive_color(theme),
-            Self::Muted => design::muted_icon_color(theme),
-        }
-    }
-
-    fn ink(self, theme: &cosmic::Theme) -> Color {
-        let cosmic = theme.cosmic();
-        match self {
-            Self::Accent => cosmic.accent.on.into(),
-            Self::Warning => cosmic.warning.on.into(),
-            Self::Danger => cosmic.destructive.on.into(),
-            Self::Muted => cosmic.primary(theme.transparent).base.into(),
-        }
-    }
-
-    fn spinner(self) -> fn(&cosmic::Theme) -> Color {
-        match self {
-            Self::Accent => design::accent_color,
-            Self::Warning => design::warning_color,
-            Self::Danger => design::destructive_color,
-            Self::Muted => design::muted_icon_color,
-        }
-    }
-}
-
-/// The top-right badge: news, with its unread count when it has one.
+/// Who is doing the work a bottom-right spinner shows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct News {
-    pub tone: Tone,
-    pub count: Option<usize>,
+pub(super) enum Activity {
+    /// An agent, in the expanded sidebar's working colour.
+    Agent,
+    /// The application itself: a deletion, or a worktree being created.
+    App,
 }
 
 /// Everything a rail cell may pin to its glyph. Both corners are independent,
@@ -104,44 +80,42 @@ pub(super) struct News {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Badges {
     pub news: Option<News>,
-    pub activity: Option<Tone>,
+    pub activity: Option<Activity>,
 }
 
 impl Badges {
-    /// The rail's reading of an attention summary. Waiting outranks a failure,
-    /// which outranks plain unread news, for the badge's colour; the count is
-    /// always the unread count, so it means the same thing on every row.
+    /// The rail's reading of an attention summary. One badge has room for one
+    /// thing, so it shows what most needs the user: an agent waiting on them,
+    /// then a failed update, then the unread count. The tooltip and the
+    /// accessible name still give the whole summary.
     pub fn attention(summary: AttentionSummary) -> Self {
-        let tone = if summary.waiting != 0 {
-            Some(Tone::Warning)
+        let news = if summary.waiting != 0 {
+            Some(News::Warning)
         } else if summary.failed != 0 {
-            Some(Tone::Danger)
+            Some(News::Failed)
         } else if summary.unread != 0 {
-            Some(Tone::Accent)
+            Some(News::Unread(Some(summary.unread)))
         } else {
             None
         };
         Self {
-            news: tone.map(|tone| News {
-                tone,
-                count: (summary.unread != 0).then_some(summary.unread),
-            }),
-            activity: (summary.working != 0).then_some(Tone::Warning),
+            news,
+            activity: (summary.working != 0).then_some(Activity::Agent),
         }
     }
 
     /// Work the application is doing to the row itself.
-    pub fn busy(tone: Tone) -> Self {
+    pub fn busy() -> Self {
         Self {
             news: None,
-            activity: Some(tone),
+            activity: Some(Activity::App),
         }
     }
 
-    /// A problem with the row that needs no count.
-    pub fn alert(tone: Tone) -> Self {
+    /// A problem with the row that needs the user.
+    pub fn warning() -> Self {
         Self {
-            news: Some(News { tone, count: None }),
+            news: Some(News::Warning),
             activity: None,
         }
     }
@@ -165,8 +139,8 @@ pub(super) fn cell<'a>(
     layers.push(
         widget::container(glyph)
             .class(design::transparent())
-            .center_x(Length::Fixed(FRAME))
-            .center_y(Length::Fixed(FRAME))
+            .center_x(Length::Fixed(CELL_WIDTH))
+            .center_y(Length::Fixed(CELL_HEIGHT))
             .into(),
     );
     if let Some(news) = badges.news {
@@ -180,9 +154,9 @@ pub(super) fn cell<'a>(
                 .into(),
         );
     }
-    if let Some(tone) = badges.activity {
+    if let Some(activity) = badges.activity {
         layers.push(
-            widget::container(activity_badge(tone))
+            widget::container(activity_badge(activity))
                 .class(design::transparent())
                 .align_x(Alignment::End)
                 .align_y(Alignment::End)
@@ -191,19 +165,14 @@ pub(super) fn cell<'a>(
                 .into(),
         );
     }
-    let frame: Element<'a, SidebarAction> = if layers.len() == 1 {
+    if layers.len() == 1 {
         layers.pop().expect("the glyph layer")
     } else {
         cosmic::iced::widget::Stack::with_children(layers)
-            .width(Length::Fixed(FRAME))
-            .height(Length::Fixed(FRAME))
+            .width(Length::Fixed(CELL_WIDTH))
+            .height(Length::Fixed(CELL_HEIGHT))
             .into()
-    };
-    widget::container(frame)
-        .class(design::transparent())
-        .center_x(Length::Fill)
-        .center_y(Length::Fill)
-        .into()
+    }
 }
 
 fn ring(theme: &cosmic::Theme) -> Color {
@@ -211,75 +180,98 @@ fn ring(theme: &cosmic::Theme) -> Color {
 }
 
 fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
-    let tone = news.tone;
-    let style = move |theme: &cosmic::Theme| widget::container::Style {
-        background: Some(Background::Color(tone.fill(theme))),
-        text_color: Some(tone.ink(theme)),
+    match news {
+        News::Unread(Some(count)) => unread_pill(count),
+        News::Unread(None) => widget::container(cosmic::iced::widget::Space::new())
+            .width(Length::Fixed(DOT))
+            .height(Length::Fixed(DOT))
+            .class(theme::Container::custom(|theme| widget::container::Style {
+                background: Some(Background::Color(design::accent_color(theme))),
+                border: Border {
+                    color: ring(theme),
+                    width: RING,
+                    radius: (DOT / 2.0).into(),
+                },
+                ..Default::default()
+            }))
+            .into(),
+        News::Warning => status_disc(
+            widget::icon(Icon::Warning.handle())
+                .size(STATUS_GLYPH)
+                .into(),
+            design::warning_color,
+        ),
+        News::Failed => status_disc(
+            widget::icon(Icon::Error.handle()).size(STATUS_GLYPH).into(),
+            design::destructive_color,
+        ),
+    }
+}
+
+fn unread_pill<'a>(count: usize) -> Element<'a, SidebarAction> {
+    let label = count_label(count);
+    // A single digit is a circle; longer counts grow the pill leftwards over
+    // the glyph, never past the cell.
+    let width = if label.len() == 1 {
+        Length::Fixed(PILL_HEIGHT)
+    } else {
+        Length::Shrink
+    };
+    widget::container(
+        widget::text(label)
+            .size(9.5)
+            .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
+                (PILL_HEIGHT - 2.0 * RING).into(),
+            ))
+            .font(design::heading_font())
+            .wrapping(cosmic::iced::widget::text::Wrapping::None),
+    )
+    .padding([0.0, RING + 1.5])
+    .center_y(Length::Fixed(PILL_HEIGHT))
+    .align_x(Alignment::Center)
+    .width(width)
+    .class(theme::Container::custom(|theme| widget::container::Style {
+        background: Some(Background::Color(design::accent_color(theme))),
+        text_color: Some(theme.cosmic().accent.on.into()),
         border: Border {
             color: ring(theme),
             width: RING,
             radius: (PILL_HEIGHT / 2.0).into(),
         },
         ..Default::default()
-    };
-    match news.count {
-        Some(count) => {
-            let label = count_label(count);
-            // A single digit is a circle; longer counts grow the pill
-            // leftwards over the glyph, never past the cell.
-            let width = if label.len() == 1 {
-                Length::Fixed(PILL_HEIGHT)
-            } else {
-                Length::Shrink
-            };
-            widget::container(
-                widget::text(label)
-                    .size(9.5)
-                    .line_height(cosmic::iced::widget::text::LineHeight::Absolute(
-                        (PILL_HEIGHT - 2.0 * RING).into(),
-                    ))
-                    .font(design::heading_font())
-                    .wrapping(cosmic::iced::widget::text::Wrapping::None),
-            )
-            .padding([0.0, RING + 1.5])
-            .center_y(Length::Fixed(PILL_HEIGHT))
-            .align_x(Alignment::Center)
-            .width(width)
-            .class(theme::Container::custom(style))
-            .into()
-        }
-        None => widget::container(cosmic::iced::widget::Space::new())
-            .width(Length::Fixed(DOT))
-            .height(Length::Fixed(DOT))
-            .class(theme::Container::custom(move |theme| {
-                widget::container::Style {
-                    border: Border {
-                        radius: (DOT / 2.0).into(),
-                        ..style(theme).border
-                    },
-                    ..style(theme)
-                }
-            }))
-            .into(),
-    }
-}
-
-fn activity_badge<'a>(tone: Tone) -> Element<'a, SidebarAction> {
-    widget::container(crate::ui_controls::activity_spinner(
-        SPINNER,
-        tone.spinner(),
-    ))
-    .center_x(Length::Fixed(SPINNER_DISC))
-    .center_y(Length::Fixed(SPINNER_DISC))
-    .class(theme::Container::custom(|theme| widget::container::Style {
-        background: Some(Background::Color(ring(theme))),
-        border: Border {
-            radius: (SPINNER_DISC / 2.0).into(),
-            ..Default::default()
-        },
-        ..Default::default()
     }))
     .into()
+}
+
+/// A status glyph on a disc of the tray's colour, which cuts it out of the
+/// glyph it overlaps.
+fn status_disc<'a>(
+    content: Element<'a, SidebarAction>,
+    ink: fn(&cosmic::Theme) -> Color,
+) -> Element<'a, SidebarAction> {
+    widget::container(content)
+        .center_x(Length::Fixed(DISC))
+        .center_y(Length::Fixed(DISC))
+        .class(theme::Container::custom(move |theme| {
+            widget::container::Style {
+                background: Some(Background::Color(ring(theme))),
+                icon_color: Some(ink(theme)),
+                border: Border {
+                    radius: (DISC / 2.0).into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        }))
+        .into()
+}
+
+fn activity_badge<'a>(activity: Activity) -> Element<'a, SidebarAction> {
+    let ink: fn(&cosmic::Theme) -> Color = match activity {
+        Activity::Agent => design::warning_color,
+        Activity::App => design::muted_icon_color,
+    };
+    status_disc(crate::ui_controls::activity_spinner(SPINNER, ink), ink)
 }
 
 /// A project's identity chip: its avatar, or its initials on its own colour.
@@ -415,37 +407,29 @@ mod tests {
             failed: 0,
             waiting: 0,
         });
-        assert_eq!(
-            badges.news,
-            Some(News {
-                tone: Tone::Accent,
-                count: Some(3)
-            })
-        );
-        assert_eq!(badges.activity, Some(Tone::Warning));
+        assert_eq!(badges.news, Some(News::Unread(Some(3))));
+        assert_eq!(badges.activity, Some(Activity::Agent));
     }
 
+    /// Waiting and failed differ in shape, not only in a colour some themes
+    /// and some readers barely tell apart; a waiting agent outranks a failed
+    /// update, which outranks unread news.
     #[test]
-    fn waiting_colours_the_news_badge_without_inventing_a_count() {
-        let badges = Badges::attention(AttentionSummary {
+    fn the_news_badge_shows_what_most_needs_the_user() {
+        let waiting = Badges::attention(AttentionSummary {
             waiting: 1,
+            failed: 1,
+            unread: 4,
             ..AttentionSummary::default()
         });
-        assert_eq!(
-            badges.news,
-            Some(News {
-                tone: Tone::Warning,
-                count: None
-            })
-        );
-        assert_eq!(badges.activity, None);
+        assert_eq!(waiting.news, Some(News::Warning));
+        assert_eq!(waiting.activity, None);
         let failed = Badges::attention(AttentionSummary {
             unread: 2,
             failed: 1,
             ..AttentionSummary::default()
         });
-        assert_eq!(failed.news.map(|news| news.tone), Some(Tone::Danger));
-        assert_eq!(failed.news.and_then(|news| news.count), Some(2));
+        assert_eq!(failed.news, Some(News::Failed));
         assert_eq!(
             Badges::attention(AttentionSummary::default()),
             Badges::default()

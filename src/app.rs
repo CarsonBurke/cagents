@@ -19264,6 +19264,7 @@ impl Application for Cagents {
             self.modal_is_open(),
             &self.navigation_cache,
             &self.settings.keyboard_shortcuts,
+            !self.core.window.sharp_corners,
         )
         .map(Message::Sidebar);
 
