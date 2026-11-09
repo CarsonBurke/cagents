@@ -215,7 +215,10 @@ fn close_retained_inner(
         if !owner.holder.is_current()
             && !crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root)?
         {
-            return Err(super::lost_execution_refusal(source, super::Holds::Running));
+            return Err(super::lost_execution_refusal(
+                source,
+                super::Holds::Running(Some(owner.root.pid)),
+            ));
         }
         let mut pending = match pending {
             Some(pending) => pending,

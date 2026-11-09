@@ -1393,13 +1393,25 @@ fn close_with_target(
         // An actor that died - killed, crashed, out of memory - leaves no
         // verified retirement and nothing to attach. A person's Close settles
         // once nothing of it can still run; a daemon stop keeps the refusal.
-        if ending == Ending::Closed
-            && match &discovered {
-                Some(owner) => chat::native_holder::retire_abandoned(owner)?,
-                None => true,
+        if ending == Ending::Closed {
+            match &discovered {
+                // Its helper is gone but something of it runs on, which
+                // nothing can now be asked to stop.
+                Some(owner)
+                    if !owner.holder.is_current()
+                        && !crate::chat::runtime::retained_actor_abandoned(
+                            &owner.holder,
+                            &owner.root,
+                        )? =>
+                {
+                    return Err(super::lost_execution_refusal(
+                        requested,
+                        super::Holds::Running(Some(owner.root.pid)),
+                    ));
+                }
+                Some(owner) if !chat::native_holder::retire_abandoned(owner)? => {}
+                _ => return super::settle_lost_execution(host, requested, &proof),
             }
-        {
-            return super::settle_lost_execution(host, requested, &proof);
         }
         if let Some(exited) = exited {
             return Err(exited.into());
