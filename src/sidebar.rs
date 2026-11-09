@@ -4070,7 +4070,6 @@ impl SidebarState {
             | SidebarAction::NewWorktree { .. }
             | SidebarAction::NewChannel { .. }
             | SidebarAction::OpenChannel { .. }
-            | SidebarAction::OpenChannelWork { .. }
             | SidebarAction::DeleteChannel { .. }
             | SidebarAction::ReorderMember { .. }
             | SidebarAction::ReorderProject { .. }
@@ -4207,9 +4206,6 @@ pub enum SidebarAction {
         project_id: ProjectId,
     },
     OpenChannel {
-        channel_id: ChannelId,
-    },
-    OpenChannelWork {
         channel_id: ChannelId,
     },
     /// Asks to delete a channel. The application confirms before removing
@@ -7062,14 +7058,6 @@ fn channel_context_controls<'a>(
             entries.insert(
                 0,
                 Item::Button(
-                    "Channel work".into(),
-                    None,
-                    ChannelContextCommand(channel_id, false, ChannelMenuCommand::Work),
-                ),
-            );
-            entries.insert(
-                0,
-                Item::Button(
                     "Rename channel…".into(),
                     Some(Icon::Rename.handle()),
                     ChannelContextCommand(channel_id, false, ChannelMenuCommand::Rename),
@@ -7099,7 +7087,6 @@ struct ChannelContextCommand(ChannelId, bool, ChannelMenuCommand);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ChannelMenuCommand {
-    Work,
     Delete,
     Rename,
     MarkRead,
@@ -7110,9 +7097,6 @@ impl widget::menu::Action for ChannelContextCommand {
 
     fn message(&self) -> SidebarAction {
         match self.2 {
-            ChannelMenuCommand::Work => {
-                return SidebarAction::OpenChannelWork { channel_id: self.0 };
-            }
             ChannelMenuCommand::Rename => return SidebarAction::RenameChannel(self.0),
             ChannelMenuCommand::MarkRead => return SidebarAction::MarkChannelRead(self.0),
             ChannelMenuCommand::Delete => {}
