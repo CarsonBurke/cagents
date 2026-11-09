@@ -359,6 +359,55 @@ mod tests {
     }
 
     #[test]
+    fn switching_back_to_a_channel_keeps_its_chat_warm_while_it_is_shown() {
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let mut cards = Vec::new();
+        let hide = |app: &mut Cagents| {
+            let (mut runtime, _handle) = shown(items());
+            runtime.set_visible(false).unwrap();
+            let card = runtime.target.card;
+            app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+            card
+        };
+        // The reader left the first chat, then visited eight others.
+        for _ in 0..CHATS {
+            cards.push(hide(&mut app));
+            app.trim_warm_chats();
+        }
+        // Returning to the first chat hides the eighth before the first's
+        // pane is laid out and shown, so in that pass nine chats are hidden.
+        let channel = ChannelId::new();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.channels.push(ProjectChannel {
+            id: channel,
+            project_id: ProjectId::new(),
+            title: "Returning".into(),
+            title_source: ChannelTitleSource::Manual,
+            ordinal: 1,
+            shared: false,
+            cards: vec![cards[0]],
+            focused: Some(cards[0]),
+        });
+        durable.active_channel = Some(channel);
+        cards.push(hide(&mut app));
+        app.trim_warm_chats();
+        let warm = |app: &Cagents, card: &CardId| match app.cards.get(card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.warm_stamp().is_some(),
+            _ => unreachable!(),
+        };
+        assert!(
+            warm(&app, &cards[0]),
+            "the chat being returned to stays warm"
+        );
+        assert!(
+            !warm(&app, &cards[1]),
+            "the chat hidden longest goes instead"
+        );
+        assert!(cards[2..].iter().all(|card| warm(&app, card)));
+    }
+
+    #[test]
     fn the_most_recently_hidden_chats_stay_warm_within_the_budget() {
         // Ten small chats hidden one at a time: the eight hidden last stay.
         let small: Vec<_> = (1..=10).map(|stamp| (stamp, 1 << 20)).collect();
