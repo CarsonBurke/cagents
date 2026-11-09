@@ -284,6 +284,7 @@ impl Project {
                     || relative.starts_with("refs")
             }) {
                 change.references = true;
+                change.configuration |= common == Some(Path::new("config"));
                 change.membership |= common == Some(Path::new("refs"));
                 continue;
             }
@@ -315,6 +316,7 @@ impl Project {
                         continue;
                     }
                     change.worktrees.insert(worktree.id);
+                    change.configuration |= relative == Path::new("config.worktree");
                     let topology = relative.as_os_str().is_empty()
                         || matches!(relative.to_str(), Some("locked" | "gitdir" | "commondir"));
                     change.topology |= topology;
@@ -381,6 +383,10 @@ pub(crate) struct Change {
     /// update. Any worktree's comparison may have moved, but its status only
     /// where its own `HEAD` did, which a consumer can tell from the refs.
     pub references: bool,
+    /// Git configuration changed, which can move a branch's upstream or the
+    /// remote it publishes to. Comes with `references` or the worktree whose
+    /// own `config.worktree` changed.
+    pub configuration: bool,
     pub topology: bool,
     pub membership: bool,
     pub error: Option<String>,
@@ -391,6 +397,7 @@ impl Change {
     pub fn merge(&mut self, other: Self) {
         self.worktrees.extend(other.worktrees);
         self.references |= other.references;
+        self.configuration |= other.configuration;
         self.topology |= other.topology;
         self.membership |= other.membership;
         if let Some(coverage) = other.coverage {
@@ -1260,7 +1267,12 @@ mod tests {
                 .unwrap();
             assert!(change.references, "{path}");
             assert!(!change.membership, "{path}");
+            assert_eq!(change.configuration, path == "config", "{path}");
         }
+        let change = project
+            .change(&modified(linked.git_dir.join("config.worktree")))
+            .unwrap();
+        assert!(change.configuration && !change.references);
         let source = linked.root.join("src");
         assert!(
             !project

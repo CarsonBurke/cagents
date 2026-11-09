@@ -27,7 +27,7 @@ use std::{
 };
 
 mod branch_census;
-pub use branch_census::{Divergence, RefTip};
+pub use branch_census::{BranchCensus, Divergence, LocalBranch, RefTip, Upstream};
 mod complete_inventory;
 mod pr_checkout;
 mod pr_creation;
@@ -801,6 +801,45 @@ pub struct RemoteRecord {
     pub fetch_url: Option<String>,
     /// Set only when `remote.<name>.pushurl` overrides the fetch URL.
     pub push_url: Option<String>,
+}
+
+/// Remote and branch configuration as `git config --get-regexp` reports it:
+/// section and variable names lowercased, branch names verbatim.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteConfig {
+    values: BTreeMap<String, String>,
+    remotes: Vec<RemoteRecord>,
+    per_worktree: bool,
+}
+
+impl RemoteConfig {
+    /// The remote `branch` publishes to: its push remote, the repository's
+    /// push default, its upstream remote, then `origin` or a sole remote.
+    pub fn branch_remote(&self, branch: &ValidatedBranchName) -> Option<RemoteRecord> {
+        let value = |key: String| self.values.get(&key);
+        let selected = value(format!("branch.{}.pushremote", branch.as_str()))
+            .or_else(|| self.values.get("remote.pushdefault"))
+            .or_else(|| value(format!("branch.{}.remote", branch.as_str())));
+        match selected {
+            Some(name) => self
+                .remotes
+                .iter()
+                .find(|remote| remote.name == *name)
+                .cloned(),
+            None => self
+                .remotes
+                .iter()
+                .find(|remote| remote.name == "origin")
+                .or_else(|| (self.remotes.len() == 1).then(|| &self.remotes[0]))
+                .cloned(),
+        }
+    }
+
+    /// Whether each worktree may override this configuration in its own
+    /// `config.worktree`, so one worktree's reading does not hold for another.
+    pub fn per_worktree(&self) -> bool {
+        self.per_worktree
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5522,35 +5561,61 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         branch: &ValidatedBranchName,
         cancellation: &CancellationToken,
     ) -> Result<Option<RemoteRecord>, RepositoryError> {
+        Ok(self
+            .remote_config(worktree, cancellation)?
+            .branch_remote(branch))
+    }
+
+    /// The remote and branch configuration a worktree sees, in one process,
+    /// so a caller resolving several branches reads it once.
+    pub fn remote_config(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<RemoteConfig, RepositoryError> {
         let command = self.git_read(
             worktree,
-            ["config", "-z", "--get-regexp", r"^(remote|branch)\."],
+            [
+                "config",
+                "-z",
+                "--get-regexp",
+                r"^(remote|branch)\.|^extensions\.worktreeconfig$",
+            ],
         );
         let output = self.run(&command, cancellation)?;
         if !output.success {
             return if output.exit_code == Some(1) {
-                Ok(None)
+                Ok(RemoteConfig::default())
             } else {
                 Err(git_failure(&command, output).into())
             };
         }
-        let config = String::from_utf8_lossy(&output.stdout).into_owned();
-        let remotes = invalid_output(parse_remote_config(&output.stdout), output)?;
-        let values: BTreeMap<_, _> = config
+        let text = String::from_utf8_lossy(&output.stdout).into_owned();
+        // A boolean set without `=` is true and arrives with no value.
+        let per_worktree = text
+            .split('\0')
+            .filter_map(|entry| match entry.split_once('\n') {
+                Some((key, value)) => Some((key, value)),
+                None => (!entry.is_empty()).then_some((entry, "")),
+            })
+            .filter(|(key, _)| *key == "extensions.worktreeconfig")
+            .last()
+            .is_some_and(|(_, value)| {
+                matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "" | "true" | "yes" | "on" | "1"
+                )
+            });
+        let values = text
             .split('\0')
             .filter_map(|entry| entry.split_once('\n'))
+            .map(|(key, value)| (key.to_owned(), value.to_owned()))
             .collect();
-        let selected = values
-            .get(format!("branch.{}.pushremote", branch.as_str()).as_str())
-            .or_else(|| values.get("remote.pushdefault"))
-            .or_else(|| values.get(format!("branch.{}.remote", branch.as_str()).as_str()));
-        Ok(match selected {
-            Some(name) => remotes.into_iter().find(|remote| remote.name == *name),
-            None => remotes
-                .iter()
-                .find(|remote| remote.name == "origin")
-                .cloned()
-                .or_else(|| (remotes.len() == 1).then(|| remotes[0].clone())),
+        let remotes = invalid_output(parse_remote_config(&output.stdout), output)?;
+        Ok(RemoteConfig {
+            values,
+            remotes,
+            per_worktree,
         })
     }
 

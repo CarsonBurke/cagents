@@ -22,6 +22,89 @@ pub struct Divergence {
     pub behind: u32,
 }
 
+/// A local branch as a worktree read needs it: its commit, what it tracks and
+/// the worktree that has it checked out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalBranch {
+    pub oid: String,
+    pub upstream: Option<Upstream>,
+    pub worktree: Option<PathBuf>,
+}
+
+/// A branch's configured upstream, which need not exist.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Upstream {
+    /// The full ref name, such as `refs/remotes/origin/main`.
+    pub refname: String,
+    /// The name `git status` shows, such as `origin/main`.
+    pub name: String,
+}
+
+/// Every local branch, and the commit of each upstream a checked-out branch
+/// tracks: what refs alone say about a repository's worktrees.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BranchCensus {
+    /// Keyed by branch name without `refs/heads/`.
+    pub branches: BTreeMap<String, LocalBranch>,
+    /// Upstreams outside `refs/heads` by full ref name, `None` when gone.
+    remote_tips: BTreeMap<String, Option<String>>,
+}
+
+impl BranchCensus {
+    /// The commit `upstream` names, or `None` when it does not exist.
+    pub fn upstream_oid(&self, upstream: &Upstream) -> Option<&str> {
+        match upstream.refname.strip_prefix("refs/heads/") {
+            Some(branch) => self.branches.get(branch).map(|branch| branch.oid.as_str()),
+            None => self
+                .remote_tips
+                .get(&upstream.refname)
+                .and_then(Option::as_deref),
+        }
+    }
+
+    /// The upstream refs outside `refs/heads` that checked-out branches track,
+    /// for the next census to read alongside the branches.
+    pub fn remote_upstreams(&self) -> impl Iterator<Item = &str> {
+        self.remote_tips.keys().map(String::as_str)
+    }
+}
+
+const BRANCH_FORMAT: &str =
+    "%(refname)%00%(objectname)%00%(upstream)%00%(upstream:short)%00%(worktreepath)%00";
+
+/// One `BRANCH_FORMAT` record: (refname, oid, upstream, upstream name, worktree).
+type BranchRecord = (String, String, String, String, Option<PathBuf>);
+
+/// Parses `BRANCH_FORMAT` output. Branch names are decoded as `git status`'s
+/// are, lossily, so a name read here matches the one a status reports.
+pub fn parse_branch_records(output: &[u8]) -> Result<Vec<BranchRecord>, GitParseError> {
+    const FORMAT: &str = "git for-each-ref branches";
+    let mut parsed = Vec::new();
+    for (index, record) in records(output).enumerate() {
+        let fields = record.split(|byte| *byte == 0).collect::<Vec<_>>();
+        let [refname, oid, upstream, name, worktree] = fields[..] else {
+            return Err(malformed(
+                FORMAT,
+                index,
+                format!("expected 5 fields, found {}", fields.len()),
+            ));
+        };
+        if refname.is_empty() {
+            return Err(malformed(FORMAT, index, "empty ref name"));
+        }
+        let oid = Oid::parse_object(String::from_utf8_lossy(oid).into_owned())
+            .map_err(|error| malformed(FORMAT, index, error.to_string()))?;
+        parsed.push((
+            String::from_utf8_lossy(refname).into_owned(),
+            oid.as_str().to_owned(),
+            String::from_utf8_lossy(upstream).into_owned(),
+            String::from_utf8_lossy(name).into_owned(),
+            (!worktree.is_empty()).then(|| bytes_path(worktree)),
+        ));
+    }
+    Ok(parsed)
+}
+
 const TIP_FORMAT: &str = "%(refname)%00%(objectname)%00%(committerdate:unix)%00%(worktreepath)%00";
 const TIP_FIELDS: usize = 4;
 
@@ -223,6 +306,87 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parse_ref_tips(&output.stdout), output)
     }
 
+    /// Every local branch with its upstream and worktree, and the commit of
+    /// each upstream a checked-out branch tracks. `known_upstreams`, the
+    /// previous census's [`BranchCensus::remote_upstreams`], are read in the
+    /// same process, so a census costs one process until a worktree starts
+    /// tracking a new upstream.
+    pub fn branch_census(
+        &self,
+        repository: &Path,
+        known_upstreams: &[String],
+        cancellation: &CancellationToken,
+    ) -> Result<BranchCensus, RepositoryError> {
+        let format = format!("--format={BRANCH_FORMAT}");
+        let known = ref_batches(known_upstreams).next().unwrap_or_default();
+        let read = |patterns: &[&str]| -> Result<Vec<BranchRecord>, RepositoryError> {
+            let command = self.git_read(
+                repository,
+                ["for-each-ref", format.as_str()]
+                    .iter()
+                    .chain(patterns)
+                    .map(OsString::from),
+            );
+            let output = self.run_checked(&command, cancellation)?;
+            invalid_output(parse_branch_records(&output.stdout), output)
+        };
+        let mut census = BranchCensus::default();
+        let mut tips = BTreeMap::new();
+        let patterns = std::iter::once("refs/heads")
+            .chain(known.iter().map(String::as_str))
+            .collect::<Vec<_>>();
+        for (refname, oid, upstream, name, worktree) in read(&patterns)? {
+            match refname.strip_prefix("refs/heads/") {
+                Some(branch) => {
+                    census.branches.insert(
+                        branch.to_owned(),
+                        LocalBranch {
+                            oid,
+                            upstream: (!upstream.is_empty()).then(|| Upstream {
+                                name: if name.is_empty() {
+                                    upstream.clone()
+                                } else {
+                                    name
+                                },
+                                refname: upstream,
+                            }),
+                            worktree,
+                        },
+                    );
+                }
+                None => {
+                    tips.insert(refname, oid);
+                }
+            }
+        }
+        let wanted = census
+            .branches
+            .values()
+            .filter(|branch| branch.worktree.is_some())
+            .filter_map(|branch| branch.upstream.as_ref())
+            .map(|upstream| upstream.refname.as_str())
+            .filter(|refname| !refname.starts_with("refs/heads/"))
+            .collect::<std::collections::BTreeSet<_>>();
+        // A pattern also matches refs below it; keep exactly the refs named.
+        // One read and found missing is gone, and is not asked about again.
+        let unread = wanted
+            .iter()
+            .filter(|refname| !known.iter().any(|known| known == *refname))
+            .map(|refname| (*refname).to_owned())
+            .collect::<Vec<_>>();
+        for batch in ref_batches(&unread) {
+            let patterns = batch.iter().map(String::as_str).collect::<Vec<_>>();
+            for (refname, oid, ..) in read(&patterns)? {
+                tips.insert(refname, oid);
+            }
+        }
+        census.remote_tips = wanted
+            .into_iter()
+            .map(|refname| (refname.to_owned(), tips.remove(refname)))
+            .collect();
+        Ok(census)
+    }
+
     /// Ahead/behind of each of `refs` (full ref names) against `base`, in as
     /// few processes as the argument budget allows. Refs that do not exist are
     /// absent from the result.
@@ -343,6 +507,32 @@ impl<E: ProcessExecutor> RepositoryService<E> {
         invalid_output(parse_status(&output.stdout), output)
     }
 
+    /// One worktree's head, upstream name and tracked changes, without the
+    /// ahead/behind walk: the counts are a function of two commits, which a
+    /// caller holding a [`BranchCensus`] measures once per pair instead. The
+    /// upstream is reported as `+0 -0` when level and as unknown otherwise.
+    pub fn tracked_status(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<StatusSnapshot, RepositoryError> {
+        let command = self.git_read(
+            worktree,
+            [
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "--no-ahead-behind",
+                "--untracked-files=no",
+                "-z",
+            ],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        let mut status = invalid_output(parse_status(&output.stdout), output)?;
+        status.untracked_omitted = true;
+        Ok(status)
+    }
+
     /// The committer time of each of `oids`, such as detached worktree heads,
     /// in one process. Commits that are not present locally fail the read.
     pub fn commit_times(
@@ -399,6 +589,38 @@ mod tests {
         assert_eq!(tips[1].committed_at_unix_ms, None);
         assert_eq!(tips[1].worktree, Some(PathBuf::from("/repo/new\nline")));
         assert!(parse_ref_tips(b"").unwrap().is_empty());
+    }
+
+    #[test]
+    fn branch_records_keep_upstreams_worktree_paths_and_undecodable_names() {
+        let output = [
+            format!("refs/heads/main\0{A}\0refs/remotes/origin/main\0origin/main\0/repo\0\n")
+                .into_bytes(),
+            b"refs/heads/b\xffd\0".to_vec(),
+            format!("{B}\0\0\0/repo/new\nline\0\n").into_bytes(),
+            format!("refs/remotes/origin/main\0{B}\0\0\0\0\n").into_bytes(),
+        ]
+        .concat();
+        let records = parse_branch_records(&output).unwrap();
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[0],
+            (
+                "refs/heads/main".to_owned(),
+                A.to_owned(),
+                "refs/remotes/origin/main".to_owned(),
+                "origin/main".to_owned(),
+                Some(PathBuf::from("/repo")),
+            )
+        );
+        assert_eq!(
+            records[1].0, "refs/heads/b\u{fffd}d",
+            "decoded as status decodes"
+        );
+        assert_eq!(records[1].4, Some(PathBuf::from("/repo/new\nline")));
+        assert_eq!(records[2].4, None);
+        assert!(parse_branch_records(format!("refs/heads/a\0{A}\0\n").as_bytes()).is_err());
+        assert!(parse_branch_records(b"refs/heads/a\0nothex\0\0\0\0\n").is_err());
     }
 
     #[test]

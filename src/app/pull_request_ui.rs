@@ -446,21 +446,14 @@ fn resolve_current_pull_request<
     cancellation: &CancellationToken,
 ) -> Result<Resolution, String> {
     let current = verify_local_head_with(git, target, cancellation)?;
-    let branch = crate::repository::ValidatedBranchName::parse(&current.branch)
+    crate::repository::ValidatedBranchName::parse(&current.branch)
         .map_err(|error| error.to_string())?;
     // Same remote selection as worktree_head_repository, using this refresh's
     // reader so the complete path has exactly one HEAD read and no status scan.
     let head_repository = git
-        .branch_remote(&current.worktree, &branch, cancellation)
+        .remote_config(&current.worktree, cancellation)
         .ok()
-        .flatten()
-        .and_then(|remote| {
-            remote
-                .push_url
-                .as_deref()
-                .or(remote.fetch_url.as_deref())
-                .and_then(crate::github::remote_repository_key)
-        });
+        .and_then(|config| crate::github::branch_head_repository(&config, &current.branch));
     let pull_request = match head_repository {
         Some(head_repository) => github
             .resolve_branch(

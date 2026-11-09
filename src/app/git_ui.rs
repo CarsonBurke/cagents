@@ -1,7 +1,11 @@
 //! Local Git invalidation has its own queue and generations. GitHub reads never
 //! replace local rows, and filesystem events never schedule a GitHub process.
 use super::*;
-use crate::{git_watch, model::WorktreeId, repository::HeadState};
+use crate::{
+    git_watch,
+    model::WorktreeId,
+    repository::{BranchCensus, Divergence, HeadState, TrackingState},
+};
 
 const LOCAL_WORKERS: usize = 2;
 const FALLBACK_INTERVAL: Duration = Duration::from_secs(60);
@@ -11,6 +15,18 @@ pub struct Snapshot {
     repository: RepositoryInfo,
     worktrees: Vec<(WorktreeRecord, Option<StatusSnapshot>)>,
     heads: HashMap<WorktreeId, GitHubRepoKey>,
+    tracking: Tracking,
+}
+
+/// What the last read measured, so the next one reads refs instead of every
+/// worktree's status when only refs moved.
+#[derive(Debug, Clone, Default)]
+struct Tracking {
+    /// Ahead/behind by (head, upstream) commit, for the pairs last shown.
+    /// A topology read starts afresh.
+    comparisons: HashMap<(String, String), Divergence>,
+    /// Upstream refs outside `refs/heads` that the last census read.
+    upstreams: Vec<String>,
 }
 
 struct Entry {
@@ -195,6 +211,7 @@ impl Cagents {
                     repository: repository.clone(),
                     worktrees: loaded.worktrees.clone(),
                     heads: loaded.head_repositories.clone(),
+                    tracking: Tracking::default(),
                 },
                 generation,
                 plan: None,
@@ -544,16 +561,63 @@ fn read_local_with_plan(
             .filter(|record| record.bare || worktree_ui::worktree_directory_available(&record.path))
             .map(|record| (record, None))
             .collect();
+        snapshot.tracking = Tracking::default();
     }
+    let touched = |record: &WorktreeRecord| {
+        !record.bare
+            && (change.topology || change.references || change.worktrees.contains(&record.id))
+    };
+    // Refs say where every branch points and which worktree has it, so a
+    // shared ref change re-reads the status only of a worktree whose head
+    // they show moved; the rest keep theirs and are compared again below.
+    let census = snapshot
+        .worktrees
+        .iter()
+        .any(|(record, _)| touched(record))
+        .then(|| {
+            git.branch_census(
+                &snapshot.repository.common_dir,
+                &snapshot.tracking.upstreams,
+                &cancellation,
+            )
+        })
+        .transpose()
+        .map_err(|error| error.to_string())?;
+    let Some(census) = census else {
+        return finish_local_read(
+            project,
+            snapshot,
+            &change,
+            HashSet::new(),
+            cancellation,
+            previous_plan,
+        );
+    };
+    let checked_out = census
+        .branches
+        .iter()
+        .filter_map(|(name, branch)| Some((branch.worktree.as_deref()?, name.as_str())))
+        .collect::<HashMap<_, _>>();
     let mut vanished = HashSet::new();
-    for (record, status) in &mut snapshot.worktrees {
-        // Shared refs move every worktree's upstream comparison.
-        if record.bare
-            || (!change.topology && !change.references && !change.worktrees.contains(&record.id))
-        {
+    let mut heads_due = Vec::new();
+    for (index, (record, status)) in snapshot.worktrees.iter_mut().enumerate() {
+        if !touched(record) {
             continue;
         }
-        let current = match git.status_with_untracked(&record.path, false, &cancellation) {
+        let reread = change.topology
+            || change.worktrees.contains(&record.id)
+            || head_moved(
+                status.as_ref(),
+                checked_out.get(record.path.as_path()).copied(),
+                &census,
+            );
+        if !reread {
+            if change.configuration {
+                heads_due.push(index);
+            }
+            continue;
+        }
+        let current = match git.tracked_status(&record.path, &cancellation) {
             Ok(current) => current,
             // Its own removal is often the event being read, and one absent
             // checkout must not fail its siblings.
@@ -563,6 +627,7 @@ fn read_local_with_plan(
             }
             Err(error) => return Err(error.to_string()),
         };
+        let branch = record.branch.clone();
         match &current.head {
             HeadState::Branch { name, oid } => {
                 record.branch = Some(format!("refs/heads/{name}"));
@@ -581,15 +646,73 @@ fn read_local_with_plan(
             }
             HeadState::Unknown => {}
         }
-        snapshot.heads.remove(&record.id);
-        if let Some(branch) = current.branch()
-            && let Some(head) =
-                crate::github::worktree_head_repository(&record.path, branch, &cancellation)
-        {
-            snapshot.heads.insert(record.id, head);
+        // Where a branch publishes depends on its name and the configuration,
+        // never on where any ref points.
+        if change.topology || change.configuration || record.branch != branch {
+            heads_due.push(index);
         }
         *status = Some(current);
     }
+    let mut comparisons = HashMap::new();
+    for (record, status) in &mut snapshot.worktrees {
+        if let Some(status) = status.as_mut().filter(|_| !vanished.contains(&record.id)) {
+            compare_with_upstream(
+                &git,
+                &snapshot.repository.common_dir,
+                status,
+                &census,
+                &snapshot.tracking.comparisons,
+                &mut comparisons,
+                &cancellation,
+            )?;
+        }
+    }
+    snapshot.tracking = Tracking {
+        comparisons,
+        upstreams: census.remote_upstreams().map(str::to_owned).collect(),
+    };
+    // Every worktree normally shares one configuration, so it is read once.
+    let mut config = None::<crate::repository::RemoteConfig>;
+    for index in heads_due {
+        let (record, status) = &snapshot.worktrees[index];
+        if vanished.contains(&record.id) {
+            continue;
+        }
+        snapshot.heads.remove(&record.id);
+        let Some(branch) = status.as_ref().and_then(StatusSnapshot::branch) else {
+            continue;
+        };
+        if config
+            .as_ref()
+            .is_none_or(crate::repository::RemoteConfig::per_worktree)
+        {
+            config = git.remote_config(&record.path, &cancellation).ok();
+        }
+        if let Some(head) = config
+            .as_ref()
+            .and_then(|config| crate::github::branch_head_repository(config, branch))
+        {
+            snapshot.heads.insert(record.id, head);
+        }
+    }
+    finish_local_read(
+        project,
+        snapshot,
+        &change,
+        vanished,
+        cancellation,
+        previous_plan,
+    )
+}
+
+fn finish_local_read(
+    project: ProjectId,
+    mut snapshot: Snapshot,
+    change: &git_watch::Change,
+    vanished: HashSet<WorktreeId>,
+    cancellation: CancellationToken,
+    previous_plan: Option<&git_watch::Project>,
+) -> Result<(Snapshot, Option<git_watch::Project>), String> {
     snapshot
         .worktrees
         .retain(|(record, _)| !vanished.contains(&record.id));
@@ -616,6 +739,89 @@ fn read_local_with_plan(
         })
         .transpose()?;
     Ok((snapshot, plan))
+}
+
+/// Whether refs show this worktree's head somewhere its last status did not:
+/// its branch moved, was born or deleted, or another branch is checked out
+/// there. Any of these changes what the index and files differ from.
+fn head_moved(
+    status: Option<&StatusSnapshot>,
+    checked_out: Option<&str>,
+    census: &BranchCensus,
+) -> bool {
+    let Some(status) = status else {
+        return true;
+    };
+    match &status.head {
+        HeadState::Branch { name, oid } => {
+            checked_out != Some(name.as_str())
+                || census
+                    .branches
+                    .get(name)
+                    .is_none_or(|branch| branch.oid != *oid)
+        }
+        HeadState::Unborn { branch } => {
+            checked_out.is_some()
+                || branch
+                    .as_ref()
+                    .is_some_and(|branch| census.branches.contains_key(branch))
+        }
+        HeadState::Detached { .. } => checked_out.is_some(),
+        HeadState::Unknown => true,
+    }
+}
+
+/// Sets a branch's ahead/behind from its head and the upstream the census
+/// read. The counts depend only on the two commits, so a pair measured by an
+/// earlier read is reused while neither commit moves. A head the census does
+/// not know yet, having moved since, keeps the status's own report.
+fn compare_with_upstream(
+    git: &RepositoryService,
+    repository: &Path,
+    status: &mut StatusSnapshot,
+    census: &BranchCensus,
+    previous: &HashMap<(String, String), Divergence>,
+    measured: &mut HashMap<(String, String), Divergence>,
+    cancellation: &CancellationToken,
+) -> Result<(), String> {
+    let HeadState::Branch { name, oid } = &status.head else {
+        return Ok(());
+    };
+    let Some(branch) = census.branches.get(name) else {
+        return Ok(());
+    };
+    let Some(upstream) = &branch.upstream else {
+        status.tracking = TrackingState::NoUpstream;
+        return Ok(());
+    };
+    let unknown = TrackingState::Unknown {
+        upstream: Some(upstream.name.clone()),
+    };
+    let Some(base) = census.upstream_oid(upstream) else {
+        status.tracking = unknown;
+        return Ok(());
+    };
+    let pair = (oid.clone(), base.to_owned());
+    let counts = match measured.get(&pair).or_else(|| previous.get(&pair)) {
+        Some(counts) => *counts,
+        None => match git.revision_divergence(repository, base, oid, cancellation) {
+            Ok(counts) => counts,
+            Err(error) if cancellation.is_cancelled() => return Err(error.to_string()),
+            // A commit missing from a partial clone leaves the branch
+            // uncompared; its siblings still are.
+            Err(_) => {
+                status.tracking = unknown;
+                return Ok(());
+            }
+        },
+    };
+    measured.insert(pair, counts);
+    status.tracking = TrackingState::Compared {
+        upstream: upstream.name.clone(),
+        ahead: counts.ahead.into(),
+        behind: counts.behind.into(),
+    };
+    Ok(())
 }
 
 /// Whether a failed read is explained by the directory no longer being a
@@ -806,7 +1012,7 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{fs, os::unix::fs::PermissionsExt, process::Command};
+    use std::{collections::BTreeMap, fs, os::unix::fs::PermissionsExt, process::Command};
 
     fn git(directory: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -850,6 +1056,7 @@ mod tests {
             repository,
             worktrees,
             heads: HashMap::new(),
+            tracking: Tracking::default(),
         }
     }
 
@@ -890,6 +1097,7 @@ mod tests {
                 .map(|(record, _)| (record.id, head.clone()))
                 .collect(),
             worktrees: records,
+            tracking: Tracking::default(),
         };
         let mut listed = previous
             .worktrees
@@ -1071,6 +1279,463 @@ mod tests {
             "passed",
         )
         .unwrap();
+    }
+
+    fn git_output(directory: &Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .current_dir(directory)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "git {args:?}: {output:?}");
+        String::from_utf8(output.stdout).unwrap().trim().to_owned()
+    }
+
+    /// The Git commands `read` ran, by name, from the `GIT_TRACE2` log at
+    /// `trace`.
+    fn commands_during<T>(trace: &Path, read: impl FnOnce() -> T) -> (T, BTreeMap<String, usize>) {
+        let before = fs::metadata(trace).map_or(0, |metadata| metadata.len() as usize);
+        let value = read();
+        let log = fs::read(trace).unwrap_or_default();
+        let mut counts = BTreeMap::new();
+        for line in String::from_utf8_lossy(&log[before.min(log.len())..]).lines() {
+            if let Some((_, name)) = line.split_once(" cmd_name ") {
+                let name = name.split(' ').next().unwrap_or_default().to_owned();
+                *counts.entry(name).or_default() += 1;
+            }
+        }
+        (value, counts)
+    }
+
+    fn ran(counts: &BTreeMap<String, usize>, command: &str) -> usize {
+        counts.get(command).copied().unwrap_or_default()
+    }
+
+    fn worktree_at<'a>(
+        snapshot: &'a Snapshot,
+        path: &Path,
+    ) -> &'a (WorktreeRecord, Option<StatusSnapshot>) {
+        snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| record.path == path)
+            .unwrap()
+    }
+
+    fn tracking_at(snapshot: &Snapshot, path: &Path) -> TrackingState {
+        worktree_at(snapshot, path)
+            .1
+            .as_ref()
+            .unwrap()
+            .tracking
+            .clone()
+    }
+
+    fn compared(upstream: &str, ahead: u64, behind: u64) -> TrackingState {
+        TrackingState::Compared {
+            upstream: upstream.into(),
+            ahead,
+            behind,
+        }
+    }
+
+    /// A shared ref change reads refs, not every worktree's files: only a
+    /// worktree whose head the refs show moved gets a status, and each
+    /// (head, upstream) pair is measured once and reused until either moves.
+    #[test]
+    fn shared_ref_changes_reread_only_moved_heads_and_reuse_comparisons() {
+        const CHILD: &str = "CAGENTS_REF_READ_TEST_TRACE";
+        let Some(trace) = std::env::var_os(CHILD).map(PathBuf::from) else {
+            let directory = tempfile::tempdir().unwrap();
+            let trace = directory.path().join("trace2.log");
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "app::git_ui::tests::shared_ref_changes_reread_only_moved_heads_and_reuse_comparisons",
+                    "--nocapture",
+                ])
+                .env(CHILD, &trace)
+                .env("GIT_TRACE2", &trace)
+                .status()
+                .unwrap();
+            assert!(status.success());
+            assert!(
+                directory.path().join("passed").exists(),
+                "the traced test body did not run"
+            );
+            return;
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let origin = directory.path().join("origin");
+        let repo = directory.path().join("repo");
+        let twin = directory.path().join("twin");
+        let feature = directory.path().join("feature");
+        let detached = directory.path().join("detached");
+        let snapshot = fixture(&repo);
+        git(
+            directory.path(),
+            &["init", "-q", "--bare", "-b", "main", "origin"],
+        );
+        git(&repo, &["config", "commit.gpgsign", "false"]);
+        git(
+            &repo,
+            &["remote", "add", "origin", origin.to_str().unwrap()],
+        );
+        git(&repo, &["push", "-q", "origin", "main", "main:feature"]);
+        git(&repo, &["fetch", "-q", "origin"]);
+        git(
+            &repo,
+            &["branch", "-q", "--set-upstream-to=origin/main", "main"],
+        );
+        for (path, branch, upstream) in [
+            (&twin, "twin", "origin/main"),
+            (&feature, "feature", "origin/feature"),
+        ] {
+            git(
+                &repo,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    branch,
+                    path.to_str().unwrap(),
+                    "main",
+                ],
+            );
+            git(
+                &repo,
+                &[
+                    "branch",
+                    "-q",
+                    &format!("--set-upstream-to={upstream}"),
+                    branch,
+                ],
+            );
+        }
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                detached.to_str().unwrap(),
+            ],
+        );
+        let project = ProjectId::new();
+        let read = |snapshot: Snapshot, change: git_watch::Change| {
+            commands_during(&trace, || {
+                read_local(project, snapshot, change, CancellationToken::default())
+                    .unwrap()
+                    .0
+            })
+        };
+        let references = || git_watch::Change {
+            references: true,
+            ..Default::default()
+        };
+        let (snapshot, counts) = read(
+            snapshot,
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(snapshot.worktrees.len(), 4);
+        assert_eq!(ran(&counts, "status"), 4);
+        assert_eq!(ran(&counts, "rev-list"), 1, "three branches share one pair");
+        assert_eq!(
+            ran(&counts, "config"),
+            1,
+            "one configuration serves them all"
+        );
+        for path in [&repo, &twin] {
+            assert_eq!(tracking_at(&snapshot, path), compared("origin/main", 0, 0));
+        }
+        assert_eq!(
+            tracking_at(&snapshot, &feature),
+            compared("origin/feature", 0, 0)
+        );
+        assert_eq!(tracking_at(&snapshot, &detached), TrackingState::NoUpstream);
+
+        // Nothing moved: one ref read, no status and no comparison.
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(
+            counts,
+            BTreeMap::from([("for-each-ref".to_owned(), 1)]),
+            "an unchanged ref census costs one process"
+        );
+
+        // A commit made elsewhere, then a fetch that moves origin/main: the
+        // two branches tracking it share one new pair.
+        let scratch = directory.path().join("scratch");
+        git(
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--detach",
+                scratch.to_str().unwrap(),
+            ],
+        );
+        fs::write(scratch.join("added.txt"), "added\n").unwrap();
+        git(&scratch, &["add", "added.txt"]);
+        git(&scratch, &["commit", "-q", "-m", "second"]);
+        let second = git_output(&scratch, &["rev-parse", "HEAD"]);
+        let first = git_output(&repo, &["rev-parse", "HEAD"]);
+        git(&repo, &["update-ref", "refs/remotes/origin/main", &second]);
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(ran(&counts, "status"), 0);
+        assert_eq!(ran(&counts, "rev-list"), 1);
+        assert_eq!(ran(&counts, "config"), 0);
+        assert_eq!(ran(&counts, "worktree"), 0);
+        for path in [&repo, &twin] {
+            assert_eq!(tracking_at(&snapshot, path), compared("origin/main", 0, 1));
+        }
+        assert_eq!(
+            tracking_at(&snapshot, &feature),
+            compared("origin/feature", 0, 0)
+        );
+
+        // A branch moved underneath its worktree, as a rebase or reset from
+        // another worktree does, changes what its index differs from.
+        git(&repo, &["update-ref", "refs/heads/feature", &second]);
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(ran(&counts, "status"), 1, "only the moved head is reread");
+        assert_eq!(ran(&counts, "rev-list"), 1);
+        let (record, status) = worktree_at(&snapshot, &feature);
+        assert_eq!(record.head_oid.as_deref(), Some(second.as_str()));
+        let status = status.as_ref().unwrap();
+        assert_eq!(status.dirty.staged, 1, "the index still lacks added.txt");
+        assert_eq!(status.tracking, compared("origin/feature", 1, 0));
+
+        // A force push to the upstream: a new pair, measured afresh; and back
+        // again, which must not reuse a count for a pair no longer shown.
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/feature", &second],
+        );
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(ran(&counts, "status"), 0);
+        assert_eq!(ran(&counts, "rev-list"), 1);
+        assert_eq!(
+            tracking_at(&snapshot, &feature),
+            compared("origin/feature", 0, 0)
+        );
+        git(
+            &repo,
+            &["update-ref", "refs/remotes/origin/feature", &first],
+        );
+        let (snapshot, _) = read(snapshot, references());
+        assert_eq!(
+            tracking_at(&snapshot, &feature),
+            compared("origin/feature", 1, 0)
+        );
+
+        // A branch switch whose own HEAD event has not arrived yet: the refs
+        // already say another branch is checked out there.
+        git(&twin, &["switch", "-q", "-c", "other"]);
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(ran(&counts, "status"), 1);
+        assert_eq!(
+            ran(&counts, "config"),
+            1,
+            "a new branch may publish elsewhere"
+        );
+        let (record, status) = worktree_at(&snapshot, &twin);
+        assert_eq!(record.branch.as_deref(), Some("refs/heads/other"));
+        assert_eq!(status.as_ref().unwrap().tracking, TrackingState::NoUpstream);
+
+        // Configuration moves where branches publish: read once, not per
+        // worktree, and no status.
+        git(
+            &repo,
+            &["config", "branch.feature.description", "described"],
+        );
+        let (snapshot, counts) = read(
+            snapshot,
+            git_watch::Change {
+                references: true,
+                configuration: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(ran(&counts, "status"), 0);
+        assert_eq!(ran(&counts, "config"), 1);
+
+        // A pruned upstream is gone, and stays one ref read per event.
+        git(&repo, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+        let (snapshot, _) = read(snapshot, references());
+        assert_eq!(
+            tracking_at(&snapshot, &feature),
+            TrackingState::Unknown {
+                upstream: Some("origin/feature".into())
+            }
+        );
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(counts, BTreeMap::from([("for-each-ref".to_owned(), 1)]));
+
+        // A detached worktree that checks out a branch, then an unborn branch
+        // that is born.
+        git(&detached, &["switch", "-q", "-c", "attached"]);
+        let (snapshot, _) = read(snapshot, references());
+        assert!(!worktree_at(&snapshot, &detached).0.detached);
+        git(&detached, &["switch", "-q", "--orphan", "newborn"]);
+        let (snapshot, _) = read(snapshot, references());
+        assert_eq!(
+            worktree_at(&snapshot, &detached).1.as_ref().unwrap().head,
+            HeadState::Unborn {
+                branch: Some("newborn".into())
+            }
+        );
+        git(&detached, &["commit", "-q", "--allow-empty", "-m", "born"]);
+        let (snapshot, counts) = read(snapshot, references());
+        assert_eq!(ran(&counts, "status"), 1);
+        assert!(matches!(
+            &worktree_at(&snapshot, &detached).1.as_ref().unwrap().head,
+            HeadState::Branch { name, .. } if name == "newborn"
+        ));
+
+        let cancelled = CancellationToken::default();
+        cancelled.cancel();
+        assert!(read_local(project, snapshot, references(), cancelled).is_err());
+        fs::write(trace.with_file_name("passed"), "passed").unwrap();
+    }
+
+    fn empty_snapshot(repository: RepositoryInfo) -> Snapshot {
+        Snapshot {
+            repository,
+            worktrees: Vec::new(),
+            heads: HashMap::new(),
+            tracking: Tracking::default(),
+        }
+    }
+
+    /// CPU time of this process's reaped children, in seconds.
+    fn children_cpu_seconds() -> f64 {
+        let mut usage = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `getrusage` fills the struct it is given and nothing else.
+        assert_eq!(
+            unsafe { libc::getrusage(libc::RUSAGE_CHILDREN, usage.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: initialized by the successful call above.
+        let usage = unsafe { usage.assume_init() };
+        let seconds = |time: libc::timeval| time.tv_sec as f64 + time.tv_usec as f64 / 1e6;
+        seconds(usage.ru_utime) + seconds(usage.ru_stime)
+    }
+
+    /// Opt-in workload (docs/performance.md, "Sidebar Git reads"): the Git
+    /// processes, child CPU and wall time one local read costs for a shared
+    /// ref change and for one worktree's own change, in an existing
+    /// repository. Run with `GIT_TRACE2` set to an absolute file to count
+    /// processes.
+    #[test]
+    #[ignore = "opt-in workload; see docs/performance.md"]
+    fn ref_event_cost() {
+        let repository = PathBuf::from(
+            std::env::var_os("CAGENTS_REF_EVENT_REPOSITORY")
+                .expect("CAGENTS_REF_EVENT_REPOSITORY names the repository to read"),
+        );
+        // Moves refs before each round; `$1` is the round number.
+        let churn = std::env::var("CAGENTS_REF_EVENT_CHURN")
+            .expect("CAGENTS_REF_EVENT_CHURN is a shell command that moves refs");
+        let rounds = std::env::var("CAGENTS_REF_EVENT_ROUNDS")
+            .ok()
+            .and_then(|rounds| rounds.parse::<usize>().ok())
+            .unwrap_or(20);
+        let trace = std::env::var_os("GIT_TRACE2")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/nonexistent"));
+        let cancellation = CancellationToken::default();
+        let info = RepositoryService::system("git")
+            .discover(&repository, &cancellation)
+            .unwrap();
+        let project = ProjectId::new();
+        let mut snapshot = read_local(
+            project,
+            empty_snapshot(info),
+            git_watch::Change {
+                topology: true,
+                ..Default::default()
+            },
+            cancellation.clone(),
+        )
+        .unwrap()
+        .0;
+        let first = snapshot
+            .worktrees
+            .iter()
+            .find(|(record, _)| !record.bare)
+            .unwrap()
+            .0
+            .id;
+        println!(
+            "worktrees={}",
+            snapshot
+                .worktrees
+                .iter()
+                .filter(|(record, _)| !record.bare)
+                .count()
+        );
+        for (label, change) in [
+            (
+                "references",
+                git_watch::Change {
+                    references: true,
+                    ..Default::default()
+                },
+            ),
+            (
+                "one-worktree",
+                git_watch::Change {
+                    worktrees: [first].into(),
+                    ..Default::default()
+                },
+            ),
+        ] {
+            let mut samples = Vec::new();
+            for round in 0..rounds {
+                if label == "references" {
+                    let status = Command::new("sh")
+                        .args(["-c", &churn, "churn", &round.to_string()])
+                        .env_remove("GIT_TRACE2")
+                        .status()
+                        .unwrap();
+                    assert!(status.success());
+                }
+                let cpu = children_cpu_seconds();
+                let started = Instant::now();
+                let (next, counts) = commands_during(&trace, || {
+                    read_local(project, snapshot, change.clone(), cancellation.clone())
+                        .unwrap()
+                        .0
+                });
+                let wall = started.elapsed().as_secs_f64();
+                let cpu = children_cpu_seconds() - cpu;
+                snapshot = next;
+                let processes = counts.values().sum::<usize>();
+                println!(
+                    "{label} round={round} processes={processes} status={} rev_list={} wall_ms={:.1} child_cpu_ms={:.1}",
+                    ran(&counts, "status"),
+                    ran(&counts, "rev-list"),
+                    wall * 1e3,
+                    cpu * 1e3
+                );
+                samples.push((processes, wall, cpu));
+            }
+            let mean = |pick: fn(&(usize, f64, f64)) -> f64| {
+                samples.iter().map(pick).sum::<f64>() / samples.len() as f64
+            };
+            println!(
+                "{label} mean: processes={:.1} wall_ms={:.1} child_cpu_ms={:.1}",
+                mean(|sample| sample.0 as f64),
+                mean(|sample| sample.1) * 1e3,
+                mean(|sample| sample.2) * 1e3
+            );
+        }
     }
 
     #[test]

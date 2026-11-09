@@ -289,10 +289,20 @@ pub fn worktree_head_repository(
     branch: &str,
     cancellation: &CancellationToken,
 ) -> Option<GitHubRepoKey> {
+    let config = crate::repository::RepositoryService::system("git")
+        .remote_config(worktree, cancellation)
+        .ok()?;
+    branch_head_repository(&config, branch)
+}
+
+/// The GitHub repository `branch` publishes to under `config`, for a caller
+/// that resolves several branches from one configuration read.
+pub fn branch_head_repository(
+    config: &crate::repository::RemoteConfig,
+    branch: &str,
+) -> Option<GitHubRepoKey> {
     let branch = crate::repository::ValidatedBranchName::parse(branch).ok()?;
-    let remote = crate::repository::RepositoryService::system("git")
-        .branch_remote(worktree, &branch, cancellation)
-        .ok()??;
+    let remote = config.branch_remote(&branch)?;
     remote
         .push_url
         .as_deref()
