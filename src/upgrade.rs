@@ -209,7 +209,7 @@ pub(crate) struct UnreadableProcess {
 
 #[cfg(any(feature = "host", feature = "ui"))]
 impl UnreadableProcess {
-    #[cfg(test)]
+    #[cfg(all(test, feature = "ui"))]
     pub(crate) fn fixture(pid: u32, start: u64, name: &str) -> Self {
         Self {
             pid,

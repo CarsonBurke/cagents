@@ -348,7 +348,7 @@ fn reconcile_with(
 
 /// Why Close kept a pane, for the person who asked.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct KeptPane {
+pub struct KeptPane {
     pub(crate) reason: String,
     /// When these are all that's in the way, the person may close the pane and
     /// leave them running. Empty otherwise.
