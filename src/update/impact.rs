@@ -226,6 +226,11 @@ mod tests {
         assert!(!previous.preserves_consent(&duplicated));
         assert!(!duplicated.preserves_consent(&previous));
         let preview = Preview {
+            from_version: String::new(),
+            windows: 0,
+            stopped: Vec::new(),
+            stopped_windows: Vec::new(),
+            labels: Default::default(),
             candidate: Candidate {
                 version: "1.0.0".into(),
                 protocol: 31,
@@ -237,6 +242,70 @@ mod tests {
         let mut changed = preview.clone();
         changed.candidate.digest = "different-local-build".into();
         assert!(!preview.preserves_consent(&changed));
+    }
+    #[test]
+    fn stopped_outcomes_require_the_same_panes_windows_and_reasons() {
+        use super::super::source_inspection::{StoppedKind, StoppedPane, StoppedWindow};
+        let preview = Preview {
+            candidate: Candidate {
+                version: "2".into(),
+                protocol: 160,
+                digest: "same".into(),
+            },
+            replaces_daemon: false,
+            daemon: None,
+            from_version: "1".into(),
+            windows: 2,
+            stopped: vec![StoppedPane {
+                pane: TerminalId::new(),
+                kind: StoppedKind::Chat,
+                label: "Review".into(),
+                reason: "its conversation could not be confirmed".into(),
+                recovery: "Press Resume in the pane to reopen it".into(),
+            }],
+            stopped_windows: vec![StoppedWindow {
+                window: 2,
+                reason: "Window 2's saved panes could not be read".into(),
+                recovery: "The saved file is kept unchanged".into(),
+            }],
+            labels: Default::default(),
+        };
+        assert!(preview.preserves_consent(&preview));
+        let mut changed = preview.clone();
+        changed.stopped[0].pane = TerminalId::new();
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped[0].reason = "ended before it recorded its conversation".into();
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped.clear();
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped_windows[0].window = 1;
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped_windows[0].reason = "another reason".into();
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped.push(changed.stopped[0].clone());
+        assert!(!preview.preserves_consent(&changed));
+        changed = preview.clone();
+        changed.stopped[0].label = "Renamed".into();
+        assert!(preview.preserves_consent(&changed));
+    }
+
+    #[test]
+    fn older_preview_json_defaults_the_outcomes_and_context() {
+        let preview: Preview = serde_json::from_value(serde_json::json!({
+            "candidate": {"version":"2", "protocol":160, "digest":"same"},
+            "replaces_daemon":false, "daemon":null
+        }))
+        .unwrap();
+        assert!(preview.stopped.is_empty());
+        assert!(preview.stopped_windows.is_empty());
+        assert!(preview.labels.is_empty());
+        assert!(preview.from_version.is_empty());
+        assert_eq!(preview.windows, 0);
     }
 }
 
@@ -254,11 +323,44 @@ pub struct Preview {
     /// Compatible updates leave the daemon and its entire inventory in place.
     pub replaces_daemon: bool,
     pub daemon: Option<DaemonImpact>,
+    #[serde(default)]
+    pub from_version: String,
+    #[serde(default)]
+    pub windows: usize,
+    #[serde(default)]
+    pub stopped: Vec<super::source_inspection::StoppedPane>,
+    #[serde(default)]
+    pub stopped_windows: Vec<super::source_inspection::StoppedWindow>,
+    #[serde(default)]
+    pub labels: BTreeMap<TerminalId, super::source_inspection::PaneLabel>,
 }
 
 impl Preview {
+    pub(super) fn inspection(&self) -> super::source_inspection::SourceInspection {
+        super::source_inspection::SourceInspection {
+            stopped: self.stopped.clone(),
+            stopped_windows: self.stopped_windows.clone(),
+            labels: self.labels.clone(),
+        }
+    }
+
+    pub(super) fn with_inspection(
+        mut self,
+        inspection: &super::source_inspection::SourceInspection,
+    ) -> Self {
+        self.stopped = inspection.stopped.clone();
+        self.stopped_windows = inspection.stopped_windows.clone();
+        self.labels = inspection.labels.clone();
+        self
+    }
+
     pub fn preserves_consent(&self, observed: &Self) -> bool {
-        self.candidate == observed.candidate
+        super::source_inspection::SourceInspection::same_outcomes(
+            &self.stopped,
+            &self.stopped_windows,
+            &observed.stopped,
+            &observed.stopped_windows,
+        ) && self.candidate == observed.candidate
             && self.replaces_daemon == observed.replaces_daemon
             && match (&self.daemon, &observed.daemon) {
                 (None, None) => true,

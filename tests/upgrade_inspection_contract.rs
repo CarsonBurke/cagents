@@ -132,8 +132,19 @@ fn inspect(
     if fs::metadata(&output).map_err(|e| e.to_string())?.len() > 16 * 1024 {
         return Err("inspection receipt exceeded limit".into());
     }
-    serde_json::from_slice::<Result<(), String>>(&fs::read(output).map_err(|e| e.to_string())?)
-        .map_err(|e| e.to_string())?
+    let inspection = serde_json::from_slice::<
+        Result<cagents::update::source_inspection::SourceInspection, String>,
+    >(&fs::read(output).map_err(|e| e.to_string())?)
+    .map_err(|e| e.to_string())??;
+    if !inspection.stopped.is_empty() || !inspection.stopped_windows.is_empty() {
+        return Err(format!(
+            "original saved terminal unexpectedly stopped: {inspection:?}"
+        ));
+    }
+    if inspection.labels.is_empty() {
+        return Err("saved terminal missing its review label".into());
+    }
+    Ok(())
 }
 fn birth(pid: u32) -> Result<String, String> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|e| e.to_string())?;

@@ -8,6 +8,7 @@ mod v77;
 pub(super) use current::Client as InspectionClient;
 
 use crate::install_guard::SourceInspectionRequest as Request;
+use crate::update::source_inspection::{SourceInspection, StoppedKind, StoppedWindow};
 use crate::{
     chat::Session,
     model::{CardKind, HostSessionProof},
@@ -43,9 +44,8 @@ pub(super) fn entry() -> Option<Result<(), String>> {
         let request =
             serde_json::from_str(argument).map_err(|_| "Invalid source inspection request")?;
         let result = inspect(request);
-        // Errors are deliberately restricted to card IDs and fixed reasons.
-        // The parent can report an actionable deferral without exposing argv,
-        // account environment, listener credentials, or transcript contents.
+        // Outcomes include only saved display labels and fixed recovery text,
+        // never argv, account environment, listener credentials or transcript text.
         let mut stdout = io::stdout().lock();
         serde_json::to_writer(&mut stdout, &result)
             .map_err(|_| "Cannot write source inspection receipt")?;
@@ -126,249 +126,309 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
     }
 }
 
-/// Keep the complete classification in one bounded pass. Details are redacted
-/// and capped independently of the inventory: a large workspace must not turn
-/// one refusal into a sequence of install/close/retry cycles.
-#[derive(Default)]
-struct InspectionFailures {
-    count: usize,
-    details: Vec<String>,
-    /// Every distinct reason, so one pane retained by several saved windows
-    /// is one problem to resolve rather than one per store.
-    seen: HashSet<String>,
-}
+const UNCHECKED: &str = "could not be checked before the update";
+const CHAT_RECOVERY: &str = "Press Resume in the pane to reopen it";
+const TERMINAL_RECOVERY: &str = "Press Restart in the pane";
+const CONSOLE_REASON: &str = "its console reopens without its chat view connected";
+const CONSOLE_RECOVERY: &str = "The console keeps running; reopen the conversation from the pane";
 
-impl InspectionFailures {
-    fn push(&mut self, reason: String) {
-        if !self.seen.insert(reason.clone()) {
-            return;
+fn stop_unchecked(
+    inspection: &mut SourceInspection,
+    saved: &[(crate::model::CardId, CardKind)],
+    checked: &HashSet<crate::model::TerminalId>,
+    current_boot: &crate::model::BootId,
+) {
+    for (_, kind) in saved {
+        let id = match kind {
+            CardKind::Chat(source) => source.id,
+            CardKind::Terminal(source) => source.id,
+            _ => continue,
+        };
+        if checked.contains(&id) {
+            continue;
         }
-        self.count += 1;
-        if self.details.len() < 40 {
-            self.details.push(reason);
+        match kind {
+            CardKind::Chat(source) if !source.is_unstarted() => {
+                inspection.stop(source.id, StoppedKind::Chat, UNCHECKED, CHAT_RECOVERY)
+            }
+            CardKind::Terminal(source) if terminal_requires_migration(source, current_boot) => {
+                inspection.stop(
+                    source.id,
+                    StoppedKind::Terminal,
+                    UNCHECKED,
+                    TERMINAL_RECOVERY,
+                )
+            }
+            _ => {}
         }
-    }
-
-    fn finish(self) -> Result<(), String> {
-        if self.count == 0 {
-            return Ok(());
-        }
-        let omitted = self.count - self.details.len();
-        let mut message = format!(
-            "Update needs recovery for {} saved-state problem(s). Source windows remain usable.\n{}",
-            self.count,
-            self.details.join("\n")
-        );
-        if omitted > 0 {
-            message.push_str(&format!(
-                "\n{omitted} additional problems were classified; showing the first 40."
-            ));
-        }
-        Err(message)
     }
 }
 
-fn inspect(request: Request) -> Result<(), String> {
+fn inspect(request: Request) -> Result<SourceInspection, String> {
     let deadline = Instant::now() + Duration::from_secs(30);
     let current_boot =
         crate::daemon::read_boot_id().map_err(|_| "Cannot verify the current kernel boot")?;
     let paths = crate::instance::window_database_paths()
         .map_err(|_| "Cannot enumerate saved source windows")?;
-    let mut failures = InspectionFailures::default();
+    let mut inspection = SourceInspection::default();
     let mut budget = crate::persistence::MigrationInspectionBudget::new(deadline);
     let mut saved = Vec::new();
     for (window, path) in paths.into_iter().enumerate() {
-        check_deadline(deadline)?;
         match std::fs::symlink_metadata(&path) {
             Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(_) => {
-                failures.push(format!("Saved window {} cannot be read.", window + 1));
-                continue;
-            }
-            Ok(_) => {}
-        }
-        match crate::persistence::read_open_migration_sessions_with_budget(&path, &mut budget) {
-            Ok(panes) => saved.extend(panes),
-            Err(_) => failures.push(format!("Saved window {} has an unreadable or unsupported pane store; its contents were preserved.", window + 1)),
-        }
-    }
-    let evidence = ExecutionEvidence::load(&current_boot);
-    let no_live_panes = saved.iter().all(|(_, kind)| match kind {
-        CardKind::Chat(session) => {
-            session.is_unstarted()
-                || evidence
-                    .classify(session)
-                    .leaves_nothing_to_carry(request.accept_unreopenable)
-        }
-        CardKind::Terminal(session) => !terminal_requires_migration(session, &current_boot),
-        _ => true,
-    });
-    if no_live_panes && request.proof.is_none() {
-        return failures.finish();
-    }
-    let mut reader = match connect(&request, deadline) {
-        Ok(reader) => reader,
-        Err(reason) => {
-            failures.push(reason);
-            return failures.finish();
-        }
-    };
-    // Resolve stale and missing sources first, then sample the roster once.
-    // Every cache entry retains the complete issued descriptor; two aliases
-    // with the same actor ID cannot borrow each other's authentication.
-    let initial_inventory = reader.list()?;
-    let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
-    let mut cold_history = Vec::new();
-    for (_, kind) in &saved {
-        check_deadline(deadline)?;
-        if let CardKind::Chat(source) = kind {
-            if !source.is_unstarted()
-                && (source.proof.as_ref() != request.proof.as_ref()
-                    || !initial_inventory.iter().any(|live| live.id == source.id))
-                && !resolutions.iter().any(|(issued, _)| issued == source)
-                && !request.proof.as_ref().is_some_and(|proof| {
-                    relisted_codex_conversation(
-                        source,
-                        &initial_inventory,
-                        proof,
-                        request.require_resumable,
-                    )
-                })
-            {
-                let missing = !initial_inventory.iter().any(|live| live.id == source.id);
-                // Nothing of its old owner remains to adopt or preserve.
-                if missing
-                    && evidence
-                        .classify(source)
-                        .leaves_nothing_to_carry(request.accept_unreopenable)
-                {
-                    continue;
-                }
-                let result = if missing && request.reconcile_retained {
-                    reader
-                        .reconcile_retained(source)
-                        .and_then(|()| reader.resolve(source))
-                } else if missing {
-                    Err(
-                        "Saved owner changed after preview; review the recovered inventory again"
-                            .into(),
-                    )
-                } else {
-                    reader.resolve(source)
-                };
-                if missing
-                    && source.is_saved_claude_history()
-                    && !result
-                        .as_ref()
-                        .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
-                    && reader.inspect_saved_history(source).is_ok()
-                {
-                    cold_history.push(source.clone());
-                }
-                resolutions.push((source.clone(), result));
-            }
-        }
-    }
-    let inventory = reader.list()?;
-    let terminals = reader.terminals()?;
-    if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
-        return Err(
-            "Source inventory exceeds the qualified migration limit; source windows remain usable"
-                .into(),
-        );
-    }
-    let proof = request
-        .proof
-        .as_ref()
-        .ok_or("Source service proof is unavailable")?;
-    let matched_cli = crate::companion::Product::Cli
-        .beside_current()
-        .map_err(|_| "Cannot qualify the destination console companion")?;
-    let mut ids = HashSet::new();
-    for session in &inventory {
-        check_deadline(deadline)?;
-        if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
-            failures.push(format!(
-                "Source conversation {} has ambiguous ownership.",
-                session.id
-            ));
-            continue;
-        }
-        if let Some(terminal) = &session.terminal {
-            if let Err(reason) = qualify_console_migration(terminal, &matched_cli) {
-                failures.push(format!("Source conversation {}: {reason}.", session.id));
-            }
-        }
-        if validate_live_chat(session, request.require_resumable).is_err() {
-            failures.push(format!(
-                "Source conversation {} has no qualified immutable migration.",
-                session.id
-            ));
-        }
-    }
-    for terminal in &terminals {
-        check_deadline(deadline)?;
-        if terminal_requires_migration(&terminal.session, &current_boot) {
-            if let Err(reason) = qualify_console_migration(&terminal.session, &matched_cli) {
-                failures.push(format!(
-                    "Source terminal {}: {reason}.",
-                    terminal.session.id
-                ));
-            }
-        }
-    }
-    for (card, kind) in saved {
-        check_deadline(deadline)?;
-        match kind {
-            CardKind::Terminal(source) if terminal_requires_migration(&source, &current_boot) => {
-                if qualify_terminal(&source, &terminals, proof).is_err() {
-                    failures.push(format!(
-                        "Saved terminal pane {card} needs exact-owner recovery."
-                    ));
-                }
-            }
-            CardKind::Chat(source) if !source.is_unstarted() => {
-                if cold_history.iter().any(|issued| issued == &source)
-                    || relisted_codex_conversation(
-                        &source,
-                        &inventory,
-                        proof,
-                        request.require_resumable,
-                    )
-                {
-                    continue;
-                }
-                if let Some(problem) = saved_chat_problem(
-                    card,
-                    &source,
-                    &inventory,
-                    &evidence,
-                    request.accept_unreopenable,
-                    || {
-                        qualify_with_mode(
-                            &source,
-                            &inventory,
-                            proof,
-                            request.require_resumable,
-                            |source| {
-                                resolutions
-                                    .iter()
-                                    .find(|(issued, _)| issued == source)
-                                    .map(|(_, result)| result.clone())
-                                    .unwrap_or_else(|| {
-                                        Err("No authenticated source resolution".into())
-                                    })
-                            },
-                        )
-                    },
-                ) {
-                    failures.push(problem);
-                }
-            }
             _ => {}
         }
+        match crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget) {
+            Ok(panes) => {
+                for crate::persistence::MigrationPane {
+                    card,
+                    kind,
+                    label,
+                    inert,
+                } in panes
+                {
+                    let pane = match &kind {
+                        CardKind::Chat(source) => source.id,
+                        CardKind::Terminal(source) => source.id,
+                        _ => continue,
+                    };
+                    inspection.labels.entry(pane).or_insert(label);
+                    if !inert {
+                        saved.push((card, kind));
+                    }
+                }
+            }
+            Err(_) => inspection.stopped_windows.push(StoppedWindow {
+                window: window + 1,
+                reason: format!("Window {}'s saved panes could not be read", window + 1),
+                recovery: "The saved file is kept unchanged".into(),
+            }),
+        }
     }
-    failures.finish()
+    let evidence = ExecutionEvidence::load(&current_boot, deadline);
+    if check_deadline(deadline).is_err() {
+        stop_unchecked(&mut inspection, &saved, &HashSet::new(), &current_boot);
+        return Ok(inspection);
+    }
+    // With no running source service there is still useful per-pane evidence.
+    // A saved pane is never a reason to refuse replacing the application.
+    if request.proof.is_none() {
+        let mut checked = HashSet::new();
+        for (_, kind) in &saved {
+            if check_deadline(deadline).is_err() {
+                stop_unchecked(&mut inspection, &saved, &checked, &current_boot);
+                break;
+            }
+            match kind {
+                CardKind::Chat(source) => {
+                    checked.insert(source.id);
+                }
+                CardKind::Terminal(source) => {
+                    checked.insert(source.id);
+                }
+                _ => {}
+            }
+            match kind {
+                CardKind::Chat(source) if !source.is_unstarted() => {
+                    if let Some((reason, recovery)) =
+                        saved_chat_problem(source, &[], &evidence, || {
+                            Err("No running service".into())
+                        })
+                    {
+                        inspection.stop(source.id, StoppedKind::Chat, &reason, recovery);
+                    }
+                }
+                CardKind::Terminal(source)
+                    if terminal_requires_migration(source, &current_boot) =>
+                {
+                    inspection.stop(
+                        source.id,
+                        StoppedKind::Terminal,
+                        "its terminal could not be matched",
+                        TERMINAL_RECOVERY,
+                    )
+                }
+                _ => {}
+            }
+        }
+        return Ok(inspection);
+    }
+    let mut reader = connect(&request, deadline)?;
+    let mut checked_saved = HashSet::new();
+    let inspect_live =
+        (|| -> Result<(), String> {
+            let initial_inventory = reader.list()?;
+            let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
+            let mut cold_history = Vec::new();
+            for (_, kind) in &saved {
+                check_deadline(deadline)?;
+                if let CardKind::Chat(source) = kind {
+                    if !source.is_unstarted()
+                        && (source.proof.as_ref() != request.proof.as_ref()
+                            || !initial_inventory.iter().any(|live| live.id == source.id))
+                        && !resolutions.iter().any(|(issued, _)| issued == source)
+                        && !request.proof.as_ref().is_some_and(|proof| {
+                            relisted_codex_conversation(
+                                source,
+                                &initial_inventory,
+                                proof,
+                                request.require_resumable,
+                            )
+                        })
+                    {
+                        let missing = !initial_inventory.iter().any(|live| live.id == source.id);
+                        if missing
+                            && matches!(
+                                evidence.classify(source),
+                                SavedExecution::Ended | SavedExecution::Unrecorded
+                            )
+                        {
+                            continue;
+                        }
+                        let result = if missing && request.reconcile_retained {
+                            reader
+                                .reconcile_retained(source)
+                                .and_then(|()| reader.resolve(source))
+                        } else if missing {
+                            Err("Saved owner changed after preview".into())
+                        } else {
+                            reader.resolve(source)
+                        };
+                        if missing
+                            && source.is_saved_claude_history()
+                            && !result
+                                .as_ref()
+                                .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
+                            && reader.inspect_saved_history(source).is_ok()
+                        {
+                            cold_history.push(source.clone());
+                        }
+                        resolutions.push((source.clone(), result));
+                    }
+                }
+            }
+            let inventory = reader.list()?;
+            let terminals = reader.terminals()?;
+            if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
+                return Err("Source inventory exceeds its inspection limit".into());
+            }
+            let proof = request
+                .proof
+                .as_ref()
+                .ok_or("Source service is unavailable")?;
+            let matched_cli = crate::companion::Product::Cli
+                .beside_current()
+                .map_err(|_| "Cannot inspect the destination console companion")?;
+            let mut ids = HashSet::new();
+            for session in &inventory {
+                check_deadline(deadline)?;
+                if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
+                    inspection.stop(
+                        session.id,
+                        StoppedKind::Chat,
+                        "its conversation could not be confirmed",
+                        CHAT_RECOVERY,
+                    );
+                    continue;
+                }
+                if session.terminal.as_ref().is_some_and(|terminal| {
+                    qualify_console_migration(terminal, &matched_cli).is_err()
+                }) {
+                    inspection.stop(
+                        session.id,
+                        StoppedKind::Chat,
+                        CONSOLE_REASON,
+                        CONSOLE_RECOVERY,
+                    );
+                } else if validate_live_chat(session, request.require_resumable).is_err() {
+                    inspection.stop(
+                        session.id,
+                        StoppedKind::Chat,
+                        "its conversation could not be confirmed",
+                        CHAT_RECOVERY,
+                    );
+                }
+            }
+            for terminal in &terminals {
+                check_deadline(deadline)?;
+                if !inventory.iter().any(|chat| chat.id == terminal.session.id)
+                    && terminal_requires_migration(&terminal.session, &current_boot)
+                    && qualify_console_migration(&terminal.session, &matched_cli).is_err()
+                {
+                    inspection.stop(
+                        terminal.session.id,
+                        StoppedKind::Terminal,
+                        CONSOLE_REASON,
+                        CONSOLE_RECOVERY,
+                    );
+                }
+            }
+            for (_, kind) in &saved {
+                check_deadline(deadline)?;
+                match kind {
+                    CardKind::Chat(source) => {
+                        checked_saved.insert(source.id);
+                    }
+                    CardKind::Terminal(source) => {
+                        checked_saved.insert(source.id);
+                    }
+                    _ => {}
+                }
+                match kind {
+                    CardKind::Terminal(source)
+                        if terminal_requires_migration(source, &current_boot) =>
+                    {
+                        if qualify_terminal(source, &terminals, proof).is_err() {
+                            inspection.stop(
+                                source.id,
+                                StoppedKind::Terminal,
+                                "its terminal could not be matched",
+                                TERMINAL_RECOVERY,
+                            );
+                        }
+                    }
+                    CardKind::Chat(source) if !source.is_unstarted() => {
+                        if cold_history.iter().any(|issued| issued == source)
+                            || relisted_codex_conversation(
+                                source,
+                                &inventory,
+                                proof,
+                                request.require_resumable,
+                            )
+                        {
+                            continue;
+                        }
+                        if let Some((reason, recovery)) =
+                            saved_chat_problem(source, &inventory, &evidence, || {
+                                qualify_with_mode(
+                                    source,
+                                    &inventory,
+                                    proof,
+                                    request.require_resumable,
+                                    |source| {
+                                        resolutions
+                                            .iter()
+                                            .find(|(issued, _)| issued == source)
+                                            .map(|(_, result)| result.clone())
+                                            .unwrap_or_else(|| {
+                                                Err("No authenticated source resolution".into())
+                                            })
+                                    },
+                                )
+                            })
+                        {
+                            inspection.stop(source.id, StoppedKind::Chat, &reason, recovery);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(())
+        })();
+    if inspect_live.is_err() {
+        stop_unchecked(&mut inspection, &saved, &checked_saved, &current_boot);
+    }
+    Ok(inspection)
 }
 
 // Cold terminal presentation is retained unchanged. An actual previous boot
@@ -402,20 +462,14 @@ enum SavedExecution {
     /// The pane has execution this evidence does not cover, or the evidence
     /// is absent, foreign or unreadable.
     Unproved,
+    /// The bounded census or process inspection could not be completed.
+    Unchecked,
     /// A pane that never learned its conversation, every actor of which has
     /// ended, but at least one without the retirement that records what it
     /// confirmed. Nothing still runs, yet nothing durable names a
     /// conversation to reopen: the destination keeps the pane and refuses to
-    /// resume or replace it. Carrying it is a loss the person must accept.
+    /// resume or replace it. The update keeps it stopped for explicit recovery.
     Unrecorded,
-}
-
-impl SavedExecution {
-    /// Whether replacing the source cannot lose this pane's execution: it has
-    /// ended, or ended unrecorded and the person accepted it will not reopen.
-    fn leaves_nothing_to_carry(self, accept_unreopenable: bool) -> bool {
-        self == Self::Ended || (accept_unreopenable && self == Self::Unrecorded)
-    }
 }
 
 /// The source daemon's own ownership evidence, read without its lease and
@@ -432,6 +486,7 @@ struct ExecutionEvidence {
     /// How long a process that may still run can show no arguments before
     /// it proves nothing.
     exec_settle: Duration,
+    deadline: Option<Instant>,
 }
 
 /// Every retained helper the durable census registered, by pane.
@@ -444,7 +499,81 @@ type Census = Vec<(
 const MAX_CENSUS_ROWS: usize = 16 * 1024;
 
 impl ExecutionEvidence {
-    fn load(boot: &crate::model::BootId) -> Self {
+    fn running_pid(&self, source: &Session) -> Option<i32> {
+        let owners = self
+            .census
+            .as_ref()
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter(|(pane, _)| *pane == source.id)
+            .map(|(_, owner)| owner)
+            .collect::<Vec<_>>();
+        for owner in &owners {
+            for expected in [&owner.root, &owner.holder] {
+                let stat = self.processes.join(expected.pid.to_string()).join("stat");
+                if std::fs::read(stat)
+                    .ok()
+                    .and_then(|stat| crate::model::agent_recovery::process_identity(&stat))
+                    .is_some_and(|(_, start)| start == expected.start)
+                {
+                    return Some(expected.pid);
+                }
+            }
+        }
+        let marker = format!("cagents-codex-{}", source.id);
+        for entry in std::fs::read_dir(&self.processes).ok()? {
+            if self
+                .deadline
+                .is_some_and(|deadline| check_deadline(deadline).is_err())
+            {
+                return None;
+            }
+            let Ok(entry) = entry else {
+                continue;
+            };
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<i32>().ok())
+            else {
+                continue;
+            };
+            if !owners.is_empty() {
+                let Some(stat) = std::fs::read(entry.path().join("stat")).ok() else {
+                    continue;
+                };
+                let Some(close) = stat.iter().rposition(|byte| *byte == b')') else {
+                    continue;
+                };
+                let fields = String::from_utf8_lossy(&stat[close + 1..]);
+                let mut fields = fields.split_ascii_whitespace().skip(2);
+                let identities = [fields.next(), fields.next()]
+                    .map(|field| field.and_then(|field| field.parse::<i32>().ok()));
+                if owners.iter().any(|owner| {
+                    identities
+                        .iter()
+                        .flatten()
+                        .any(|id| *id == owner.root.pid || *id == owner.holder.pid)
+                }) {
+                    return Some(pid);
+                }
+            }
+            if source.launch.provider == crate::agent::Provider::Codex {
+                if let Ok(Threads::Arguments(arguments)) = process_arguments(&entry.path()) {
+                    if arguments
+                        .windows(marker.len())
+                        .any(|window| window == marker.as_bytes())
+                    {
+                        return Some(pid);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    fn load(boot: &crate::model::BootId, deadline: Instant) -> Self {
         let store = crate::instance::project_dirs()
             .ok_or_else(|| "The data directory is unavailable".to_owned())
             .map(|dirs| dirs.data_dir().join("workspace-model.sqlite3"));
@@ -457,6 +586,7 @@ impl ExecutionEvidence {
             retired: store.and_then(|path| read_retired_owners(&path)),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
+            deadline: Some(deadline),
         }
     }
 
@@ -472,6 +602,7 @@ impl ExecutionEvidence {
             retired: Err("A Codex pane has no census".into()),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
+            deadline: None,
         }
     }
 
@@ -509,7 +640,7 @@ impl ExecutionEvidence {
             return SavedExecution::Unproved;
         }
         let (Ok(census), Ok(native_holders)) = (&self.census, &self.native_holders) else {
-            return SavedExecution::Unproved;
+            return SavedExecution::Unchecked;
         };
         let mut owners = census
             .iter()
@@ -525,7 +656,7 @@ impl ExecutionEvidence {
             Kind::Native,
         ) {
             Ok(discovered) => discovered,
-            Err(_) => return SavedExecution::Unproved,
+            Err(_) => return SavedExecution::Unchecked,
         };
         owners.extend(&discovered);
         // A pane that never learned its conversation resumes only the one a
@@ -535,14 +666,20 @@ impl ExecutionEvidence {
         let mut execution = SavedExecution::Ended;
         let mut unrecorded = false;
         for owner in owners.into_iter().filter(|owner| owner.boot == self.boot) {
+            if self
+                .deadline
+                .is_some_and(|deadline| check_deadline(deadline).is_err())
+            {
+                return SavedExecution::Unchecked;
+            }
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
-                Err(_) => return SavedExecution::Unproved,
+                Err(_) => return SavedExecution::Unchecked,
             }
             match &self.retired {
                 Ok(retired) => unrecorded |= unnamed && !retired.contains(owner),
-                Err(_) if unnamed => return SavedExecution::Unproved,
+                Err(_) if unnamed => return SavedExecution::Unchecked,
                 Err(_) => {}
             }
         }
@@ -573,7 +710,7 @@ impl ExecutionEvidence {
         let (Ok(census), Ok(native_holders), Ok(retired)) =
             (&self.census, &self.native_holders, &self.retired)
         else {
-            return SavedExecution::Unproved;
+            return SavedExecution::Unchecked;
         };
         let mut owners = census
             .iter()
@@ -588,11 +725,17 @@ impl ExecutionEvidence {
             Kind::Native,
         ) {
             Ok(discovered) => discovered,
-            Err(_) => return SavedExecution::Unproved,
+            Err(_) => return SavedExecution::Unchecked,
         };
         owners.extend(&discovered);
         let mut execution = SavedExecution::Ended;
         for owner in owners {
+            if self
+                .deadline
+                .is_some_and(|deadline| check_deadline(deadline).is_err())
+            {
+                return SavedExecution::Unchecked;
+            }
             if !retired.contains(owner) {
                 return SavedExecution::Unproved;
             }
@@ -602,7 +745,7 @@ impl ExecutionEvidence {
             match crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root) {
                 Ok(true) => {}
                 Ok(false) => execution = SavedExecution::Running,
-                Err(_) => return SavedExecution::Unproved,
+                Err(_) => return SavedExecution::Unchecked,
             }
         }
         execution
@@ -635,19 +778,19 @@ impl ExecutionEvidence {
             return SavedExecution::Unproved;
         };
         let Ok(native_holders) = &self.native_holders else {
-            return SavedExecution::Unproved;
+            return SavedExecution::Unchecked;
         };
         let control = holder_registry::socket(native_holders, source.id);
         // Discovery refuses a record of another boot.
         let holder = match holder_registry::recovery_candidate(&control, Kind::Native) {
             Ok(holder) => holder,
-            Err(_) => return SavedExecution::Unproved,
+            Err(_) => return SavedExecution::Unchecked,
         };
         if let Some(holder) = holder {
             match crate::chat::runtime::retained_actor_abandoned(&holder.holder, &holder.root) {
                 Ok(true) => {}
                 Ok(false) => return SavedExecution::Running,
-                Err(_) => return SavedExecution::Unproved,
+                Err(_) => return SavedExecution::Unchecked,
             }
         }
         // Recent Codex releases bind a socket in their own runtime directory
@@ -660,16 +803,22 @@ impl ExecutionEvidence {
             {
                 None
             }
-            Err(_) => return SavedExecution::Unproved,
+            Err(_) => return SavedExecution::Unchecked,
         };
         // A holder binds its control socket before it starts the server and
         // publishes its record, so a starting holder is seen by that socket.
         let mut sockets = vec![listener.socket.as_path(), control.as_path()];
         sockets.extend(published.as_deref());
-        match codex_listener_survives(&self.processes, source.id, &sockets, self.exec_settle) {
+        match codex_listener_survives(
+            &self.processes,
+            source.id,
+            &sockets,
+            self.exec_settle,
+            self.deadline,
+        ) {
             Ok(true) => SavedExecution::Running,
             Ok(false) => SavedExecution::Ended,
-            Err(_) => SavedExecution::Unproved,
+            Err(_) => SavedExecution::Unchecked,
         }
     }
 }
@@ -693,6 +842,7 @@ fn codex_listener_survives(
     pane: crate::model::TerminalId,
     sockets: &[&Path],
     settle: Duration,
+    inspection_deadline: Option<Instant>,
 ) -> Result<bool, String> {
     use std::os::unix::ffi::OsStrExt;
     let marker = format!("cagents-codex-{pane}");
@@ -700,7 +850,9 @@ fn codex_listener_survives(
     let uid = crate::daemon::current_uid().to_string();
     // The arguments a process shows, or None once it can no longer run.
     let arguments = |path: &Path| -> Result<Option<Vec<u8>>, String> {
-        let deadline = Instant::now() + settle;
+        let deadline = inspection_deadline.map_or(Instant::now() + settle, |deadline| {
+            deadline.min(Instant::now() + settle)
+        });
         settled_process_arguments(
             || process_arguments(path),
             || {
@@ -715,6 +867,9 @@ fn codex_listener_survives(
     let entries = std::fs::read_dir(processes)
         .map_err(|error| format!("Cannot enumerate processes: {error}"))?;
     for entry in entries {
+        if let Some(deadline) = inspection_deadline {
+            check_deadline(deadline)?;
+        }
         let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
         if entry
             .file_name()
@@ -1022,36 +1177,56 @@ fn relisted_codex_conversation(
 /// look is held and qualifies like any live chat, and an owner that started
 /// since then is no longer Ended. Only a pane the source does not list and
 /// whose execution has ended is exempt from exact qualification.
+fn provider_name(provider: crate::agent::Provider) -> &'static str {
+    match provider {
+        crate::agent::Provider::Claude => "Claude",
+        crate::agent::Provider::Codex => "Codex",
+        crate::agent::Provider::Omp => "OMP",
+    }
+}
+
 fn saved_chat_problem(
-    card: crate::model::CardId,
     source: &Session,
     inventory: &[Session],
     evidence: &ExecutionEvidence,
-    accept_unreopenable: bool,
     qualify: impl FnOnce() -> Result<(), String>,
-) -> Option<String> {
+) -> Option<(String, &'static str)> {
     let execution =
         (!inventory.iter().any(|live| live.id == source.id)).then(|| evidence.classify(source));
-    if execution.is_some_and(|execution| execution.leaves_nothing_to_carry(accept_unreopenable)) {
+    if execution == Some(SavedExecution::Ended) {
         return None;
     }
-    qualify()
-        .err()
-        .map(|_| unqualified_chat_pane(card, execution))
-}
-
-fn unqualified_chat_pane(card: crate::model::CardId, execution: Option<SavedExecution>) -> String {
-    if execution == Some(SavedExecution::Running) {
-        format!(
-            "Saved conversation pane {card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
-        )
-    } else if execution == Some(SavedExecution::Unrecorded) {
-        format!(
-            "Saved conversation pane {card} ended before it recorded which conversation it had, so the update may not be able to reopen it. Nothing of it still runs. To update anyway, run `cagents daemon upgrade --accept-unreopenable` (or `scripts/install-local --accept-unreopenable`): the pane stays in its window, and if its conversation cannot be proved it will not resume or start one. A conversation it began stays on disk and can be reopened with Resume."
-        )
-    } else {
-        format!("Saved conversation pane {card} needs exact conversation recovery.")
+    if execution == Some(SavedExecution::Unrecorded) {
+        return Some((
+            "ended before it recorded its conversation".into(),
+            "Start fresh in the pane; anything it began can be reopened from Resume",
+        ));
     }
+    qualify().err().map(|_| {
+        if execution == Some(SavedExecution::Running) {
+            let pid = evidence.running_pid(source);
+            (
+                match pid {
+                    Some(pid) => format!(
+                        "{} is still running outside cagents (pid {pid})",
+                        provider_name(source.launch.provider)
+                    ),
+                    None => format!(
+                        "{} is still running outside cagents",
+                        provider_name(source.launch.provider)
+                    ),
+                },
+                "Stop that process, then press Resume in the pane",
+            )
+        } else if execution == Some(SavedExecution::Unchecked) {
+            (UNCHECKED.into(), CHAT_RECOVERY)
+        } else {
+            (
+                "its conversation could not be confirmed".into(),
+                CHAT_RECOVERY,
+            )
+        }
+    })
 }
 
 fn check_deadline(deadline: Instant) -> Result<(), String> {
@@ -1191,18 +1366,23 @@ mod tests {
     }
 
     #[test]
-    fn large_workspace_refusals_are_reported_together_with_bounded_details() {
-        let mut failures = InspectionFailures::default();
+    fn large_workspaces_report_every_stopped_pane() {
+        let mut inspection = SourceInspection::default();
         for _ in 0..65 {
-            failures.push(format!(
-                "Saved conversation pane {} needs exact conversation recovery.",
-                crate::model::CardId::new()
-            ));
+            inspection.stop(
+                TerminalId::new(),
+                StoppedKind::Chat,
+                "its conversation could not be confirmed",
+                CHAT_RECOVERY,
+            );
         }
-        let message = failures.finish().unwrap_err();
-        assert!(message.contains("65 saved-state problem(s)"));
-        assert!(message.contains("25 additional problems"));
-        assert!(message.len() < 16 * 1024);
+        assert_eq!(inspection.stopped.len(), 65);
+        assert!(
+            inspection
+                .stopped
+                .iter()
+                .all(|pane| pane.reason == "its conversation could not be confirmed")
+        );
     }
 
     #[test]
@@ -1228,6 +1408,21 @@ mod tests {
         let older = qualify_console_migration(&terminal, matched).unwrap_err();
         assert!(older.contains("different matched CLI installation"));
         for error in [same_path, older] {
+            let mut inspection = SourceInspection::default();
+            inspection.stop(
+                terminal.id,
+                StoppedKind::Terminal,
+                CONSOLE_REASON,
+                CONSOLE_RECOVERY,
+            );
+            assert_eq!(
+                inspection.stopped[0].reason,
+                "its console reopens without its chat view connected"
+            );
+            assert_eq!(
+                inspection.stopped[0].recovery,
+                "The console keeps running; reopen the conversation from the pane"
+            );
             assert!(!error.contains("private-directory"));
             assert!(!error.contains("never-print-this"));
             assert!(!error.contains("/installed"));
@@ -1326,6 +1521,7 @@ mod tests {
             retired: Ok(Vec::new()),
             processes: "/proc".into(),
             exec_settle: EXEC_SETTLE,
+            deadline: None,
         }
     }
 
@@ -1548,7 +1744,7 @@ mod tests {
         }
         let mut unreadable = evidence(holders.path(), ended.clone());
         unreadable.census = Err("unreadable".into());
-        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unchecked);
         // Discovery evidence that cannot be authenticated is never absence.
         std::fs::write(
             crate::daemon::holder_registry::socket(holders.path(), card.id).with_extension("json"),
@@ -1557,7 +1753,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             evidence(holders.path(), ended).classify(&card),
-            SavedExecution::Unproved
+            SavedExecution::Unchecked
         );
     }
 
@@ -1588,7 +1784,7 @@ mod tests {
             older.create(holders.path()).unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
-                SavedExecution::Unproved
+                SavedExecution::Unchecked
             );
         }
     }
@@ -1639,6 +1835,7 @@ mod tests {
                 card.id,
                 &[listener.as_path(), control.as_path()],
                 Duration::from_secs(2),
+                None,
             ) {
                 Ok(false) => absent += 1,
                 Err(error) if error == "A process has not published its arguments yet" => {
@@ -1705,7 +1902,7 @@ mod tests {
             process_arguments(&process).unwrap(),
             Threads::Unsettled
         ));
-        assert_eq!(evidence.classify(&card), SavedExecution::Unproved);
+        assert_eq!(evidence.classify(&card), SavedExecution::Unchecked);
 
         // Publish an unrelated process's actual arguments. The exact Ended
         // assertion must hold once that process no longer needs settlement.
@@ -1921,11 +2118,11 @@ mod tests {
         );
         let mut unreadable = live_processes.evidence(holders.path());
         unreadable.native_holders = Err("unavailable".into());
-        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unchecked);
         // A process table that cannot be read proves nothing.
         let mut absent = live_processes.evidence(holders.path());
         absent.processes = root.path().join("absent");
-        assert_eq!(absent.classify(&card), SavedExecution::Unproved);
+        assert_eq!(absent.classify(&card), SavedExecution::Unchecked);
         // A process that has not published its arguments might be the
         // server, unless none of its threads can run again: each is a zombie,
         // exiting (PF_EXITING, like a PID-namespace init waiting in do_exit)
@@ -1990,25 +2187,25 @@ mod tests {
             (
                 ('Z', 0, (0, 0)),
                 Some(('S', 0, (0, 0))),
-                SavedExecution::Unproved,
+                SavedExecution::Unchecked,
             ),
             (
                 ('Z', 0, (0, 0)),
                 Some(('S', 0, (term, term))),
-                SavedExecution::Unproved,
+                SavedExecution::Unchecked,
             ),
             (
                 ('D', 0x4, (0, 0)),
                 Some(('R', 0, (0, 0))),
-                SavedExecution::Unproved,
+                SavedExecution::Unchecked,
             ),
             (
                 ('R', 0, (0, 0)),
                 Some(('Z', 0, (0, 0))),
-                SavedExecution::Unproved,
+                SavedExecution::Unchecked,
             ),
-            (('R', 0, (0, 0)), None, SavedExecution::Unproved),
-            (('D', 0, (0, 0)), None, SavedExecution::Unproved),
+            (('R', 0, (0, 0)), None, SavedExecution::Unchecked),
+            (('D', 0, (0, 0)), None, SavedExecution::Unchecked),
         ] {
             let _ = std::fs::remove_dir_all(process.join("task"));
             thread(4242, leader.0, leader.1, leader.2);
@@ -2046,14 +2243,14 @@ mod tests {
             b"4242 (codex) Z 1 4242 4242",
         )
         .unwrap();
-        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        assert_eq!(table.classify(&card), SavedExecution::Unchecked);
         // The effective user decides, not the owner of the process directory,
         // which is root for a non-dumpable process of this user.
         thread(4242, 'R', 0, (0, 0));
         std::fs::write(process.join("status"), user(uid.wrapping_add(1))).unwrap();
         assert_eq!(table.classify(&card), SavedExecution::Ended);
         std::fs::write(process.join("status"), b"Name:\tcodex\n").unwrap();
-        assert_eq!(table.classify(&card), SavedExecution::Unproved);
+        assert_eq!(table.classify(&card), SavedExecution::Unchecked);
         std::fs::write(process.join("status"), user(uid)).unwrap();
         let named = card.owned_codex_listener.clone().unwrap().socket;
         std::fs::write(
@@ -2095,12 +2292,12 @@ mod tests {
         .unwrap();
         assert_eq!(
             live_processes.evidence(holders.path()).classify(&card),
-            SavedExecution::Unproved
+            SavedExecution::Unchecked
         );
     }
 
     #[test]
-    fn ended_panes_neither_hide_nor_join_a_live_refusal() {
+    fn ended_panes_are_omitted_and_live_unlisted_panes_report_recovery() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let retired = retained_card(current_boot());
         let previous = retained_card(BootId::new("previous-boot"));
@@ -2116,39 +2313,43 @@ mod tests {
         ];
         let evidence = evidence(holders.path(), census);
         let inventory = [held.clone()];
-        let (live_card, held_card) = (crate::model::CardId::new(), crate::model::CardId::new());
-        let mut failures = InspectionFailures::default();
-        for (card, source) in [
-            (crate::model::CardId::new(), &retired),
-            (live_card, &live),
-            (crate::model::CardId::new(), &previous),
-            (held_card, &held),
-        ] {
-            if let Some(problem) =
-                saved_chat_problem(card, source, &inventory, &evidence, false, || {
-                    Err("unqualified".into())
-                })
+        let mut inspection = SourceInspection::default();
+        for source in [&retired, &live, &previous, &held] {
+            if let Some((reason, recovery)) =
+                saved_chat_problem(source, &inventory, &evidence, || Err("unqualified".into()))
             {
-                failures.push(problem);
+                inspection.stop(source.id, StoppedKind::Chat, &reason, recovery);
             }
         }
-        let message = failures.finish().unwrap_err();
-        assert!(message.contains("2 saved-state problem(s)"), "{message}");
-        assert!(message.contains(&format!(
-            "Saved conversation pane {live_card} still has provider processes the source service does not list; reopen or close that pane in the source app, then update."
-        )));
-        // A listed chat is the source's live work and always qualifies exactly.
-        assert!(message.contains(&format!(
-            "Saved conversation pane {held_card} needs exact conversation recovery."
-        )));
-        assert!(
-            saved_chat_problem(live_card, &live, &inventory, &evidence, false, || Ok(())).is_none(),
-            "a live actor the source adopted and qualified is not a problem"
+        assert_eq!(inspection.stopped.len(), 2);
+        let running = inspection
+            .stopped
+            .iter()
+            .find(|pane| pane.pane == live.id)
+            .unwrap();
+        assert_eq!(
+            running.reason,
+            format!(
+                "Claude is still running outside cagents (pid {})",
+                std::process::id()
+            )
         );
+        assert_eq!(
+            running.recovery,
+            "Stop that process, then press Resume in the pane"
+        );
+        let held = inspection
+            .stopped
+            .iter()
+            .find(|pane| pane.pane == held.id)
+            .unwrap();
+        assert_eq!(held.reason, "its conversation could not be confirmed");
+        assert_eq!(held.recovery, CHAT_RECOVERY);
+        assert!(saved_chat_problem(&live, &inventory, &evidence, || Ok(())).is_none());
     }
 
     #[test]
-    fn an_unnamed_pane_whose_actor_ended_unrecorded_is_carried_only_when_accepted() {
+    fn an_unnamed_pane_whose_actor_ended_unrecorded_reopens_stopped() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let mut unrecorded = retained_card(current_boot());
         unrecorded.launch.session_id = None;
@@ -2164,51 +2365,86 @@ mod tests {
         ];
         let mut evidence = evidence(holders.path(), census);
         assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unrecorded);
-        // A surviving provider is live work, which no acceptance waives.
         assert_eq!(evidence.classify(&running), SavedExecution::Running);
-        let card = crate::model::CardId::new();
-        let refusal = saved_chat_problem(card, &unrecorded, &[], &evidence, false, || {
-            Err("unqualified".into())
+        let (reason, recovery) = saved_chat_problem(&unrecorded, &[], &evidence, || {
+            panic!("an ended unrecorded pane needs no qualification")
         })
         .unwrap();
-        assert!(
-            refusal.contains(&format!(
-                "Saved conversation pane {card} ended before it recorded"
-            )),
-            "{refusal}"
-        );
-        assert!(refusal.contains("--accept-unreopenable"), "{refusal}");
-        assert!(refusal.contains("reopened with Resume"), "{refusal}");
+        let mut inspection = SourceInspection::default();
+        inspection.stop(unrecorded.id, StoppedKind::Chat, &reason, recovery);
         assert_eq!(
-            saved_chat_problem(card, &unrecorded, &[], &evidence, true, || panic!(
-                "an accepted unrecorded pane needs no qualification"
-            )),
-            None
+            inspection.stopped[0].reason,
+            "ended before it recorded its conversation"
+        );
+        assert_eq!(
+            inspection.stopped[0].recovery,
+            "Start fresh in the pane; anything it began can be reopened from Resume"
         );
         assert!(
-            saved_chat_problem(card, &running, &[], &evidence, true, || Err(
-                "unqualified".into()
-            ))
-            .is_some()
+            saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into())).is_some()
         );
-        // Once the source lists it, it is the source's live work again.
-        assert!(
+        assert_eq!(
             saved_chat_problem(
-                card,
                 &unrecorded,
                 std::slice::from_ref(&unrecorded),
                 &evidence,
-                true,
                 || Err("unqualified".into())
             )
-            .is_some()
+            .unwrap()
+            .0,
+            "its conversation could not be confirmed"
         );
-        // A recorded retirement names what it confirmed; nothing to accept.
         evidence.retired = Ok(vec![ended]);
         assert_eq!(evidence.classify(&unrecorded), SavedExecution::Ended);
-        // Unreadable retirements prove nothing either way.
         evidence.retired = Err("unreadable".into());
-        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unproved);
+        assert_eq!(evidence.classify(&unrecorded), SavedExecution::Unchecked);
+    }
+
+    #[test]
+    fn exhausted_budget_omits_checked_panes_and_cold_terminals() {
+        let live = retained_card(current_boot());
+        let checked = retained_card(current_boot());
+        let cold = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            live.launch.recipe.clone(),
+            None,
+        )
+        .session;
+        let panes = vec![
+            (crate::model::CardId::new(), CardKind::Chat(live.clone())),
+            (crate::model::CardId::new(), CardKind::Chat(checked.clone())),
+            (crate::model::CardId::new(), CardKind::Terminal(cold)),
+        ];
+        let mut inspection = SourceInspection::default();
+        stop_unchecked(
+            &mut inspection,
+            &panes,
+            &HashSet::from([checked.id]),
+            &current_boot(),
+        );
+        assert_eq!(inspection.stopped.len(), 1);
+        assert_eq!(inspection.stopped[0].pane, live.id);
+        assert_eq!(inspection.stopped[0].reason, UNCHECKED);
+    }
+
+    #[test]
+    fn census_and_process_scan_failures_reopen_only_the_unchecked_pane_stopped() {
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let card = retained_card(current_boot());
+        for reason in [
+            "Cannot enumerate processes",
+            "The retained actor census exceeds its inspection bound",
+            "exceeded its bounded budget",
+        ] {
+            let mut evidence = evidence(holders.path(), Vec::new());
+            evidence.census = Err(reason.into());
+            let (reason, recovery) =
+                saved_chat_problem(&card, &[], &evidence, || Err("unqualified".into())).unwrap();
+            let mut inspection = SourceInspection::default();
+            inspection.stop(card.id, StoppedKind::Chat, &reason, recovery);
+            assert_eq!(inspection.stopped[0].pane, card.id);
+            assert_eq!(inspection.stopped[0].reason, UNCHECKED);
+        }
     }
 
     #[test]
@@ -2450,18 +2686,19 @@ mod tests {
     }
 
     #[test]
-    fn a_pane_held_by_several_saved_windows_is_one_problem() {
-        let mut failures = InspectionFailures::default();
-        let card = crate::model::CardId::new();
+    fn a_pane_held_by_several_saved_windows_is_one_outcome() {
+        let mut inspection = SourceInspection::default();
+        let pane = TerminalId::new();
         for _ in 0..3 {
-            failures.push(format!(
-                "Saved conversation pane {card} needs exact conversation recovery."
-            ));
+            inspection.stop(
+                pane,
+                StoppedKind::Chat,
+                "its conversation could not be confirmed",
+                CHAT_RECOVERY,
+            );
         }
-        failures.push("Source conversation has no qualified immutable migration.".into());
-        let message = failures.finish().unwrap_err();
-        assert!(message.contains("2 saved-state problem(s)"), "{message}");
-        assert_eq!(message.matches(&card.to_string()).count(), 1, "{message}");
+        assert_eq!(inspection.stopped.len(), 1);
+        assert_eq!(inspection.stopped[0].pane, pane);
     }
 
     #[test]
@@ -2502,7 +2739,7 @@ mod tests {
         // An unreadable retirement table proves nothing.
         let mut unreadable = evidence(holders.path(), vec![(card.id, ended.clone())]);
         unreadable.retired = Err("unreadable".into());
-        assert_eq!(unreadable.classify(&card), SavedExecution::Unproved);
+        assert_eq!(unreadable.classify(&card), SavedExecution::Unchecked);
 
         // Only a retained Claude pane has an owner roster; an incomplete proof
         // is not the absence of one.

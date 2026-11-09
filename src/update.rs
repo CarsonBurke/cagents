@@ -6,6 +6,9 @@ mod installed;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
+mod review;
+pub mod source_inspection;
+pub use review::render_review;
 #[cfg(feature = "ui")]
 pub mod startup;
 use std::{
@@ -396,13 +399,7 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 #[derive(Serialize, Deserialize)]
 enum UpdateRequest {
     Release(Release),
-    Installed {
-        root: PathBuf,
-        /// See `SourceInspectionRequest::accept_unreopenable`. An older
-        /// worker that cannot honor it ignores it and refuses those panes.
-        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-        accept_unreopenable: bool,
-    },
+    Installed { root: PathBuf },
 }
 
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
@@ -419,10 +416,9 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
     )
 }
 
-pub fn apply_installed(
-    executable: &Path,
-    accept_unreopenable: bool,
-) -> Result<UpdateJob, UpdateError> {
+// The ignored argument retains the existing window call signature until that
+// flow is changed; it grants no authority and is never sent to the worker.
+pub fn apply_installed(executable: &Path, _compatibility: bool) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
@@ -442,10 +438,7 @@ pub fn apply_installed(
     start_job(
         &installation,
         &version,
-        &UpdateRequest::Installed {
-            root: served,
-            accept_unreopenable,
-        },
+        &UpdateRequest::Installed { root: served },
     )
 }
 
@@ -510,11 +503,7 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 
 /// CLI entry point for the same leased worker, exact preview and window fence
 /// used by the application. The served candidate always supplies the worker.
-pub fn upgrade_installed(
-    yes: bool,
-    interrupt: bool,
-    accept_unreopenable: bool,
-) -> Result<UpdateJob, UpdateError> {
+pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     use std::io::IsTerminal;
     if !yes && !io::stdin().is_terminal() {
         return Err(invalid(
@@ -523,17 +512,14 @@ pub fn upgrade_installed(
     }
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
-    let initial = apply_installed(&candidate, accept_unreopenable)?;
-    let policy = if interrupt {
+    let initial = apply_installed(&candidate, false)?;
+    let mut policy = if interrupt {
         impact::Policy::Interrupt
     } else {
         impact::Policy::WhenIdle
     };
     let mut submitted = None;
     let mut policy_requested = None;
-    // The preview whose unreachable conversations were ended; the worker
-    // publishes the changed impact under a new nonce.
-    let mut ended_for: Option<String> = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
     loop {
         let job = status()?
@@ -559,70 +545,53 @@ pub fn upgrade_installed(
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
                     policy_requested = Some(confirmation.nonce.clone());
                 }
-            } else if submitted.as_ref() != Some(&confirmation.nonce)
-                && ended_for.as_ref() != Some(&confirmation.nonce)
-            {
+            } else if submitted.as_ref() != Some(&confirmation.nonce) {
+                // A changed preview is a new review, including after approval.
+                eprint!("{}", render_review(&confirmation.preview));
                 if submitted.is_some() {
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
                     return Err(invalid(
                         "Update impact changed after approval; review and retry the update.",
                     ));
                 }
-                eprintln!(
-                    "Update to {}{}",
-                    job.version,
-                    if confirmation.preview.replaces_daemon {
-                        " (replaces terminal service)"
-                    } else {
-                        " (keeps terminal service)"
-                    }
-                );
-                if let Some(daemon) = &confirmation.preview.daemon {
-                    for session in &daemon.sessions {
-                        eprintln!(
-                            "  {} ({}): {}",
-                            session.title,
-                            session.disposition.label(),
-                            session.reason
-                        );
-                    }
-                    if daemon.blocked() {
-                        for blocker in &daemon.blockers {
-                            eprintln!("  {blocker}");
-                        }
-                        let ended = if accept_unreopenable && ended_for.is_none() {
-                            end_unreachable_source_chats(&job.id, &confirmation.nonce, daemon, yes)
-                        } else {
-                            Ok(false)
-                        };
-                        match ended {
-                            Ok(true) => {}
-                            Ok(false) => {
-                                decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                                return Err(invalid(if accept_unreopenable {
-                                    "Resolve the displayed update blockers, then retry. --accept-unreopenable ends only conversations whose provider can no longer be carried."
-                                } else {
-                                    "Resolve the displayed update blockers, then retry."
-                                }));
-                            }
-                            Err(error) => {
-                                // Never leave the reviewed preview pending: the
-                                // worker would hold it until it expires.
-                                let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
-                                return Err(error);
-                            }
-                        }
-                        ended_for = Some(confirmation.nonce.clone());
-                        thread::sleep(Duration::from_millis(250));
-                        continue;
-                    }
-                }
-                if !yes && !confirm_on_terminal("Proceed with this update? [y/N] ")? {
+                if confirmation
+                    .preview
+                    .daemon
+                    .as_ref()
+                    .is_some_and(impact::DaemonImpact::blocked)
+                {
                     decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                    return Err(UpdateError::Cancelled);
+                    return Err(invalid(
+                        "Resolve the items that need attention, then run the update again.",
+                    ));
                 }
-                decide(&job.id, &confirmation.nonce, UpdateChoice::Confirm)?;
-                submitted = Some(confirmation.nonce.clone());
+                let choice = if yes {
+                    UpdateChoice::Confirm
+                } else {
+                    match prompt_review(&confirmation.preview) {
+                        Ok(choice) => choice,
+                        Err(error) => {
+                            let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                            return Err(error.into());
+                        }
+                    }
+                };
+                match choice {
+                    UpdateChoice::Cancel => {
+                        decide(&job.id, &confirmation.nonce, choice)?;
+                        return Err(UpdateError::Cancelled);
+                    }
+                    UpdateChoice::Policy(next) => {
+                        policy = next;
+                        decide(&job.id, &confirmation.nonce, choice)?;
+                        policy_requested = Some(confirmation.nonce.clone());
+                        submitted = None;
+                    }
+                    UpdateChoice::Confirm => {
+                        decide(&job.id, &confirmation.nonce, choice)?;
+                        submitted = Some(confirmation.nonce.clone());
+                    }
+                }
             }
         }
         if Instant::now() >= deadline {
@@ -634,140 +603,65 @@ pub fn upgrade_installed(
     }
 }
 
-fn confirm_on_terminal(question: &str) -> io::Result<bool> {
-    eprint!("{question}");
-    io::stderr().flush()?;
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer)?;
-    Ok(matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ))
+fn review_answer(answer: &str, working: bool) -> Option<UpdateChoice> {
+    match answer.trim().to_ascii_lowercase().as_str() {
+        "" | "y" | "yes" => Some(UpdateChoice::Confirm),
+        "i" if working => Some(UpdateChoice::Policy(impact::Policy::Interrupt)),
+        "n" | "no" => Some(UpdateChoice::Cancel),
+        _ => None,
+    }
 }
 
-/// Show what ending the blocked conversations loses, ask unless `yes`, and
-/// end them. `Ok(false)` means something else blocks, so nothing was ended.
-/// A conversation that changed while the person decided is not ended: the
-/// worker issues a new nonce for any reviewed change, and the source's list
-/// must still name exactly the reviewed conversations.
-fn end_unreachable_source_chats(
-    job: &str,
-    nonce: &str,
-    daemon: &impact::DaemonImpact,
-    yes: bool,
-) -> Result<bool, UpdateError> {
-    let Some(ending) = unreachable_source_chats(daemon)? else {
-        return Ok(false);
-    };
-    eprintln!("--accept-unreopenable ends these conversations, which this update cannot carry:");
-    for (title, loss, _) in &ending {
-        eprintln!("  {title}: {loss}");
-    }
-    if !yes && !confirm_on_terminal("End them and continue? [y/N] ")? {
-        return Err(UpdateError::Cancelled);
-    }
-    let still_reviewed = status()?
-        .filter(|current| current.id == job)
-        .and_then(|current| {
-            current
-                .active_confirmation()
-                .map(|active| active.nonce.clone())
-        })
-        .is_some_and(|current| current == nonce);
-    let reselected = unreachable_source_chats(daemon)?;
-    let unchanged = reselected.as_ref().is_some_and(|reselected| {
-        reselected.len() == ending.len()
-            && reselected
+fn prompt_review(preview: &impact::Preview) -> io::Result<UpdateChoice> {
+    let working = preview.daemon.as_ref().is_some_and(|daemon| {
+        daemon.policy == impact::Policy::WhenIdle
+            && daemon
+                .sessions
                 .iter()
-                .zip(&ending)
-                .all(|(now, reviewed)| now.2 == reviewed.2)
+                .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
     });
-    if !still_reviewed || !unchanged {
-        return Err(invalid(
-            "The conversations to end changed while you decided; nothing more was ended. Review and retry the update.",
-        ));
-    }
-    end_source_chats(daemon, ending)?;
-    Ok(true)
+    read_review_choice(&mut io::stdin().lock(), &mut io::stderr().lock(), working)
 }
 
-/// A blocked source conversation that only ending it resolves, with what
-/// ending it loses. Every blocked conversation must be one, and nothing else
-/// may block, or the update still needs the person to resolve it.
-type EndedChat = (String, &'static str, crate::chat::Session);
-
-/// The source cannot carry a Codex conversation whose server it can no longer
-/// reach: its listener is gone, so no successor can join that server, and the
-/// server still writes the thread, so none may resume it beside the server.
-/// A provider that stopped without confirming its work settled is refused
-/// for the same reason, and the source itself asks for it to be closed.
-fn unreachable_source_chats(
-    daemon: &impact::DaemonImpact,
-) -> Result<Option<Vec<EndedChat>>, UpdateError> {
-    if !daemon.blockers.is_empty() {
-        // Connect only when a selection is possible.
-        return Ok(None);
+fn read_review_choice(
+    input: &mut impl io::BufRead,
+    output: &mut impl Write,
+    working: bool,
+) -> io::Result<UpdateChoice> {
+    loop {
+        write!(
+            output,
+            "{}",
+            if working {
+                "Enter: update when they finish   i: interrupt them now   n: cancel\n"
+            } else {
+                "Update now? [Y/n] "
+            }
+        )?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Ok(UpdateChoice::Cancel);
+        }
+        if let Some(choice) = review_answer(&answer, working) {
+            return Ok(choice);
+        }
     }
-    let listed = source_client_for(daemon)?.list_chats()?;
-    Ok(select_unreachable_chats(daemon, &listed))
 }
 
-fn select_unreachable_chats(
-    daemon: &impact::DaemonImpact,
-    listed: &[crate::chat::Session],
-) -> Option<Vec<EndedChat>> {
-    if !daemon.blockers.is_empty() {
-        return None;
-    }
-    let mut ending = Vec::new();
-    for session in daemon
-        .sessions
-        .iter()
-        .filter(|session| session.disposition == impact::Disposition::Blocked)
-    {
-        let Some(source) = listed.iter().find(|listed| listed.id == session.id) else {
-            return None;
-        };
-        let recorded = source.launch.session_id.is_some();
-        let lost_listener = source.launch.provider == crate::agent::Provider::Codex
-            && source.owns_codex_listener()
-            && source
-                .owned_codex_listener
-                .as_ref()
-                .is_some_and(|listener| {
-                    session.reason.starts_with(&format!(
-                        "Cannot join existing Codex daemon at {}:",
-                        listener.socket.display()
-                    )) && fs::metadata(&listener.socket)
-                        .is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
-                });
-        let loss = if session.kind != impact::SessionKind::NativeChat {
-            return None;
-        } else if lost_listener && recorded {
-            "its Codex server can no longer be reached, so ending it stops that server and any turn it is running. Its thread stays on disk and can be reopened with Resume."
-        } else if lost_listener {
-            "its Codex server can no longer be reached, so ending it stops that server and any turn it is running. It never recorded a thread to reopen."
-        } else if session.reason == impact::STOPPED_WITH_UNSETTLED_WORK && recorded {
-            "its provider stopped without confirming its work finished; any unfinished work it held is lost. Its conversation stays on disk and can be reopened with Resume."
-        } else if session.reason == impact::STOPPED_WITH_UNSETTLED_WORK {
-            "its provider stopped without confirming its work finished; any unfinished work it held is lost. It never recorded a conversation to reopen."
-        } else {
-            return None;
-        };
-        ending.push((session.title.clone(), loss, source.clone()));
-    }
-    (!ending.is_empty()).then_some(ending)
-}
-
+/// End only the exact source descriptors selected by a later destructive
+/// confirmation. Kept separate from the non-destructive update review.
+#[allow(dead_code)]
 fn end_source_chats(
     daemon: &impact::DaemonImpact,
-    ending: Vec<EndedChat>,
+    ending: Vec<crate::chat::Session>,
 ) -> Result<(), UpdateError> {
     let mut client = source_client_for(daemon)?;
     // One the source cannot end does not keep the rest: each was approved
     // on its own, and ending it releases what it held either way.
     let mut failed = Vec::new();
-    for (title, _, session) in ending {
+    for session in ending {
+        let title = session.launch.provider.label().to_owned();
         match client.close_chat(session) {
             Ok(()) => eprintln!("  Ended {title}"),
             Err(error) => {
@@ -1116,7 +1010,7 @@ pub fn restart_windows(instance: &str) -> Result<(), UpdateError> {
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard
         .prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-            crate::install_guard::preflight_source_panes(guard, None, false, false)
+            crate::install_guard::preflight_source_panes(guard, None, false).map(|_| ())
         })?;
     // Saving and closing takes as long as the windows need, and another install
     // can land inside it. Reopen whatever is served now, so this relaunch does
@@ -1175,11 +1069,8 @@ fn perform_update(
             Installation::detect()?;
             release
         }
-        UpdateRequest::Installed {
-            root,
-            accept_unreopenable,
-        } => {
-            return installed::perform(installation, state, job, &root, accept_unreopenable);
+        UpdateRequest::Installed { root } => {
+            return installed::perform(installation, state, job, &root);
         }
     };
     let cancellation = CancellationToken::new();
@@ -1221,10 +1112,11 @@ fn perform_update(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    reconcile_saved_sources(staged.identity.protocol, false)?;
+    let inspection = reconcile_saved_sources(staged.identity.protocol)?;
+    let context = ReviewContext::capture(installation)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
-        observe_impact(&staged.identity, policy)
+        Ok(context.apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
     })?;
     set_phase(
         state,
@@ -1235,10 +1127,10 @@ fn perform_update(
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, false)?;
+        let inspected = crate::install_guard::preflight_source_panes(guard,
+            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
         let latest = observe_impact(&staged.identity, confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
-            .map_err(io::Error::other)?;
+            .map_err(io::Error::other)?.with_inspection(&inspected);
         if !confirmed.preserves_consent(&latest) {
             return Err(io::Error::other("Session ownership changed during pane inspection; existing windows were kept open"));
         }
@@ -1252,7 +1144,8 @@ fn perform_update(
                 .daemon
                 .as_ref()
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )?;
+        )?
+        .with_inspection(&confirmed.inspection());
         if !confirmed.preserves_consent(&current) {
             return Err(invalid(
                 "Session ownership changed while saving windows; reopen and review the update again",
@@ -1293,45 +1186,56 @@ fn perform_update(
     reopen_result
 }
 
+struct ReviewContext {
+    from_version: String,
+    windows: usize,
+}
+
+impl ReviewContext {
+    fn capture(installation: &Installation) -> Result<Self, UpdateError> {
+        let _guard = crate::instance::UiUpdateGuard::acquire()?;
+        let windows = crate::instance::verified_running_windows()?;
+        let layout = locate(&std::env::current_exe()?)?;
+        let from_version = installed_daemon_owner(&layout)?
+            .map(|owner| owner.version)
+            .or_else(|| {
+                windows
+                    .first()
+                    .and_then(|window| locate(&window.executable).ok().map(|layout| layout.version))
+            })
+            .unwrap_or_else(|| installation.version.clone());
+        Ok(Self {
+            from_version,
+            windows: windows.len(),
+        })
+    }
+
+    fn apply(&self, mut preview: impact::Preview) -> impact::Preview {
+        preview.from_version = self.from_version.clone();
+        preview.windows = self.windows;
+        preview
+    }
+}
+
 /// Invoke only the matched host implementation: SQLite stays out of the CLI
 /// graph, and an older helper must refuse its unknown option before admission.
 pub(crate) fn inspect_source_panes(
     guard: &crate::instance::UiUpdateGuard,
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
-    accept_unreopenable: bool,
-) -> Result<(), UpdateError> {
-    inspect_source_panes_mode(guard, proof, require_resumable, false, accept_unreopenable)
+) -> Result<source_inspection::SourceInspection, UpdateError> {
+    inspect_source_panes_mode(guard, proof, require_resumable, false)
 }
 
 // Recover only already-owned providers before publishing the inventory the
 // user will consent to. Never expand consent after windows have prepared.
 fn reconcile_saved_sources(
     destination_protocol: u16,
-    accept_unreopenable: bool,
-) -> Result<(), UpdateError> {
+) -> Result<source_inspection::SourceInspection, UpdateError> {
     let guard = crate::instance::UiUpdateGuard::acquire()?;
     let (protocol, proof) = source::inspect_identity(None)?;
-    let mut problems = Vec::new();
-    if let Err(error) =
-        crate::install_guard::preflight_editor_companions(Some(destination_protocol))
-    {
-        problems.push(error.to_string());
-    }
-    if let Err(error) = inspect_source_panes_mode(
-        &guard,
-        proof,
-        protocol != destination_protocol,
-        true,
-        accept_unreopenable,
-    ) {
-        problems.push(error.to_string());
-    }
-    if problems.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid(problems.join("\n")))
-    }
+    crate::install_guard::preflight_editor_companions(Some(destination_protocol))?;
+    inspect_source_panes_mode(&guard, proof, protocol != destination_protocol, true)
 }
 
 fn inspect_source_panes_mode(
@@ -1339,8 +1243,7 @@ fn inspect_source_panes_mode(
     proof: Option<crate::model::HostSessionProof>,
     require_resumable: bool,
     reconcile_retained: bool,
-    accept_unreopenable: bool,
-) -> Result<(), UpdateError> {
+) -> Result<source_inspection::SourceInspection, UpdateError> {
     let (protocol, proof) = source::inspect_identity(proof.as_ref())?;
     let helper = crate::companion::Product::Daemon.beside(&std::env::current_exe()?)?;
     let before = fs::symlink_metadata(&helper)?;
@@ -1357,7 +1260,6 @@ fn inspect_source_panes_mode(
         proof,
         require_resumable,
         reconcile_retained,
-        accept_unreopenable,
     };
     let mut command = Command::new(&helper);
     crate::install_guard::sanitize_child_environment(&mut command);
@@ -1369,7 +1271,7 @@ fn inspect_source_panes_mode(
     let mut output = bounded_command(
         &mut command,
         "source pane inspection (windows remain open)",
-        16 * 1024,
+        JOB_STATE_LIMIT,
         Duration::from_secs(35),
         &CancellationToken::new(),
     )?;
@@ -1386,15 +1288,16 @@ fn inspect_source_panes_mode(
             "The source inspector changed during inspection; source windows remain usable",
         ));
     }
-    let result: Result<(), String> = serde_json::from_reader(&mut output)?;
-    result.map_err(invalid)?;
+    let result: Result<source_inspection::SourceInspection, String> =
+        serde_json::from_reader(&mut output)?;
+    let inspection = result.map_err(invalid)?;
     let (current_protocol, current_proof) = source::inspect_identity(request.proof.as_ref())?;
     if current_protocol != request.protocol || current_proof != request.proof {
         return Err(invalid(
             "Source ownership changed during pane inspection; source windows remain usable",
         ));
     }
-    Ok(())
+    Ok(inspection)
 }
 
 /// Probe only a fixed, owned companion beside an authenticated editor process.
@@ -1541,6 +1444,11 @@ fn observe_impact(
         None
     };
     Ok(impact::Preview {
+        from_version: String::new(),
+        windows: 0,
+        stopped: Vec::new(),
+        stopped_windows: Vec::new(),
+        labels: Default::default(),
         candidate: candidate.clone(),
         replaces_daemon,
         daemon,
@@ -2126,149 +2034,57 @@ fn verify_digest(file: &mut File, expected: &[u8; 32]) -> Result<(), UpdateError
 
 #[cfg(test)]
 mod tests {
-    fn codex_chat(root: &Path) -> crate::chat::Session {
-        let id = crate::model::TerminalId::new();
-        let proof = crate::model::HostSessionProof {
-            host_session_id: crate::model::HostSessionId::new("source-host"),
-            boot_id: crate::model::BootId::new("source-boot"),
-            host_incarnation: crate::model::HostIncarnation::new("source-incarnation"),
-        };
-        let socket = root.join(format!("cagents-codex-{id}/control.sock"));
-        crate::chat::Session {
-            id,
-            launch: crate::chat::Launch {
-                provider: crate::agent::Provider::Codex,
-                recipe: crate::model::LaunchRecipe {
-                    program: "codex".into(),
-                    arguments: vec!["--remote".into(), format!("unix://{}", socket.display())],
-                    working_directory: root.to_owned(),
-                    environment: Default::default(),
-                    unset_environment: Default::default(),
-                },
-                session_id: Some("thread".into()),
-            },
-            proof: Some(proof.clone()),
-            terminal: None,
-            native_continuity: Default::default(),
-            owned_codex_listener: Some(crate::chat::OwnedCodexListener {
-                socket,
-                allocator: proof,
-            }),
-        }
-    }
-
-    fn blocked(session: &crate::chat::Session, reason: &str) -> impact::SessionImpact {
-        impact::SessionImpact {
-            id: session.id,
-            kind: impact::SessionKind::NativeChat,
-            title: format!("chat {}", session.id),
-            identity: "identity".into(),
-            disposition: impact::Disposition::Blocked,
-            reason: reason.into(),
-            interrupted_subagents: Vec::new(),
-        }
-    }
-
-    fn daemon_impact(sessions: Vec<impact::SessionImpact>) -> impact::DaemonImpact {
-        impact::DaemonImpact {
-            capability: crate::terminal_ipc::ShutdownCapability {
-                proof: crate::model::HostSessionProof {
-                    host_session_id: crate::model::HostSessionId::new("source-host"),
-                    boot_id: crate::model::BootId::new("source-boot"),
-                    host_incarnation: crate::model::HostIncarnation::new("source-incarnation"),
-                },
-                token: "preview".into(),
-                inventory_generation: 1,
-                live_terminals: 0,
-                background_subagents: 0,
-                background_identity: "none".into(),
-                expires_at_unix_ms: 100,
-            },
-            policy: impact::Policy::WhenIdle,
-            sessions,
-            blockers: Vec::new(),
-        }
+    #[test]
+    fn review_prompt_defaults_to_update_but_eof_cancels() {
+        let mut output = Vec::new();
+        assert!(matches!(
+            read_review_choice(&mut &b"\n"[..], &mut output, false).unwrap(),
+            UpdateChoice::Confirm
+        ));
+        assert_eq!(String::from_utf8(output).unwrap(), "Update now? [Y/n] ");
+        let mut output = Vec::new();
+        assert!(matches!(
+            read_review_choice(&mut &b"i\n"[..], &mut output, true).unwrap(),
+            UpdateChoice::Policy(impact::Policy::Interrupt)
+        ));
+        assert_eq!(
+            String::from_utf8(output).unwrap(),
+            "Enter: update when they finish   i: interrupt them now   n: cancel\n"
+        );
+        assert!(matches!(
+            read_review_choice(&mut &b""[..], &mut Vec::new(), false).unwrap(),
+            UpdateChoice::Cancel
+        ));
+        assert!(matches!(
+            read_review_choice(&mut &b"n\n"[..], &mut Vec::new(), true).unwrap(),
+            UpdateChoice::Cancel
+        ));
+        assert!(matches!(
+            read_review_choice(&mut &b"maybe\ny\n"[..], &mut Vec::new(), false).unwrap(),
+            UpdateChoice::Confirm
+        ));
     }
 
     #[test]
-    fn only_conversations_the_source_cannot_carry_are_ended_on_acceptance() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let lost = codex_chat(root.path());
-        let reachable = codex_chat(root.path());
-        let socket = &reachable.owned_codex_listener.as_ref().unwrap().socket;
-        fs::create_dir(socket.parent().unwrap()).unwrap();
-        let _server = std::os::unix::net::UnixListener::bind(socket).unwrap();
-        let mut stopped = codex_chat(root.path());
-        stopped.launch.provider = crate::agent::Provider::Claude;
-        stopped.owned_codex_listener = None;
-        let listed = [lost.clone(), reachable.clone(), stopped.clone()];
-        let cannot_join = |session: &crate::chat::Session| {
-            format!(
-                "Cannot join existing Codex daemon at {}: No such file or directory (os error 2). Start the Codex shared daemon first; no private fallback is launched.",
-                session
-                    .owned_codex_listener
-                    .as_ref()
-                    .unwrap()
-                    .socket
-                    .display()
-            )
-        };
-        let unreachable = blocked(&lost, &cannot_join(&lost));
-        let unsettled = blocked(&stopped, impact::STOPPED_WITH_UNSETTLED_WORK);
-
-        let ending = select_unreachable_chats(
-            &daemon_impact(vec![unreachable.clone(), unsettled.clone()]),
-            &listed,
-        )
-        .unwrap();
-        let ended = ending
-            .iter()
-            .map(|(_, _, session)| session.id)
-            .collect::<Vec<_>>();
-        assert_eq!(ended, [lost.id, stopped.id]);
-        assert!(ending[0].1.contains("can be reopened with Resume"));
-        assert!(ending[1].1.contains("unfinished work it held is lost"));
-
-        // Resume is offered only for a conversation the source recorded.
-        let mut unrecorded = lost.clone();
-        unrecorded.launch.session_id = None;
-        let ending = select_unreachable_chats(
-            &daemon_impact(vec![blocked(&unrecorded, &cannot_join(&unrecorded))]),
-            &[unrecorded.clone()],
-        )
-        .unwrap();
-        assert!(ending[0].1.contains("never recorded a thread"));
-
-        // A Codex server still reachable at its listener is carried or waited
-        // for, never ended to clear a blocker it does not cause.
-        for refused in [
-            vec![
-                unreachable.clone(),
-                blocked(&reachable, &cannot_join(&reachable)),
-            ],
-            // A lost listener does not explain a different refusal.
-            vec![blocked(
-                &lost,
-                "Finish the pending return to terminal or close this conversation.",
-            )],
-            vec![blocked(&stopped, "Its provider is not ready yet.")],
-            vec![impact::SessionImpact {
-                kind: impact::SessionKind::Terminal,
-                ..unsettled.clone()
-            }],
-        ] {
-            assert!(select_unreachable_chats(&daemon_impact(refused), &listed).is_none());
-        }
-        // A conversation the source no longer lists cannot be ended here.
-        assert!(select_unreachable_chats(&daemon_impact(vec![unreachable.clone()]), &[]).is_none());
-        // Any other blocker still needs the person.
-        let mut other = daemon_impact(vec![unreachable]);
-        other
-            .blockers
-            .push("Wait for starting sessions to finish opening.".into());
-        assert!(select_unreachable_chats(&other, &listed).is_none());
-        // Nothing blocked: nothing to end.
-        assert!(select_unreachable_chats(&daemon_impact(Vec::new()), &listed).is_none());
+    fn review_enter_proceeds_and_interrupt_requires_working_review() {
+        assert!(matches!(
+            review_answer("\n", false),
+            Some(UpdateChoice::Confirm)
+        ));
+        assert!(matches!(
+            review_answer("", true),
+            Some(UpdateChoice::Confirm)
+        ));
+        assert!(matches!(
+            review_answer("i", true),
+            Some(UpdateChoice::Policy(impact::Policy::Interrupt))
+        ));
+        assert!(review_answer("i", false).is_none());
+        assert!(matches!(
+            review_answer("n", true),
+            Some(UpdateChoice::Cancel)
+        ));
+        assert!(review_answer("maybe", true).is_none());
     }
 
     #[test]

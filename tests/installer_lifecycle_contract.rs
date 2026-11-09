@@ -200,7 +200,7 @@ if verified.returncode:
     sys.exit(91)
 with (pathlib.Path(os.environ['HOME'])/'source-inspected').open('a') as inspected:
     inspected.write(json.dumps(request)+'\n')
-print(json.dumps({'Ok':None}))
+print(json.dumps({'Ok':{'stopped':[], 'stopped_windows':[], 'labels':{}}}))
 "#,
     );
 }

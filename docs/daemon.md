@@ -87,7 +87,7 @@ cagents daemon stop --confirm
 | `ui [--new-window \| --window NAME]` | Launch the UI, open another window, or open a named window |
 | `daemon start` | Start the daemon if it is not already running |
 | `daemon status` | Report whether the daemon runs, with `cli_version` and `daemon_version` |
-| `daemon upgrade [--yes] [--interrupt] [--accept-unreopenable]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
+| `daemon upgrade [--yes] [--interrupt]` | Review a staged installation, save windows, replace the service when needed, and wait for completion |
 | `daemon stop` | Request daemon termination (see below) |
 | `daemon preflight` | Print a short-lived shutdown capability for `daemon stop --confirm` |
 | `daemon prepare-upgrade --yes` | Checkpoint resumable sessions and stop for a full upgrade |
@@ -195,9 +195,8 @@ the current protocol, historical current-wire protocols 128 and 156, and bespoke
 protocols 77 and 119. Other source protocols require an intermediate build first;
 the update is never handed to an older build's worker. `--yes` skips the
 interactive prompt; `--interrupt` additionally permits native turn interruption.
-`--accept-unreopenable` carries saved panes whose ended actor never recorded
-its conversation; they stay in their windows without reopening it.
-It does not grant approval for a different inventory discovered afterward.
+Saved panes that cannot reconnect reopen stopped, with a reason and a recovery
+action in the review. A changed inventory requires another review.
 Unsaved window work blocks replacement, and failures remain visible in the
 application's update state. A compatible update closes and reopens windows
 without replacing the daemon or recovering sessions.

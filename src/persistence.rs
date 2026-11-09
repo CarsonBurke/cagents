@@ -2730,6 +2730,17 @@ impl MigrationInspectionBudget {
         Ok(())
     }
 
+    fn reserve_bytes(&mut self, bytes: u64) -> Result<()> {
+        self.check_deadline()?;
+        if bytes > self.remaining_bytes {
+            return Err(invalid_state!(
+                "Saved pane inventory exceeds the migration inspection limit"
+            ));
+        }
+        self.remaining_bytes -= bytes;
+        Ok(())
+    }
+
     fn reserve(&mut self, bytes: u64) -> Result<()> {
         self.check_deadline()?;
         if self.remaining_rows == 0 || bytes > self.remaining_bytes {
@@ -2753,11 +2764,90 @@ fn read_open_migration_sessions(path: &Path) -> Result<Vec<(CardId, CardKind)>> 
 
 /// Read exact open descriptors without migrating or writing a source database.
 /// Refuse unreadable or over-budget rows instead of omitting recovery work.
-#[cfg(any(feature = "host", test))]
+#[cfg(test)]
 pub(crate) fn read_open_migration_sessions_with_budget(
     path: &Path,
     budget: &mut MigrationInspectionBudget,
 ) -> Result<Vec<(CardId, CardKind)>> {
+    Ok(read_labeled_migration_sessions_with_budget(path, budget)?
+        .into_iter()
+        .filter(|pane| !pane.inert)
+        .map(|pane| (pane.card, pane.kind))
+        .collect())
+}
+
+/// The saved presentation and exact descriptor share one read-only snapshot.
+#[cfg(any(feature = "host", test))]
+pub(crate) struct MigrationPane {
+    pub(crate) card: CardId,
+    pub(crate) kind: CardKind,
+    pub(crate) label: crate::update::source_inspection::PaneLabel,
+    pub(crate) inert: bool,
+}
+
+/// Persisted sidebar roots, bounded independently of the saved pane inventory.
+/// Ancestor lookup matches components, so `repo-other` is not inside `repo`.
+#[cfg(any(feature = "host", test))]
+fn migration_project_roots(
+    transaction: &Transaction<'_>,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<BTreeMap<PathBuf, String>> {
+    let mut statement = transaction.prepare(
+        "SELECT CASE WHEN length(CAST(p.name AS BLOB)) <= 65536 THEN p.name ELSE NULL END,
+                CASE WHEN length(CAST(p.repository_json AS BLOB)) <= 65536 THEN p.repository_json ELSE NULL END,
+                CASE WHEN length(CAST(p.existence_json AS BLOB)) <= 4096 THEN p.existence_json ELSE NULL END,
+                CASE WHEN length(CAST(p.existence_json AS BLOB)) <= 4096 THEN p.existence_json ELSE NULL END,
+                1
+         FROM projects p
+         UNION ALL
+         SELECT CASE WHEN length(CAST(p.name AS BLOB)) <= 65536 THEN p.name ELSE NULL END,
+                CASE WHEN length(CAST(w.path_json AS BLOB)) <= 65536 THEN w.path_json ELSE NULL END,
+                CASE WHEN length(CAST(p.existence_json AS BLOB)) <= 4096 THEN p.existence_json ELSE NULL END,
+                CASE WHEN length(CAST(w.existence_json AS BLOB)) <= 4096 THEN w.existence_json ELSE NULL END,
+                0
+         FROM worktrees w JOIN projects p ON p.project_id = w.project_id",
+    )?;
+    let mut rows = statement.query([])?;
+    let mut roots = BTreeMap::new();
+    let mut count = 0;
+    while let Some(row) = rows.next()? {
+        budget.check_deadline()?;
+        count += 1;
+        if count > 16 * 1024 {
+            return Err(invalid_state!(
+                "Saved project roots exceed the migration inspection limit"
+            ));
+        }
+        let name: String = row.get(0)?;
+        let path: String = row.get(1)?;
+        let project_existence: String = row.get(2)?;
+        let root_existence: String = row.get(3)?;
+        budget.reserve_bytes(
+            (name.len() + path.len() + project_existence.len() + root_existence.len()) as u64,
+        )?;
+        if !from_json::<Existence>("project existence", &project_existence)?.is_open()
+            || !from_json::<Existence>("worktree existence", &root_existence)?.is_open()
+        {
+            continue;
+        }
+        let path: PathBuf = from_json("project root", &path)?;
+        let repository: bool = row.get(4)?;
+        if repository
+            && path.file_name().is_some_and(|name| name == ".git")
+            && let Some(parent) = path.parent()
+        {
+            roots.insert(parent.to_owned(), name.clone());
+        }
+        roots.insert(path, name);
+    }
+    Ok(roots)
+}
+
+#[cfg(any(feature = "host", test))]
+pub(crate) fn read_labeled_migration_sessions_with_budget(
+    path: &Path,
+    budget: &mut MigrationInspectionBudget,
+) -> Result<Vec<MigrationPane>> {
     // Local presentation markers are not daemon authority. Read them under
     // the same snapshot and budget as their exact saved source descriptors.
     fn retained_metadata<T: serde::de::DeserializeOwned + Default>(
@@ -2823,7 +2913,8 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                     + coalesce(length(CAST({predecessor} AS BLOB)),0) + coalesce(length(CAST(t.path_json AS BLOB)),0)
                FROM terminal_recipes r LEFT JOIN transcript_metadata t ON t.terminal_id=r.terminal_id WHERE r.card_id=c.card_id)
          END,
-         CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END
+         CASE WHEN length(CAST(w.workspace_id AS BLOB)) <= 128 THEN w.workspace_id ELSE NULL END,
+         CASE WHEN length(CAST(c.title AS BLOB)) <= 65536 THEN c.title ELSE NULL END
          FROM cards c JOIN workspaces w ON w.workspace_id = c.workspace_id
          WHERE c.kind_tag IN ('chat', 'terminal') ORDER BY c.card_id"
     ))?;
@@ -2831,6 +2922,10 @@ pub(crate) fn read_open_migration_sessions_with_budget(
     let mut sessions = Vec::new();
     let mut retained =
         HashMap::<WorkspaceId, (HashSet<CardId>, HashMap<CardId, crate::chat::Session>)>::new();
+    let mut channel_names = HashMap::<WorkspaceId, Vec<ProjectChannel>>::new();
+    let mut project_names = HashMap::<ProjectId, (String, String)>::new();
+    let mut card_scopes = HashMap::<WorkspaceId, HashMap<CardId, PathBuf>>::new();
+    let mut project_roots = None;
     while let Some(row) = rows.next()? {
         budget.check_deadline()?;
         let existence: String = row.get(3)?;
@@ -2848,6 +2943,7 @@ pub(crate) fn read_open_migration_sessions_with_budget(
         let content: Option<String> = row.get(2)?;
         let card = parse_id("migration card", &card)?;
         let session = read_migration_session_at(&transaction, card, &kind, content.as_deref())?;
+        let mut inert = false;
         if let CardKind::Chat(source) = &session {
             let workspace: String = row.get(6)?;
             let workspace = parse_id("migration workspace", &workspace)?;
@@ -2876,10 +2972,143 @@ pub(crate) fn read_open_migration_sessions_with_budget(
                         "Retained saved pane has invalid native continuity"
                     ));
                 }
-                continue;
+                inert = true;
             }
         }
-        sessions.push((card, session));
+        let workspace: String = row.get(6)?;
+        let workspace = parse_id("migration workspace", &workspace)?;
+        let title: String = row.get(7)?;
+        budget.reserve_bytes(title.len() as u64)?;
+        if let std::collections::hash_map::Entry::Vacant(entry) = channel_names.entry(workspace) {
+            entry.insert(retained_metadata(
+                &transaction,
+                workspace,
+                CHANNELS_FIELD,
+                budget,
+            )?);
+        }
+        let channel = channel_names.get(&workspace).and_then(|channels| {
+            channels
+                .iter()
+                .find(|channel| channel.cards.contains(&card))
+        });
+        let project = if let Some(channel) = channel {
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                project_names.entry(channel.project_id)
+            {
+                let project: Option<(String, String)> = transaction.query_row(
+                    "SELECT CASE WHEN length(CAST(name AS BLOB)) <= 65536 THEN name ELSE NULL END,
+                     CASE WHEN length(CAST(repository_json AS BLOB)) <= 65536 THEN repository_json ELSE NULL END
+                     FROM projects WHERE project_id = ?1",
+                    [channel.project_id.to_string()], |row| Ok((row.get(0)?, row.get(1)?)),
+                ).optional()?;
+                let (name, default_channel) = if let Some((name, repository_json)) = project {
+                    budget.reserve_bytes((name.len() + repository_json.len()) as u64)?;
+                    let repository: PathBuf = from_json("project repository", &repository_json)?;
+                    let primary = if repository.file_name().is_some_and(|name| name == ".git") {
+                        repository.parent().unwrap_or(&repository)
+                    } else {
+                        &repository
+                    };
+                    let branch: Option<String> = transaction.query_row(
+                        "SELECT CASE WHEN length(CAST(branch AS BLOB)) <= 65536 THEN branch ELSE NULL END FROM worktrees
+                         WHERE project_id = ?1 AND path_json IN (?2, ?3) LIMIT 1",
+                        params![channel.project_id.to_string(), repository_json, to_json(&primary)?],
+                        |row| row.get(0),
+                    ).optional()?.flatten();
+                    if let Some(branch) = &branch {
+                        budget.reserve_bytes(branch.len() as u64)?;
+                    }
+                    let default_channel = branch
+                        .map(|branch| {
+                            format!(
+                                "New channel · {}",
+                                branch.strip_prefix("refs/heads/").unwrap_or(&branch)
+                            )
+                        })
+                        .unwrap_or_else(|| "New channel".into());
+                    (name, default_channel)
+                } else {
+                    ("Unknown project".into(), "New channel".into())
+                };
+                entry.insert((name, default_channel));
+            }
+            project_names
+                .get(&channel.project_id)
+                .map(|(name, _)| name.as_str())
+                .unwrap_or("Unknown project")
+        } else {
+            if let std::collections::hash_map::Entry::Vacant(entry) = card_scopes.entry(workspace) {
+                entry.insert(retained_metadata(
+                    &transaction,
+                    workspace,
+                    "card_scopes",
+                    budget,
+                )?);
+            }
+            if project_roots.is_none() {
+                project_roots = Some(migration_project_roots(&transaction, budget)?);
+            }
+            let roots = project_roots
+                .as_ref()
+                .expect("project roots were just loaded");
+            // An explicit saved scope names the pane's strip even if it was
+            // moved there from another cwd. Never use the window's active strip.
+            let scope = card_scopes
+                .get(&workspace)
+                .and_then(|scopes| scopes.get(&card));
+            let directory = scope.unwrap_or_else(|| match &session {
+                CardKind::Chat(source) => &source.launch.recipe.working_directory,
+                CardKind::Terminal(source) => &source.launch.working_directory,
+                _ => unreachable!(),
+            });
+            let project = if scope.is_some() {
+                roots.get(directory)
+            } else {
+                directory
+                    .ancestors()
+                    .find_map(|ancestor| roots.get(ancestor))
+            };
+            project.map(String::as_str).unwrap_or_else(|| {
+                directory
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("Unknown project")
+            })
+        };
+        #[cfg(feature = "host")]
+        let started = match &session {
+            CardKind::Chat(source)
+                if crate::update::source_inspection::is_untitled(&title, true) =>
+            {
+                crate::update::source_inspection::conversation_started(source)
+            }
+            _ => None,
+        };
+        #[cfg(not(feature = "host"))]
+        let started = None;
+        let label = crate::update::source_inspection::pane_label(
+            &title,
+            channel.map(|channel| {
+                if channel.title.is_empty() {
+                    project_names
+                        .get(&channel.project_id)
+                        .map(|(_, title)| title.as_str())
+                        .unwrap_or("New channel")
+                } else {
+                    &channel.title
+                }
+            }),
+            project,
+            matches!(session, CardKind::Chat(_)),
+            started,
+        );
+        sessions.push(MigrationPane {
+            card,
+            kind: session,
+            label,
+            inert,
+        });
     }
     budget.check_deadline()?;
     Ok(sessions)
@@ -8102,6 +8331,122 @@ mod tests {
     }
 
     #[test]
+    fn migration_inspection_names_saved_panes_without_splitting_details() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("labels.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let project = ProjectState {
+            id: ProjectId::new(),
+            generation: 0,
+            name: "alpha".into(),
+            repository: "/alpha".into(),
+            kind: Default::default(),
+            existence: Existence::Open,
+        };
+        store.save_project(&project).unwrap();
+        let (mut workspace, source) = agent_workspace(crate::agent::Provider::Claude);
+        let card = workspace.cards[0].id;
+        workspace.cards[0].title = "Pane Details: keep verbatim".into();
+        workspace.cards[0].kind = CardKind::Chat(source.clone());
+        workspace.channels.push(ProjectChannel {
+            id: ChannelId::new(),
+            project_id: project.id,
+            title: "Release Details: rollout".into(),
+            title_source: Default::default(),
+            ordinal: 1,
+            shared: false,
+            cards: vec![card],
+            focused: Some(card),
+        });
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let original = std::fs::read(&path).unwrap();
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        budget.remaining_rows = 1;
+        let panes = read_labeled_migration_sessions_with_budget(&path, &mut budget).unwrap();
+        assert_eq!(panes.len(), 1);
+        assert_eq!(
+            panes[0].label,
+            "Pane Details: keep verbatim · Release Details: rollout · alpha"
+        );
+        assert!(!panes[0].inert);
+        assert_eq!(
+            budget.remaining_rows, 0,
+            "labels consume bytes, not another pane row"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn migration_inspection_names_unchanneled_panes_by_their_saved_sidebar_project() {
+        for mode in ["subdirectory", "explicit-scope", "component-prefix"] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("scoped-labels.sqlite3");
+            let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+            let project = ProjectState {
+                id: ProjectId::new(),
+                generation: 0,
+                name: "Custom cagents name".into(),
+                repository: "/projects/cagents".into(),
+                kind: Default::default(),
+                existence: Existence::Open,
+            };
+            store.save_project(&project).unwrap();
+            store
+                .save_project(&ProjectState {
+                    id: ProjectId::new(),
+                    generation: 0,
+                    name: "Parent workspace".into(),
+                    repository: "/projects".into(),
+                    kind: Default::default(),
+                    existence: Existence::Open,
+                })
+                .unwrap();
+            let root = PathBuf::from("/projects/cagents/.worktrees/update-outcomes");
+            store
+                .save_worktree(&WorktreeState {
+                    id: WorktreeId::new(),
+                    project_id: project.id,
+                    generation: 0,
+                    path: root.clone(),
+                    branch: Some("feat/update-outcomes".into()),
+                    existence: Existence::Open,
+                })
+                .unwrap();
+            let (mut workspace, mut source) = agent_workspace(crate::agent::Provider::Claude);
+            source.terminal = None;
+            source.launch.recipe.working_directory = match mode {
+                "explicit-scope" => "/tmp/unrelated-launch".into(),
+                "component-prefix" => "/projects/cagents-other/src".into(),
+                _ => root.join("src"),
+            };
+            let card = workspace.cards[0].id;
+            workspace.cards[0].title = "Inspect Details: scope".into();
+            workspace.cards[0].kind = CardKind::Chat(source);
+            if mode == "explicit-scope" {
+                workspace.card_scopes.insert(card, root);
+            }
+            SaveLane::default().save(&store, &workspace).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let mut budget =
+                MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+            budget.remaining_rows = 1;
+            let panes = read_labeled_migration_sessions_with_budget(&path, &mut budget).unwrap();
+            assert_eq!(panes.len(), 1);
+            assert_eq!(
+                panes[0].label,
+                if mode == "component-prefix" {
+                    "Inspect Details: scope · Parent workspace"
+                } else {
+                    "Inspect Details: scope · Custom cagents name"
+                },
+                "{mode}"
+            );
+            assert_eq!(budget.remaining_rows, 0);
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
+    }
+
+    #[test]
     fn migration_inspection_omits_only_exact_retained_local_chat_sources() {
         for mode in [
             "retained",
@@ -8233,10 +8578,12 @@ mod tests {
             Connection::open_with_flags(&paths[0], OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
         let inspection_bytes: u64 = connection
             .query_row(
-                "SELECT length(CAST(content_json AS BLOB)) +
+                "SELECT length(CAST(content_json AS BLOB)) + length(CAST(title AS BLOB)) +
                  (SELECT coalesce(sum(length(CAST(value AS BLOB))), 0) FROM metadata
                   WHERE key LIKE '%:navigation:local_only_cards'
-                     OR key LIKE '%:navigation:pending_chat_admissions')
+                     OR key LIKE '%:navigation:pending_chat_admissions'
+                     OR key LIKE '%:navigation:threads'
+                     OR key LIKE '%:navigation:card_scopes')
                  FROM cards WHERE kind_tag='chat'",
                 [],
                 |row| row.get(0),

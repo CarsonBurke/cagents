@@ -2841,7 +2841,7 @@ mod tests {
     }
 
     /// A 2 MiB screenshot used to be rejected by the 64 KiB identity guard, which
-    /// killed the provider and made the session unreopenable.
+    /// killed the provider and prevented the session from reopening.
     #[test]
     fn inline_image_far_past_the_identity_budget_round_trips() {
         let mut store = Store::at(std::env::temp_dir()).unwrap();

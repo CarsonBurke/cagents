@@ -185,6 +185,11 @@ mod tests {
 
     fn preview(changed: bool) -> impact::Preview {
         impact::Preview {
+            from_version: String::new(),
+            windows: 0,
+            stopped: Vec::new(),
+            stopped_windows: Vec::new(),
+            labels: Default::default(),
             candidate: impact::Candidate {
                 version: "9.8.7".into(),
                 protocol: 32,

@@ -38,7 +38,7 @@ elif args[0] == 'coordinate-install':
     # The real coordinator resolves this exact sibling, never a PATH fallback.
     inspected = subprocess.run([str(helper), '--inspect-upgrade-source', 'fixture'],
                                check=True, capture_output=True, text=True)
-    assert json.loads(inspected.stdout) == {'Ok': None}
+    assert json.loads(inspected.stdout) == {'Ok': {'stopped': [], 'stopped_windows': [], 'labels': {}}}
     record('coordinate', executable=str(pathlib.Path(sys.argv[0]).resolve()),
            helper=str(helper), mode=helper.stat().st_mode & 0o777)
     installer = args[args.index('--installer') + 1]
@@ -71,7 +71,7 @@ import json, os, pathlib, sys
 assert sys.argv[1:] == ['--inspect-upgrade-source', 'fixture']
 with pathlib.Path(os.environ['FIXTURE_CALLS']).open('a') as output:
     output.write(json.dumps({'event': 'inspect', 'source': SOURCE}) + '\n')
-print(json.dumps({'Ok': None}))
+print(json.dumps({'Ok': {'stopped': [], 'stopped_windows': [], 'labels': {}}}))
 '''
 
 
