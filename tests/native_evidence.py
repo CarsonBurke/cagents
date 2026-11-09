@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import re
 import shutil
@@ -1035,6 +1036,202 @@ class Evidence(unittest.TestCase):
         (self.task / "fixture-seed.home").unlink()
         result = self.run_tool("start", "after")
         self.assertIn("chats in the seed will not reopen", result.stderr)
+
+    def fixture_shell(self, script: str, check: bool = True) -> subprocess.CompletedProcess:
+        """Runs a command as the app would, in the fixture's environment and project."""
+        return self.run_tool("env", "sh", "-c", f'cd "$CAGENTS_EVIDENCE_FIXTURE/project" && {script}',
+                             check=check)
+
+    def switch_forge_on(self) -> Path:
+        fixture = self.task / "fixture"
+        # The fixture provides the directory, as a steps file's touch relies on.
+        (fixture / "home" / ".config" / "fixture-forge").touch()
+        return fixture
+
+    def test_the_fixture_has_no_forge_or_network_until_switched_on(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        for command in ("gh --version", "gh auth status --json hosts",
+                        "gh repo view --json nameWithOwner,url"):
+            refused = self.fixture_shell(command, check=False)
+            self.assertEqual(refused.returncode, 1, command)
+            self.assertEqual(refused.stderr, "gh: the fixture has no forge access\n")
+        offline = self.fixture_shell("curl -q --url https://avatars.githubusercontent.com/octo", check=False)
+        self.assertEqual(offline.returncode, 7)
+        self.assertIn("no network access", offline.stderr)
+        # Nor can git: a project's github.com remote is only for the forge to name.
+        fetch = self.fixture_shell("git ls-remote https://github.com/octo-org/app", check=False)
+        self.assertNotEqual(fetch.returncode, 0)
+        self.assertIn("transport 'https' not allowed", fetch.stderr)
+
+        # Read on every call: a step can switch it on in a running session.
+        self.switch_forge_on()
+        self.assertRegex(self.fixture_shell("gh --version").stdout, r"^gh version \d+\.\d+\.\d+ ")
+        hosts = json.loads(self.fixture_shell(
+            "gh auth status --active --hostname github.com --json hosts").stdout)
+        self.assertEqual(hosts, {"hosts": {"github.com": [{
+            "state": "success", "active": True, "host": "github.com", "login": "fixture",
+            "tokenSource": "keyring", "scopes": "gist, read:org, repo, workflow", "gitProtocol": "https",
+        }]}})
+        self.assertEqual(json.loads(self.fixture_shell("gh auth status --json hosts").stdout), hosts)
+        # gh reports another host's absence in JSON, and succeeds.
+        enterprise = self.fixture_shell("gh auth status --hostname ghe.example.invalid --json hosts")
+        self.assertEqual(json.loads(enterprise.stdout), {"hosts": {}})
+
+        selector = "-R github.com/octo-org/app"
+        fields = "--json number,title,headRefName"
+        for command in (f"gh pr list {selector} --state open --limit 30 {fields}",
+                        f"gh pr list {selector} --state all --limit 100 {fields} --head main",
+                        f"gh pr list {selector} --author @me --state open --search sort:updated-desc {fields}"):
+            self.assertEqual(json.loads(self.fixture_shell(command).stdout), [], command)
+        missing = self.fixture_shell(f"gh pr view 7 {selector} {fields}", check=False)
+        self.assertEqual(missing.returncode, 1)
+        self.assertIn("Could not resolve to a PullRequest with the number of 7.", missing.stderr)
+
+        # The review-request poll, behind the headers --include asks for. Text
+        # mode reads gh's CRLF header lines as LF.
+        page = self.fixture_shell(
+            "gh api graphql --include --hostname github.com "
+            "-f 'query=query($owner:String!,$name:String!,$cursor:String){viewer{id login} "
+            "repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN)"
+            "{nodes{number} pageInfo{hasNextPage endCursor}}}}' -f owner=octo-org -f name=app").stdout
+        head, body = page.split("\n\n", 1)
+        self.assertTrue(head.startswith("HTTP/2.0 200 OK\n"))
+        self.assertNotIn("X-Ratelimit-Remaining: 0", head)
+        data = json.loads(body)["data"]
+        self.assertEqual(data["viewer"]["login"], "fixture")
+        self.assertEqual(data["repository"]["pullRequests"],
+                         {"nodes": [], "pageInfo": {"hasNextPage": False, "endCursor": None}})
+        # The pull request browser and its search find nothing to list.
+        browser = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query($owner:String!,$name:String!,$cursor:String)"
+            "{repository(owner:$owner,name:$name){pullRequests(first:50,after:$cursor,states:OPEN)"
+            "{nodes{id} pageInfo{hasNextPage endCursor}}}}' -f owner=octo-org -f name=app").stdout)
+        self.assertEqual(browser["data"], {"repository": {"pullRequests": data["repository"]["pullRequests"]}})
+        search = json.loads(self.fixture_shell(
+            "gh api graphql --hostname github.com -f 'query=query($searchText:String!,$cursor:String)"
+            "{search(type:ISSUE,query:$searchText,first:50,after:$cursor){nodes{... on PullRequest{id}} "
+            "pageInfo{hasNextPage endCursor}}}' -f 'searchText=repo:octo-org/app is:pr fix'").stdout)
+        self.assertEqual(search["data"]["search"]["nodes"], [])
+        releases = self.fixture_shell(
+            "gh api --hostname github.com --method GET repos/o/r/releases?per_page=100&page=1")
+        self.assertEqual(json.loads(releases.stdout), [])
+        absent = self.fixture_shell("gh api --include --hostname github.com repos/o/r/compare/a...b",
+                                    check=False)
+        self.assertEqual(absent.returncode, 1)
+        self.assertIn("HTTP/2.0 404 Not Found\n", absent.stdout)
+        self.assertEqual(absent.stderr, "gh: Not Found (HTTP 404)\n")
+        write = self.fixture_shell("gh pr create -R github.com/o/r --title t --body-file -", check=False)
+        self.assertEqual(write.returncode, 1)
+        self.assertIn("`gh pr create`", write.stderr)
+        dangling = self.fixture_shell("gh pr list --json", check=False)
+        self.assertEqual((dangling.returncode, dangling.stderr), (1, "flag needs an argument: --json\n"))
+
+    def test_the_forge_names_the_repository_of_a_github_remote(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        self.switch_forge_on()
+        view = "gh repo view --json nameWithOwner,url"
+        none = self.fixture_shell(view, check=False)
+        self.assertEqual((none.returncode, none.stderr), (1, "no git remotes found\n"))
+        self.fixture_shell("git remote add origin https://gitlab.example.invalid/octo-org/app.git")
+        elsewhere = self.fixture_shell(view, check=False)
+        self.assertEqual(elsewhere.returncode, 1)
+        self.assertIn("point to a known GitHub host", elsewhere.stderr)
+
+        for url in ("https://github.com/Octo-Org/my.app", "https://github.com/Octo-Org/my.app.git",
+                    "git@github.com:Octo-Org/my.app.git", "ssh://git@github.com/Octo-Org/my.app/"):
+            self.fixture_shell(f"git remote set-url origin {url}")
+            self.assertEqual(json.loads(self.fixture_shell(view).stdout), {
+                "nameWithOwner": "Octo-Org/my.app", "url": "https://github.com/Octo-Org/my.app",
+            }, url)
+        # As gh does, an upstream remote names the base repository over origin.
+        self.fixture_shell("git remote add upstream https://github.com/upstream-org/app")
+        self.assertEqual(json.loads(self.fixture_shell(view).stdout)["nameWithOwner"], "upstream-org/app")
+        # And the remote `gh repo set-default` marked comes before both.
+        self.fixture_shell("git config remote.origin.gh-resolved base")
+        self.assertEqual(json.loads(self.fixture_shell(view).stdout)["nameWithOwner"], "Octo-Org/my.app")
+
+    def test_the_forge_seeds_owner_avatars_into_the_apps_cache(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        fixture = self.switch_forge_on()
+        seed = fixture / "avatars" / "Octo-Org.image"
+        seed.write_bytes(b"\x89PNG\r\n\x1a\nseeded")
+        old = time.time() - 30 * 24 * 60 * 60
+        os.utime(seed, (old, old))
+        self.fixture_shell("git remote add origin https://github.com/Octo-Org/app")
+        self.fixture_shell("gh repo view --json nameWithOwner,url")
+
+        # The path avatar.rs reads under the development storage name, owner lower-cased.
+        cached = fixture / "cache" / "cagents-development" / "github-avatars" / "github.com-octo-org.image"
+        self.assertEqual(cached.read_bytes(), seed.read_bytes())
+        # Under its seven-day freshness, so the app does not try to download it.
+        self.assertLess(time.time() - cached.stat().st_mtime, 60)
+
+        # A cache it can't write leaves the avatar out, not the repository.
+        cached.unlink()
+        cached.parent.chmod(0o555)
+        try:
+            seed.write_bytes(b"\x89PNG\r\n\x1a\nchanged")
+            viewed = self.fixture_shell("gh repo view --json nameWithOwner,url")
+            self.assertEqual(json.loads(viewed.stdout)["nameWithOwner"], "Octo-Org/app")
+            self.assertEqual(viewed.stderr, "")
+            self.assertEqual(list(cached.parent.iterdir()), [])
+        finally:
+            cached.parent.chmod(0o755)
+
+    def test_the_forge_lists_seeded_pull_requests_of_each_repository(self) -> None:
+        if shutil.which("jq") is None:
+            self.skipTest("jq is not installed")
+        self.built()
+        self.run_tool("start", "after")
+        fixture = self.switch_forge_on()
+        pull = {"isDraft": False, "baseRefName": "main", "headRepository": {"name": "app"},
+                "headRepositoryOwner": {"login": "octo-org"}, "updatedAt": "2026-11-01T00:00:00Z"}
+        (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([
+            {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
+             "author": {"login": "fixture"}, "url": "https://github.com/octo-org/app/pull/7"},
+            {**pull, "number": 8, "title": "Merged", "state": "MERGED", "headRefName": "done",
+             "author": {"login": "someone"}, "url": "https://github.com/octo-org/app/pull/8"},
+            {**pull, "number": 9, "title": "Elsewhere", "state": "OPEN", "headRefName": "feature",
+             "url": "https://github.com/other/app/pull/9"},
+        ]))
+        selector = "-R github.com/Octo-Org/app"
+
+        def numbers(arguments: str) -> list[int]:
+            listed = json.loads(self.fixture_shell(f"gh pr list {selector} {arguments}").stdout)
+            return [entry["number"] for entry in listed]
+
+        self.assertEqual(numbers("--state open --json number"), [7])
+        self.assertEqual(numbers("--state closed --json number"), [8])
+        self.assertEqual(numbers("--state all --json number"), [7, 8])
+        self.assertEqual(numbers("--state all --limit 1 --json number"), [7])
+        self.assertEqual(numbers("--state all --head done --json number"), [8])
+        self.assertEqual(numbers("--state all --author @me --json number"), [7])
+        self.assertEqual(numbers("--state=all --head=done --json=number"), [8])
+        # Only the requested fields, as gh prints them.
+        self.assertEqual(json.loads(self.fixture_shell(
+            f"gh pr view 7 {selector} --json number,headRefName").stdout),
+            {"number": 7, "headRefName": "feature"})
+        checks = self.fixture_shell(f"gh pr checks 7 {selector} --json name", check=False)
+        self.assertEqual((checks.returncode, checks.stderr), (1, "no checks reported on the 'feature' branch\n"))
+        self.assertEqual(self.fixture_shell(f"gh pr view 9 {selector} --json number", check=False).returncode, 1)
+        # A malformed seed fails in gh, naming the file, rather than as bad JSON in the app.
+        (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text('{"number": 7}')
+        malformed = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
+        self.assertEqual(malformed.returncode, 1)
+        self.assertIn("fixture-forge-prs.json must be a JSON array", malformed.stderr)
+        # So does one missing a field the app requires, or with a state gh never prints.
+        complete = {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
+                    "url": "https://github.com/octo-org/app/pull/7"}
+        for broken in ({k: v for k, v in complete.items() if k != "title"}, {**complete, "state": "open"},
+                       {k: v for k, v in complete.items() if k != "headRepositoryOwner"}):
+            (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([broken]))
+            refused = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
+            self.assertEqual(refused.returncode, 1, broken)
+            self.assertIn("title, state (OPEN, CLOSED or MERGED), headRefName, baseRefName, updatedAt, "
+                          "headRepositoryOwner.login and headRepository.name", refused.stderr)
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
