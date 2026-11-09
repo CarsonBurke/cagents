@@ -5954,6 +5954,17 @@ fn skipped_record(bytes: &[u8], at: usize, oversized: bool) -> Skipped {
                             .is_some_and(|team| !team.is_empty());
                     }
                     "message" => map.next_value_seed(Message(&mut record.kind))?,
+                    // An attachment's or progress record's body comes before
+                    // its type, and only those records have one, so a record
+                    // cut inside it is known not to be a message.
+                    "attachment" => {
+                        record.kind.get_or_insert_with(|| "attachment".into());
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                    "data" => {
+                        record.kind.get_or_insert_with(|| "progress".into());
+                        map.next_value::<IgnoredAny>()?;
+                    }
                     _ => {
                         map.next_value::<IgnoredAny>()?;
                     }
@@ -6981,6 +6992,9 @@ impl History {
         let mut start = self.offset;
         let mut total = 0;
         let mut charged = HashSet::new();
+        // A marker for messages that could not be shown takes no space, so
+        // the first record a page holds is counted, not its first link.
+        let mut holds_record = false;
         while start > 0 && self.offset - start < 100 {
             let Link::Record(offset, len, _) = self.chain[start - 1] else {
                 start -= 1;
@@ -7008,11 +7022,12 @@ impl History {
             // Original records and required call dependencies share the page
             // byte budget. One oversized record/dependency group remains
             // loadable under the existing individual MAX_PAYLOAD limit.
-            if total + bytes > HISTORY_PAGE && start != self.offset {
+            if total + bytes > HISTORY_PAGE && holds_record {
                 break;
             }
             total += bytes;
             charged.extend(records.into_keys());
+            holds_record = true;
             start -= 1;
         }
         let mut result = Vec::new();
@@ -16606,6 +16621,47 @@ mod tests {
         ]);
         assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "u2"]);
         assert_eq!((history.damaged, history.oversized), (0, 0));
+        // Claude Code writes an attachment's body before its type, so a cut
+        // attachment says what it was only by the field it was cut in. It is
+        // not reported whether the next message names it or its parent.
+        let attachment =
+            r#"{"parentUuid":"a1","isSidechain":false,"attachment":{"type":"file","content":"abc"#;
+        for parent in ["a1", "lost"] {
+            let mut history = index_lines(&[
+                claude_line("u1", None, "user", "", "Question"),
+                claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+                attachment.into(),
+                claude_line("u2", Some(parent), "user", "", "Next"),
+            ]);
+            assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "u2"]);
+            assert_eq!((history.damaged, history.oversized), (0, 0));
+        }
+    }
+
+    /// A marker takes no room on a page, so the record before it still
+    /// shares the page rather than waiting for the next one.
+    #[test]
+    fn a_marker_at_the_end_does_not_fill_a_page_alone() {
+        let mut history = index_lines(&[
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line(
+                "a1",
+                Some("u1"),
+                "assistant",
+                "",
+                &"x".repeat(HISTORY_PAGE as usize + 10),
+            ),
+            claude_line(
+                "huge",
+                Some("a1"),
+                "user",
+                "",
+                &"x".repeat(MAX_PAYLOAD + 10),
+            ),
+        ]);
+        assert_eq!(shown(&history.page().unwrap()), ["a1", "1 large"]);
+        assert!(history.offset > 0, "the first prompt is on an earlier page");
+        assert_eq!(shown(&history.page().unwrap()), ["u1"]);
     }
 
     /// A damaged compaction boundary still leads back to the turns it
