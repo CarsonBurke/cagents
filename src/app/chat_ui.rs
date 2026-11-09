@@ -24425,7 +24425,7 @@ mod tests {
     }
 
     /// `/resume` sends nothing: it opens the picker on the conversation's
-    /// provider and project, searching for what follows it, and an untouched
+    /// project, searching for what follows it, and an untouched
     /// draft gives its place to the conversation chosen there.
     #[test]
     fn resume_command_opens_the_picker_for_this_conversation() {
@@ -24437,7 +24437,7 @@ mod tests {
         assert!(app.resume_ui.open);
         assert_eq!(app.resume_ui.query, "flaky tests");
         let scope = app.resume_ui.scope.as_ref().expect("a narrowed search");
-        assert_eq!(scope.provider, Provider::Codex);
+        assert_eq!(scope.reach, crate::app::resume_ui::Reach::Project);
         assert!(
             scope
                 .roots
