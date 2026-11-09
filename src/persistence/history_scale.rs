@@ -126,8 +126,6 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
                         },
                     }
                 },
-                exposure: Exposure::Offscreen,
-                residency: Residency::Cold,
                 kind: kind(name, index),
             });
         }
