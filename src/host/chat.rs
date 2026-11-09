@@ -33,6 +33,8 @@ mod retained_pending_installation_tests;
 #[cfg(test)]
 mod retained_publication_tests;
 #[cfg(test)]
+mod retained_receipt_collection_tests;
+#[cfg(test)]
 mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]

@@ -397,6 +397,103 @@ fn collect(db: &Connection, sql: &str) -> Result<Vec<View>, String> {
     .collect()
 }
 
+/// A channel whose view was emptied by closing its only pane, as nearly every
+/// view in a long-lived store is.
+#[cfg(test)]
+pub(super) struct EmptiedView(Scope);
+
+#[cfg(test)]
+impl EmptiedView {
+    pub(super) fn plant(registry: &mut Registry) -> Self {
+        let repository = std::path::PathBuf::from("/planted/emptied-view");
+        registry
+            .apply(&ModelEdit::OpenProject {
+                repository: repository.clone(),
+                name: "emptied".into(),
+                kind: Default::default(),
+            })
+            .unwrap();
+        let channel = ChannelId::new();
+        registry
+            .apply(&ModelEdit::CreateChannel {
+                id: channel,
+                repository,
+                title: "emptied".into(),
+                title_source: Default::default(),
+            })
+            .unwrap();
+        let scope = Scope::Channel(channel);
+        let pane = crate::workspace_model::views::Pane {
+            id: crate::model::CardId::new(),
+            title: "closed".into(),
+            user_title: None,
+            pending_terminal_start: false,
+            width_fraction: 0.5,
+            scope: None,
+            kind: crate::model::CardKind::Browser(crate::model::BrowserSession {
+                id: crate::model::BrowserId::new(),
+                current_url: "https://example.com".parse().unwrap(),
+                history: vec![],
+                history_index: 0,
+                scroll_x: 0.,
+                scroll_y: 0.,
+                fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+            }),
+        };
+        let id = pane.id;
+        for change in [Change::Insert { pane, before: None }, Change::Remove { id }] {
+            registry
+                .apply(&ModelEdit::ChangeView {
+                    expected_revision: registry.view_revision(&scope).unwrap(),
+                    scope: scope.clone(),
+                    operation: Uuid::new_v4(),
+                    change,
+                })
+                .unwrap();
+        }
+        assert!(read(&registry.db, &scope).unwrap().panes.is_empty());
+        Self(scope)
+    }
+
+    /// Runs `search` while this view's stored tombstones cannot be parsed, so
+    /// a search that reads emptied views fails, and one that skips them
+    /// answers as it otherwise would. Whole-model reads, such as the model an
+    /// applied edit returns, fail meanwhile, so `search` must not apply edits.
+    pub(super) fn unreadable_during<T>(
+        &self,
+        registry: &mut Registry,
+        search: impl FnOnce(&mut Registry) -> T,
+    ) -> T {
+        let scope = key(&self.0).unwrap();
+        let set = |registry: &Registry, retired: &str| {
+            assert_eq!(
+                registry
+                    .db
+                    .execute(
+                        "UPDATE shared_views SET retired = ?2 WHERE scope = ?1 AND panes = '[]'",
+                        params![scope, retired],
+                    )
+                    .unwrap(),
+                1,
+                "the emptied view is stored as an empty pane list"
+            );
+        };
+        let readable: String = registry
+            .db
+            .query_row(
+                "SELECT retired FROM shared_views WHERE scope = ?1",
+                [&scope],
+                |row| row.get(0),
+            )
+            .unwrap();
+        set(registry, "unreadable");
+        assert!(all(&registry.db).is_err(), "reading every view now fails");
+        let found = search(registry);
+        set(registry, &readable);
+        found
+    }
+}
+
 /// Read the pane still presenting this execution agent's resource without
 /// changing it. Preflight and retirement share this exact authority predicate.
 /// The current owner can differ from the agent's original placement after a
@@ -1067,6 +1164,74 @@ mod tests {
             occupied(&r.db).unwrap(),
             vec![read(&r.db, &Scope::Channel(a)).unwrap()]
         );
+    }
+    #[test]
+    fn hosted_resource_ownership_reads_only_occupied_views() {
+        let (mut r, _, a, b) = setup();
+        let emptied = EmptiedView::plant(&mut r);
+        let p = pane();
+        let mut alias = p.clone();
+        alias.id = CardId::new();
+        let mut renamed = p.clone();
+        renamed.title = "renamed".into();
+        // Seeding, inserting and updating each look for the resource's pane,
+        // applied here without the whole model an applied edit returns.
+        let owner = emptied.unreadable_during(&mut r, |r| {
+            let tx = r.db.transaction().unwrap();
+            let change = |tx: &rusqlite::Transaction<'_>, channel, change| {
+                let scope = Scope::Channel(channel);
+                let edit = ModelEdit::ChangeView {
+                    expected_revision: read(tx, &scope).unwrap().revision,
+                    scope,
+                    operation: Uuid::new_v4(),
+                    change,
+                };
+                apply(tx, &edit).unwrap();
+            };
+            apply(
+                &tx,
+                &ModelEdit::SeedView {
+                    scope: Scope::Channel(a),
+                    panes: vec![p.clone()],
+                    closed: vec![],
+                },
+            )
+            .unwrap();
+            change(
+                &tx,
+                b,
+                Change::Insert {
+                    pane: alias,
+                    before: None,
+                },
+            );
+            change(
+                &tx,
+                a,
+                Change::Update {
+                    before: p.clone(),
+                    pane: renamed.clone(),
+                },
+            );
+            let owner = resource_owner(&tx, &pane_with_kind(&p)).unwrap();
+            tx.commit().unwrap();
+            owner
+        });
+        assert_eq!(owner, Some(p.id), "the resource's pane was found");
+        assert!(
+            read(&r.db, &Scope::Channel(b)).unwrap().panes.is_empty(),
+            "the resource already has its pane in another view"
+        );
+        assert_eq!(
+            read(&r.db, &Scope::Channel(a)).unwrap().panes,
+            vec![renamed]
+        );
+    }
+    fn pane_with_kind(of: &Pane) -> Pane {
+        Pane {
+            id: CardId::new(),
+            ..of.clone()
+        }
     }
     #[test]
     fn migration_and_updates_keep_one_pane_per_hosted_resource() {
