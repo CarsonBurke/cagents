@@ -1504,31 +1504,31 @@ fn start_with_execution(
             source_execution.as_ref()
         },
     )?;
-    // A server launched on an existing thread would be a second writer beside
-    // any process still writing it: a Codex CLI, the desktop app, or a server
-    // an earlier daemon left running. A checkpointed restart replaces the
-    // server it was taken from, so it is not checked.
-    if owned_socket.is_some()
-        && restart_launch.is_none()
-        && let Some(thread) = session.launch.session_id.as_deref()
-        && let Some(writer) = codex_owners::writer(
-            chat::protocol::codex::thread_writer_lock(&process_launch, thread).as_deref(),
-            thread,
-        )
-        .map_err(unavailable)?
-    {
-        return Err(error(if writer.hosted {
-            format!(
-                "This conversation is still open in another chat or terminal here (pid {}). Close it there, then resume it here.",
-                writer.pid
-            )
-        } else {
-            format!(
-                "This conversation is open in another Codex process ({}, pid {}). Close it there, then resume it here.",
-                writer.name, writer.pid
-            )
-        }));
-    }
+    // A begun thread's bare remote joins the account's shared daemon, which
+    // owns the thread while it runs. With nothing serving that daemon, the
+    // thread is reopened from its history on a listener of its own instead of
+    // failing to join a daemon that is absent.
+    let owned_socket = match owned_socket {
+        None if !owned
+            && source.is_none()
+            && restart_launch.is_none()
+            && !saved_history_only
+            && process_launch.provider == Provider::Codex
+            && chat::protocol::codex::shared_daemon_socket(&process_launch)
+                .is_some_and(|shared| owned_listener::stopped(&shared))
+            && listeners.claim_for_unserved_thread(&mut session, &allocator) =>
+        {
+            process_launch.recipe.arguments = session.launch.recipe.arguments.clone();
+            let socket = session
+                .owned_codex_listener
+                .as_ref()
+                .unwrap()
+                .socket
+                .clone();
+            (!served_owned_listener(&socket)?).then_some(socket)
+        }
+        owned_socket => owned_socket,
+    };
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }

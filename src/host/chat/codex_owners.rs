@@ -7,7 +7,14 @@
 //! of a loaded thread by holding the thread's writer lock in its account home,
 //! so the lock's holder is that writer. Releases without the lock still keep
 //! the thread's current rollout open for writing while it is loaded.
-use std::{io, os::unix::fs::MetadataExt, path::Path};
+use std::{
+    io,
+    os::{
+        fd::AsRawFd,
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    },
+    path::Path,
+};
 
 /// Bounds a census of a host that is spawning processes without end.
 const MAX_PROCESSES: usize = 65_536;
@@ -52,7 +59,14 @@ fn read(path: &str) -> Result<String, String> {
 /// The process holding the lock at `lock`, according to the kernel's `locks`
 /// table. Waiters queued behind the holder are not writers.
 fn lock_holder(lock: &Path, table: &str) -> Result<Option<libc::pid_t>, String> {
-    let file = match std::fs::metadata(lock) {
+    // Pin the inode and its mount together. Btrfs stat() reports a different
+    // device for each subvolume, while /proc/locks uses the superblock device
+    // from mountinfo, so metadata.dev() is not the kernel lock identity.
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(lock)
+    {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
@@ -62,7 +76,11 @@ fn lock_holder(lock: &Path, table: &str) -> Result<Option<libc::pid_t>, String> 
             ));
         }
     };
-    let (major, minor) = (libc::major(file.dev()), libc::minor(file.dev()));
+    let expected_inode = file
+        .metadata()
+        .map_err(|error| format!("Cannot inspect Codex thread writer lock: {error}"))?
+        .ino();
+    let (major, minor) = kernel_device(&file)?;
     Ok(table.lines().find_map(|line| {
         let fields: Vec<_> = line.split_whitespace().collect();
         let [_, kind, _, _, pid, identity, ..] = fields[..] else {
@@ -77,10 +95,33 @@ fn lock_holder(lock: &Path, table: &str) -> Result<Option<libc::pid_t>, String> 
             u32::from_str_radix(identity.next()?, 16).ok()?,
         );
         let inode: u64 = identity.next()?.parse().ok()?;
-        (device == (major, minor) && inode == file.ino())
+        (device == (major, minor) && inode == expected_inode)
             .then(|| pid.parse().ok())
             .flatten()
     }))
+}
+
+/// Device used by the kernel lock table for this exact open mount.
+fn kernel_device(file: &std::fs::File) -> Result<(u32, u32), String> {
+    let info = read(&format!("/proc/self/fdinfo/{}", file.as_raw_fd()))?;
+    let mount = info
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:").map(str::trim))
+        .ok_or("Cannot identify the Codex writer lock's mount")?;
+    mount_device(mount, &read("/proc/self/mountinfo")?)
+        .ok_or_else(|| "Cannot identify the Codex writer lock's kernel device".into())
+}
+
+fn mount_device(mount: &str, table: &str) -> Option<(u32, u32)> {
+    table.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.next()? != mount {
+            return None;
+        }
+        fields.next()?;
+        let (major, minor) = fields.next()?.split_once(':')?;
+        Some((major.parse().ok()?, minor.parse().ok()?))
+    })
 }
 
 /// A process of this account with one of `thread`'s rollouts open for writing.
@@ -155,6 +196,9 @@ fn rollout_of(target: &Path, thread: &str) -> bool {
     let Some(stem) = target
         .file_name()
         .and_then(|name| name.to_str())
+        // procfs retains an unlinked file's original name with this suffix.
+        // Its open writer remains live until the descriptor is closed.
+        .map(|name| name.strip_suffix(" (deleted)").unwrap_or(name))
         .and_then(|name| name.strip_prefix("rollout-"))
         .and_then(|name| name.strip_suffix(".jsonl"))
     else {
@@ -236,6 +280,10 @@ mod tests {
         for (name, expected) in [
             (format!("rollout-2026-10-14T09-00-00-{thread}.jsonl"), true),
             (
+                format!("rollout-2026-10-14T09-00-00-{thread}.jsonl (deleted)"),
+                true,
+            ),
+            (
                 format!(
                     "rollout-2026-11-04T09-00-00-{thread}_01a1a9fb-0000-7000-8000-000000000000.jsonl"
                 ),
@@ -262,12 +310,8 @@ mod tests {
         let lock = directory.path().join("thread.lock");
         std::fs::write(&lock, b"").unwrap();
         let file = std::fs::metadata(&lock).unwrap();
-        let identity = format!(
-            "{:02x}:{:02x}:{}",
-            libc::major(file.dev()),
-            libc::minor(file.dev()),
-            file.ino()
-        );
+        let (major, minor) = kernel_device(&std::fs::File::open(&lock).unwrap()).unwrap();
+        let identity = format!("{major:02x}:{minor:02x}:{}", file.ino());
         let table = format!(
             "1: FLOCK  ADVISORY  WRITE 4242 00:00:1 0 EOF\n\
              2: FLOCK  ADVISORY  WRITE 31337 {identity} 0 EOF\n\
@@ -293,6 +337,19 @@ mod tests {
             lock_holder(&lock, &read("/proc/locks").unwrap()).unwrap(),
             None
         );
+    }
+
+    #[test]
+    fn a_lock_uses_its_exact_mounts_kernel_device_including_btrfs_subvolumes() {
+        let mounts = "31 20 0:30 /@home /home rw - btrfs /dev/nvme0n1p2 rw\n\
+                      42 20 0:30 /@tmp /var/tmp rw - btrfs /dev/nvme0n1p2 rw\n\
+                      43 20 0:58 / /tmp rw - tmpfs tmpfs rw\n";
+        // The Btrfs subvolume's stat device can be 0:57, while this mount
+        // shares the superblock device 0:30 used in /proc/locks.
+        assert_eq!(mount_device("42", mounts), Some((0, 30)));
+        assert_eq!(mount_device("43", mounts), Some((0, 58)));
+        assert_eq!(mount_device("4", mounts), None);
+        assert_eq!(mount_device("42", "42 20 not-a-device / /tmp"), None);
     }
 
     #[test]
@@ -342,6 +399,8 @@ mod tests {
         assert_eq!(found.pid, loaded.id() as libc::pid_t);
         assert_eq!(found.name, "sleep");
         assert!(found.hosted, "a child of this process is one it started");
+        std::fs::remove_file(&segment).unwrap();
+        assert_eq!(writer(None, &thread).unwrap().unwrap().pid, found.pid);
         for child in readers.iter_mut().chain([&mut loaded]) {
             child.kill().unwrap();
             child.wait().unwrap();

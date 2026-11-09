@@ -402,6 +402,10 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     // that incorrectly tries to launch the installed Codex stand-in.
     server.kill().unwrap();
     server.wait().unwrap();
+    assert!(
+        !root.join("codex-arguments").exists(),
+        "no second private server was launched"
+    );
     let refusal = result.unwrap_err();
     assert!(
         refusal.message.contains(&format!("pid {})", writer.pid)),
@@ -410,10 +414,6 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     assert!(
         !refusal.retryable,
         "a second server cannot help while the writer owns it"
-    );
-    assert!(
-        !root.join("codex-arguments").exists(),
-        "no second private server was launched"
     );
     assert!(host.lock().unwrap().chat_spawning.is_empty());
 }
