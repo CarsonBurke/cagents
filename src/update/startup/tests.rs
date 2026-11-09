@@ -65,10 +65,14 @@ fn real_worker_lock_and_unchanged_status_distinguish_active_from_orphan_without_
         ),
         "observation did not release the worker's lock"
     );
+    // Model an unrelated child paused between fork and exec: its descriptor
+    // shares the same open-file description even with CLOEXEC set.
+    let unrelated_fork = lock.try_clone().unwrap();
     drop(lock);
     let orphan = observe_installation(&executable, LockState::Free);
     assert_eq!(orphan.heading(), "Update completion is unconfirmed");
     assert!(orphan.can_open() && !orphan.finished());
+    drop(unrelated_fork);
     assert_eq!(fs::read(state.join("status.json")).unwrap(), original);
     assert_eq!(
         fs::metadata(state.join("status.json")).unwrap().ino(),
