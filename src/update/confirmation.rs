@@ -185,6 +185,7 @@ mod tests {
 
     fn preview(changed: bool) -> impact::Preview {
         impact::Preview {
+            editors: Vec::new(),
             candidate: impact::Candidate {
                 version: "9.8.7".into(),
                 protocol: 32,

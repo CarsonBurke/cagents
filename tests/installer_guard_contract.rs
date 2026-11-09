@@ -1775,3 +1775,172 @@ fn sealed_anonymous_update_probe_does_not_require_installed_routing() {
         assert_eq!(response["data"]["running"], false);
     }
 }
+
+#[test]
+fn staged_cli_handoff_starts_its_matched_daemon_after_the_old_owner_exits() {
+    let _fixture = OS_FIXTURE.lock().unwrap();
+    if !user_fixture::enter() {
+        return;
+    }
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let prefix = root.path().join("install");
+    for version in ["old", "new"] {
+        let bin = prefix.join("versions").join(version).join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        for name in ["cagents", "cagentsd", "cagents-ui"] {
+            fs::write(bin.join(name), "complete matched fixture").unwrap();
+        }
+    }
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink("versions/new", prefix.join("current")).unwrap();
+    let new = prefix.join("versions/new/bin");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), new.join("cagents")).unwrap();
+    let marker = prefix.join("versions/new/.deferred-owner.json");
+    fs::write(&marker, r#"{"version":1,"owner_version":"old"}"#).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o600)).unwrap();
+    let runtime = root.path().join("runtime");
+    let daemon_dir = runtime.join(cagents::instance::RUNTIME_SUBDIRECTORY);
+    fs::create_dir_all(&daemon_dir).unwrap();
+    fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&daemon_dir, fs::Permissions::from_mode(0o700)).unwrap();
+    let lock = file(&daemon_dir.join("cagentsd.lock"));
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    // The updater now owns the old daemon's lock inode, but its old metadata
+    // still names a process that has exited. Routing cannot authenticate that
+    // former executable as the current serving owner.
+    let mut old = Command::new("/bin/true").spawn().unwrap();
+    let old_pid = old.id();
+    assert!(old.wait().unwrap().success());
+    fs::write(
+        daemon_dir.join("cagentsd.lock"),
+        format!("{{\"pid\":{old_pid}}}"),
+    )
+    .unwrap();
+    let launched = root.path().join("successor-launched");
+    fs::write(
+        new.join("cagentsd"),
+        r#"#!/usr/bin/python3
+import fcntl, os, pathlib
+fd = int(os.environ['CAGENTS_DAEMON_LEASE_FD'])
+assert fd == 199
+actual = os.fstat(fd)
+expected = os.stat(os.environ['CAGENTS_TEST_HANDOFF_LOCK'])
+assert (actual.st_dev, actual.st_ino) == (expected.st_dev, expected.st_ino)
+fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+pathlib.Path(os.environ['CAGENTS_TEST_HANDOFF_LAUNCHED']).write_text('matched daemon inherited lease\n')
+# This fixture verifies the actual CLI routing and inherited-fd transport. It
+# does not stand in for a restored host: fail deliberately before readiness.
+raise SystemExit(79)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(new.join("cagentsd"), fs::Permissions::from_mode(0o700)).unwrap();
+    let run = |verb: &str, descriptor: Option<&File>, lease_marker: Option<&str>| {
+        let mut command = Command::new(new.join("cagents"));
+        command
+            .args(["--json", "daemon", verb])
+            .env("HOME", root.path())
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CACHE_HOME", root.path().join("cache"))
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env(
+                "CAGENTS_TEST_HANDOFF_LOCK",
+                daemon_dir.join("cagentsd.lock"),
+            )
+            .env("CAGENTS_TEST_HANDOFF_LAUNCHED", &launched)
+            .env_remove("CAGENTS_DEVELOPMENT_INSTANCE")
+            .env_remove("CAGENTS_DAEMON_LEASE_FD")
+            .env_remove("CAGENTS_DAEMON_LAUNCH_FENCE_FD")
+            .env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
+        if let Some(marker) = lease_marker {
+            command.env("CAGENTS_DAEMON_LEASE_FD", marker);
+        }
+        let descriptor = descriptor.map(AsRawFd::as_raw_fd);
+        // SAFETY: only descriptor syscalls run after fork. The test retains
+        // every source File until the real CLI and its matched helper settle.
+        unsafe {
+            command.pre_exec(move || {
+                if let Some(descriptor) = descriptor {
+                    if libc::dup2(descriptor, 199) == -1 || libc::fcntl(199, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else {
+                    libc::close(199);
+                }
+                Ok(())
+            });
+        }
+        command.output().unwrap()
+    };
+    let unrelated = file(&runtime.join("unrelated-lease"));
+    assert_eq!(
+        unsafe { libc::flock(unrelated.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+    let independent = File::open(daemon_dir.join("cagentsd.lock")).unwrap();
+    for verb in ["status", "start"] {
+        for (descriptor, lease_marker) in [
+            (None, "199"),
+            (Some(&lock), "999"),
+            (Some(&unrelated), "199"),
+            (Some(&independent), "199"),
+        ] {
+            let output = run(verb, descriptor, Some(lease_marker));
+            assert!(
+                !output.status.success(),
+                "{verb} accepted malformed, missing, mismatched, or unheld lease authority: {output:?}"
+            );
+            assert!(!launched.exists(), "invalid authority launched a daemon");
+        }
+    }
+    let status = run("status", Some(&lock), Some("199"));
+    assert!(status.status.success(), "{status:?}");
+    let response: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(response["data"]["running"], false);
+    assert!(
+        !launched.exists(),
+        "read-only handoff status started a daemon"
+    );
+    // Without update authority, ordinary status still reports a held lease as
+    // running/starting. Remove only this fixture's staged-routing marker so
+    // the former source identity does not independently refuse that control.
+    let parked_marker = marker.with_extension("parked");
+    fs::rename(&marker, &parked_marker).unwrap();
+    let ordinary_status = run("status", None, None);
+    fs::rename(&parked_marker, &marker).unwrap();
+    assert!(ordinary_status.status.success(), "{ordinary_status:?}");
+    let response: serde_json::Value = serde_json::from_slice(&ordinary_status.stdout).unwrap();
+    assert_eq!(response["data"]["running"], true);
+    let started = run("start", Some(&lock), Some("199"));
+    assert!(
+        !started.status.success(),
+        "the fixture deliberately fails startup"
+    );
+    assert_eq!(
+        fs::read_to_string(&launched).unwrap(),
+        "matched daemon inherited lease\n",
+        "the actual staged CLI must reach its own matched daemon"
+    );
+    assert!(
+        String::from_utf8_lossy(&started.stderr).contains("exited before becoming ready"),
+        "startup must report its actual matched child's failure: {started:?}"
+    );
+    // Neither validation nor the failed daemon command may unlock the worker.
+    assert_eq!(
+        unsafe { libc::flock(independent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().kind(),
+        std::io::ErrorKind::WouldBlock
+    );
+}

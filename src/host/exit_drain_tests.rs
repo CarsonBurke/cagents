@@ -330,6 +330,7 @@ fn run_host() -> (
     // A real private launch fence/HostLease is acquired; no daemon guard is
     // fabricated and no process-wide authority marker is removed or changed.
     let admission = DaemonAdmission {
+        lease: None,
         _guard: crate::instance::DaemonAdmissionGuard::acquire().unwrap(),
     };
     let (complete, completion) = mpsc::channel();

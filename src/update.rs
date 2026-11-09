@@ -577,6 +577,15 @@ pub fn upgrade_installed(
                         " (keeps terminal service)"
                     }
                 );
+                for editor in &confirmation.preview.editors {
+                    if editor.protocol != Some(confirmation.preview.candidate.protocol) {
+                        eprintln!(
+                            "  {} ({}): agent features reconnect after the editor updates",
+                            editor.name,
+                            editor.version.as_deref().unwrap_or("version unknown")
+                        );
+                    }
+                }
                 if let Some(daemon) = &confirmation.preview.daemon {
                     for session in &daemon.sessions {
                         eprintln!(
@@ -1144,7 +1153,10 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     if job.id != job_id || job.phase != UpdatePhase::Starting {
         return Err(invalid("update job is no longer pending"));
     }
-    let result = perform_update(&installation, &state, &mut job);
+    // Keep the shared lease through the durable final outcome, including a
+    // startup failure. Dropping a worker copy must never unlock the successor.
+    let mut handoff = None;
+    let result = perform_update(&installation, &state, &mut job, &mut handoff);
     job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
         UpdatePhase::Cancelled
     } else if result.is_ok() {
@@ -1165,6 +1177,7 @@ fn perform_update(
     installation: &Installation,
     state: &Path,
     job: &mut UpdateJob,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<(), UpdateError> {
     let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
@@ -1179,7 +1192,14 @@ fn perform_update(
             root,
             accept_unreopenable,
         } => {
-            return installed::perform(installation, state, job, &root, accept_unreopenable);
+            return installed::perform(
+                installation,
+                state,
+                job,
+                &root,
+                accept_unreopenable,
+                handoff,
+            );
         }
     };
     let cancellation = CancellationToken::new();
@@ -1233,7 +1253,6 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
         crate::install_guard::preflight_source_panes(guard,
             confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, false)?;
@@ -1262,10 +1281,15 @@ fn perform_update(
             let socket = crate::terminal_ipc::daemon_socket_path()?;
             let mut client =
                 source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+            let paths = crate::daemon::RuntimePaths::discover()
+                .map_err(|error| invalid(error.to_string()))?;
+            let source =
+                crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
+                    .map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
-            wait_daemon_stopped(&socket)?;
+            *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
         }
         set_phase(
             state,
@@ -1281,8 +1305,10 @@ fn perform_update(
             &checksums,
             current.replaces_daemon,
             &guard,
+            handoff.as_ref(),
         )
     })();
+    record_handoff_failure(state, job, &install_result, handoff)?;
     let reopen_result = guard
         .relaunch_windows(
             &windows,
@@ -1313,11 +1339,6 @@ fn reconcile_saved_sources(
     let guard = crate::instance::UiUpdateGuard::acquire()?;
     let (protocol, proof) = source::inspect_identity(None)?;
     let mut problems = Vec::new();
-    if let Err(error) =
-        crate::install_guard::preflight_editor_companions(Some(destination_protocol))
-    {
-        problems.push(error.to_string());
-    }
     if let Err(error) = inspect_source_panes_mode(
         &guard,
         proof,
@@ -1430,7 +1451,9 @@ fn owned_cli_protocol(
         .ok_or_else(|| invalid(format!("{subject} did not report a valid protocol")))
 }
 
-pub(crate) fn companion_namespace(executable: &Path) -> Result<String, UpdateError> {
+pub(crate) fn companion_identity(
+    executable: &Path,
+) -> Result<(String, Option<String>), UpdateError> {
     // `daemon status` reports the compiled instance even when stopped. Give it
     // a fresh nonexistent runtime, so it cannot contact production or start a
     // service. This also works with older unmarked companion sets.
@@ -1450,7 +1473,15 @@ pub(crate) fn companion_namespace(executable: &Path) -> Result<String, UpdateErr
         .and_then(|data| data.get("instance"))
         .and_then(serde_json::Value::as_str)
     {
-        Some(instance @ ("production" | "development")) => Ok(instance.into()),
+        Some(instance @ ("production" | "development")) => Ok((
+            instance.into(),
+            envelope
+                .get("data")
+                .and_then(|data| data.get("cli_version"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|version| !version.is_empty())
+                .map(str::to_owned),
+        )),
         _ => Err(invalid(
             "Ceditor's companion has no verifiable application instance",
         )),
@@ -1541,27 +1572,88 @@ fn observe_impact(
         None
     };
     Ok(impact::Preview {
+        editors: crate::install_guard::editor_companions(),
         candidate: candidate.clone(),
         replaces_daemon,
         daemon,
     })
 }
 
-fn wait_daemon_stopped(socket: &Path) -> Result<(), UpdateError> {
-    let deadline = Instant::now() + Duration::from_secs(30);
-    let paths =
-        crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
+fn wait_daemon_stopped(
+    paths: crate::daemon::RuntimePaths,
+    source: crate::daemon::lease_handoff::HandoffSource,
+    state: &Path,
+    job: &mut UpdateJob,
+) -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {
+    use crate::daemon::lease_handoff::{LeaseHandoff, holder_pid};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    const WAITING: &str = "Waiting for the terminal service to save its panes";
+    let (sender, receiver) = mpsc::sync_channel(1);
+    let waiting_paths = paths.clone();
+    let pid = source.pid;
+    thread::Builder::new()
+        .name("daemon-lease-handoff".into())
+        .spawn(move || {
+            let _ = sender.send(LeaseHandoff::wait(&waiting_paths, pid));
+        })?;
+    let mut last_progress = Instant::now();
+    let mut source_exited_at = None;
     loop {
-        if !crate::daemon::HostLease::is_held(&paths).map_err(|error| invalid(error.to_string()))?
-            && !socket.exists()
+        match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => return result.map_err(|error| invalid(error.to_string())),
+            Err(RecvTimeoutError::Disconnected) => {
+                return Err(invalid("Terminal service lease handoff thread exited"));
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        // A nonblocking older client can race the kernel's waiter wakeup.
+        // Never start a successor against that unexpected holder, or wait
+        // indefinitely for it under the original daemon's identity.
+        let exited = source.exited()?;
+        if let Some(holder) = holder_pid(&paths)? {
+            if holder != std::process::id() as i32 && (Some(holder) != source.locker_pid || exited)
+            {
+                return Err(invalid(format!(
+                    "Terminal service lease handoff was interrupted by holder process {holder} (expected process {pid}); saved panes were retained. Check cagents daemon status before retrying"
+                )));
+            }
+        }
+        // An inherited flock can outlive its original process, and its
+        // kernel record may no longer be visible in this PID namespace. Never
+        // impose a checkpoint deadline while the pinned source lives; after
+        // exit, allow the waiter to run before diagnosing a leaked description.
+        if exited
+            && source_exited_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(5)
         {
-            return Ok(());
+            return Err(invalid(format!(
+                "Terminal service process {pid} exited but its lease was not handed over (holder PID unavailable); saved panes were retained. Check cagents daemon status before retrying"
+            )));
         }
-        if Instant::now() >= deadline {
-            return Err(UpdateError::Timeout("terminal service checkpoint"));
+        if last_progress.elapsed() >= Duration::from_secs(15) {
+            eprintln!("{WAITING}");
+            set_phase(state, job, UpdatePhase::Installing, WAITING)?;
+            last_progress = Instant::now();
         }
-        thread::sleep(Duration::from_millis(50));
     }
+}
+
+/// Recovery windows may autostart the old version. Publish failure before
+/// allowing that start, rather than keeping the runtime reserved until reopen.
+fn record_handoff_failure(
+    state: &Path,
+    job: &mut UpdateJob,
+    result: &Result<(), UpdateError>,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+) -> Result<(), UpdateError> {
+    if let Err(error) = result {
+        eprintln!("{error}");
+        job.phase = UpdatePhase::Failed;
+        job.confirmation = None;
+        job.message = error.to_string();
+        write_job(state, job)?;
+        drop(handoff.take());
+    }
+    Ok(())
 }
 
 fn run_installer(
@@ -1572,6 +1664,7 @@ fn run_installer(
     checksums: &File,
     restart_daemon: bool,
     guard: &crate::instance::UiUpdateGuard,
+    handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<(), UpdateError> {
     let files = [
         installer.as_raw_fd(),
@@ -1613,6 +1706,9 @@ fn run_installer(
             }
             Ok(())
         });
+    }
+    if let Some(handoff) = handoff {
+        handoff.inherit(&mut command)?;
     }
     // Do not kill an installer mid-transaction. Its migration protocol owns
     // bounded shutdown/startup and rollback, and its log survives every UI.
@@ -3672,5 +3768,140 @@ finally:
         std::os::unix::fs::symlink(&destination, root.path().join("lock")).unwrap();
         assert!(acquire_lock(root.path()).is_err());
         assert_eq!(fs::read(destination).unwrap(), b"untouched");
+    }
+    #[cfg(feature = "host")]
+    #[test]
+    fn startup_failure_is_persisted_before_releasing_the_handoff() {
+        use crate::daemon::{HostLease, RuntimePaths, lease_handoff::LeaseHandoff};
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("daemon");
+        let paths = RuntimePaths {
+            socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
+            lock: directory.join("cagentsd.lock"),
+            directory,
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("handoff-failure"),
+            boot_id: crate::model::BootId::new("handoff-failure"),
+            host_incarnation: crate::model::HostIncarnation::new("handoff-failure"),
+        };
+        drop(HostLease::acquire(&paths, &proof).unwrap());
+        let mut handoff = Some(LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: root.path().join("worker.log"),
+            confirmation: None,
+        };
+        let result = Err(invalid("the original startup failure"));
+        // A failed status write must leave the reservation intact.
+        assert!(
+            record_handoff_failure(
+                &root.path().join("missing"),
+                &mut job,
+                &result,
+                &mut handoff
+            )
+            .is_err()
+        );
+        assert!(handoff.is_some());
+        assert!(HostLease::is_held(&paths).unwrap());
+        record_handoff_failure(root.path(), &mut job, &result, &mut handoff).unwrap();
+        let persisted: UpdateJob =
+            serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap()).unwrap();
+        assert_eq!(persisted.phase, UpdatePhase::Failed);
+        assert_eq!(persisted.message, "the original startup failure");
+        assert!(handoff.is_none());
+        assert!(!HostLease::is_held(&paths).unwrap());
+    }
+    #[cfg(feature = "host")]
+    #[test]
+    fn handoff_reports_an_exited_source_with_a_leaked_lock_description() {
+        use crate::daemon::{RuntimePaths, lease_handoff::HandoffSource};
+        use std::io::BufRead;
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("daemon");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
+            lock: directory.join("cagentsd.lock"),
+            directory,
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("leaked-handoff"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("leaked-handoff"),
+        };
+        let mut daemon = Command::new("python3").args(["-c", r#"
+import fcntl, json, os, subprocess, sys
+lock = open(sys.argv[1], 'w+')
+os.chmod(sys.argv[1], 0o600)
+fcntl.flock(lock, fcntl.LOCK_EX)
+json.dump({'pid':os.getpid(), 'proof':json.loads(sys.argv[2])}, lock)
+lock.flush()
+# Model an accidentally inherited copy after the serving process exits.
+leak = subprocess.Popen(['/bin/sleep', '30'], pass_fds=(lock.fileno(),),
+                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+print(leak.pid, flush=True)
+sys.stdin.buffer.read(1)
+"#]).arg(&paths.lock).arg(serde_json::to_string(&proof).unwrap())
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).spawn().unwrap();
+        let mut ready = String::new();
+        io::BufReader::new(daemon.stdout.take().unwrap())
+            .read_line(&mut ready)
+            .unwrap();
+        let leaked_pid: u32 = ready.trim().parse().unwrap();
+        let source_pid = daemon.id();
+        let source = HandoffSource::pin(&paths, &proof).unwrap();
+        // Pin the deliberate leak before allowing the original daemon to exit.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, leaked_pid, 0) };
+        assert!(fd >= 0);
+        struct Leak(File);
+        impl Drop for Leak {
+            fn drop(&mut self) {
+                // SAFETY: the exact fixture process is pinned, never looked up again.
+                unsafe {
+                    libc::syscall(
+                        libc::SYS_pidfd_send_signal,
+                        self.0.as_raw_fd(),
+                        libc::SIGKILL,
+                        std::ptr::null::<libc::siginfo_t>(),
+                        0,
+                    );
+                }
+            }
+        }
+        let leak = Leak(unsafe { File::from_raw_fd(fd as i32) });
+        daemon.stdin.take().unwrap().write_all(b"x").unwrap();
+        assert!(daemon.wait().unwrap().success());
+        let state = root.path().to_owned();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: state.join("worker.log"),
+            confirmation: None,
+        };
+        let (send, recv) = std::sync::mpsc::sync_channel(1);
+        let monitor = thread::spawn(move || {
+            let _ = send.send(wait_daemon_stopped(paths, source, &state, &mut job));
+        });
+        let result = recv.recv_timeout(Duration::from_secs(10));
+        drop(leak); // Also releases a broken monitor before joining its thread.
+        monitor.join().unwrap();
+        let error = result
+            .expect("a dead source must not wait forever")
+            .err()
+            .expect("a leaked lock is not a completed handoff")
+            .to_string();
+        assert!(error.contains(&source_pid.to_string()), "{error}");
+        assert!(
+            error.contains("holder process") || error.contains("holder PID unavailable"),
+            "{error}"
+        );
     }
 }

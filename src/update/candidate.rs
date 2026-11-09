@@ -19,6 +19,7 @@ impl Staged {
                     .is_ok()
                 {
                     Ok(impact::Preview {
+                        editors: crate::install_guard::editor_companions(),
                         candidate: self.identity.clone(),
                         replaces_daemon: false,
                         daemon: None,

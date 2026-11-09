@@ -72,6 +72,7 @@ pub(super) fn perform(
     job: &mut UpdateJob,
     root: &Path,
     accept_unreopenable: bool,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
@@ -126,7 +127,6 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    crate::install_guard::preflight_editor_companions(Some(staged.identity.protocol))?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
         crate::install_guard::preflight_source_panes(guard,
             confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon, accept_unreopenable)?;
@@ -158,10 +158,15 @@ pub(super) fn perform(
             let socket = crate::terminal_ipc::daemon_socket_path()?;
             let mut client =
                 source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+            let paths = crate::daemon::RuntimePaths::discover()
+                .map_err(|error| invalid(error.to_string()))?;
+            let source =
+                crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
+                    .map_err(|error| invalid(error.to_string()))?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
-            wait_daemon_stopped(&socket)?;
+            *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
         }
         set_phase(
             state,
@@ -176,6 +181,9 @@ pub(super) fn perform(
         command.args(["--json", "daemon", "start"]);
         output.attach(&mut command)?;
         guard.inherit_for_install(&mut command)?;
+        if let Some(handoff) = handoff.as_ref() {
+            handoff.inherit(&mut command)?;
+        }
         let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
@@ -209,8 +217,7 @@ pub(super) fn perform(
         && !startup_owned
         && result.is_err()
         && crate::daemon::running_executable()
-            .map_err(|error| invalid(error.to_string()))?
-            .is_some_and(|executable| executable == root.join("bin/cagentsd"));
+            .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
     let reopen = if result.is_ok() || successor_owns_runtime || startup_owned {
         root.to_owned()
     } else {
@@ -219,6 +226,7 @@ pub(super) fn perform(
             .join("versions")
             .join(&installation.version)
     };
+    record_handoff_failure(state, job, &result, handoff)?;
     let reopened = guard
         .relaunch_windows(&windows, &reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
@@ -282,6 +290,7 @@ fn observe_installed_source(
         ));
     }
     Ok(impact::Preview {
+        editors: crate::install_guard::editor_companions(),
         candidate: staged.identity.clone(),
         replaces_daemon: true,
         daemon: Some(daemon),

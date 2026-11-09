@@ -204,6 +204,7 @@ pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
 /// Holds launch exclusion until the daemon listener is ready.
 pub struct DaemonAdmission {
     _guard: crate::instance::DaemonAdmissionGuard,
+    lease: Option<std::fs::File>,
 }
 
 /// Authenticate startup authority before diagnostics or runtime threads exist.
@@ -218,7 +219,12 @@ pub unsafe fn prepare_daemon_admission() -> Result<DaemonAdmission, HostError> {
         std::env::remove_var(crate::instance::DAEMON_FENCE_ENV);
         std::env::remove_var(crate::instance::INSTALL_GUARD_ENV);
     }
-    Ok(DaemonAdmission { _guard: admission })
+    // SAFETY: this is still the single-threaded entry point.
+    let lease = unsafe { daemon::lease_handoff::take_inherited_lease()? };
+    Ok(DaemonAdmission {
+        _guard: admission,
+        lease,
+    })
 }
 
 /// How often the daemon reclaims runtime-directory space that its chats no
@@ -274,7 +280,7 @@ fn listener_before_restore(
     Ok(listener)
 }
 
-pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
+pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
     daemon::install_signal_handlers()?;
     descriptor_limit::raise();
     let proof = HostSessionProof {
@@ -283,7 +289,10 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
     };
     let paths = RuntimePaths::discover()?;
-    let _lease = HostLease::acquire(&paths, &proof)?;
+    let _lease = match admission.lease.take() {
+        Some(lease) => HostLease::acquire_with_handoff(&paths, &proof, Some(lease))?,
+        None => HostLease::acquire(&paths, &proof)?,
+    };
     // Before anything is launched or adopted: sessions launched through this
     // entry by an earlier daemon now run the CLI that speaks this protocol.
     if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {

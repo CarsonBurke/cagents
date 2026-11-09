@@ -261,6 +261,7 @@ fn coordinated_release_mode(
     coordinator: &str,
     stage_only: bool,
 ) {
+    let handoff = restart.is_some_and(|mode| mode.starts_with("handoff-"));
     let home = tempfile::tempdir().unwrap();
     let coordinator_bin = home.path().join("coordinator-bin");
     fs::create_dir(&coordinator_bin).unwrap();
@@ -281,6 +282,13 @@ fn coordinated_release_mode(
     }
     let status = r#"#!/bin/sh
 CLI=old
+if [ "$FIXTURE_HANDOFF" = true ]; then
+  "$FIXTURE_LEASE_CHECK" || exit 97
+  # The worker already owns window coordination in this fixture. This CLI
+  # stands in for its verified inherited fence; real guard/adoption validation
+  # is covered by installer_guard_contract and the daemon process tests.
+  case "$*" in 'verify-install-guard'*) exit 0 ;; esac
+fi
 case "$*" in
   'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
     case "$FIXTURE_COORDINATOR:$CLI" in
@@ -307,6 +315,9 @@ case "$*" in
     if [ "$CLI" = new ] && [ "$FIXTURE_COMPATIBLE" = false ] &&
        [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" = old ]; then exit 9; fi
     if [ -e "$FIXTURE_RUNNING" ]; then running=true; else running=false; fi
+    # Historical CLIs see the updater's flock as a running daemon, even though
+    # its socket is gone. The candidate recognizes its inherited lease instead.
+    if [ "$FIXTURE_HANDOFF:$CLI" = true:old ]; then running=true; fi
     if [ -e "$FIXTURE_PENDING" ]; then
       [ "$CLI" = old ] || exit 98
       printf '%s\n' old:draining >> "$FIXTURE_ACTIONS"
@@ -359,7 +370,7 @@ case "$*" in
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
-    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ]; }; then exit 4; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ] || [ "$FIXTURE_RESTART" = handoff-start-failure ]; }; then exit 4; fi
     if [ -e "$FIXTURE_CHECKPOINT" ]; then
       [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
       expected=versions/old
@@ -534,7 +545,13 @@ esac
     let running = home.path().join("running");
     let checkpoint = home.path().join("checkpoint");
     let restored = home.path().join("restored");
-    fs::write(&running, "old\n").unwrap();
+    if handoff {
+        // Prepare/checkpoint already completed in the worker; the installer
+        // receives a held lock and no running service, just as after shutdown.
+        fs::write(&checkpoint, "exact-conversation-and-shells\n").unwrap();
+    } else {
+        fs::write(&running, "old\n").unwrap();
+    }
     let runtime = home.path().join("runtime");
     fs::create_dir(&runtime).unwrap();
     fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
@@ -584,12 +601,62 @@ exec sh "$@""#,
             .env("CAGENTS_ARCHIVE", &archive)
             .env("CAGENTS_CHECKSUMS", &checksums);
     }
+    let lease_path = runtime.join("worker-held.lock");
+    let handoff_lease = handoff.then(|| {
+        use std::os::fd::AsRawFd;
+        let lease = fs::File::create(&lease_path).unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        lease
+    });
+    let lease_check = home.path().join("check-lease");
+    if let Some(lease) = &handoff_lease {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        executable(
+            &lease_check,
+            r#"#!/usr/bin/python3
+import fcntl, os
+assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '199'
+held = os.fstat(199)
+expected = os.stat(os.environ['FIXTURE_LEASE_PATH'])
+assert (held.st_dev, held.st_ino) == (expected.st_dev, expected.st_ino)
+fcntl.flock(199, fcntl.LOCK_EX | fcntl.LOCK_NB)
+with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
+    try:
+        fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        pass
+    else:
+        raise AssertionError('worker lease was released during installation')
+"#,
+        );
+        command
+            .env("CAGENTS_DAEMON_LEASE_FD", "199")
+            .env("CAGENTS_UI_UPDATE_GUARD_FD", "198");
+        let descriptor = lease.as_raw_fd();
+        // SAFETY: the parent guard outlives installation, and only descriptor
+        // syscalls run after fork. The fixed descriptor matches the real path.
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(descriptor, 199) == -1 || libc::fcntl(199, libc::F_SETFD, 0) == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    } else {
+        command.env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
+    }
     let output = command
         .env("HOME", home.path())
         .env("XDG_DATA_HOME", &data)
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_RUNTIME_DIR", &runtime)
-        .env_remove("CAGENTS_UI_UPDATE_GUARD_FD")
+        .env("FIXTURE_HANDOFF", handoff.to_string())
+        .env("FIXTURE_LEASE_CHECK", &lease_check)
+        .env("FIXTURE_LEASE_PATH", &lease_path)
         .env("FIXTURE_REAL_CLI", &real_cli)
         .env(
             "FIXTURE_SOURCE_PROTOCOL",
@@ -648,7 +715,7 @@ exec sh "$@""#,
     let outer_pid = output.id();
     let output = output.wait_with_output().unwrap();
     let source_inspected = home.path().join("source-inspected");
-    if stage_only || !home.path().join("coordinator-used").exists() {
+    if stage_only || handoff || !home.path().join("coordinator-used").exists() {
         assert!(
             !source_inspected.exists(),
             "staging and pre-coordinator refusals must not inspect source panes"
@@ -667,6 +734,62 @@ exec sh "$@""#,
                 "reconcile_retained": false,
             })
         );
+    }
+    if handoff {
+        use std::os::fd::AsRawFd;
+        let success = restart == Some("handoff-success");
+        assert_eq!(output.status.success(), success, "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new(if success {
+                "versions/9.9.9"
+            } else {
+                "versions/old"
+            })
+        );
+        let actions = fs::read_to_string(&actions).unwrap();
+        assert_eq!(
+            actions,
+            if success {
+                "new:stopped\nnew:start\n"
+            } else {
+                "new:stopped\nnew:start\nnew:stopped\n"
+            }
+        );
+        assert!(
+            !actions.contains("old:"),
+            "the stopped source must not be prepared or restarted: {actions}"
+        );
+        assert_eq!(
+            fs::read(&checkpoint).unwrap(),
+            b"exact-conversation-and-shells\n"
+        );
+        if success {
+            assert_eq!(fs::read(&restored).unwrap(), fs::read(&checkpoint).unwrap());
+            assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+        } else {
+            assert!(!running.exists());
+            assert!(!prefix.join("versions/9.9.9").exists());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("replacement daemon startup failed")
+            );
+        }
+        let contender = fs::File::open(&lease_path).unwrap();
+        assert_ne!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        drop(handoff_lease);
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        return;
     }
     if outer_signal {
         assert_eq!(
@@ -1136,4 +1259,13 @@ fn staging_keeps_both_trees_when_current_cannot_be_safely_rolled_back() {
 #[test]
 fn staging_cannot_borrow_candidate_support_from_an_installed_coordinator() {
     coordinated_release_mode(false, 38, None, None, None, "stage-unsupported", true);
+}
+
+/// Shell transaction coverage with a real inherited flock and mocked companion
+/// replies; native daemon adoption is exercised by the daemon process tests.
+#[test]
+fn transferred_lease_skips_source_prepare_and_survives_installer_start_failure() {
+    for mode in ["handoff-success", "handoff-start-failure"] {
+        upgrade_fixture(false, 7, None, Some(mode));
+    }
 }

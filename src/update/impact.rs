@@ -216,6 +216,29 @@ mod tests {
     }
 
     #[test]
+    fn editor_census_is_backwards_compatible_and_does_not_expand_consent() {
+        let before: Preview = serde_json::from_value(serde_json::json!({
+            "candidate": { "version": "1.0", "protocol": 160, "digest": "verified" },
+            "replaces_daemon": true,
+            "daemon": null
+        }))
+        .unwrap();
+        assert!(before.editors.is_empty());
+        let mut after = before.clone();
+        after.editors.push(crate::install_guard::EditorCompanion {
+            name: "Ceditor".into(),
+            version: Some("07e7efc5".into()),
+            protocol: Some(127),
+            pid: 42,
+        });
+        assert!(before.preserves_consent(&after));
+        assert!(after.preserves_consent(&before));
+        let roundtrip: Preview =
+            serde_json::from_slice(&serde_json::to_vec(&after).unwrap()).unwrap();
+        assert_eq!(after, roundtrip);
+    }
+
+    #[test]
     fn duplicate_inventory_and_changed_candidate_cannot_reuse_confirmation() {
         let mut previous = waiting();
         let mut additional = previous.sessions[0].clone();
@@ -226,6 +249,7 @@ mod tests {
         assert!(!previous.preserves_consent(&duplicated));
         assert!(!duplicated.preserves_consent(&previous));
         let preview = Preview {
+            editors: Vec::new(),
             candidate: Candidate {
                 version: "1.0.0".into(),
                 protocol: 31,
@@ -250,6 +274,8 @@ pub struct Candidate {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Preview {
+    #[serde(default)]
+    pub editors: Vec<crate::install_guard::EditorCompanion>,
     pub candidate: Candidate,
     /// Compatible updates leave the daemon and its entire inventory in place.
     pub replaces_daemon: bool,
