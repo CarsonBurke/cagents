@@ -761,6 +761,31 @@ bounds that wait, and the wait for a slot there, as it does a wait here; on
 expiry the command exits 124 naming the cause. The build there has no
 timeout. Set `CAGENTS_BUILD_REMOTE=local` to build here.
 
+Each slot's build output is bounded by its lease. Cargo removes nothing, and
+every feature lane, profile and kind of target of the `cagents` crate keeps
+an incremental session of 1–6 GiB, so slots on fw16 grew to about 97 GiB
+each, 40–60 GiB of it incremental state. Once a lease holds a slot, and no
+earlier command of the slot's is still running, it keeps the incremental
+state of the crates the slot compiled most recently, up to
+`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), and moves the rest out of
+the target; with `0` it keeps none. Every 6 hours it also moves out compiled
+dependencies in the profiles' `deps` that nothing has read or written for 3
+days, such as old versions after a dependency update, unless the file system
+keeps no access times. Below twice the host's floor, the larger of
+`CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
+default, a slot keeps a quarter of the budget, its dependencies are looked
+through at once, and the lease does the same to every other slot no lease
+holds, under that slot's locks. A crate whose session a `rustc` holds stays,
+whatever started it. Each crate's state is moved out with one rename into the
+slot's `evicted` directory, which Cargo never reads, so a build never finds
+part of one; a process of its own then removes it at idle CPU and I/O
+priority, and the next trim of the slot finishes a removal that was cut
+short. Rustc remakes an evicted session, so that crate's next build compiles
+it in full rather than incrementally; Cargo rebuilds a removed dependency.
+Measuring a session it has not seen takes about a second for a full slot; a
+finalized session never changes, so each is measured once and recorded in
+the slot's `incremental-sizes`.
+
 A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
 (`CAGENTS_BUILD_INSTALLED_GATE`; empty disables this), when the installed
 `gate_version` is newer, so a worktree that has fallen behind `main` still
@@ -870,7 +895,7 @@ local build, removes them with `scripts/prune-build-dirs` in two ways:
 - **Running low.** When the file system has less than twice a floor free (5% of its size, at most 64 GiB), it starts the pruner in the background at once, and again each hour, at low rather than idle priority. Builds still don't wait. This run also removes, at once, the build directories of removed workspaces in the mirrored `/var/tmp/cargo-build` layout, and native-evidence builds unused for an hour; on the schedule they wait six and twelve hours.
 - **Below the floor.** The guard starts the same background run, unless one did within the hour. The build waits for the pruner, at most every ten minutes across the host, or for the run already pruning. After `CAGENTS_BUILD_PRUNE_BUDGET_SECONDS` (default 300) it starts no new search or removal, so the build waits about that long at most. If there is still too little room, the guard refuses the build and says why. With no pruner beside it and no `CAGENTS_BUILD_PRUNE`, it says it has nothing to reclaim with. A `CAGENTS_BUILD_PRUNE` command runs before the build whenever there is less than twice the floor free.
 
-The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either. It skips a checkout's committed directories, which hold only sources.
+The pruner searches the repository's main checkout first, then the mirrored `/var/tmp/cargo-build`, then `~/.cache`, `~/.local/state` and `/var/tmp`, six levels deep. `CAGENTS_BUILD_PRUNE_ROOTS` replaces the last three. `~` is the account's home from the password database, because a test fixture's builds run under a private `HOME` that holds none of the account's build output, and a search of only that would find nothing yet count as a complete run. When `HOME` differs, its `~/.cache` and `~/.local/state` are searched as well, for a user who keeps builds under a `HOME` of their own. `~/.local/share` and the offload slots are never touched under either: their leases bound them, as [described above](#building-on-another-host), and before each of the guard's background runs and its run below the floor, `scripts/cargo-offload --trim-slots` beside it bounds the slots under the account's `~/.cache/cagents-offload` (`CAGENTS_BUILD_OFFLOAD_SLOTS`; empty for none) that no lease holds, under their leases' locks, as a lease would. A background run's account of it is in `/var/tmp/cagents-prune-build-dirs-UID.slots.log`. Below the floor the build waits for that trim and its removals beside the pruner, within the same budget. A `CAGENTS_BUILD_PRUNE` command replaces both. It skips a checkout's committed directories, which hold only sources.
 
 It recognizes build output by Cargo's own markers, not by name or place: a root `.rustc_info.json`, or a `CACHEDIR.TAG` beside a profile's `.fingerprint`. A [native-evidence](#native-evidence) task's `target-before` and `target-after`, beside the task's `.native-evidence` marker, are build output too. It removes a build directory only when all of these hold:
 
