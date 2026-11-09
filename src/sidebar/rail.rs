@@ -64,6 +64,9 @@ pub(super) enum News {
     Warning,
     /// An agent's update failed. The expanded sidebar's error mark.
     Failed,
+    /// A provider usage limit stops an agent until it resets. The expanded
+    /// sidebar's alarm.
+    Limited,
 }
 
 /// Who is doing the work a bottom-right spinner shows.
@@ -93,6 +96,8 @@ impl Badges {
             Some(News::Warning)
         } else if summary.failed != 0 {
             Some(News::Failed)
+        } else if summary.limited != 0 {
+            Some(News::Limited)
         } else if summary.unread != 0 {
             Some(News::Unread(Some(summary.unread)))
         } else {
@@ -204,6 +209,10 @@ fn news_badge<'a>(news: News) -> Element<'a, SidebarAction> {
         News::Failed => status_disc(
             widget::icon(Icon::Error.handle()).size(STATUS_GLYPH).into(),
             design::destructive_color,
+        ),
+        News::Limited => status_disc(
+            widget::icon(Icon::Alarm.handle()).size(STATUS_GLYPH).into(),
+            design::warning_color,
         ),
     }
 }
@@ -406,6 +415,7 @@ mod tests {
             working: 1,
             failed: 0,
             waiting: 0,
+            limited: 0,
         });
         assert_eq!(badges.news, Some(News::Unread(Some(3))));
         assert_eq!(badges.activity, Some(Activity::Agent));
@@ -413,7 +423,8 @@ mod tests {
 
     /// Waiting and failed differ in shape, not only in a colour some themes
     /// and some readers barely tell apart; a waiting agent outranks a failed
-    /// update, which outranks unread news.
+    /// update, which outranks a usage limit, which outranks unread news: the
+    /// order of the expanded sidebar's `AttentionSummary::state`.
     #[test]
     fn the_news_badge_shows_what_most_needs_the_user() {
         let waiting = Badges::attention(AttentionSummary {
@@ -430,6 +441,16 @@ mod tests {
             ..AttentionSummary::default()
         });
         assert_eq!(failed.news, Some(News::Failed));
+        let limited = AttentionSummary {
+            unread: 2,
+            working: 1,
+            ..AttentionSummary::default()
+        }
+        .limited(true);
+        let limited = Badges::attention(limited);
+        assert_eq!(limited.news, Some(News::Limited));
+        // A limited agent is not working, whatever it last reported.
+        assert_eq!(limited.activity, None);
         assert_eq!(
             Badges::attention(AttentionSummary::default()),
             Badges::default()
