@@ -5846,10 +5846,14 @@ fn check_generation(
     Ok(())
 }
 
-fn next_generation(expected: u64, kind: &str, id: impl std::fmt::Display) -> Result<u64> {
-    expected
-        .checked_add(1)
-        .ok_or_else(|| invalid_state!("{kind} {id} exhausted its generation counter"))
+fn next_generation(expected: u64, kind: &'static str, id: impl std::fmt::Display) -> Result<u64> {
+    expected.checked_add(1).ok_or_else(|| {
+        StoreError::InvalidState(Violation::of_kind(
+            "{kind} {id} exhausted its generation counter",
+            kind,
+            format!("{kind} {id} exhausted its generation counter"),
+        ))
+    })
 }
 
 fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
@@ -5896,12 +5900,20 @@ fn now_unix_ms() -> i64 {
     i64::try_from(millis).unwrap_or(i64::MAX)
 }
 
-fn u64_to_i64(value: u64, kind: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| invalid_state!("{kind} exceeds SQLite INTEGER range"))
+fn u64_to_i64(value: u64, kind: &'static str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| integer_out_of_range(kind))
 }
 
-fn usize_to_i64(value: usize, kind: &str) -> Result<i64> {
-    i64::try_from(value).map_err(|_| invalid_state!("{kind} exceeds SQLite INTEGER range"))
+fn usize_to_i64(value: usize, kind: &'static str) -> Result<i64> {
+    i64::try_from(value).map_err(|_| integer_out_of_range(kind))
+}
+
+fn integer_out_of_range(kind: &'static str) -> StoreError {
+    StoreError::InvalidState(Violation::of_kind(
+        "{kind} exceeds SQLite INTEGER range",
+        kind,
+        format!("{kind} exceeds SQLite INTEGER range"),
+    ))
 }
 
 fn i64_to_u64(value: i64, kind: &str) -> Result<u64> {

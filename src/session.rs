@@ -91,7 +91,7 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
 /// content cannot help, so the remedy is changing it.
 pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
      its own; everything else keeps saving. Changing or closing the item saves it again. If this \
-     repeats, report the rule it broke, which `cagents diagnostics` keeps, and the database path.";
+     repeats, report the rule it broke, which cagents diagnostics keeps, and the database path.";
 
 impl SaveFailureCategory {
     pub fn label(self) -> &'static str {

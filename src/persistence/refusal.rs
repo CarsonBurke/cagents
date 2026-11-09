@@ -20,6 +20,9 @@ use super::StoreError;
 #[derive(Debug)]
 pub struct Violation {
     check: &'static str,
+    /// What `{kind}` in `check` stands for, when that is a static noun such
+    /// as `card generation` rather than the write's content.
+    kind: Option<&'static str>,
     message: String,
 }
 
@@ -29,6 +32,22 @@ impl Violation {
     pub(crate) fn new(check: &'static str, message: impl Into<String>) -> Self {
         Self {
             check,
+            kind: None,
+            message: message.into(),
+        }
+    }
+
+    /// A violation of a rule shared by several kinds of record, whose check
+    /// names the kind: `{kind}` in `check` reads as `kind`, which is static
+    /// text like the rest of the check.
+    pub(crate) fn of_kind(
+        check: &'static str,
+        kind: &'static str,
+        message: impl Into<String>,
+    ) -> Self {
+        Self {
+            check,
+            kind: Some(kind),
             message: message.into(),
         }
     }
@@ -76,8 +95,12 @@ pub(crate) use invalid_state;
 /// it can be kept in private diagnostics and shown outside the window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefusedCheck<'a> {
-    /// One of storage's own rules, by its static check.
-    Rule(&'static str),
+    /// One of storage's own rules, by its static check and the static kind of
+    /// record it concerns, when the check names one.
+    Rule {
+        check: &'static str,
+        kind: Option<&'static str>,
+    },
     /// The state could not be encoded as JSON. serde_json's category is no
     /// help here: it reports every encoding failure as a syntax error.
     Encoding,
@@ -105,7 +128,10 @@ impl StoreError {
     pub fn refused_check(&self) -> Option<RefusedCheck<'_>> {
         match self {
             Self::Card { error, .. } => error.refused_check(),
-            Self::InvalidState(violation) => Some(RefusedCheck::Rule(violation.check)),
+            Self::InvalidState(violation) => Some(RefusedCheck::Rule {
+                check: violation.check,
+                kind: violation.kind,
+            }),
             Self::Serialization(_) => Some(RefusedCheck::Encoding),
             Self::Sqlite(rusqlite::Error::SqliteFailure(error, message)) => match error.code {
                 ErrorCode::ConstraintViolation => Some(RefusedCheck::Constraint {
@@ -168,7 +194,7 @@ fn constraint_target(message: &str) -> Option<&str> {
 impl fmt::Display for RefusedCheck<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match *self {
-            Self::Rule(check) => write_template(formatter, check),
+            Self::Rule { check, kind } => write_template(formatter, check, kind),
             Self::Encoding => formatter.write_str("the state could not be encoded as JSON"),
             Self::Constraint { kind, target } => {
                 formatter.write_str("a SQLite ")?;
@@ -195,8 +221,12 @@ impl From<RefusedCheck<'_>> for crate::diagnostics::Check {
 
 /// Writes a format template with an ellipsis where each value would go:
 /// `chat card {card} changed source identity` reads `chat card … changed
-/// source identity`.
-fn write_template(formatter: &mut fmt::Formatter<'_>, template: &str) -> fmt::Result {
+/// source identity`. `{kind}` reads as `kind` when there is one.
+fn write_template(
+    formatter: &mut fmt::Formatter<'_>,
+    template: &str,
+    kind: Option<&str>,
+) -> fmt::Result {
     use fmt::Write as _;
 
     let mut characters = template.chars().peekable();
@@ -205,12 +235,14 @@ fn write_template(formatter: &mut fmt::Formatter<'_>, template: &str) -> fmt::Re
             '{' if characters.next_if_eq(&'{').is_some() => formatter.write_char('{')?,
             '}' if characters.next_if_eq(&'}').is_some() => formatter.write_char('}')?,
             '{' => {
-                for skipped in characters.by_ref() {
-                    if skipped == '}' {
-                        break;
-                    }
+                let placeholder = characters
+                    .by_ref()
+                    .take_while(|&skipped| skipped != '}')
+                    .collect::<String>();
+                match kind {
+                    Some(kind) if placeholder == "kind" => formatter.write_str(kind)?,
+                    _ => formatter.write_char('…')?,
                 }
-                formatter.write_char('…')?;
             }
             character => formatter.write_char(character)?,
         }
@@ -253,7 +285,32 @@ mod tests {
 
         assert_eq!(
             error.refused_check(),
-            Some(RefusedCheck::Rule("invalid card ordinal"))
+            Some(RefusedCheck::Rule {
+                check: "invalid card ordinal",
+                kind: None,
+            })
+        );
+    }
+
+    #[test]
+    fn a_rule_shared_by_kinds_of_record_names_the_kind() {
+        let error = StoreError::InvalidState(Violation::of_kind(
+            "{kind} {id} exhausted its generation counter",
+            "card",
+            "card 7 exhausted its generation counter",
+        ));
+
+        assert_eq!(
+            error.refused_check().unwrap().to_string(),
+            "card … exhausted its generation counter"
+        );
+        // Without a kind, `{kind}` is a value like any other.
+        assert_eq!(
+            invalid_state!("{kind} exhausted", kind = "secret")
+                .refused_check()
+                .unwrap()
+                .to_string(),
+            "… exhausted"
         );
     }
 
