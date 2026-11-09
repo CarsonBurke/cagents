@@ -23540,21 +23540,14 @@ mod tests {
             }
             let (app, card) = reopen_with_saved_queue("old", queue, vec![still]);
             let runtime = chat_runtime(&app, card);
-            if renumbered {
-                // Its old place now holds the other message, which stays
-                // listed; the one the provider no longer holds comes back.
-                assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
-                assert!(runtime.attachments.is_empty());
-                assert_eq!(
-                    runtime.restored_waiting,
-                    Some(RestoredWaiting {
-                        count: 1,
-                        whole: false
-                    })
-                );
-                continue;
-            }
-            assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
+            // Renumbered, the listed message carries the other saved
+            // message's id, yet its words still claim the message it is: either
+            // way only the message the provider no longer holds comes back.
+            assert_eq!(
+                runtime.composer.text().trim(),
+                "And summarize\ntyped after",
+                "renumbered: {renumbered}"
+            );
             assert!(runtime.attachments.is_empty());
             assert_eq!(
                 runtime.restored_waiting,
