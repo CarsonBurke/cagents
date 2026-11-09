@@ -840,9 +840,10 @@ impl Cagents {
         // to a strip restores its actual offset, even if focus is offscreen.
         let offset = offset.unwrap_or_else(|| self.workspace.camera().target());
         self.workspace.native_scroll(offset, width);
-        // Only the cards whose place changes: those this strip shows and
-        // those the strip being left showed. Every other card stays where it
-        // was, offscreen.
+        // The cards this strip shows, and those the strip being left showed.
+        // Every surface was just hidden, so a card on screen both before and
+        // after is told again to show itself. Every other card stays where
+        // it was, offscreen.
         let transitions = self
             .durable
             .cards
@@ -858,7 +859,7 @@ impl Cagents {
                     .workspace
                     .visibility(card.id)
                     .unwrap_or(VisibilityClass::Offscreen);
-                (from != to).then_some(VisibilityTransition {
+                (from != to || to != VisibilityClass::Offscreen).then_some(VisibilityTransition {
                     id: card.id,
                     from,
                     to,

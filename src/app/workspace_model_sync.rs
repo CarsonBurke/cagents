@@ -1297,12 +1297,7 @@ impl Cagents {
             }
         }
         self.cards.insert(card_id, CardRuntime::Loading);
-        self.lifecycle.register(
-            card_id,
-            Exposure::Offscreen,
-            Residency::Cold,
-            Instant::now(),
-        );
+        self.register_presence(card_id, Exposure::Offscreen, Residency::Cold);
         // Native chats keep a lightweight attachment even offscreen, just as
         // initialize_runtimes does after a window restart. The deferred
         // lifecycle hydrator only starts terminal/browser surfaces; leaving a

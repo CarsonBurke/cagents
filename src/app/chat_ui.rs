@@ -20834,6 +20834,39 @@ mod tests {
         );
     }
 
+    /// Rebuilding the strip hides every surface before it lays the new one
+    /// out. A conversation on screen both before and after is shown again
+    /// rather than left blank.
+    #[test]
+    fn a_chat_on_screen_across_a_strip_rebuild_is_shown_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let handle = Arc::clone(chat_runtime(&app, card).handle().unwrap());
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(handle.is_visible_for_test());
+        let directory = super::super::worktree_ui::card_directory(app.card_state(card).unwrap())
+            .expect("a conversation has a directory")
+            .to_path_buf();
+
+        // A strip that no longer matches its scope is rebuilt even when the
+        // same worktree is selected again.
+        app.workspace = Cagents::rebuild_workspace(&Default::default());
+        app.workspace.resize_viewport(1_600.0);
+        drop(app.select_worktree(directory, false));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(handle.is_visible_for_test(), "the chat is shown again");
+    }
+
     #[test]
     fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
