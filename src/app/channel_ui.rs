@@ -1162,6 +1162,8 @@ impl Cagents {
 
     /// View publication supplies the settled revision. The registry checks
     /// that exact revision and the channel's incarnation before retiring it.
+    /// Until the daemon's channel work store is retired, it also keeps a
+    /// channel whose incarnation has channel work entries or operations.
     pub(super) fn retire_settled_empty_channels(&mut self) {
         let candidates = self
             .channel_ui
