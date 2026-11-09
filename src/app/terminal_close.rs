@@ -653,7 +653,7 @@ impl Cagents {
                 },
             };
         }
-        let closed = self.apply_viewport(update, true, true);
+        let closed = self.apply_viewport(update, true, DurableChange::Content);
         // A chat returned to a terminal is replaced only now that it
         // is closed, so no state ever holds both.
         let replacement = replacement
