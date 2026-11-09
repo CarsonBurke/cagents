@@ -1641,3 +1641,93 @@ fn what_a_warm_hidden_chat_holds() {
         );
     }
 }
+
+/// How soon a chat opened cold shows what its reader sees first. Every
+/// message of the window waits for a parser at once, as the subscriptions
+/// start them; a person at the latest edge sees the newest exchange, so what
+/// matters is when it is ready, not when the whole history is.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn a_cold_open_parses_what_is_read_first() {
+    const CYCLES: usize = 12;
+    let items = transcript(16);
+    let newest = items.last().expect("an item").id.clone();
+    let screen: Vec<String> = items[items.len() - 8..]
+        .iter()
+        .map(|item| item.id.clone())
+        .collect();
+    let [mut first, mut read, mut all] = std::array::from_fn(|_| Stage::default());
+    for cycle in 0..CYCLES + 2 {
+        let account = Account::system(Provider::Claude);
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &account,
+            false,
+        )
+        .expect("a session");
+        let snapshot = Snapshot {
+            ready: true,
+            items: items.iter().cloned().map(Arc::new).collect(),
+            ..Snapshot::default()
+        };
+        let handle = Arc::new(ClientHandle::fixture(session.clone(), snapshot));
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let mut runtime = Runtime::new(
+            target,
+            session,
+            Connection::Live(handle),
+            true,
+            crate::settings::EditorSyntaxTheme::default(),
+        );
+        let installed = preparation::drain_concurrently(&mut runtime);
+        assert!(runtime.cache.values().all(|cached| !cached.placeholder));
+        let at = |id: &str| {
+            installed
+                .iter()
+                .find(|(installed, _)| installed == id)
+                .map_or(Duration::ZERO, |(_, at)| *at)
+        };
+        if cycle == CYCLES + 1 {
+            // Where the newest exchange fell in the last cycle's install order.
+            for id in &screen {
+                let places: Vec<String> = installed
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (installed, _))| installed == id)
+                    .map(|(place, (_, at))| format!("#{place} at {:.1} ms", at.as_secs_f64() * 1e3))
+                    .collect();
+                println!("    {id}: installed {}", places.join(", "));
+            }
+            println!(
+                "    {} installs of {} messages",
+                installed.len(),
+                items.len()
+            );
+        }
+        if cycle >= 2 {
+            first.0.push(at(&newest));
+            read.0
+                .push(screen.iter().map(|id| at(id)).max().unwrap_or_default());
+            all.0.push(
+                installed
+                    .iter()
+                    .map(|(_, at)| *at)
+                    .max()
+                    .unwrap_or_default(),
+            );
+        }
+    }
+    println!(
+        "{} items opened cold, {CYCLES} cycles, {} cores:",
+        items.len(),
+        std::thread::available_parallelism().map_or(0, usize::from)
+    );
+    first.report("newest message ready");
+    read.report("newest exchange ready");
+    all.report("whole window ready");
+}

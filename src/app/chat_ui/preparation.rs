@@ -245,12 +245,14 @@ struct Shared {
     data: Option<Box<SharedData>>,
     // Capture admission on the UI thread where the application owns the job.
     // Its future may be polled on another executor thread.
-    workers: Arc<tokio::sync::Semaphore>,
+    workers: Arc<Pool>,
 }
 struct SharedData {
     latest: Mutex<Request>,
     canonical: Mutex<Option<Canonical>>,
     cancelled: AtomicBool,
+    // Where this input waits for a parser; see [`Pool`].
+    priority: AtomicU64,
     // Actual request/canonical allocations are destroyed before this lease.
     lease: Arc<Lease>,
 }
@@ -563,6 +565,7 @@ impl State {
                         theme,
                         reader_proofs: Arc::default(),
                     }),
+                    priority: AtomicU64::new(0),
                     canonical: Mutex::default(),
                     cancelled: AtomicBool::new(false),
                     lease,
@@ -693,6 +696,13 @@ impl State {
     }
     pub(super) fn contains(&self, id: &str) -> bool {
         self.entries.contains_key(id)
+    }
+    /// Rank a staged item's wait for a parser: lower ranks are parsed first.
+    /// An input already parsing keeps its parser.
+    pub(super) fn rank(&self, id: &str, rank: u64) {
+        if let Some(entry) = self.entries.get(id) {
+            entry.shared.priority.store(rank, Ordering::Relaxed);
+        }
     }
     #[cfg(test)]
     pub(super) fn growing_canonical_for_test(&self, item: &Arc<chat::Item>) -> Option<usize> {
@@ -855,6 +865,7 @@ impl State {
                         theme,
                         reader_proofs: self.reader_proofs.clone(),
                     }),
+                    priority: AtomicU64::new(UNRANKED),
                     canonical: Mutex::new(None),
                     cancelled: AtomicBool::new(false),
                     lease,
@@ -1158,7 +1169,7 @@ impl Prepared {
 }
 
 /// A single background reclaimer drops only Send data. Installed output
-/// retirement retains one of its application's two parser/output permits; detached
+/// retirement retains one of its application's parser/output permits; detached
 /// canonical owners retain their existing source/item admission until dropped.
 /// Reader Rc state and renderer trees never leave the event thread.
 struct Retired {
@@ -1493,8 +1504,87 @@ impl std::hash::Hash for Job {
         self.run.hash(state);
     }
 }
-fn workers() -> Arc<tokio::sync::Semaphore> {
-    application_capacity!(2)
+/// The rank of a staged input no caller has ranked.
+const UNRANKED: u64 = u64::MAX;
+
+/// Parser admission for one application, granted in rank order.
+///
+/// Every queued message is its own subscription, and subscriptions start in
+/// no particular order, so a plain semaphore parsed a returning transcript in
+/// whatever order its entries hashed to: the rows on screen could wait behind
+/// the whole history. Waiters here queue by the rank their transcript gave
+/// them, ties in arrival order, and only the first in line contends for a
+/// permit, so a later but better-ranked arrival still goes next.
+struct Pool {
+    permits: Arc<tokio::sync::Semaphore>,
+    waiting: Mutex<std::collections::BTreeSet<(u64, u64)>>,
+    turn: tokio::sync::Notify,
+    arrivals: AtomicU64,
+}
+impl Pool {
+    fn new(permits: usize) -> Self {
+        Self {
+            permits: Arc::new(tokio::sync::Semaphore::new(permits)),
+            waiting: Mutex::default(),
+            turn: tokio::sync::Notify::new(),
+            arrivals: AtomicU64::new(0),
+        }
+    }
+    /// Parsing is CPU-bound and each parser owns its input and output, so
+    /// parallelism follows the cores, leaving room for the event loop and the
+    /// compositor. The byte and item admission bounds what is in flight.
+    fn sized() -> Self {
+        let cores = std::thread::available_parallelism().map_or(2, usize::from);
+        Self::new((cores / 2).clamp(2, 8))
+    }
+    fn first(&self) -> Option<(u64, u64)> {
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .first()
+            .copied()
+    }
+    async fn acquire(
+        &self,
+        rank: u64,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        struct Waiting<'a>(&'a Pool, (u64, u64));
+        impl Drop for Waiting<'_> {
+            fn drop(&mut self) {
+                self.0
+                    .waiting
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&self.1);
+                self.0.turn.notify_waiters();
+            }
+        }
+        let key = (rank, self.arrivals.fetch_add(1, Ordering::Relaxed));
+        self.waiting
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key);
+        let _waiting = Waiting(self, key);
+        // A new first in line displaces the one contending now.
+        self.turn.notify_waiters();
+        loop {
+            let turn = self.turn.notified();
+            let mut turn = std::pin::pin!(turn);
+            turn.as_mut().enable();
+            if self.first() != Some(key) {
+                turn.await;
+                continue;
+            }
+            let acquire = std::pin::pin!(self.permits.clone().acquire_owned());
+            match iced::futures::future::select(acquire, turn).await {
+                iced::futures::future::Either::Left((permit, _)) => return permit,
+                iced::futures::future::Either::Right(_) => {}
+            }
+        }
+    }
+}
+fn workers() -> Arc<Pool> {
+    application_shared!(Pool, Pool::sized())
 }
 fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let job = job.clone();
@@ -1509,8 +1599,7 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
     let permit = shared
         .workers
-        .clone()
-        .acquire_owned()
+        .acquire(shared.priority.load(Ordering::Relaxed))
         .await
         .map_err(|_| "Message loading stopped.".to_owned())?;
     if shared.cancelled.load(Ordering::Relaxed) {
@@ -1738,6 +1827,47 @@ pub(super) fn drain_fixture(runtime: &mut Runtime) {
     panic!("fixture preparation did not quiesce");
 }
 
+/// Drive the production parser admission as the application's subscriptions
+/// do: every running entry starts at once, in the order the subscriptions
+/// list them, and each result is installed on this thread as it arrives.
+/// Returns each installed item and when, from the start, it was installed.
+#[cfg(test)]
+pub(super) fn drain_concurrently(runtime: &mut Runtime) -> Vec<(String, std::time::Duration)> {
+    let executor = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("a runtime");
+    let start = std::time::Instant::now();
+    let (sent, mut arrivals) = tokio::sync::mpsc::unbounded_channel();
+    let mut started = std::collections::HashSet::new();
+    let mut installed = Vec::new();
+    let mut pending = 0usize;
+    loop {
+        for (id, entry) in runtime
+            .preparation
+            .entries
+            .iter()
+            .filter(|(_, entry)| entry.running)
+        {
+            if started.insert((id.clone(), entry.run)) {
+                let (id, generation, shared) = (id.clone(), entry.run, entry.shared.clone());
+                let sent = sent.clone();
+                pending += 1;
+                executor.spawn(async move {
+                    let _ = sent.send((id, generation, run(shared).await));
+                });
+            }
+        }
+        if pending == 0 {
+            return installed;
+        }
+        let (id, generation, result) = executor.block_on(arrivals.recv()).expect("a parser result");
+        pending -= 1;
+        runtime.markdown_prepared(runtime.target, &id, generation, Ready::new(result));
+        installed.push((id, start.elapsed()));
+    }
+}
+
 /// Parse one coalesced publication once. The parser can reparse an unfinished
 /// rich block on append; feeding a cold body in artificial chunks amplifies
 /// that cost. Cancellation fences ownership before and after the parser call;
@@ -1792,6 +1922,192 @@ mod tests {
         let entry = &state.entries["message"];
         (entry.run, entry.shared.clone())
     }
+    /// The ranks that obtain `pool`'s permits, in the order they do, when
+    /// waiters with `ranks` queue behind permits that are all held.
+    fn grants(pool: Pool, held: usize, ranks: &[u64], late: Option<u64>) -> Vec<u64> {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let pool = Arc::new(pool);
+            let blockers: Vec<_> = (0..held)
+                .map(|_| pool.permits.clone().try_acquire_owned().unwrap())
+                .collect();
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let spawn = |rank: u64| {
+                let (pool, granted) = (pool.clone(), granted.clone());
+                tokio::spawn(async move {
+                    let permit = pool.acquire(rank).await.unwrap();
+                    granted.send(rank).unwrap();
+                    // Hold the parser briefly, as a worker does.
+                    tokio::task::yield_now().await;
+                    drop(permit);
+                })
+            };
+            let mut tasks: Vec<_> = ranks.iter().map(|&rank| spawn(rank)).collect();
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            tasks.extend(late.map(spawn));
+            for _ in 0..4 {
+                tokio::task::yield_now().await;
+            }
+            drop(blockers);
+            for task in tasks {
+                task.await.unwrap();
+            }
+            drop(granted);
+            let mut grants = Vec::new();
+            while let Some(rank) = order.recv().await {
+                grants.push(rank);
+            }
+            grants
+        })
+    }
+
+    #[test]
+    fn parsers_go_to_the_best_ranked_waiters_first() {
+        // Arrival order is the order subscriptions happened to start in.
+        assert_eq!(
+            grants(Pool::new(1), 1, &[40, 2, 30, 1, 20], None),
+            [1, 2, 20, 30, 40]
+        );
+        // A row the reader returned to, ranked after others already queued,
+        // still goes before them.
+        assert_eq!(
+            grants(Pool::new(1), 1, &[40, 30, 20], Some(1)),
+            [1, 20, 30, 40]
+        );
+        // Equal ranks keep arrival order.
+        assert_eq!(grants(Pool::new(1), 1, &[5, 5, 5], None), [5, 5, 5]);
+    }
+
+    #[test]
+    fn a_waiter_that_stops_waiting_gives_up_its_place() {
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            let first = tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire(1).await.map(drop) }
+            });
+            tokio::task::yield_now().await;
+            let second = tokio::spawn({
+                let pool = pool.clone();
+                async move { pool.acquire(2).await.map(drop) }
+            });
+            tokio::task::yield_now().await;
+            // The first in line is cancelled, as when its message is replaced.
+            first.abort();
+            assert!(first.await.unwrap_err().is_cancelled());
+            assert_eq!(pool.first(), Some((2, 1)));
+            drop(held);
+            tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .expect("the next waiter is granted the released parser")
+                .unwrap()
+                .unwrap();
+            assert!(pool.waiting.lock().unwrap().is_empty());
+        });
+    }
+
+    #[test]
+    fn a_transcript_ranks_its_newest_messages_first() {
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+        )
+        .unwrap();
+        let items: Vec<_> = (0..6)
+            .map(|index| {
+                Arc::new(chat::Item {
+                    id: format!("answer-{index}"),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: format!("Answer **{index}**"),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    started_at: None,
+                    at: None,
+                })
+            })
+            .collect();
+        let handle = Arc::new(ClientHandle::fixture(
+            session.clone(),
+            Snapshot {
+                ready: true,
+                generation: 1,
+                items,
+                ..Snapshot::default()
+            },
+        ));
+        let runtime = Runtime::new(
+            target(),
+            session,
+            Connection::Live(handle),
+            true,
+            crate::settings::EditorSyntaxTheme::Auto,
+        );
+        let ranks: Vec<u64> = (0..6)
+            .map(|index| {
+                runtime.preparation.entries[&format!("answer-{index}")]
+                    .shared
+                    .priority
+                    .load(Ordering::Relaxed)
+            })
+            .collect();
+        assert!(
+            ranks.windows(2).all(|pair| pair[0] > pair[1]),
+            "older messages wait behind newer ones: {ranks:?}"
+        );
+    }
+
+    #[test]
+    fn another_applications_waiters_leave_this_queue_alone() {
+        let ours = workers();
+        let theirs = std::thread::spawn(workers).join().unwrap();
+        assert!(!Arc::ptr_eq(&ours, &theirs));
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        executor.block_on(async {
+            let _full = theirs
+                .permits
+                .clone()
+                .try_acquire_many_owned(theirs.permits.available_permits() as u32)
+                .unwrap();
+            // Their best-ranked waiter is stuck behind their own full pool.
+            let stuck = tokio::spawn({
+                let theirs = theirs.clone();
+                async move { theirs.acquire(0).await.map(drop) }
+            });
+            tokio::task::yield_now().await;
+            assert_eq!(theirs.first(), Some((0, 0)));
+            assert_eq!(ours.first(), None);
+            tokio::time::timeout(Duration::from_secs(5), ours.acquire(UNRANKED))
+                .await
+                .expect("our worst-ranked waiter still gets one of our parsers")
+                .unwrap();
+            stuck.abort();
+        });
+    }
+
+    #[test]
+    fn parser_capacity_follows_the_cores_within_bounds() {
+        let permits = Pool::sized().permits.available_permits();
+        assert!((2..=8).contains(&permits));
+    }
+
     fn permit() -> tokio::sync::OwnedSemaphorePermit {
         Arc::new(tokio::sync::Semaphore::new(1))
             .try_acquire_owned()
@@ -1814,7 +2130,8 @@ mod tests {
             |_, _| false,
         );
         let (_, shared) = job(&state);
-        let originating_workers: Arc<tokio::sync::Semaphore> = workers();
+        let originating_workers = workers().permits.clone();
+        let capacity = originating_workers.available_permits();
         let observed_workers = originating_workers.clone();
         let held = hold_retirement();
         let (report, observed) = std::sync::mpsc::channel();
@@ -1822,7 +2139,9 @@ mod tests {
         let executor_thread = std::thread::spawn(move || {
             // A fresh thread is a different test application with its own
             // pool. Exhausting that pool must not touch the constructing UI's.
-            let _foreign_application = workers().try_acquire_many_owned(2).unwrap();
+            let foreign = workers().permits.clone();
+            let all = foreign.available_permits() as u32;
+            let _foreign_application = foreign.try_acquire_many_owned(all).unwrap();
             let executor = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
@@ -1843,23 +2162,24 @@ mod tests {
         });
         let available = observed.recv().unwrap();
         drop(held);
-        proceed.send(available == 1).unwrap();
+        proceed.send(available == capacity - 1).unwrap();
         let output = executor_thread.join().unwrap();
         assert_eq!(
-            available, 1,
+            available,
+            capacity - 1,
             "the dispatched job must own a slot from its constructing application"
         );
         let output = output.expect("admitted real parser job").unwrap();
         assert!(Arc::ptr_eq(output.item(), &source));
-        assert_eq!(originating_workers.available_permits(), 1);
+        assert_eq!(originating_workers.available_permits(), capacity - 1);
         // Discarded outputs retain their originating slot through queued
         // storage retirement, even while the reclaimer is held.
         let held = hold_retirement();
         output.discard();
-        assert_eq!(originating_workers.available_permits(), 1);
+        assert_eq!(originating_workers.available_permits(), capacity - 1);
         drop(held);
         retirement_barrier();
-        assert_eq!(originating_workers.available_permits(), 2);
+        assert_eq!(originating_workers.available_permits(), capacity);
         drop(state);
         retirement_barrier();
     }

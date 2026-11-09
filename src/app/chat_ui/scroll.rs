@@ -278,6 +278,28 @@ impl Memory {
         })
     }
 
+    /// The rows the saved reading window showed, which a returning reader
+    /// sees first. Empty without saved geometry, such as at the latest edge.
+    pub(super) fn reading_rows(&self, context: Option<&str>) -> Vec<String> {
+        let anchor = self.0.borrow();
+        anchor
+            .contexts
+            .iter()
+            .find(|saved| saved.subagent.as_deref() == context)
+            .and_then(|saved| Some((saved, saved.geometry?, saved.top?)))
+            .map_or_else(Vec::new, |(saved, geometry, top)| {
+                saved
+                    .rows
+                    .iter()
+                    .filter(|row| {
+                        row.bounds.y + row.bounds.height > top
+                            && row.bounds.y < top + geometry.viewport.height
+                    })
+                    .map(|row| row.id.clone())
+                    .collect()
+            })
+    }
+
     pub fn retained_rows(&self) -> usize {
         self.0
             .borrow()
