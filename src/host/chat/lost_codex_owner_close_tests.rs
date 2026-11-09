@@ -221,6 +221,43 @@ fn finished_actor(root: &std::path::Path) -> chat::runtime::Handle {
     handle
 }
 
+/// A provider actor that still owns its provider's work: its own process
+/// has ended, and the provider it serves is left with a native holder the
+/// caller hands it. A stand-in for a Codex actor, which a test cannot start
+/// without a provider.
+fn provider_actor(root: &std::path::Path) -> chat::runtime::Handle {
+    use chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
+    struct Quiet;
+    impl Adapter for Quiet {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, _: chat::Command) -> Result<Step, String> {
+            Err("no provider work in this fixture".into())
+        }
+        fn receive(&mut self, _: serde_json::Value) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+    }
+    let spec = ProcessSpec {
+        stdout_noise: None,
+        execution: None,
+        messages: None,
+        unset_environment: Default::default(),
+        transport: TransportSpec::JsonLines,
+        program: "/bin/cat".into(),
+        arguments: Vec::new(),
+        working_directory: root.to_owned(),
+        environment: Default::default(),
+    };
+    let mut initial = Step::default();
+    let store = chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let handle =
+        chat::runtime::Handle::start(spec, Box::new(Quiet), initial, store, None, |_| {}).unwrap();
+    handle.close().unwrap();
+    handle
+}
+
 fn current() -> registry::Process {
     registry::Process::read(std::process::id() as i32).unwrap()
 }
@@ -546,6 +583,71 @@ fn a_pending_close_whose_provider_outlived_its_holder_waits_for_it() {
     kill(&record.root);
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
     fixture.assert_settled();
+}
+
+/// The pane a person has open while its holder dies and Codex runs on: the
+/// actor is still resident and asks its holder to Release. That reached only
+/// the dead holder's closed channel, and Close reported "Broken pipe (os error
+/// 32)" (or, while the provider still held that channel, waited until "Resource
+/// temporarily unavailable"). Close now names what still runs and how to end
+/// it, and the pane closes once it has ended.
+#[test]
+fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
+    let Some(root) = isolated("an_open_pane_whose_holder_died_names_what_runs_then_closes") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let mut spawned = Spawned::new(&fixture.source);
+    let record = Spawned::record(&fixture.source);
+    let handle = provider_actor(&root);
+    handle.fixture_retained_native_holder(
+        spawned.holder.take().unwrap(),
+        "The provider is still running".into(),
+    );
+    assert!(handle.owns_work());
+    fixture.host.lock().unwrap().chats.insert(
+        fixture.source.id,
+        super::Record {
+            execution_instance: uuid::Uuid::new_v4(),
+            console_recipe: None,
+            paired_terminal: None,
+            session: fixture.source.clone(),
+            handle,
+            source_process: None,
+            subscribers: BTreeMap::new(),
+            observations: BTreeMap::new(),
+            completion_observed: true,
+            returning_terminal: false,
+        },
+    );
+    let close = || {
+        let target = {
+            let state = fixture.host.lock().unwrap();
+            CloseTarget::capture(&state, &state.chats[&fixture.source.id]).unwrap()
+        };
+        close_captured(&fixture.host, target)
+    };
+    kill(&record.holder);
+    assert!(record.root.is_current(), "the provider outlived its holder");
+    let refusal = close().err().expect("Close refused").message;
+    assert!(
+        refusal.contains(&format!("pkill -f cagents-codex-{}", fixture.source.id)),
+        "{refusal}"
+    );
+    assert!(
+        fixture
+            .host
+            .lock()
+            .unwrap()
+            .chats
+            .contains_key(&fixture.source.id)
+    );
+    // The person ends it as told, and closes the pane again.
+    kill(&record.root);
+    close().unwrap();
+    fixture.assert_settled();
+    assert!(!has_native_owner(&fixture.source).unwrap());
+    assert!(!fixture.socket().parent().unwrap().exists());
 }
 
 /// Reopening a conversation whose pane closed this way: its owner left no

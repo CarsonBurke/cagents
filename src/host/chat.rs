@@ -1076,15 +1076,7 @@ fn settle_lost_execution(
     if let Some(holds) = what_holds(host, session, proof)? {
         return Err(lost_execution_refusal(session, holds));
     }
-    // Proving the loss retired any stale endpoint; give back the allocation.
-    if let Some(parent) = session
-        .owned_codex_listener
-        .as_ref()
-        .filter(|_| session.owns_codex_listener())
-        .and_then(|listener| listener.socket.parent())
-    {
-        let _ = std::fs::remove_dir(parent);
-    }
+    let _ = return_listener_allocation(session);
     let Ok(registry) = super::agent_execution::registry(host) else {
         return Ok(());
     };
@@ -1106,6 +1098,27 @@ fn settle_lost_execution(
                 &crate::agent_execution::HostedSession::Chat(source),
                 true,
             )?;
+    }
+    Ok(())
+}
+
+/// Gives back the listener allocation of a Codex conversation whose provider
+/// has ended, as its holder does when it releases. A holder that died never
+/// will, and its directory would outlive the conversation. An endpoint that
+/// something still serves keeps it.
+fn return_listener_allocation(session: &Session) -> Result<(), String> {
+    let Some(listener) = session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener())
+    else {
+        return Ok(());
+    };
+    if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? {
+        return Ok(());
+    }
+    if let Some(parent) = listener.socket.parent() {
+        let _ = std::fs::remove_dir(parent);
     }
     Ok(())
 }
@@ -1148,6 +1161,37 @@ fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
         Holds::Unproved => format!(
             "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so the pane was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing the pane will work."
         ),
+    }
+}
+
+/// The refusal for a conversation whose native owner's helper has died while
+/// its provider runs on, if that is what happened to `owner`.
+///
+/// Nothing can ask that provider to stop any more: Release reaches only a
+/// closed channel, and settling would leave it running unseen. Close says so
+/// and how to end it, rather than report the dead channel's I/O error.
+fn holder_lost_refusal(
+    source: &Session,
+    owner: &crate::daemon::holder_registry::Record,
+) -> Result<Option<String>, String> {
+    if owner.holder.is_current()
+        || crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root)?
+    {
+        return Ok(None);
+    }
+    Ok(Some(lost_execution_refusal(
+        source,
+        Holds::Running(Some(owner.root.pid)),
+    )))
+}
+
+/// [`holder_lost_refusal`] for the native owner registered for `source`.
+fn registered_holder_lost_refusal(source: &Session) -> Result<Option<String>, String> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let socket = registry::socket(&registry::directory(Kind::Native)?, source.id);
+    match registry::recovery_candidate(&socket, Kind::Native)? {
+        Some(owner) => holder_lost_refusal(source, &owner),
+        None => Ok(None),
     }
 }
 
@@ -3835,7 +3879,12 @@ pub(super) fn close_captured(
     handle.decide_detached_work(super::agent_execution::detached_work_on_close(
         host, source.id,
     ));
-    handle.close_for_resume().map_err(unavailable)?;
+    if let Err(error) = handle.close_for_resume() {
+        // Its Release failed. When that is because the helper died while the
+        // provider runs on, say what holds the conversation and how to end it.
+        let refusal = registered_holder_lost_refusal(&source).ok().flatten();
+        return Err(unavailable(refusal.unwrap_or(error)));
+    }
     let snapshot = handle.snapshot(None).ok_or_else(|| {
         unavailable("Exact native final snapshot is unavailable; retirement remains unconfirmed")
     })?;
@@ -3952,6 +4001,8 @@ pub(super) fn close_captured(
         record
     };
     if let Some(record) = &record {
+        // A holder that died before its Release left the allocation behind.
+        let _ = return_listener_allocation(&record.session);
         super::agent_execution::retired(host, &record.session).map_err(unavailable)?;
     }
     drop(record);
@@ -4458,6 +4509,8 @@ pub(super) fn close_terminal_actor(
         .map_err(unavailable)?;
     owners.close(host, &closing)?;
     owners.require_current(host, &closing)?;
+    // A holder that died before its Release left the allocation behind.
+    let _ = return_listener_allocation(&owners.target.source);
     // Preserve the exact closed owners until durable execution retirement succeeds.
     super::agent_execution::retired(host, &owners.target.source).map_err(unavailable)?;
     let removed = {

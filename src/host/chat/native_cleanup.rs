@@ -212,13 +212,8 @@ fn close_retained_inner(
         // A holder that died while its provider runs on can no longer be
         // asked to stop it, and nothing else may: say so, rather than fail
         // reaching the holder.
-        if !owner.holder.is_current()
-            && !crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root)?
-        {
-            return Err(super::lost_execution_refusal(
-                source,
-                super::Holds::Running(Some(owner.root.pid)),
-            ));
+        if let Some(refusal) = super::holder_lost_refusal(source, &owner)? {
+            return Err(refusal);
         }
         let mut pending = match pending {
             Some(pending) => pending,
