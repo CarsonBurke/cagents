@@ -669,27 +669,38 @@ fn age(registry: &Registry, operation: Uuid) {
 }
 
 #[test]
-fn an_operation_is_forgotten_after_retention_and_a_late_resend_cannot_apply_twice() {
+fn an_operation_is_forgotten_after_retention_and_a_late_resend_meets_a_revision_conflict() {
     let (mut registry, _directory, scope) = fresh();
-    seed(&mut registry, &scope, vec![]);
+    let (p, q, r) = (browser("p"), browser("q"), browser("r"));
+    seed(&mut registry, &scope, vec![p.clone(), q.clone(), r.clone()]);
+    // Moves are not idempotent: applying `old` again would reorder the view.
     let old = change(
         &registry,
         &scope,
-        Change::Insert {
-            pane: browser("old"),
-            before: None,
+        Change::Move {
+            id: r.id,
+            before: Some(p.id),
         },
     );
     registry.apply(&old).unwrap();
     let recent = change(
         &registry,
         &scope,
-        Change::Insert {
-            pane: browser("recent"),
-            before: None,
+        Change::Move {
+            id: p.id,
+            before: Some(r.id),
         },
     );
     registry.apply(&recent).unwrap();
+    let ids = |registry: &Registry| -> Vec<CardId> {
+        read(&registry.db, &scope)
+            .unwrap()
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .collect()
+    };
+    assert_eq!(ids(&registry), vec![p.id, r.id, q.id]);
     let (
         ModelEdit::ChangeView {
             operation: old_id, ..
@@ -715,8 +726,9 @@ fn an_operation_is_forgotten_after_retention_and_a_late_resend_cannot_apply_twic
         "a recent operation was forgotten"
     );
     assert_eq!(registry.collect_view_operations().unwrap(), 0);
-    // Past retention the view's revision has moved on, so the resend is
-    // refused instead of inserting the pane a second time.
+    // Past retention only the revision check stands. Its conflict is
+    // retryable, so a client that rebased would apply the move again; that is
+    // why windows stop resending long before retention ends (`REPLAY_LIMIT`).
     let error = registry.apply(&old).unwrap_err();
     assert!(error.contains(Registry::VIEW_REVISION_CONFLICT), "{error}");
     assert_eq!(read(&registry.db, &scope).unwrap(), view);
