@@ -318,7 +318,7 @@ check, so a stale window cannot overwrite a newer draft from another window.
 | `closed_panes` chat rows with a provider session | 180 days, at most 5000 rows, and never while its resource is hosted or pinned | deleted oldest first |
 | `closed_panes` other rows | 30 days, and never while its resource is hosted or pinned | deleted |
 | `retired_panes`, empty `view_scopes` | until no window can seed from a local copy (stage 5) | then 30 days |
-| `shared_view_edits` / `view_operations` | the newest 1024 per scope (stage 2, no schema change); 7 days once rows carry a time (stage 3) | deleted; client retries span seconds, and a persisted pending creation is fenced by `closed_panes`, not by this log |
+| `shared_view_edits` / `view_operations` | kept until rows carry `applied_at` (stage 3); then 7 days, and never while a window still holds the operation pending | deleted. Not pruned earlier: `operation_seen` is the only replay guard, and a replay it misses fails the revision check as a *retryable* conflict, so a rebasing client would apply it twice |
 | Worktree scopes whose project is closed | cascade, after their panes become `closed_panes` rows | deleted with the project |
 | `.final` receipt snapshot | until the daemon commits the actor's retirement | rewritten without the transcript and marked `compacted`; the proof fields stay so same-boot readers keep validating, and reading it as a transcript is an error |
 | `.final` of an actor that ended without retiring | until reboot | kept whole: a close whose reply was lost publishes its transcript from it |
@@ -465,16 +465,22 @@ stores, so an old copy can never feed a later upgrade or seed.
 Each stage is an independently mergeable PR with tests and a before/after
 measurement on a realistic-size workspace.
 
-1. Runtime directory: compact `.final` receipts after the daemon commits
-   retirement and delete receipts no ownership needs; sweep transcript caches
-   every 10 minutes with bounded retention for orphaned journals.
-2. Store quick wins without wire or daemon schema changes: flushes skip
-   cards that storage already holds closed and unchanged; navigation metadata
-   is written only when its bytes change; startup loads cards in one query;
-   daemon model reads use one query; `resource_owner` uses the model it
-   already read instead of parsing every view again; the edit log keeps the
-   newest 1024 operations per scope; window-store indexes for
-   `saved_conversations`.
+1. Runtime directory (#2481): compact `.final` receipts after the daemon
+   commits retirement; reclaim unleased journals 24 h after their last write;
+   both at startup and every 10 minutes. Deleting receipts waits for the
+   ownership-row lifecycle.
+2. Store quick wins without wire or daemon schema changes (#2489): navigation
+   metadata is written only when its bytes change, and maps are serialized in
+   key order so equal navigation is equal bytes; an unchanged chat skips the
+   stored-row identity comparison; the archived-descriptor flag and pending
+   admissions no longer cost a query or a scan per card; daemon view listings
+   use one query and pane searches read only occupied views. An unchanged
+   flush of 1769 cards writes 1 row instead of 16 and 1 WAL page instead of
+   5. Deferred: edit-log pruning (see the lifecycle table), single-query card
+   load and a `saved_conversations` index (both measured at a few
+   milliseconds, within noise), and skipping closed cards before serializing
+   them, which stage 5 does properly by dropping closed cards from window
+   state.
 3. Normalized daemon view schema (`view_scopes`, `panes`, `retired_panes`,
    `view_operations`, `closed_panes`), row-level edits, its downgrade
    converter, no wire change. Conversion from `shared_views` is mechanical:
