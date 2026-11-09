@@ -108,6 +108,20 @@ def write_figures(directory, *, available_gib=1024, cpu=0, memory=0):
 
 
 class Parsing(unittest.TestCase):
+    def test_a_missing_memory_helper_refuses_before_admission(self):
+        with patch.dict(os.environ, {"CAGENTS_BUILD_OFFLOAD_HOST": "fixture-host"}), \
+                patch.object(Path, "read_text", side_effect=FileNotFoundError("missing helper")), \
+                patch.object(offload, "say") as say:
+            self.assertEqual(offload.main(["test"]), offload.REFUSED)
+        self.assertIn("require memory-capped", say.call_args.args[0])
+
+    def test_only_commands_that_execute_tests_need_a_memory_cap(self):
+        for arguments, expected in ((["test"], True), (["t", "--doc"], True),
+                                    (["bench"], True), (["test", "--no-run"], False),
+                                    (["bench", "--no-run"], False), (["build"], False)):
+            with self.subTest(arguments=arguments):
+                self.assertEqual(offload.Plan(arguments).runs_tests, expected)
+
     def test_commands_that_compile_run_remotely(self):
         for arguments, subcommand in (
             (["build", "--locked", "--profile", "dev-runtime", "--bin", "cagents"], "build"),
@@ -842,7 +856,7 @@ class StandInHost(unittest.TestCase):
         python_tools.mkdir()
         (python_tools / "python3").symlink_to(Path(sys.executable).resolve())
         for name in ("cargo-gate", "cargo-gate-command.py", "cargo-gate-rustc-guard",
-                     "cargo-offload"):
+                     "cargo-offload", "memory-capped"):
             shutil.copy2(ROOT / "scripts" / name, tools / name)
         (tools / "ssh").write_text(STAND_IN_SSH)
         (tools / "ssh").chmod(0o755)
@@ -912,7 +926,40 @@ class StandInHost(unittest.TestCase):
         # Nothing was built here.
         self.assertFalse((self.root / "local-build").exists())
 
-    def test_the_build_host_builds_in_its_own_slots_through_a_loopback(self):
+    def assert_test_memory_cap(self, env):
+        # Prove a real scope is available, without compiling or allocating.
+        cap = ROOT / "scripts/memory-capped"
+        report = 'cat "/sys/fs/cgroup$(sed -n "s/^0:://p" /proc/self/cgroup)/memory.max"'
+        probe = self.scope.run([str(cap), "sh", "-c", report], capture_output=True, text=True,
+                               env=os.environ | {"CAGENTS_MEMORY_MAX": "128M"}, timeout=60)
+        if probe.returncode or probe.stdout.strip() != str(128 * 2**20):
+            self.skipTest("needs an unconstrained user manager with working memory scopes")
+        (self.crate / "src/lib.rs").write_text(r'''#[test]
+fn bounded_allocation() {
+    let group = std::fs::read_to_string("/proc/self/cgroup").unwrap();
+    let group = group.lines().find_map(|line| line.strip_prefix("0::")).unwrap();
+    let limit = std::fs::read_to_string(format!("/sys/fs/cgroup{group}/memory.max")).unwrap();
+    assert_eq!(limit.trim(), "134217728", "offloaded tests lost their cap");
+    // Even a broken cap cannot allocate without bound: stop at 512 MiB.
+    let chunks: Vec<_> = (0..64).map(|_| vec![1u8; 8 * 1024 * 1024]).collect();
+    std::hint::black_box(chunks);
+}
+''')
+        env = env | {"CAGENTS_MEMORY_MAX": "128M", "CAGENTS_MEMORY_SWAP_MAX": "0"}
+        built = self.gate_run("test", "--lib", "--no-run", env=env)
+        self.assertEqual(built.returncode, 0, built.stderr)
+        result = self.gate_run("test", "--lib", env=env)
+        self.assertEqual(result.returncode, 137, result.stdout + result.stderr)
+        self.assertIn("went over the limit", result.stderr)
+        self.assertNotIn("offloaded tests lost their cap", result.stdout)
+
+    def test_offloaded_tests_enforce_the_memory_cap(self):
+        self.assert_test_memory_cap(self.remote_env())
+
+    def test_loopback_tests_enforce_the_memory_cap(self):
+        self.assert_test_memory_cap(self.loopback_env())
+
+    def loopback_env(self):
         # The host's login shell, standing in for this one's: its home holds
         # the slots, and its own search path finds Cargo.
         shell = self.root / "tools/host-shell"
@@ -935,6 +982,10 @@ class StandInHost(unittest.TestCase):
                           "CAGENTS_BUILD_REMOTE_LOOPBACK": "1",
                           "CAGENTS_BUILD_REMOTE_LOOPBACK_SHELL": str(shell),
                           "CARGO_TARGET_DIR": str(self.root / "evidence/target-after")}
+        return env
+
+    def test_the_build_host_builds_in_its_own_slots_through_a_loopback(self):
+        env = self.loopback_env()
         slot = self.host_home / ".cache/cagents-offload/crate/slot-0/src"
         result = self.gate_run("build", "--bin", "probe", env=env)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -1954,6 +2005,21 @@ class RemoteRun(unittest.TestCase):
             env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(scope.name, "cof"))}
             | (env or {}), **options)
 
+    def test_the_remote_launch_runs_its_supplied_memory_wrapper(self):
+        with FixtureDirectory() as scope:
+            base = Path(scope.name, "slot-0")
+            (base / "src").mkdir(parents=True)
+            wrapper = "import os, sys; print(os.environ['CAGENTS_MEMORY_MAX'], sys.argv[1:]); sys.exit(37)"
+            child = self.agent(scope, "run", str(base), ".", "sh", "-c", "exit 99",
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+            child.stdin.write(json.dumps({"environment": {"CAGENTS_MEMORY_MAX": "128M"},
+                                          "memory_cap": wrapper}).encode() + b"\n")
+            child.stdin.flush()
+            self.assertEqual(child.stdout.read().decode().strip(), "128M ['sh', '-c', 'exit 99']")
+            self.assertEqual(child.wait(timeout=30), 37)
+            child.stdin.close()
+            child.stdout.close()
+
     def test_a_released_slot_waits_for_its_command_to_end(self):
         # A cancelled build closes the lease and the command's connections
         # together; the next build must not start in the slot while the
@@ -2437,6 +2503,12 @@ class RemoteRun(unittest.TestCase):
             self.assertEqual(self.run_agent(scope, base, echo), str(min(max(4, cpus // 4), most)))
 
     def test_closing_the_connection_ends_the_command_and_its_children(self):
+        self.assert_connection_cleanup(capped=False)
+
+    def test_closing_the_connection_ends_a_memory_capped_command_and_its_children(self):
+        self.assert_connection_cleanup(capped=True)
+
+    def assert_connection_cleanup(self, *, capped):
         with FixtureDirectory() as scope:
             base = scope.name
             Path(base, "src").mkdir()
@@ -2444,7 +2516,10 @@ class RemoteRun(unittest.TestCase):
             agent = self.agent(scope, "run", base, ".",
                                "sh", "-c", f"sleep 120 & echo $! >{marker}; wait",
                                stdin=subprocess.PIPE, start_new_session=True)
-            agent.stdin.write(b'{"environment": {}}\n')
+            request = {"environment": {"CAGENTS_MEMORY_MAX": "128M", "CAGENTS_MEMORY_SWAP_MAX": "0"}}
+            if capped:
+                request["memory_cap"] = (ROOT / "scripts/memory-capped").read_text()
+            agent.stdin.write(json.dumps(request).encode() + b"\n")
             agent.stdin.flush()
             deadline = time.monotonic() + 10
             while not marker.exists() or not marker.read_text().strip():
