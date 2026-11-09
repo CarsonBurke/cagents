@@ -193,6 +193,13 @@ turn reaches that line: the fixture records each such line's number in
 `fixture-frames.exited`, so the reconnected provider goes on, and removing
 that file arms them all again.
 
+A Stop on an agent the frames started answers as Claude Code 2.1.296 does
+for an agent that already sent its notice and is waiting on its own
+background work: a `task_updated` frame patching the task `killed`, with no
+further notice. `tests/fixtures/waiting-agent-scene.sh` builds a scene on
+this: an agent that reports it is waiting, then is resumed, finishes, fails,
+is resumed elsewhere, or is stopped from its tab.
+
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads
 anything: the number of seconds on the file's first line, such as `1.5`, or

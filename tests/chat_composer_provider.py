@@ -153,6 +153,42 @@ class Provider(unittest.TestCase):
         rearmed, _, _ = self.run_provider()
         self.assertEqual(rearmed.returncode, 1)
 
+    def test_a_stop_for_a_task_the_frames_started_patches_it_killed_without_a_notice(self):
+        # As Claude Code 2.1.296 answers a stop for an agent that already sent
+        # its notice and is waiting on its own background work.
+        self.frames({"type": "system", "subtype": "task_started", "uuid": "start-@TURN@",
+                     "task_id": "fixture-task-toolu_reviewer_1", "tool_use_id": "toolu_reviewer_1",
+                     "task_type": "local_agent", "description": "Review restart safety"},
+                    {"type": "result", "uuid": "result-@TURN@", "subtype": "success",
+                     "is_error": False},
+                    {"_end": True})
+        stop = {"type": "control_request", "request_id": "stop-1",
+                "request": {"subtype": "stop_task", "task_id": "fixture-task-toolu_reviewer_1"}}
+        result, output, _ = self.run_provider(frames=(prompt(1), stop))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        answered = next(index for index, frame in enumerate(output)
+                        if frame.get("type") == "control_response")
+        self.assertEqual(output[answered]["response"]["request_id"], "stop-1")
+        after = output[answered + 1:]
+        self.assertEqual(
+            [(frame.get("subtype"), frame.get("task_id"), frame.get("patch")) for frame in after],
+            [("task_updated", "fixture-task-toolu_reviewer_1", {"status": "killed"})])
+
+    def test_a_stop_for_a_working_scene_agent_still_reports_it_stopped(self):
+        (self.config / "fixture-subagents").touch()
+        stop = {"type": "control_request", "request_id": "stop-1",
+                "request": {"subtype": "stop_task", "task_id": "fixture-task-scout-1"}}
+        interrupt = {"type": "control_request", "request_id": "stop-2",
+                     "request": {"subtype": "interrupt"}}
+        result, output, _ = self.run_provider(frames=(prompt(1), stop, interrupt))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        notices = [(frame["task_id"], frame["status"]) for frame in output
+                   if frame.get("subtype") == "task_notification"]
+        # Scout is stopped by its own Stop, Planner by the interrupt, once each.
+        self.assertEqual(notices, [("fixture-task-scout-1", "stopped"),
+                                   ("fixture-task-planner-1", "stopped")])
+        self.assertFalse(any(frame.get("subtype") == "task_updated" for frame in output), output)
+
     def test_a_status_that_is_not_one_is_refused_with_its_line(self):
         for status in ("x", 256, -1, 1.5):
             with self.subTest(status=status):
