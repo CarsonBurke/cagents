@@ -967,6 +967,56 @@ class Evidence(unittest.TestCase):
         self.assertTrue((fixture / "home" / "seeded").exists())
         self.assertFalse((fixture / "home" / "changed-during-after").exists())
 
+    def test_a_seeded_chat_keeps_the_provider_home_it_recorded(self) -> None:
+        # A chat records its provider home's device and inode and refuses to
+        # reopen once that directory is replaced, so restoring a seed must
+        # keep the directories, not recreate them.
+        self.built("after")
+        self.built("before")
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        provider_home = fixture / "home" / ".claude"
+        recorded = provider_home.stat()
+        (provider_home / "session.jsonl").write_text("seeded\n")
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+        session_file = (provider_home / "session.jsonl").stat().st_ino
+
+        self.run_tool("start", "before")
+        (provider_home / "session.jsonl").write_text("changed by before\n")
+        (provider_home / "left-by-before").write_text("data")
+        self.run_tool("stop")
+        result = self.run_tool("start", "after")
+        restored = provider_home.stat()
+        self.assertEqual((restored.st_dev, restored.st_ino), (recorded.st_dev, recorded.st_ino))
+        self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
+        self.assertFalse((provider_home / "left-by-before").exists())
+        self.assertNotIn("will not reopen", result.stderr)
+        self.run_tool("stop")
+
+        # A transcript keeps its file, which its location records.
+        self.assertEqual((provider_home / "session.jsonl").stat().st_ino, session_file)
+
+        # A fixture removed meanwhile can't keep them, and every start says so
+        # until the seed is saved again.
+        shutil.rmtree(fixture)
+        for _ in range(2):
+            result = self.run_tool("start", "before")
+            self.assertIn("the provider home is not the one the seed was saved from", result.stderr)
+            self.assertEqual((provider_home / "session.jsonl").read_text(), "seeded\n")
+            self.run_tool("stop")
+        self.run_tool("save-seed")
+        self.assertNotIn("will not reopen", self.run_tool("start", "after").stderr)
+
+    def test_a_seed_saved_before_its_home_was_recorded_is_said_not_to_reopen(self) -> None:
+        self.built("after")
+        self.run_tool("start", "after")
+        self.run_tool("stop")
+        self.run_tool("save-seed")
+        (self.task / "fixture-seed.home").unlink()
+        result = self.run_tool("start", "after")
+        self.assertIn("chats in the seed will not reopen", result.stderr)
+
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
         self.run_tool("start", "after", "--limit", "1")

@@ -5,10 +5,12 @@ All Git repositories and intentional damage belong to each private fixture.
 The helper receipt stages source; it supplies no lane or child-settlement proof.
 """
 
+import ast
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import stat
 import subprocess
 import sys
@@ -610,6 +612,16 @@ class ScriptContractsApplicability(unittest.TestCase):
         cls.run_block = block("Check validation checkout and process custody contracts")
         if not cls.run_block.startswith("python3 -I -B - <<'PY'\n"):
             raise AssertionError("applicability step must run its inline isolated Python")
+        # Every other pair the step checks, in its order, which these private
+        # fixtures leave absent: a pair added to the workflow needs no edit here.
+        listed = [ast.literal_eval(line.strip().rstrip(","))[0]
+                  for line in cls.run_block.splitlines()
+                  if re.fullmatch(r'\s*\("[^"]+", "[^"]+", "[^"]+"\),', line)]
+        names = [name for name, _, _ in cls.pairs]
+        if listed[:len(names)] != names:
+            raise AssertionError(f"the step must check {names} first, not {listed}")
+        cls.absent = [f"Not applicable: {name} (source and fixture both absent at this head)"
+                      for name in listed[len(names):]]
         cls.syntax_block = block("Check shell syntax")
         # Exercise the historical unconditional fixture command, when present,
         # as well as the applicability and syntax steps that can reach it.
@@ -675,16 +687,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         self.assertEqual(result.stdout.splitlines(), [
             f"Not applicable: {name} (source and fixture both absent at this head)"
             for name, _, _ in self.pairs
-        ] + [
-            "Not applicable: build directory seeding (source and fixture both absent at this head)",
-            "Not applicable: build disk guard and gate install (source and fixture both absent at this head)",
-            "Not applicable: build directory pruning (source and fixture both absent at this head)",
-            "Not applicable: build offload (source and fixture both absent at this head)",
-            "Not applicable: focused lib tests (source and fixture both absent at this head)",
-            "Not applicable: lock holders (source and fixture both absent at this head)",
-            "Not applicable: memory limit (source and fixture both absent at this head)",
-            "Not applicable: local install head check (source and fixture both absent at this head)",
-        ])
+        ] + self.absent)
         self.assertEqual(self.calls(root), [])
         self.assertEqual(list(root.iterdir()), [])
 
@@ -695,16 +698,7 @@ class ScriptContractsApplicability(unittest.TestCase):
         result = self.invoke_block(root)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout.splitlines(), [f"Checking: {name}" for name, _, _ in self.pairs]
-                         + [
-                             "Not applicable: build directory seeding (source and fixture both absent at this head)",
-                             "Not applicable: build disk guard and gate install (source and fixture both absent at this head)",
-                             "Not applicable: build directory pruning (source and fixture both absent at this head)",
-                             "Not applicable: build offload (source and fixture both absent at this head)",
-                             "Not applicable: focused lib tests (source and fixture both absent at this head)",
-                             "Not applicable: lock holders (source and fixture both absent at this head)",
-                             "Not applicable: memory limit (source and fixture both absent at this head)",
-                             "Not applicable: local install head check (source and fixture both absent at this head)",
-                         ])
+                         + self.absent)
         self.assertEqual(self.calls(root), self.expected_calls(*range(len(self.pairs))))
 
     def test_each_partial_pair_fails_instead_of_being_skipped(self):

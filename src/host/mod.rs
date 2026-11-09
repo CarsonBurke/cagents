@@ -254,6 +254,7 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         );
     }
     let mut initial = HostState::new(proof);
+    initial.codex_listeners = chat::CodexListenerRoots::in_runtime_directory(&paths.directory);
     initial.native_chat_capacity = crate::native_chat_capacity::load()? as usize;
     let host: SharedHost = Arc::new(crate::host::state::HostLock::new(initial));
     host.lock()
@@ -372,6 +373,10 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     })?;
     drop(admission);
     crate::diagnostics::record(crate::diagnostics::Event::Ready);
+    // After restore, so the first pass covers every conversation it carried.
+    if let Err(error) = chat::keep_legacy_codex_listeners_fresh(&host) {
+        tracing::warn!(%error, "Codex listeners in the temporary directory will not be kept fresh");
+    }
     let tally_host = Arc::downgrade(&host);
     let _tray = crate::tray::start(move || {
         let host = tally_host.upgrade()?;

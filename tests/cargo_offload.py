@@ -273,6 +273,172 @@ class Resident(unittest.TestCase):
             self.assertEqual(held[999999999], 0)
 
 
+def agent_scope():
+    """The host agent's definitions, as its commands run them."""
+    scope = {"__name__": "cargo-offload-agent"}
+    with patch.object(sys, "argv", ["cargo-offload", "test", "~"]):
+        exec(compile(offload.REMOTE_AGENT.split("\nif command == ")[0], "agent", "exec"), scope)
+    return scope
+
+
+class Busiest(unittest.TestCase):
+    """What holds the CPUs, from two process tables standing in for /proc's
+    a second apart. Their PIDs are beyond any the kernel gives, so nothing of
+    theirs is in /proc: each command is the name it was sampled with."""
+
+    TICKS = os.sysconf("SC_CLK_TCK")
+
+    def process(self, pid, *, parent=1, session=None, terminal=0, own=0.0, reaped=0.0, age=30,
+                name="spin"):
+        return pid, self.scope["Process"](
+            parent, pid if session is None else session, terminal, round(own * self.TICKS),
+            round(reaped * self.TICKS), round((self.up - age - 0.5) * self.TICKS), name)
+
+    def busiest(self, first, second, *, seconds=1.0, **options):
+        """`busiest` over tables of CPU seconds, `seconds` apart by the clock
+        it reads around its own sleep."""
+        tables = iter([dict(first), dict(second)])
+        clock = iter([0.0, 0.0, seconds, seconds])
+        self.scope["process_table"] = lambda: next(tables)
+        self.scope["time"] = type("Clock", (), {"monotonic": staticmethod(lambda: next(clock)),
+                                                "sleep": staticmethod(lambda _: None)})
+        return self.scope["busiest"](**options)
+
+    def setUp(self):
+        self.scope = agent_scope()
+        # A host of two CPUs, whatever this one has.
+        self.scope["host_cpus"] = lambda: 2
+        self.up = float(Path("/proc/uptime").read_text().split()[0])
+
+    def test_a_loop_of_short_lived_commands_is_named_by_what_it_reaps(self):
+        loop, child = 5_000_001, 5_000_002
+        text = self.busiest(
+            [self.process(loop, own=1, reaped=5, name="sh"),
+             self.process(child, parent=loop, session=loop, own=10)],
+            # The child ended after 0.5 more seconds, another lived 0.4 of
+            # them, and the loop itself used 0.1: only what the sample saw.
+            [self.process(loop, own=1.1, reaped=5 + 10.5 + 0.4, name="sh")])
+        self.assertRegex(text, rf"; besides builds, the CPUs go to session {loop} "
+                               rf"\(sh, started 3\ds ago\): 1\.0 CPU in 1 process\. ")
+        self.assertTrue(text.endswith(f". `ps -s {loop}` lists session {loop}'s processes, "
+                                      f"and `pkill -s {loop}` ends them"), text)
+
+    def test_what_ended_within_the_sample_is_taken_off_the_ancestor_that_outlived_it(self):
+        # A shell runs make, which runs a compiler an hour in; both end.
+        shell, make, compiler = 5_000_003, 5_000_004, 5_000_005
+        text = self.busiest(
+            [self.process(shell, name="sh"), self.process(make, parent=shell, session=shell, own=2),
+             self.process(compiler, parent=make, session=shell, own=3600)],
+            [self.process(shell, reaped=2 + 3600 + 0.5, name="sh")])
+        self.assertIn(f"session {shell} (sh, started 30s ago): 0.5 CPUs in 1 process", text)
+        # Nothing is said to use more than every CPU, however its ticks came.
+        text = self.busiest([self.process(shell, name="sh")],
+                            [self.process(shell, reaped=10**6, name="sh")])
+        self.assertIn(": 2.0 CPUs in 1 process", text)
+
+    def test_a_session_whose_leader_has_exited_says_so(self):
+        session, orphan = 5_000_010, 5_000_011
+        text = self.busiest([self.process(orphan, session=session, age=45, name="runaway")],
+                            [self.process(orphan, session=session, own=1, age=45, name="runaway")])
+        self.assertIn(f"session {session}, whose leader has exited: 1.0 CPU in 1 process, "
+                      f"most in pid {orphan} (runaway, started 45s ago)", text)
+
+    def test_a_command_reaches_the_terminal_without_its_control_characters(self):
+        loop = 5_000_012
+        name = "spin\x1b]0;owned\x07\x1b[2Jloop"
+        text = self.busiest([self.process(loop, name=name)],
+                            [self.process(loop, own=1, name=name)])
+        self.assertIn("(spin ]0;owned [2Jloop, started", text)
+        self.assertFalse(any(not char.isprintable() for char in text), repr(text))
+
+    def test_the_running_builds_holding_the_cpus_is_said_outright(self):
+        build, detached, other = 5_000_020, 5_000_021, 5_000_022
+        first = [self.process(build), self.process(detached, parent=build), self.process(other)]
+        second = [self.process(build, own=2), self.process(detached, parent=build, own=1),
+                  self.process(other, own=0.1)]
+        self.assertEqual(self.busiest(first, second, pids=[build]),
+                         "nothing else uses much; the running builds hold them: "
+                         "builds use 3.0 CPUs and everything else 0.1 CPUs")
+        # One build compiling a crate on one CPU holds them as surely.
+        self.assertEqual(self.busiest(first, [self.process(build, own=1.0)], pids=[build]),
+                         "nothing else uses much; the running builds hold them: "
+                         "builds use 1.0 CPU and everything else 0.0 CPUs")
+        self.assertEqual(self.busiest(first, [self.process(other, own=0.1)]),
+                         "nothing uses much at the moment: builds use 0.0 CPUs and everything else "
+                         "0.1 CPUs, of 2 in all")
+        # Pressure averages ten seconds, so it can outlast a burst: builds
+        # leaving most CPUs idle don't hold them.
+        self.scope["host_cpus"] = lambda: 16
+        self.assertEqual(self.busiest(first, [self.process(build, own=3)], pids=[build]),
+                         "nothing uses much at the moment: builds use 3.0 CPUs and everything else "
+                         "0.0 CPUs, of 16 in all")
+
+    def test_the_rate_is_over_the_time_the_sample_took(self):
+        sessions = [5_000_030 + index for index in range(5)]
+        first = [self.process(pid) for pid in sessions]
+        # Four sessions use 2 CPU seconds each and one 0.6, over 2 seconds.
+        second = [self.process(pid, own=2) for pid in sessions[:4]] + [self.process(sessions[4], own=0.6)]
+        with patch.dict(os.environ, {"CAGENTS_OFFLOAD_BUSIEST_SHOWN": "a few",
+                                     "CAGENTS_OFFLOAD_BUSIEST_LEAST": "nan"}):
+            text = self.busiest(first, second, seconds=2.0, there=True)
+        self.assertTrue(text.startswith("builds use 0.0 CPUs and everything else 4.3 CPUs; "), text)
+        # Settings that are not numbers show the default three of at least
+        # half a CPU.
+        self.assertEqual(text.count(": 1.0 CPU in 1 process"), 3, text)
+        self.assertIn("; and 2 more sessions using 1.3 CPUs. `ps -s ", text)
+        self.assertRegex(text, r"`ps -s \d+` there lists session \d+'s processes, and `pkill -s \d+` ends them$")
+
+    def test_no_session_a_person_works_in_is_offered_to_end_whole(self):
+        def idle(name, **env):
+            """A real process, for what busiest reads of it from /proc."""
+            directory = Path(tempfile.mkdtemp(prefix="cagents-busiest-"))
+            self.addCleanup(shutil.rmtree, directory, True)
+            program = directory / name
+            shutil.copy2(shutil.which("sleep"), program)
+            process = subprocess.Popen([program, "60"], env=os.environ | env)
+            self.addCleanup(lambda: (process.kill(), process.wait()))
+            return process.pid
+
+        terminal, own, kernel, starter, leaderless = 5_000_060, 5_000_061, 5_000_062, 5_000_063, 5_000_064
+        desktop = idle("sleep", XDG_SESSION_TYPE="wayland")
+        daemon = idle("cagentsd")
+        cases = (
+            ([self.process(terminal, terminal=34816, name="bash")], terminal, "a terminal's"),
+            ([self.process(own, session=os.getsid(0))], os.getsid(0), "the one this wait runs in"),
+            # What started this wait, such as the agent waiting, in a session of its own.
+            ([(os.getpid(), self.scope["Process"](starter, os.getsid(0), 0, 0, 0, 0, "python3")),
+              self.process(starter, session=starter, name="agent")], starter, "the one this wait runs in"),
+            # A daemon whose leader has exited, started from the desktop.
+            ([self.process(desktop, session=leaderless)], leaderless, "one started from the desktop"),
+            # cagents' own daemon, whatever started it.
+            ([self.process(daemon, session=leaderless)], leaderless, "cagents' own"),
+        )
+        for table, session, why in cases:
+            with self.subTest(why):
+                busy = [(pid, entry._replace(own=entry.own + self.TICKS)) for pid, entry in table]
+                text = self.busiest(table, busy)
+                self.assertIn(f". Session {session} is {why}: `ps -s {session}` lists its processes, "
+                              f"to end only what you recognise", text)
+                self.assertNotIn("pkill", text)
+        # The kernel's threads are named, though no one can end them.
+        text = self.busiest([self.process(kernel, parent=2, session=0, name="kswapd0")],
+                            [self.process(kernel, parent=2, session=0, own=1.5, name="kswapd0")])
+        self.assertEqual(text, "builds use 0.0 CPUs and everything else 1.5 CPUs; besides builds, "
+                               "the CPUs go to the kernel's own threads: 1.5 CPUs")
+
+    def test_a_session_using_under_half_a_cpu_is_not_named(self):
+        quiet, builds = 5_000_040, 5_000_041
+        text = self.busiest([self.process(quiet), self.process(builds)],
+                            [self.process(quiet, own=0.4), self.process(builds, own=1)], pids=[builds])
+        self.assertEqual(text, "nothing else uses much; the running builds hold them: "
+                               "builds use 1.0 CPU and everything else 0.4 CPUs")
+        many = [5_000_050 + index for index in range(10)]
+        text = self.busiest([self.process(pid) for pid in many],
+                            [self.process(pid, own=0.3) for pid in many])
+        self.assertEqual(text, "builds use 0.0 CPUs and everything else 3.0 CPUs, "
+                               "though no session outside them uses half a CPU")
+
+
 # Sockets bind under these tests' directories, whose paths must stay short
 # however long TMPDIR is.
 SOCKET_ROOT = "/tmp"
@@ -626,10 +792,12 @@ cd "$HOME"
 ulimit -Sn 256
 # Its Cargo keeps intermediates outside the slot, as a build-dir setting in
 # its configuration would, and inside the stand-in's home, which the test
-# removes.
+# removes. A test may have it name every session that holds its CPUs.
 exec env -i CAGENTS_BUILD_REGISTRY= HOME="$HOME" PATH="$STAND_IN_HOST_PATH" CARGO_HOME="$CARGO_HOME" \
     RUSTUP_HOME="$RUSTUP_HOME" CARGO_BUILD_BUILD_DIR="$HOME/build{workspace-root}/target" \
-    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" sh -c "$*"
+    CAGENTS_OFFLOAD_FIGURES="$HOME/figures" CAGENTS_OFFLOAD_TEMPORARY_ROOT="$HOME/cof" \
+    CAGENTS_OFFLOAD_BUSIEST_SHOWN="${CAGENTS_OFFLOAD_BUSIEST_SHOWN-}" \
+    CAGENTS_OFFLOAD_BUSIEST_LEAST="${CAGENTS_OFFLOAD_BUSIEST_LEAST-}" sh -c "$*"
 """
 
 
@@ -1582,6 +1750,35 @@ class StandInHost(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertNotIn("waiting", result.stderr)
 
+    def test_a_wait_for_the_build_hosts_cpus_names_what_holds_them(self):
+        other = self.host_home / ".cache/cagents-offload/crate/slot-1"
+        other.mkdir(parents=True)
+        # Another build's lease holds a slot: a process of its own, which
+        # what this test starts is not below.
+        lease = self.scope.popen(
+            [sys.executable, "-c", "import fcntl, sys, time\nlock = open(sys.argv[1], 'a')\n"
+             "fcntl.flock(lock, fcntl.LOCK_EX)\nprint(flush=True)\ntime.sleep(600)", str(other / "lock")],
+            stdout=subprocess.PIPE)
+        self.addCleanup(lambda: (lease.kill(), lease.wait(), lease.stdout.close()))
+        lease.stdout.readline()
+        write_figures(self.host_home / "figures", cpu=90)
+        # A runaway loop on the build host, in a session of its own.
+        runaway = self.scope.popen([f"runaway-{os.getpid()}", "-c", "while True: pass"],
+                                   executable=sys.executable, start_new_session=True)
+        self.addCleanup(lambda: (runaway.kill(), runaway.wait()))
+        env = self.remote_env() | {"CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "4",
+                                   "CAGENTS_OFFLOAD_BUSIEST_SHOWN": "1000",
+                                   "CAGENTS_OFFLOAD_BUSIEST_LEAST": "0.05"}
+        result = self.gate_run("check", env=env)
+        self.assertEqual(result.returncode, 124, result.stderr)
+        self.assertRegex(result.stderr, r"waiting for CPU on stand-in: its CPU pressure is 90%, at or "
+                                        r"above the 40% limit; builds use \d+\.\d CPUs? and everything "
+                                        r"else \d+\.\d CPUs?; besides builds, the CPUs go to ")
+        self.assertRegex(result.stderr, rf"session {runaway.pid} \(runaway-{os.getpid()} -c while True: pass, "
+                                        rf"started \d+s ago\): \d+\.\d CPUs? in 1 process")
+        self.assertRegex(result.stderr, r"`ps -s \d+` there lists session \d+'s processes, and "
+                                        r"`pkill -s \d+` ends them|Session \d+ is ")
+
     def test_remote_commands_leave_no_core_dumps_unless_asked(self):
         (self.crate / "src/main.rs").write_text(textwrap.dedent("""
             fn main() {}
@@ -1857,7 +2054,14 @@ class RemoteRun(unittest.TestCase):
                 write_figures(stand_in, **figures)
                 self.hold(base, 0, {"cost": 1, "pid": None})
                 _, lines = self.lease(base, figures=stand_in)
-                self.assertEqual(lines.next(10), reason)
+                line = lines.next(10)
+                if reason.startswith("wait cpu "):
+                    # Followed by what holds the CPUs; the other slot's
+                    # holder here is the test, which spins on nothing.
+                    self.assertRegex(line, rf"^{reason} -- (nothing (else )?uses much|builds use "
+                                           rf"\d+\.\d CPUs? and everything else \d+\.\d CPUs?)")
+                else:
+                    self.assertEqual(line, reason)
                 with self.assertRaises(TimeoutError):
                     lines.next(1.5)
                 write_figures(stand_in)
