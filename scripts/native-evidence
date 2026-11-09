@@ -48,7 +48,8 @@ both use the same fixture data and synthetic provider.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
-                  where Cargo and rustup live.
+                  where Cargo and rustup live. Between sessions it runs under
+                  the side the last session ran, with no daemon running.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
   nested CMD...   Run a command in the nested compositor's environment.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
@@ -908,7 +909,14 @@ case $command in
         fixture_env "$target/dev-runtime/cagents" "$@"
         ;;
     env)
-        side=$(current_side)
+        # Between sessions the fixture is still there, with no daemon holding
+        # its stores, so setup that needs the daemon stopped runs then, under
+        # the side the last session ran.
+        if live_session || [ ! -f "$state/side" ]; then
+            side=$(current_side)
+        else
+            side=$(cat "$state/side")
+        fi
         load_side "$side" "$state/source"
         fixture_env "$@"
         ;;
