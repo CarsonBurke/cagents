@@ -2046,6 +2046,58 @@ pub(in crate::host) fn reconcile_previous_boot_history(host: &SharedHost) -> Res
     }
 }
 
+/// Release the transcripts that this boot's retired actors keep in their final
+/// receipts, and return the bytes released.
+///
+/// Only actors whose retirement the registry has committed are touched, and
+/// the receipt itself stays: a resume later in this boot authenticates the
+/// retirement through it. Runs beside the daemon, so it takes the host and
+/// registry locks only to read the roster, never across file work.
+pub(in crate::host) fn compact_retired_receipts(host: &SharedHost) -> Result<u64, String> {
+    let proof = {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.shutting_down {
+            return Ok(0);
+        }
+        state.proof().clone()
+    };
+    let registry = super::super::agent_execution::registry(host)?;
+    let mut released = 0u64;
+    let mut after = None;
+    loop {
+        let retired = {
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            let page = registry.native_actor_ownerships(after, 128)?;
+            let Some(last) = page.last() else {
+                return Ok(released);
+            };
+            after = Some(last.actor());
+            page.into_iter()
+                .filter(|ownership| ownership.owner().boot == proof.boot_id)
+                .filter_map(
+                    |ownership| match registry.native_actor_retirement(ownership.actor()) {
+                        Ok(Some(_)) => Some(ownership.owner().clone()),
+                        Ok(None) => None,
+                        // One unreadable row keeps only its own receipt whole.
+                        Err(error) => {
+                            tracing::debug!(actor = %ownership.actor(), %error, "retirement unreadable; receipt kept whole");
+                            None
+                        }
+                    },
+                )
+                .collect::<Vec<_>>()
+        };
+        for owner in retired {
+            match Handle::compact_retired_receipt(&owner, &proof) {
+                Ok(bytes) => released = released.saturating_add(bytes),
+                Err(error) => {
+                    tracing::debug!(terminal = %owner.terminal, %error, "retired receipt kept whole");
+                }
+            }
+        }
+    }
+}
+
 /// Finish a durable retirement whose helper completed before the prior daemon
 /// could commit its registry receipt. No attachment or provider is created.
 /// A missing receipt remains unknown; a roster row alone never proves closure.
