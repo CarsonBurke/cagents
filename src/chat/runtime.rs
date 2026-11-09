@@ -1411,6 +1411,13 @@ impl LocalHandle {
             .requests
             .clone()
     }
+    pub(crate) fn work_hold(&self) -> super::WorkHold {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .work_hold()
+    }
     pub(crate) fn background_subagents(&self) -> Vec<String> {
         let state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         state
@@ -2299,6 +2306,39 @@ impl TurnAttention {
         false
     }
 }
+/// Why an interrupt that would also stop background subagents was refused.
+fn interrupt_refusal(affected: &super::Held<'_>) -> String {
+    format!(
+        "Interrupting would also stop {}. {} Use --including-subagents to permit this, or stop {} in the app first.",
+        affected.count(),
+        affected.detail(),
+        affected.where_to_stop()
+    )
+}
+
+/// Why a close that requires an idle conversation left it open. Subagents
+/// that hold a conversation whose turn has ended leave it looking finished,
+/// so they are named along with how to let them go.
+fn idle_close_refusal(readiness: UpdateReadiness, state: &Snapshot) -> String {
+    let hold = state.work_hold();
+    match readiness {
+        UpdateReadiness::Busy if !hold.turn && !hold.subagents.is_empty() => {
+            let held = hold.subagents();
+            format!(
+                "{} Stop {} in the conversation to let it close.",
+                held.detail(),
+                held.where_to_stop()
+            )
+        }
+        UpdateReadiness::Busy => {
+            "The conversation is busy or waiting for an answer, so it was left open.".into()
+        }
+        UpdateReadiness::Unready | UpdateReadiness::Idle => {
+            "The conversation's provider still has work in flight, so it was left open. Try again in a moment.".into()
+        }
+    }
+}
+
 /// Parent admission deliberately excludes aggregate background-child activity.
 fn accepts_prompt(state: &Snapshot) -> bool {
     state.ready && !state.busy && !state.waiting && !state.exited && state.requests.is_empty()
@@ -2851,17 +2891,10 @@ impl Actor {
                             .subagents
                             .iter()
                             .filter(|agent| agent.stopped_by_interrupt(&state.capabilities))
+                            .map(super::HeldSubagent::of)
                             .collect();
                         if !affected.is_empty() {
-                            let names = affected
-                                .iter()
-                                .take(8)
-                                .map(|agent| agent.id.as_str())
-                                .collect::<Vec<_>>()
-                                .join(", ");
-                            let _ = reply.send(Err(format!(
-                                "Interrupt would stop {} running background subagent(s): {names}. Use --including-subagents to permit this, or stop one subagent separately.", affected.len()
-                            )));
+                            let _ = reply.send(Err(interrupt_refusal(&affected.iter().collect())));
                             continue;
                         }
                     }
@@ -2872,10 +2905,9 @@ impl Actor {
                     // A stale generation must never hide new requests, child
                     // work or pending transport. Only a proved idle actor can
                     // return the retryable generation-change receipt.
-                    if self.update_readiness(&state) != UpdateReadiness::Idle {
-                        let _ = reply.send(Err(
-                            "Provider state changed before conditional idle close".into(),
-                        ));
+                    let readiness = self.update_readiness(&state);
+                    if readiness != UpdateReadiness::Idle {
+                        let _ = reply.send(Err(idle_close_refusal(readiness, &state)));
                         continue;
                     }
                     let unchanged = state.generation == generation;
@@ -5671,6 +5703,51 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    fn refusals_name_a_waiting_subagent_and_how_to_let_it_go() {
+        let mut state = Snapshot::default();
+        let subagent = |id: &str, description: &str, status| super::super::Subagent {
+            id: id.into(),
+            kind: "general-purpose".into(),
+            description: description.into(),
+            status,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        };
+        state.subagents = vec![subagent(
+            "toolu_dev",
+            "Run the dev server",
+            ToolStatus::Waiting,
+        )];
+        assert_eq!(
+            idle_close_refusal(UpdateReadiness::Busy, &state),
+            "Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Stop it from its tab in the conversation to let it close."
+        );
+        state.subagents.push(subagent(
+            "toolu_audit",
+            "Audit the parser",
+            ToolStatus::Running,
+        ));
+        let hold = state.work_hold();
+        let refused = interrupt_refusal(&hold.subagents());
+        assert_eq!(
+            refused,
+            "Interrupting would also stop 1 running and 1 waiting background subagent. Background subagent \u{201c}Audit the parser\u{201d} is still running, and \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Use --including-subagents to permit this, or stop them from their tabs in the app first."
+        );
+        assert!(!refused.contains("toolu_"));
+        // A turn still under way is what holds it; its subagents are not
+        // offered as the reason.
+        state.busy = true;
+        assert_eq!(
+            idle_close_refusal(UpdateReadiness::Busy, &state),
+            "The conversation is busy or waiting for an answer, so it was left open."
+        );
+        assert!(idle_close_refusal(UpdateReadiness::Unready, &state).contains("in flight"));
+    }
+
+    #[test]
     fn queued_interrupt_rechecks_background_tasks_at_provider_dispatch() {
         struct GatedBackground {
             entered: crossbeam_channel::Sender<()>,
@@ -5823,9 +5900,15 @@ mod tests {
             .unwrap()
             .unwrap_err();
         assert!(
-            refused.contains("40 running background")
-                && refused.contains("late-background-0")
-                && refused.contains("--including-subagents")
+            refused.starts_with("Interrupting would also stop 40 running background subagents.")
+                && refused.contains("\u{201c}Started after the caller observed idle\u{201d}")
+                && refused.contains("and 37 more are still running")
+                && refused.contains("--including-subagents"),
+            "{refused}"
+        );
+        assert!(
+            !refused.contains("late-background"),
+            "transport IDs are not names: {refused}"
         );
         assert_eq!(interrupts.load(Ordering::Relaxed), 0);
         assert_eq!(handle.background_subagents().len(), 40);
@@ -5845,7 +5928,11 @@ mod tests {
             UpdateReadiness::Busy
         );
         let refused = handle.interrupt_owned(None, false).unwrap_err();
-        assert!(refused.contains("8 running background") && refused.contains("late-background-0"));
+        assert!(
+            refused.contains("8 running background subagents")
+                && refused.contains("\u{201c}Started after the caller observed idle\u{201d}"),
+            "{refused}"
+        );
         assert_eq!(interrupts.load(Ordering::Relaxed), 0);
         handle.interrupt_owned(None, true).unwrap();
         assert_eq!(interrupts.load(Ordering::Relaxed), 1);

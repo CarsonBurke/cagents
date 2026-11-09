@@ -719,6 +719,20 @@ fn draft_start_backend() -> Option<(String, String, String)> {
     })
 }
 
+/// Why sending cannot move a conversation to another account yet: a
+/// background subagent holds it, which the daemon would refuse to close.
+fn account_switch_hold(snapshot: &chat::Snapshot) -> Option<String> {
+    let hold = snapshot.work_hold();
+    let held = hold.subagents();
+    (!held.is_empty()).then(|| {
+        format!(
+            "Sending would move this conversation to another account, but it can't move while background work is still going. {} Stop {} in the conversation, then send again.",
+            held.detail(),
+            held.where_to_stop()
+        )
+    })
+}
+
 /// The account home `session` launches its provider in, as its launch names it.
 fn chat_account_home(session: &chat::Session) -> Option<&str> {
     let variable = account::home_variable(session.launch.provider)?;
@@ -11562,6 +11576,17 @@ impl Cagents {
                             self.handle_chat_ui(Action::Submit(target, mode)),
                         ]);
                     }
+                    // The daemon closes the conversation before moving it, and
+                    // a conversation that looks finished can still hold a
+                    // subagent, perhaps indefinitely. Say which, and keep the
+                    // message, rather than send it on the account that needs
+                    // replacing or attempt a switch the daemon refuses.
+                    if let Some(runtime) = self.chat_runtime_mut(target)
+                        && let Some(refusal) = account_switch_hold(&runtime.snapshot)
+                    {
+                        runtime.error = Some(refusal);
+                        return Task::none();
+                    }
                     return self.change_chat_account(
                         target.card,
                         account.id(),
@@ -17375,6 +17400,71 @@ mod tests {
                 .environment
                 .contains_key(account::routing::AUTOMATIC_MARKER)
         );
+    }
+
+    #[test]
+    fn automatic_account_switch_names_the_subagent_holding_the_conversation() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let alternate = app.account_ui.add_managed_fixture(Provider::Codex, 105);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let now = crate::chat::now_ms().unwrap();
+        for (id, allowed) in [
+            (Account::system(Provider::Codex).id(), false),
+            (alternate.clone(), true),
+        ] {
+            let (owner, ticket) = app.account_ui.begin_probe_for_test(
+                &id,
+                crate::account::schedule::Trigger::Focus,
+                now,
+            );
+            let _ = app.update(Message::AccountUi(crate::app::account_ui::Action::Probed {
+                owner,
+                ticket,
+                id,
+                outcome: account::probe::Outcome::Answered {
+                    identity: None,
+                    catalog: None,
+                    snapshot: account::codex::parse_rate_limits(
+                        &serde_json::json!({"ordinaryUsageAllowed": allowed}),
+                        now,
+                    ),
+                },
+            }));
+        }
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime
+            .session
+            .launch
+            .recipe
+            .environment
+            .insert(account::routing::AUTOMATIC_MARKER.into(), "1".into());
+        runtime.replace_draft(text_editor::Content::with_text("Keep this message"));
+        Arc::make_mut(&mut runtime.snapshot).subagents = vec![chat::Subagent {
+            id: "toolu_dev_server".into(),
+            kind: "general-purpose".into(),
+            description: "Run the dev server".into(),
+            status: chat::ToolStatus::Waiting,
+            model: None,
+            waiting: false,
+            detail: String::new(),
+            background: true,
+            items: Vec::new(),
+        }];
+        let (_, generation, _) = app
+            .automatic_chat_account(target, PromptMode::Send)
+            .expect("the limited account would be replaced");
+        assert!(generation.is_some(), "the conversation is live");
+        drop(app.update(Message::ChatUi(Action::Submit(target, PromptMode::Send))));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(
+            runtime.error.as_deref(),
+            Some(
+                "Sending would move this conversation to another account, but it can't move while background work is still going. Background subagent \u{201c}Run the dev server\u{201d} is waiting on its own background work, which may not finish on its own. Stop it from its tab in the conversation, then send again."
+            )
+        );
+        assert_eq!(runtime.composer.text().trim(), "Keep this message");
+        assert!(!app.chat_start_pending(card), "no switch was attempted");
     }
 
     /// A new conversation, which runs nothing until its first message is

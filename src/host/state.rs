@@ -8362,9 +8362,18 @@ for line in sys.stdin:
         assert_eq!(interrupt.sessions[0].disposition, Disposition::Interrupted);
         assert_eq!(interrupt.sessions[0].interrupted_subagents, ["first"]);
         assert!(
-            interrupt.sessions[0]
+            interrupt.sessions[0].reason.starts_with(
+                "The update will stop 1 running background subagent (\u{201c}first\u{201d})"
+            ),
+            "only a turn under way is called the active turn: {}",
+            interrupt.sessions[0].reason
+        );
+        assert!(
+            waiting.sessions[0]
                 .reason
-                .contains("1 running background")
+                .contains("Background subagent \u{201c}first\u{201d} is still running"),
+            "{}",
+            waiting.sessions[0].reason
         );
         let now = Instant::now();
         let capability = state.shutdown_preflight(now).unwrap().capability;

@@ -639,10 +639,20 @@ impl Handle {
             Owner::Remote(remote) => {
                 let state = remote.state();
                 (
-                    state.working || state.waiting || !state.requests.is_empty(),
+                    state.working
+                        || state.waiting
+                        || !state.requests.is_empty()
+                        || !state.work_hold().subagents.is_empty(),
                     state.ready,
                 )
             }
+        }
+    }
+    /// What holds the conversation, in the terms its reader knows it by.
+    pub(crate) fn work_hold(&self) -> chat::WorkHold {
+        match &self.0 {
+            Owner::Local(local) => local.work_hold(),
+            Owner::Remote(remote) => remote.state().work_hold(),
         }
     }
     pub(crate) fn is_idle(&self) -> bool {
