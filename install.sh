@@ -418,7 +418,11 @@ OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
 DAEMON_DEFERRED=0
 DAEMON_START_ATTEMPTED=0
-# Releases before the converter read shared-model store schema 22.
+# The shared-model store's schema before the replacement daemon starts, which
+# is the schema the previous daemon reads; `none` when there is no store yet.
+STORE_SCHEMA_BEFORE=
+# A store the replacement creates is converted back this far, the schema of
+# releases before the converter.
 OLDEST_STORE_SCHEMA=22
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
@@ -509,26 +513,20 @@ cleanup() {
     fi
 
     # A replacement daemon that started may have converted the shared-model
-    # store forward. The replacement converts it back to the schema the
-    # restored daemon reads before that daemon starts; an older daemon that
-    # cannot report its schema reads the oldest convertible one. Without that
-    # conversion the restored daemon could not open the store, so the new
-    # installation is retained instead.
+    # store forward, past what the restored daemon reads. The replacement
+    # converts it back to the schema recorded before it started; the previous
+    # release is never run to ask, since releases before the converter take no
+    # options and would start a daemon instead. Without that conversion the
+    # restored daemon could not open the store, so the new installation is
+    # retained instead.
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ] \
-        && [ "$HAD_CURRENT" -eq 1 ] && [ "$DAEMON_START_ATTEMPTED" -eq 1 ] \
-        && [ -x "$NEW_VERSION_DIR/bin/cagentsd" ]; then
-        case $PREVIOUS_CURRENT_TARGET in
-            /*) previous_root=$PREVIOUS_CURRENT_TARGET ;;
-            *) previous_root=$PREFIX/$PREVIOUS_CURRENT_TARGET ;;
-        esac
-        previous_schema=$("$previous_root/bin/cagentsd" --store-schema 2>/dev/null) || previous_schema=
-        case $previous_schema in
-            '' | *[!0-9]*) previous_schema=$OLDEST_STORE_SCHEMA ;;
-        esac
-        if ! "$NEW_VERSION_DIR/bin/cagentsd" --downgrade-store "$previous_schema" >/dev/null; then
+        && [ "$DAEMON_START_ATTEMPTED" -eq 1 ] && [ -n "$STORE_SCHEMA_BEFORE" ]; then
+        restored_schema=$STORE_SCHEMA_BEFORE
+        [ "$restored_schema" != none ] || restored_schema=$OLDEST_STORE_SCHEMA
+        if ! "$NEW_VERSION_DIR/bin/cagentsd" --downgrade-store "$restored_schema" >/dev/null; then
             TRANSACTION_COMMITTED=1
-            printf '%s: the replacement daemon converted the shared-model store and could not convert it back for the previous version; retained the new installation; stop its daemon, then run %s --downgrade-store %s before restoring the previous version\n' \
-                "$PROGRAM" "$NEW_VERSION_DIR/bin/cagentsd" "$previous_schema" >&2
+            printf '%s: the replacement daemon may have converted the shared-model store past what the previous version reads, and converting it back to schema %s failed; retained the new installation, which reads it\n' \
+                "$PROGRAM" "$restored_schema" >&2
         fi
     fi
 
@@ -1123,6 +1121,17 @@ else
         ROLLBACK_OK=0
         fail 'current installation appeared while preparing the update; retained the candidate for recovery'
     fi
+fi
+# The previous daemon has stopped, so the store holds the schema it reads.
+# Record it before the replacement can convert the store, so that a rollback
+# can convert it back.
+if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRED" -eq 0 ]; then
+    STORE_SCHEMA_BEFORE=$("$NEW_VERSION_DIR/bin/cagentsd" --stored-schema) \
+        || fail 'cannot read the shared-model store schema; installation was not changed'
+    case $STORE_SCHEMA_BEFORE in
+        '') STORE_SCHEMA_BEFORE=none ;;
+        *[!0-9]*) fail 'the shared-model store schema is unreadable; installation was not changed' ;;
+    esac
 fi
 CURRENT_TEMP=$PREFIX/.current.$$
 rm -f "$CURRENT_TEMP"

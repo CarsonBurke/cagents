@@ -500,8 +500,9 @@ measurement on a realistic-size workspace.
    state.
 3. Normalized daemon view schema (`view_scopes`, `view_revision_clock`,
    `panes`, `retired_panes`, `view_operations`), row-level edits, 7-day
-   operation retention, and `cagentsd --downgrade-store`, which the installer
-   runs when a failed update restores a release on schema 22; no wire change.
+   operation retention, and `cagentsd --downgrade-store`, with which a failed
+   update converts the store back to the schema it recorded before the
+   replacement daemon started; no wire change.
    Conversion keeps every pane a view holds, in list order, and refuses
    (leaving the store at 22) rather than drop one held twice; schema 22's
    pane index is rebuilt from the views. On a copy of the user's store (1858

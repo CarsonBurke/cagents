@@ -1,7 +1,7 @@
 //! Schema 22 <-> 23 conversion, applied-operation retention and the row-level
 //! writer, against real stores on disk.
 use super::*;
-use crate::host::model::{Registry, channel_work, migrate_through};
+use crate::host::model::{Registry, SCHEMA_VERSION, channel_work, migrate_through};
 use crate::model::{BrowserId, BrowserRestoreFidelity, BrowserSession, ChannelId};
 use crate::workspace_model::{ModelEdit, views::Change};
 use std::path::Path;
@@ -517,7 +517,26 @@ fn conversion_back_goes_no_further_than_schema_22() {
     drop(Registry::at(&path).unwrap());
     let error = Registry::downgrade_at(&path, 21).unwrap_err();
     assert!(error.contains("only as far as schema 22"), "{error}");
-    assert_eq!(user_version(&path), Registry::SCHEMA);
+    assert_eq!(user_version(&path), SCHEMA_VERSION);
+}
+
+/// What the installer records before a replacement daemon starts, and so what
+/// a rollback converts back to.
+#[test]
+fn the_stored_schema_is_what_the_store_holds_and_nothing_when_there_is_none() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("model.sqlite3");
+    assert_eq!(Registry::stored_schema_at(&path).unwrap(), None);
+    assert!(!path.exists(), "reading the schema must not create a store");
+    schema_22(&path);
+    assert_eq!(Registry::stored_schema_at(&path).unwrap(), Some(22));
+    drop(Registry::at(&path).unwrap());
+    assert_eq!(
+        Registry::stored_schema_at(&path).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
+    Registry::downgrade_at(&path, 22).unwrap();
+    assert_eq!(Registry::stored_schema_at(&path).unwrap(), Some(22));
 }
 
 /// A fresh store with project `/repo` and one channel view.

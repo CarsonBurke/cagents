@@ -131,15 +131,27 @@ impl Registry {
         })
     }
 
-    /// The schema this version writes.
-    pub(crate) const SCHEMA: u32 = SCHEMA_VERSION;
+    fn installed_path() -> Result<std::path::PathBuf, String> {
+        let dirs = crate::instance::project_dirs()
+            .ok_or_else(|| "the data directory is unavailable".to_owned())?;
+        Ok(dirs.data_dir().join("workspace-model.sqlite3"))
+    }
+
+    /// The schema of this installation's store, or `None` if it has none; see
+    /// [`schema::stored_version`].
+    pub(crate) fn stored_schema() -> Result<Option<u32>, String> {
+        schema::stored_version(&Self::installed_path()?)
+    }
 
     /// Converts this installation's store back to schema `target`; see
     /// [`schema::downgrade`].
     pub(crate) fn downgrade(target: u32) -> Result<Option<u32>, String> {
-        let dirs = crate::instance::project_dirs()
-            .ok_or_else(|| "the data directory is unavailable".to_owned())?;
-        schema::downgrade(&dirs.data_dir().join("workspace-model.sqlite3"), target)
+        schema::downgrade(&Self::installed_path()?, target)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_schema_at(path: &Path) -> Result<Option<u32>, String> {
+        schema::stored_version(path)
     }
 
     #[cfg(test)]

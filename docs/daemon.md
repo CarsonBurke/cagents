@@ -339,14 +339,18 @@ than risk a second writer. Inspect `cagents daemon status` before retrying.
 
 A replacement daemon that started may already have converted the shared
 workspace store (`workspace-model.sqlite3`) to a newer schema, which the
-previous daemon refuses to open. Before it starts the previous daemon, the
-rollback asks the previous `cagentsd --store-schema` which schema it reads
-(releases before the converter read 22) and runs the replacement's
-`cagentsd --downgrade-store <schema>`, which converts the store back in one
-transaction, keeping every view, pane, retired id and applied pane change. The
-converter refuses while a daemon runs. If it fails, the installer keeps the new
-installation and prints the command to run once its daemon is stopped, rather
-than restore a daemon that cannot read its store.
+previous daemon refuses to open. Once the previous daemon has stopped and
+before the replacement starts, the installer records the store's schema with
+the replacement's `cagentsd --stored-schema`; that is the schema the previous
+daemon reads. A rollback then runs the replacement's
+`cagentsd --downgrade-store <schema>` (schema 22 for a store the replacement
+created), which converts the store back in one transaction, keeping every
+view, pane, retired id and applied pane change. The previous release is never
+run to ask, because releases before these options take none and would start a
+daemon. Both options refuse while a daemon runs. If the schema cannot be read,
+the installation is not changed; if the conversion fails, the installer keeps
+the new installation, which reads the store, rather than restore a daemon
+that cannot.
 
 A retained native conversation that its provider refuses to reattach, for
 example because Codex no longer finds the thread's rollout in its account

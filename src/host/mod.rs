@@ -287,16 +287,9 @@ fn listener_before_restore(
     Ok(listener)
 }
 
-/// The shared-model store schema this version writes.
-pub fn store_schema() -> u32 {
-    model::Registry::SCHEMA
-}
-
-/// Converts this installation's shared-model store back to schema `target`, so
-/// a daemon that predates the current schema can open it after a rollback.
-/// Holds the daemon lease throughout, so it refuses while a daemon runs.
-/// Returns the schema it converted from, or `None` if there was nothing to do.
-pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
+/// Runs `work` on this installation's shared-model store while holding the
+/// daemon lease, so no daemon can open or convert the store meanwhile.
+fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     let proof = HostSessionProof {
         host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
         boot_id: daemon::read_boot_id().map_err(|error| error.to_string())?,
@@ -305,11 +298,27 @@ pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
     let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
     let _lease = HostLease::acquire(&paths, &proof).map_err(|error| match error {
         PlatformError::AlreadyRunning { .. } => {
-            "a cagents daemon is running; stop it before converting its store".to_owned()
+            "a cagents daemon is running; stop it before reading or converting its store".to_owned()
         }
         error => error.to_string(),
     })?;
-    model::Registry::downgrade(target)
+    work()
+}
+
+/// The schema of this installation's shared-model store, or `None` if there is
+/// no store yet. The installer records it before a replacement daemon starts,
+/// since that daemon may convert the store forward, so that a rollback can
+/// convert it back without running the previous release.
+pub fn stored_schema() -> Result<Option<u32>, String> {
+    with_store_stopped(model::Registry::stored_schema)
+}
+
+/// Converts this installation's shared-model store back to schema `target`, so
+/// a daemon that predates the current schema can open it after a rollback.
+/// Refuses while a daemon runs. Returns the schema it converted from, or
+/// `None` if there was nothing to do.
+pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
+    with_store_stopped(|| model::Registry::downgrade(target))
 }
 
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {

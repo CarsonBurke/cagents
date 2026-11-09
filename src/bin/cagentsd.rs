@@ -3,9 +3,12 @@ fn command() -> clap::Command {
         .version(cagents::version())
         .about("Run the cagents terminal and conversation daemon. Prefer `cagents daemon start`.")
         .arg(
-            clap::Arg::new("store-schema")
-                .long("store-schema")
-                .help("Print the shared-model store schema this version writes, then exit")
+            clap::Arg::new("stored-schema")
+                .long("stored-schema")
+                .help(
+                    "Print the schema of the shared-model store on disk, or nothing if there is \
+                     none, then exit. Refuses while a daemon runs.",
+                )
                 .action(clap::ArgAction::SetTrue),
         )
         .arg(
@@ -63,9 +66,19 @@ fn main() -> std::process::ExitCode {
     // Informational flags exit before opening runtime state or taking its
     // daemon lease. Internal precheck owners keep their separate entrypoint.
     let matches = command().get_matches();
-    if matches.get_flag("store-schema") {
-        println!("{}", cagents::host::store_schema());
-        return std::process::ExitCode::SUCCESS;
+    if matches.get_flag("stored-schema") {
+        return match cagents::host::stored_schema() {
+            Ok(schema) => {
+                if let Some(schema) = schema {
+                    println!("{schema}");
+                }
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("cagentsd: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
     }
     if let Some(&target) = matches.get_one::<u32>("downgrade-store") {
         return match cagents::host::downgrade_store(target) {

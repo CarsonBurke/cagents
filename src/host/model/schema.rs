@@ -184,6 +184,19 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
 /// The oldest schema this version can convert a store back to.
 pub(super) const OLDEST_DOWNGRADE: u32 = 22;
 
+/// The schema of the store at `path`, or `None` when there is no store. Reads
+/// only; a store from a newer release is reported, not refused. The caller
+/// must hold the daemon lease, so that no daemon converts it meanwhile.
+pub(super) fn stored_version(path: &Path) -> Result<Option<u32>, String> {
+    if !path.try_exists().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let db = connect(path, false)?;
+    db.pragma_query_value(None, "user_version", |row| row.get(0))
+        .map(Some)
+        .map_err(|e| e.to_string())
+}
+
 /// Converts the store at `path` back to schema `target`, for a daemon that
 /// predates the current schema. One transaction: a failure leaves the store as
 /// it was. Returns the schema it converted from, or `None` when the store is
