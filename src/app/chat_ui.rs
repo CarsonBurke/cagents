@@ -7733,7 +7733,11 @@ impl Cagents {
         };
         // The new pane's input takes the keyboard through the workspace's
         // focus request, now if it is drawn or once it starts.
-        Task::batch([skills, self.apply_viewport(update, true, false), title])
+        Task::batch([
+            skills,
+            self.apply_viewport(update, true, DurableChange::None),
+            title,
+        ])
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -10004,7 +10008,7 @@ impl Cagents {
             self.workspace
                 .focus(*card)
                 .ok()
-                .map(|update| self.apply_viewport(update, true, false))
+                .map(|update| self.apply_viewport(update, true, DurableChange::None))
         } else {
             None
         };
@@ -21383,7 +21387,7 @@ mod tests {
         let first = live_chat(&mut app, Some("menu-first"));
         let second = live_chat(&mut app, Some("menu-second"));
         let update = app.workspace.resize_viewport(3_000.0);
-        let _ = app.apply_viewport(update, false, true);
+        let _ = app.apply_viewport(update, false, DurableChange::Content);
         let _ = app.update(Message::Viewport {
             generation: app.workspace_view_generation,
             event: WorkspaceViewportEvent::PointerRested(second),
