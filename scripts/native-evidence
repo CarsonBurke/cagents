@@ -40,7 +40,8 @@ both use the same fixture data and synthetic provider.
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--portal gtk|kde|gnome|cosmic]
-                  Take the native lock and start a headless session. The lock is
+                  Take the native lock and start a headless session at the
+                  requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
