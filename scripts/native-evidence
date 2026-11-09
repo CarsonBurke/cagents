@@ -814,6 +814,10 @@ cmd_seed() {
     [[ $number =~ ^[0-9]+$ ]] || die '--seed must be a whole number' 2
     require_side "$side"
     live_session && die 'stop the session before seeding its fixture'
+    # A lost session's daemon or window may still have the fixture's stores
+    # open; replacing them underneath it would hand it another workspace.
+    [ -z "$(session_processes)" ] ||
+        die 'processes of a lost session still use the fixture; run: stop'
     mark_used
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"

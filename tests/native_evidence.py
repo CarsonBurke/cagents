@@ -887,6 +887,16 @@ class Evidence(unittest.TestCase):
         self.assertIn("lost session", self.run_tool("stop").stdout)
         self.assertEqual(self.fixture_process_count(), 0)
 
+    def test_seed_refuses_while_a_lost_session_still_uses_the_fixture(self) -> None:
+        self.killed_supervisor_processes(9, extra={"CAGENTS_MEMORY_MAX": "0"})
+        marker = self.task / "fixture" / "home" / "kept"
+        marker.write_text("in use\n")
+        result = self.run_tool("seed", "--profile", "small", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("lost session", result.stderr)
+        self.assertTrue(marker.exists())
+        self.run_tool("stop")
+
     def test_a_portal_runs_inside_the_session_only_when_asked(self) -> None:
         self.built()
         self.run_tool("start", "after")
