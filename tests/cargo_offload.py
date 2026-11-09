@@ -60,6 +60,41 @@ offload = load_offload()
 os.environ["CAGENTS_BUILD_REGISTRY"] = ""
 
 
+def setUpModule():
+    """Fails the suite if it leaves anything in the runtime directories'
+    `cof`, where the build host's agent puts each slot's temporary files by
+    default: the one this environment names, and the login session's, which
+    the loopback gives the agent. A test's agent keeps them in its own
+    directory through CAGENTS_OFFLOAD_TEMPORARY_ROOT."""
+    roots = {Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "cof"),
+             Path(f"/run/user/{os.getuid()}", "cof")}
+
+    def names(root):
+        with contextlib.suppress(FileNotFoundError):
+            return {path.name for path in root.iterdir()}
+        return set()
+
+    def real_slots(root):
+        """The names this host's own slots take there: a build using a slot
+        for the first time while the suite runs adds one."""
+        temporary_directory = agent_function("temporary_directory")
+        with patch.dict(os.environ, {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(root)}):
+            return {os.path.basename(temporary_directory(str(slot))) for slot in
+                    Path("~/.cache/cagents-offload").expanduser().glob("*/slot-*")}
+
+    before = {root: names(root) for root in roots}
+
+    def unchanged():
+        left = {}
+        for root, known in before.items():
+            if new := names(root) - known:
+                if new := new - real_slots(root):
+                    left[str(root)] = sorted(new)
+        if left:
+            raise AssertionError(f"the tests left temporary directories outside their own: {left}")
+    unittest.addModuleCleanup(unchanged)
+
+
 def write_figures(directory, *, available_gib=1024, cpu=0, memory=0):
     """A build host's memory and CPU figures, standing in for /proc. Unless a
     test is about them, an idle, roomy host: admission otherwise holds builds
@@ -255,10 +290,13 @@ class RemoteCommand(unittest.TestCase):
 
 
 def agent_function(name):
+    """The build host's agent's top-level function `name`, on its own, with
+    the modules its functions use."""
+    import hashlib, stat
     tree = ast.parse(offload.REMOTE_AGENT)
     function = next(node for node in tree.body
                     if isinstance(node, ast.FunctionDef) and node.name == name)
-    scope = {"os": os}
+    scope = {"os": os, "hashlib": hashlib, "shutil": shutil, "stat": stat, "sys": sys}
     exec(compile(ast.Module([function], []), "agent", "exec"), scope)
     return scope[name]
 
@@ -506,30 +544,22 @@ class SharedConnection(unittest.TestCase):
 
 class EnclosingCheckout(unittest.TestCase):
     def test_a_git_marker_in_any_ancestor_is_found(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "enclosing_checkout")
-        scope = {"os": os}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        enclosing_checkout = agent_function("enclosing_checkout")
         with tempfile.TemporaryDirectory() as root:
             deep = Path(root, "a", "b", "c")
             deep.mkdir(parents=True)
-            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            self.assertIsNone(enclosing_checkout(str(deep)))
             Path(root, "a", ".git").mkdir()
-            self.assertEqual(scope["enclosing_checkout"](str(deep)), str(Path(root, "a", ".git")))
+            self.assertEqual(enclosing_checkout(str(deep)), str(Path(root, "a", ".git")))
             # The directory itself is not its own ancestor.
             Path(root, "a", ".git").rmdir()
             Path(deep, ".git").write_text("gitdir: x")
-            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            self.assertIsNone(enclosing_checkout(str(deep)))
 
 
 class Clear(unittest.TestCase):
     def test_directories_left_without_permissions_are_removed(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "clear")
-        scope = {"os": os, "shutil": shutil, "sys": sys}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        clear = agent_function("clear")
         with tempfile.TemporaryDirectory() as root:
             locked = Path(root, "t", "a", "target")
             (locked / "deep").mkdir(parents=True)
@@ -539,7 +569,7 @@ class Clear(unittest.TestCase):
             locked.chmod(0)
             Path(root, "t").chmod(0)
             Path(root).chmod(0o755)
-            scope["clear"](str(Path(root, "t")))
+            clear(str(Path(root, "t")))
             self.assertFalse(Path(root, "t").exists())
             # Outside the tree, nothing changed.
             self.assertEqual(Path(root).stat().st_mode & 0o777, 0o755)
@@ -547,13 +577,7 @@ class Clear(unittest.TestCase):
 
 class TemporaryDirectory(unittest.TestCase):
     def scope(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "temporary_directory")
-        import hashlib, stat
-        scope = {"os": os, "stat": stat, "hashlib": hashlib}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
-        return scope["temporary_directory"]
+        return agent_function("temporary_directory")
 
     def test_the_base_stays_within_the_fixtures_budget(self):
         temporary_directory = self.scope()
@@ -1455,10 +1479,19 @@ class StandInHost(unittest.TestCase):
 
     def test_a_program_run_inside_exec_cannot_compile_through_absolute_cargo(self):
         self.shell_program()
+        # The program's $CARGO is the first `cargo` on this host's PATH. A
+        # shim such as mise's, outside a directory where it manages Rust,
+        # looks `cargo` up on PATH again, finds the gate's and builds on the
+        # build host, so nothing reaches the guard. rustup's Cargo, first
+        # here as on the build host, compiles here.
+        cargo = os.path.join(self.env["CARGO_HOME"], "bin", "cargo")
+        env = self.remote_env() | self.logging_rustc_wrapper()
+        env["PATH"] = os.pathsep.join([os.path.dirname(cargo), env["PATH"]])
         result = self.gate_run(
             "exec", "cargo", "run", "--quiet", "--", "-ec",
-            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; "$CARGO" build --bin probe',
-            env=self.remote_env() | self.logging_rustc_wrapper())
+            '"$RUSTC_WRAPPER" rustc -vV >/dev/null; printf %s "$CARGO"; "$CARGO" build --bin probe',
+            env=env)
+        self.assertEqual(result.stdout, cargo, result.stderr)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("would compile on this host", result.stderr)
         self.assertEqual([path for path in (self.root / "local-build").rglob("probe*")
@@ -1889,16 +1922,23 @@ class RemoteRun(unittest.TestCase):
     """The build host's end of a command: it ends what it started when the
     connection to this host closes, outside any supervisor here."""
 
+    def agent(self, scope, *arguments, env=None, **options):
+        """Starts the build host's agent in `scope`, as ssh would there. Its
+        temporary directories go in the scope: by default they would go in
+        the runtime directory, which the host's own builds share."""
+        return scope.popen(
+            [sys.executable, "-c", offload.REMOTE_AGENT, *arguments],
+            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(scope.name, "cof"))}
+            | (env or {}), **options)
+
     def test_a_released_slot_waits_for_its_command_to_end(self):
         # A cancelled build closes the lease and the command's connections
         # together; the next build must not start in the slot while the
         # command's process group is still being ended.
         with FixtureDirectory() as scope:
             base = scope.name
-            lease = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
-                stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
+            lease = self.agent(scope, "lease", base, "1", "key", "0", "",
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
             self.assertRegex(offload.Lines(lease.stdout).next(10), r'^slot \{"index": 0, ')
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
@@ -1915,8 +1955,7 @@ class RemoteRun(unittest.TestCase):
             stale.write_text("")
             with open(Path(base, "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                prune = scope.popen([sys.executable, "-c", offload.REMOTE_AGENT, "prune", base],
-                                         stdin=subprocess.PIPE)
+                prune = self.agent(scope, "prune", base, stdin=subprocess.PIPE)
                 prune.stdin.close()
                 with self.assertRaises(subprocess.TimeoutExpired):
                     prune.wait(timeout=1)
@@ -1931,10 +1970,8 @@ class RemoteRun(unittest.TestCase):
             Path(base, "slot-0").mkdir()
             with open(Path(base, "slot-0", "running"), "a") as running:
                 fcntl.flock(running, fcntl.LOCK_EX)
-                lease = scope.popen(
-                    [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, "1", "key", "0", ""],
-                    stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-                    env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof"))})
+                lease = self.agent(scope, "lease", base, "1", "key", "0", "",
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
                 lines = offload.Lines(lease.stdout)
                 # It says it is waiting, so a long wait is not taken for a
                 # host that does not answer.
@@ -1958,14 +1995,12 @@ class RemoteRun(unittest.TestCase):
         if figures is None:
             figures = Path(base, "figures")
             write_figures(figures)
-        lease = self.scope.popen(
-            [sys.executable, "-c", offload.REMOTE_AGENT, "lease", base, str(slots), "key", "0", "",
-             "", build],
+        lease = self.agent(
+            self.scope, "lease", base, str(slots), "key", "0", "", "", build,
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
-            env=os.environ | {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(Path(base, "cof")),
-                              "CAGENTS_BUILD_REGISTRY": str(registry),
-                              "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
-                              "CAGENTS_OFFLOAD_FIGURES": str(figures)} | (env or {}))
+            env={"CAGENTS_BUILD_REGISTRY": str(registry),
+                 "CAGENTS_OFFLOAD_SLOT_DISK_BYTES": str(slot_disk),
+                 "CAGENTS_OFFLOAD_FIGURES": str(figures)} | (env or {}))
         return lease, offload.Lines(lease.stdout)
 
     def hold(self, base, index, claim=None):
@@ -2202,8 +2237,8 @@ class RemoteRun(unittest.TestCase):
     def run_agent(self, scope, base, command):
         Path(base, "src").mkdir(exist_ok=True)
         # Its standard input stays open: closing it cancels the command.
-        agent = scope.popen([sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                                  *command], stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+        agent = self.agent(scope, "run", base, ".", *command,
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
         agent.stdin.write(b'{"environment": {}}\n')
         agent.stdin.flush()
         output = agent.stdout.read()
@@ -2247,9 +2282,8 @@ class RemoteRun(unittest.TestCase):
                         "CAGENTS_BUILD_REGISTRY": str(registry)}
             if least is not None:
                 settings["CAGENTS_OFFLOAD_TEST_LEAST_BYTES"] = str(least)
-            agent = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "run", str(base), ".", *command],
-                stdin=subprocess.PIPE, env=os.environ | settings)
+            agent = self.agent(scope, "run", str(base), ".", *command,
+                               stdin=subprocess.PIPE, env=settings)
             # A relocatable Python finds its library by its own path, which
             # its copies do not share.
             request = {"environment": {"PYTHONHOME": sys.base_prefix}}
@@ -2338,10 +2372,9 @@ class RemoteRun(unittest.TestCase):
             base = scope.name
             Path(base, "src").mkdir()
             marker = Path(base, "pid")
-            agent = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                 "sh", "-c", f"sleep 120 & echo $! >{marker}; wait"],
-                stdin=subprocess.PIPE, start_new_session=True)
+            agent = self.agent(scope, "run", base, ".",
+                               "sh", "-c", f"sleep 120 & echo $! >{marker}; wait",
+                               stdin=subprocess.PIPE, start_new_session=True)
             agent.stdin.write(b'{"environment": {}}\n')
             agent.stdin.flush()
             deadline = time.monotonic() + 10
@@ -2370,10 +2403,8 @@ class RemoteRun(unittest.TestCase):
             base = scope.name
             Path(base, "src").mkdir()
             # The connection stays open, as it does while the gate waits.
-            agent = scope.popen(
-                [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                 "sh", "-c", 'test "$PROBE" = x && exit 7'],
-                stdin=subprocess.PIPE)
+            agent = self.agent(scope, "run", base, ".", "sh", "-c", 'test "$PROBE" = x && exit 7',
+                               stdin=subprocess.PIPE)
             agent.stdin.write(b'{"environment": {"PROBE": "x"}}\n')
             agent.stdin.flush()
             self.assertEqual(agent.wait(timeout=15), 7)
@@ -2387,9 +2418,8 @@ class RemoteRun(unittest.TestCase):
                 base = scope.name
                 Path(base, "src").mkdir()
                 # The agent starts low, as an ssh session's 1024 does.
-                agent = scope.popen(
-                    [sys.executable, "-c", offload.REMOTE_AGENT, "run", base, ".",
-                     "sh", "-c", "ulimit -Sn"],
+                agent = self.agent(
+                    scope, "run", base, ".", "sh", "-c", "ulimit -Sn",
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                     preexec_fn=lambda: resource.setrlimit(resource.RLIMIT_NOFILE, (32, hard)))
                 # The connection stays open, as it does while the gate waits.

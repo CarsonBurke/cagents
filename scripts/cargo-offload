@@ -1867,11 +1867,13 @@ elif command == "run":
         cpus = len(os.sched_getaffinity(0))
         environment["CARGO_BUILD_JOBS"] = str(
             min(max(4, cpus // max(1, builds)), max(4, min(8, cpus // 2))))
-    # Temporary files go on disk in a directory of this slot's own, rather
-    # than in the host's /tmp, which may be memory and which others use. The
-    # path stays short: tests bind Unix sockets under it, whose paths are
-    # limited to 108 bytes. The slot runs one command at a time, so whatever
-    # the last one left there is stale.
+    # Temporary files go in a directory of this slot's own, rather than in
+    # the host's /tmp, which others use: temporary_directory puts it in the
+    # runtime directory, which is memory on a systemd host such as fw16, or
+    # in the slot when that is unsafe or unavailable. The path stays short:
+    # tests bind Unix sockets under it, whose paths are limited to 108 bytes.
+    # The slot runs one command at a time, so whatever the last one left
+    # there is stale.
     environment["TMPDIR"] = temporary = temporary_directory(base)
     # What the command starts is this build's, whichever session it moves to.
     environment[SLOT_MARK] = os.path.realpath(base)
