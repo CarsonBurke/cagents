@@ -46,6 +46,10 @@ pub(super) fn record_card_index() {
 pub(super) fn record_persist() {
     PERSISTS.set(PERSISTS.get() + 1);
 }
+/// How many times this thread's windows have saved their workspace.
+pub(super) fn persist_count() -> usize {
+    PERSISTS.get()
+}
 fn counts() -> (usize, usize) {
     (PROJECTIONS.get(), PROTECTIONS.get())
 }

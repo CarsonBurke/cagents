@@ -2406,6 +2406,9 @@ pub(super) struct Runtime {
     /// this conversation stopped, now returned to the composer unsent. Shown
     /// beside the draft until it is sent or the notice is dismissed.
     restored_waiting: Option<RestoredWaiting>,
+    /// The provider queue a parked runtime last saved, by entry, as a parked
+    /// runtime does not refresh the snapshot a live one compares against.
+    parked_queue: Vec<String>,
     composer_actions: bool,
     /// The `+` menu's search, cleared each time the menu opens.
     composer_actions_query: String,
@@ -3463,6 +3466,7 @@ impl Runtime {
             taken_back: Vec::new(),
             resend: None,
             restored_waiting: None,
+            parked_queue: Vec::new(),
             composer_actions: false,
             composer_actions_query: String::new(),
             mode_before_plan: None,
@@ -11142,20 +11146,31 @@ impl Cagents {
                 if let Some(runtime) = self.chat_ui.parked.get_mut(&target.card)
                     && runtime.target == target
                 {
-                    let snapshot = match runtime.handle() {
-                        Some(handle) if needs_name && matches!(wake, Wake::Changed) => {
-                            Some(handle.snapshot())
-                        }
+                    let current = match runtime.handle() {
+                        Some(handle) if matches!(wake, Wake::Changed) => Some(handle.snapshot()),
                         _ => None,
                     };
+                    // A queue that changes off screen is saved as it changes.
+                    let mut queue_changed = false;
+                    if let Some(snapshot) = &current {
+                        let ids = snapshot.queued_messages.iter().map(|message| &message.id);
+                        if !ids.clone().eq(runtime.parked_queue.iter()) {
+                            runtime.parked_queue = ids.cloned().collect();
+                            queue_changed = true;
+                        }
+                    }
                     if let Wake::Disconnected(error) = wake {
                         runtime.disconnected = true;
                         runtime.error = Some(error);
                     }
-                    if let Some((name, source)) =
-                        snapshot.and_then(|snapshot| self.observe_channel_name(target, &snapshot))
+                    if let Some((name, source)) = current
+                        .filter(|_| needs_name)
+                        .and_then(|snapshot| self.observe_channel_name(target, &snapshot))
                     {
                         self.publish_observed_channel_name(target, name, source);
+                    }
+                    if queue_changed {
+                        self.persist();
                     }
                     return Task::none();
                 }
@@ -13508,6 +13523,11 @@ impl Cagents {
                     && let Some(CardRuntime::Chat(mut runtime)) = self.cards.remove(&target.card)
                 {
                     runtime.show(false);
+                    runtime.parked_queue = snapshot
+                        .queued_messages
+                        .iter()
+                        .map(|message| message.id.clone())
+                        .collect();
                     self.chat_ui.parked.insert(target.card, runtime);
                 }
                 // Enqueue the returned live proof checkpoint. The host retains
@@ -23360,10 +23380,27 @@ mod tests {
         snapshot.queued_messages.remove(0);
         snapshot.generation += 1;
         handle.publish_snapshot_for_test(snapshot);
+        let saves = crate::app::terminal_output_tests::persist_count();
         drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
         assert_eq!(
-            app.durable.chat_waiting_messages.get(&card).unwrap(),
+            crate::app::terminal_output_tests::persist_count(),
+            saves + 1
+        );
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_waiting_messages
+                .get(&card)
+                .unwrap(),
             &saved_queue()[1..]
+        );
+        // A publication that leaves the queue as it was saves nothing more.
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(
+            crate::app::terminal_output_tests::persist_count(),
+            saves + 1
         );
         provider_drops(&mut app, target, &handle, "queued-2", None);
         assert!(
