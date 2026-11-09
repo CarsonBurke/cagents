@@ -47,6 +47,9 @@ pub(super) struct State {
     /// The untouched draft `/resume` was asked from, which the resumed
     /// conversation takes the place of.
     pub(super) replace: Option<CardId>,
+    /// The conversation `/resume` was typed in. It is not listed: the reader
+    /// is already in it.
+    pub(super) asked_from: Option<CardId>,
     /// Transcripts read so far and transcripts to read, while indexing.
     indexing: Option<(usize, usize)>,
     /// Whether a chosen conversation is being prepared to resume.
@@ -650,14 +653,19 @@ impl Cagents {
             return None;
         }
         let state = &mut self.resume_ui;
-        let last = state.visible.len().min(state.limit).saturating_sub(1);
-        state.selected = match key {
-            Named::ArrowDown => (state.selected + 1).min(last),
+        let target = match key {
+            Named::ArrowDown => state.selected + 1,
             Named::ArrowUp => state.selected.saturating_sub(1),
-            Named::PageDown => (state.selected + PAGE_STEP).min(last),
+            Named::PageDown => state.selected + PAGE_STEP,
             Named::PageUp => state.selected.saturating_sub(PAGE_STEP),
             _ => return None,
         };
+        // Moving past the last row listed lists more, as "Show more" does,
+        // which the keyboard cannot reach while the picker owns Tab.
+        if target >= state.limit {
+            state.limit = (target + 1).next_multiple_of(PAGE);
+        }
+        state.selected = target.min(state.visible.len().min(state.limit).saturating_sub(1));
         Some(self.reveal_resume_selection())
     }
 
@@ -812,6 +820,7 @@ impl Cagents {
             })
         });
         let task = self.open_resume(scope)?;
+        self.resume_ui.asked_from = Some(card);
         Some(Task::batch([
             task,
             self.update_resume(Action::Query(query)),
@@ -848,6 +857,7 @@ impl Cagents {
         state.missing.clear();
         state.counts = [0; 3];
         state.replace = None;
+        state.asked_from = None;
         state.error = None;
         state.loading = false;
         state.indexing = Some((0, 0));
@@ -1070,8 +1080,10 @@ impl Cagents {
                     .iter()
                     .map(|seed| self.resume_account_label(seed))
                     .collect();
+                let asked_from = self.resume_ui.asked_from;
                 let rows = entries
                     .into_iter()
+                    .filter(|entry| Some(entry.card) != asked_from)
                     .map(|entry| {
                         let account = self.resume_account_label(&entry.session);
                         let place =
@@ -2468,6 +2480,81 @@ mod tests {
             app.resume_ui.selected >= PAGE && app.resume_ui.selected < app.resume_ui.limit,
             "a page of newer rows leaves it listed"
         );
+    }
+
+    fn press(app: &mut Cagents, key: keyboard::key::Named) {
+        let _ = app.resume_key_event(&keyboard::Event::KeyPressed {
+            key: keyboard::Key::Named(key),
+            modified_key: keyboard::Key::Named(key),
+            physical_key: keyboard::key::Physical::Unidentified(
+                keyboard::key::NativeCode::Unidentified,
+            ),
+            location: keyboard::Location::Standard,
+            modifiers: keyboard::Modifiers::empty(),
+            text: None,
+            repeat: false,
+        });
+    }
+
+    /// "Show more" is a button the keyboard cannot reach while the picker
+    /// owns Tab, so moving past the last row listed lists more.
+    #[test]
+    fn the_keyboard_reaches_past_the_first_page() {
+        use keyboard::key::Named;
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        list(
+            &mut app,
+            generation,
+            (0..PAGE + 20).map(|_| saved(directory.path())).collect(),
+        );
+        assert_eq!(app.resume_ui.visible.len(), PAGE + 20);
+        assert_eq!(app.resume_ui.limit, PAGE);
+        for _ in 0..PAGE / PAGE_STEP {
+            press(&mut app, Named::PageDown);
+        }
+        assert_eq!(app.resume_ui.selected, PAGE / PAGE_STEP * PAGE_STEP);
+        while app.resume_ui.selected < PAGE - 1 {
+            press(&mut app, Named::ArrowDown);
+        }
+        press(&mut app, Named::ArrowDown);
+        assert_eq!(app.resume_ui.selected, PAGE, "the next page is listed");
+        assert!(app.resume_ui.limit > PAGE);
+        for _ in 0..10 {
+            press(&mut app, Named::PageDown);
+        }
+        assert_eq!(app.resume_ui.selected, PAGE + 19, "and stops at the last");
+        press(&mut app, Named::PageUp);
+        assert_eq!(app.resume_ui.selected, PAGE + 19 - PAGE_STEP);
+    }
+
+    /// `/resume` lists conversations to go to, so the one it was typed in,
+    /// where the reader already is, is not among them.
+    #[test]
+    fn resume_does_not_offer_the_conversation_it_was_typed_in() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        let generation = app.resume_ui.generation;
+        let here = SavedConversation {
+            open: true,
+            updated_at_unix_ms: 2,
+            ..saved(directory.path())
+        };
+        let earlier = saved(directory.path());
+        app.resume_ui.asked_from = Some(here.card);
+        list(&mut app, generation, vec![here, earlier.clone()]);
+        let listed = app
+            .resume_ui
+            .visible
+            .iter()
+            .map(|&index| app.resume_ui.rows[index].card)
+            .collect::<Vec<_>>();
+        assert_eq!(listed, [earlier.card]);
     }
 
     /// The picker opens on its project, with its worktree and every

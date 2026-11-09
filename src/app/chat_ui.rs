@@ -24448,6 +24448,7 @@ mod tests {
         assert!(runtime.composer.is_empty());
         assert!(runtime.is_draft() && !app.chat_start_pending(card));
         assert_eq!(app.resume_ui.replace, Some(card));
+        assert_eq!(app.resume_ui.asked_from, Some(card), "not offered");
 
         let _ = app.resume_saved_conversation(earlier(&app, card));
         let resumed = app.workspace.focused().unwrap();
