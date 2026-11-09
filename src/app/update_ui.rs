@@ -256,8 +256,29 @@ impl State {
     /// per line, for the header control's tooltip: its summary only counts
     /// them, and a window that never watched the review has no notice that
     /// names them.
+    /// They are what the review found, so they are introduced as such: a
+    /// conversation closed since then no longer holds anything back.
     fn held_back(&self) -> Option<String> {
-        self.refusal().map(|refusal| refusal.details().join("\n"))
+        self.refusal().map(|refusal| {
+            format!(
+                "Held back at that attempt by:\n{}",
+                refusal.details().join("\n")
+            )
+        })
+    }
+
+    /// What the header adds when a newer installed build outranks the
+    /// refusal's own warning: which update was stopped, why, and that
+    /// reopening windows, which retries it, asks again.
+    fn superseded_refusal(&self) -> Option<String> {
+        let refusal = self.refusal()?;
+        let job = self.job.as_ref()?;
+        Some(format!(
+            "Switching to {} was stopped: {}. Reopening windows asks again.\n{}",
+            job.version,
+            refusal.summary(),
+            self.held_back()?
+        ))
     }
 
     /// The header's account of what went wrong with the last update, and
@@ -612,18 +633,15 @@ impl Cagents {
             )
         } else if state.superseded.is_some() {
             // Reopening retries the installed update. When a review refused
-            // it, this outranks the warning that names why, so carry that.
-            held_back = state
-                .refusal()
-                .zip(state.held_back())
-                .map(|(refusal, reasons)| {
-                    format!(
-                        "The last update was not installed: {}.\n{reasons}",
-                        refusal.summary()
-                    )
-                });
+            // it, this outranks the warning that names why, so carry that,
+            // and keep the warning icon so it shows without a hover.
+            held_back = state.superseded_refusal();
             (
-                Icon::Update,
+                if held_back.is_some() {
+                    Icon::Warning
+                } else {
+                    Icon::Update
+                },
                 "A newer build is installed; reopen windows to use it".to_owned(),
                 Some(Message::UpdateUi(Action::Restart)),
             )
@@ -1235,7 +1253,20 @@ mod tests {
         assert_eq!(
             app.update_ui.held_back().as_deref(),
             Some(
-                "Claude: Its provider stopped but may still hold unfinished work. \
+                "Held back at that attempt by:\n\
+                 Claude: Its provider stopped but may still hold unfinished work. \
+                 Close this conversation to release it."
+            )
+        );
+        // Where a newer installed build outranks that warning, the header
+        // still says which update was stopped and why.
+        assert_eq!(
+            app.update_ui.superseded_refusal().as_deref(),
+            Some(
+                "Switching to 9.8.7 was stopped: 1 session needs attention. \
+                 Reopening windows asks again.\n\
+                 Held back at that attempt by:\n\
+                 Claude: Its provider stopped but may still hold unfinished work. \
                  Close this conversation to release it."
             )
         );

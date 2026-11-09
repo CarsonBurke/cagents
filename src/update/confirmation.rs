@@ -144,8 +144,8 @@ fn wait_for(
                 }
                 fs::remove_file(&path)?;
                 match decision.choice {
-                    // A blocked preview offers nothing but closing it, so
-                    // closing it is the refusal its blockers caused.
+                    // A blocked preview cannot be confirmed, so closing it
+                    // is the refusal its blockers caused.
                     Choice::Cancel => {
                         return Err(refused(&preview, false).unwrap_or(UpdateError::Declined));
                     }

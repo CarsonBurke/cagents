@@ -758,6 +758,9 @@ pub fn upgrade_installed(
 /// approved, in a window, is theirs to keep.
 fn close_review(job: &str, reviewed: &str, ended_any: bool) {
     let deadline = Instant::now() + Duration::from_secs(if ended_any { 5 } else { 0 });
+    // A cancel can lose a race with a republish; the review it missed is
+    // read again and closed in its place.
+    let mut attempts = 3;
     loop {
         let Ok(current) = status() else {
             let _ = decide(job, reviewed, UpdateChoice::Cancel);
@@ -776,8 +779,11 @@ fn close_review(job: &str, reviewed: &str, ended_any: bool) {
             return;
         }
         if Instant::now() >= deadline {
-            let _ = decide(job, reviewed, UpdateChoice::Cancel);
-            return;
+            attempts -= 1;
+            if decide(job, reviewed, UpdateChoice::Cancel).is_ok() || attempts == 0 {
+                return;
+            }
+            continue;
         }
         thread::sleep(Duration::from_millis(250));
     }
