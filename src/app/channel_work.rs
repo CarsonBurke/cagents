@@ -1751,7 +1751,7 @@ mod tests {
             assert_eq!(selection, ("fixture/work".into(), 0, 12));
             let cache = frame.into_cache();
             let update = app.workspace.focus(survivor).unwrap();
-            let hidden = app.apply_viewport(update, false, true);
+            let hidden = app.apply_viewport(update, false, DurableChange::Content);
             let mut frame = mount(&app, cache, &mut renderer);
             let messages = local_close_effects(&mut frame, &renderer, hidden);
             assert!(
@@ -1765,8 +1765,11 @@ mod tests {
             // Isolate delivery of the original queued focus: expose the
             // Conversations frame without issuing a new focus request.
             app.channel_work.main = false;
-            let visible =
-                app.apply_viewport(crate::workspace::ViewportUpdate::unchanged(), false, true);
+            let visible = app.apply_viewport(
+                crate::workspace::ViewportUpdate::unchanged(),
+                false,
+                DurableChange::Content,
+            );
             let mut frame = mount(&app, cache, &mut renderer);
             let messages = local_close_effects(&mut frame, &renderer, visible);
             assert!(
