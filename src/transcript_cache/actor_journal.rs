@@ -261,8 +261,7 @@ mod tests {
         );
         retention.allow_removal().unwrap();
         assert_eq!(
-            crate::transcript_cache::sweep_reclaiming(root.path(), Path::new("/proc"), &directory)
-                .count,
+            crate::transcript_cache::sweep(root.path()).unwrap().count,
             1
         );
         assert!(!directory.exists());
@@ -286,9 +285,6 @@ mod tests {
 
         let later = |after| std::time::SystemTime::now() + after;
         let retention = crate::transcript_cache::ORPHANED_JOURNAL_RETENTION;
-        // A concurrent test's fork can briefly keep a dropped lease locked;
-        // keeping the directory then would prove nothing about retention.
-        crate::transcript_cache::wait_unleased(&orphan);
         assert_eq!(
             crate::transcript_cache::sweep_at(
                 root.path(),
@@ -301,12 +297,12 @@ mod tests {
             "a recent failure stays inspectable"
         );
         assert!(orphan.join(JOURNAL).exists());
-        let swept = crate::transcript_cache::sweep_reclaiming_at(
+        let swept = crate::transcript_cache::sweep_at(
             root.path(),
             Path::new("/proc"),
-            &orphan,
-            || later(retention + std::time::Duration::from_secs(60)),
-        );
+            later(retention + std::time::Duration::from_secs(60)),
+        )
+        .unwrap();
         assert_eq!(swept.count, 1);
         assert!(!orphan.exists());
         assert!(
