@@ -28,9 +28,12 @@
 # `unreachable` moves one project's folder away in the seed, so every later
 # session finds that project missing as it loads the sidebar.
 #
-# No step here produces a failed worktree deletion: the delete dialog checks
-# for a lock both as it opens and as it is confirmed, and Git still forgets a
-# worktree it could only partly remove, so the row goes either way.
+# `live` also puts a `git` in front of the real one on the session's PATH
+# that refuses to remove billing-service's linked worktrees, slowly:
+# deleting one from the sidebar shows it deleting for 20 seconds, then
+# failed. Every other command reaches the real Git. Nothing in Git itself
+# serves: the delete dialog refuses a locked worktree both as it opens and as
+# it is confirmed, and Git forgets a worktree it could only partly remove.
 #
 # The result frames carry no session_id: the app refuses a result from any
 # conversation but the agent's own, and the fixture names that one itself.
@@ -217,6 +220,26 @@ cmd_live() {
     spawn unread edge-proxy "TLS renewals"
     spawn working edge-proxy "TLS renewals"
     rm -f -- "$frames"
+    refuse_removal
+}
+
+refuse_removal() {
+    local real
+    real=$(PATH=/usr/local/bin:/usr/bin command -v git)
+    # The fixture's bin comes first on the session's PATH, and the app looks
+    # Git up there each time it runs it.
+    cat >"$fixture/bin/git" <<EOF
+#!/bin/sh
+case " \$* " in
+    *" worktree remove "*"/billing-service-"*)
+        sleep 20
+        echo "error: fixture: refusing to remove this worktree" >&2
+        exit 1
+        ;;
+esac
+exec $real "\$@"
+EOF
+    chmod 755 "$fixture/bin/git"
 }
 
 cmd_unreachable() {
