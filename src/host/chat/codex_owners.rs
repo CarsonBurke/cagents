@@ -332,11 +332,17 @@ mod tests {
         let found = writer(Some(&lock), "unrelated").unwrap().unwrap();
         assert_eq!(found.pid, std::process::id() as libc::pid_t);
         assert!(found.hosted);
+        // Another test may fork before exec while this file is open. Those
+        // inherited descriptors share its open file description, just like
+        // this duplicate, so dropping our original alone need not unlock it.
+        let inherited = held.try_clone().unwrap();
+        assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_UN) }, 0);
         drop(held);
         assert_eq!(
             lock_holder(&lock, &read("/proc/locks").unwrap()).unwrap(),
             None
         );
+        drop(inherited);
     }
 
     #[test]
