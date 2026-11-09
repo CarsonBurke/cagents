@@ -1915,6 +1915,9 @@ mod tests {
             fs::read(retained_directory.join("actor-journal.sqlite")).unwrap(),
             b"accepted input and unacknowledged outcome"
         );
+        // A forked copy of the dropped lease would make the sweep skip the
+        // cache rather than judge, and keep it.
+        crate::transcript_cache::wait_unleased(&retained_directory);
         assert_eq!(
             crate::transcript_cache::sweep(root.path()).unwrap().count,
             0

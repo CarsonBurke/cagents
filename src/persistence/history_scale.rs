@@ -282,21 +282,30 @@ fn statements_during(store: &StateStore, run: impl FnOnce()) -> Vec<String> {
         }
         0
     }
-    let recorded = Mutex::new(Vec::new());
-    // SAFETY: the handle is the store's open connection, which outlives this
-    // call; the trace is removed again before `recorded` goes out of scope.
-    let handle = unsafe { store.lock_inner().unwrap().connection.handle() };
-    unsafe {
-        ffi::sqlite3_trace_v2(
-            handle,
-            ffi::SQLITE_TRACE_STMT as c_uint,
-            Some(record),
-            (&raw const recorded).cast_mut().cast(),
-        );
+    /// Removes the trace when dropped, so a `run` that panics cannot leave
+    /// SQLite calling back into a `recorded` its unwinding has freed.
+    struct Traced(*mut ffi::sqlite3);
+    impl Drop for Traced {
+        fn drop(&mut self) {
+            // SAFETY: the handle is still the store's open connection.
+            unsafe { ffi::sqlite3_trace_v2(self.0, 0, None, std::ptr::null_mut()) };
+        }
     }
-    run();
-    unsafe {
-        ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut());
+    let recorded = Mutex::new(Vec::new());
+    {
+        // SAFETY: the handle is the store's open connection, which outlives
+        // this call; `traced` removes the trace before `recorded` is dropped.
+        let handle = unsafe { store.lock_inner().unwrap().connection.handle() };
+        unsafe {
+            ffi::sqlite3_trace_v2(
+                handle,
+                ffi::SQLITE_TRACE_STMT as c_uint,
+                Some(record),
+                (&raw const recorded).cast_mut().cast(),
+            );
+        }
+        let _traced = Traced(handle);
+        run();
     }
     recorded.into_inner().unwrap()
 }

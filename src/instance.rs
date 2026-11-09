@@ -552,7 +552,10 @@ pub const DEVELOPMENT_DAEMON_LOG_ENV: &str = "CAGENTS_DEVELOPMENT_DAEMON_LOG";
 
 /// Points standard error at [`DEVELOPMENT_DAEMON_LOG_ENV`]'s file when a
 /// development build names one, and removes the variable so the daemon's
-/// terminals and agents do not inherit it. Production builds ignore it.
+/// terminals and agents do not inherit it; children that inherit standard
+/// error, such as helpers, write to the same file. Production builds ignore
+/// the variable. A file that cannot be opened is reported on the original
+/// standard error, which a spawned daemon has on `/dev/null`.
 ///
 /// # Safety
 /// Call from the single-threaded entry point: this changes the environment.

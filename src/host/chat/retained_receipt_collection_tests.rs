@@ -37,16 +37,17 @@ const INELIGIBLE: [Case; 6] = [
 
 /// The census in actor order, which is the order it is paged in 128s.
 ///
-/// Pages one and two interleave ineligible actors with retired ones, including
-/// the last row of page one and the first of page two; page three holds no
-/// retired actor at all; page four is a partial page of retired actors. The
-/// pass must reach all 300 retired actors.
+/// Pages one and two interleave ineligible actors with retired ones, and a
+/// retired actor sits on each side of their boundary, so a page that drops or
+/// repeats its first or last row compacts the wrong set. Page three holds no
+/// retired actor at all, and page four is a partial page that starts with one,
+/// so a pass that stops at an empty page, or skips the row after one, falls
+/// short of all 300.
 fn census() -> Vec<Case> {
     let mut ineligible = INELIGIBLE.iter().copied().cycle();
     let mut cases = (0..256)
         .map(|row| match row % 4 {
-            3 => ineligible.next().unwrap(),
-            _ if row == 128 => ineligible.next().unwrap(),
+            1 => ineligible.next().unwrap(),
             _ => Case::Retired,
         })
         .collect::<Vec<_>>();
@@ -70,6 +71,11 @@ fn reaped_process() -> crate::daemon::holder_registry::Process {
 
 #[test]
 fn collection_compacts_every_committed_verified_retirement_and_nothing_else() {
+    // A supervisor refuses an --exact that selects nothing, bounds a hang and
+    // reaps whatever the body leaves behind.
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
     const ROOT: &str = "CAGENTS_RECEIPT_COLLECTION_FIXTURE";
     let Some(root) = std::env::var_os(ROOT).map(PathBuf::from) else {
         // The receipts live in the runtime directory and the reader must hold
@@ -82,6 +88,7 @@ fn collection_compacts_every_committed_verified_retirement_and_nothing_else() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", &exact, "--nocapture"])
             .env_clear()
+            .envs(crate::retained_fixture::owner_env())
             .env(ROOT, directory.path())
             .env("HOME", directory.path().join("home"))
             .env("XDG_RUNTIME_DIR", directory.path().join("run"))
@@ -96,6 +103,11 @@ fn collection_compacts_every_committed_verified_retirement_and_nothing_else() {
             "isolated receipt collection failed:\nstdout={}\nstderr={}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "the isolated body ran: {}",
+            String::from_utf8_lossy(&output.stdout)
         );
         return;
     };
@@ -227,8 +239,16 @@ fn census_layout_straddles_every_page_boundary() {
         300
     );
     assert_eq!(census.len().div_ceil(128), 4);
-    assert_ne!(census[127], Case::Retired);
-    assert_ne!(census[128], Case::Retired);
+    for (row, retired) in [
+        (127, true),
+        (128, true),
+        (255, true),
+        (256, false),
+        (383, false),
+        (384, true),
+    ] {
+        assert_eq!(census[row] == Case::Retired, retired, "row {row}");
+    }
     assert!(page(2).iter().all(|case| *case != Case::Retired));
     assert!(page(3).iter().all(|case| *case == Case::Retired));
     for case in INELIGIBLE {
