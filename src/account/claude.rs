@@ -341,6 +341,13 @@ fn normalized_window(limit: &Value) -> Option<UsageWindow> {
     })
 }
 
+/// The model or surface a window applies to, where Claude scoped it. A
+/// scoped window's key is `{kind}:{scope}`; an account-wide one's has no
+/// colon, whatever its label shows.
+pub fn window_scope(window: &UsageWindow) -> Option<&str> {
+    window.key.split_once(':').map(|(_, scope)| scope)
+}
+
 /// What a scoped limit applies to: a model's display name, else a surface.
 fn scope_label(scope: &Value) -> Option<String> {
     let model = &scope["model"];
@@ -815,6 +822,8 @@ mod tests {
             .map(|window| window.key.as_str())
             .collect();
         assert_eq!(keys, ["session", "weekly_all", "weekly_scoped:Opus"]);
+        let scopes: Vec<_> = usage.windows.iter().map(window_scope).collect();
+        assert_eq!(scopes, [None, None, Some("Opus")]);
         assert_eq!(usage.status, UsageStatus::Limited);
         assert_eq!(usage.windows[1].resets_at, None);
         assert!(usage.credits.is_none());
@@ -841,6 +850,9 @@ mod tests {
             labels,
             ["Session · Daily burst", "Weekly · Cowork", "Monthly pool"]
         );
+        // Only what Claude scoped is scoped, whatever the label shows.
+        let scopes: Vec<_> = usage.windows.iter().map(window_scope).collect();
+        assert_eq!(scopes, [None, Some("Cowork"), None]);
         assert_eq!(usage.windows[2].kind, WindowKind::Other);
     }
 

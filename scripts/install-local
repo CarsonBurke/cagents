@@ -29,7 +29,7 @@ and edits in other checkouts never reach the binaries.
 
   --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
                      to the repository at the same path relative to $HOME.
-  --stage-only       Stop after staging; finish from the application's notice.
+  --stage-only       Stop after staging; finish later with: cagents daemon upgrade
   --this-commit      Build HEAD even when it is detached or its branch is
                      behind its upstream.
   --yes, --interrupt, --accept-unreopenable
@@ -257,7 +257,7 @@ EOF
 fi
 
 if ((STAGE_ONLY)); then
-    printf 'Staged %s. Finish the update from the application, or run: cagents daemon upgrade\n' "$VERSION"
+    printf 'Staged %s. Finish the update with: cagents daemon upgrade\n' "$VERSION"
     exit 0
 fi
 exec "$PREFIX/current/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"

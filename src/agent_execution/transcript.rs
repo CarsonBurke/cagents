@@ -43,7 +43,7 @@ pub struct Query {
     pub full: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Page {
     /// The session as `cagents sessions --channel` lists it.
     pub session: super::directory::Member,

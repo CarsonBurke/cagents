@@ -555,6 +555,7 @@ pub fn with_chat_memory(mut model: InspectorModel, memory: ChatMemory) -> Inspec
 pub fn model_for_card(
     card: &CardState,
     runtime: RuntimeStatus,
+    residency: &Residency,
     projects: &[SidebarProject],
     repository_runtime: Option<&RepositoryInspectorContext>,
 ) -> InspectorModel {
@@ -918,7 +919,7 @@ pub fn model_for_card(
         "Status",
         vec![
             Fact::new("Runtime", runtime.label()),
-            Fact::new("Lifecycle", residency_label(&card.residency)).diagnostic(),
+            Fact::new("Lifecycle", residency_label(residency)).diagnostic(),
         ],
     ));
 
@@ -2013,8 +2014,8 @@ mod tests {
     use super::*;
     use crate::lsp::{LspCompletionEdit, LspPosition, LspRange};
     use crate::model::{
-        BrowserId, BrowserRestoreFidelity, BrowserSession, Existence, Exposure, LaunchRecipe,
-        ProjectId, RepositoryView, TerminalId, TerminalSession, WorktreeId,
+        BrowserId, BrowserRestoreFidelity, BrowserSession, Existence, LaunchRecipe, ProjectId,
+        RepositoryView, TerminalId, TerminalSession, WorktreeId,
     };
     use crate::splitter::{Edge as SplitterEdge, Splitter};
     use cosmic::iced::{
@@ -2112,8 +2113,6 @@ mod tests {
             title: "worktree".into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Terminal(TerminalSession {
                 owned_codex_listener: None,
                 recovery_origin: None,
@@ -2153,7 +2152,7 @@ mod tests {
             proof: None,
             terminal: Some(source),
         });
-        let model = model_for_card(&card, RuntimeStatus::Ready, &[], None);
+        let model = model_for_card(&card, RuntimeStatus::Ready, &Residency::Hot, &[], None);
         let facts = &model
             .sections
             .iter()
@@ -2200,8 +2199,6 @@ mod tests {
                 fidelity: BrowserRestoreFidelity::HistoryAndScroll,
             }),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
         }
     }
 
@@ -2218,8 +2215,6 @@ mod tests {
                 worktree: PathBuf::from("/repo"),
             }),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
         }
     }
 
@@ -2230,6 +2225,7 @@ mod tests {
                 "https://alice:password@EXAMPLE.test:443/private%20path?oauth=secret#token",
             ),
             RuntimeStatus::Ready,
+            &Residency::Hot,
             &[],
             None,
         );
@@ -2264,7 +2260,7 @@ mod tests {
             RuntimeStatus::Suspended,
             RuntimeStatus::Unavailable,
         ] {
-            let model = model_for_card(&card, status, &[], None);
+            let model = model_for_card(&card, status, &Residency::Hot, &[], None);
             assert!(
                 !model
                     .actions
@@ -2274,7 +2270,7 @@ mod tests {
             );
         }
         for status in [RuntimeStatus::Ready, RuntimeStatus::Loading] {
-            let model = model_for_card(&card, status, &[], None);
+            let model = model_for_card(&card, status, &Residency::Hot, &[], None);
             assert!(
                 model
                     .actions
@@ -2320,8 +2316,6 @@ mod tests {
             title: "feature".into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(RepositoryView {
                 selected_file: None,
                 project: project_id,
@@ -2330,7 +2324,13 @@ mod tests {
             }),
         };
 
-        let model = model_for_card(&card, RuntimeStatus::Ready, &[project], None);
+        let model = model_for_card(
+            &card,
+            RuntimeStatus::Ready,
+            &Residency::Hot,
+            &[project],
+            None,
+        );
         assert!(model.actions.iter().any(|action| matches!(
             &action.message,
             InspectorAction::CreatePullRequest { project_id: action_project, worktree }
@@ -2342,7 +2342,13 @@ mod tests {
     fn repository_conflict_exposes_recovery_actions() {
         let card = repository_card();
         let source = source_context();
-        let model = model_for_card(&card, RuntimeStatus::Attention, &[], Some(&source));
+        let model = model_for_card(
+            &card,
+            RuntimeStatus::Attention,
+            &Residency::Hot,
+            &[],
+            Some(&source),
+        );
         assert!(model.actions.iter().any(|action| matches!(
             action.message,
             InspectorAction::OverwriteRepositoryFile(id) if id == card.id
@@ -2376,7 +2382,7 @@ mod tests {
     #[test]
     fn terminal_model_exposes_identity_context_and_real_actions() {
         let card = terminal_card();
-        let model = model_for_card(&card, RuntimeStatus::Ready, &[], None);
+        let model = model_for_card(&card, RuntimeStatus::Ready, &Residency::Hot, &[], None);
         assert_eq!(model.card_id, card.id);
         assert_eq!(model.kind, "Terminal");
         assert!(
@@ -2397,7 +2403,13 @@ mod tests {
     #[test]
     fn unavailable_runtime_adds_retry_without_replacing_context() {
         let card = terminal_card();
-        let model = model_for_card(&card, RuntimeStatus::Unavailable, &[], None);
+        let model = model_for_card(
+            &card,
+            RuntimeStatus::Unavailable,
+            &Residency::Hot,
+            &[],
+            None,
+        );
         assert!(
             model.actions.iter().any(
                 |action| matches!(action.message, InspectorAction::Retry(id) if id == card.id)
@@ -2667,7 +2679,13 @@ mod tests {
     fn lsp_model(card: &CardState, lsp: &LspInspectorContext) -> InspectorModel {
         let source = source_context();
         with_lsp(
-            model_for_card(card, RuntimeStatus::Ready, &[], Some(&source)),
+            model_for_card(
+                card,
+                RuntimeStatus::Ready,
+                &Residency::Hot,
+                &[],
+                Some(&source),
+            ),
             card.id,
             lsp,
         )
@@ -2696,7 +2714,13 @@ mod tests {
             diff_basis: Some("Branch"),
             ..source_context()
         };
-        let model = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&source));
+        let model = model_for_card(
+            &card,
+            RuntimeStatus::Ready,
+            &Residency::Hot,
+            &[],
+            Some(&source),
+        );
 
         assert!(
             model
@@ -2714,7 +2738,13 @@ mod tests {
             can_show_diff: false,
             ..source
         };
-        let model = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&saving));
+        let model = model_for_card(
+            &card,
+            RuntimeStatus::Ready,
+            &Residency::Hot,
+            &[],
+            Some(&saving),
+        );
 
         assert!(
             !model
@@ -2730,7 +2760,13 @@ mod tests {
     fn a_quiet_language_server_context_adds_nothing() {
         let card = repository_card();
         let source = source_context();
-        let plain = model_for_card(&card, RuntimeStatus::Ready, &[], Some(&source));
+        let plain = model_for_card(
+            &card,
+            RuntimeStatus::Ready,
+            &Residency::Hot,
+            &[],
+            Some(&source),
+        );
         let decorated = with_lsp(plain.clone(), card.id, &LspInspectorContext::default());
 
         assert_eq!(plain, decorated);
@@ -2740,16 +2776,24 @@ mod tests {
     fn every_fact_a_card_builds_for_itself_stays_inert() {
         let source = source_context();
         for model in [
-            model_for_card(&terminal_card(), RuntimeStatus::Ready, &[], None),
+            model_for_card(
+                &terminal_card(),
+                RuntimeStatus::Ready,
+                &Residency::Hot,
+                &[],
+                None,
+            ),
             model_for_card(
                 &browser_card("https://example.test"),
                 RuntimeStatus::Ready,
+                &Residency::Hot,
                 &[],
                 None,
             ),
             model_for_card(
                 &repository_card(),
                 RuntimeStatus::Attention,
+                &Residency::Hot,
                 &[],
                 Some(&source),
             ),

@@ -518,8 +518,9 @@ fn changed_for_instance(
         return;
     }
     let proof = state.proof().clone();
-    // A conversation that starts or settles may take the messages left for it.
-    if matches!(&update, Update::PromptAvailable)
+    // A conversation that starts or settles may take the messages left for
+    // it, and may have hit a usage limit or left one behind.
+    if matches!(&update, Update::PromptAvailable | Update::Activity { .. })
         && let Some(courier) = &state.mailbox
     {
         courier.wake();

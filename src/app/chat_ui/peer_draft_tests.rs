@@ -1441,7 +1441,7 @@ fn a_file_queued_behind_this_windows_own_start_comes_along() {
         Some("my own first message")
     );
     assert_eq!(
-        peer.app.chat_ui.carried_files[&peer.card]
+        peer.app.chat_ui.draft_attachments[&peer.card]
             .iter()
             .map(|attachment| attachment.path.as_path())
             .collect::<Vec<_>>(),

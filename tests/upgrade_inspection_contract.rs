@@ -7,8 +7,8 @@ use cagents::{
     agent_execution::Authority,
     control::{ControlClient, ControlError},
     model::{
-        CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, WorkspaceState,
+        CardId, CardKind, CardState, Existence, LaunchRecipe, TerminalContinuity, TerminalId,
+        TerminalSession, WorkspaceState,
     },
     persistence::{SnapshotBase, StateStore},
     process::{CancellationToken, CommandSpec, ProcessExecutor, SystemProcessExecutor},
@@ -455,8 +455,6 @@ fn actual_same_generation_inspection_and_upgrade_keep_the_original_saved_pty() {
             title: "Original shell".into(),
             width_fraction: 0.6,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Terminal(saved.clone()),
         });
         workspace.focused = Some(workspace.cards[0].id);

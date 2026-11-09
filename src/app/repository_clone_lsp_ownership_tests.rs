@@ -59,9 +59,9 @@ impl CloneLspFixture {
             worktree: self.root.clone(),
             selected_file: None,
         };
+        app.set_residency(card, Residency::Hot);
         let state = app.card_state_mut(card).unwrap();
         state.kind = CardKind::Repository(view.clone());
-        state.residency = Residency::Hot;
         let mut repository = RepositoryRuntime::new(view.clone());
         repository.set_auto_save(false);
         repository.restore_navigation(&crate::model::RepositoryNavigation {

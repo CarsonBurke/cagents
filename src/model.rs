@@ -197,8 +197,6 @@ pub struct CardState {
     pub title: String,
     pub width_fraction: f32,
     pub existence: Existence,
-    pub exposure: Exposure,
-    pub residency: Residency,
     pub kind: CardKind,
 }
 
@@ -1390,8 +1388,6 @@ mod tests {
                 title: title.to_owned(),
                 width_fraction: 0.5,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Chat(crate::chat::Session {
                     native_continuity: Default::default(),
                     owned_codex_listener: None,

@@ -1,5 +1,7 @@
 # Offline chat composer validation
 
+For how fixtures fit together and how to add a behaviour, see [Fixtures](fixtures.md).
+
 `tests/fixtures/chat-composer-claude.sh` is a fake Claude stream-json executable
 for native UI checks. It requires `jq`, makes no network requests, and uses a
 synthetic account. It advertises asynchronous message support, holds its first
@@ -9,7 +11,9 @@ this fixture checks composer interactions, not provider delivery.
 
 From a shell without a desktop session, such as plain SSH,
 [`scripts/native-evidence`](development.md#native-evidence) sets up this environment;
-you still open the project and start the conversation.
+you still open the project and start the conversation. From a session cagents
+hosts, add `--remote fw16` to run it on the build host
+([Native evidence from a cagents session](development.md#native-evidence-from-a-cagents-session)).
 By hand, use a new directory beneath the repository's ignored `.worktrees/` for every
 run. Keep its HOME, XDG data/config/cache, daemon runtime, and project isolated
 from the development application you normally use. For example, from the
@@ -116,6 +120,12 @@ conversation that stopped, and no prompt is sent until you send one.
 To see a resume that fails, create `fixture-fail-resume` too: the next
 resumed start exits before it answers, and the card offers **Try again**. The
 file is removed first, so pressing it resumes normally.
+
+A resumed transcript may be damaged, as a crash leaves one. The provider
+skips each line that isn't a JSON record, as Claude Code does. It then
+goes on from the last record it could read, a simplification: Claude Code
+follows the `parentUuid` chain to its leaf. A last line cut short without a newline
+is ended first, so the next record starts its own line.
 
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a

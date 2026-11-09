@@ -25,11 +25,24 @@ impl Runtime {
                 [design::RADIUS_M; 4],
                 false,
             ));
-        let content = widget::column::with_children(vec![
-            header.into(),
-            design::body("This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.").into(),
-            widget::scrollable(draft).height(Length::Fill).into(),
-        ])
+        // Files and images wait with the text; their names say they were kept.
+        let attached = self
+            .unsent_attachments()
+            .iter()
+            .map(Attachment::label)
+            .collect::<Vec<_>>();
+        let content = widget::column::with_children(
+            [
+                header.into(),
+                design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into(),
+                widget::scrollable(draft).height(Length::Fill).into(),
+            ]
+            .into_iter()
+            .chain((!attached.is_empty()).then(|| {
+                design::caption(format!("Attached: {}", attached.join(", "))).into()
+            }))
+            .collect::<Vec<_>>(),
+        )
         .spacing(space::M)
         .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))
@@ -62,7 +75,7 @@ impl Cagents {
             visible,
             self.settings.editor_syntax_theme,
         );
-        self.restore_unsent_chat(card, &mut runtime);
+        self.restore_saved_draft(card, &mut runtime);
         // Deliberately no provider connection, draft skill discovery, retirement,
         // or lifecycle job: this is only a local view of saved bytes.
         self.cards
@@ -76,18 +89,15 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&copy) else {
             return Task::none();
         };
+        // Exactly what the workspace snapshot saves for this card later.
+        let (draft, attachments) = runtime.persistent_draft();
         let payload = crate::persistence::RetainedChatCopy {
             workspace: self.durable.id,
             source_card,
             source: runtime.session.clone(),
             copy: self.card_state(copy).expect("retained card exists").clone(),
-            draft: runtime.unsent_text(),
-            attachments: runtime
-                .unsent_attachments()
-                .iter()
-                .filter(|image| image.reference.is_some())
-                .cloned()
-                .collect(),
+            draft,
+            attachments,
             scope: self.durable.card_scopes.get(&copy).cloned(),
             channel: self
                 .durable
@@ -267,7 +277,6 @@ impl Cagents {
             // strict upgrade attachment was in flight. The copy still owns
             // the runtime's original source, never that newer descriptor.
             state.kind = CardKind::Chat(runtime.session.clone());
-            state.residency = Residency::Hot;
             let local_card = state.clone();
             runtime.retarget(self.chat_ui.next_target(retained));
             let durable = Arc::make_mut(&mut self.durable);
@@ -283,6 +292,7 @@ impl Cagents {
                 .pending_chat_admissions
                 .insert(retained, runtime.session.clone());
             durable.cards.push(state);
+            self.set_presence(retained, self.exposure(pane.id), Residency::Hot);
             self.retain_local_pane(retained);
             self.cards.insert(retained, CardRuntime::Chat(runtime));
             presentation = self.checkpoint_retained_chat_copy(pane.id, retained);
@@ -399,6 +409,48 @@ mod tests {
                 matches!(app.cards.get(&card), Some(CardRuntime::Failed(_))),
                 "review-only admission must not start the replacement provider"
             );
+        });
+    }
+
+    /// The file a person chose stays with the draft another window's start
+    /// set aside, and in the inert copy kept beside the replacement (#2202).
+    #[test]
+    fn admission_keeps_an_unsent_file_beside_the_draft_images() {
+        chat::attachment_assets::with_test_image(|image| {
+            let file = chat::Attachment::file("/project/notes.txt");
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            drop(app.new_native_chat(Provider::Claude, Some("/project".into())));
+            let card = app.workspace.focused().unwrap();
+            let mut source = match app.cards.get(&card).unwrap() {
+                CardRuntime::Chat(runtime) => runtime.session.clone(),
+                _ => panic!("native draft expected"),
+            };
+            source.launch.session_id = Some("old-file-thread".into());
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            app.chat_ui
+                .draft_attachments
+                .insert(card, vec![image.clone(), file.clone()]);
+            app.await_shared_chat_admission(card, source.clone());
+            let CardRuntime::Chat(runtime) = app.cards.get(&card).unwrap() else {
+                panic!("saved draft expected")
+            };
+            assert_eq!(runtime.unsent_attachments(), [image.clone(), file.clone()]);
+
+            let mut replacement = app.card_state(card).unwrap().clone();
+            let mut canonical = source.clone();
+            canonical.id = TerminalId::new();
+            canonical.launch.session_id = Some("different-thread".into());
+            replacement.kind = CardKind::Chat(canonical);
+            let pane = crate::workspace_model::views::Pane::from_card(
+                &replacement,
+                Some("/project".into()),
+            )
+            .unwrap();
+            let (task, retained) = app.retain_unresolved_shared_upgrade(&pane);
+            drop(task);
+            let retained = retained.expect("a file-carrying draft receives an inert source copy");
+            let saved = app.persistent_workspace();
+            assert_eq!(saved.chat_draft_attachments[&retained], [image, file]);
         });
     }
 }

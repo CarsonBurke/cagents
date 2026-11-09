@@ -591,7 +591,7 @@ impl Registry {
         if blocked {
             return Ok(false);
         }
-        if super::views::all(&tx)?.iter().any(|view| {
+        if super::views::occupied(&tx)?.iter().any(|view| {
             view.panes.iter().any(|pane| {
             matches!(&pane.kind, crate::model::CardKind::Chat(chat) if chat.id == source.id)
         })

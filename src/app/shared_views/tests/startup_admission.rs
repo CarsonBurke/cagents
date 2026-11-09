@@ -445,8 +445,6 @@ fn cached_chat() -> (Cagents, ChannelId, ChannelId, Pane, uuid::Uuid) {
         width_fraction: pane.width_fraction,
         kind: pane.kind.clone(),
         existence: Existence::Open,
-        exposure: Exposure::Offscreen,
-        residency: Residency::Cold,
     });
     app.workspace = Cagents::rebuild_workspace(&app.durable);
     app.shared_views = State::for_workspace(&app.durable);

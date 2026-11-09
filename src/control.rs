@@ -1900,6 +1900,7 @@ impl ControlClient {
             ServerMessage::ChatChanged { chat_id }
             | ServerMessage::ChatObserved { chat_id, .. }
             | ServerMessage::ChatActivity { chat_id, .. }
+            | ServerMessage::ChatLimit { chat_id, .. }
                 if self.attached_chats.contains(&chat_id) => {}
             ServerMessage::Redraw { terminal_id, .. }
             | ServerMessage::Snapshot { terminal_id, .. }
@@ -2123,6 +2124,7 @@ fn message_targets(message: &ServerMessage, expected: TerminalId) -> bool {
         | ServerMessage::NotificationActivated { .. }
         | ServerMessage::WorkBoard { .. }
         | ServerMessage::ConversationPullRequests { .. }
+        | ServerMessage::ChatLimit { .. }
         | ServerMessage::Error(_) => false,
     }
 }
@@ -2143,6 +2145,7 @@ fn message_name(message: &ServerMessage) -> &'static str {
         ServerMessage::TerminalCreated { .. } => "terminal_created",
         ServerMessage::WorkspaceModelEdited { .. } => "workspace_model_edited",
         ServerMessage::ChatAccountUsage { .. } => "chat_account_usage",
+        ServerMessage::ChatLimit { .. } => "chat_limit",
         ServerMessage::NotificationsChanged => "notifications_changed",
         ServerMessage::NotificationActivated { .. } => "notification_activated",
         ServerMessage::WorkBoard { .. } => "work_board",

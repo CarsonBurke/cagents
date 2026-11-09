@@ -2702,8 +2702,6 @@ mod tests {
             title: "Editor".into(),
             width_fraction: 0.7,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(view),
         });
         durable.card_scopes.insert(card, target.path.clone());
@@ -3018,11 +3016,11 @@ mod tests {
                     boot_id: "removal-boot".into(),
                     host_incarnation: "removal-host".into(),
                 };
-                card.residency = Residency::Hot;
                 let original = card.kind.clone();
                 let durable = Arc::make_mut(&mut app.durable);
                 durable.cards.push(card);
                 durable.card_scopes.insert(id, target.path.clone());
+                app.set_residency(id, Residency::Hot);
                 app.cards.insert(id, CardRuntime::Loading);
                 app.workspace = Cagents::rebuild_workspace(&app.durable);
                 let capture = app.capture_worktree_removal(&target);

@@ -8,18 +8,26 @@
 //! never interrupts a turn or answers a question meant for the user; a busy
 //! conversation receives it after its turn. It acts as an execution client,
 //! not as a person, so delivering never takes over a delegated agent.
+//!
+//! A conversation a usage limit stops is idle yet takes nothing, so the
+//! courier also judges which ones a limit stops. It holds their messages, and
+//! tells every surface showing such a conversation that it is limited and
+//! until when, so the daemon gives one account of a limit everywhere.
 
 use super::{SharedHost, SharedRegistry, caller, directory, registry};
 use crate::{
     agent_execution::{
         AcceptanceError, Authority, Lineage, Origin,
-        mailbox::{Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To},
+        directory::{Member, Scope, UsageLimit},
+        mailbox::{
+            Delivery, Inbox, Message, Outgoing, Party, Reach, Receipt, Seal, Sent, State, To,
+        },
     },
     chat::{self, runtime::Rejection},
     model::{MessageId, TerminalId},
 };
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     sync::{Arc, Condvar, Mutex, Weak},
     thread::JoinHandle,
     time::{Duration, Instant},
@@ -34,17 +42,39 @@ const PRUNE_EVERY: Duration = Duration::from_secs(60 * 60);
 /// a stranger that happens to share one character.
 const MIN_HANDLE: usize = 4;
 
+/// Sends as an older CLI asks to, without reporting the recipient.
 pub(in crate::host) fn send(
     host: &SharedHost,
     authority: &Authority,
     outgoing: Outgoing,
 ) -> Result<Sent, AcceptanceError> {
+    post(host, authority, outgoing).map(|delivery| delivery.sent)
+}
+
+/// Leaves a message and reports what its recipient can do with it now.
+///
+/// A recipient stopped by a usage limit keeps the message until the limit
+/// resets, so the sender is not left waiting on a reply that cannot come
+/// before then. One whose provider exited cannot receive it at all.
+pub(in crate::host) fn post(
+    host: &SharedHost,
+    authority: &Authority,
+    outgoing: Outgoing,
+) -> Result<Delivery, AcceptanceError> {
     outgoing.validate()?;
     let (_, session) = caller(host, authority)?;
+    // Read first, as the listing takes the registry lock itself.
+    let listing = directory::list(
+        host,
+        authority,
+        directory::Wanted::Scope(Scope::All),
+        true,
+        true,
+    )?;
     let live = directory::live_sessions(host);
     let registry = registry(host)?;
     let now = super::now();
-    let (message, reach) = {
+    let (message, reach, recipient) = {
         let mut registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         let lineages =
             registry.session_lineages(live.iter().map(|entry| entry.id).chain(session))?;
@@ -77,7 +107,10 @@ pub(in crate::host) fn send(
         };
         let (to, reply_to) = match &outgoing.to {
             To::Session(handle) => (
-                Some(resolve(&model.agents, &live, &lineage_of, handle)?),
+                Some(
+                    resolve(&model.agents, &live, &lineage_of, handle)
+                        .map_err(|error| stopped(&listing, handle).unwrap_or(error))?,
+                ),
                 None,
             ),
             To::Parent => (parent(&registry, session, from.lineage)?, None),
@@ -108,6 +141,10 @@ pub(in crate::host) fn send(
                 }
             }
         };
+        let recipient = to.and_then(|to| recipient(&listing, to));
+        let limited = recipient
+            .as_ref()
+            .is_some_and(|member| member.limit.is_some());
         let to_title = to.and_then(|to| {
             live.iter()
                 .find(|entry| lineage_of(entry.id) == to)
@@ -123,20 +160,65 @@ pub(in crate::host) fn send(
             },
             reply_to,
             body: outgoing.body,
-            // No one can answer before a session of it starts, so the asker
-            // does not wait and a later reply is not held for it.
+            // No one can answer before a session of it starts, or before
+            // its usage limit resets, so the asker does not wait and a later
+            // reply is not held for it.
             wait_until_ms: outgoing
                 .wait_ms
-                .filter(|_| reach != Reach::Offline)
+                .filter(|_| reach != Reach::Offline && !limited)
                 .map(|wait| now.saturating_add(wait)),
             state: State::Pending,
             created_ms: now,
         };
         registry.post_message(&message)?;
-        (message, reach)
+        (message, reach, recipient)
     };
     wake(host);
-    Ok(Sent { message, reach })
+    Ok(Delivery {
+        sent: Sent { message, reach },
+        recipient,
+    })
+}
+
+/// The session of `lineage` a message reaches, as the listing reports it: a
+/// live conversation before a terminal, and either before one whose provider
+/// exited.
+fn recipient(listing: &directory::Listing, lineage: Lineage) -> Option<Member> {
+    listing
+        .members()
+        .filter(|member| member.session.lineage == lineage)
+        .min_by_key(|member| {
+            (
+                member.exited,
+                member.session.surface != crate::agent_execution::directory::Surface::Chat,
+            )
+        })
+        .cloned()
+}
+
+/// Why `handle` names no live session when it names one whose provider
+/// exited: such a session cannot take a message until it is resumed.
+fn stopped(listing: &directory::Listing, handle: &str) -> Option<String> {
+    let handle = handle.to_ascii_lowercase();
+    if handle.len() < MIN_HANDLE {
+        return None;
+    }
+    let member = listing.members().find(|member| {
+        member.exited
+            && (member.session.id.to_string().starts_with(&handle)
+                || member.session.lineage.to_string().starts_with(&handle))
+    })?;
+    let mut reason = format!(
+        "Session {} has stopped: its provider exited, so it cannot receive messages",
+        member.session.id
+    );
+    if let Some(failure) = &member.failure {
+        reason.push_str(&format!(" ({failure})"));
+    }
+    reason.push_str(
+        ". Resume its conversation first, or message another session from `cagents sessions --all`",
+    );
+    Some(reason)
 }
 
 pub(in crate::host) fn inbox(
@@ -351,10 +433,19 @@ struct Inner {
     seal: Arc<Seal>,
     state: Mutex<WakeState>,
     changed: Condvar,
+    /// What each conversation's subscribers were last told of its limit.
+    limits: Mutex<BTreeMap<TerminalId, Told>>,
     #[cfg(test)]
     scanned_generation: Mutex<Option<u64>>,
     #[cfg(test)]
     scanned: Condvar,
+}
+
+/// A conversation's usage limit as the courier last judged it, and the
+/// subscribers that know it. A subscriber starts out knowing of no limit.
+struct Told {
+    limit: Option<UsageLimit>,
+    clients: BTreeSet<crate::host::state::ClientId>,
 }
 
 /// Wakes the courier. Cheap enough to call on every activity edge.
@@ -426,6 +517,7 @@ impl Courier {
             seal,
             state: Mutex::new(WakeState::default()),
             changed: Condvar::new(),
+            limits: Mutex::new(BTreeMap::new()),
             #[cfg(test)]
             scanned_generation: Mutex::new(None),
             #[cfg(test)]
@@ -535,9 +627,109 @@ impl Handle {
         Ok(())
     }
 
+    /// Judges which conversations a usage limit stops, telling every
+    /// subscriber of one whose judgement changed, and each new subscriber,
+    /// what it now is. Returns the limits, by conversation.
+    fn publish_limits(&self, host: &SharedHost, now: u64) -> BTreeMap<TerminalId, UsageLimit> {
+        let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            state
+                .chats
+                .iter()
+                .filter(|(_, record)| !record.handle.is_completed())
+                .map(|(id, record)| (*id, record.session.launch.provider, record.handle.clone()))
+                .collect()
+        };
+        // Accounts are read once a scan, and only if a provider reported a
+        // limit; the judgement reads no transcript.
+        let mut accounts = None;
+        let limits: BTreeMap<_, _> = chats
+            .iter()
+            .filter_map(|(id, provider, handle)| {
+                directory::chat_limit(
+                    *provider,
+                    handle,
+                    || {
+                        accounts
+                            .get_or_insert_with(|| super::account_info::Accounts::load(now))
+                            .as_ref()
+                            .and_then(|accounts| {
+                                accounts.of(*provider, &handle.execution_environment().0)
+                            })
+                    },
+                    now,
+                )
+                .map(|limit| (*id, limit))
+            })
+            .collect();
+        let mut told = self.0.limits.lock().unwrap_or_else(|p| p.into_inner());
+        let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
+        let proof = state.proof().clone();
+        let crate::host::state::HostState { chats, clients, .. } = &mut *state;
+        told.retain(|id, _| chats.contains_key(id));
+        for (id, record) in chats.iter() {
+            let limit = limits.get(id);
+            let known = told.entry(*id).or_insert_with(|| Told {
+                limit: None,
+                clients: record.subscribers.keys().copied().collect(),
+            });
+            if known.limit.as_ref() != limit {
+                known.limit = limit.cloned();
+                known.clients.clear();
+            }
+            known
+                .clients
+                .retain(|client| record.subscribers.contains_key(client));
+            for &client in record.subscribers.keys() {
+                if known.clients.contains(&client) {
+                    continue;
+                }
+                let Some(delivery) = clients.get(&client) else {
+                    continue;
+                };
+                let message = crate::terminal_ipc::ServerMessage::ChatLimit {
+                    chat_id: *id,
+                    limit: known.limit.clone(),
+                };
+                if delivery
+                    .push(crate::terminal_ipc::ServerEnvelope {
+                        version: crate::terminal_ipc::PROTOCOL_VERSION,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message,
+                    })
+                    .is_ok()
+                {
+                    known.clients.insert(client);
+                }
+            }
+        }
+        limits
+    }
+
     /// Gives each lineage with a live, idle conversation its oldest waiting
-    /// message. Returns when the next held reply is released.
+    /// message. Returns when the courier must look again: when the next held
+    /// reply is released or a known usage limit resets.
     fn deliver(&self, host: &SharedHost) -> Result<Option<u64>, String> {
+        let limits = self.publish_limits(host, super::now());
+        let reset = limits
+            .values()
+            .filter_map(|limit| limit.resets_at)
+            .filter(|at| *at >= 0)
+            .map(|at| (at as u64).saturating_mul(1000))
+            .min();
+        let released = self.deliver_messages(host, &limits)?;
+        Ok(match (released, reset) {
+            (Some(released), Some(reset)) => Some(released.min(reset)),
+            (released, reset) => released.or(reset),
+        })
+    }
+
+    fn deliver_messages(
+        &self,
+        host: &SharedHost,
+        limits: &BTreeMap<TerminalId, UsageLimit>,
+    ) -> Result<Option<u64>, String> {
         let live = directory::live_sessions(host);
         let (pending, released, heads, pending_lineages, lineages) = {
             let mut registry = self.0.registry.lock().unwrap_or_else(|p| p.into_inner());
@@ -577,13 +769,13 @@ impl Handle {
         if crate::host::client::ensure_control_open(host).is_err() {
             return Ok(released);
         }
-        let chats: Vec<(TerminalId, chat::runtime::Handle)> = {
+        let chats: Vec<(TerminalId, crate::agent::Provider, chat::runtime::Handle)> = {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             state
                 .chats
                 .iter()
                 .filter(|(_, record)| !record.handle.is_completed())
-                .map(|(id, record)| (*id, record.handle.clone()))
+                .map(|(id, record)| (*id, record.session.launch.provider, record.handle.clone()))
                 .collect()
         };
         let lineages = self
@@ -591,15 +783,14 @@ impl Handle {
             .registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .session_lineages(chats.iter().map(|(id, _)| *id))?;
+            .session_lineages(chats.iter().map(|(id, _, _)| *id))?;
         for message in pending {
             let Some(recipient) = message.to.lineage else {
                 continue;
             };
-            let Some((session, handle)) = chats
-                .iter()
-                .find(|(id, handle)| lineages.get(id) == Some(&recipient) && handle.is_idle())
-            else {
+            let Some((session, _, handle)) = chats.iter().find(|(id, _, handle)| {
+                lineages.get(id) == Some(&recipient) && handle.is_idle() && !limits.contains_key(id)
+            }) else {
                 continue;
             };
             self.hand_over(&message, *session, handle)?;
@@ -684,6 +875,7 @@ mod tests {
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
             changed: Condvar::new(),
+            limits: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
@@ -804,6 +996,7 @@ mod tests {
                 seal: Arc::new(Seal::new([9; 32])),
                 state: Mutex::default(),
                 changed: Condvar::new(),
+                limits: Mutex::default(),
                 scanned_generation: Mutex::new(None),
                 scanned: Condvar::new(),
             }));
@@ -912,6 +1105,7 @@ mod tests {
             seal: Arc::new(Seal::new([7; 32])),
             state: Mutex::default(),
             changed: Condvar::new(),
+            limits: Mutex::default(),
             scanned_generation: Mutex::new(None),
             scanned: Condvar::new(),
         }));
