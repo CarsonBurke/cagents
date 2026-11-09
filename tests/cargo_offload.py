@@ -2551,20 +2551,37 @@ class Trim(unittest.TestCase):
         self.assertTrue(compiling.exists())
         self.assertFalse(idle.exists())
 
+    def test_the_large_session_compiled_last_stays_though_it_crosses_the_budget(self):
+        small = incremental_session(self.slot, "small-1", age=3600)
+        large = incremental_session(self.slot, "large-1", age=60, size=256 * 1024)
+        self.trim(self.session_size(small))
+        self.assertEqual((large.exists(), small.exists()), (True, False))
+
     def test_each_finalized_session_is_measured_once(self):
         crate = incremental_session(self.slot, "crate-1", age=60)
+        older = incremental_session(self.slot, "older-1", age=3600)
         size = self.session_size(crate)
-        self.trim(size)
-        self.assertTrue(crate.exists())
+        self.trim(2 * size - 1)
+        self.assertTrue(older.exists())
         # Rustc never changes a finalized session; one it is writing is
         # measured again each time.
         session = next(path for path in crate.iterdir() if path.is_dir())
         (session / "more.o").write_bytes(os.urandom(64 * 1024))
-        self.trim(size)
-        self.assertTrue(crate.exists())
+        self.trim(2 * size - 1)
+        self.assertTrue(older.exists())
         session.rename(crate / f"{session.name}-working")
-        self.trim(size)
-        self.assertFalse(crate.exists())
+        self.trim(2 * size - 1)
+        self.assertTrue(crate.exists())
+        self.assertFalse(older.exists())
+
+    def test_an_unreadable_record_of_sizes_is_measured_again(self):
+        crate = incremental_session(self.slot, "crate-1", age=60)
+        older = incremental_session(self.slot, "older-1", age=3600)
+        for record in ("not json", "[]", '{"src/target/debug/incremental/crate-1/s-crate-1-0-0": "x"}'):
+            with self.subTest(record=record):
+                (self.slot / "incremental-sizes").write_text(record)
+                self.trim(self.session_size(crate) + 1)
+                self.assertTrue(older.exists())
 
     def test_dependencies_unread_for_days_go_every_few_hours_or_at_once_when_pressed(self):
         if os.statvfs(self.slot).f_flag & os.ST_NOATIME:
@@ -2578,14 +2595,37 @@ class Trim(unittest.TestCase):
             os.utime(path, (then, then))
             return path
         stale, used = dependency("libold-1.rlib", 4), dependency("libnew-1.rlib", 1)
+        # A unit goes whole or not at all: its rmeta was read lately.
+        partly = [dependency("libpart-1.rlib", 4), dependency("libpart-1.rmeta", 1),
+                  dependency("part-1.d", 4)]
+        build = self.slot / "src/target/debug/build"
+        scripts = []
+        for name, days in (("old-1", 4), ("new-1", 1)):
+            (build / name / "out").mkdir(parents=True)
+            output = build / name / "out" / "generated.rs"
+            output.write_bytes(b"fn x() {}")
+            then = time.time() - days * 86400
+            os.utime(output, (then, then))
+            scripts.append(build / name)
         self.trim(2**40)
         self.assertEqual((stale.exists(), used.exists()), (False, True))
+        self.assertTrue(all(path.exists() for path in partly))
+        self.assertEqual([path.exists() for path in scripts], [False, True])
         # Not again for hours, unless the disk is low.
         later = dependency("libold-2.rlib", 4)
         self.trim(2**40)
         self.assertTrue(later.exists())
         self.trim(2**40, pressed=True)
         self.assertFalse(later.exists())
+
+    def test_a_slot_held_shared_by_a_trim_is_not_taken_for_a_running_build(self):
+        lock = self.slot / "lock"
+        with open(lock, "a") as trimming:
+            fcntl.flock(trimming, fcntl.LOCK_SH)
+            self.assertFalse(self.agent["leased"](str(self.slot)))
+        with open(lock, "a") as leasing:
+            fcntl.flock(leasing, fcntl.LOCK_EX)
+            self.assertTrue(self.agent["leased"](str(self.slot)))
 
     def test_the_guard_trims_only_the_slots_no_lease_holds(self):
         root = self.slot.parent / "offload"

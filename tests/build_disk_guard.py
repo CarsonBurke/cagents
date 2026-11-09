@@ -250,8 +250,7 @@ class BuildDiskGuard(unittest.TestCase):
         result = self.guard(floor, guard=guard)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.calls(calls, 1)
-        # Before the pruner, in the same detached run, without waiting for
-        # what it frees.
+        # Beside the pruner's detached run, without waiting for what it frees.
         self.assertEqual(self.calls(trims, 1), [f"--trim-slots {floor}"])
 
     def test_below_the_floor_idle_offload_slots_are_trimmed_and_waited_for(self):
@@ -271,6 +270,26 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual(self.prunes(), 1)
         time.sleep(0.5)
         self.assertFalse(trims.exists())
+
+    def test_the_background_trim_keeps_none_of_the_builds_descriptors(self):
+        # As the real trim closes what it inherited as it starts, and then
+        # runs on; the shell that starts it must not hold them meanwhile.
+        guard, calls = self.stand_in_pruner(then="exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\n")
+        offload = guard.with_name("cargo-offload")
+        offload.write_text("#!/bin/sh\nexec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\nsleep 5\n")
+        offload.chmod(0o755)
+        read, write = os.pipe()
+        started = time.monotonic()
+        with subprocess.Popen([str(guard), str(self.root)], pass_fds=(write,),
+                              env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(self.band())},
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as guarding:
+            os.close(write)
+            self.assertEqual(guarding.wait(timeout=30), 0)
+            self.calls(calls, 1)
+            # The pipe closes once nothing of the build's holds it.
+            self.assertEqual(os.read(read, 1), b"")
+        os.close(read)
+        self.assertLess(time.monotonic() - started, 4)
 
     def test_the_background_run_keeps_none_of_the_builds_descriptors(self):
         # As the real pruner closes what it inherited, and then runs on.

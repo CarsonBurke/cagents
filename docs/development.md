@@ -766,25 +766,29 @@ every feature lane, profile and kind of target of the `cagents` crate keeps
 an incremental session of 1–6 GiB, so slots on fw16 grew to about 97 GiB
 each, 40–60 GiB of it incremental state. Once a lease holds a slot, and no
 earlier command of the slot's is still running, it keeps the incremental
-state of the crates the slot compiled most recently, up to
-`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), and moves the rest out of
-the target; with `0` it keeps none. Every 6 hours it also moves out compiled
-dependencies in the profiles' `deps` that nothing has read or written for 3
-days, such as old versions after a dependency update, unless the file system
-keeps no access times. Below twice the host's floor, the larger of
+state of the crates the slot compiled most recently until they fill
+`CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses it
+included, and moves the rest out of the target; with `0` it keeps none. Every
+6 hours it also moves out compiled units nothing has read or written for 3
+days, such as old versions after a dependency update: all the files of one
+`<crate>-<hash>` in a profile's `deps` together, and a build script's
+directory in its `build`, judged by its newest file. It skips this where the
+file system keeps no access times. Below twice the host's floor, the larger of
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
 default, a slot keeps a quarter of the budget, its dependencies are looked
 through at once, and the lease does the same to every other slot no lease
-holds, under that slot's locks. A crate whose session a `rustc` holds stays,
+holds, under that slot's locks; it holds their lease locks shared, which no
+lease, admission or hold takes for a running build. A crate whose session a `rustc` holds stays,
 whatever started it. Each crate's state is moved out with one rename into the
 slot's `evicted` directory, which Cargo never reads, so a build never finds
 part of one; a process of its own then removes it at idle CPU and I/O
 priority, and the next trim of the slot finishes a removal that was cut
 short. Rustc remakes an evicted session, so that crate's next build compiles
 it in full rather than incrementally; Cargo rebuilds a removed dependency.
-Measuring a session it has not seen takes about a second for a full slot; a
-finalized session never changes, so each is measured once and recorded in
-the slot's `incremental-sizes`.
+Measuring a full slot's sessions takes 1–2 seconds; a finalized session
+never changes, so each is measured once and recorded in the slot's
+`incremental-sizes`, and a lease measures only what the last build made. One
+that takes over 5 seconds says it is trimming the slot.
 
 A checkout's gate defers to the installed one, `/var/tmp/cagents-cargo-gate`
 (`CAGENTS_BUILD_INSTALLED_GATE`; empty disables this), when the installed

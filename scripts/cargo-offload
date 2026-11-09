@@ -15,7 +15,7 @@ reuses what the previous one compiled there, and the slot a worktree used
 last is preferred. Before each build, its lease bounds the slot's build
 output: it keeps the incremental compilation state of the crates the slot
 compiled most recently, within CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB, and
-every few hours drops compiled dependencies nothing has read for days. Below
+every few hours drops compiled units nothing has read for days. Below
 twice the host's floor it keeps a quarter as much, in every slot no lease
 holds as well. `--trim-slots FLOOR_GIB [--wait]` does the same to this
 host's own idle slots for scripts/build-disk-guard. With
@@ -790,10 +790,11 @@ def evict(slot, path):
 
 def trim(slot, budget, pressed):
     """Bounds the build output of `slot`, whose lease and `running` lock the
-    caller holds, so no build of its own runs there: moves out the
-    incremental sessions of the crates its builds compiled least recently
-    beyond `budget` bytes, or a quarter of it when `pressed`, and every few
-    hours, or at once when `pressed`, compiled dependencies unread for days.
+    caller holds, so no build of its own runs there: keeps the incremental
+    sessions of the crates its builds compiled most recently until they
+    fill `budget` bytes, or a quarter of it when `pressed`, and moves out
+    the rest, and every few hours, or at once when `pressed`, compiled
+    units unread for days.
     Returns the bytes moved out. A crate whose session a rustc holds stays,
     whatever started it."""
     if pressed:
@@ -826,15 +827,17 @@ def trim(slot, budget, pressed):
                     # Being written, or left by a build that was stopped.
                     size += tree_size(session.path, seen)
                     continue
-                if not isinstance(known.get(key), int):
-                    known[key] = tree_size(session.path, seen)
+                if not isinstance(known.get(key), int) or known[key] < 0:
+                    known[key] = tree_size(session.path, set())
                 measured[key] = known[key]
                 size += known[key]
             crates.append((last, size, crate.path))
     kept = moved = 0
-    # The crates compiled most recently stay, the rest go.
+    # The crates compiled most recently stay until they fill the budget,
+    # the one that crosses it included: the next build most likely needs
+    # the large session it compiled last. The rest go.
     for last, size, crate in sorted(crates, reverse=True):
-        if kept + size <= budget:
+        if kept < budget:
             kept += size
             continue
         try:
@@ -845,10 +848,14 @@ def trim(slot, budget, pressed):
         except OSError:
             continue
         moved += size
-    with open(record + ".new", "w") as file:
-        json.dump({key: size for key, size in measured.items()
-                   if os.path.isdir(os.path.join(slot, key))}, file)
-    os.replace(record + ".new", record)
+    # Only a record: on a full disk the trim goes on without it.
+    try:
+        with open(record + ".new", "w") as file:
+            json.dump({key: size for key, size in measured.items()
+                       if os.path.isdir(os.path.join(slot, key))}, file)
+        os.replace(record + ".new", record)
+    except OSError:
+        pass
     swept = os.path.join(slot, "dependencies-swept")
     try:
         due = pressed or time.time() - os.stat(swept).st_mtime >= DEPENDENCY_SWEEPS
@@ -857,19 +864,65 @@ def trim(slot, budget, pressed):
     # Where reading a file leaves its access time alone, every dependency
     # would look unread.
     if due and not os.statvfs(slot).f_flag & os.ST_NOATIME:
-        cutoff = time.time() - DEPENDENCY_IDLE
-        for deps in target_directories(slot, "deps"):
-            for entry in os.scandir(deps):
+        try:
+            moved += sweep_dependencies(slot, time.time() - DEPENDENCY_IDLE)
+            open(swept, "a").close()
+            os.utime(swept)
+        except OSError:
+            pass
+    return moved
+
+
+def sweep_dependencies(slot, cutoff):
+    """Moves out of the slot's target each compiled unit that nothing has
+    read or written since `cutoff`: in a profile's `deps`, all the files of
+    one `<crate>-<hash>` together (its rlib, rmeta, dep-info and any
+    executable or library), so a unit in use never loses part of itself;
+    in its `build`, a build script's directory, judged by its newest file.
+    Cargo builds again whatever a build needs of them. Returns the bytes
+    moved out."""
+    moved = 0
+    for deps in target_directories(slot, "deps"):
+        units = {}
+        for entry in os.scandir(deps):
+            try:
+                status = entry.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            if not stat.S_ISREG(status.st_mode):
+                continue
+            unit = entry.name.split(".", 1)[0].removeprefix("lib")
+            units.setdefault(unit, []).append((entry.path, status))
+        for files in units.values():
+            if any(max(status.st_atime, status.st_mtime) >= cutoff for _, status in files):
+                continue
+            for path, status in files:
                 try:
-                    status = entry.stat(follow_symlinks=False)
-                    if not stat.S_ISREG(status.st_mode) or max(status.st_atime, status.st_mtime) >= cutoff:
-                        continue
-                    evict(slot, entry.path)
+                    evict(slot, path)
                 except OSError:
                     continue
                 moved += status.st_blocks * 512
-        open(swept, "a").close()
-        os.utime(swept)
+    for build in target_directories(slot, "build"):
+        for entry in os.scandir(build):
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            # By its files: looking through its directories reads them.
+            newest, size = 0.0, 0
+            for directory, _names, files in os.walk(entry.path):
+                for name in files:
+                    try:
+                        status = os.lstat(os.path.join(directory, name))
+                    except OSError:
+                        continue
+                    newest = max(newest, status.st_atime, status.st_mtime)
+                    size += status.st_blocks * 512
+            if newest >= cutoff:
+                continue
+            try:
+                evict(slot, entry.path)
+            except OSError:
+                continue
+            moved += size
     return moved
 
 
@@ -905,15 +958,25 @@ for slot in sys.argv[1:]:
 """
 
 
+def evicted_left(slot):
+    """Whether anything trim moved out of `slot` is still there."""
+    try:
+        return bool(os.listdir(os.path.join(slot, "evicted")))
+    except OSError:
+        return False
+
+
 def remove_evicted(slots, wait=False):
-    """Removes what trim moved out of `slots` in a session of its own, at
-    idle CPU and I/O priority, waiting for it only when asked."""
-    slots = [slot for slot in slots if os.path.isdir(os.path.join(slot, "evicted"))]
+    """Removes what trim moved out of `slots` in a session of its own,
+    waiting for it, and for any removal of theirs already under way, only
+    when asked. A build waiting for it gets low priority rather than idle,
+    which the I/O of running builds could starve."""
+    slots = [slot for slot in slots if evicted_left(slot)]
     if not slots:
         return
-    lower = [shutil.which("nice") or "nice", "-n", "19"]
+    lower = [shutil.which("nice") or "nice", "-n", "10" if wait else "19"]
     if shutil.which("ionice"):
-        lower += [shutil.which("ionice"), "-c3"]
+        lower += [shutil.which("ionice"), *(("-c2", "-n7") if wait else ("-c3",))]
     remover = subprocess.Popen([*lower, sys.executable, "-c", REMOVER, *slots],
                                cwd="/", stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                stderr=subprocess.DEVNULL, start_new_session=True)
@@ -951,7 +1014,8 @@ def trim_free(base, budget, floor, mine=None):
                 try:
                     moved = trim(slot, budget, free_space(slot) < pressure_floor(slot, floor))
                 except OSError:
-                    continue
+                    # What it moved out before failing is still to remove.
+                    moved = 0
                 trimmed.append((slot, moved))
     return trimmed
 
@@ -1037,11 +1101,13 @@ def leased(slot):
 
 
 def leased_lock(path):
-    """Whether something holds the lock file at `path`."""
+    """Whether something holds the lock file at `path` exclusively, as a
+    lease or build does. A trim of an idle slot, or a hold's check that its
+    lease lasts, holds it shared, and is no build."""
     try:
         with open(path, "a") as lock:
             try:
-                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(lock, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
                 return True
             fcntl.flock(lock, fcntl.LOCK_UN)
@@ -1980,7 +2046,7 @@ if command == "lease":
     pressed = free() < pressure_floor(base, floor)
     if not announced:
         # Measuring sessions it has not seen before may take a while.
-        slow = threading.Timer(5, say, ("wait",))
+        slow = threading.Timer(5, say, ("wait", "trim"))
         slow.daemon = True
         slow.start()
     trimmed = [slot]
@@ -2111,7 +2177,10 @@ elif command == "trim":
     trimmed = []
     for repository in sorted(glob.glob(os.path.join(glob.escape(base), "*", ""))):
         trimmed += trim_free(repository.rstrip(os.sep), budget, floor)
-    remove_evicted([slot for slot, _ in trimmed], wait=wait)
+    # Waiting, for every slot's removal, including those of a trim that
+    # held a slot this one passed over.
+    remove_evicted(sorted(glob.glob(os.path.join(glob.escape(base), "*", "slot-*"))) if wait
+                   else [slot for slot, _ in trimmed], wait=wait)
     moved = sum(size for _, size in trimmed)
     if moved:
         say(f"moved {moved / GIB:.1f} GiB of build output out of {len(trimmed)} idle build slots")
@@ -2677,6 +2746,8 @@ class Offload:
                         say(f"waiting for CPU on {self.host}: its CPU pressure is "
                             f"{words[2]}%, at or above the {words[3]}% limit"
                             + (f"; {culprits}" if culprits else ""))
+                    elif reason == "trim":
+                        say(f"waiting while {self.host} trims old build output from this build's slot")
                     elif reason == "same":
                         say(f"waiting for the same build of this checkout on {self.host} to "
                             f"finish, which leaves this one little to compile")
