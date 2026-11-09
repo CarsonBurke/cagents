@@ -1384,8 +1384,10 @@ pub struct Subagent {
 }
 
 impl Subagent {
-    /// Running delegated work that cancelling the parent's turn would also
-    /// stop, where the provider's interrupt does not spare it.
+    /// Delegated work, running or waiting on its own background work, that
+    /// cancelling the parent's turn would also stop, where the provider's
+    /// interrupt does not spare it. Claude Code's interrupt kills a waiting
+    /// agent and its own background work as it does a running one.
     pub fn stopped_by_interrupt(&self, capabilities: &Capabilities) -> bool {
         self.status.is_live() && self.background && capabilities.interrupt_stops_background
     }
@@ -2952,7 +2954,8 @@ mod tests {
         assert!(!snapshot.is_working());
         // `Waiting` means the person is needed, and nothing here needs them.
         assert_eq!(snapshot.activity(), crate::agent::ActivityState::Idle);
-        // Stopping the turn ends it, so a person is warned as for running work.
+        // An interrupt kills it, as recorded from Claude Code, so a person is
+        // warned as for running work.
         let capabilities = Capabilities {
             interrupt_stops_background: true,
             ..Capabilities::default()
