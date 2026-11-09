@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+from contextlib import closing
 import os
 from pathlib import Path
 import sqlite3
@@ -10,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 
 REPOSITORY = Path(__file__).resolve().parent.parent
 SCRIPT = REPOSITORY / "scripts/rehearse-update"
@@ -89,7 +91,7 @@ class Comparison(unittest.TestCase):
                 (out / f"{name}.json").write_text(records.dump({"ok": True, "data": {name: rows}}))
             database = root / "home/.local/share/cagents/sessions.sqlite3"
             database.parent.mkdir(parents=True)
-            with sqlite3.connect(database) as db:
+            with closing(sqlite3.connect(database)) as db, db:
                 db.execute("CREATE TABLE cards(card_id TEXT, title TEXT, existence_json TEXT, kind_tag TEXT)")
                 db.execute("INSERT INTO cards VALUES ('a', 'Codex agent', '\"open\"', 'chat')")
                 db.commit()
@@ -144,7 +146,7 @@ class Comparison(unittest.TestCase):
             home = Path(temporary)
             path = home / ".local/share/cagents/windows/main/sessions.sqlite3"
             path.parent.mkdir(parents=True)
-            with sqlite3.connect(path) as db:
+            with closing(sqlite3.connect(path)) as db, db:
                 db.execute("PRAGMA journal_mode=WAL")
                 db.execute("CREATE TABLE cards(card_id TEXT, title TEXT, existence_json TEXT)")
                 db.execute("INSERT INTO cards VALUES ('one', 'Details: pane', '\"open\"')")
@@ -156,6 +158,25 @@ class Comparison(unittest.TestCase):
                 self.assertEqual(captured["windows/main/sessions.sqlite3"]["rows"]["cards"][0]["title"],
                                  "Details: pane")
                 self.assertEqual(path.read_bytes(), original)
+
+
+class ReopenedWindows(unittest.TestCase):
+    def test_success_requires_the_new_ui_image_in_both_named_windows(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        rehearsal = scenario.Rehearsal('/var/tmp/rehearsal-test', str(SCRIPT))
+        windows = {'main': {'pid': 1}, 'second': {'pid': 2}}
+        expected = '/var/tmp/rehearsal-test/home/.local/share/cagents-install/versions/new/bin/cagents-ui'
+        with patch.object(rehearsal, 'mapped', return_value=windows), \
+                patch.object(scenario.os, 'readlink', side_effect=[expected, expected]):
+            self.assertEqual(rehearsal.wait_windows(['main','second'], timeout=1, version='new'), windows)
+        with patch.object(rehearsal, 'mapped', return_value=windows), \
+                patch.object(scenario.os, 'readlink', side_effect=[expected, expected.replace('/new/', '/old/')]), \
+                patch.object(scenario.time, 'monotonic', side_effect=[0, .1, 2]), \
+                patch.object(scenario.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'windows did not map on new'):
+                rehearsal.wait_windows(['main','second'], timeout=1, version='new')
 
 
 class Pty(unittest.TestCase):

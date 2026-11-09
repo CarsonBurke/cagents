@@ -64,14 +64,21 @@ class Rehearsal:
             slots[slot] = window
         return slots
 
-    def wait_windows(self, required, timeout=60):
+    def wait_windows(self, required, timeout=60, version=None):
         deadline = time.monotonic()+timeout
         while time.monotonic() < deadline:
             slots = self.mapped()
             if all(name in slots for name in required):
-                return slots
+                if version is None:
+                    return slots
+                try:
+                    expected = self.root/'home/.local/share/cagents-install/versions'/version/'bin/cagents-ui'
+                    if all(Path(os.readlink(f'/proc/{slots[name]["pid"]}/exe')) == expected for name in required):
+                        return slots
+                except OSError:
+                    pass
             time.sleep(1)
-        raise RuntimeError(f'windows did not map: wanted {required}, saw {list(slots)}')
+        raise RuntimeError(f'windows did not map on {version or "the desktop"}: wanted {required}, saw {list(slots)}')
 
     def observe(self, output, shots=None):
         observed = {}
@@ -289,7 +296,7 @@ class Rehearsal:
             if code:
                 self.errors.append(f'update exited {code}')
             try:
-                self.wait_windows(['main','second'],timeout=args.reopen_timeout)
+                self.wait_windows(['main','second'],timeout=args.reopen_timeout,version=args.new_version if code==0 else None)
             except RuntimeError as exc:
                 self.errors.append(str(exc))
             code, _ = self.call('record','after',timeout=150,check=False)

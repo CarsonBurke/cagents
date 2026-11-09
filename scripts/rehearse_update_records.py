@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -85,7 +86,7 @@ def stores(home: Path, errors: list[str]) -> dict:
         key = str(path.relative_to(base))
         try:
             # mode=ro includes the live WAL. immutable=1 would silently miss it.
-            with sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5) as db:
+            with closing(sqlite3.connect(path.as_uri() + "?mode=ro", uri=True, timeout=5)) as db:
                 db.row_factory = sqlite3.Row
                 db.execute("PRAGMA query_only=ON")
                 db.execute("BEGIN")
