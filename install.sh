@@ -525,7 +525,7 @@ cleanup() {
         && [ -n "$STORE_SCHEMA_BEFORE" ]; then
         restored_schema=$STORE_SCHEMA_BEFORE
         [ "$restored_schema" != none ] || restored_schema=$OLDEST_STORE_SCHEMA
-        if ! "$NEW_VERSION_DIR/bin/cagentsd" --downgrade-store "$restored_schema" >/dev/null; then
+        if ! "$NEW_VERSION_DIR/bin/cagents" daemon downgrade-store "$restored_schema" >/dev/null; then
             TRANSACTION_COMMITTED=1
             printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store; inspect cagents daemon status before retrying\n' \
                 "$PROGRAM" "$restored_schema" >&2
@@ -751,6 +751,13 @@ supports_stage_guard() {
         stage_help=$("$1" "$stage_command" --help 2>/dev/null) || return 1
         printf '%s\n' "$stage_help" | awk '$1 == "--stage-only" { found = 1 } END { exit !found }' || return 1
     done
+}
+# The replacement's own command line reports whether it can read and convert
+# the shared-model store, without starting anything.
+supports_store_conversion() {
+    [ -x "$1" ] \
+        && "$1" daemon store-schema --help >/dev/null 2>&1 \
+        && "$1" daemon downgrade-store --help >/dev/null 2>&1
 }
 supports_selected_guard() {
     if [ "$STAGE_ONLY" -eq 1 ]; then supports_stage_guard "$1"; else supports_install_guard "$1"; fi
@@ -1126,9 +1133,13 @@ else
 fi
 # The previous daemon has stopped, so the store holds the schema it reads.
 # Record it before the replacement can convert the store, so that a rollback
-# can convert it back.
-if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRED" -eq 0 ]; then
-    STORE_SCHEMA_BEFORE=$("$NEW_VERSION_DIR/bin/cagentsd" --stored-schema) \
+# can convert it back. Only a replacement whose command line offers the store
+# commands is asked. Its daemon is never run directly: releases before the
+# options ignore arguments and would start serving. A replacement without
+# them predates every conversion, so it has nothing to undo.
+if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRED" -eq 0 ] \
+    && supports_store_conversion "$NEW_VERSION_DIR/bin/cagents"; then
+    STORE_SCHEMA_BEFORE=$("$NEW_VERSION_DIR/bin/cagents" daemon store-schema) \
         || fail 'cannot read the shared-model store schema; installation was not changed'
     case $STORE_SCHEMA_BEFORE in
         '') STORE_SCHEMA_BEFORE=none ;;
