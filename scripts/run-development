@@ -1167,9 +1167,12 @@ stop_instance_session() {
         # Through the session's own environment, never the caller's desktop.
         # niri-harness exec refuses a session that is no longer live; the
         # sweep below then ends its daemon with the session's other processes.
+        # The session's environment does not name the instance, and without
+        # it the CLI addresses the session's default development daemon.
         if niri-harness exec --session "$harness_session" -- true 2>/dev/null; then
             cli=$(instance_cli_path)
             if ! output=$(niri-harness exec --session "$harness_session" -- \
+                env CAGENTS_DEVELOPMENT_INSTANCE="$instance" \
                 "$cli" daemon stop-for-rebuild --including-subagents 2>&1); then
                 printf '%s\n' "$output" >&2
                 exit 1
