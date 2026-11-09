@@ -1449,13 +1449,29 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    // A server that stopped without cleaning up leaves its endpoint behind.
-    // A listener still being served is joined; anything else is retired so
-    // this conversation's own server starts again at the same path.
+    // Join a served listener. Before replacing a saved conversation's server,
+    // prove its old execution ended, even if its endpoint vanished. Inspect
+    // the original descriptor: claiming a legacy listener above grants no
+    // evidence about the execution that used to serve it.
     let owned_socket = match owned_socket {
         Some(socket)
-            if !owned_listener::served(&socket).map_err(|failure| {
-                unavailable(format!("Cannot retire stopped provider socket: {failure}"))
+            if !owned_listener::served_before_retire(&socket, || {
+                use super::upgrade_inspect::{CodexExecution, codex_execution};
+                if requested_source.launch.session_id.is_none() {
+                    return Ok(());
+                }
+                let message = match codex_execution(&requested_source, &allocator.boot_id) {
+                    CodexExecution::Ended => return Ok(()),
+                    CodexExecution::Running { pid } => format!(
+                        "Codex is still running this conversation in another process{}. Stop it, or close this pane and resume the conversation from the picker.",
+                        pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+                    ),
+                    CodexExecution::Unproved => "The old Codex process could not be checked, so this conversation was not restarted. Stop the old process, or close this pane and resume the conversation from the picker.".into(),
+                };
+                Err(std::io::Error::other(message))
+            })
+            .map_err(|failure| {
+                unavailable(format!("Cannot restart Codex: {failure}"))
             })? =>
         {
             Some(socket)

@@ -620,6 +620,14 @@ impl ExecutionEvidence {
     /// console runs outside the server, so a pane whose console was paired in
     /// this boot stays unproved.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
+        match self.codex_execution(source) {
+            CodexExecution::Ended => SavedExecution::Ended,
+            CodexExecution::Running { .. } => SavedExecution::Running,
+            CodexExecution::Unproved => SavedExecution::Unproved,
+        }
+    }
+
+    fn codex_execution(&self, source: &Session) -> CodexExecution {
         use crate::daemon::holder_registry::{self, Kind};
         // A console paired in an earlier kernel boot cannot still run; one of
         // this boot, or with incomplete evidence, is outside what this sees.
@@ -632,22 +640,22 @@ impl ExecutionEvidence {
         let Some(listener) = source.owned_codex_listener.as_ref().filter(|_| {
             source.owns_codex_listener() && source.has_valid_native_continuity() && console_ended
         }) else {
-            return SavedExecution::Unproved;
+            return CodexExecution::Unproved;
         };
         let Ok(native_holders) = &self.native_holders else {
-            return SavedExecution::Unproved;
+            return CodexExecution::Unproved;
         };
         let control = holder_registry::socket(native_holders, source.id);
         // Discovery refuses a record of another boot.
         let holder = match holder_registry::recovery_candidate(&control, Kind::Native) {
             Ok(holder) => holder,
-            Err(_) => return SavedExecution::Unproved,
+            Err(_) => return CodexExecution::Unproved,
         };
         if let Some(holder) = holder {
             match crate::chat::runtime::retained_actor_abandoned(&holder.holder, &holder.root) {
                 Ok(true) => {}
-                Ok(false) => return SavedExecution::Running,
-                Err(_) => return SavedExecution::Unproved,
+                Ok(false) => return CodexExecution::Running { pid: None },
+                Err(_) => return CodexExecution::Unproved,
             }
         }
         // Recent Codex releases bind a socket in their own runtime directory
@@ -660,25 +668,39 @@ impl ExecutionEvidence {
             {
                 None
             }
-            Err(_) => return SavedExecution::Unproved,
+            Err(_) => return CodexExecution::Unproved,
         };
         // A holder binds its control socket before it starts the server and
         // publishes its record, so a starting holder is seen by that socket.
         let mut sockets = vec![listener.socket.as_path(), control.as_path()];
         sockets.extend(published.as_deref());
         match codex_listener_survives(&self.processes, source.id, &sockets, self.exec_settle) {
-            Ok(true) => SavedExecution::Running,
-            Ok(false) => SavedExecution::Ended,
-            Err(_) => SavedExecution::Unproved,
+            Ok(execution) => execution,
+            Err(_) => CodexExecution::Unproved,
         }
     }
+}
+
+/// The same execution proof used by source inspection, close and resume.
+/// A socket or surviving process group need not identify a live process ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CodexExecution {
+    Ended,
+    Running { pid: Option<u32> },
+    Unproved,
+}
+
+pub(super) fn codex_execution(source: &Session, boot: &crate::model::BootId) -> CodexExecution {
+    if source.launch.provider != crate::agent::Provider::Codex {
+        return CodexExecution::Unproved;
+    }
+    ExecutionEvidence::codex(boot).codex_execution(source)
 }
 
 /// Whether nothing of a Codex pane of `boot` can still run, by the evidence
 /// an upgrade requires before it replaces the service that ran it.
 pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootId) -> bool {
-    source.launch.provider == crate::agent::Provider::Codex
-        && ExecutionEvidence::codex(boot).classify_codex(source) == SavedExecution::Ended
+    codex_execution(source, boot) == CodexExecution::Ended
 }
 
 /// Whether any process of this user names a Codex pane's listener directory
@@ -693,7 +715,7 @@ fn codex_listener_survives(
     pane: crate::model::TerminalId,
     sockets: &[&Path],
     settle: Duration,
-) -> Result<bool, String> {
+) -> Result<CodexExecution, String> {
     use std::os::unix::ffi::OsStrExt;
     let marker = format!("cagents-codex-{pane}");
     let marker = marker.as_bytes();
@@ -743,20 +765,30 @@ fn codex_listener_survives(
         if arguments(&path)?
             .is_some_and(|argv| argv.windows(marker.len()).any(|window| window == marker))
         {
-            return Ok(true);
+            return Ok(CodexExecution::Running {
+                pid: entry
+                    .file_name()
+                    .to_str()
+                    .and_then(|name| name.parse().ok()),
+            });
         }
     }
     let bound = std::fs::read(processes.join("net/unix"))
         .map_err(|error| format!("Cannot inspect bound sockets: {error}"))?;
     // The path is the last field, after the fixed-width columns.
-    Ok(bound.split(|byte| *byte == b'\n').skip(1).any(|line| {
+    let survives = bound.split(|byte| *byte == b'\n').skip(1).any(|line| {
         sockets.iter().any(|socket| {
             let socket = socket.as_os_str().as_bytes();
             line.len() > socket.len()
                 && line.ends_with(socket)
                 && line[line.len() - socket.len() - 1] == b' '
         })
-    }))
+    });
+    Ok(if survives {
+        CodexExecution::Running { pid: None }
+    } else {
+        CodexExecution::Ended
+    })
 }
 
 /// A process or thread no longer found, or a thread whose id an `execve`
@@ -1640,7 +1672,7 @@ mod tests {
                 &[listener.as_path(), control.as_path()],
                 Duration::from_secs(2),
             ) {
-                Ok(false) => absent += 1,
+                Ok(CodexExecution::Ended) => absent += 1,
                 Err(error) if error == "A process has not published its arguments yet" => {
                     unpublished += 1;
                 }

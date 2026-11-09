@@ -42,7 +42,11 @@ fn isolated(test: &str) -> Option<std::path::PathBuf> {
                 "--color=never",
             ])
             .env(MODE, directory.path())
+            .env("HOME", directory.path())
             .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", directory.path().join("data"))
+            .env("XDG_CONFIG_HOME", directory.path().join("config"))
+            .env("XDG_CACHE_HOME", directory.path().join("cache"))
             .stdout(std::fs::File::create(&stdout).unwrap())
             .stderr(std::fs::File::create(&stderr).unwrap())
             .spawn()
@@ -601,4 +605,293 @@ fn a_finished_resident_whose_owner_ended_closes() {
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
     fixture.assert_settled();
     assert!(!fixture.socket().parent().unwrap().exists());
+}
+
+/// A fake app-server records its actual launch, then waits without speaking the
+/// provider protocol. These tests cover execution admission, not provider RPC.
+fn codex_start_fixture(root: &std::path::Path) -> Fixture {
+    let mut fixture = Fixture::new(root);
+    let program = root.join("codex");
+    std::fs::write(
+        &program,
+        "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"$CAGENTS_START_PROOF_ARGV\"\nexec /bin/sleep 60\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let home = root.join("codex-home");
+    std::fs::create_dir(&home).unwrap();
+    fixture.source.launch.recipe.program = program.to_str().unwrap().into();
+    fixture.source.launch.recipe.environment = BTreeMap::from([
+        ("CODEX_HOME".into(), home.to_str().unwrap().into()),
+        (
+            "CAGENTS_START_PROOF_ARGV".into(),
+            root.join("started-argv").to_str().unwrap().into(),
+        ),
+    ]);
+    fixture.host.lock().unwrap().codex_listeners = CodexListenerRoots::at(root.into());
+    fixture
+}
+
+fn codex_start(fixture: &Fixture) -> Result<ServerResponse, ProtocolError> {
+    start(
+        &fixture.host,
+        1,
+        fixture.source.clone(),
+        None,
+        false,
+        None,
+        Default::default(),
+    )
+}
+
+fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
+    let response = codex_start(fixture).unwrap();
+    assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+    let expected = format!(
+        "app-server\n--listen\nunix://{}\n",
+        fixture.socket().display()
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let argv = loop {
+        if let Ok(argv) = std::fs::read_to_string(root.join("started-argv")) {
+            if argv == expected {
+                break argv;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the fake app-server never launched"
+        );
+        thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(
+        argv.lines().collect::<Vec<_>>(),
+        [
+            "app-server",
+            "--listen",
+            &format!("unix://{}", fixture.socket().display())
+        ]
+    );
+    let handle = fixture.host.lock().unwrap().chats[&fixture.source.id]
+        .handle
+        .clone();
+    handle.close().unwrap();
+    let record = registry::recovery_candidate(
+        &registry::socket(
+            &registry::directory(Kind::Native).unwrap(),
+            fixture.source.id,
+        ),
+        Kind::Native,
+    )
+    .unwrap();
+    assert!(
+        record.is_none(),
+        "closing must reap the fake app-server's holder"
+    );
+}
+
+/// Startup and a lost/unlinked endpoint can leave a writer alive with no
+/// served socket. The same ChatStart must refuse until that writer exits.
+#[test]
+fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
+    use std::io::Read;
+    let Some(root) = isolated("codex_start_refuses_a_surviving_process_then_starts_after_it_exits")
+    else {
+        return;
+    };
+    let fixture = codex_start_fixture(&root);
+    struct Named(std::process::Child);
+    impl Drop for Named {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut named = Named(
+        std::process::Command::new("/bin/sh")
+            .args(["-c", "printf ready; IFS= read -r release"])
+            .arg(fixture.socket())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = [0; 5];
+    named
+        .0
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+    assert!(!fixture.socket().exists());
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("Codex is still running this conversation"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains(&format!("pid {}", named.0.id())),
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure
+            .message
+            .contains("resume the conversation from the picker")
+    );
+    assert!(!root.join("started-argv").exists());
+    assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
+    drop(named);
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_start_refuses_legacy_listener_without_old_execution_evidence() {
+    let Some(root) = isolated("codex_start_refuses_legacy_listener_without_old_execution_evidence")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.source.owned_codex_listener = None;
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("old Codex process could not be checked"),
+        "{}",
+        failure.message
+    );
+    assert!(!root.join("started-argv").exists());
+}
+
+#[test]
+fn codex_start_refuses_unproved_console_without_retiring_the_endpoint() {
+    let Some(root) = isolated("codex_start_refuses_unproved_console_without_retiring_the_endpoint")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    // A paired console with no complete boot proof is outside the shared
+    // inspector's evidence, even though the listener itself looks stopped.
+    fixture.source.terminal = Some(
+        crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            fixture.source.launch.recipe.clone(),
+            None,
+        )
+        .session,
+    );
+    std::os::unix::fs::symlink(root.join("missing-socket"), fixture.socket()).unwrap();
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("old Codex process could not be checked"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.socket())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!root.join("started-argv").exists());
+}
+
+#[test]
+fn codex_start_brand_new_conversation_needs_no_old_execution_evidence() {
+    let Some(root) = isolated("codex_start_brand_new_conversation_needs_no_old_execution_evidence")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.source.launch.session_id = None;
+    fixture.source.proof = None;
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_start_refuses_unreadable_listener_evidence() {
+    let Some(root) = isolated("codex_start_refuses_unreadable_listener_evidence") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    // ELOOP is unreadable evidence, rather than a missing/ended listener.
+    let looped = root.join("loop");
+    std::os::unix::fs::symlink(&looped, &looped).unwrap();
+    let socket = looped
+        .join(format!("cagents-codex-{}", fixture.source.id))
+        .join("control.sock");
+    fixture.source.launch.recipe.arguments[1] = format!("unix://{}", socket.display());
+    fixture.source.owned_codex_listener.as_mut().unwrap().socket = socket;
+    assert!(fixture.source.owns_codex_listener());
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("old Codex process could not be checked"),
+        "{}",
+        failure.message
+    );
+    assert!(!root.join("started-argv").exists());
+}
+
+#[test]
+fn codex_start_refuses_a_bound_unlinked_published_target() {
+    let Some(root) = isolated("codex_start_refuses_a_bound_unlinked_published_target") else {
+        return;
+    };
+    let fixture = codex_start_fixture(&root);
+    let target = root.join("published.sock");
+    let _server = std::os::unix::net::UnixListener::bind(&target).unwrap();
+    std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
+    std::fs::remove_file(&target).unwrap();
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure
+            .message
+            .contains("Codex is still running this conversation"),
+        "{}",
+        failure.message
+    );
+    assert!(
+        std::fs::symlink_metadata(fixture.socket())
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert!(!root.join("started-argv").exists());
+}
+
+#[test]
+fn codex_start_joins_a_served_listener_without_launching() {
+    let Some(root) = isolated("codex_start_joins_a_served_listener_without_launching") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    let target = root.join("published.sock");
+    let _server = std::os::unix::net::UnixListener::bind(&target).unwrap();
+    std::os::unix::fs::symlink(&target, fixture.socket()).unwrap();
+    // Missing old ownership evidence must not block an existing attachment.
+    fixture.source.owned_codex_listener = None;
+    let response = codex_start(&fixture).unwrap();
+    assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+    assert!(!root.join("started-argv").exists());
+    assert!(
+        std::fs::symlink_metadata(
+            root.join(format!("cagents-codex-{}", fixture.source.id))
+                .join("control.sock")
+        )
+        .is_ok()
+    );
+    let handle = fixture.host.lock().unwrap().chats[&fixture.source.id]
+        .handle
+        .clone();
+    handle.close().unwrap();
 }
