@@ -54,29 +54,38 @@ STUBS = {
         printf '%s\\n' "$*" >> "$STUB_LOG/harness"
         printf '%s\\n' "$PATH" >> "$STUB_LOG/harness-path"
         ls -l /proc/self/fd >> "$STUB_LOG/harness-fds" 2>&1
-        if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1 $2" = "session stop" ]; then exec sleep 300; fi
+        if [ "$1" = --help ]; then echo 'start stop list env exec gc'; exit 0; fi
+        if [ "$1 $2" = "start --help" ]; then
+            echo '--root --width --portal --backend --host-bus'; exit 0
+        fi
+        [ "$1" != session ] || { echo 'legacy session command' >&2; exit 2; }
+        if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1" = stop ]; then exec sleep 300; fi
+        cmd=()
         args=("$@")
         for ((i = 0; i < $#; i++)); do
             case ${args[i]} in
                 --root) root=${args[i + 1]} ;;
-                --cmd) cmd=${args[i + 1]} ;;
+                --) cmd=("${args[@]:i + 1}"); break ;;
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
-                    printf 'window=1\\n'
                     # Output a reader stops at: its pipe closes under the harness.
                     if [ -e "$STUB_LOG/observe-large" ]; then
+                        printf '{"window":{"id":1},"text":"'
                         head -c 1000000 /dev/zero | tr '\\0' x
                         [ "${PIPESTATUS[1]}" = 0 ] || exit 1
+                        printf '"}\\n'
+                    else
+                        printf '{"window":{"id":1}}\\n'
                     fi
                     exit 0
                     ;;
             esac
         done
-        if [ -n "${cmd:-}" ]; then
+        if [ "${#cmd[@]}" -gt 0 ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
-            sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
+            "${cmd[@]}" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
             # Nor does it report ready until the app is up, unless told not to wait.
@@ -267,6 +276,29 @@ class Evidence(unittest.TestCase):
                 return False
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
+
+    def test_separate_commands_use_the_pinned_harness_after_a_legacy_path_start(self):
+        self.built("after")
+        pinned = Path(self.env["HOME"]) / ".local/lib/cagents/niri-harness/5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46/bin/niri-harness"
+        pinned.parent.mkdir(parents=True)
+        shutil.copy2(self.bin / "niri-harness", pinned)
+        (self.bin / "niri-harness").write_text("#!/bin/sh\necho legacy-global-harness >&2\nexit 2\n")
+        self.run_tool("start", "after")
+        self.run_tool("drive", "observe", "--no-text", "--json")
+        result = self.run_tool("nested", "sh", "-c", 'echo "$NESTED_MARKER"')
+        self.assertEqual(result.stdout.strip(), "nested")
+        self.run_tool("shot", "pinned")
+        self.run_tool("stop")
+
+    def test_a_legacy_harness_is_refused_before_waiting_for_the_native_lock(self):
+        self.built("after")
+        harness = self.bin / "niri-harness"
+        harness.write_text("#!/bin/sh\necho 'usage: niri-harness session start' >&2\nexit 2\n")
+        harness.chmod(0o755)
+        result = self.run_tool("start", "after", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires niri-harness source tree 5ab6ba0a", result.stderr)
+        self.assertNotIn("waiting for the native session", result.stdout)
 
     def test_a_session_has_a_memory_limit_made_before_its_private_environment(self):
         source = (REPOSITORY / "scripts/native-evidence").read_text()
@@ -620,7 +652,7 @@ class Evidence(unittest.TestCase):
     def test_a_session_is_ready_only_once_the_harness_saw_a_window(self) -> None:
         self.built()
         self.run_tool("start", "after")
-        start = next(line for line in (self.logs / "harness").read_text().splitlines() if "--cmd" in line)
+        start = next(line for line in (self.logs / "harness").read_text().splitlines() if line.startswith("start --name"))
         self.assertNotIn("--no-window-wait", start)
         self.run_tool("stop")
 
@@ -880,7 +912,7 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after", "--portal", "gtk")
         self.run_tool("stop")
         starts = [line for line in (self.logs / "harness").read_text().splitlines()
-                  if line.startswith("session start")]
+                  if line.startswith("start --name")]
         self.assertEqual(len(starts), 2, starts)
         self.assertNotIn("--portal", starts[0])
         self.assertIn("--portal gtk", starts[1])

@@ -211,6 +211,41 @@ real decision. The check never runs Cargo's build, so nothing compiles outside
 a slot. Launching the other lane rebuilds the UI and invalidates this lane's
 record. Delete the record to force the next launch through the gate.
 
+### Harness runtime
+
+Named instances and native evidence require top-level `start`, `stop`, `list`,
+`env`, `exec` and `gc`, plus the start options `--root`, `--width`, `--portal`,
+`--backend` and `--host-bus`. Both runners check these capabilities before using
+a harness. A compatible PATH installation wins; otherwise they use the isolated
+runtime at `~/.local/lib/cagents/niri-harness/5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46/bin`.
+
+This is Git source tree `5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46` from the
+current harness checkout, based on commit `41f75699cdef1aed76aeee876a6738ee8496b2c6`
+plus its working changes. The base commit alone lacks `exec` and `gc` and is
+refused. The source snapshot is retained on fw16 under
+`~/.local/state/cagents-harness-2451/5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46/source`.
+To install that snapshot without replacing a global runtime:
+
+```sh
+make -C "$HOME/.local/state/cagents-harness-2451/5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46/source" install \
+    PREFIX="$HOME/.local/lib/cagents/niri-harness/5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46"
+```
+
+The snapshot can also be exported from the harness repository with
+`git archive 5ab6ba0a0b5b2f3c83c8d45d7f7493727d181d46` or copied from fw16.
+`make install` builds the harness's small C input helpers; Rust application
+builds still go through `scripts/cargo-gate`. The versioned prefix has its own
+launcher, helpers and resources, so no running session's files are replaced.
+Older checkouts keep their global legacy CLI. Update a global install only
+when its sessions have ended and all callers support its CLI.
+
+Each separate start, drive, capture and lifecycle invocation resolves its
+harness. Listing still works without one; garbage collection refuses to remove
+instances or storage when harness liveness cannot be checked. Native evidence
+uses the window backend inside its private KWin compositor. With no portal it
+shares that private bus; with `--portal` the harness owns the portal's private
+bus. Named development instances use the headless backend.
+
 ### Parallel instances
 
 Several people or agents can each validate a change in the native app at once
