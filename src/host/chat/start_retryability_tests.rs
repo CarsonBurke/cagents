@@ -593,6 +593,26 @@ fn managed_account_registry_io_is_retryable_but_malformed_data_is_blocked() {
     assert!(host.lock().unwrap().chats.is_empty());
     assert!(host.lock().unwrap().chat_spawning.is_empty());
 
+    // A known unsupported account format needs a newer executable, rather
+    // than the resource Retry used for an unreadable registry above.
+    let mut future: toml::Value =
+        toml::from_str(&fs::read_to_string(&saved_registry).unwrap()).unwrap();
+    future["version"] = toml::Value::Integer(i64::from(u32::MAX));
+    fs::write(&registry, toml::to_string(&future).unwrap()).unwrap();
+    let future_bytes = fs::read(&registry).unwrap();
+    let failure = refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Blocked,
+        "{}",
+        failure.message
+    );
+    assert!(failure.message.contains("newer cagents"));
+    assert_eq!(fs::read(&registry).unwrap(), future_bytes);
+    assert!(!root.join("provider.json").exists());
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+
     fs::remove_file(&registry).unwrap();
     fs::rename(&saved_registry, &registry).unwrap();
     let _server = start_codex_peer(&root, &socket, &home);

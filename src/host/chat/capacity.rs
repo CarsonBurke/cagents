@@ -152,8 +152,9 @@ impl Reservation {
                 ));
             }
         }
-        if state.chat_handoffs.contains_key(&source.id) {
-            return Err(error(
+        if let Some(receipt) = state.chat_handoffs.get(&source.id) {
+            receipt.validate_source(source)?;
+            return Err(retryable_unavailable(
                 "This chat already returned to terminal; complete its handoff",
             ));
         }
@@ -1179,6 +1180,74 @@ exit 0
             chat::client::ClientHandle::fixture_restore(client, source),
             server,
         )
+    }
+
+    #[test]
+    fn pending_terminal_handoff_can_reattach_and_complete_without_starting_a_writer() {
+        let host = host();
+        let mut source = session();
+        source.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
+        source.proof = Some(host.lock().unwrap().proof().clone());
+        let recipe = source.launch.recipe.clone();
+        let terminal = crate::model::TerminalSession {
+            id: TerminalId::new(),
+            launch: recipe.clone(),
+            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
+                recipe,
+                last_exit: None,
+            },
+            owned_codex_listener: None,
+            recovery_origin: None,
+            predecessor: None,
+            resume_hint: None,
+            transcript_path: None,
+        };
+        host.lock().unwrap().chat_handoffs.insert(
+            source.id,
+            HandoffReceipt::new(
+                source.clone(),
+                terminal.clone(),
+                1,
+                BTreeMap::new(),
+                Instant::now() + Duration::from_secs(30),
+            ),
+        );
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server_host = host.clone();
+        let server = thread::spawn(move || {
+            super::super::super::client::serve(server, 63, server_host);
+        });
+        let refused =
+            match chat::client::ClientHandle::fixture_start_on(client, source.clone(), |_| {}) {
+                Err(failure) => failure,
+                Ok(_) => panic!("a committed handoff cannot start a second native writer"),
+            };
+        server.join().unwrap();
+        assert_eq!(
+            refused.recovery,
+            chat::Recovery::Retry,
+            "{}",
+            refused.message
+        );
+        let mut changed = source.clone();
+        changed
+            .launch
+            .recipe
+            .arguments
+            .push("--another-recipe".into());
+        assert!(!Reservation::new(&host, &changed).err().unwrap().retryable);
+        let (restored, server) = restore_client(&host, source.clone(), 64);
+        let restored = restored.unwrap();
+        assert_eq!(restored.session(), source);
+        assert_eq!(restored.return_terminal().unwrap(), terminal);
+        drop(restored);
+        server.join().unwrap();
+        let state = host.lock().unwrap();
+        assert!(state.chats.is_empty());
+        assert!(state.chat_spawning.is_empty());
+        assert!(state.native_actor_startups.is_empty());
+        assert!(state.terminals.is_empty());
+        assert_eq!(state.chat_handoffs[&source.id].source, source);
     }
 
     #[test]

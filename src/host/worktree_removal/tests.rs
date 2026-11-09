@@ -41,10 +41,15 @@ fn launches_inside_a_reserved_worktree_are_refused_until_it_is_released() {
     ] {
         let error = ensure_outside(&host, &inside).unwrap_err();
         assert_eq!(error.message, STARTING_INSIDE, "{}", inside.display());
+        assert!(error.retryable, "{}", inside.display());
     }
     ensure_outside(&host, &root.path().join("other")).unwrap();
     ensure_outside(&host, root.path()).unwrap();
-    assert!(ensure_outside(&host, Path::new("relative")).is_err());
+    assert!(
+        !ensure_outside(&host, Path::new("relative"))
+            .unwrap_err()
+            .retryable
+    );
     drop(reservation);
     ensure_outside(&host, &worktree.join("child")).unwrap();
     ensure_outside(&host, Path::new("relative")).unwrap();
@@ -54,14 +59,25 @@ fn launches_inside_a_reserved_worktree_are_refused_until_it_is_released() {
 fn a_moved_worktree_still_refuses_launches_by_inode() {
     let (root, worktree) = tree();
     let host = host();
-    let _reservation = Reservation::install(&host, &worktree).unwrap();
+    let reservation = Reservation::install(&host, &worktree).unwrap();
     let pinned = open_directory(&worktree.join("child"), 0).unwrap();
     let moved = root.path().join("moved");
     std::fs::rename(&worktree, &moved).unwrap();
-    assert!(ensure_outside_directory(&host, &pinned).is_err());
-    assert!(ensure_outside(&host, &moved.join("child")).is_err());
+    assert!(
+        ensure_outside_directory(&host, &pinned)
+            .unwrap_err()
+            .retryable
+    );
+    assert!(
+        ensure_outside(&host, &moved.join("child"))
+            .unwrap_err()
+            .retryable
+    );
     let unrelated = open_directory(&root.path().join("other"), 0).unwrap();
     ensure_outside_directory(&host, &unrelated).unwrap();
+    drop(reservation);
+    ensure_outside_directory(&host, &pinned).unwrap();
+    ensure_outside(&host, &moved.join("child")).unwrap();
 }
 
 #[test]

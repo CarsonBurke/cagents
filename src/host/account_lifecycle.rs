@@ -77,7 +77,7 @@ fn startup_failure(error: SetupError) -> ProtocolError {
 fn filesystem_failure(message: String, error: &std::io::Error) -> SetupError {
     if matches!(
         error.raw_os_error(),
-        Some(libc::EINVAL | libc::ENAMETOOLONG | libc::ENOTDIR)
+        Some(libc::EINVAL | libc::ENAMETOOLONG)
     ) {
         SetupError::Invalid(message)
     } else {
@@ -1341,6 +1341,51 @@ pub(crate) mod tests {
         ));
         assert!(matches!(
             Home::capture_for_start(PathBuf::from("relative")),
+            Err(SetupError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn startup_account_path_retries_when_original_parent_replaces_a_temporary_file() {
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let reserved = root.path().join("reserved");
+        let selected_parent = root.path().join("selected-parent");
+        let selected = selected_parent.join("home");
+        let parked = root.path().join("parked-parent");
+        std::fs::create_dir(&reserved).unwrap();
+        std::fs::create_dir_all(&selected).unwrap();
+        let selected_home = Home::capture_for_start(selected.clone()).unwrap();
+        let host = host();
+        let _reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                reserved,
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
+        ensure_paths(&host, [selected.clone()]).unwrap();
+        std::fs::rename(&selected_parent, &parked).unwrap();
+        std::fs::write(&selected_parent, "temporary filesystem obstruction").unwrap();
+        let refused = ensure_paths(&host, [selected.clone()]).unwrap_err();
+        assert!(refused.retryable, "{}", refused.message);
+        assert!(matches!(
+            selected_home.verify_for_start(),
+            Err(SetupError::Unavailable(_))
+        ));
+        std::fs::remove_file(&selected_parent).unwrap();
+        std::fs::rename(&parked, &selected_parent).unwrap();
+        ensure_paths(&host, [selected.clone()]).unwrap();
+        selected_home.verify_for_start().unwrap();
+        std::fs::rename(&selected, selected_parent.join("original-home")).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        assert!(matches!(
+            selected_home.verify_for_start(),
             Err(SetupError::Invalid(_))
         ));
     }

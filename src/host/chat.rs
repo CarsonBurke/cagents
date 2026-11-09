@@ -396,7 +396,7 @@ fn retryable_unavailable(message: impl Into<String>) -> ProtocolError {
 fn launch_account_error(failure: crate::account::registry::LaunchAccountError) -> ProtocolError {
     let retryable = matches!(&failure,
         crate::account::registry::LaunchAccountError::Unreadable(error)
-            if error.kind() != std::io::ErrorKind::InvalidData
+            if !matches!(error.kind(), std::io::ErrorKind::InvalidData | std::io::ErrorKind::Unsupported)
     );
     ProtocolError::new(
         if matches!(
@@ -1627,14 +1627,23 @@ fn start_with_execution(
         if state.shutting_down {
             return Err(retryable_unavailable("Daemon is shutting down"));
         }
-        if state.chat_handoffs.contains_key(&session.id) {
-            return Err(error(
+        if let Some(receipt) = state.chat_handoffs.get(&session.id) {
+            receipt.validate_source(&session)?;
+            return Err(retryable_unavailable(
                 "This chat already returned to terminal; reattach and complete that handoff instead of starting another writer",
             ));
         }
         let recovering = if let Some(record) = state.chats.get(&session.id) {
             if record.returning_terminal {
-                return Err(error(
+                if record.session.launch.provider != session.launch.provider
+                    || record.session.launch.recipe != session.launch.recipe
+                    || record.handle.session_id() != session.launch.session_id
+                {
+                    return Err(error(
+                        "Explicit recovery must retain the exact closed chat identity",
+                    ));
+                }
+                return Err(retryable_unavailable(
                     "Retry the pending terminal handoff or explicitly close it before starting another native writer",
                 ));
             }

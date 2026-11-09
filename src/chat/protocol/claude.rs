@@ -7020,21 +7020,25 @@ impl History {
             .read_exact(&mut bytes)
             .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
         let mut frame: Value = serde_json::from_slice(&bytes).map_err(|e| {
-            super::SetupError::Invalid(format!("Claude history changed while reading: {e}"))
+            super::SetupError::Unavailable(format!("Claude history changed while reading: {e}"))
         })?;
         // The provider can rewrite this inode after indexing. Revalidate the
         // record being published, including off-page tool-call dependencies.
+        // A mismatch here invalidates this read, not the immutable launch:
+        // another attempt can reindex the repaired or newly settled file.
         if frame["sessionId"]
             .as_str()
             .is_some_and(|id| id != self.session_id)
         {
-            return Err("Claude history changed session identity while reading".into());
+            return Err(super::SetupError::Unavailable(
+                "Claude history changed session identity while reading".into(),
+            ));
         }
-        frame["_cagents_block_base"] = json!(base);
-        frame
-            .as_object_mut()
-            .ok_or("Claude history message is not an object")?
-            .remove("supersedes");
+        let object = frame.as_object_mut().ok_or_else(|| {
+            super::SetupError::Unavailable("Claude history message is not an object".into())
+        })?;
+        object.insert("_cagents_block_base".into(), json!(base));
+        object.remove("supersedes");
         Ok(frame)
     }
     fn page(&mut self) -> Result<Vec<HistoryRecord>, String> {
@@ -7133,21 +7137,31 @@ impl History {
                         .as_array()
                         .and_then(|blocks| blocks.get(index))
                         .cloned()
-                        .ok_or("Claude indexed tool block changed while reading")?
+                        .ok_or_else(|| {
+                            super::SetupError::Unavailable(
+                                "Claude indexed tool block changed while reading".into(),
+                            )
+                        })?
                 } else {
                     let blocks = original.as_mut().unwrap()["message"]["content"]
                         .as_array_mut()
-                        .ok_or("Claude indexed tool call changed while reading")?;
-                    std::mem::take(
-                        blocks
-                            .get_mut(index)
-                            .ok_or("Claude indexed tool block changed while reading")?,
-                    )
+                        .ok_or_else(|| {
+                            super::SetupError::Unavailable(
+                                "Claude indexed tool call changed while reading".into(),
+                            )
+                        })?;
+                    std::mem::take(blocks.get_mut(index).ok_or_else(|| {
+                        super::SetupError::Unavailable(
+                            "Claude indexed tool block changed while reading".into(),
+                        )
+                    })?)
                 };
                 if !matches!(string(&block, "type"), "tool_use" | "server_tool_use") {
-                    return Err("Claude indexed tool call changed while reading".into());
+                    return Err(super::SetupError::Unavailable(
+                        "Claude indexed tool call changed while reading".into(),
+                    ));
                 }
-                required(&block, "name").map_err(super::SetupError::Invalid)?;
+                required(&block, "name").map_err(super::SetupError::Unavailable)?;
                 call_blocks.insert((offset, index), std::sync::Arc::new(block));
             }
         }
@@ -7161,15 +7175,19 @@ impl History {
                     let block = record.frame["message"]["content"]
                         .as_array()
                         .and_then(|blocks| blocks.get(result_index))
-                        .ok_or("Claude indexed tool result changed while reading")?;
+                        .ok_or_else(|| {
+                            super::SetupError::Unavailable(
+                                "Claude indexed tool result changed while reading".into(),
+                            )
+                        })?;
                     let context = call_blocks[&(call, call_index)].clone();
                     if string(block, "type") != "tool_result"
-                        || required(block, "tool_use_id").map_err(super::SetupError::Invalid)?
-                            != required(&context, "id").map_err(super::SetupError::Invalid)?
+                        || required(block, "tool_use_id").map_err(super::SetupError::Unavailable)?
+                            != required(&context, "id").map_err(super::SetupError::Unavailable)?
                     {
-                        return Err(
-                            "Claude indexed tool result identity changed while reading".into()
-                        );
+                        return Err(super::SetupError::Unavailable(
+                            "Claude indexed tool result identity changed while reading".into(),
+                        ));
                     }
                     record.tool_calls.insert(result_index, context);
                 }
@@ -17558,6 +17576,171 @@ mod tests {
 mod startup_history_retryability_tests {
     use super::*;
     use std::io::Write;
+
+    const SESSION: &str = "00000000-0000-4000-8000-000000000001";
+
+    fn indexed(path: &Path) -> History {
+        History::index_for_start(File::open(path).unwrap(), SESSION, 4096, 16).unwrap()
+    }
+
+    #[test]
+    fn indexed_transcript_mutation_and_repair_keep_retryable_startup_errors() {
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let original = format!(
+            "{}\n",
+            json!({
+                "type":"user", "uuid":"prompt", "parentUuid":null, "sessionId":SESSION,
+                "message":{"role":"user","content":"kept prompt"}
+            })
+        )
+        .into_bytes();
+        let mut malformed = original.clone();
+        malformed[0] = b'[';
+        let replaced = String::from_utf8(original.clone())
+            .unwrap()
+            .replace(SESSION, "00000000-0000-4000-8000-000000000002")
+            .into_bytes();
+        let padded = |bytes: &[u8]| {
+            let mut bytes = bytes.to_vec();
+            bytes.resize(original.len(), b' ');
+            bytes
+        };
+        let truncated = original[..original.len() / 2].to_vec();
+        for (case, changed) in [
+            ("malformed rewrite", malformed),
+            ("replaced session", replaced),
+            ("null rewrite", padded(b"null")),
+            ("array rewrite", padded(b"[]")),
+            ("scalar rewrite", padded(b"1")),
+            ("truncated during read", truncated),
+        ] {
+            std::fs::write(fixture.path(), &original).unwrap();
+            let mut history = indexed(fixture.path());
+            let mut startup = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            let offset = history.offset;
+            std::fs::write(fixture.path(), changed).unwrap();
+            let failure = history.page_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "{case}: {failure}"
+            );
+            assert_eq!(
+                history.offset, offset,
+                "a refused page must remain available after repair"
+            );
+            let failure = startup.initialize_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "startup {case}: {failure}"
+            );
+            std::fs::write(fixture.path(), &original).unwrap();
+            let page = history.page_for_start().unwrap();
+            assert_eq!(page.len(), 1);
+            assert_eq!(page[0]["sessionId"], SESSION);
+            assert_eq!(page[0]["message"]["content"], "kept prompt");
+            let mut repaired = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            assert!(
+                repaired.initialize_for_start().is_ok(),
+                "startup repair: {case}"
+            );
+        }
+    }
+
+    fn padded_record(record: &Value) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(record).unwrap();
+        assert!(bytes.len() < 1024);
+        bytes.resize(1023, b' ');
+        bytes.push(b'\n');
+        bytes
+    }
+
+    #[test]
+    fn indexed_tool_mutation_and_repair_keep_retryable_startup_errors() {
+        let fixture = tempfile::NamedTempFile::new().unwrap();
+        let call = json!({"type":"assistant", "uuid":"call", "parentUuid":null,
+        "sessionId":SESSION, "message":{"id":"call-message", "role":"assistant", "content":[
+            {"type":"tool_use", "id":"tool-read", "name":"Read", "input":{"file_path":"/fixture/file"}}
+        ]}});
+        let result = json!({"type":"user", "uuid":"result", "parentUuid":"call",
+        "sessionId":SESSION, "message":{"role":"user", "content":[
+            {"type":"tool_result", "tool_use_id":"tool-read", "content":"kept result"}
+        ]}});
+        let original = [padded_record(&call), padded_record(&result)].concat();
+        for case in 0..8 {
+            std::fs::write(fixture.path(), &original).unwrap();
+            let mut history = indexed(fixture.path());
+            let mut startup = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            let offset = history.offset;
+            let mut changed_call = call.clone();
+            let mut changed_result = result.clone();
+            match case {
+                0 => changed_call["message"]["content"] = json!([]),
+                1 => changed_call["message"]["content"][0]["type"] = json!("text"),
+                2 => {
+                    changed_call["message"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("name");
+                }
+                3 => changed_result["message"]["content"] = json!([]),
+                4 => changed_result["message"]["content"][0]["type"] = json!("text"),
+                5 => {
+                    changed_result["message"]["content"][0]["tool_use_id"] = json!("different-tool")
+                }
+                6 => {
+                    changed_result["message"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("tool_use_id");
+                }
+                7 => {
+                    changed_call["message"]["content"][0]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("id");
+                }
+                _ => unreachable!(),
+            }
+            std::fs::write(
+                fixture.path(),
+                [padded_record(&changed_call), padded_record(&changed_result)].concat(),
+            )
+            .unwrap();
+            let failure = history.page_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "case {case}: {failure}"
+            );
+            assert_eq!(history.offset, offset);
+            let failure = startup.initialize_for_start().unwrap_err();
+            assert!(
+                matches!(failure, super::super::SetupError::Unavailable(_)),
+                "startup case {case}: {failure}"
+            );
+            std::fs::write(fixture.path(), &original).unwrap();
+            let page = history.page_for_start().unwrap();
+            assert_eq!(page.len(), 2);
+            assert_eq!(page[1].tool_calls[&0]["id"], "tool-read");
+            assert_eq!(page[1]["message"]["content"][0]["tool_use_id"], "tool-read");
+            let mut repaired = Claude {
+                history: Some(indexed(fixture.path())),
+                ..Claude::default()
+            };
+            assert!(
+                repaired.initialize_for_start().is_ok(),
+                "startup repair case {case}"
+            );
+        }
+    }
 
     #[test]
     fn transcript_read_failure_is_retryable_but_invalid_history_is_not() {
