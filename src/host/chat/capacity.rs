@@ -83,12 +83,16 @@ impl Reservation {
     ) -> Result<Option<Self>, ProtocolError> {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
-            return Err(unavailable("Daemon is shutting down"));
+            return Err(retryable_unavailable("Daemon is shutting down"));
         }
-        if state.chat_spawning.contains_key(&source.id)
-            || state.native_closing.contains_key(&source.id)
-        {
-            return Err(error("Chat is already starting or closing"));
+        if let Some(pending) = state.chat_spawning.get(&source.id) {
+            if pending.launch != source.launch {
+                return Err(error("Pending chat has a different exact launch"));
+            }
+            return Err(retryable_unavailable("Chat is already starting or closing"));
+        }
+        if state.native_closing.contains_key(&source.id) {
+            return Err(retryable_unavailable("Chat is already starting or closing"));
         }
         if let Some(record) = state.chats.get(&source.id) {
             // An exact live Codex terminal pair is an attachment, not admission.
@@ -128,7 +132,13 @@ impl Reservation {
                 return Ok(None);
             }
             if record.returning_terminal || record.handle.owns_work() {
-                return Err(error(
+                if record.session.launch.provider != source.launch.provider
+                    || record.session.launch.recipe != source.launch.recipe
+                    || record.handle.session_id() != source.launch.session_id
+                {
+                    return Err(error("Existing chat has a different exact launch"));
+                }
+                return Err(retryable_unavailable(
                     "Chat already owns work or a pending handoff; attach to its existing view",
                 ));
             }
@@ -152,7 +162,7 @@ impl Reservation {
             launch.session_id = record.handle.session_id();
             record.handle.owns_work() && same_conversation(&launch, &source.launch)
         }) {
-            return Err(error(
+            return Err(retryable_unavailable(
                 "This exact conversation already owns work; attach to its existing chat",
             ));
         }
@@ -161,7 +171,9 @@ impl Reservation {
             .values()
             .any(|pending| same_conversation(&pending.launch, &source.launch))
         {
-            return Err(error("This exact conversation is already starting"));
+            return Err(retryable_unavailable(
+                "This exact conversation is already starting",
+            ));
         }
         if !state.chats.contains_key(&source.id) {
             require_available(&state)?;
@@ -241,6 +253,35 @@ mod tests {
             owned_codex_listener: None,
             native_continuity: Default::default(),
         }
+    }
+
+    #[test]
+    fn same_launch_can_retry_after_pending_admission_and_shutdown_end() {
+        let host = host();
+        let mut source = session();
+        source.launch.session_id = Some("92bec561-2706-4e26-a34d-468f5a67148c".into());
+        host.lock().unwrap().shutting_down = true;
+        assert!(Reservation::new(&host, &source).err().unwrap().retryable);
+        host.lock().unwrap().shutting_down = false;
+        let held = Reservation::new(&host, &source).unwrap();
+        assert!(Reservation::new(&host, &source).err().unwrap().retryable);
+        let mut changed = source.clone();
+        changed
+            .launch
+            .recipe
+            .arguments
+            .push("--another-source".into());
+        assert!(!Reservation::new(&host, &changed).err().unwrap().retryable);
+        let mut other_pane = source.clone();
+        other_pane.id = TerminalId::new();
+        assert!(
+            Reservation::new(&host, &other_pane)
+                .err()
+                .unwrap()
+                .retryable
+        );
+        drop(held);
+        assert!(Reservation::new(&host, &source).unwrap().is_some());
     }
 
     #[test]
@@ -1814,16 +1855,28 @@ type LoadedHistory = (
 );
 
 fn load_history(session: &Session) -> Result<LoadedHistory, String> {
-    if has_native_owner(session).map_err(|error| error.message)? {
-        return Err("An authenticated native provider owner remains".into());
+    load_history_for_start(session).map_err(|error| error.to_string())
+}
+
+fn load_history_for_start(session: &Session) -> Result<LoadedHistory, chat::protocol::SetupError> {
+    if has_native_owner(session).map_err(|error| {
+        if error.retryable {
+            chat::protocol::SetupError::Unavailable(error.message)
+        } else {
+            chat::protocol::SetupError::Invalid(error.message)
+        }
+    })? {
+        return Err(chat::protocol::SetupError::Unavailable(
+            "An authenticated native provider owner remains".into(),
+        ));
     }
-    let (spec, mut adapter) = chat::protocol::create_history(&session.launch)?;
+    let (spec, mut adapter) = chat::protocol::create_history_for_start(&session.launch)?;
     if !matches!(spec.transport, chat::protocol::TransportSpec::History) {
         return Err(
             "The saved conversation cannot currently be reopened as read-only history".into(),
         );
     }
-    let initial = adapter.initialize()?;
+    let initial = adapter.initialize_for_start()?;
     if !initial.writes.is_empty() {
         return Err("History reload attempted a provider write".into());
     }
@@ -1832,7 +1885,9 @@ fn load_history(session: &Session) -> Result<LoadedHistory, String> {
         .iter()
         .any(|event| matches!(event, chat::Event::HistoryError(_)))
     {
-        return Err("Provider history could not be reloaded".into());
+        return Err(chat::protocol::SetupError::Unavailable(
+            "Provider history could not be reloaded".into(),
+        ));
     }
     Ok((spec, adapter, initial))
 }
@@ -1882,21 +1937,21 @@ pub(super) fn restore_saved_history(
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.chats.contains_key(&session.id) {
-            return Err(unavailable(
+            return Err(retryable_unavailable(
                 "The saved history became resident; retry its normal attach",
             ));
         }
     }
     super::super::account_lifecycle::ensure_idle(host)?;
     require_unmanaged(host, session.id).map_err(unavailable)?;
-    let (mut spec, adapter, mut initial) = load_history(&session).map_err(unavailable)?;
+    let (mut spec, adapter, mut initial) = load_history_for_start(&session).map_err(setup_error)?;
     spec.messages = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .mailbox_seal
         .as_ref()
         .map(|seal| Arc::new(seal.recognizer()));
-    let store = chat::runtime::preflight(&spec, &mut initial).map_err(unavailable)?;
+    let store = chat::runtime::preflight_for_start(&spec, &mut initial).map_err(setup_error)?;
     let environment = spec.environment.clone();
     let weak = Arc::downgrade(host);
     let id = session.id;
@@ -1909,14 +1964,14 @@ pub(super) fn restore_saved_history(
         environment,
         move |update| changed(&weak, id, update),
     )
-    .map_err(unavailable)?;
+    .map_err(retryable_unavailable)?;
     let result = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down
             || state.chats.contains_key(&id)
             || state.chat_spawning.get(&id) != Some(&session)
         {
-            Err(unavailable(
+            Err(retryable_unavailable(
                 "Native history ownership changed before installation",
             ))
         } else {
@@ -1945,7 +2000,7 @@ pub(super) fn restore_saved_history(
                 returning_terminal: false,
             };
             let response =
-                session_snapshot(&record.session, &record.handle).map_err(unavailable)?;
+                session_snapshot(&record.session, &record.handle).map_err(retryable_unavailable)?;
             record
                 .handle
                 .commit_native_installation()

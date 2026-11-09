@@ -1,4 +1,6 @@
+use super::native_actor_retirement::read_error;
 use super::*;
+use crate::chat::protocol::SetupError;
 use crate::workspace_model::views::{Change, Scope, View};
 
 pub(super) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
@@ -366,7 +368,11 @@ pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
 /// The views holding at least one pane. Nearly every scope a long-lived store
 /// knows is an emptied worktree, so a search for a pane reads only these.
 pub(super) fn occupied(db: &Connection) -> Result<Vec<View>, String> {
-    collect(
+    occupied_for_start(db).map_err(|error| error.to_string())
+}
+
+pub(super) fn occupied_for_start(db: &Connection) -> Result<Vec<View>, SetupError> {
+    collect_for_start(
         db,
         "SELECT scope, revision, panes, retired FROM shared_views
          WHERE panes <> '[]' ORDER BY scope",
@@ -374,7 +380,11 @@ pub(super) fn occupied(db: &Connection) -> Result<Vec<View>, String> {
 }
 
 fn collect(db: &Connection, sql: &str) -> Result<Vec<View>, String> {
-    let mut statement = db.prepare_cached(sql).map_err(|error| error.to_string())?;
+    collect_for_start(db, sql).map_err(|error| error.to_string())
+}
+
+fn collect_for_start(db: &Connection, sql: &str) -> Result<Vec<View>, SetupError> {
+    let mut statement = db.prepare_cached(sql).map_err(read_error)?;
     let rows = statement
         .query_map([], |row| {
             Ok((
@@ -384,14 +394,16 @@ fn collect(db: &Connection, sql: &str) -> Result<Vec<View>, String> {
                 row.get::<_, String>(3)?,
             ))
         })
-        .map_err(|error| error.to_string())?;
+        .map_err(read_error)?;
     rows.map(|row| {
-        let (scope, revision, panes, retired) = row.map_err(|error| error.to_string())?;
+        let (scope, revision, panes, retired) = row.map_err(read_error)?;
         Ok(View {
-            scope: parse_scope(&scope)?,
+            scope: parse_scope(&scope).map_err(SetupError::Invalid)?,
             revision,
-            panes: serde_json::from_str(&panes).map_err(|error| error.to_string())?,
-            retired: serde_json::from_str(&retired).map_err(|error| error.to_string())?,
+            panes: serde_json::from_str(&panes)
+                .map_err(|error| SetupError::Invalid(error.to_string()))?,
+            retired: serde_json::from_str(&retired)
+                .map_err(|error| SetupError::Invalid(error.to_string()))?,
         })
     })
     .collect()

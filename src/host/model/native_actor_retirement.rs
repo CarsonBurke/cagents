@@ -1,12 +1,34 @@
 //! Transfer exact semantic-retirement proof before consuming helper cleanup.
 //! This proves one actor retired, never the absence of other session writers.
 use super::Registry;
+use crate::chat::protocol::SetupError;
 use crate::{account::scope::LaunchAccountScope, chat, daemon::holder_registry::Record};
 use rusqlite::{OptionalExtension, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 const MAX_RECEIPT_BYTES: usize = 256 * 1024;
+
+/// Registry reads distinguish an unavailable database from invalid stored
+/// evidence before the startup caller chooses whether the same card can retry.
+pub(super) fn read_error(error: rusqlite::Error) -> SetupError {
+    use rusqlite::ErrorCode;
+    match error.sqlite_error_code() {
+        Some(
+            ErrorCode::PermissionDenied
+            | ErrorCode::DatabaseBusy
+            | ErrorCode::DatabaseLocked
+            | ErrorCode::OutOfMemory
+            | ErrorCode::ReadOnly
+            | ErrorCode::OperationInterrupted
+            | ErrorCode::SystemIoFailure
+            | ErrorCode::DiskFull
+            | ErrorCode::CannotOpen
+            | ErrorCode::FileLockingProtocolFailed,
+        ) => SetupError::Unavailable(error.to_string()),
+        _ => SetupError::Invalid(error.to_string()),
+    }
+}
 
 /// Pending is cleanup evidence only; installation requires the helper ACK and
 /// committed Registry projection. Missing phase is explicitly legacy Installed.
@@ -434,6 +456,14 @@ impl Registry {
         &self,
         actor: Uuid,
     ) -> Result<Option<NativeActorOwnership>, String> {
+        self.native_actor_ownership_for_start(actor)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn native_actor_ownership_for_start(
+        &self,
+        actor: Uuid,
+    ) -> Result<Option<NativeActorOwnership>, SetupError> {
         let encoded: Option<String> = self
             .db
             .query_row(
@@ -442,14 +472,14 @@ impl Registry {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
         encoded
             .map(|encoded| {
                 if encoded.len() > MAX_RECEIPT_BYTES {
                     return Err("Stored actor census exceeds its metadata bound".into());
                 }
-                let ownership: NativeActorOwnership =
-                    serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+                let ownership: NativeActorOwnership = serde_json::from_str(&encoded)
+                    .map_err(|error| SetupError::Invalid(error.to_string()))?;
                 if ownership.actor != actor || ownership.actor.is_nil() {
                     return Err("Stored actor census key changed its identity".into());
                 }
@@ -466,23 +496,32 @@ impl Registry {
         after: Option<Uuid>,
         limit: usize,
     ) -> Result<Vec<NativeActorOwnership>, String> {
+        self.native_actor_ownerships_for_start(after, limit)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn native_actor_ownerships_for_start(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<Vec<NativeActorOwnership>, SetupError> {
         if !(1..=128).contains(&limit) {
             return Err("Retained actor census page must contain between one and 128 rows".into());
         }
         let after = after.map(|id| id.to_string()).unwrap_or_default();
-        let mut statement=self.db.prepare("SELECT actor,ownership FROM native_actor_ownerships WHERE actor>?1 ORDER BY actor LIMIT ?2").map_err(|e|e.to_string())?;
+        let mut statement=self.db.prepare("SELECT actor,ownership FROM native_actor_ownerships WHERE actor>?1 ORDER BY actor LIMIT ?2").map_err(read_error)?;
         let rows = statement
             .query_map(params![after, limit as i64], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
             })
-            .map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
         rows.map(|row| {
-            let (actor, encoded) = row.map_err(|e| e.to_string())?;
+            let (actor, encoded) = row.map_err(read_error)?;
             if encoded.len() > MAX_RECEIPT_BYTES {
                 return Err("Stored actor census exceeds its metadata bound".into());
             }
-            let ownership: NativeActorOwnership =
-                serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+            let ownership: NativeActorOwnership = serde_json::from_str(&encoded)
+                .map_err(|error| SetupError::Invalid(error.to_string()))?;
             if ownership.actor.to_string() != actor || ownership.actor.is_nil() {
                 return Err("Stored actor census key changed its identity".into());
             }
@@ -499,6 +538,15 @@ impl Registry {
         terminal: crate::model::TerminalId,
         boot: &crate::model::BootId,
     ) -> Result<Option<NativeActorOwnership>, String> {
+        self.newest_native_actor_ownership_for_start(terminal, boot)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn newest_native_actor_ownership_for_start(
+        &self,
+        terminal: crate::model::TerminalId,
+        boot: &crate::model::BootId,
+    ) -> Result<Option<NativeActorOwnership>, SetupError> {
         // Every ownership records its allocation's id as text; the prefilter
         // only spares decoding other allocations' rows, and is rechecked below.
         let mut statement = self
@@ -507,18 +555,18 @@ impl Registry {
                 "SELECT actor,ownership FROM native_actor_ownerships
                  WHERE instr(ownership, ?1) > 0 ORDER BY rowid DESC",
             )
-            .map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
         let mut rows = statement
             .query([terminal.to_string()])
-            .map_err(|e| e.to_string())?;
-        while let Some(row) = rows.next().map_err(|e| e.to_string())? {
-            let actor: String = row.get(0).map_err(|e| e.to_string())?;
-            let encoded: String = row.get(1).map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
+        while let Some(row) = rows.next().map_err(read_error)? {
+            let actor: String = row.get(0).map_err(read_error)?;
+            let encoded: String = row.get(1).map_err(read_error)?;
             if encoded.len() > MAX_RECEIPT_BYTES {
                 return Err("Stored actor census exceeds its metadata bound".into());
             }
-            let ownership: NativeActorOwnership =
-                serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
+            let ownership: NativeActorOwnership = serde_json::from_str(&encoded)
+                .map_err(|error| SetupError::Invalid(error.to_string()))?;
             if ownership.actor.to_string() != actor || ownership.actor.is_nil() {
                 return Err("Stored actor census key changed its identity".into());
             }
@@ -619,6 +667,14 @@ impl Registry {
         &self,
         actor: Uuid,
     ) -> Result<Option<NativeActorRetirement>, String> {
+        self.native_actor_retirement_for_start(actor)
+            .map_err(|error| error.to_string())
+    }
+
+    pub(in crate::host) fn native_actor_retirement_for_start(
+        &self,
+        actor: Uuid,
+    ) -> Result<Option<NativeActorRetirement>, SetupError> {
         let encoded: Option<String> = self
             .db
             .query_row(
@@ -627,15 +683,15 @@ impl Registry {
                 |row| row.get(0),
             )
             .optional()
-            .map_err(|e| e.to_string())?;
+            .map_err(read_error)?;
         encoded
             .map(|encoded| {
                 if encoded.len() > MAX_RECEIPT_BYTES {
                     return Err("Stored actor retirement exceeds its metadata bound".into());
                 }
-                let receipt: NativeActorRetirement =
-                    serde_json::from_str(&encoded).map_err(|e| e.to_string())?;
-                receipt.validate()?;
+                let receipt: NativeActorRetirement = serde_json::from_str(&encoded)
+                    .map_err(|error| SetupError::Invalid(error.to_string()))?;
+                receipt.validate().map_err(SetupError::Invalid)?;
                 if receipt.actor != actor {
                     return Err("Stored actor retirement belongs to another actor".into());
                 }
@@ -714,6 +770,132 @@ mod tests {
             purge_ids: Vec::new(),
         };
         (actor, owner, source, scope)
+    }
+
+    #[test]
+    fn startup_reads_preserve_locked_database_recovery() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = directory.path().join("registry");
+        let mut registry = Registry::at(&path).unwrap();
+        let (actor, owner, source, scope) = fixture(directory.path());
+        registry
+            .register_native_actor_ownership(actor, &owner, &source, Ok(&scope))
+            .unwrap();
+        // A real SQLite read lock fails before any evidence can be decoded.
+        // Release that external condition and the same exact lookup succeeds.
+        registry
+            .db
+            .execute_batch("PRAGMA journal_mode=DELETE; PRAGMA busy_timeout=0;")
+            .unwrap();
+        let blocker = rusqlite::Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN EXCLUSIVE;").unwrap();
+        assert!(matches!(
+            registry.native_actor_ownership_for_start(actor),
+            Err(SetupError::Unavailable(_))
+        ));
+        assert!(matches!(
+            registry.native_actor_ownerships_for_start(None, 128),
+            Err(SetupError::Unavailable(_))
+        ));
+        assert!(matches!(
+            registry.native_actor_retirement_for_start(actor),
+            Err(SetupError::Unavailable(_))
+        ));
+        assert!(matches!(
+            super::super::views::occupied_for_start(&registry.db),
+            Err(SetupError::Unavailable(_))
+        ));
+        let later_boot = crate::model::BootId::from("later-boot");
+        assert!(matches!(
+            registry.newest_native_actor_ownership_for_start(source.id, &later_boot),
+            Err(SetupError::Unavailable(_))
+        ));
+        blocker.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(
+            registry
+                .native_actor_ownership_for_start(actor)
+                .unwrap()
+                .unwrap()
+                .source(),
+            &source
+        );
+        assert_eq!(
+            registry
+                .native_actor_ownerships_for_start(None, 128)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(
+            registry
+                .native_actor_retirement_for_start(actor)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            super::super::views::occupied_for_start(&registry.db)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            registry
+                .newest_native_actor_ownership_for_start(source.id, &later_boot)
+                .unwrap()
+                .unwrap()
+                .source(),
+            &source
+        );
+    }
+
+    #[test]
+    fn startup_reads_reject_corrupt_ownership_and_receipt_evidence() {
+        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut registry = Registry::at(&directory.path().join("registry")).unwrap();
+        let (actor, owner, source, scope) = fixture(directory.path());
+        registry
+            .register_native_actor_ownership(actor, &owner, &source, Ok(&scope))
+            .unwrap();
+        registry
+            .commit_native_actor_retirement(actor, &owner, &source, Ok(&scope), None)
+            .unwrap();
+        registry
+            .db
+            .execute(
+                "UPDATE native_actor_ownerships SET ownership=?1",
+                [format!("{{{}", source.id)],
+            )
+            .unwrap();
+        assert!(matches!(
+            registry.native_actor_ownership_for_start(actor),
+            Err(SetupError::Invalid(_))
+        ));
+        assert!(matches!(
+            registry.native_actor_ownerships_for_start(None, 128),
+            Err(SetupError::Invalid(_))
+        ));
+        assert!(matches!(
+            registry.newest_native_actor_ownership_for_start(
+                source.id,
+                &crate::model::BootId::from("later-boot"),
+            ),
+            Err(SetupError::Invalid(_))
+        ));
+        registry
+            .db
+            .execute("UPDATE native_actor_retirements SET receipt='{'", [])
+            .unwrap();
+        assert!(matches!(
+            registry.native_actor_retirement_for_start(actor),
+            Err(SetupError::Invalid(_))
+        ));
+        registry
+            .db
+            .execute("DROP TABLE native_actor_retirements", [])
+            .unwrap();
+        assert!(matches!(
+            registry.native_actor_retirement_for_start(actor),
+            Err(SetupError::Invalid(_))
+        ));
     }
 
     /// Root's serialized build lane runs this producer before the actual a96

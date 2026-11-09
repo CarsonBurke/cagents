@@ -42,10 +42,22 @@ const MODES: &[&str] = &[
 ];
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, false)
 }
 
 pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_history_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(super) fn create_history_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, true)
 }
 
@@ -154,14 +166,14 @@ pub(crate) fn create_prepared(
     identity: PreparedIdentity,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
     identity.validate(launch)?;
-    create_inner(launch, Some(identity), false)
+    create_inner(launch, Some(identity), false).map_err(|error| error.to_string())
 }
 
 fn create_inner(
     launch: &Launch,
     prepared: Option<PreparedIdentity>,
     forced_history: bool,
-) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     if forced_history
         && (launch
             .session_id
@@ -182,7 +194,7 @@ fn create_inner(
     }
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.stdout_noise = Some(embedded_protocol_frame);
-    spec.arguments = arguments(launch)?;
+    spec.arguments = arguments(launch).map_err(super::SetupError::Invalid)?;
     let history_only = forced_history || launch.needs_read_only_history();
     // A conversation whose saved history cannot be shown still resumes: the
     // provider keeps its own copy. Only a reader with no provider needs it.
@@ -200,7 +212,7 @@ fn create_inner(
         Ok(history) => (history, None),
         Err(HistoryUnavailable::Unreadable(error)) if !history_only => {
             tracing::warn!(%error, "Resuming a Claude conversation without its saved history");
-            (None, Some(error))
+            (None, Some(error.to_string()))
         }
         Err(HistoryUnavailable::Missing(error) | HistoryUnavailable::Unreadable(error)) => {
             return Err(error);
@@ -2576,12 +2588,16 @@ impl Adapter for Claude {
         !self.deferred_attention.is_empty()
     }
     fn initialize(&mut self) -> Result<Step, String> {
+        self.initialize_for_start()
+            .map_err(|error| error.to_string())
+    }
+    fn initialize_for_start(&mut self) -> Result<Step, super::SetupError> {
         let mut step = if self.history_only {
             Step::default()
         } else {
             self.control(
                 json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[], "promptSuggestions":true}),
-            )?
+            ).map_err(super::SetupError::Invalid)?
         };
         if let Some(error) = self.history_error.take() {
             step.events.push(Event::History {
@@ -2620,10 +2636,11 @@ impl Adapter for Claude {
                     .filter(|id| history.agent_status.get(*id) == Some(&ToolStatus::Running))
                     .cloned(),
             );
-            let frames = history.page()?;
+            let frames = history.page_for_start()?;
             let mut history_step = Step::default();
             for frame in frames {
-                self.history_message(&frame, &mut history_step)?;
+                self.history_message(&frame, &mut history_step)
+                    .map_err(super::SetupError::Invalid)?;
             }
             // Replayed Agent tool uses can reinsert completed background jobs.
             // The full history index is authoritative even when a sidecar is
@@ -6054,11 +6071,11 @@ fn skipped_parent(
 #[derive(Debug)]
 enum HistoryUnavailable {
     /// There is no transcript, so Claude Code has nothing to resume either.
-    Missing(String),
+    Missing(super::SetupError),
     /// The transcript is there, but cagents cannot read it, for example
     /// because it is too large to index. Claude Code may still resume from
     /// it.
-    Unreadable(String),
+    Unreadable(super::SetupError),
 }
 type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
 #[derive(Debug)]
@@ -6116,8 +6133,8 @@ struct Compaction {
 impl History {
     /// The account configuration and resolved directory whose transcript a
     /// launch resumes. Only a launch that names neither exactly fails here.
-    fn locate(launch: &Launch, id: &str) -> Result<(PathBuf, PathBuf), String> {
-        validate_id(id)?;
+    fn locate(launch: &Launch, id: &str) -> Result<(PathBuf, PathBuf), super::SetupError> {
+        validate_id(id).map_err(super::SetupError::Invalid)?;
         let saved_cwd = &launch.recipe.working_directory;
         let cwd = match saved_cwd.canonicalize() {
             Ok(cwd) => cwd,
@@ -6133,7 +6150,11 @@ impl History {
             {
                 saved_cwd.clone()
             }
-            Err(error) => return Err(format!("Cannot resolve Claude session directory: {error}")),
+            Err(error) => {
+                return Err(super::SetupError::Unavailable(format!(
+                    "Cannot resolve Claude session directory: {error}"
+                )));
+            }
         };
         let config = launch
             .recipe
@@ -6164,7 +6185,15 @@ impl History {
     }
 
     fn open(config: &Path, cwd: &Path, id: &str) -> Result<Self, HistoryUnavailable> {
-        let path = crate::agent::claude_transcript(config, cwd, id).map_err(|error| {
+        let path = crate::agent::claude_transcript_for_start(config, cwd, id).map_err(|error| {
+            let error = match error {
+                crate::agent::ClaudeTranscriptError::Invalid(message) => {
+                    super::SetupError::Invalid(message)
+                }
+                crate::agent::ClaudeTranscriptError::Unavailable(message) => {
+                    super::SetupError::Unavailable(message)
+                }
+            };
             if crate::agent::claude_transcript_exists(config, cwd, id) {
                 HistoryUnavailable::Unreadable(error)
             } else {
@@ -6177,14 +6206,17 @@ impl History {
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
         let file = options.open(&path).map_err(|error| {
-            let message = format!("Cannot open exact Claude transcript: {error}");
+            let failure = super::SetupError::Unavailable(format!(
+                "Cannot open exact Claude transcript: {error}"
+            ));
             if error.kind() == std::io::ErrorKind::NotFound {
-                HistoryUnavailable::Missing(message)
+                HistoryUnavailable::Missing(failure)
             } else {
-                HistoryUnavailable::Unreadable(message)
+                HistoryUnavailable::Unreadable(failure)
             }
         })?;
-        let mut history = Self::index(file, id).map_err(HistoryUnavailable::Unreadable)?;
+        let mut history = Self::index_for_start(file, id, 32 * 1024 * 1024, 200_000)
+            .map_err(HistoryUnavailable::Unreadable)?;
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
@@ -6192,13 +6224,24 @@ impl History {
         Self::index_with_tool_budget(file, id, 32 * 1024 * 1024, 200_000)
     }
     fn index_with_tool_budget(
-        mut file: File,
+        file: File,
         id: &str,
         tool_bytes_limit: usize,
         tool_count_limit: usize,
     ) -> Result<Self, String> {
+        Self::index_for_start(file, id, tool_bytes_limit, tool_count_limit)
+            .map_err(|error| error.to_string())
+    }
+    fn index_for_start(
+        mut file: File,
+        id: &str,
+        tool_bytes_limit: usize,
+        tool_count_limit: usize,
+    ) -> Result<Self, super::SetupError> {
         use std::io::BufRead as _;
-        let metadata = file.metadata().map_err(|e| e.to_string())?;
+        let metadata = file
+            .metadata()
+            .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
         if !metadata.is_file() || metadata.len() > 256 * 1024 * 1024 {
             return Err("Claude transcript must be a regular file smaller than 256 MiB".into());
         }
@@ -6227,7 +6270,7 @@ impl History {
             let count = std::io::Read::by_ref(&mut reader)
                 .take(MAX_PAYLOAD as u64 + 1)
                 .read_until(b'\n', &mut line)
-                .map_err(|e| e.to_string())?;
+                .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
             if count == 0 {
                 break;
             }
@@ -6241,7 +6284,7 @@ impl History {
                     let more = std::io::Read::by_ref(&mut reader)
                         .take(MAX_PAYLOAD as u64)
                         .read_until(b'\n', &mut line)
-                        .map_err(|e| e.to_string())?;
+                        .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
                     if more == 0 {
                         break;
                     }
@@ -6964,15 +7007,25 @@ impl History {
         Ok(children)
     }
     fn read_record(&mut self, offset: u64, len: u64, base: usize) -> Result<Value, String> {
+        self.read_record_for_start(offset, len, base)
+            .map_err(|error| error.to_string())
+    }
+    fn read_record_for_start(
+        &mut self,
+        offset: u64,
+        len: u64,
+        base: usize,
+    ) -> Result<Value, super::SetupError> {
         self.file
             .seek(SeekFrom::Start(offset))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
         let mut bytes = vec![0; len as usize];
         self.file
             .read_exact(&mut bytes)
-            .map_err(|e| e.to_string())?;
-        let mut frame: Value = serde_json::from_slice(&bytes)
-            .map_err(|e| format!("Claude history changed while reading: {e}"))?;
+            .map_err(|e| super::SetupError::Unavailable(e.to_string()))?;
+        let mut frame: Value = serde_json::from_slice(&bytes).map_err(|e| {
+            super::SetupError::Invalid(format!("Claude history changed while reading: {e}"))
+        })?;
         // The provider can rewrite this inode after indexing. Revalidate the
         // record being published, including off-page tool-call dependencies.
         if frame["sessionId"]
@@ -6989,6 +7042,9 @@ impl History {
         Ok(frame)
     }
     fn page(&mut self) -> Result<Vec<HistoryRecord>, String> {
+        self.page_for_start().map_err(|error| error.to_string())
+    }
+    fn page_for_start(&mut self) -> Result<Vec<HistoryRecord>, super::SetupError> {
         let mut start = self.offset;
         let mut total = 0;
         let mut charged = HashSet::new();
@@ -7037,7 +7093,7 @@ impl History {
                 Link::Record(offset, len, base) => {
                     positions.insert(offset, result.len());
                     HistoryRecord {
-                        frame: self.read_record(offset, len, base)?,
+                        frame: self.read_record_for_start(offset, len, base)?,
                         tool_calls: HashMap::new(),
                         gap: None,
                     }
@@ -7073,7 +7129,7 @@ impl History {
             let mut original = if positions.contains_key(&offset) {
                 None
             } else {
-                Some(self.read_record(offset, len, base)?)
+                Some(self.read_record_for_start(offset, len, base)?)
             };
             for index in indices {
                 let block = if let Some(position) = positions.get(&offset) {
@@ -7095,7 +7151,7 @@ impl History {
                 if !matches!(string(&block, "type"), "tool_use" | "server_tool_use") {
                     return Err("Claude indexed tool call changed while reading".into());
                 }
-                required(&block, "name")?;
+                required(&block, "name").map_err(super::SetupError::Invalid)?;
                 call_blocks.insert((offset, index), std::sync::Arc::new(block));
             }
         }
@@ -7112,7 +7168,8 @@ impl History {
                         .ok_or("Claude indexed tool result changed while reading")?;
                     let context = call_blocks[&(call, call_index)].clone();
                     if string(block, "type") != "tool_result"
-                        || required(block, "tool_use_id")? != required(&context, "id")?
+                        || required(block, "tool_use_id").map_err(super::SetupError::Invalid)?
+                            != required(&context, "id").map_err(super::SetupError::Invalid)?
                     {
                         return Err(
                             "Claude indexed tool result identity changed while reading".into()
@@ -17402,5 +17459,71 @@ mod tests {
         let page = history.page().unwrap();
         assert_eq!(page.len(), 2);
         assert_eq!(page[1].tool_calls[&0]["input"]["new_string"], "new-2");
+    }
+}
+
+#[cfg(test)]
+mod startup_history_retryability_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn transcript_read_failure_is_retryable_but_invalid_history_is_not() {
+        let session = "00000000-0000-4000-8000-000000000001";
+        let mut fixture = tempfile::NamedTempFile::new().unwrap();
+        writeln!(
+            fixture,
+            "{}",
+            json!({
+                "type":"user", "uuid":"foreign-prompt", "parentUuid":null,
+                "sessionId":"00000000-0000-4000-8000-000000000002",
+                "message":{"role":"user","content":"foreign prompt"}
+            })
+        )
+        .unwrap();
+        assert!(matches!(
+            History::index_for_start(File::open(fixture.path()).unwrap(), session, 1024, 16),
+            Err(super::super::SetupError::Invalid(_))
+        ));
+        std::fs::write(
+            fixture.path(),
+            format!(
+                "{}\n",
+                json!({
+                    "type":"user", "uuid":"prompt", "parentUuid":null, "sessionId":session,
+                    "message":{"role":"user","content":"kept prompt"}
+                })
+            ),
+        )
+        .unwrap();
+        // A regular file with an unusable read handle models the same OS read
+        // failure as lost permissions/storage, without depending on test uid.
+        let write_only = || {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(fixture.path())
+                .unwrap()
+        };
+        assert!(matches!(
+            History::index_for_start(write_only(), session, 1024, 16),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
+        let mut history = History::index(File::open(fixture.path()).unwrap(), session).unwrap();
+        history.file = write_only();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        assert!(matches!(
+            adapter.initialize_for_start(),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
+        // Repairing the read handle admits exactly the same saved history.
+        let history = History::index(File::open(fixture.path()).unwrap(), session).unwrap();
+        let mut adapter = Claude {
+            history: Some(history),
+            ..Claude::default()
+        };
+        assert!(adapter.initialize_for_start().is_ok());
     }
 }

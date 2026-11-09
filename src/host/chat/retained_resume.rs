@@ -2,6 +2,7 @@
 //! This proves one predecessor closed; ordinary launch/account and concurrent
 //! conversation admission still run for the new pane and its new writer.
 use super::{Handle, Provider, Session, SharedHost};
+use crate::chat::protocol::SetupError;
 use crate::{
     account::scope::LaunchAccountScope,
     daemon::holder_registry::{OriginalRole, Record},
@@ -130,7 +131,7 @@ fn current_admission(
     host: &SharedHost,
     source: &Session,
     expected: &HostSessionProof,
-) -> Result<(), String> {
+) -> Result<(), SetupError> {
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
         || state.proof() != expected
@@ -146,10 +147,10 @@ fn current_admission(
             pending.id == source.id || super::same_conversation(&pending.launch, &source.launch)
         })
     {
-        return Err(
+        return Err(SetupError::Unavailable(
             "Claude resume has a current owner or unsettled admission; no replacement was prepared"
                 .into(),
-        );
+        ));
     }
     Ok(())
 }
@@ -157,8 +158,15 @@ fn current_admission(
 /// The successor would select the exact physical account home the old actor
 /// captured, so its provider reads the same on-disk conversation.
 fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<(), String> {
-    captured.revalidate()?;
-    if !same_scope(captured, &selected_account_home(source)?) {
+    same_account_home_for_start(source, captured).map_err(|error| error.to_string())
+}
+
+fn same_account_home_for_start(
+    source: &Session,
+    captured: &LaunchAccountScope,
+) -> Result<(), SetupError> {
+    captured.revalidate_for_start().map_err(SetupError::from)?;
+    if !same_scope(captured, &selected_account_home_for_start(source)?) {
         return Err("Claude disk resume would select a different physical account home".into());
     }
     Ok(())
@@ -166,6 +174,10 @@ fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<
 
 /// The physical Claude account home `source`'s launch would select now.
 fn selected_account_home(source: &Session) -> Result<LaunchAccountScope, String> {
+    selected_account_home_for_start(source).map_err(|error| error.to_string())
+}
+
+fn selected_account_home_for_start(source: &Session) -> Result<LaunchAccountScope, SetupError> {
     let launch = super::prepare_native_process_launch(
         &source.launch,
         Some(crate::model::agent_recovery::fresh_native_environment(
@@ -175,14 +187,25 @@ fn selected_account_home(source: &Session) -> Result<LaunchAccountScope, String>
         &Default::default(),
         None,
     )
-    .map_err(|e| e.message)?;
-    LaunchAccountScope::resolve(Provider::Claude, &launch.recipe.working_directory, |name| {
-        launch
-            .recipe
-            .environment
-            .get(name)
-            .map(std::ffi::OsString::from)
-    })
+    .map_err(|e| {
+        if e.retryable {
+            SetupError::Unavailable(e.message)
+        } else {
+            SetupError::Invalid(e.message)
+        }
+    })?;
+    LaunchAccountScope::resolve_for_start(
+        Provider::Claude,
+        &launch.recipe.working_directory,
+        |name| {
+            launch
+                .recipe
+                .environment
+                .get(name)
+                .map(std::ffi::OsString::from)
+        },
+    )
+    .map_err(SetupError::from)
 }
 
 /// Whether two captures from different kernel boots name the same physical
@@ -210,22 +233,30 @@ pub(super) const PRIOR_BOOT_ACCOUNT_CHANGED: &str = "This conversation last ran 
 /// newest counts. A pane with no such row, or whose newest row captured no
 /// home, has nothing to compare; the launch's own account checks still apply.
 pub(super) fn ensure_prior_boot_account(host: &SharedHost, source: &Session) -> Result<(), String> {
+    ensure_prior_boot_account_for_start(host, source).map_err(|error| error.to_string())
+}
+
+pub(super) fn ensure_prior_boot_account_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<(), SetupError> {
     let boot = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .boot_id
         .clone();
-    let newest = super::super::agent_execution::registry(host)?
+    let newest = super::super::agent_execution::registry(host)
+        .map_err(SetupError::Unavailable)?
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .newest_native_actor_ownership(source.id, &boot)?;
+        .newest_native_actor_ownership_for_start(source.id, &boot)?;
     let Some(captured) = newest.as_ref().and_then(|ownership| ownership.scope().ok()) else {
         return Ok(());
     };
     // The launch's own failure to select a home is its own refusal, not an
     // account change.
-    let selected = selected_account_home(source)?;
+    let selected = selected_account_home_for_start(source)?;
     if same_home_across_boots(captured, &selected) {
         return Ok(());
     }
@@ -235,7 +266,7 @@ pub(super) fn ensure_prior_boot_account(host: &SharedHost, source: &Session) -> 
         selected = %selected.canonical_home.display(),
         "earlier-boot Claude account home changed"
     );
-    Err(PRIOR_BOOT_ACCOUNT_CHANGED.to_owned())
+    Err(SetupError::Invalid(PRIOR_BOOT_ACCOUNT_CHANGED.to_owned()))
 }
 
 const SURVIVOR: &str = "A process from this conversation's earlier Claude session is still running, so nothing was started in its place. Retry once it has exited";
@@ -313,6 +344,13 @@ pub(super) fn inspect_resume_retirement(
     host: &SharedHost,
     source: &Session,
 ) -> Result<ResumeRetirement, String> {
+    inspect_resume_retirement_for_start(host, source).map_err(|error| error.to_string())
+}
+
+pub(super) fn inspect_resume_retirement_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<ResumeRetirement, SetupError> {
     if !matches!(
         source.native_continuity,
         crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 2 }
@@ -333,7 +371,8 @@ pub(super) fn inspect_resume_retirement(
     {
         return Ok(ResumeRetirement::Unclassified);
     }
-    let registry = super::super::agent_execution::registry(host)?;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
     let mut after = None;
     let mut verified = None;
     let mut running = false;
@@ -342,7 +381,7 @@ pub(super) fn inspect_resume_retirement(
         let page = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .native_actor_ownerships(after, 128)?;
+            .native_actor_ownerships_for_start(after, 128)?;
         if page.is_empty() {
             // The census is keyed by actor, not pane. A historical retired
             // actor cannot hide a current owner of the same pane allocation.
@@ -362,10 +401,10 @@ pub(super) fn inspect_resume_retirement(
             }
             if ownership.is_pending() {
                 let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-                let retirement = registry.native_actor_retirement(ownership.actor())?;
+                let retirement = registry.native_actor_retirement_for_start(ownership.actor())?;
                 let archived = match retirement.as_ref() {
                     Some(retirement) => registry
-                        .archived_history(source, &ownership, retirement, &proof.boot_id)?
+                        .archived_history_for_start(source, &ownership, retirement, &proof.boot_id)?
                         .is_some(),
                     None => false,
                 };
@@ -373,13 +412,16 @@ pub(super) fn inspect_resume_retirement(
                     return Err("Pending cleanup intent never grants disk resume authority".into());
                 }
             }
-            match Handle::inspect_retained_retirement(ownership.owner(), &proof)? {
+            match Handle::inspect_retained_retirement(ownership.owner(), &proof)
+                .map_err(SetupError::Unavailable)?
+            {
                 crate::chat::runtime::RetirementInspection::Running => running = true,
                 crate::chat::runtime::RetirementInspection::ExitedUnproved => {
                     // Disk resume decides separately whether this exit left
                     // no surviving writer; it is never retirement evidence.
                     if ownership.is_pending()
-                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)?
+                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)
+                            .map_err(SetupError::Unavailable)?
                     {
                         return Err(
                             "The saved Claude actor exited without verified retirement".into()
@@ -391,9 +433,11 @@ pub(super) fn inspect_resume_retirement(
                     let retirement = registry
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .native_actor_retirement(ownership.actor())?
+                        .native_actor_retirement_for_start(ownership.actor())?
                         .ok_or("The saved Claude actor has no committed retirement")?;
-                    if unconfirmed_retired_startup(&ownership, &retirement, &receipt)? {
+                    if unconfirmed_retired_startup(&ownership, &retirement, &receipt)
+                        .map_err(SetupError::Invalid)?
+                    {
                         continue;
                     }
                     if receipt.receipt().identity.instance != ownership.actor()
@@ -431,6 +475,13 @@ const OPEN_ELSEWHERE: &str = "Another pane may still be writing to this Claude c
 /// and every other registered owner of that conversation must be proved
 /// ended, since a second process on it would be a second writer.
 pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Unstarted>, String> {
+    unstarted_for_start(host, source).map_err(|error| error.to_string())
+}
+
+pub(super) fn unstarted_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<Unstarted>, SetupError> {
     if source.launch.provider != Provider::Claude
         || source.native_continuity != crate::chat::NativeContinuity::ReconnectOnly
         || source.proof.is_some()
@@ -442,7 +493,9 @@ pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Un
     let proof = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.chats.contains_key(&source.id) || state.chat_handoffs.contains_key(&source.id) {
-            return Err("This conversation is already open, so nothing was started".into());
+            return Err(SetupError::Unavailable(
+                "This conversation is already open, so nothing was started".into(),
+            ));
         }
         // An idle process on the conversation can still write to it.
         if state.chats.values().any(|record| {
@@ -451,18 +504,19 @@ pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Un
             super::same_conversation(&launch, &source.launch)
                 || super::same_conversation(&record.session.launch, &source.launch)
         }) {
-            return Err(OPEN_ELSEWHERE.into());
+            return Err(SetupError::Unavailable(OPEN_ELSEWHERE.into()));
         }
         state.proof().clone()
     };
     current_admission(host, source, &proof)?;
-    let registry = super::super::agent_execution::registry(host)?;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
     let mut after = None;
     loop {
         let page = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .native_actor_ownerships(after, 128)?;
+            .native_actor_ownerships_for_start(after, 128)?;
         if page.is_empty() {
             break;
         }
@@ -481,28 +535,32 @@ pub(super) fn unstarted(host: &SharedHost, source: &Session) -> Result<Option<Un
             let retirement = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .native_actor_retirement(ownership.actor())?;
+                .native_actor_retirement_for_start(ownership.actor())?;
             let ended = match retirement {
                 Some(retirement) => !ownership.is_pending() && !retirement.is_pending(),
                 None => {
                     !ownership.is_pending()
-                        && Handle::inspect_abandoned_actor(ownership.owner(), &proof)?
+                        && Handle::inspect_abandoned_actor(ownership.owner(), &proof)
+                            .map_err(SetupError::Unavailable)?
                 }
             };
             if !ended {
-                return Err(if this_pane {
-                    STARTED_HERE
-                } else {
-                    OPEN_ELSEWHERE
-                }
-                .into());
+                return Err(SetupError::Unavailable(
+                    if this_pane {
+                        STARTED_HERE
+                    } else {
+                        OPEN_ELSEWHERE
+                    }
+                    .into(),
+                ));
             }
         }
     }
     let recorded = registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .session_lineage(source.id)?
+        .session_lineage(source.id)
+        .map_err(SetupError::Unavailable)?
         .is_some();
     Ok(Some(if recorded {
         Unstarted::InLineage
@@ -526,6 +584,13 @@ pub(super) fn unnamed_conversation(
     host: &SharedHost,
     source: &Session,
 ) -> Result<Option<String>, String> {
+    unnamed_conversation_for_start(host, source).map_err(|error| error.to_string())
+}
+
+pub(super) fn unnamed_conversation_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<Option<String>, SetupError> {
     if !source.has_unnamed_retained_claude_actor() {
         return Err("Only an unnamed retained Claude pane resumes without its conversation".into());
     }
@@ -538,7 +603,8 @@ pub(super) fn unnamed_conversation(
         return Err("The unnamed Claude pane has no complete ownership proof".into());
     };
     let previous_boot = saved.boot_id != proof.boot_id;
-    let registry = super::super::agent_execution::registry(host)?;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
     let mut after = None;
     let mut found = false;
     let mut learned: Option<String> = None;
@@ -546,7 +612,7 @@ pub(super) fn unnamed_conversation(
         let page = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .native_actor_ownerships(after, 128)?;
+            .native_actor_ownerships_for_start(after, 128)?;
         if page.is_empty() {
             break;
         }
@@ -562,7 +628,7 @@ pub(super) fn unnamed_conversation(
             let retirement = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .native_actor_retirement(ownership.actor())?;
+                .native_actor_retirement_for_start(ownership.actor())?;
             if retirement.as_ref().is_some_and(|r| r.is_pending()) {
                 return Err("Pending cleanup retirement never grants disk resume authority".into());
             }
@@ -576,15 +642,19 @@ pub(super) fn unnamed_conversation(
             let confirmed = if ownership.owner().boot != proof.boot_id {
                 recorded?
             } else {
-                match Handle::inspect_retained_retirement(ownership.owner(), &proof)? {
+                match Handle::inspect_retained_retirement(ownership.owner(), &proof)
+                    .map_err(SetupError::Unavailable)?
+                {
                     crate::chat::runtime::RetirementInspection::Running => {
-                        return Err(
+                        return Err(SetupError::Unavailable(
                             "The saved Claude actor still executes; no replacement was prepared"
                                 .into(),
-                        );
+                        ));
                     }
                     crate::chat::runtime::RetirementInspection::ExitedUnproved => {
-                        if !Handle::inspect_abandoned_actor(ownership.owner(), &proof)? {
+                        if !Handle::inspect_abandoned_actor(ownership.owner(), &proof)
+                            .map_err(SetupError::Unavailable)?
+                        {
                             return Err(SURVIVOR.into());
                         }
                         recorded?
@@ -625,8 +695,16 @@ pub(super) fn prepare_resume(host: &SharedHost, source: &Session) -> Result<bool
 pub(super) fn prepare_resume_verified(
     host: &SharedHost,
     source: &Session,
-    mut verified: Option<crate::chat::runtime::VerifiedRetirement>,
+    verified: Option<crate::chat::runtime::VerifiedRetirement>,
 ) -> Result<bool, String> {
+    prepare_resume_verified_for_start(host, source, verified).map_err(|error| error.to_string())
+}
+
+pub(super) fn prepare_resume_verified_for_start(
+    host: &SharedHost,
+    source: &Session,
+    mut verified: Option<crate::chat::runtime::VerifiedRetirement>,
+) -> Result<bool, SetupError> {
     if source.launch.provider != Provider::Claude {
         return Ok(false);
     }
@@ -643,9 +721,11 @@ pub(super) fn prepare_resume_verified(
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let paths = crate::daemon::RuntimePaths::discover().map_err(|e| e.to_string())?;
+    let paths = crate::daemon::RuntimePaths::discover()
+        .map_err(|e| SetupError::Unavailable(e.to_string()))?;
     if !proof.is_complete()
-        || crate::daemon::lease_owner(&paths.lock, &proof).map_err(|e| e.to_string())?
+        || crate::daemon::lease_owner(&paths.lock, &proof)
+            .map_err(|e| SetupError::Unavailable(e.to_string()))?
             != std::process::id()
         || source
             .proof
@@ -654,9 +734,16 @@ pub(super) fn prepare_resume_verified(
     {
         return Err("Claude resume reader does not own this boot's current daemon lease".into());
     }
-    super::super::account_lifecycle::ensure_idle(host).map_err(|e| e.message)?;
+    super::super::account_lifecycle::ensure_idle(host).map_err(|failure| {
+        if failure.retryable {
+            SetupError::Unavailable(failure.message)
+        } else {
+            SetupError::Invalid(failure.message)
+        }
+    })?;
     current_admission(host, source, &proof)?;
-    let registry = super::super::agent_execution::registry(host)?;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
     let mut after = None;
     let mut matched = false;
     let mut archived_history = None;
@@ -664,7 +751,7 @@ pub(super) fn prepare_resume_verified(
         let page = registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .native_actor_ownerships(after, 128)?;
+            .native_actor_ownerships_for_start(after, 128)?;
         if page.is_empty() {
             break;
         }
@@ -681,7 +768,7 @@ pub(super) fn prepare_resume_verified(
             let retirement = registry
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .native_actor_retirement(ownership.actor())?;
+                .native_actor_retirement_for_start(ownership.actor())?;
             if retirement
                 .as_ref()
                 .is_some_and(|receipt| receipt.is_pending())
@@ -696,16 +783,17 @@ pub(super) fn prepare_resume_verified(
                 if super::same_conversation(&ownership.source().launch, &source.launch)
                     && retirement.is_none()
                     && (ownership.is_pending()
-                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)?)
+                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)
+                            .map_err(SetupError::Unavailable)?)
                 {
-                    return Err(
+                    return Err(SetupError::Unavailable(
                         "Another registered Claude owner has no completed retirement".into(),
-                    );
+                    ));
                 }
                 continue;
             }
             let Some(retirement) = retirement else {
-                abandoned(&ownership, source, &proof)?;
+                abandoned(&ownership, source, &proof).map_err(SetupError::Invalid)?;
                 if matched {
                     return Err("The saved Claude pane matches more than one ended actor".into());
                 }
@@ -717,7 +805,12 @@ pub(super) fn prepare_resume_verified(
                     registry
                         .lock()
                         .unwrap_or_else(|p| p.into_inner())
-                        .archived_history(source, &ownership, &retirement, &proof.boot_id)?
+                        .archived_history_for_start(
+                            source,
+                            &ownership,
+                            &retirement,
+                            &proof.boot_id,
+                        )?
                         .ok_or("Pending cleanup intent never grants disk resume authority")?,
                 )
             } else {
@@ -729,14 +822,15 @@ pub(super) fn prepare_resume_verified(
             {
                 crate::chat::runtime::RetirementInspection::Verified(verified.take().unwrap())
             } else {
-                Handle::inspect_retained_retirement(ownership.owner(), &proof)?
+                Handle::inspect_retained_retirement(ownership.owner(), &proof)
+                    .map_err(SetupError::Unavailable)?
             };
             let verified = match inspection {
                 crate::chat::runtime::RetirementInspection::Verified(verified) => verified,
                 crate::chat::runtime::RetirementInspection::Running => {
-                    return Err(
+                    return Err(SetupError::Unavailable(
                         "The saved Claude actor still executes; no replacement was prepared".into(),
-                    );
+                    ));
                 }
                 crate::chat::runtime::RetirementInspection::ExitedUnproved => {
                     if retirement.is_pending() {
@@ -745,7 +839,7 @@ pub(super) fn prepare_resume_verified(
                                 .into(),
                         );
                     }
-                    abandoned(&ownership, source, &proof)?;
+                    abandoned(&ownership, source, &proof).map_err(SetupError::Invalid)?;
                     if matched {
                         return Err(
                             "The saved Claude pane matches more than one ended actor".into()
@@ -755,7 +849,9 @@ pub(super) fn prepare_resume_verified(
                     continue;
                 }
             };
-            if unconfirmed_retired_startup(&ownership, &retirement, &verified)? {
+            if unconfirmed_retired_startup(&ownership, &retirement, &verified)
+                .map_err(SetupError::Invalid)?
+            {
                 continue;
             }
             let receipt = verified.receipt();
@@ -769,23 +865,29 @@ pub(super) fn prepare_resume_verified(
                 &retirement,
                 &evidence,
                 archived.as_ref(),
-            )?;
+            )
+            .map_err(SetupError::Invalid)?;
             if matched {
                 return Err("The saved Claude pane matches more than one retired actor".into());
             }
-            let captured = evidence.scope.map_err(str::to_owned)?;
-            same_account_home(source, captured)?;
+            let captured = evidence
+                .scope
+                .map_err(|message| SetupError::Invalid(message.into()))?;
+            same_account_home_for_start(source, captured)?;
             match (&evidence.source.terminal, evidence.paired_holder) {
                 (None, None) => {}
                 (Some(terminal), Some(pair))
                     if terminal.id == pair.terminal && pair.terminal == source.id =>
                 {
-                    let role = OriginalRole::authenticated(pair, evidence.proof, &proof)?;
+                    let role = OriginalRole::authenticated(pair, evidence.proof, &proof)
+                        .map_err(SetupError::Invalid)?;
                     if !crate::terminal::holder::cleanup::confirmed_owner_with_role(
                         pair,
                         &proof,
                         role.as_ref(),
-                    )? {
+                    )
+                    .map_err(SetupError::Invalid)?
+                    {
                         return Err("The retired Claude actor's exact paired terminal has no confirmed close proof".into());
                     }
                 }
@@ -803,11 +905,12 @@ pub(super) fn prepare_resume_verified(
         registry
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .recheck_archived_history(archived)?;
+            .recheck_archived_history_for_start(archived)?;
     }
     current_admission(host, source, &proof)?;
     // This is a fresh current-lease check after all disk and account reads.
-    if crate::daemon::lease_owner(&paths.lock, &proof).map_err(|e| e.to_string())?
+    if crate::daemon::lease_owner(&paths.lock, &proof)
+        .map_err(|e| SetupError::Unavailable(e.to_string()))?
         != std::process::id()
     {
         return Err("Daemon authority changed during Claude resume preparation".into());

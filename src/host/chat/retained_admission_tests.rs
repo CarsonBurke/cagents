@@ -649,14 +649,24 @@ fn named_resume_case(name: &str, fail_retirement: bool, finish_with_close: bool)
 /// Framed native Client calls use the actual HOST handlers, lease and private
 /// execed helper. This test adapter supplies only the Connect envelope; it does
 /// not fabricate start/attach, provider exit, semantic ACK or retirement data.
-struct HostClientWire {
+pub(super) struct HostClientWire {
     stop: Arc<std::sync::atomic::AtomicBool>,
     streams: Arc<std::sync::Mutex<Vec<std::os::unix::net::UnixStream>>>,
     worker: Option<thread::JoinHandle<()>>,
 }
 
 impl HostClientWire {
-    fn start(host: &SharedHost, proof: &HostSessionProof) -> Self {
+    pub(super) fn start(host: &SharedHost, proof: &HostSessionProof) -> Self {
+        Self::start_with_dispatch(host, proof, false)
+    }
+
+    /// Full client registration and delivery are needed when a regression
+    /// observes presentation hydration, rather than only ordered RPC replies.
+    pub(super) fn start_native(host: &SharedHost, proof: &HostSessionProof) -> Self {
+        Self::start_with_dispatch(host, proof, true)
+    }
+
+    fn start_with_dispatch(host: &SharedHost, proof: &HostSessionProof, native: bool) -> Self {
         use crate::terminal_ipc::{
             ClientEnvelope, ServerEnvelope, ServerMessage, read_frame, write_frame,
         };
@@ -672,6 +682,7 @@ impl HostClientWire {
         let proof = proof.clone();
         let worker = thread::spawn(move || {
             let mut workers = Vec::new();
+            let mut next_client = 1;
             while !stopped.load(Ordering::Acquire) {
                 let (mut stream, _) = match listener.accept() {
                     Ok(pair) => pair,
@@ -682,7 +693,7 @@ impl HostClientWire {
                     Err(error) => panic!("native client fixture accept: {error}"),
                 };
                 stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .set_read_timeout((!native).then_some(Duration::from_secs(5)))
                     .unwrap();
                 stream
                     .set_write_timeout(Some(Duration::from_secs(5)))
@@ -694,6 +705,14 @@ impl HostClientWire {
                 let stopped = stopped.clone();
                 let host = host.clone();
                 let proof = proof.clone();
+                if native {
+                    let client = next_client;
+                    next_client += 1;
+                    workers.push(thread::spawn(move || {
+                        crate::host::client::serve(stream, client, host);
+                    }));
+                    continue;
+                }
                 workers.push(thread::spawn(move || {
                     while !stopped.load(Ordering::Acquire) {
                         let envelope: ClientEnvelope = match read_frame(&mut stream) {

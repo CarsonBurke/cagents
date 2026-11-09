@@ -14,6 +14,24 @@ use super::{
 };
 use crate::agent::Provider;
 
+#[derive(Debug)]
+pub(crate) enum ScopeError {
+    Invalid(String),
+    Unavailable(String),
+}
+impl std::fmt::Display for ScopeError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message.fmt(f),
+        }
+    }
+}
+impl From<&str> for ScopeError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct LaunchAccountScope {
     pub provider: Provider,
@@ -37,9 +55,17 @@ impl LaunchAccountScope {
         cwd: &Path,
         environment: impl Fn(&str) -> Option<OsString>,
     ) -> Result<Self, String> {
+        Self::resolve_for_start(provider, cwd, environment).map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn resolve_for_start(
+        provider: Provider,
+        cwd: &Path,
+        environment: impl Fn(&str) -> Option<OsString>,
+    ) -> Result<Self, ScopeError> {
         let registry = Store::installation().and_then(|store| store.load().ok());
         let homes = Homes::installation();
-        Self::resolve_with_registry(
+        Self::resolve_with_registry_for_start(
             provider,
             cwd,
             environment,
@@ -55,6 +81,17 @@ impl LaunchAccountScope {
         registry: Option<&Registry>,
         homes: Option<&Homes>,
     ) -> Result<Self, String> {
+        Self::resolve_with_registry_for_start(provider, cwd, environment, registry, homes)
+            .map_err(|error| error.to_string())
+    }
+
+    fn resolve_with_registry_for_start(
+        provider: Provider,
+        cwd: &Path,
+        environment: impl Fn(&str) -> Option<OsString>,
+        registry: Option<&Registry>,
+        homes: Option<&Homes>,
+    ) -> Result<Self, ScopeError> {
         if !cwd.is_absolute() {
             return Err(
                 "The provider launch needs an absolute working directory for account scope".into(),
@@ -76,11 +113,16 @@ impl LaunchAccountScope {
                 })
             }
         };
-        let canonical_home = path
-            .canonicalize()
-            .map_err(|error| format!("Cannot identify the selected provider home: {error}"))?;
-        let metadata = std::fs::metadata(&canonical_home)
-            .map_err(|error| format!("Cannot identify the selected provider home: {error}"))?;
+        let canonical_home = path.canonicalize().map_err(|error| {
+            ScopeError::Unavailable(format!(
+                "Cannot identify the selected provider home: {error}"
+            ))
+        })?;
+        let metadata = std::fs::metadata(&canonical_home).map_err(|error| {
+            ScopeError::Unavailable(format!(
+                "Cannot identify the selected provider home: {error}"
+            ))
+        })?;
         if !metadata.is_dir() {
             return Err("The selected provider home is not a directory".into());
         }
@@ -120,14 +162,22 @@ impl LaunchAccountScope {
             }
             scope.purge_ids = matching;
         }
-        scope.revalidate()?;
+        scope.revalidate_for_start()?;
         Ok(scope)
     }
 
     /// Refuse retained launch use after this pathname was replaced by another home.
     pub(crate) fn revalidate(&self) -> Result<(), String> {
-        let metadata = std::fs::metadata(&self.canonical_home)
-            .map_err(|error| format!("The captured provider home is unavailable: {error}"))?;
+        self.revalidate_for_start()
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) fn revalidate_for_start(&self) -> Result<(), ScopeError> {
+        let metadata = std::fs::metadata(&self.canonical_home).map_err(|error| {
+            ScopeError::Unavailable(format!(
+                "The captured provider home is unavailable: {error}"
+            ))
+        })?;
         if metadata.is_dir() && metadata.dev() == self.device && metadata.ino() == self.inode {
             Ok(())
         } else {
@@ -140,6 +190,39 @@ impl LaunchAccountScope {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn scope_io_can_be_repaired_but_a_replaced_home_is_permanent() {
+        let root = tempfile::tempdir().unwrap();
+        let home = root.path().join("home");
+        let parked = root.path().join("parked");
+        std::fs::create_dir(&home).unwrap();
+        let resolve = || {
+            LaunchAccountScope::resolve_for_start(Provider::Claude, root.path(), |name| {
+                (name == "CLAUDE_CONFIG_DIR").then(|| home.clone().into_os_string())
+            })
+        };
+        let original = resolve().unwrap();
+        std::fs::rename(&home, &parked).unwrap();
+        assert!(matches!(
+            original.revalidate_for_start(),
+            Err(ScopeError::Unavailable(_))
+        ));
+        assert!(matches!(resolve(), Err(ScopeError::Unavailable(_))));
+        std::fs::rename(&parked, &home).unwrap();
+        assert!(original.revalidate_for_start().is_ok());
+        assert_eq!(resolve().unwrap(), original);
+        std::fs::rename(&home, &parked).unwrap();
+        std::fs::create_dir(&home).unwrap();
+        assert!(matches!(
+            original.revalidate_for_start(),
+            Err(ScopeError::Invalid(_))
+        ));
+        assert!(matches!(
+            LaunchAccountScope::resolve_for_start(Provider::Claude, root.path(), |_| None),
+            Err(ScopeError::Invalid(_))
+        ));
+    }
 
     #[test]
     fn captured_scope_preserves_raw_home_bytes_in_private_census_and_actor_handoff() {

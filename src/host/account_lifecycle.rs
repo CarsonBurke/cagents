@@ -60,6 +60,10 @@ fn refusal(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, false)
 }
 
+fn pending_operation(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, true)
+}
+
 impl Home {
     fn capture(path: PathBuf) -> Result<Self, String> {
         if !path.is_absolute() {
@@ -966,7 +970,7 @@ pub(super) fn ensure_paths(
     for path in paths {
         let home = Home::capture(path).map_err(refusal)?;
         if reserved.iter().any(|other| home.overlaps(other)) {
-            return Err(refusal(
+            return Err(pending_operation(
                 "This account home is being changed. Wait for the account operation to finish before using or editing it.",
             ));
         }
@@ -1032,7 +1036,7 @@ fn ensure_credential_roots(
     }
     ensure_paths(host, paths)?;
     if unknown_root && reservations_active(host) {
-        return Err(refusal(
+        return Err(pending_operation(
             "Cannot establish both provider credential directories while an account operation is pending. Set absolute HOME or provider homes, or wait for that operation to finish.",
         ));
     }
@@ -1156,7 +1160,7 @@ pub(super) fn ensure_idle(host: &SharedHost) -> Result<(), ProtocolError> {
     {
         Ok(())
     } else {
-        Err(refusal(
+        Err(pending_operation(
             "An account operation is still finishing. Wait for it before shutting down or upgrading this daemon.",
         ))
     }
@@ -1264,11 +1268,19 @@ pub(crate) mod tests {
             &homes,
         )
         .unwrap();
-        assert!(ensure_paths(&host, [directory.join("child")]).is_err());
+        assert!(
+            ensure_paths(&host, [directory.join("child")])
+                .unwrap_err()
+                .retryable
+        );
         let moved = root.path().join("moved");
         std::fs::rename(&directory, &moved).unwrap();
         std::fs::create_dir(&directory).unwrap();
-        assert!(ensure_paths(&host, [moved.join("child")]).is_err());
+        assert!(
+            ensure_paths(&host, [moved.join("child")])
+                .unwrap_err()
+                .retryable
+        );
         assert!(reservation.verify().is_err());
         assert!(ensure_paths(&host, [root.path().join("unrelated")]).is_ok());
         drop(reservation);
@@ -1472,27 +1484,31 @@ pub(crate) mod tests {
             &homes,
         )
         .unwrap();
+        let unknown = ensure_launch(
+            &host,
+            root.path(),
+            &BTreeMap::new(),
+            &BTreeSet::new(),
+            false,
+        )
+        .unwrap_err();
         assert!(
-            ensure_launch(
-                &host,
-                root.path(),
-                &BTreeMap::new(),
-                &BTreeSet::new(),
-                false
-            )
-            .is_err()
+            unknown.retryable,
+            "waiting for the operation repairs unknown roots"
         );
         let directory = File::open(root.path()).unwrap();
+        let relative = ensure_launch_at_directory(
+            &host,
+            root.path(),
+            &BTreeMap::from([("HOME".into(), "relative".into())]),
+            &BTreeSet::new(),
+            false,
+            Some(&directory),
+        )
+        .unwrap_err();
         assert!(
-            ensure_launch_at_directory(
-                &host,
-                root.path(),
-                &BTreeMap::from([("HOME".into(), "relative".into())]),
-                &BTreeSet::new(),
-                false,
-                Some(&directory)
-            )
-            .is_err()
+            !relative.retryable,
+            "a pinned-directory recipe needs an explicit correction"
         );
         drop(reservation);
         ensure_launch(
@@ -1560,6 +1576,7 @@ pub(crate) mod tests {
             "{}",
             failure.message
         );
+        assert!(failure.retryable);
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
         assert!(std::fs::read_dir(selected).unwrap().next().is_none());
@@ -1579,7 +1596,7 @@ pub(crate) mod tests {
         let reservation = Reservation::test_install(&host, &[account], store, &homes).unwrap();
         let gate = host.lock().unwrap().control_gate.clone();
         let _writer = super::super::client::try_scoped_control_write(&gate).unwrap();
-        assert!(ensure_idle(&host).is_err());
+        assert!(ensure_idle(&host).unwrap_err().retryable);
         let error = host
             .lock()
             .unwrap()

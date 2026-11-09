@@ -1041,12 +1041,48 @@ fn append_text_copy_page(
     Ok(())
 }
 
+enum HandshakeError {
+    Protocol(ipc::ProtocolError),
+    Transport(String),
+}
+impl From<String> for HandshakeError {
+    fn from(message: String) -> Self {
+        Self::Transport(message)
+    }
+}
+impl From<&str> for HandshakeError {
+    fn from(message: &str) -> Self {
+        Self::Transport(message.into())
+    }
+}
 fn receive(
     stream: &mut UnixStream,
     codec: &mut FrameCodec,
     request_id: u64,
     proof: Option<&HostSessionProof>,
 ) -> Result<ServerResponse, String> {
+    receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
+        HandshakeError::Protocol(error) => error.message,
+        HandshakeError::Transport(message) => message,
+    })
+}
+fn receive_start(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    request_id: u64,
+    proof: Option<&HostSessionProof>,
+) -> Result<ServerResponse, StartFailure> {
+    receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
+        HandshakeError::Protocol(error) => start_failure(error),
+        HandshakeError::Transport(message) => StartFailure::retry(message),
+    })
+}
+fn receive_handshake(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    request_id: u64,
+    proof: Option<&HostSessionProof>,
+) -> Result<ServerResponse, HandshakeError> {
     #[cfg(feature = "ui")]
     let health_request = crate::daemon_health::begin();
     let frame = codec.read(stream);
@@ -1079,7 +1115,7 @@ fn receive(
         ServerMessage::Error(error) => {
             #[cfg(feature = "ui")]
             crate::daemon_health::frame(stream, None, health_request);
-            Err(error.message)
+            Err(HandshakeError::Protocol(error))
         }
         _ => Err("Unexpected daemon handshake frame".into()),
     }
@@ -1124,7 +1160,7 @@ fn restore(
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
-    let mut refusal = None;
+    let mut refusal: Option<StartFailure> = None;
     if retry_explicit_start
         || !session
             .proof
@@ -1147,7 +1183,7 @@ fn restore(
                 },
             )
             .map_err(|error| error.to_string())?;
-        let sessions = match receive(stream, codec, request_id, Some(proof))? {
+        let sessions = match receive_start(stream, codec, request_id, Some(proof))? {
             ServerResponse::ChatListed { sessions } => sessions,
             _ => return Err("Daemon did not return its native chat inventory".into()),
         };
@@ -1180,7 +1216,7 @@ fn restore(
                         },
                     )
                     .map_err(|error| error.to_string())?;
-                let prepared = match receive(stream, codec, request_id, Some(proof))? {
+                let prepared = match receive_start(stream, codec, request_id, Some(proof))? {
                     ServerResponse::ChatResumePrepared { session } => session,
                     _ => {
                         return Err(
@@ -1240,7 +1276,7 @@ fn restore(
                 },
             )
             .map_err(|error| error.to_string())?;
-        match receive(stream, codec, request_id, Some(proof)) {
+        match receive_start(stream, codec, request_id, Some(proof)) {
             Ok(ServerResponse::UpgradeChatResolved { session: restored })
                 if restored.id == session.id
                     && restored.proof.as_ref() == Some(proof)
@@ -1269,10 +1305,10 @@ fn restore(
                 return Ok(ClientRequest::ChatAttach { session: restored });
             }
             Ok(_) => {
-                refusal = Some(
-                    "The daemon answered this chat's upgrade lineage with a different conversation."
-                        .to_owned(),
-                );
+                refusal = Some(StartFailure {
+                    message: "The daemon answered this chat's upgrade lineage with a different conversation.".into(),
+                    recovery: super::Recovery::Blocked,
+                });
             }
             // A daemon an installer stopped and restarted never wrote an
             // upgrade checkpoint, which is the ordinary case after an
@@ -1292,25 +1328,35 @@ fn restore(
             proof,
             session,
             resumed_from,
-            refusal,
+            refusal.map(|failure| failure.message),
         );
     }
     if session.native_continuity.retains_provider() {
-        return Err(StartFailure::from(format!(
+        let mut failure = refusal.unwrap_or_else(|| {
+            StartFailure::retry("No authenticated native holder was available.")
+        });
+        failure.message = format!(
             "The saved native conversation could not be reattached. Its uncertain work was not restarted or resubmitted. {}",
-            refusal.unwrap_or_else(|| "No authenticated native holder was available.".into())
-        )));
+            failure.message
+        );
+        return Err(failure);
     }
     if session.launch.provider == crate::agent::Provider::Claude && !retry_explicit_start {
-        return Err(StartFailure::from(format!(
+        let mut failure = refusal.unwrap_or_else(|| {
+            StartFailure::retry("No authenticated history attachment was available.")
+        });
+        failure.message = format!(
             "Saved Claude history could not be opened without starting a provider. Its exact conversation and draft are retained. {}",
-            refusal.unwrap_or_else(|| "No authenticated history attachment was available.".into())
-        )));
+            failure.message
+        );
+        return Err(failure);
     }
     if session.launch.session_id.is_none() {
         return Err(StartFailure::fresh(format!(
             "The daemon that was hosting this conversation is no longer running, and this card never recorded a conversation to resume. {}",
-            refusal.unwrap_or_else(|| "No saved daemon proof was available either.".to_owned())
+            refusal
+                .map(|failure| failure.message)
+                .unwrap_or_else(|| "No saved daemon proof was available either.".to_owned())
         )));
     }
     // The live daemon proved its identity during the handshake, so the start
@@ -1367,13 +1413,15 @@ fn resume_retained_claude(
             },
         )
         .map_err(|error| error.to_string())?;
-    let prepared = match receive(stream, codec, request_id, Some(proof)) {
+    let prepared = match receive_start(stream, codec, request_id, Some(proof)) {
         Ok(ServerResponse::ChatResumePrepared { session: prepared }) => prepared,
         Ok(_) => return Err("The daemon did not answer the saved conversation's resume".into()),
-        Err(reason) => {
-            return Err(StartFailure::retry(format!(
-                "The saved conversation could not be reopened yet, so nothing was restarted or resent. {reason}"
-            )));
+        Err(mut failure) => {
+            failure.message = format!(
+                "The saved conversation could not be reopened yet, so nothing was restarted or resent. {}",
+                failure.message
+            );
+            return Err(failure);
         }
     };
     if prepared == session {
@@ -1989,7 +2037,7 @@ impl ClientHandle {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let proof = match receive(&mut stream, &mut codec, 1, expected.as_ref())? {
+        let proof = match receive_start(&mut stream, &mut codec, 1, expected.as_ref())? {
             ServerResponse::Connected { proof, .. } => proof,
             _ => return Err("Daemon did not complete native chat handshake".into()),
         };
@@ -2029,7 +2077,7 @@ impl ClientHandle {
                     },
                 )
                 .map_err(|error| error.to_string())?;
-            match receive(&mut stream, &mut codec, request_id, Some(&proof))? {
+            match receive_start(&mut stream, &mut codec, request_id, Some(&proof))? {
                 ServerResponse::UpgradeChatResolved { session: resolved }
                     if resolved == expected => {}
                 _ => return Err("The daemon did not authenticate the exact canonical chat".into()),
@@ -4059,6 +4107,29 @@ mod tests {
     }
 
     #[test]
+    fn retained_resume_preparation_honors_typed_refusals() {
+        for (retryable, expected) in [
+            (true, super::super::Recovery::Retry),
+            (false, super::super::Recovery::Blocked),
+        ] {
+            let (result, resumed, _) = resume_stranded(
+                stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495")),
+                move |_| {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        "Exact preparation refusal",
+                        retryable,
+                    ))
+                },
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(failure.recovery, expected);
+            assert!(failure.message.contains("Exact preparation refusal"));
+            assert!(resumed.is_none());
+        }
+    }
+
+    #[test]
     fn stranded_retained_claude_card_never_replaces_a_live_or_unproved_owner() {
         let source = stranded_claude(Some("6f1f6f1e-4a4b-4c4d-8e8f-909192939495"));
         // A still-present owner is returned unchanged: attach, never replace.
@@ -4081,7 +4152,7 @@ mod tests {
             ServerMessage::Error(ipc::ProtocolError::new(
                 ipc::ProtocolErrorCode::TerminalUnavailable,
                 "The old provider owner has no confirmed close receipt.",
-                false,
+                true,
             ))
         });
         let failure = result.unwrap_err();
@@ -4148,7 +4219,7 @@ mod tests {
             assert!(resumed.is_none());
         }
         // Without a retirement that records the conversation, the daemon
-        // refuses, and the card keeps its conversation behind Retry.
+        // refuses permanently for this card; Resume can locate a new descriptor.
         let (result, resumed, _) = resume_stranded(stranded_claude(None), |_| {
             ServerMessage::Error(ipc::ProtocolError::new(
                 ipc::ProtocolErrorCode::TerminalUnavailable,
@@ -4156,13 +4227,13 @@ mod tests {
                 false,
             ))
         });
-        assert_eq!(result.unwrap_err().recovery, crate::chat::Recovery::Retry);
+        assert_eq!(result.unwrap_err().recovery, crate::chat::Recovery::Blocked);
         assert!(resumed.is_none());
     }
 
     #[test]
     fn explicit_retry_classifies_exact_history_reader_and_live_successor() {
-        for state in 0..5 {
+        for state in 0..7 {
             let proof = host_proof("current");
             let mut source = omp_card(Some(CONVERSATION), Some(proof.clone()));
             source.launch.provider = crate::agent::Provider::Claude;
@@ -4188,14 +4259,14 @@ mod tests {
                     let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
                     let response = match (step, request.request) {
                         (0, ClientRequest::ChatList) => ServerResponse::ChatListed {
-                            sessions: if state < 3 {
+                            sessions: if state < 3 || state >= 5 {
                                 vec![expected.clone()]
                             } else {
                                 vec![]
                             },
                         },
                         (1, ClientRequest::ChatPrepareResume { source })
-                            if state < 3 && source == expected =>
+                            if (state < 3 || state >= 5) && source == expected =>
                         {
                             ServerResponse::ChatResumePrepared {
                                 session: expected.clone(),
@@ -4217,7 +4288,15 @@ mod tests {
                                 version: PROTOCOL_VERSION,
                                 request_id: Some(request.request_id),
                                 proof: server_proof.clone(),
-                                message: ServerMessage::Response { response },
+                                message: if step == 1 && state >= 5 {
+                                    ServerMessage::Error(ipc::ProtocolError::new(
+                                        ipc::ProtocolErrorCode::InvalidRequest,
+                                        "Exact resume preparation refusal",
+                                        state == 5,
+                                    ))
+                                } else {
+                                    ServerMessage::Response { response }
+                                },
                             },
                         )
                         .unwrap();
@@ -4247,6 +4326,18 @@ mod tests {
                         .message
                         .contains("changed the explicit retry request")
                 ),
+                5 | 6 => {
+                    let failure = result.unwrap_err();
+                    assert_eq!(
+                        failure.recovery,
+                        if state == 5 {
+                            crate::chat::Recovery::Retry
+                        } else {
+                            crate::chat::Recovery::Blocked
+                        }
+                    );
+                    assert_eq!(failure.message, "Exact resume preparation refusal");
+                }
                 _ => unreachable!(),
             }
         }
@@ -4296,6 +4387,42 @@ mod tests {
             false,
         );
         (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn cold_retained_codex_resolve_refusal_keeps_the_daemons_recovery() {
+        let live = host_proof("current");
+        for retryable in [false, true] {
+            let mut source = omp_card(Some(CONVERSATION), Some(host_proof("previous")));
+            source.launch.provider = crate::agent::Provider::Codex;
+            source.launch.recipe.program = "codex".into();
+            source.native_continuity = super::super::NativeContinuity::Durable {
+                provider_version: "0.100.0".into(),
+            };
+            let (result, request, recovery) = negotiate_with_recovery(
+                &live,
+                source.clone(),
+                ServerMessage::Error(ipc::ProtocolError::new(
+                    ipc::ProtocolErrorCode::InvalidRequest,
+                    "Exact retained source refusal",
+                    retryable,
+                )),
+            );
+            assert!(
+                matches!(request, ClientRequest::ResolveUpgradeChat { source: requested } if requested == source)
+            );
+            let failure = result.unwrap_err();
+            assert_eq!(
+                failure.recovery,
+                if retryable {
+                    crate::chat::Recovery::Retry
+                } else {
+                    crate::chat::Recovery::Blocked
+                }
+            );
+            assert!(failure.message.contains("Exact retained source refusal"));
+            assert!(recovery.is_none());
+        }
     }
 
     #[test]

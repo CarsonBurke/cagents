@@ -174,6 +174,12 @@ pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<()
 }
 
 pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     create_inner(launch, None, None)
 }
 
@@ -181,6 +187,13 @@ pub(crate) fn create_with_listener(
     launch: &Launch,
     socket: PathBuf,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_with_listener_for_start(launch, socket).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_with_listener_for_start(
+    launch: &Launch,
+    socket: PathBuf,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     let bytes = socket.as_os_str().as_encoded_bytes();
     // Match the actual platform Unix address before any provider can start.
     // All sockaddr_un fields are integers, so its all-zero value is valid.
@@ -192,9 +205,9 @@ pub(crate) fn create_with_listener(
         || bytes.contains(&0)
         || bytes.len() >= capacity
     {
-        return Err(format!(
+        return Err(super::SetupError::Invalid(format!(
             "Owned Codex listener requires a nonempty, UTF-8, NUL-free Unix socket path shorter than {capacity} bytes; use a shorter UTF-8 temporary directory"
-        ));
+        )));
     }
     create_inner(launch, Some(socket), None)
 }
@@ -204,6 +217,12 @@ pub(crate) fn create_with_listener(
 pub(crate) fn create_restored(
     recovery: &crate::chat::native_holder::Recovery,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_restored_for_start(recovery).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_restored_for_start(
+    recovery: &crate::chat::native_holder::Recovery,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     let confirmed = recovery
         .server_identity
         .clone()
@@ -218,7 +237,7 @@ fn create_inner(
     launch: &Launch,
     owned_socket: Option<PathBuf>,
     retained_identity: Option<ServerIdentity>,
-) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {
     if launch
         .session_id
         .as_ref()
@@ -242,11 +261,13 @@ fn create_inner(
             "--remote" => {
                 shared = true;
                 explicit_socket =
-                    remote_socket(args.next().ok_or("Missing Codex --remote address")?)?;
+                    remote_socket(args.next().ok_or("Missing Codex --remote address")?)
+                        .map_err(super::SetupError::Invalid)?;
             }
             _ if arg.starts_with("--remote=") => {
                 shared = true;
-                explicit_socket = remote_socket(&arg["--remote=".len()..])?;
+                explicit_socket =
+                    remote_socket(&arg["--remote=".len()..]).map_err(super::SetupError::Invalid)?;
             }
             "resume" => {
                 let id = args
@@ -257,9 +278,9 @@ fn create_inner(
                 }
             }
             "-m" | "--model" | "-s" | "--sandbox" | "-a" | "--ask-for-approval" => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                let value = args.next().ok_or_else(|| {
+                    super::SetupError::Invalid(format!("Missing value for Codex {arg}"))
+                })?;
                 // Attaching must not mutate a running thread's configuration.
                 if launch.session_id.is_none() {
                     let key = match arg.as_str() {
@@ -271,9 +292,9 @@ fn create_inner(
                 }
             }
             "--config" | "-c" if launch.session_id.is_none() => {
-                let value = args
-                    .next()
-                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                let value = args.next().ok_or_else(|| {
+                    super::SetupError::Invalid(format!("Missing value for Codex {arg}"))
+                })?;
                 // Only an override with a typed `thread/start` equivalent is
                 // translated; any other key would silently change meaning.
                 let effort = value
@@ -287,9 +308,9 @@ fn create_inner(
                     })
                     .filter(|effort| crate::agent_execution::valid_reasoning_effort(effort))
                     .ok_or_else(|| {
-                        format!(
+                        super::SetupError::Invalid(format!(
                             "Codex launch option {arg} {value:?} cannot safely be translated to native app-server mode"
-                        )
+                        ))
                     })?;
                 start["config"][REASONING_EFFORT_KEY] = json!(effort);
             }
@@ -298,8 +319,9 @@ fn create_inner(
             {
                 // The exact thread is already configured on the shared
                 // server. Keep its live permissions/model, not TUI defaults.
-                args.next()
-                    .ok_or_else(|| format!("Missing value for Codex {arg}"))?;
+                args.next().ok_or_else(|| {
+                    super::SetupError::Invalid(format!("Missing value for Codex {arg}"))
+                })?;
             }
             "--search" if launch.session_id.is_some() => {}
             "--dangerously-bypass-approvals-and-sandbox" | "--yolo" => {
@@ -313,9 +335,9 @@ fn create_inner(
                 }
             }
             _ => {
-                return Err(format!(
+                return Err(super::SetupError::Invalid(format!(
                     "Codex launch option {arg:?} cannot safely be translated to native app-server mode"
-                ));
+                )));
             }
         }
     }
@@ -340,10 +362,10 @@ fn create_inner(
         identity.canonical_home.clone()
     } else {
         std::fs::canonicalize(&home).map_err(|e| {
-            format!(
+            super::SetupError::Unavailable(format!(
                 "Cannot verify Codex account directory {}: {e}",
                 home.display()
-            )
+            ))
         })?
     };
     // Joining a thread that already exists means joining whichever process
@@ -370,12 +392,12 @@ fn create_inner(
         } else {
             spec.working_directory.join(socket)
         };
-        let metadata = std::fs::metadata(&socket).map_err(|error| format!("Cannot join existing Codex daemon at {}: {error}. Start the Codex shared daemon first; no private fallback is launched.", socket.display()))?;
+        let metadata = std::fs::metadata(&socket).map_err(|error| super::SetupError::Unavailable(format!("Cannot join existing Codex daemon at {}: {error}. Start the Codex shared daemon first; no private fallback is launched.", socket.display())))?;
         if !metadata.file_type().is_socket() {
-            return Err(format!(
+            return Err(super::SetupError::Unavailable(format!(
                 "Codex endpoint {} is not a Unix socket",
                 socket.display()
-            ));
+            )));
         }
         // Linux sun_path is 108 bytes. The symlink resolves to this exact
         // verified socket, not a discovered/newest daemon or a different
@@ -386,20 +408,26 @@ fn create_inner(
             std::fs::DirBuilder::new()
                 .mode(0o700)
                 .create(&directory)
-                .map_err(|e| format!("Creating private Codex socket alias: {e}"))?;
+                .map_err(|e| {
+                    super::SetupError::Unavailable(format!(
+                        "Creating private Codex socket alias: {e}"
+                    ))
+                })?;
             let link = directory.join("s");
             if let Err(error) = std::os::unix::fs::symlink(&socket, &link) {
                 let _ = std::fs::remove_dir(&directory);
-                return Err(format!("Creating exact Codex socket alias: {error}"));
+                return Err(super::SetupError::Unavailable(format!(
+                    "Creating exact Codex socket alias: {error}"
+                )));
             }
             let verified = std::fs::metadata(&link)
                 .is_ok_and(|m| m.dev() == metadata.dev() && m.ino() == metadata.ino());
             if !verified {
                 let _ = std::fs::remove_file(&link);
                 let _ = std::fs::remove_dir(&directory);
-                return Err(
+                return Err(super::SetupError::Unavailable(
                     "Codex socket changed during alias verification; reconnect explicitly".into(),
-                );
+                ));
             }
             alias = Some(directory);
             link

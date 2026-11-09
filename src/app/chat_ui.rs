@@ -27370,7 +27370,7 @@ mod tests {
         app.cards.insert(card, CardRuntime::Loading);
         drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
         let target = chat_runtime_attempt(&app, card);
-        let reason = "Cannot join existing Codex daemon for this thread";
+        let reason = "Codex recipe resume ID does not match the selected thread";
         answer_start(
             &mut app,
             target,
@@ -27428,7 +27428,7 @@ mod tests {
         let source = chat_runtime(&app, card).session.clone();
         drop(app.start_chat(card, source.clone(), chat::Intent::Resume, None, false));
         let target = chat_runtime_attempt(&app, card);
-        let reason = "This thread still has an active writer";
+        let reason = "Codex recipe resume ID does not match the selected thread";
         answer_start(
             &mut app,
             target,

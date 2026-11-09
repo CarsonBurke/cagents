@@ -38,6 +38,8 @@ mod retained_receipt_collection_tests;
 mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]
+mod start_retryability_tests;
+#[cfg(test)]
 mod startup_tests;
 pub(super) mod upgrade_resolution;
 use crate::{
@@ -380,6 +382,15 @@ fn error(message: impl Into<String>) -> ProtocolError {
 }
 fn unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, false)
+}
+fn setup_error(failure: chat::protocol::SetupError) -> ProtocolError {
+    match failure {
+        chat::protocol::SetupError::Invalid(message) => error(message),
+        chat::protocol::SetupError::Unavailable(message) => retryable_unavailable(message),
+    }
+}
+fn retryable_unavailable(message: impl Into<String>) -> ProtocolError {
+    ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
 }
 
 fn check_launch_account(launch: &chat::Launch) -> Result<(), ProtocolError> {
@@ -880,12 +891,12 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
         return Ok(false);
     }
     use crate::daemon::holder_registry::{self as registry, Kind};
-    let directory = registry::directory(Kind::Native).map_err(unavailable)?;
+    let directory = registry::directory(Kind::Native).map_err(retryable_unavailable)?;
     registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
         // Unsupported retained protocols still own this allocation. Discovery
         // fences launch; only authenticated recovery may interpret its version.
         .map(|record| record.is_some())
-        .map_err(unavailable)
+        .map_err(retryable_unavailable)
 }
 
 /// Whether `session`'s complete proof names a kernel boot other than this one,
@@ -1199,14 +1210,13 @@ fn start_with_execution(
     if let Some(pending) = pending
         && has_native_owner(&pending.source)?
     {
-        let response =
-            native_recovery::restore(host, client, &pending.source).map_err(unavailable)?;
+        let response = native_recovery::restore_for_start(host, client, &pending.source)?;
         pending.context.installed();
         retained_actor::forget_startup(host, &pending.source, &pending.context);
         return Ok(response);
     }
     // A failed pre-discovery helper still owns its exact cleanup context.
-    retained_actor::reconcile_startup(host, &session).map_err(unavailable)?;
+    retained_actor::reconcile_startup_for_start(host, &session).map_err(setup_error)?;
     // A named Claude Start in place of an owner an earlier boot left runs under
     // the account home that owner used.
     if session.launch.provider == Provider::Claude
@@ -1214,7 +1224,8 @@ fn start_with_execution(
         && !session.native_continuity.retains_provider()
         && super::agent_execution::registry(host).is_ok()
     {
-        retained_resume::ensure_prior_boot_account(host, &session).map_err(unavailable)?;
+        retained_resume::ensure_prior_boot_account_for_start(host, &session)
+            .map_err(setup_error)?;
     }
     // Reserve before provider/account initialization. Pending owners recovered above
     // use their own exact reservation through restore.
@@ -1297,8 +1308,9 @@ fn start_with_execution(
         ));
     }
     if session.native_continuity.retains_provider() || has_native_owner(&session)? {
-        return native_recovery::restore_with_admission(host, client, &session, admission)
-            .map_err(unavailable);
+        return native_recovery::restore_with_admission_for_start(
+            host, client, &session, admission,
+        );
     }
     let mut source_process = None;
     let mut resolved_restart_recipe = None;
@@ -1391,7 +1403,7 @@ fn start_with_execution(
     if source.is_some() && !terminate_source && session.launch.provider == Provider::Codex {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         if state.shutting_down {
-            return Err(unavailable("Daemon is shutting down"));
+            return Err(retryable_unavailable("Daemon is shutting down"));
         }
         validate_proof(source.as_ref(), state.proof())?;
         if let Some(record) = state.chats.get_mut(&session.id)
@@ -1455,7 +1467,7 @@ fn start_with_execution(
     let owned_socket = match owned_socket {
         Some(socket)
             if !owned_listener::served(&socket).map_err(|failure| {
-                unavailable(format!("Cannot retire stopped provider socket: {failure}"))
+                retryable_unavailable(format!("Cannot retire stopped provider socket: {failure}"))
             })? =>
         {
             Some(socket)
@@ -1532,9 +1544,9 @@ fn start_with_execution(
         false,
     )?;
     let (mut spec, mut adapter) = if let Some(owned_socket) = owned_socket {
-        chat::protocol::codex::create_with_listener(&process_launch, owned_socket)
+        chat::protocol::codex::create_with_listener_for_start(&process_launch, owned_socket)
     } else {
-        chat::protocol::create(&process_launch)
+        chat::protocol::create_for_start(&process_launch)
     }
     .map_err(|message| {
         // Removal may have won after the early check while the adapter
@@ -1542,13 +1554,13 @@ fn start_with_execution(
         // those reads, but preserve the actionable account classification.
         check_launch_account(&session.launch)
             .err()
-            .unwrap_or_else(|| error(message))
+            .unwrap_or_else(|| setup_error(message))
     })?;
     let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
     let execution = if remote && execution.is_none() {
         Some(Arc::new(
             chat::protocol::ExecutionContext::capture(&spec.working_directory)
-                .map_err(unavailable)?,
+                .map_err(retryable_unavailable)?,
         ))
     } else {
         execution
@@ -1587,8 +1599,8 @@ fn start_with_execution(
         &spec.unset_environment,
         false,
     )?;
-    let mut initial = adapter.initialize().map_err(error)?;
-    let store = chat::runtime::preflight(&spec, &mut initial).map_err(error)?;
+    let mut initial = adapter.initialize_for_start().map_err(setup_error)?;
+    let store = chat::runtime::preflight_for_start(&spec, &mut initial).map_err(setup_error)?;
     if terminate_source && source.is_none() {
         return Err(error("Source termination requires an exact host proof"));
     }
@@ -1596,7 +1608,7 @@ fn start_with_execution(
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
         require_unreserved_terminals(&state, &session)?;
         if state.shutting_down {
-            return Err(unavailable("Daemon is shutting down"));
+            return Err(retryable_unavailable("Daemon is shutting down"));
         }
         if state.chat_handoffs.contains_key(&session.id) {
             return Err(error(
@@ -1633,13 +1645,13 @@ fn start_with_execution(
         if (state.chat_spawning.contains_key(&session.id) && admission.is_none())
             || state.native_closing.contains_key(&session.id)
         {
-            return Err(error("Chat is already starting"));
+            return Err(retryable_unavailable("Chat is already starting"));
         }
         for record in state.chats.values() {
             let mut launch = record.session.launch.clone();
             launch.session_id = record.handle.session_id();
             if same_conversation(&launch, &session.launch) && record.handle.owns_work() {
-                return Err(error(
+                return Err(retryable_unavailable(
                     "This exact conversation already has a daemon writer or unconfirmed backend work; attach to its existing chat",
                 ));
             }
@@ -1647,7 +1659,9 @@ fn start_with_execution(
         if state.chat_spawning.iter().any(|(id, pending)| {
             *id != session.id && same_conversation(&pending.launch, &session.launch)
         }) {
-            return Err(error("This exact conversation is already starting"));
+            return Err(retryable_unavailable(
+                "This exact conversation is already starting",
+            ));
         }
         if let Some(id) = &session.launch.session_id {
             for (&terminal_id, record) in &state.terminals {
@@ -1663,7 +1677,7 @@ fn start_with_execution(
                 if recipe.arguments.iter().any(|arg| {
                     arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id)
                 }) {
-                    return Err(error(format!(
+                    return Err(retryable_unavailable(format!(
                         "The exact conversation is already owned by CLI terminal {terminal_id}; convert that proven source rather than launching another writer"
                     )));
                 }
@@ -1739,9 +1753,9 @@ fn start_with_execution(
             if session.launch.provider != Provider::Codex && !handle.is_completed() {
                 // Freeze the exact source family before the final identity check.
                 // Dropping the guard on any error resumes it without losing work.
-                let mut frozen = handle.prepare_upgrade().map_err(unavailable)?;
+                let mut frozen = handle.prepare_upgrade().map_err(retryable_unavailable)?;
                 if !frozen.only_agent_tree(current_process.pid) {
-                    return Err(unavailable(
+                    return Err(retryable_unavailable(
                         "This terminal also owns unrelated jobs. Finish or move those jobs before converting the agent.",
                     ));
                 }
@@ -1781,7 +1795,7 @@ fn start_with_execution(
         {
             let state = host.lock().unwrap_or_else(|p| p.into_inner());
             if state.shutting_down {
-                return Err(unavailable(
+                return Err(retryable_unavailable(
                     "Daemon shutdown cancelled chat start; exact source/session evidence remains recoverable",
                 ));
             }
@@ -1897,7 +1911,7 @@ fn start_with_execution(
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             require_unreserved_terminals(&state, &session)?;
             if state.native_actor_startups.contains_key(&id) {
-                return Err(unavailable(
+                return Err(retryable_unavailable(
                     "An exact retained startup still owns cleanup; no second helper was started",
                 ));
             }
@@ -1935,7 +1949,7 @@ fn start_with_execution(
         .map_err(|message| {
             check_launch_account(&session.launch)
                 .err()
-                .unwrap_or_else(|| unavailable(message))
+                .unwrap_or_else(|| retryable_unavailable(message))
         })?;
         if let Some((source, mut frozen)) = pending_fresh {
             let committed = confirm_fresh_session(
@@ -1949,7 +1963,9 @@ fn start_with_execution(
             )
             .and_then(|()| {
                 if host.lock().unwrap_or_else(|p| p.into_inner()).shutting_down {
-                    return Err(unavailable("Daemon shutdown cancelled fresh chat handoff"));
+                    return Err(retryable_unavailable(
+                        "Daemon shutdown cancelled fresh chat handoff",
+                    ));
                 }
                 stop_source(&source, &mut frozen)
             });
@@ -2002,7 +2018,9 @@ fn start_with_execution(
         if state.shutting_down || require_unreserved_terminals(&state, &session).is_err() {
             drop(state);
             let _ = handle.close();
-            return Err(unavailable("Daemon shutdown cancelled chat start"));
+            return Err(retryable_unavailable(
+                "Daemon shutdown cancelled chat start",
+            ));
         }
         let observation = Observation {
             after_generation: handle.observe_next_update(),
@@ -2163,7 +2181,7 @@ fn start_with_execution(
                         // reservation while normal Close takes its own exact fence.
                         drop(admission.take());
                         if let Err(cleanup) = close_captured(host, target) {
-                            return Err(unavailable(format!(
+                            return Err(retryable_unavailable(format!(
                                 "{message}. The exact startup cleanup owner is retained: {}. Retry finishes its normal close before another launch.",
                                 cleanup.message
                             )));
@@ -2171,7 +2189,7 @@ fn start_with_execution(
                         if let Some(context) = &execution {
                             retained_actor::forget_startup(host, &startup_source, context);
                         }
-                        return Err(unavailable(message));
+                        return Err(retryable_unavailable(message));
                     }
                 }
             }
@@ -2832,8 +2850,8 @@ fn process_inner(
             {
                 return Err(error("Saved conversation has invalid continuity evidence"));
             }
-            if let Some(session) =
-                retained_actor::prepare_failed_start(host, &source).map_err(unavailable)?
+            if let Some(session) = retained_actor::prepare_failed_start_for_start(host, &source)
+                .map_err(setup_error)?
             {
                 return Ok(ServerResponse::ChatResumePrepared { session });
             }
@@ -2853,7 +2871,9 @@ fn process_inner(
             let mut source = source;
             let mut unconfirmed = false;
             if unnamed {
-                match retained_resume::unnamed_conversation(host, &source).map_err(unavailable)? {
+                match retained_resume::unnamed_conversation_for_start(host, &source)
+                    .map_err(setup_error)?
+                {
                     Some(conversation) => source.launch.session_id = Some(conversation),
                     None => unconfirmed = true,
                 }
@@ -2864,7 +2884,8 @@ fn process_inner(
             let retirement = if unconfirmed {
                 retained_resume::ResumeRetirement::Abandoned
             } else if source.launch.provider == Provider::Claude {
-                retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
+                retained_resume::inspect_resume_retirement_for_start(host, &source)
+                    .map_err(setup_error)?
             } else {
                 retained_resume::ResumeRetirement::Unclassified
             };
@@ -2873,7 +2894,8 @@ fn process_inner(
             let retirement = if !retirement.is_classified()
                 && retained_actor::finish_interrupted_exit_of(host, &ended).map_err(unavailable)?
             {
-                retained_resume::inspect_resume_retirement(host, &source).map_err(unavailable)?
+                retained_resume::inspect_resume_retirement_for_start(host, &source)
+                    .map_err(setup_error)?
             } else {
                 retirement
             };
@@ -2892,7 +2914,7 @@ fn process_inner(
             let unstarted = if previous_boot || unconfirmed {
                 None
             } else {
-                retained_resume::unstarted(host, &source).map_err(unavailable)?
+                retained_resume::unstarted_for_start(host, &source).map_err(setup_error)?
             };
             // A successor no lineage records here resumes on its own, as any
             // conversation reopened without an owner to take over.
@@ -2907,8 +2929,12 @@ fn process_inner(
             {
                 true
             } else if source.launch.provider == Provider::Claude {
-                retained_resume::prepare_resume_verified(host, &source, retirement.verified())
-                    .map_err(unavailable)?
+                retained_resume::prepare_resume_verified_for_start(
+                    host,
+                    &source,
+                    retirement.verified(),
+                )
+                .map_err(setup_error)?
             } else {
                 // An owner lost without its receipt was closed all the same,
                 // proved while no start or close can take its allocation.
@@ -2920,14 +2946,15 @@ fn process_inner(
                     })
             };
             if !closed {
-                return Err(unavailable(
+                return Err(retryable_unavailable(
                     "The old provider owner has no confirmed close receipt. Restore its original pane and close it before reopening; no replacement was started.",
                 ));
             }
             // A changed boot proves the old owner is gone, not that the
             // recorded launch still selects the account home it ran under.
             if previous_boot && source.launch.provider == Provider::Claude {
-                retained_resume::ensure_prior_boot_account(host, &source).map_err(unavailable)?;
+                retained_resume::ensure_prior_boot_account_for_start(host, &source)
+                    .map_err(setup_error)?;
             }
             // The old process is proved ended, as after a daemon stop: its
             // authority and unfinished runs end and its agent stays open, so
@@ -3113,7 +3140,8 @@ fn process_inner(
                     .is_some_and(|record| record.handle.is_close_only())
             };
             if cleanup {
-                retained_actor::recover_cleanup_attachment(host, &session).map_err(unavailable)?;
+                retained_actor::recover_cleanup_attachment_for_start(host, &session)
+                    .map_err(setup_error)?;
             }
             let missing = {
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -3131,7 +3159,7 @@ fn process_inner(
                 let state = host.lock().unwrap_or_else(|p| p.into_inner());
                 validate_proof(session.proof.as_ref(), state.proof())?;
                 if state.chat_spawning.contains_key(&session.id) {
-                    return Err(unavailable(
+                    return Err(retryable_unavailable(
                         "Native chat ownership is changing; retry its normal attach after the transition finishes",
                     ));
                 }

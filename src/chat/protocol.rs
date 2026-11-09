@@ -12,6 +12,40 @@ mod image_references;
 pub mod omp;
 mod terminal_output;
 
+/// Startup recovery for the same card and exact conversation. Unavailable
+/// means another attempt may succeed after an external condition changes;
+/// it promises neither immediate success nor automatic replay of uncertain
+/// writes. Existing ownership and idempotency reconciliation still run first.
+/// Invalid is reserved for known immutable identity/recipe or structural
+/// failures. An opaque operational String is not evidence of permanence:
+/// preserve retry conservatively at legacy boundaries, and classify explicit
+/// decisions here rather than inferring authority from diagnostic wording.
+#[derive(Debug)]
+pub enum SetupError {
+    Invalid(String),
+    Unavailable(String),
+}
+impl std::fmt::Display for SetupError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Invalid(message) | Self::Unavailable(message) => message.fmt(f),
+        }
+    }
+}
+impl From<crate::account::scope::ScopeError> for SetupError {
+    fn from(error: crate::account::scope::ScopeError) -> Self {
+        match error {
+            crate::account::scope::ScopeError::Invalid(message) => Self::Invalid(message),
+            crate::account::scope::ScopeError::Unavailable(message) => Self::Unavailable(message),
+        }
+    }
+}
+impl From<&str> for SetupError {
+    fn from(message: &str) -> Self {
+        Self::Invalid(message.into())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TransportSpec {
     /// Page an exact provider transcript without starting a provider process.
@@ -343,6 +377,11 @@ pub trait Adapter: Send {
         None
     }
     fn initialize(&mut self) -> Result<Step, String>;
+    /// Preserve resource failures during history preparation without treating
+    /// malformed initialization data as an invitation to repeat it.
+    fn initialize_for_start(&mut self) -> Result<Step, SetupError> {
+        self.initialize().map_err(SetupError::Invalid)
+    }
     /// Whether the initial handshake still needs its matching provider reply.
     /// Advisory frames do not complete it; later readiness changes are separate.
     fn initialization_pending(&self) -> bool {
@@ -379,6 +418,16 @@ pub fn create(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String
     launch.provider.create_chat(launch)
 }
 
+pub(crate) fn create_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
+    match launch.provider {
+        crate::agent::Provider::Codex => codex::create_for_start(launch),
+        crate::agent::Provider::Claude => claude::create_for_start(launch),
+        _ => create(launch).map_err(SetupError::Invalid),
+    }
+}
+
 /// A bounded diagnostic prefix, with terminal controls escaped. Inspect only
 /// the prefix needed for the preview, even when the provider sends a huge line.
 pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
@@ -401,8 +450,14 @@ pub(crate) fn diagnostic_preview(bytes: &[u8], limit: usize) -> String {
 /// Reconstruct a saved reader without granting permission to launch a provider.
 /// Support is deliberately limited to adapters with a local history transport.
 pub(crate) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
+    create_history_for_start(launch).map_err(|error| error.to_string())
+}
+
+pub(crate) fn create_history_for_start(
+    launch: &Launch,
+) -> Result<(ProcessSpec, Box<dyn Adapter>), SetupError> {
     match launch.provider {
-        crate::agent::Provider::Claude => claude::create_history(launch),
+        crate::agent::Provider::Claude => claude::create_history_for_start(launch),
         _ => {
             Err("This provider does not support restoring a local read-only history reader".into())
         }
