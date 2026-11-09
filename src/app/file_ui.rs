@@ -212,7 +212,7 @@ impl Cagents {
                 .workspace
                 .focus(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged());
-            return Task::batch([jump, self.apply_viewport(update, true, false)]);
+            return Task::batch([jump, self.apply_viewport(update, true, DurableChange::None)]);
         }
         let view = RepositoryView {
             project,
@@ -292,7 +292,11 @@ impl Cagents {
             )
         }
         .unwrap_or_else(|_| ViewportUpdate::unchanged());
-        Task::batch([load, jump, self.apply_viewport(update, true, true)])
+        Task::batch([
+            load,
+            jump,
+            self.apply_viewport(update, true, DurableChange::Content),
+        ])
     }
 
     pub(super) fn preview_local_file(&mut self, card: CardId) -> Task<Message> {
@@ -885,7 +889,7 @@ mod tests {
         assert_eq!(app.durable.card_scopes.get(&file_a), Some(&scope_a));
         // Repository loading does not advance the pane's layout/reveal animation.
         let update = app.workspace.tick(std::time::Duration::from_secs(1));
-        drop(app.apply_viewport(update, true, false));
+        drop(app.apply_viewport(update, true, DurableChange::None));
         assert_eq!(
             app.workspace.visibility(file_a),
             Some(VisibilityClass::Visible)
