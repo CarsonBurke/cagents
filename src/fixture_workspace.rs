@@ -22,9 +22,8 @@ use serde::Deserialize;
 
 use crate::model::{
     BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-    ChannelTitleSource, Existence, Exposure, LaunchRecipe, ProjectId, PullRequestView,
-    RepositoryView, Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
-    WorkspaceId, WorktreeId,
+    ChannelTitleSource, Existence, LaunchRecipe, ProjectId, PullRequestView, RepositoryView,
+    TerminalContinuity, TerminalId, TerminalSession, Tombstone, WorkspaceId, WorktreeId,
 };
 use crate::workspace_model::views::Scope;
 
@@ -438,8 +437,6 @@ impl Plan {
                     },
                 },
             },
-            exposure: Exposure::Offscreen,
-            residency: Residency::Cold,
             kind,
         })
     }
