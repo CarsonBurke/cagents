@@ -440,8 +440,10 @@ impl ImageReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
-    /// Absent on legacy provider files and non-image attachments. Legacy text
-    /// that happens to say `[Image N]` never manufactures an image reference.
+    /// Absent on files the person chose that are not images, which a draft
+    /// keeps by path, and on legacy provider files such as images a provider
+    /// names by a path cagents does not own. Legacy text that happens to say
+    /// `[Image N]` never manufactures an image reference.
     #[serde(default)]
     pub reference: Option<ImageReference>,
 }
