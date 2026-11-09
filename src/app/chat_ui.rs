@@ -6,6 +6,7 @@ use crate::app::account_ui::ChatAccounts;
 use crate::chat::client::{ClientHandle, Wake};
 use crate::chat::{self, Attachment, Command, ItemContent, PromptMode, Snapshot};
 use crate::file_drop;
+use crate::model::SavedQueue;
 use crate::performance::chat_stage::{self, Stage};
 use base64::Engine as _;
 use cosmic::widget::text_editor;
@@ -806,7 +807,7 @@ pub(super) struct State {
     peer_started: HashMap<CardId, TerminalId>,
     /// The provider queue each card last saved, until a connection to its
     /// conversation shows whether the provider that held it is still there.
-    waiting: HashMap<CardId, Vec<chat::QueuedMessage>>,
+    waiting: HashMap<CardId, SavedQueue>,
     /// Automatically opened placeholders, discarded when their scope is left
     /// until the reader puts work into them or starts their conversation.
     default_chats: HashSet<CardId>,
@@ -873,10 +874,7 @@ impl State {
             ..Self::default()
         }
     }
-    pub(super) fn with_waiting_messages(
-        mut self,
-        waiting: HashMap<CardId, Vec<chat::QueuedMessage>>,
-    ) -> Self {
+    pub(super) fn with_waiting_messages(mut self, waiting: HashMap<CardId, SavedQueue>) -> Self {
         self.waiting = waiting;
         self
     }
@@ -2356,13 +2354,52 @@ enum QueuedStep {
     Prompt,
 }
 
+/// Whether the provider a conversation reconnected to accounts for a message
+/// its last one was holding: it still lists the message, by id or by the same
+/// words and files (some providers' ids only name a place in the queue), or
+/// its history shows a user message the provider delivered under that id.
+fn accounted_for(snapshot: &chat::Snapshot, message: &chat::QueuedMessage) -> bool {
+    snapshot.queued_messages.iter().any(|queued| {
+        queued.id == message.id
+            || (queued.text == message.text && queued.attachments == message.attachments)
+    }) || snapshot.items.iter().any(|item| {
+        item.role == chat::Role::User
+            && item
+                .id
+                .strip_prefix(message.id.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+    })
+}
+
 /// What came back to the composer from a provider queue that did not survive.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RestoredWaiting {
     count: usize,
     /// Whether every message came back whole; a provider lists only a
-    /// preview of a long message or of input the composer cannot hold.
+    /// preview of a long message or of input the composer cannot hold, and
+    /// may list an attachment without a file it can name.
     whole: bool,
+}
+
+impl RestoredWaiting {
+    /// What the notice beside the draft says: what came back, that it was
+    /// not sent again, and that the agent may have it anyway.
+    fn caption(self) -> String {
+        let mut text = if self.count == 1 {
+            "Back in your draft: a message that was still queued when this conversation stopped. It has not been resent; the agent may already have received it.".to_owned()
+        } else {
+            format!(
+                "Back in your draft: {} messages that were still queued when this conversation stopped. They have not been resent; the agent may already have received some of them.",
+                self.count
+            )
+        };
+        if !self.whole {
+            text.push_str(
+                " Only part of what was queued could be restored; check it before sending.",
+            );
+        }
+        text
+    }
 }
 
 const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check eligibility with cagents chat release ID --dry-run; release requires verified saved history and no protected work. Then retry. Your conversation and draft are kept.";
@@ -2856,6 +2893,15 @@ impl Runtime {
             other => self.composer.perform(other),
         }
         self.cancel_invalid_attachment_jobs();
+        self.settle_restored_notice();
+    }
+
+    /// The restored-messages notice describes the draft; once the reader
+    /// has cleared the draft away, there is nothing left for it to describe.
+    fn settle_restored_notice(&mut self) {
+        if self.attachments.is_empty() && self.composer.text().trim().is_empty() {
+            self.restored_waiting = None;
+        }
     }
 
     fn cancel_invalid_attachment_jobs(&mut self) {
@@ -3094,6 +3140,7 @@ impl Runtime {
         }
         let mut text = String::new();
         let mut attachments: Vec<Attachment> = Vec::new();
+        let mut whole = messages.iter().all(|message| message.editable);
         for message in &messages {
             let body = message.text.trim_end();
             if !body.is_empty() {
@@ -3104,9 +3151,9 @@ impl Runtime {
             }
             // A path the provider could not vouch for names no file here.
             for attachment in &message.attachments {
-                if (attachment.reference.is_some() || !attachment.path.as_os_str().is_empty())
-                    && !attachments.contains(attachment)
-                {
+                if attachment.reference.is_none() && attachment.path.as_os_str().is_empty() {
+                    whole = false;
+                } else if !attachments.contains(attachment) {
                     attachments.push(attachment.clone());
                 }
             }
@@ -3114,7 +3161,7 @@ impl Runtime {
         self.prepend_to_draft(&text, attachments);
         self.restored_waiting = Some(RestoredWaiting {
             count: messages.len(),
-            whole: messages.iter().all(|message| message.editable),
+            whole,
         });
     }
 
@@ -7403,7 +7450,7 @@ impl Cagents {
             })
             .filter_map(|state| {
                 let waiting = self.chat_waiting_to_save(state.id);
-                (!waiting.is_empty()).then_some((state.id, waiting))
+                (!waiting.messages.is_empty()).then_some((state.id, waiting))
             })
             .collect::<HashMap<_, _>>();
         let editors = self
@@ -7933,20 +7980,27 @@ impl Cagents {
 
     /// What `card`'s provider is holding, to be saved in case it does not
     /// come back: the queue saved before, until a connection settles it, then
-    /// whatever its chat runtime last heard, each message once.
-    pub(super) fn chat_waiting_to_save(&self, card: CardId) -> Vec<chat::QueuedMessage> {
-        let mut waiting = self.chat_ui.waiting.get(&card).cloned().unwrap_or_default();
+    /// whatever its chat runtime last heard, each message once, with the
+    /// daemon that hosted the provider listing them.
+    pub(super) fn chat_waiting_to_save(&self, card: CardId) -> SavedQueue {
+        let mut saved = self.chat_ui.waiting.get(&card).cloned().unwrap_or_default();
         let runtime = match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => Some(runtime.as_ref()),
             _ => self.chat_ui.parked.get(&card).map(Box::as_ref),
         };
-        for message in runtime.map(Runtime::waiting_messages).unwrap_or_default() {
-            if !waiting.iter().any(|saved| saved.id == message.id) {
-                waiting.push(message);
+        if let Some(runtime) = runtime {
+            let listed = runtime.waiting_messages();
+            if saved.messages.is_empty() && !listed.is_empty() {
+                saved.host = runtime.session.proof.clone();
+            }
+            for message in listed {
+                if !saved.messages.iter().any(|kept| kept.id == message.id) {
+                    saved.messages.push(message);
+                }
             }
         }
-        waiting.truncate(chat::QueuedMessage::LIMIT);
-        waiting
+        saved.messages.truncate(chat::QueuedMessage::LIMIT);
+        saved
     }
 
     /// Gives a new runtime for `card` the draft saved when its last one
@@ -10714,11 +10768,21 @@ impl Cagents {
                         // afresh, with none of the queue the last one held.
                         let other_daemon = attempt.session.proof.is_none()
                             || attempt.session.proof != session.proof;
-                        let mut waiting = self
+                        let saved = self
                             .chat_ui
                             .waiting
                             .remove(&target.card)
                             .unwrap_or_default();
+                        // A queue saved under an earlier daemon than the one
+                        // this conversation last connected through is older
+                        // than that connection: a build that keeps no queue
+                        // ran in between, and the queue is no longer news.
+                        let mut waiting =
+                            if saved.host.is_some() && saved.host == attempt.session.proof {
+                                saved.messages
+                            } else {
+                                Vec::new()
+                            };
                         let channel_name = self.observe_channel_name(target, &snapshot);
                         let title = channel_name.as_ref().map(|(title, _)| title.clone());
                         let activity = Activity {
@@ -10794,16 +10858,12 @@ impl Cagents {
                                 waiting.clear();
                             }
                         }
-                        // What the new provider lists is still waiting there.
-                        // The rest may never have reached the agent, or may
-                        // have just before the last one went: either way it is
-                        // the reader's to send again, edit or discard.
-                        waiting.retain(|message| {
-                            !snapshot
-                                .queued_messages
-                                .iter()
-                                .any(|queued| queued.id == message.id)
-                        });
+                        // What the new provider lists is still waiting there,
+                        // and what its history shows sent has arrived. The
+                        // rest may never have reached the agent, or may have
+                        // just before the last one went: either way it is the
+                        // reader's to send again, edit or discard.
+                        waiting.retain(|message| !accounted_for(&snapshot, message));
                         let restored_waiting = !waiting.is_empty();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.restore_waiting(waiting);
@@ -12427,11 +12487,18 @@ impl Cagents {
                 let Some(runtime) = self.chat_runtime_mut(target) else {
                     return Task::none();
                 };
+                let mut followups_sent = false;
                 let first_prompt = match result {
                     Ok(()) => {
                         if pending.followup {
+                            followups_sent = !runtime.followups.is_empty();
                             runtime.followups.clear();
                             let _ = runtime.present();
+                        }
+                        // What the notice described left with this message,
+                        // even when the reader has typed on since.
+                        if pending.draft_revision.is_some() {
+                            runtime.restored_waiting = None;
                         }
                         if pending.draft_revision == Some(runtime.revision) {
                             runtime.replace_draft(text_editor::Content::new());
@@ -12460,6 +12527,9 @@ impl Cagents {
                                 runtime.find_navigation.document_epoch(),
                             )
                             .map(cosmic::Action::App);
+                            if followups_sent {
+                                self.persist();
+                            }
                             return Task::batch([
                                 snap,
                                 self.dispatch_queued(target),
@@ -12490,6 +12560,11 @@ impl Cagents {
                         None
                     }
                 };
+                // Sent follow-ups were saved with the draft, so a restart
+                // before the next save would offer them to send again.
+                if followups_sent {
+                    self.persist();
+                }
                 if let Some(prompt) = first_prompt {
                     self.name_channel_from_prompt(target.card, &prompt);
                 }
@@ -13228,6 +13303,7 @@ impl Cagents {
                         runtime.attachments.remove(index);
                         runtime.thumbnails.sync(&runtime.attachments);
                         runtime.revision = runtime.revision.wrapping_add(1);
+                        runtime.settle_restored_notice();
                     }
                 }
             }
@@ -23228,12 +23304,40 @@ mod tests {
         assert_eq!(attempt.session, source);
     }
 
-    /// A saved chat whose provider queue was saved, reopened by `daemon`, with
-    /// the reopened provider listing `listed`.
+    fn daemon_proof(daemon: &str) -> crate::model::HostSessionProof {
+        crate::model::HostSessionProof {
+            host_session_id: format!("{daemon}-host").into(),
+            boot_id: format!("{daemon}-boot").into(),
+            host_incarnation: format!("{daemon}-incarnation").into(),
+        }
+    }
+
+    /// A saved chat last connected through `daemon`, whose provider queue was
+    /// saved there, reopened by the fixture daemon with its provider listing
+    /// `listed`.
     fn reopen_with_saved_queue(
         daemon: &str,
         waiting: Vec<chat::QueuedMessage>,
         listed: Vec<chat::QueuedMessage>,
+    ) -> (Cagents, CardId) {
+        reopen_with(
+            daemon,
+            daemon,
+            waiting,
+            Snapshot {
+                queued_messages: listed,
+                ..Snapshot::default()
+            },
+        )
+    }
+
+    /// As [`reopen_with_saved_queue`], with the queue saved under
+    /// `queue_daemon` and the reopened provider showing `reopened`.
+    fn reopen_with(
+        daemon: &str,
+        queue_daemon: &str,
+        waiting: Vec<chat::QueuedMessage>,
+        reopened: Snapshot,
     ) -> (Cagents, CardId) {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let mut session = chat::fresh_session(
@@ -23244,22 +23348,20 @@ mod tests {
         )
         .unwrap();
         session.launch.session_id = Some("f0e49307-af96-4edd-b23f-60b185fe4fea".into());
-        session.proof = Some(crate::model::HostSessionProof {
-            host_session_id: format!("{daemon}-host").into(),
-            boot_id: format!("{daemon}-boot").into(),
-            host_incarnation: format!("{daemon}-incarnation").into(),
-        });
+        session.proof = Some(daemon_proof(daemon));
         drop(app.insert_chat_card(session.clone(), None, None));
         let card = app.workspace.focused().unwrap();
         app.chat_ui.drafts.insert(card, "typed after".into());
-        app.chat_ui.waiting.insert(card, waiting);
+        app.chat_ui.waiting.insert(
+            card,
+            SavedQueue {
+                host: Some(daemon_proof(queue_daemon)),
+                messages: waiting,
+            },
+        );
         let target = chat_runtime_attempt(&app, card);
         // The fixture daemon is "fixture"; the saved session names `daemon`.
-        session.proof = Some(crate::model::HostSessionProof {
-            host_session_id: "fixture-host".into(),
-            boot_id: "fixture-boot".into(),
-            host_incarnation: "fixture-incarnation".into(),
-        });
+        session.proof = Some(daemon_proof("fixture"));
         answer_start(
             &mut app,
             target,
@@ -23268,8 +23370,7 @@ mod tests {
                 Snapshot {
                     ready: true,
                     session_id: session.launch.session_id.clone(),
-                    queued_messages: listed,
-                    ..Snapshot::default()
+                    ..reopened
                 },
             ))),
         );
@@ -23319,22 +23420,71 @@ mod tests {
             saved.chat_draft_attachments.get(&card).unwrap(),
             &[Attachment::file("/project/notes.txt")]
         );
-        // Sending the draft or dismissing the notice puts it away.
+        // Dismissing the notice puts it away and keeps the draft.
         let target = chat_runtime(&app, card).target;
         drop(app.handle_chat_ui(Action::DismissRestoredWaiting(target)));
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.restored_waiting, None);
+        assert_eq!(
+            runtime.composer.text().trim(),
+            "Then run the tests\nAnd summarize\ntyped after"
+        );
+    }
+
+    /// The notice describes the draft, so it goes when the draft does: sent,
+    /// even while the reader types on, or cleared away by hand.
+    #[test]
+    fn the_restored_notice_leaves_with_the_draft_it_describes() {
+        let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
+        let target = chat_runtime(&app, card).target;
+        drop(app.handle_chat_ui(Action::Submit(target, PromptMode::Send)));
+        assert!(chat_runtime(&app, card).pending.is_some());
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .composer_action(text_editor::Action::Edit(text_editor::Edit::Insert('!')));
+        assert!(chat_runtime(&app, card).restored_waiting.is_some());
+        settle(&mut app, card, Ok(()));
+        assert_eq!(chat_runtime(&app, card).restored_waiting, None);
+
+        let (mut app, card) = reopen_with_saved_queue("old", saved_queue(), vec![]);
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.composer_action(text_editor::Action::SelectAll);
+        runtime.composer_action(text_editor::Action::Edit(text_editor::Edit::Backspace));
+        // The file is still there, and so is what the notice says about it.
+        assert!(runtime.restored_waiting.is_some());
+        drop(app.handle_chat_ui(Action::RemoveAttachment(target, 0)));
         assert_eq!(chat_runtime(&app, card).restored_waiting, None);
     }
 
-    /// A message the reopened provider still lists is waiting there, and only
-    /// the rest comes back; one listed only in preview says so.
+    /// The notice says what it can promise: nothing was resent, and the agent
+    /// may have the message anyway; and when only part came back, that too.
     #[test]
-    fn a_queue_the_new_provider_still_lists_stays_with_the_provider() {
-        let mut queue = saved_queue();
-        queue[1].editable = false;
-        let still = queue[0].clone();
-        let (app, card) = reopen_with_saved_queue("old", queue, vec![still]);
+    fn the_restored_notice_says_nothing_was_resent_and_what_is_missing() {
+        assert_eq!(
+            RestoredWaiting {
+                count: 1,
+                whole: true
+            }
+            .caption(),
+            "Back in your draft: a message that was still queued when this conversation stopped. It has not been resent; the agent may already have received it."
+        );
+        assert_eq!(
+            RestoredWaiting {
+                count: 3,
+                whole: false
+            }
+            .caption(),
+            "Back in your draft: 3 messages that were still queued when this conversation stopped. They have not been resent; the agent may already have received some of them. Only part of what was queued could be restored; check it before sending."
+        );
+        // An attachment listed without a file it can name is part missing.
+        let mut message = provider_message("queued-1", "Look at this");
+        message.attachments = vec![Attachment {
+            path: PathBuf::new(),
+            reference: None,
+        }];
+        let (app, card) = reopen_with_saved_queue("old", vec![message], vec![]);
         let runtime = chat_runtime(&app, card);
-        assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
         assert!(runtime.attachments.is_empty());
         assert_eq!(
             runtime.restored_waiting,
@@ -23342,6 +23492,84 @@ mod tests {
                 count: 1,
                 whole: false
             })
+        );
+    }
+
+    /// A message the reopened provider still lists is waiting there, and only
+    /// the rest comes back; one listed only in preview says so. A provider
+    /// whose ids only number places in its queue is matched by the message.
+    #[test]
+    fn a_queue_the_new_provider_still_lists_stays_with_the_provider() {
+        for renumbered in [false, true] {
+            let mut queue = saved_queue();
+            queue[1].editable = false;
+            let mut still = queue[0].clone();
+            if renumbered {
+                still.id = "queued-2".into();
+            }
+            let (app, card) = reopen_with_saved_queue("old", queue, vec![still]);
+            let runtime = chat_runtime(&app, card);
+            if renumbered {
+                // Its old place now holds the other message, which may have
+                // been delivered; nothing is resurrected that is listed.
+                assert_eq!(runtime.composer.text().trim(), "typed after");
+                assert_eq!(runtime.restored_waiting, None);
+                continue;
+            }
+            assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
+            assert!(runtime.attachments.is_empty());
+            assert_eq!(
+                runtime.restored_waiting,
+                Some(RestoredWaiting {
+                    count: 1,
+                    whole: false
+                })
+            );
+        }
+    }
+
+    /// A message the reopened provider's history shows it was given arrived,
+    /// so only what has no trace there comes back.
+    #[test]
+    fn a_message_the_history_shows_delivered_is_not_restored() {
+        let (app, card) = reopen_with(
+            "old",
+            "old",
+            saved_queue(),
+            Snapshot {
+                items: vec![Arc::new(chat::Item {
+                    id: "queued-1:0".into(),
+                    role: chat::Role::User,
+                    at: None,
+                    started_at: None,
+                    content: ItemContent::Text {
+                        text: "Then run the tests".into(),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                })],
+                ..Snapshot::default()
+            },
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
+        assert!(runtime.attachments.is_empty());
+        assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(1));
+    }
+
+    /// A queue saved under an earlier daemon than the one the conversation
+    /// last connected through outlived a build that keeps none, which ran in
+    /// between; what it lists is long settled and does not come back.
+    #[test]
+    fn a_queue_an_earlier_daemon_saved_is_not_restored() {
+        let (mut app, card) = reopen_with("old", "older", saved_queue(), Snapshot::default());
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.composer.text().trim(), "typed after");
+        assert_eq!(runtime.restored_waiting, None);
+        assert!(
+            !app.persistent_workspace()
+                .chat_waiting_messages
+                .contains_key(&card)
         );
     }
 
@@ -23368,12 +23596,13 @@ mod tests {
     fn a_provider_queue_is_saved_while_it_holds_messages() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let (card, target, handle) = provider_queue(&mut app, saved_queue());
+        // Saved with the daemon whose provider holds it.
         assert_eq!(
-            app.persistent_workspace()
-                .chat_waiting_messages
-                .get(&card)
-                .unwrap(),
-            &saved_queue()
+            app.persistent_workspace().chat_waiting_messages.get(&card),
+            Some(&SavedQueue {
+                host: Some(daemon_proof("fixture")),
+                messages: saved_queue(),
+            })
         );
         // The provider's next publication is saved when it arrives.
         let mut snapshot = (*handle.snapshot()).clone();
@@ -23387,10 +23616,7 @@ mod tests {
             saves + 1
         );
         assert_eq!(
-            app.persistent_workspace()
-                .chat_waiting_messages
-                .get(&card)
-                .unwrap(),
+            app.persistent_workspace().chat_waiting_messages[&card].messages,
             &saved_queue()[1..]
         );
         // A publication that leaves the queue as it was saves nothing more.
@@ -23427,6 +23653,147 @@ mod tests {
         let (draft, attachments) = runtime.persistent_draft();
         assert_eq!(draft.trim(), "first task\nsecond task\nstill typing");
         assert_eq!(attachments, [Attachment::file("/project/a.txt")]);
+    }
+
+    /// Once the provider has taken held follow-ups they are saved without
+    /// them at once, so a restart cannot offer them to be sent again.
+    #[test]
+    fn sent_followups_leave_the_saved_draft_when_the_provider_takes_them() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("followup"));
+        let target = chat_runtime(&app, card).target;
+        let runtime = app.chat_runtime_mut(target).unwrap();
+        runtime.followups.push(followup(0, "first task", &[]));
+        runtime.replace_draft(text_editor::Content::with_text("still typing"));
+        drop(app.dispatch_queued(target));
+        assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
+        let saves = crate::app::terminal_output_tests::persist_count();
+        settle(&mut app, card, Ok(()));
+        assert!(crate::app::terminal_output_tests::persist_count() > saves);
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&card)
+                .map(|draft| draft.trim()),
+            Some("still typing")
+        );
+    }
+
+    /// A conversation parked for a terminal handoff refreshes no snapshot of
+    /// its own, yet what its provider holds is saved as it changes.
+    #[test]
+    fn a_parked_conversation_saves_its_provider_queue_as_it_changes() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target, handle) = provider_queue(&mut app, saved_queue());
+        let Some(CardRuntime::Chat(runtime)) = app.cards.remove(&card) else {
+            panic!("chat runtime");
+        };
+        let mut runtime = runtime;
+        runtime.parked_queue = saved_queue()
+            .into_iter()
+            .map(|message| message.id)
+            .collect();
+        app.chat_ui.parked.insert(card, runtime);
+        assert_eq!(
+            app.persistent_workspace().chat_waiting_messages[&card].messages,
+            saved_queue()
+        );
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.queued_messages.remove(0);
+        snapshot.generation += 1;
+        handle.publish_snapshot_for_test(snapshot);
+        let saves = crate::app::terminal_output_tests::persist_count();
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(
+            crate::app::terminal_output_tests::persist_count(),
+            saves + 1
+        );
+        assert_eq!(
+            app.persistent_workspace().chat_waiting_messages[&card].messages,
+            &saved_queue()[1..]
+        );
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        assert_eq!(
+            crate::app::terminal_output_tests::persist_count(),
+            saves + 1
+        );
+    }
+
+    /// An open conversation whose daemon went away, or whose provider ended,
+    /// gets back on reconnecting what that provider was holding; one that
+    /// reconnects to the provider that still holds it gets nothing back.
+    #[test]
+    fn an_open_conversation_reconnecting_gets_back_what_its_lost_provider_held() {
+        for (daemon, ended, restored) in [
+            ("old", false, true),
+            ("fixture", true, true),
+            ("fixture", false, false),
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target, handle) = history_fixture_for_provider(&mut app, Provider::Claude);
+            let mut snapshot = (*handle.snapshot()).clone();
+            snapshot.queued_messages = saved_queue();
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            app.chat_runtime_mut(target)
+                .unwrap()
+                .replace_draft(text_editor::Content::with_text("typed after"));
+            let mut snapshot = (*handle.snapshot()).clone();
+            if ended {
+                snapshot.exited = true;
+            }
+            snapshot.generation += 1;
+            handle.publish_snapshot_for_test(snapshot);
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.refresh();
+            runtime.disconnected = !ended;
+            // The fixture daemon answers the reconnection; this conversation
+            // last connected through `daemon`.
+            runtime.session.proof = Some(daemon_proof(daemon));
+            drop(app.handle_chat_ui(Action::Reconnect(target)));
+            let attempt = chat_runtime_attempt(&app, card);
+            let session = app.chat_ui.attempt(card).unwrap().session.clone();
+            let session_id = session.launch.session_id.clone();
+            answer_start(
+                &mut app,
+                attempt,
+                Ok(Arc::new(ClientHandle::fixture(
+                    session,
+                    Snapshot {
+                        ready: true,
+                        session_id,
+                        ..Snapshot::default()
+                    },
+                ))),
+            );
+            let runtime = chat_runtime(&app, card);
+            assert!(
+                app.chat_ui.attempt(card).is_none()
+                    && runtime.session.proof == Some(daemon_proof("fixture")),
+                "{daemon} ended={ended}: the new connection was not taken (attempt {:?}, proof {:?}, status {:?}, error {:?}, disconnected {}, live {})",
+                app.chat_ui.attempt(card).map(|attempt| attempt.intent),
+                runtime.session.proof,
+                app.status,
+                runtime.error,
+                runtime.disconnected,
+                runtime.handle().is_some(),
+            );
+            if restored {
+                assert_eq!(
+                    runtime.composer.text().trim(),
+                    "Then run the tests\nAnd summarize\ntyped after",
+                    "{daemon} ended={ended}"
+                );
+                assert_eq!(
+                    runtime.attachments,
+                    [Attachment::file("/project/notes.txt")]
+                );
+                assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(2));
+            } else {
+                assert_eq!(runtime.composer.text().trim(), "typed after");
+                assert_eq!(runtime.restored_waiting, None);
+            }
+        }
     }
 
     /// Every state a stopped or disconnected card can be in names its action

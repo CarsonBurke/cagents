@@ -272,7 +272,7 @@ pub struct WorkspaceManifest {
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
-    pub chat_waiting_messages: HashMap<CardId, Vec<crate::chat::QueuedMessage>>,
+    pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -4004,12 +4004,11 @@ fn save_workspace_transaction(
     let waiting = state
         .chat_waiting_messages
         .iter()
-        .filter(|(id, messages)| !messages.is_empty() && open_chats.contains_key(id))
-        .map(|(id, messages)| {
-            (
-                *id,
-                &messages[..messages.len().min(crate::chat::QueuedMessage::LIMIT)],
-            )
+        .filter(|(id, queue)| !queue.messages.is_empty() && open_chats.contains_key(id))
+        .map(|(id, queue)| {
+            let mut queue = queue.clone();
+            queue.messages.truncate(crate::chat::QueuedMessage::LIMIT);
+            (*id, queue)
         })
         .collect::<HashMap<_, _>>();
     set_metadata(
@@ -7719,13 +7718,19 @@ mod tests {
         let mut message =
             crate::chat::QueuedMessage::new("queued-1".into(), "Then run the tests".into());
         message.attachments = vec![crate::chat::Attachment::file("/project/notes.txt")];
-        workspace
-            .chat_waiting_messages
-            .insert(chat, vec![message.clone()]);
+        let queue = crate::model::SavedQueue {
+            host: Some(HostSessionProof {
+                host_session_id: "daemon".into(),
+                boot_id: "chat-boot".into(),
+                host_incarnation: "1".into(),
+            }),
+            messages: vec![message],
+        };
+        workspace.chat_waiting_messages.insert(chat, queue.clone());
         // A card this workspace no longer holds keeps nothing.
         workspace
             .chat_waiting_messages
-            .insert(CardId::new(), vec![message.clone()]);
+            .insert(CardId::new(), queue.clone());
         SaveLane::default().save(&store, &workspace).unwrap();
         drop(store);
         let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
@@ -7733,10 +7738,7 @@ mod tests {
             .load_workspace(workspace.id, None)
             .unwrap()
             .unwrap();
-        assert_eq!(
-            saved.chat_waiting_messages,
-            HashMap::from([(chat, vec![message])])
-        );
+        assert_eq!(saved.chat_waiting_messages, HashMap::from([(chat, queue)]));
         reopened
             .lock_inner()
             .unwrap()

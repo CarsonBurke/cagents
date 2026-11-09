@@ -4681,31 +4681,11 @@ impl Runtime {
         }
     }
 
-    /// The messages waiting to be sent, docked on the composer.
-    ///
-    /// One list whoever holds a message - the provider's own queue or this
-    /// chat, for a provider without one - because a reader asks the same of
-    /// each: what is waiting, when it goes, and how to change their mind. A
-    /// row is a glance rather than the message, so the list stays a list at
-    /// a hundred entries; revising one takes it back into the composer, the
-    /// one place that edits text and files.
     /// Says, where the queue was, that what a provider which did not come
     /// back was holding is now the reader's draft, and was not sent again.
     fn restored_waiting_notice(&self) -> Option<Element<'_, Message>> {
         let restored = self.restored_waiting?;
-        let mut text = if restored.count == 1 {
-            "Back in your draft: a message that was still queued when this conversation stopped. Nothing was sent again; the agent may already have received it.".to_owned()
-        } else {
-            format!(
-                "Back in your draft: {} messages that were still queued when this conversation stopped. Nothing was sent again; the agent may already have received some of them.",
-                restored.count
-            )
-        };
-        if !restored.whole {
-            text.push_str(
-                " Only part of what was queued could be restored; check it before sending.",
-            );
-        }
+        let text = restored.caption();
         Some(
             widget::container(
                 widget::row::with_children(vec![
@@ -4731,6 +4711,14 @@ impl Runtime {
         )
     }
 
+    /// The messages waiting to be sent, docked on the composer.
+    ///
+    /// One list whoever holds a message - the provider's own queue or this
+    /// chat, for a provider without one - because a reader asks the same of
+    /// each: what is waiting, when it goes, and how to change their mind. A
+    /// row is a glance rather than the message, so the list stays a list at
+    /// a hundred entries; revising one takes it back into the composer, the
+    /// one place that edits text and files.
     fn queue_view(&self) -> Option<Element<'_, Message>> {
         let target = self.target;
         let caps = &self.snapshot.capabilities;
