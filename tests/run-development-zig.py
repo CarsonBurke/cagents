@@ -597,6 +597,27 @@ exit 83
         self.assertEqual(words[program + 1:program + 3], ["--name", "cagents-ui"])
         self.assertTrue(words[program + 3].endswith("/cagents-ui"), words)
 
+    def test_an_instance_daemon_log_is_chosen_by_the_flag_alone(self):
+        started = self.root / "started"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(
+            '#!/bin/sh\ncase " $* " in *" start "*) printf "%s|%s\\n" '
+            f'"${{CAGENTS_DEVELOPMENT_DAEMON_LOG-unset}}" "${{CAGENTS_LOCAL_DEBUG-unset}}" >"{started}" ;;'
+            ' *) exit 1 ;; esac\n'
+        )
+        harness.chmod(0o755)
+        caller = self.root / "caller"
+        caller.mkdir()
+        result = subprocess.run(
+            [str(self.runner), "--browserless", "--instance", "logged", "--daemon-log", "daemon.log"],
+            cwd=caller, env=self.env, capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(started.read_text(), f"{caller / 'daemon.log'}|1\n")
+        self.launch("--browserless", "--instance", "unlogged",
+                    CAGENTS_DEVELOPMENT_DAEMON_LOG="/inherited.log")
+        self.assertEqual(started.read_text(), "unset|unset\n")
+
     def test_the_memory_limit_speaks_to_the_terminal_and_the_app_to_the_log(self):
         limit = self.runner.with_name("memory-capped")
         limit.write_text('#!/bin/sh\nshift 2\n"$@"\necho limit-message >&2\n')
