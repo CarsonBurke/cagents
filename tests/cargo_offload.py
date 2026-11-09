@@ -65,8 +65,7 @@ def setUpModule():
     `cof`, where the build host's agent puts each slot's temporary files by
     default: the one this environment names, and the login session's, which
     the loopback gives the agent. A test's agent keeps them in its own
-    directory through CAGENTS_OFFLOAD_TEMPORARY_ROOT. A build on this host
-    using a slot for the first time also adds one."""
+    directory through CAGENTS_OFFLOAD_TEMPORARY_ROOT."""
     roots = {Path(os.environ.get("XDG_RUNTIME_DIR") or f"/run/user/{os.getuid()}", "cof"),
              Path(f"/run/user/{os.getuid()}", "cof")}
 
@@ -75,11 +74,22 @@ def setUpModule():
             return {path.name for path in root.iterdir()}
         return set()
 
+    def real_slots(root):
+        """The names this host's own slots take there: a build using a slot
+        for the first time while the suite runs adds one."""
+        temporary_directory = agent_function("temporary_directory")
+        with patch.dict(os.environ, {"CAGENTS_OFFLOAD_TEMPORARY_ROOT": str(root)}):
+            return {os.path.basename(temporary_directory(str(slot))) for slot in
+                    Path("~/.cache/cagents-offload").expanduser().glob("*/slot-*")}
+
     before = {root: names(root) for root in roots}
 
     def unchanged():
-        left = {str(root): sorted(names(root) - known) for root, known in before.items()}
-        left = {root: entries for root, entries in left.items() if entries}
+        left = {}
+        for root, known in before.items():
+            if new := names(root) - known:
+                if new := new - real_slots(root):
+                    left[str(root)] = sorted(new)
         if left:
             raise AssertionError(f"the tests left temporary directories outside their own: {left}")
     unittest.addModuleCleanup(unchanged)
@@ -280,10 +290,13 @@ class RemoteCommand(unittest.TestCase):
 
 
 def agent_function(name):
+    """The build host's agent's top-level function `name`, on its own, with
+    the modules its functions use."""
+    import hashlib, stat
     tree = ast.parse(offload.REMOTE_AGENT)
     function = next(node for node in tree.body
                     if isinstance(node, ast.FunctionDef) and node.name == name)
-    scope = {"os": os}
+    scope = {"os": os, "hashlib": hashlib, "shutil": shutil, "stat": stat, "sys": sys}
     exec(compile(ast.Module([function], []), "agent", "exec"), scope)
     return scope[name]
 
@@ -531,30 +544,22 @@ class SharedConnection(unittest.TestCase):
 
 class EnclosingCheckout(unittest.TestCase):
     def test_a_git_marker_in_any_ancestor_is_found(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "enclosing_checkout")
-        scope = {"os": os}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        enclosing_checkout = agent_function("enclosing_checkout")
         with tempfile.TemporaryDirectory() as root:
             deep = Path(root, "a", "b", "c")
             deep.mkdir(parents=True)
-            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            self.assertIsNone(enclosing_checkout(str(deep)))
             Path(root, "a", ".git").mkdir()
-            self.assertEqual(scope["enclosing_checkout"](str(deep)), str(Path(root, "a", ".git")))
+            self.assertEqual(enclosing_checkout(str(deep)), str(Path(root, "a", ".git")))
             # The directory itself is not its own ancestor.
             Path(root, "a", ".git").rmdir()
             Path(deep, ".git").write_text("gitdir: x")
-            self.assertIsNone(scope["enclosing_checkout"](str(deep)))
+            self.assertIsNone(enclosing_checkout(str(deep)))
 
 
 class Clear(unittest.TestCase):
     def test_directories_left_without_permissions_are_removed(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "clear")
-        scope = {"os": os, "shutil": shutil, "sys": sys}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
+        clear = agent_function("clear")
         with tempfile.TemporaryDirectory() as root:
             locked = Path(root, "t", "a", "target")
             (locked / "deep").mkdir(parents=True)
@@ -564,7 +569,7 @@ class Clear(unittest.TestCase):
             locked.chmod(0)
             Path(root, "t").chmod(0)
             Path(root).chmod(0o755)
-            scope["clear"](str(Path(root, "t")))
+            clear(str(Path(root, "t")))
             self.assertFalse(Path(root, "t").exists())
             # Outside the tree, nothing changed.
             self.assertEqual(Path(root).stat().st_mode & 0o777, 0o755)
@@ -572,13 +577,7 @@ class Clear(unittest.TestCase):
 
 class TemporaryDirectory(unittest.TestCase):
     def scope(self):
-        tree = ast.parse(offload.REMOTE_AGENT)
-        function = next(node for node in tree.body
-                        if isinstance(node, ast.FunctionDef) and node.name == "temporary_directory")
-        import hashlib, stat
-        scope = {"os": os, "stat": stat, "hashlib": hashlib}
-        exec(compile(ast.Module([function], []), "agent", "exec"), scope)
-        return scope["temporary_directory"]
+        return agent_function("temporary_directory")
 
     def test_the_base_stays_within_the_fixtures_budget(self):
         temporary_directory = self.scope()
@@ -1483,13 +1482,15 @@ class StandInHost(unittest.TestCase):
         # The program's $CARGO is the first `cargo` on this host's PATH. A
         # shim such as mise's, outside a directory where it manages Rust,
         # looks `cargo` up on PATH again, finds the gate's and builds on the
-        # build host, so nothing reaches the guard. rustup's Cargo, as on the
-        # build host, compiles here.
-        cargo = str(Path(self.env["CARGO_HOME"], "bin", "cargo"))
+        # build host, so nothing reaches the guard. rustup's Cargo, first
+        # here as on the build host, compiles here.
+        cargo = os.path.join(self.env["CARGO_HOME"], "bin", "cargo")
+        env = self.remote_env() | self.logging_rustc_wrapper()
+        env["PATH"] = os.pathsep.join([os.path.dirname(cargo), env["PATH"]])
         result = self.gate_run(
             "exec", "cargo", "run", "--quiet", "--", "-ec",
             '"$RUSTC_WRAPPER" rustc -vV >/dev/null; printf %s "$CARGO"; "$CARGO" build --bin probe',
-            env=self.remote_env() | self.logging_rustc_wrapper() | {"CAGENTS_BUILD_CARGO": cargo})
+            env=env)
         self.assertEqual(result.stdout, cargo, result.stderr)
         self.assertNotEqual(result.returncode, 0, result.stderr)
         self.assertIn("would compile on this host", result.stderr)
