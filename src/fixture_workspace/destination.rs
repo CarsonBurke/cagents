@@ -168,13 +168,24 @@ impl Destination {
                     store.display()
                 ));
             }
-            for suffix in ["-wal", "-shm", "-journal"] {
+            // Closed stores leave a WAL folded back into the database and
+            // truncated, and its index. Anything else is unwritten data.
+            let wal = with_suffix(&staging, "-wal");
+            if std::fs::metadata(&wal).is_ok_and(|metadata| metadata.len() > 0)
+                || with_suffix(&staging, "-journal").exists()
+            {
+                return Err(format!(
+                    "{} is not checkpointed: the seed did not close its store",
+                    staging.display()
+                ));
+            }
+            for suffix in ["-wal", "-shm"] {
                 let sidecar = with_suffix(&staging, suffix);
-                if sidecar.exists() {
-                    return Err(format!(
-                        "{} is still open: the seed did not close its store",
-                        sidecar.display()
-                    ));
+                match std::fs::remove_file(&sidecar) {
+                    Err(error) if error.kind() != io::ErrorKind::NotFound => {
+                        return Err(format!("Cannot remove {}: {error}", sidecar.display()));
+                    }
+                    _ => {}
                 }
             }
             std::fs::rename(&staging, &store)
@@ -355,8 +366,10 @@ mod tests {
     }
 
     fn seed(plan: &Plan, part: Part, directories: &Directories) -> Result<(), String> {
-        Destination::claim(plan, part, directories.clone())?
-            .write(|path| std::fs::write(path, b"store").map_err(|error| error.to_string()))
+        Destination::claim(plan, part, directories.clone())?.write(|path| {
+            std::fs::create_dir_all(path.parent().unwrap()).map_err(|error| error.to_string())?;
+            std::fs::write(path, b"store").map_err(|error| error.to_string())
+        })
     }
 
     #[test]
