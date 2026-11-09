@@ -237,7 +237,7 @@ if [ -n "$prune" ] && open7 "$state"; then
                     trimming=$!
                 else
                     (
-                        exec </dev/null >"$pruner_state.slots.log" 2>&1 7>&-
+                        exec </dev/null >>"$pruner_state.slots.log" 2>&1 7>&-
                         eval "exec $offload --trim-slots $floor"
                     ) &
                 fi
