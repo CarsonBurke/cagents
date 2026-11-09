@@ -1,0 +1,459 @@
+#!/usr/bin/python3
+"""Observe gh's HTTP traffic without adding requests or changing its arguments."""
+import argparse
+import collections
+import datetime
+import email.utils
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import statistics
+import tempfile
+import sys
+import time
+from urllib.parse import urlsplit
+
+HEADERS = {"date", "age", "x-gh-cache-status", "x-from-cache", "retry-after", "x-ratelimit-limit", "x-ratelimit-remaining", "x-ratelimit-reset", "x-ratelimit-resource", "x-ratelimit-used", "x-github-request-id"}
+MAX_BODY = 1024 * 1024
+
+
+def state_dir():
+    return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local/state"))) / "cagents/gh-observe"
+
+
+def stamp():
+    return datetime.datetime.now(datetime.timezone.utc).isoformat(timespec="milliseconds")
+
+
+def append(record):
+    """One bounded append per event, safe among unrelated processes; fail open."""
+    try:
+        root = state_dir()
+        root.mkdir(parents=True, mode=0o700, exist_ok=True)
+        path = root / (datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d") + ".jsonl")
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC, 0o600)
+        try:
+            os.write(fd, (json.dumps(record, separators=(",", ":")) + "\n").encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        pass
+
+
+def ancestry():
+    result = []
+    pid = os.getppid()
+    for _ in range(12):
+        if pid <= 1:
+            break
+        try:
+            root = Path("/proc") / str(pid)
+            stat = (root / "stat").read_text()
+            end = stat.rfind(")")
+            comm = stat[stat.find("(") + 1:end]
+            fields = stat[end + 2:].split()
+            exe = os.readlink(root / "exe")
+            result.append({"pid": pid, "comm": comm, "exe": exe, "start_ticks": fields[19]})
+            pid = int(fields[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return result
+
+
+def command_name(args):
+    # Options can contain tokens, bodies, file paths or queries. Never log argv.
+    words = []
+    for arg in args:
+        if arg.startswith("-") or not re.fullmatch(r"[a-z][a-z-]*", arg):
+            break
+        words.append(arg)
+        if len(words) == 2:
+            break
+    return " ".join(words) or "gh"
+
+
+def context(args):
+    chain = ancestry()
+    caller = next((p for p in chain if p["comm"] in {"claude", "codex", "node"}), None)
+    if caller is None:
+        caller = next((p for p in chain if Path(p["exe"].removesuffix(" (deleted)")).name in {"cagents", "cagents-ui", "ceditor"} or p["comm"] == "cagentsd"), chain[0] if chain else {})
+    # Only UUID-shaped identifiers; never copy authority or arbitrary env values.
+    sessions = {key: value for key, value in os.environ.items() if key in {"CAGENTS_SESSION_ID", "CAGENTS_CHANNEL_ID", "CODEX_THREAD_ID", "CLAUDE_SESSION_ID"} and re.fullmatch(r"[a-fA-F0-9-]{32,36}", value)}
+    metadata = {"invocation": f"{os.getpid()}-{time.time_ns()}", "command": command_name(args), "caller": caller, "ancestors": chain, "sessions": sessions}
+    # Some gh versions redact request bodies. Already supplied queries can
+    # still be grouped without retaining their text or adding a network call.
+    for index, arg in enumerate(args):
+        field = arg[2:] if arg.startswith(("-fquery=", "-Fquery=")) else arg
+        if field.startswith("query=") and index and (args[index - 1] in {"-f", "-F", "--field", "--raw-field"} or field != arg):
+            metadata.update(operation(field[6:]))
+    return metadata
+
+
+def operation(query):
+    # Hash the field shape, removing argument values and comments.
+    query = re.sub(r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"', '""', query)
+    query = re.sub(r"#[^\n]*", "", query)
+    query = re.sub(r"\b\d+\b", "0", query)
+    name = re.search(r"(?:^|})\s*(query|mutation|subscription)(?:\s+([A-Za-z_][A-Za-z_0-9]*))?", query)
+    kind = name.group(1) if name else "query"
+    normalized = re.sub(r"\s+", "", query)
+    return {"graphql_kind": kind, "operation": (name.group(2) if name else None) or "anonymous", "shape": hashlib.sha256(normalized.encode()).hexdigest()[:16]}
+
+
+def safe_endpoint(target):
+    url = urlsplit(target)
+    path = url.path
+    # No URL query values (search terms, credentials); path only, bounded.
+    if not re.fullmatch(r"/[A-Za-z0-9_./%~:@+-]*", path):
+        path = "<redacted>"
+    return {"host": url.hostname, "path": path[:512]}
+
+
+class Traffic:
+    def __init__(self, metadata, emit=append):
+        self.metadata = metadata
+        self.emit = emit
+        self.current = None
+        self.phase = None
+        self.body = bytearray()
+        self.body_truncated = False
+
+    def body_info(self):
+        if self.body_truncated:
+            return
+        if self.phase == "request_body" and self.body.lstrip().startswith(b"GraphQL query:\n"):
+            text = self.body.decode(errors="replace").lstrip()[len("GraphQL query:\n"):]
+            query, marker, _ = text.partition("\nGraphQL variables:")
+            if marker:
+                self.current.update(operation(query))
+                self.current["request_body_parseable"] = True
+                return
+        try:
+            body = json.loads(self.body)
+        except (ValueError, UnicodeDecodeError):
+            if self.phase == "request_body":
+                self.current["request_body_parseable"] = False
+                self.current["request_body_bytes"] = len(self.body)
+            return
+        if self.phase == "request_body":
+            self.current["request_body_parseable"] = True
+        if self.phase == "request_body" and isinstance(body, dict) and isinstance(body.get("query"), str):
+            self.current.update(operation(body["query"]))
+        if self.phase == "response_body" and isinstance(body, dict):
+            limit = (body.get("data") or {}).get("rateLimit") if isinstance(body.get("data"), dict) else None
+            if isinstance(limit, dict) and type(limit.get("cost")) is int:
+                self.current["primary_cost"] = limit["cost"]
+            errors = body.get("errors")
+            if isinstance(errors, list) and errors:
+                self.current["graphql_errors"] = len(errors)
+                self.current["rate_limited"] = any(isinstance(e, dict) and (e.get("type") == "RATE_LIMITED" or re.search(r"rate limit|secondary rate|abuse", str(e.get("message", "")), re.I)) for e in errors)
+                self.current["error_types"] = sorted({e["type"] for e in errors if isinstance(e, dict) and e.get("type") in {"RATE_LIMITED", "FORBIDDEN", "NOT_FOUND", "UNAUTHORIZED", "INTERNAL", "SERVICE_UNAVAILABLE"}})
+            message = body.get("message")
+            if isinstance(message, str) and re.search(r"rate limit|secondary rate|abuse", message, re.I):
+                self.current["rate_limited"] = True
+
+    def finish(self, incomplete=False):
+        if self.current is None:
+            return
+        self.body_info()
+        is_graphql = self.current.get("path") in {"/graphql", "/api/graphql"}
+        if not is_graphql:
+            self.current["primary_cost"] = 0 if self.current.get("status") == 304 else None
+        try:
+            server_time = email.utils.parsedate_to_datetime(self.current["headers"]["date"]).timestamp()
+            request_time = datetime.datetime.fromisoformat(self.current["timestamp"]).timestamp()
+            self.current["cached_response"] = bool(self.current.get("request_cache_ttl") and server_time < request_time - 60)
+        except (KeyError, ValueError, TypeError, OverflowError):
+            pass
+        mutation = self.current.get("graphql_kind") == "mutation"
+        read = self.current.get("method") in {"GET", "HEAD", "OPTIONS"} or (is_graphql and not mutation)
+        self.current["secondary_points_estimate"] = 1 if read else 5
+        self.current["incomplete"] = incomplete
+        self.emit({**self.metadata, **self.current, "event": "request"})
+        self.current = None
+        self.phase = None
+        self.body.clear()
+        self.body_truncated = False
+
+    def feed(self, line):
+        """Return True for injected debug lines, False for ordinary stderr."""
+        parsed = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", line)
+        clean = parsed.rstrip(b"\r\n")
+        if clean.startswith(b"* Request at "):
+            self.finish(incomplete=True)
+            self.current = {key: self.metadata[key] for key in ("operation", "shape", "graphql_kind") if key in self.metadata}
+            self.current.update({"timestamp": stamp(), "headers": {}, "primary_cost": None})
+            self.phase = "request_headers"
+            return True
+        if self.current is None:
+            # gh emits git tracing when GH_DEBUG is enabled as well.
+            return clean.startswith((b"[git ", b"[sh -c "))
+        if clean.startswith(b"* Request took "):
+            units = {"ns": 0.000001, "us": 0.001, "µs": 0.001, "μs": 0.001, "ms": 1, "s": 1000, "m": 60000, "h": 3600000}
+            duration = clean[len(b"* Request took "):].decode(errors="replace")
+            pieces = re.findall(r"([0-9]+(?:\.[0-9]+)?)(ns|us|µs|μs|ms|s|m|h)", duration)
+            if pieces:
+                self.current["duration_ms"] = sum(float(value) * units[unit] for value, unit in pieces)
+            self.finish()
+            return True
+        if clean.startswith(b"* Request to "):
+            self.current.update(safe_endpoint(clean[len(b"* Request to "):].decode(errors="replace")))
+        elif clean.startswith(b"> ") and self.phase == "request_headers":
+            match = re.match(rb"> (GET|HEAD|POST|PUT|PATCH|DELETE|OPTIONS) (\S+) HTTP/", clean)
+            if match:
+                self.current["method"] = match.group(1).decode()
+            key, sep, value = clean[2:].partition(b":")
+            if sep and key.lower() == b"x-gh-cache-ttl":
+                self.current["request_cache_ttl"] = value.decode(errors="replace").strip()[:64]
+        elif clean.startswith(b"< HTTP/"):
+            self.body_info()
+            self.body.clear()
+            self.body_truncated = False
+            self.phase = "response_headers"
+            match = re.match(rb"< HTTP/\S+ (\d+)", clean)
+            if match:
+                self.current["status"] = int(match.group(1))
+        elif clean.startswith(b"< ") and self.phase == "response_headers":
+            key, sep, value = clean[2:].partition(b":")
+            name = key.decode(errors="replace").lower()
+            if sep and name in HEADERS:
+                self.current["headers"][name] = value.decode(errors="replace").strip()[:256]
+        elif not clean and self.phase in {"request_headers", "response_headers"}:
+            self.phase = self.phase.replace("headers", "body")
+        elif self.phase in {"request_body", "response_body"}:
+            if len(self.body) + len(parsed) <= MAX_BODY:
+                self.body.extend(parsed)
+            else:
+                self.body_truncated = True
+                self.body.clear()
+        return True
+
+
+def coordinator():
+    path = Path(__file__).resolve().with_name("gh-coordinate.py")
+    if not path.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("gh_coordinate", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def shim(real, args):
+    if os.environ.get("CAGENTS_GH_OBSERVE") == "0":
+        os.execv(real, [real, *args])
+    metadata = context(args)
+    guard = coordinator()
+    content_fd = None
+    if guard is not None:
+        try:
+            content_fd = guard.before(state_dir(), args)
+        except guard.Deferred as error:
+            append({**metadata, "event": "invocation", "timestamp": stamp(), "detailed": False, "deferred": True, "retry_after": error.retry_after})
+            os.write(2, error.stderr())
+            raise SystemExit(75)
+        except OSError:
+            pass
+    detailed = not os.isatty(2) and not os.environ.get("GH_DEBUG") and not os.environ.get("DEBUG") and not any(arg in {"--verbose", "-v"} for arg in args)
+    append({**metadata, "event": "invocation", "timestamp": stamp(), "detailed": detailed})
+    if not detailed:
+        os.execv(real, [real, *args])
+    # Keep gh itself as the process the shell waits for. The reader has only
+    # stderr, consumes injected HTTP debug, and never touches stdin or stdout.
+    read_fd, write_fd = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        os.close(write_fd)
+        if content_fd is not None:
+            os.close(content_fd)
+        os.close(0)
+        os.close(1)
+        def observed(row):
+            if guard is not None:
+                guard.observed(state_dir(), row)
+            append(row)
+        parser = Traffic(metadata, observed)
+        try:
+            with os.fdopen(read_fd, "rb") as stream:
+                while line := stream.readline(MAX_BODY + 1):
+                    if not parser.feed(line):
+                        try:
+                            os.write(2, line)
+                        except OSError:
+                            pass
+            parser.finish(incomplete=True)
+            append({**metadata, "event": "end", "timestamp": stamp()})
+        finally:
+            os._exit(0)
+    os.close(read_fd)
+    os.dup2(write_fd, 2)
+    os.close(write_fd)
+    environment = dict(os.environ, GH_DEBUG="api")
+    os.execve(real, [real, *args], environment)
+
+
+def install(args):
+    prefix = Path(args.directory).expanduser().resolve()
+    prefix.mkdir(parents=True, exist_ok=True)
+    destination = prefix / "gh"
+    marker = "# cagents gh-observe shim\n"
+    if destination.exists() and marker not in destination.read_text(errors="replace"):
+        raise SystemExit(f"Refusing to overwrite {destination}")
+    real = Path(args.real or shutil.which("gh") or "/usr/bin/gh").resolve()
+    if real == destination or not real.is_file() or not os.access(real, os.X_OK):
+        raise SystemExit("Choose the real gh executable with --real")
+    sources = {"gh-observe": Path(__file__).resolve().read_bytes()}
+    companion = Path(__file__).resolve().with_name("gh-coordinate.py")
+    if companion.is_file():
+        sources["gh-coordinate.py"] = companion.read_bytes()
+    digest = hashlib.sha256(b"".join(name.encode() + value for name, value in sorted(sources.items()))).hexdigest()
+    runtime = Path(os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "cagents/gh-observe" / digest
+    runtime.mkdir(parents=True, exist_ok=True)
+    for name, source in sources.items():
+        destination_script = runtime / name
+        if destination_script.exists():
+            continue
+        with tempfile.NamedTemporaryFile(dir=runtime, prefix=".install-", delete=False) as stage:
+            stage.write(source)
+            temporary_script = Path(stage.name)
+        temporary_script.chmod(0o755)
+        temporary_script.replace(destination_script)
+    script = runtime / "gh-observe"
+    text = "#!/bin/sh\n" + marker + "exec /usr/bin/python3 " + shlex.quote(str(script)) + " --shim " + shlex.quote(str(real)) + ' "$@"\n'
+    temporary = destination.with_name(f".gh-observe-{os.getpid()}")
+    temporary.write_text(text)
+    temporary.chmod(0o755)
+    temporary.replace(destination)
+    print(f"Installed {destination}; real gh: {real}")
+    print(f"Logs: {state_dir()}; opt out: CAGENTS_GH_OBSERVE=0")
+
+
+def report(args):
+    start = datetime.datetime.fromisoformat(args.since).timestamp() if args.since else 0
+    end = datetime.datetime.fromisoformat(args.until).timestamp() if args.until else time.time()
+    calls = collections.Counter()
+    logical_calls = collections.Counter()
+    commands = collections.Counter()
+    errors = []
+    timestamps = []
+    detailed = collections.Counter()
+    groups = {}
+    requests = []
+    for path in sorted(state_dir().glob("*.jsonl")):
+        with path.open() as stream:
+            for line in stream:
+                try:
+                    row = json.loads(line)
+                    instant = datetime.datetime.fromisoformat(row["timestamp"]).timestamp()
+                except (ValueError, KeyError):
+                    continue
+                if instant >= end:
+                    continue
+                if row.get("event") == "request":
+                    requests.append((instant, row))
+                elif instant >= start and row.get("event") == "invocation":
+                    caller = row.get("caller", {})
+                    who = f'{caller.get("comm", "unknown")}:{caller.get("pid", "?")}:{caller.get("start_ticks", "?")}'
+                    commands[(who, row["command"])] += 1
+                    detailed[str(row.get("detailed", False))] += 1
+    seen = set()
+    logical_count = cached_count = duplicate_count = unattributed = network_count = 0
+    for instant, row in sorted(requests, key=lambda entry: entry[0]):
+        request_id = row.get("headers", {}).get("x-github-request-id")
+        identity = (row.get("host"), request_id) if request_id else None
+        repeated = identity is not None and identity in seen
+        if identity is not None:
+            seen.add(identity)
+        if instant < start:
+            continue
+        logical_count += 1
+        cached = row.get("cached_response", False)
+        duplicate_count += int(repeated)
+        cached_count += int(cached)
+        unattributed += int(identity is None)
+        network = not cached and not repeated and not row.get("incomplete", False)
+        network_count += int(network)
+        timestamps.append(instant)
+        caller = row.get("caller", {})
+        who = f'{caller.get("comm", "unknown")}:{caller.get("pid", "?")}:{caller.get("start_ticks", "?")}'
+        minute = datetime.datetime.fromtimestamp(instant, datetime.timezone.utc).strftime("%Y-%m-%dT%H:%MZ")
+        op = row.get("operation", row.get("path", "unknown"))
+        if row.get("shape"):
+            op += ":" + row["shape"]
+        logical_calls[(minute, who, row["command"], op)] += 1
+        if network:
+            calls[(minute, who, row["command"], op)] += 1
+        key = (who, row["command"], op)
+        group = groups.setdefault(key, {"network_count": 0, "logical_count": 0, "primary_cost_known": 0, "primary_cost_sum": 0, "secondary_points_estimate": 0, "statuses": collections.Counter(), "resources": collections.Counter(), "durations": []})
+        group["logical_count"] += 1
+        if network:
+            group["network_count"] += 1
+            if type(row.get("primary_cost")) is int:
+                group["primary_cost_known"] += 1
+                group["primary_cost_sum"] += row["primary_cost"]
+            group["secondary_points_estimate"] += row.get("secondary_points_estimate", 0)
+            group["statuses"][str(row.get("status", "unknown"))] += 1
+            group["resources"][row.get("headers", {}).get("x-ratelimit-resource", "unknown")] += 1
+            if "duration_ms" in row:
+                group["durations"].append(row["duration_ms"])
+        if row.get("status", 0) >= 400 or row.get("graphql_errors") or row.get("incomplete"):
+            errors.append({"network": network, "reused_response": repeated, **{key: row.get(key) for key in ("timestamp", "command", "caller", "path", "operation", "shape", "status", "headers", "graphql_errors", "error_types", "rate_limited", "incomplete")}})
+    aggregates = []
+    for key, group in sorted(groups.items()):
+        durations = group.pop("durations")
+        if durations:
+            durations.sort()
+            group["duration_ms"] = {"samples": len(durations), "median": statistics.median(durations), "p95": durations[min(len(durations) - 1, int(len(durations) * 0.95))], "max": max(durations)}
+        aggregates.append({"caller": key[0], "command": key[1], "operation": key[2], **group})
+    # Include zero-network rows for logical cache hits rather than silently
+    # presenting GH_DEBUG cache exchanges as fresh GitHub traffic.
+    per_minute = [{"minute": key[0], "caller": key[1], "command": key[2], "operation": key[3], "network_count": calls[key], "logical_count": count} for key, count in sorted(logical_calls.items())]
+    output = {"since": args.since, "until": args.until, "first_request": min(timestamps) if timestamps else None, "last_request": max(timestamps) if timestamps else None, "network_requests": network_count, "logical_exchanges": logical_count, "cached_by_date_and_ttl": cached_count, "reused_response_ids": duplicate_count, "exchanges_without_request_id": unattributed, "network_count_method": "Completed exchanges, excluding reused server request IDs and responses with a cache TTL and server Date older than 60 seconds; exchanges without a request ID cannot be deduplicated.", "detailed_invocations": dict(detailed), "commands": [{"caller": key[0], "command": key[1], "count": count} for key, count in sorted(commands.items())], "operations": aggregates, "calls_per_minute": per_minute, "errors": errors}
+    print(json.dumps(output, indent=2))
+
+
+def configure_coordination(args):
+    root = state_dir()
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    marker = root / "coordination.enabled"
+    if args.setting == "on":
+        marker.touch(mode=0o600)
+    elif args.setting == "off":
+        marker.unlink(missing_ok=True)
+    guard = coordinator()
+    print("enabled" if guard is not None and guard.enabled(root) else "disabled")
+
+
+def main():
+    if len(sys.argv) >= 3 and sys.argv[1] == "--shim":
+        shim(sys.argv[2], sys.argv[3:])
+        return
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest="action", required=True)
+    installer = commands.add_parser("install", help="Install an earlier-on-PATH gh wrapper")
+    installer.add_argument("--directory", default=str(Path.home() / ".local/bin"))
+    installer.add_argument("--real", help="Absolute path to real gh")
+    installer.set_defaults(func=install)
+    coordination = commands.add_parser("coordinate", help="Enable shared cooldowns and serialized content calls (no network)")
+    coordination.add_argument("setting", choices=("on", "off", "status"))
+    coordination.set_defaults(func=configure_coordination)
+    reporter = commands.add_parser("report", help="Summarize local logs; never calls GitHub")
+    reporter.add_argument("--since", help="ISO timestamp, including timezone")
+    reporter.add_argument("--until", help="ISO timestamp, including timezone")
+    reporter.set_defaults(func=report)
+    args = parser.parse_args()
+    args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        import signal
+        signal.signal(signal.SIGINT, signal.SIG_DFL)
+        os.kill(os.getpid(), signal.SIGINT)

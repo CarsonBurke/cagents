@@ -5,6 +5,7 @@
 - [Development runner](#development-runner)
 - [Build and test resource usage](#build-and-test-resource-usage)
 - [Testing](#testing)
+- [Shared GitHub traffic](#shared-github-traffic)
 - [Native evidence](#native-evidence)
 - [Installer and package checks](#installer-and-package-checks)
 - [Troubleshooting](#troubleshooting)
@@ -1426,6 +1427,87 @@ For UI changes, launch the real UI with
 the runner and exercise the changed path. For browser or feature-boundary
 changes, verify both the browserless and integrated lanes. Performance
 workloads are described in [Performance](performance.md).
+
+## Shared GitHub traffic
+
+Use the shared, on-demand status cache instead of a watcher per agent:
+
+```sh
+cagents gh pr-status 1234 -R CarsonBurke/cagents --json
+```
+
+The command requires an explicit repository, needs no daemon, and reads PR,
+head, CI, review and merge state in one GraphQL request. Local callers with
+the same gh credential context share one refresh per PR every 120 seconds;
+when nobody reads it, it makes no requests. Check `data.stale`, `data.error`,
+`data.retry_at` and `data.snapshot.pull_request.headRefOid` before acting.
+A failed refresh exits nonzero and labels any retained snapshot stale.
+Exit zero confirms a readable snapshot; inspect `checks_state` to decide
+whether CI passed, failed or is pending.
+The aggregate check state covers all contexts; `checks_complete=false` means
+the displayed context list stops at 100. No reported checks means unknown,
+not passing. Enterprise repositories also accept `--hostname HOST`.
+
+The app and Ceditor share a resumable review-request scan per repository and
+credential context. A settled scan waits 60 seconds, and continuation pages
+wait at least six seconds. Background monitoring still serves desktop review
+alerts; hidden inspector and review panes retain their existing visibility
+guards. Private snapshots and cooldowns live under
+`${XDG_STATE_HOME:-~/.local/state}/cagents/github-status`. Token environment
+and gh account/configuration changes select another cache. Rotating a keyring
+secret without changing its account/configuration is not detected locally.
+
+To measure agent and app traffic without generating additional requests,
+install an earlier-on-PATH gh wrapper:
+
+```sh
+scripts/gh-observe install --real /usr/bin/gh
+# Keep ~/.local/bin before /usr/bin on PATH. Use `hash -r` in an existing Bash.
+scripts/gh-observe report --since 2026-11-09T23:24:00+00:00 \
+    --until 2026-11-09T23:54:00+00:00 > github-traffic.json
+```
+
+Installation copies the runtime outside the checkout, so removing a worktree
+does not break gh. The daily JSONL logs are private files under
+`${XDG_STATE_HOME:-~/.local/state}/cagents/gh-observe`. They record timestamps,
+caller process ancestry/session IDs, subcommands, GraphQL operation shapes,
+HTTP status, duration and allowlisted rate-limit headers. Credentials,
+arguments, GraphQL variables and response bodies are discarded. Operation
+names and endpoint paths can identify private repositories; keep raw logs
+local and publish only the needed aggregates. Remove old daily logs when the
+measurement no longer needs them.
+
+The wrapper execs the real gh with its original arguments, stdin and stdout;
+it filters injected HTTP debug from stderr. Explicit debug and interactive
+stderr retain their behavior and log invocations only, which the report marks
+as a coverage gap. Absolute gh paths, other hosts, connectors and Git's own
+HTTPS traffic bypass this wrapper. Exact GraphQL primary cost is reported only
+when the original query asks `rateLimit { cost }`; quota headers are cumulative,
+so their deltas cannot be attributed to one concurrent caller. Secondary point
+estimates use GitHub's published defaults and are separate from primary cost.
+
+After the baseline, enable shared cooldown and content-write coordination:
+
+```sh
+scripts/gh-observe coordinate on
+scripts/gh-observe coordinate status
+scripts/gh-observe coordinate off
+```
+
+The coordinator honors `Retry-After`, exhausted-primary reset times and
+exponential secondary-limit backoff across new gh invocations on this host.
+It serializes recognized content-writing commands with eight seconds between
+starts, adding no automatic retries. A write's outcome remains gh's outcome.
+One gh invocation can send several content requests; aliases, extensions and
+already-running internal watch loops are not a per-request quota guarantee.
+Use the shared status command and avoid `gh pr checks --watch`, `gh run watch`
+and independent polling loops.
+
+Set `CAGENTS_GH_OBSERVE=0` to bypass the wrapper entirely, or
+`CAGENTS_GH_COORDINATE=0` to keep measurement but bypass coordination for one
+shell. `CAGENTS_GH_COORDINATE=1` enables it for one shell. To uninstall, remove
+only the generated gh wrapper whose second line is `# cagents gh-observe shim`.
+Do not replace another tool's gh executable.
 
 ## Native evidence
 
