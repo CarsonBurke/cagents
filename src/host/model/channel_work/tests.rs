@@ -515,6 +515,8 @@ fn native_origin(registry: &mut Registry, home: Home) -> TrustedResolvedOrigin {
 #[test]
 fn proved_native_session_needs_no_fabricated_managed_agent_or_run() {
     let (mut registry, _directory, home) = fixture();
+    // Resolving the actor's pane searches occupied views only.
+    views::plant_unreadable_emptied_view(&mut registry);
     let origin = native_origin(&mut registry, home);
     let request = claim(home, 1, 0);
     let proof = origin.proof.as_ref().unwrap();

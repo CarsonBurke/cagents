@@ -2408,6 +2408,8 @@ mod tests {
         for case in 0..13 {
             let (mut registry, directory, request) = fixture();
             let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            // Archival looks for the conversation's pane in occupied views only.
+            super::super::views::plant_unreadable_emptied_view(&mut registry);
             let HostedSession::Chat(mut current) = source() else {
                 unreachable!()
             };
@@ -2650,6 +2652,8 @@ mod tests {
             for case in 0..9 {
                 let (mut registry, directory, request) = fixture();
                 let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+                // Both lookups search occupied views only for the history's pane.
+                super::super::views::plant_unreadable_emptied_view(&mut registry);
                 let HostedSession::Chat(mut current) = source() else {
                     unreachable!()
                 };

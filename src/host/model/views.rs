@@ -397,6 +397,73 @@ fn collect(db: &Connection, sql: &str) -> Result<Vec<View>, String> {
     .collect()
 }
 
+/// Adds a channel whose view was emptied by closing its only pane, with a
+/// stored tombstone set no reader can parse. A pane search that reads emptied
+/// views therefore fails on this store, so one that succeeds proves it skipped
+/// them.
+#[cfg(test)]
+pub(super) fn plant_unreadable_emptied_view(registry: &mut Registry) {
+    let repository = std::path::PathBuf::from("/planted/emptied-view");
+    registry
+        .apply(&ModelEdit::OpenProject {
+            repository: repository.clone(),
+            name: "emptied".into(),
+            kind: Default::default(),
+        })
+        .unwrap();
+    let channel = ChannelId::new();
+    registry
+        .apply(&ModelEdit::CreateChannel {
+            id: channel,
+            repository,
+            title: "emptied".into(),
+            title_source: Default::default(),
+        })
+        .unwrap();
+    let scope = Scope::Channel(channel);
+    let pane = crate::workspace_model::views::Pane {
+        id: crate::model::CardId::new(),
+        title: "closed".into(),
+        user_title: None,
+        pending_terminal_start: false,
+        width_fraction: 0.5,
+        scope: None,
+        kind: crate::model::CardKind::Browser(crate::model::BrowserSession {
+            id: crate::model::BrowserId::new(),
+            current_url: "https://example.com".parse().unwrap(),
+            history: vec![],
+            history_index: 0,
+            scroll_x: 0.,
+            scroll_y: 0.,
+            fidelity: crate::model::BrowserRestoreFidelity::UrlOnly,
+        }),
+    };
+    let id = pane.id;
+    for change in [Change::Insert { pane, before: None }, Change::Remove { id }] {
+        registry
+            .apply(&ModelEdit::ChangeView {
+                expected_revision: registry.view_revision(&scope).unwrap(),
+                scope: scope.clone(),
+                operation: Uuid::new_v4(),
+                change,
+            })
+            .unwrap();
+    }
+    assert!(read(&registry.db, &scope).unwrap().panes.is_empty());
+    assert_eq!(
+        registry
+            .db
+            .execute(
+                "UPDATE shared_views SET retired = 'unreadable' WHERE scope = ?1 AND panes = '[]'",
+                [key(&scope).unwrap()],
+            )
+            .unwrap(),
+        1,
+        "the emptied view is stored as an empty pane list"
+    );
+    assert!(all(&registry.db).is_err(), "reading every view now fails");
+}
+
 /// Read the pane still presenting this execution agent's resource without
 /// changing it. Preflight and retirement share this exact authority predicate.
 /// The current owner can differ from the agent's original placement after a
@@ -1066,6 +1133,44 @@ mod tests {
         assert_eq!(
             occupied(&r.db).unwrap(),
             vec![read(&r.db, &Scope::Channel(a)).unwrap()]
+        );
+    }
+    #[test]
+    fn hosted_resource_ownership_reads_only_occupied_views() {
+        let (mut r, _, a, b) = setup();
+        plant_unreadable_emptied_view(&mut r);
+        let p = pane();
+        // Seeding, inserting and updating each look for the resource's pane.
+        seed(&mut r, a, vec![p.clone()]);
+        let mut alias = p.clone();
+        alias.id = CardId::new();
+        let insert = edit(
+            &mut r,
+            b,
+            Change::Insert {
+                pane: alias,
+                before: None,
+            },
+        );
+        r.apply(&insert).unwrap();
+        assert!(
+            read(&r.db, &Scope::Channel(b)).unwrap().panes.is_empty(),
+            "the resource already has its pane in another view"
+        );
+        let mut renamed = p.clone();
+        renamed.title = "renamed".into();
+        let update = edit(
+            &mut r,
+            a,
+            Change::Update {
+                before: p,
+                pane: renamed.clone(),
+            },
+        );
+        r.apply(&update).unwrap();
+        assert_eq!(
+            read(&r.db, &Scope::Channel(a)).unwrap().panes,
+            vec![renamed]
         );
     }
     #[test]

@@ -254,6 +254,106 @@ fn an_unchanged_flush_writes_only_the_workspace_generation() {
     assert_eq!(changes(&store) - before, 1);
 }
 
+/// The SQL of every statement the store's connection starts while `run` runs,
+/// as SQLite's own statement trace reports it.
+fn statements_during(store: &StateStore, run: impl FnOnce()) -> Vec<String> {
+    use rusqlite::ffi;
+    use std::{
+        ffi::{CStr, c_int, c_uint, c_void},
+        sync::Mutex,
+    };
+    unsafe extern "C" fn record(
+        _event: c_uint,
+        context: *mut c_void,
+        statement: *mut c_void,
+        _sql: *mut c_void,
+    ) -> c_int {
+        // SAFETY: `context` is the `Mutex` below, which outlives the trace,
+        // and a statement event's subject is the statement being started.
+        unsafe {
+            let recorded = &*(context as *const Mutex<Vec<String>>);
+            let sql = ffi::sqlite3_sql(statement.cast());
+            if !sql.is_null() {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push(CStr::from_ptr(sql).to_string_lossy().into_owned());
+            }
+        }
+        0
+    }
+    let recorded = Mutex::new(Vec::new());
+    // SAFETY: the handle is the store's open connection, which outlives this
+    // call; the trace is removed again before `recorded` goes out of scope.
+    let handle = unsafe { store.lock_inner().unwrap().connection.handle() };
+    unsafe {
+        ffi::sqlite3_trace_v2(
+            handle,
+            ffi::SQLITE_TRACE_STMT as c_uint,
+            Some(record),
+            (&raw const recorded).cast_mut().cast(),
+        );
+    }
+    run();
+    unsafe {
+        ffi::sqlite3_trace_v2(handle, 0, None, std::ptr::null_mut());
+    }
+    recorded.into_inner().unwrap()
+}
+
+/// Statements that read one card's row of `cards` by its id.
+fn card_row_reads(statements: &[String]) -> Vec<&String> {
+    statements
+        .iter()
+        .filter(|sql| {
+            let sql = sql.split_whitespace().collect::<String>();
+            sql.starts_with("SELECT") && sql.contains("FROMcardsWHEREcard_id=?")
+        })
+        .collect()
+}
+
+/// An unchanged flush learns everything it needs about each stored card from
+/// the one query over the window's cards: the 45 open chats skip their
+/// identity comparison and the 580 closed terminals their archived-descriptor
+/// check, which each cost a query per card. A chat that did change is still
+/// compared with its stored row.
+#[test]
+fn an_unchanged_flush_reads_no_card_row_on_its_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = StateStore::open(
+        directory.path().join("history.sqlite3"),
+        BootId::new("scale"),
+    )
+    .unwrap();
+    let mut state = long_lived_workspace();
+    let mut lane = Lane::default();
+    lane.save(&store, &state);
+
+    let unchanged = statements_during(&store, || {
+        lane.save(&store, &state);
+    });
+    assert!(
+        unchanged
+            .iter()
+            .any(|sql| sql.contains("FROM cards WHERE workspace_id")),
+        "the trace sees the flush's statements"
+    );
+    assert_eq!(card_row_reads(&unchanged), Vec::<&String>::new());
+
+    let chat = state
+        .cards
+        .iter()
+        .position(|card| card.existence.is_open() && matches!(card.kind, CardKind::Chat(_)))
+        .unwrap();
+    state.cards[chat].title = "a renamed conversation".into();
+    let changed = statements_during(&store, || {
+        lane.save(&store, &state);
+    });
+    let reads = card_row_reads(&changed);
+    assert_eq!(reads.len(), 1, "{reads:?}");
+    assert!(reads[0].contains("SELECT content_json FROM cards"));
+}
+
 #[test]
 #[ignore = "timing at realistic size; run explicitly"]
 fn time_store_paths_at_long_lived_size() {
