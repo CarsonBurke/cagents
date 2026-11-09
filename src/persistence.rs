@@ -10429,7 +10429,7 @@ mod tests {
         other_option.launch.recipe.arguments.push("--search".into());
         assert!(matches!(
             card_refusal(save(&other_option), workspace.cards[0].id),
-            StoreError::InvalidState(message) if message.contains("launch recipe")
+            StoreError::InvalidState(violation) if violation.message().contains("launch recipe")
         ));
         save(&own).unwrap();
         let stored =

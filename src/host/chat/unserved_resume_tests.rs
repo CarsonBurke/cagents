@@ -338,3 +338,82 @@ fn a_reopened_codex_thread_another_process_has_open_is_refused() {
     );
     assert!(host.lock().unwrap().chat_spawning.is_empty());
 }
+
+/// Private app-servers do not publish the shared control socket. A server
+/// retaining its writer lock must still prevent a second private server,
+/// including when it has no rollout descriptor open at this instant.
+#[test]
+fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
+    const NAME: &str = "host::chat::unserved_resume_tests::a_reopened_codex_thread_served_on_another_private_listener_is_refused";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    install_codex(&root);
+    let locks = root.join("home/.codex/thread-writer-locks");
+    std::fs::create_dir_all(&locks).unwrap();
+    let private = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = private.path().join("private.sock");
+    let ready = private.path().join("ready");
+    let mut server = std::process::Command::new("/usr/bin/python3")
+        .args([
+            "-c",
+            "import fcntl, pathlib, socket, sys, time\n\
+             lock = open(sys.argv[1], 'w')\n\
+             fcntl.flock(lock, fcntl.LOCK_EX)\n\
+             listener = socket.socket(socket.AF_UNIX)\n\
+             listener.bind(sys.argv[2])\n\
+             listener.listen()\n\
+             pathlib.Path(sys.argv[3]).touch()\n\
+             time.sleep(30)",
+        ])
+        .arg(locks.join(format!("{}.lock", thread_id())))
+        .arg(&socket)
+        .arg(&ready)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !ready.exists() {
+        assert!(
+            Instant::now() < deadline,
+            "the private server never became ready"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let writer = super::codex_owners::writer(
+        Some(&locks.join(format!("{}.lock", thread_id()))),
+        thread_id(),
+    )
+    .unwrap()
+    .expect("the private server holds the real kernel writer lock");
+    assert_eq!(writer.pid, server.id() as libc::pid_t);
+    host.lock().unwrap().register_client(1);
+    let result = start(
+        &host,
+        1,
+        reopened(&root),
+        None,
+        false,
+        None,
+        Default::default(),
+    );
+    // Clean up the fixture before checking the result, including a mutant
+    // that incorrectly tries to launch the installed Codex stand-in.
+    server.kill().unwrap();
+    server.wait().unwrap();
+    assert!(
+        !root.join("codex-arguments").exists(),
+        "no second private server was launched"
+    );
+    let refusal = result.unwrap_err();
+    assert!(
+        refusal.message.contains(&format!("pid {})", writer.pid)),
+        "{refusal:?}"
+    );
+    assert!(
+        !refusal.retryable,
+        "a second server cannot help while the writer owns it"
+    );
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+}

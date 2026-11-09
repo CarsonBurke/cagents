@@ -1162,8 +1162,9 @@ impl Session {
     ///
     /// A begun thread's bare remote names the account's shared daemon, which
     /// owns the thread whenever it is running. Only the daemon calls this,
-    /// after proving nothing serves that daemon's endpoint: the thread then
-    /// has no live owner to join, so reopening it needs a server of its own.
+    /// after finding the shared endpoint unserved and checking for another
+    /// process writing the thread. This method only assigns the listener;
+    /// the caller remains responsible for those launch checks.
     pub fn claim_owned_codex_listener_for_unserved_thread(
         &mut self,
         root: &std::path::Path,

@@ -3874,6 +3874,78 @@ mod tests {
     }
 
     #[test]
+    fn a_lost_codex_resume_reply_attaches_its_allocated_listener() {
+        let live = host_proof("live");
+        let mut saved = omp_card(Some(CONVERSATION), None);
+        saved.launch.provider = crate::agent::Provider::Codex;
+        saved.launch.recipe.program = "codex".into();
+        saved.launch.recipe.arguments = ["resume", CONVERSATION, "--remote", "unix://"]
+            .map(String::from)
+            .into();
+        let mut hosted = saved.clone();
+        assert!(hosted.claim_owned_codex_listener_for_unserved_thread(
+            std::path::Path::new("/run/test-native"),
+            &live,
+        ));
+        hosted.proof = Some(live.clone());
+        for conflict in 0..5 {
+            let mut advertised = hosted.clone();
+            match conflict {
+                0 => {}
+                1 => advertised.launch.session_id = Some("other-thread".into()),
+                2 => advertised.launch.recipe.arguments.push("--search".into()),
+                3 => advertised.launch.recipe.working_directory = "/other".into(),
+                4 => advertised.proof = Some(host_proof("stale")),
+                _ => unreachable!(),
+            }
+            let (mut client, mut server) = UnixStream::pair().unwrap();
+            client
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = live.clone();
+            let worker = thread::spawn(move || {
+                let envelope: ClientEnvelope = ipc::read_frame(&mut server).unwrap().unwrap();
+                assert!(matches!(envelope.request, ClientRequest::ChatList));
+                ipc::write_frame(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(envelope.request_id),
+                        proof,
+                        message: ServerMessage::Response {
+                            response: ServerResponse::ChatListed {
+                                sessions: vec![advertised],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            });
+            let result = restore(
+                &mut client,
+                &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+                &mut 1,
+                &live,
+                saved.clone(),
+                &mut None,
+                &mut None,
+                true,
+            );
+            worker.join().unwrap();
+            if conflict == 0 {
+                assert!(
+                    matches!(result, Ok(ClientRequest::ChatAttach { session }) if session == hosted)
+                );
+            } else {
+                assert!(
+                    result.is_err(),
+                    "a changed identity must not attach or restart: {conflict}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn proofless_restore_refuses_a_conflicting_hosted_identity() {
         let live = host_proof("live");
         let saved = omp_card(Some(CONVERSATION), None);
