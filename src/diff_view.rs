@@ -285,11 +285,15 @@ const LINGER: std::time::Duration = std::time::Duration::from_secs(20);
 
 #[derive(Default)]
 struct Retained {
+    /// The grammar every live lease shares, which a new lease joins rather
+    /// than loading another copy while any parser still holds it.
     shared: std::sync::Weak<parsing::SyntaxSet>,
-    /// The cache's own hold, until `until`, and whether a thread is waiting
-    /// to let it go.
+    /// The cache's own hold, which keeps the grammar loaded between parsers.
     kept: Option<Arc<parsing::SyntaxSet>>,
+    /// When `kept` is let go, unless a parser takes or returns a lease first.
     until: Option<std::time::Instant>,
+    /// Whether a thread is already waiting to let `kept` go, so each use
+    /// moves `until` instead of starting another waiter.
     releasing: bool,
 }
 
@@ -374,6 +378,8 @@ pub(crate) struct SyntaxLease(Arc<parsing::SyntaxSet>, Arc<SyntaxCache>);
 
 impl Drop for SyntaxLease {
     fn drop(&mut self) {
+        // Every return re-keeps the grammar on purpose: the linger counts
+        // from the last parser to finish, not from when it started.
         let mut current = self.1.retained();
         self.1.keep(&mut current, &self.0);
     }
@@ -1764,6 +1770,52 @@ mod tests {
         assert!(!cache.retained().releasing);
         let _next = cache.acquire();
         assert_eq!(loads(), 2);
+    }
+
+    /// What keeping the grammar costs the process, and whether letting it go
+    /// gives that back: resident memory before a load, while kept after
+    /// highlighting a few languages, and once the linger has passed.
+    #[test]
+    #[ignore = "measurement; run with --ignored --nocapture"]
+    fn what_a_kept_grammar_costs_the_process() {
+        fn resident_mib() -> f64 {
+            let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+            let pages: f64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+            pages * 4096.0 / (1024.0 * 1024.0)
+        }
+        let linger = std::time::Duration::from_millis(300);
+        let cache = Arc::new(SyntaxCache::new(linger));
+        let before = resident_mib();
+        let grammar = {
+            let lease = cache.acquire();
+            let grammar = Arc::downgrade(&lease.0);
+            drop(lease);
+            for (language, line) in [
+                ("rust", "fn main() { let x = vec![1, 2, 3]; }\n"),
+                ("python", "def main():\n"),
+                ("ts", "const x: number = 1;\n"),
+                ("sh", "for f in *; do echo \"$f\"; done\n"),
+            ] {
+                let mut parser = HighlightParser::with_syntaxes(language, AUTO, cache.acquire());
+                parser.line(line, &CancellationToken::new()).unwrap();
+            }
+            grammar
+        };
+        let kept = resident_mib();
+        while grammar.upgrade().is_some() || cache.retained().releasing {
+            std::thread::sleep(linger / 4);
+        }
+        let released = resident_mib();
+        let clock = std::time::Instant::now();
+        // SAFETY: malloc_trim only returns free heap pages to the system.
+        unsafe { libc::malloc_trim(0) };
+        let trim = clock.elapsed();
+        let trimmed = resident_mib();
+        println!(
+            "resident {before:.1} MiB before, {kept:.1} MiB kept, {released:.1} MiB released, \
+             {trimmed:.1} MiB after a {:.1} ms malloc_trim",
+            trim.as_secs_f64() * 1e3
+        );
     }
 
     #[test]
