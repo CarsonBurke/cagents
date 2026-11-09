@@ -708,11 +708,16 @@ impl SettledClosure {
     /// Whether offering `card` at `ordinal` over `stored`, against the base
     /// generation `expected`, would leave storage as it is.
     ///
-    /// That is the case exactly when [`save_card`] would find the fingerprint
-    /// it computes for the offer already stored, and its checks before that
-    /// would pass. The fingerprint covers the workspace, the card's position
-    /// and every value [`CardWrite`] binds, so each input to it is compared
-    /// here, and a stale base is left for [`save_card`] to report.
+    /// That is the case when [`save_card`] would find the fingerprint it
+    /// computes for the offer already stored, and its checks before that would
+    /// pass. The fingerprint covers the workspace, the card's position and
+    /// every value [`CardWrite`] binds, so each input to it is compared here,
+    /// and a stale base is left for [`save_card`] to report.
+    ///
+    /// `kind` is compared by value, which equates a few spellings that
+    /// serialize differently, such as a path with a redundant separator or a
+    /// negative zero scroll offset. Such an offer keeps the equivalent bytes
+    /// already stored, as [`RefusedClosure::repeats`] does for a refusal.
     fn holds(
         &self,
         workspace: WorkspaceId,
@@ -12283,6 +12288,99 @@ mod tests {
         assert_eq!(after.0, before.0 + 1);
         assert_eq!(after.2, before.2, "the snapshot's content is stored again");
         assert_eq!(store.load_card(card, None).unwrap().unwrap().title, "two");
+    }
+
+    /// A write the store makes outside the snapshot lane, here a closed
+    /// terminal's transcript metadata, leaves the next flush writing that card.
+    #[test]
+    fn transcript_metadata_for_a_settled_closed_terminal_is_followed_by_a_write() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        workspace.cards[0].existence = closed_by_user();
+        workspace.focused = None;
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            0,
+            "every card is closed and settled"
+        );
+        let card = workspace.cards[0].id;
+        let CardKind::Terminal(terminal) = &workspace.cards[0].kind else {
+            unreachable!("the fixture's first card is a terminal");
+        };
+        let before = stored_card_row(&store, card);
+        store
+            .save_transcript_metadata(
+                terminal.id,
+                &TranscriptMetadata {
+                    path: terminal.transcript_path.clone().unwrap(),
+                    byte_len: 123,
+                    durable_offset: 100,
+                    updated_at_unix_ms: 42,
+                    location: None,
+                },
+                0,
+            )
+            .unwrap();
+        assert_eq!(stored_card_row(&store, card).2, None);
+
+        assert_eq!(
+            card_writes_built(|| {
+                lane.save(&store, &workspace).unwrap();
+            }),
+            1
+        );
+        let after = stored_card_row(&store, card);
+        assert_eq!(after.0, before.0 + 1);
+        assert_eq!(after.2, before.2, "the snapshot's content is stored again");
+    }
+
+    /// A closed card remembered from a flush that rolled back is written by
+    /// the next flush that offers it, since storage never held it.
+    #[test]
+    fn a_closed_card_from_a_rolled_back_flush_is_written_again() {
+        let directory = tempdir().unwrap();
+        let boot_id = boot("boot-a");
+        let store =
+            StateStore::open(directory.path().join("state.sqlite3"), boot_id.clone()).unwrap();
+        let (mut workspace, mut lane) = settled_closed_history(&store, &boot_id);
+        let renamed = workspace.cards[1].id;
+        let stale = workspace.cards[3].id;
+        let before = stored_card_row(&store, renamed);
+        let shift_generation = |delta: i64| {
+            store
+                .lock_inner()
+                .unwrap()
+                .connection
+                .execute(
+                    "UPDATE cards SET generation = generation + ?1 WHERE card_id = ?2",
+                    params![delta, stale.to_string()],
+                )
+                .unwrap();
+        };
+
+        // The renamed card is written before the later card's stale base
+        // rolls the whole flush back.
+        workspace.cards[1].title = "renamed in a failed flush".into();
+        shift_generation(1);
+        assert!(matches!(
+            lane.save(&store, &workspace),
+            Err(StoreError::StaleGeneration { .. })
+        ));
+        assert_eq!(stored_card_row(&store, renamed), before);
+
+        shift_generation(-1);
+        lane.save(&store, &workspace).unwrap();
+        assert_eq!(stored_card_row(&store, renamed).0, before.0 + 1);
+        assert_eq!(
+            store.load_card(renamed, None).unwrap().unwrap().title,
+            "renamed in a failed flush"
+        );
     }
 
     /// Remembering a settled card never hides that storage moved past the
