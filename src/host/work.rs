@@ -301,7 +301,9 @@ struct Shared {
     /// Why Linear cannot be asked about tickets cards still want.
     linear_unavailable: Option<String>,
     stale_after_days: u16,
+    /// A CLI read keeps its short freshness window independently of UI watches.
     read_at: Option<Instant>,
+    watching: bool,
     /// Forge listings read from the store for projects not yet tracked.
     restored: BTreeMap<PathBuf, (u64, forge::Snapshot)>,
 }
@@ -341,8 +343,33 @@ impl Shared {
     }
 
     fn being_read(&self) -> bool {
-        self.read_at
-            .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+        self.watching
+            || self
+                .read_at
+                .is_some_and(|read_at| read_at.elapsed() < READ_WINDOW)
+    }
+
+    /// A departing window stops the fast cadence immediately. Keep explicit
+    /// refresh requests and failure backoff intact, and reuse the last answer
+    /// until its new interval expires rather than polling once more on detach.
+    fn set_watching(&mut self, watching: bool) {
+        if self.watching == watching {
+            return;
+        }
+        self.watching = watching;
+        let reading = self.being_read();
+        for tracked in self.projects.values_mut() {
+            if tracked.forge != Forge::NotGitHub
+                && let Some(last) = tracked.last_poll
+            {
+                let deadline = last + forge::interval(reading, tracked.failures);
+                tracked.next_poll = if tracked.failures > 0 {
+                    tracked.next_poll.max(deadline)
+                } else {
+                    deadline
+                };
+            }
+        }
     }
 
     /// How long a project goes without a re-read when no watcher event asks
@@ -493,6 +520,7 @@ impl Service {
             linear_unavailable: None,
             stale_after_days: stale_after_days(),
             read_at: None,
+            watching: false,
             restored: BTreeMap::new(),
         };
         if let Some(store) = &mut store {
@@ -709,6 +737,7 @@ impl Handle {
 
     fn board(&self, host: &SharedHost, scope: &Scope, fresh: bool) -> Result<Board, String> {
         let selected = self.resolve(host, scope)?;
+        self.shared().read_at = Some(Instant::now());
         self.settle(&selected, fresh);
         Ok(self.assemble(host, &selected))
     }
@@ -721,7 +750,6 @@ impl Handle {
         let mut targets = Vec::new();
         {
             let mut shared = self.shared();
-            shared.read_at = Some(Instant::now());
             for (repository, name) in selected {
                 let tracked = shared.track(repository, name);
                 let recent = |at: Option<Instant>| at.is_some_and(|at| at.elapsed() < FRESH_ENOUGH);
@@ -755,7 +783,8 @@ impl Handle {
                         });
                 // Unread, listings go stale for minutes; the first read in a
                 // while refreshes them without waiting for the answer.
-                if tracked.forge != Forge::NotGitHub
+                if tracked.failures == 0
+                    && tracked.forge != Forge::NotGitHub
                     && tracked
                         .last_poll
                         .is_some_and(|at| at.elapsed() >= forge::WATCHED_INTERVAL)
@@ -857,6 +886,7 @@ impl Handle {
         self.settle(&selected, false);
         let mut publication = self.publication();
         publication.watchers.insert(client, delivery);
+        self.shared().set_watching(true);
         // Assembled while subscribed, so no later change can miss this
         // client; the others are sent the same board if it is new to them.
         let board = self.assemble(host, &selected);
@@ -865,11 +895,16 @@ impl Handle {
         drop(publication);
         // The publisher now has a watcher to republish for.
         self.0.publisher.notify();
+        self.0.forge.notify();
         Ok((revision, board))
     }
 
     pub(super) fn unwatch(&self, client: ClientId) {
-        self.publication().watchers.remove(&client);
+        let mut publication = self.publication();
+        publication.watchers.remove(&client);
+        self.shared().set_watching(!publication.watchers.is_empty());
+        drop(publication);
+        self.0.forge.notify();
     }
 
     fn publication(&self) -> MutexGuard<'_, Publication> {
@@ -911,6 +946,7 @@ impl Handle {
         publication
             .watchers
             .retain(|_, delivery| delivery.strong_count() > 0);
+        self.shared().set_watching(!publication.watchers.is_empty());
         if publication.watchers.is_empty() {
             publication.sent = None;
             return false;
@@ -924,8 +960,6 @@ impl Handle {
         };
         let untracked = {
             let mut shared = self.shared();
-            // A watched board is a read, which keeps polls and tickets current.
-            shared.read_at = Some(Instant::now());
             let untracked = selected
                 .iter()
                 .any(|(repository, _)| !shared.projects.contains_key(repository));
@@ -941,7 +975,9 @@ impl Handle {
         }
         let board = self.assemble(host, &selected);
         publication.offer(host, &board, None);
-        true
+        let watched = !publication.watchers.is_empty();
+        self.shared().set_watching(watched);
+        watched
     }
 
     /// The one card on `board` named by `name`: its branch, its storage key or
@@ -1176,6 +1212,7 @@ impl Handle {
                             .collect(),
                     };
                     // A request made while this poll runs wants the next one.
+                    let requested = tracked.poll_requested;
                     tracked.poll_requested = false;
                     tracked.polls_started += 1;
                     Some((
@@ -1183,13 +1220,31 @@ impl Handle {
                         target,
                         std::mem::take(&mut tracked.memory),
                         tracked.polls_started,
+                        requested,
                     ))
                 })
                 .collect::<Vec<_>>()
         };
-        for (id, target, mut memory, sequence) in due {
+        for (id, target, mut memory, sequence, requested) in due {
             if self.0.cancellation.is_cancelled() {
                 break;
+            }
+            {
+                let mut shared = self.shared();
+                let Some(tracked) = shared
+                    .projects
+                    .get_mut(&target.repository)
+                    .filter(|tracked| tracked.id == id)
+                else {
+                    continue;
+                };
+                // The last reader can leave while an earlier repository in
+                // this wave is being read. Its new idle deadline applies to
+                // queued polls too; explicit freshness requests still run.
+                if !requested && !tracked.poll_requested && tracked.next_poll > Instant::now() {
+                    tracked.memory = memory;
+                    continue;
+                }
             }
             let outcome = forge::poll(&target, &mut memory, &self.0.cancellation);
             let synced_at = now_unix_ms();
@@ -1576,6 +1631,140 @@ impl Scanner {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn polling_handle() -> Handle {
+        Handle(Arc::new(Inner {
+            host: Weak::new(),
+            shared: Mutex::new(Shared {
+                projects: BTreeMap::new(),
+                pins: BTreeMap::new(),
+                session_activity: HashMap::new(),
+                tickets: BTreeMap::new(),
+                linear_unavailable: None,
+                stale_after_days: 7,
+                read_at: None,
+                watching: false,
+                restored: BTreeMap::new(),
+            }),
+            updated: Condvar::new(),
+            scanner: Signal::default(),
+            forge: Signal::default(),
+            publisher: Signal::default(),
+            publication: Mutex::new(Publication::default()),
+            jobs: Jobs::default(),
+            store: Mutex::new(None),
+            conversations: conversations::Conversations::default(),
+            cancellation: CancellationToken::new(),
+        }))
+    }
+
+    #[test]
+    fn last_work_watcher_detaching_restores_idle_polling_without_an_extra_read() {
+        let handle = polling_handle();
+        let first = Arc::new(DeliveryQueue::new(1, 16));
+        let second = Arc::new(DeliveryQueue::new(2, 16));
+        {
+            let mut publication = handle.publication();
+            publication.watchers.insert(1, Arc::downgrade(&first));
+            publication.watchers.insert(2, Arc::downgrade(&second));
+        }
+        let last = Instant::now();
+        {
+            let mut shared = handle.shared();
+            let tracked = shared.track(Path::new("/fixture/repo"), "repo");
+            tracked.last_poll = Some(last);
+            tracked.next_poll = last + forge::interval(false, 0);
+            shared.set_watching(true);
+            assert_eq!(
+                shared.projects[Path::new("/fixture/repo")].next_poll,
+                last + forge::WATCHED_INTERVAL
+            );
+        }
+        handle.unwatch(1);
+        assert!(
+            handle.shared().being_read(),
+            "the other window still reads Work"
+        );
+        handle.unwatch(2);
+        let shared = handle.shared();
+        assert!(
+            !shared.being_read(),
+            "UI watches leave no two-minute read lease"
+        );
+        assert_eq!(
+            shared.projects[Path::new("/fixture/repo")].next_poll,
+            last + forge::interval(false, 0)
+        );
+    }
+
+    #[test]
+    fn work_watcher_changes_preserve_cli_reads_explicit_refresh_and_backoff() {
+        let handle = polling_handle();
+        let mut shared = handle.shared();
+        let last = Instant::now();
+        let tracked = shared.track(Path::new("/fixture/repo"), "repo");
+        tracked.last_poll = Some(last);
+        tracked.failures = 2;
+        tracked.poll_requested = true;
+        shared.read_at = Some(last);
+        shared.set_watching(true);
+        shared.set_watching(false);
+        assert!(
+            shared.being_read(),
+            "an explicit CLI read retains its own lease"
+        );
+        let tracked = &shared.projects[Path::new("/fixture/repo")];
+        assert_eq!(tracked.next_poll, last + forge::interval(true, 2));
+        assert!(
+            tracked.poll_requested,
+            "an explicit fresh request is not lost"
+        );
+        shared.read_at = Some(last - READ_WINDOW);
+        shared.set_watching(true);
+        shared.set_watching(false);
+        assert!(!shared.being_read());
+        assert_eq!(
+            shared.projects[Path::new("/fixture/repo")].next_poll,
+            last + forge::interval(false, 2)
+        );
+    }
+
+    #[test]
+    fn work_watcher_reconnect_preserves_failed_backoff_but_refreshes_healthy_stale_data() {
+        let handle = polling_handle();
+        let selected = vec![(PathBuf::from("/fixture/repo"), "repo".into())];
+        let deadline = {
+            let mut shared = handle.shared();
+            let tracked = shared.track(&selected[0].0, &selected[0].1);
+            tracked.local = Some(Arc::new(scan::Local::default()));
+            tracked.pending = None;
+            tracked.last_poll = Some(Instant::now() - forge::WATCHED_INTERVAL);
+            tracked.failures = 2;
+            tracked.forge = Forge::Unavailable {
+                reason: "temporarily unavailable".into(),
+            };
+            tracked.next_poll = Instant::now() + forge::interval(true, tracked.failures);
+            tracked.next_poll
+        };
+        // watch() settles the initial board before registering its watch.
+        // Focus changes reconnect this way; they are not explicit refreshes.
+        handle.settle(&selected, false);
+        {
+            let mut shared = handle.shared();
+            shared.set_watching(true);
+            let tracked = &shared.projects[&selected[0].0];
+            assert!(!tracked.poll_requested);
+            assert_eq!(tracked.next_poll, deadline);
+        }
+        handle
+            .shared()
+            .projects
+            .get_mut(&selected[0].0)
+            .unwrap()
+            .failures = 0;
+        handle.settle(&selected, false);
+        assert!(handle.shared().projects[&selected[0].0].poll_requested);
+    }
 
     #[test]
     fn signals_keep_a_notification_sent_before_the_wait() {
