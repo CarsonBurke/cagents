@@ -4520,7 +4520,6 @@ impl Runtime {
         // a reader at the latest edge sees come first, and admission that
         // runs out leaves the oldest history waiting. The cursor stores this
         // order's position.
-        let reading = self.scroll_memory.reading_rows(context.as_deref());
         for position in start..end {
             let index = newest - position;
             let item = &items[index];
@@ -4670,7 +4669,7 @@ impl Runtime {
                         &item.id,
                         if growing {
                             0
-                        } else if reading.iter().any(|id| *id == item.id) {
+                        } else if self.scroll_memory.was_reading(context.as_deref(), &item.id) {
                             1
                         } else {
                             2 + position as u64

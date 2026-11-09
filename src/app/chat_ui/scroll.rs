@@ -268,36 +268,19 @@ impl Memory {
         if evicted && (saved.geometry.is_some() || saved.edge.is_some()) {
             return true;
         }
-        let Some((geometry, top)) = saved.geometry.zip(saved.top) else {
-            return false;
-        };
-        saved.rows.iter().any(|row| {
-            row.bounds.y + row.bounds.height > top
-                && row.bounds.y < top + geometry.viewport.height
-                && pending(&row.id)
-        })
+        saved.shown_rows().any(|row| pending(&row.id))
     }
 
-    /// The rows the saved reading window showed, which a returning reader
-    /// sees first. Empty without saved geometry, such as at the latest edge.
-    pub(super) fn reading_rows(&self, context: Option<&str>) -> Vec<String> {
-        let anchor = self.0.borrow();
-        anchor
+    /// Whether `id` is one of the rows the saved reading window showed,
+    /// which a returning reader sees first. None are without saved geometry,
+    /// such as at the latest edge.
+    pub(super) fn was_reading(&self, context: Option<&str>, id: &str) -> bool {
+        self.0
+            .borrow()
             .contexts
             .iter()
             .find(|saved| saved.subagent.as_deref() == context)
-            .and_then(|saved| Some((saved, saved.geometry?, saved.top?)))
-            .map_or_else(Vec::new, |(saved, geometry, top)| {
-                saved
-                    .rows
-                    .iter()
-                    .filter(|row| {
-                        row.bounds.y + row.bounds.height > top
-                            && row.bounds.y < top + geometry.viewport.height
-                    })
-                    .map(|row| row.id.clone())
-                    .collect()
-            })
+            .is_some_and(|saved| saved.shown_rows().any(|row| row.id == id))
     }
 
     pub fn retained_rows(&self) -> usize {
@@ -1001,6 +984,18 @@ struct Context {
     follow_end: bool,
     edge: Option<Edge>,
     preserve: Option<PreserveRefresh>,
+}
+impl Context {
+    /// The saved rows that intersected the saved viewport.
+    fn shown_rows(&self) -> impl Iterator<Item = &Row> {
+        let window = self.geometry.zip(self.top);
+        self.rows.iter().filter(move |row| {
+            window.is_some_and(|(geometry, top)| {
+                row.bounds.y + row.bounds.height > top
+                    && row.bounds.y < top + geometry.viewport.height
+            })
+        })
+    }
 }
 
 impl Context {
