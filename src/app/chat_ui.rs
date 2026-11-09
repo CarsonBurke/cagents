@@ -2478,6 +2478,9 @@ pub(super) struct Runtime {
     resume_failed: bool,
     /// The daemon says repeating this start cannot help.
     start_retry_blocked: bool,
+    /// Resume may retire this actor before its replacement answers. Keep the
+    /// source body until a successful attachment supplies its successor.
+    resume_source_pinned: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
     /// Notices raised while an earlier page is shown. That page holds
@@ -3433,6 +3436,7 @@ impl Runtime {
             capacity_refused: false,
             resume_failed: false,
             start_retry_blocked: false,
+            resume_source_pinned: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
@@ -4602,7 +4606,7 @@ impl Runtime {
         self.prepare_local_prompt();
         self.refresh_session();
         if !self.visible.load(Ordering::Relaxed) {
-            if !self.retains_failed_start_body()
+            if !self.retains_source_body()
                 && let Some((snapshot, clock)) = self
                     .handle()
                     .and_then(|handle| handle.hidden_snapshot_with_clock())
@@ -4614,7 +4618,7 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let publication = if self.retains_failed_start_body() {
+        let publication = if self.retains_source_body() {
             self.presentation_evicted
                 .then(|| (self.snapshot.clone(), self.source_clock))
         } else {
@@ -5170,7 +5174,7 @@ impl Runtime {
                 self.refresh();
             }
         } else if result.is_ok()
-            && !self.retains_failed_start_body()
+            && !self.retains_source_body()
             && self.handle().is_some_and(|handle| {
                 // Notice suppression is not permission to discard the last
                 // body: a lost client may already have installed metadata.
@@ -5244,11 +5248,11 @@ impl Runtime {
             evicted_cache_entries = cache_entries, exposed_presentation_bytes = 0usize);
     }
 
-    /// A failed start may have retired the old actor while its IPC stream
-    /// remains open. That stream cannot reload this conversation; retain its
-    /// last body until an actual attachment replaces it.
-    fn retains_failed_start_body(&self) -> bool {
-        self.resume_failed || self.start_retry_blocked
+    /// Resume can retire the old actor before its replacement answers. Keep
+    /// the last source body until an actual attachment replaces it, including
+    /// when that start fails while the old IPC stream remains open.
+    fn retains_source_body(&self) -> bool {
+        self.resume_source_pinned || self.resume_failed || self.start_retry_blocked
     }
 
     /// Tells the connection whether to keep the card's snapshot current.
@@ -5264,7 +5268,7 @@ impl Runtime {
         let retain_body = self.visible.load(Ordering::Relaxed);
         let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
         match self.handle() {
-            Some(handle) if handle.is_connected() && !self.retains_failed_start_body() => {
+            Some(handle) if handle.is_connected() && !self.retains_source_body() => {
                 match handle.set_interest(interested, retain_body) {
                     // The connection can drop between the check and the call, and
                     // is then as lost as one found lost: not this pass's to report.
@@ -8725,6 +8729,9 @@ impl Cagents {
         self.chat_ui.capacity_offers.remove(&card);
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) {
             runtime.capacity_refused = false;
+            if intent == chat::Intent::Resume && runtime.resumes_in_place() {
+                runtime.resume_source_pinned = true;
+            }
         }
         let selection = None;
         let initially_visible = self.workspace.visibility(card) == Some(VisibilityClass::Visible)
@@ -10651,6 +10658,7 @@ impl Cagents {
                             runtime.capacity_refused = false;
                             runtime.resume_failed = false;
                             runtime.start_retry_blocked = false;
+                            runtime.resume_source_pinned = false;
                             runtime.show(visible);
                             // Show the new connection's state at once, as a
                             // new runtime does, rather than the ended one's
@@ -27466,7 +27474,10 @@ mod tests {
 
     #[test]
     fn failed_resume_retains_history_and_refusal_when_a_stale_connected_handle_cannot_hydrate() {
-        for recovery in [chat::Recovery::Retry, chat::Recovery::Blocked] {
+        for (recovery, hide_before_reply) in [chat::Recovery::Retry, chat::Recovery::Blocked]
+            .into_iter()
+            .flat_map(|recovery| [false, true].map(|hidden| (recovery, hidden)))
+        {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             app.workspace.resize_viewport(1280.0);
             let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
@@ -27505,6 +27516,13 @@ mod tests {
             app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
             drop(app.start_chat(card, source, chat::Intent::Resume, None, false));
             let attempt = chat_runtime_attempt(&app, card);
+            if hide_before_reply {
+                handle.set_interest(false, false).unwrap();
+                app.set_workspace_surfaces_visible(false);
+                let runtime = app.chat_runtime_mut(target).unwrap();
+                runtime.refresh();
+                assert_eq!(runtime.snapshot.items, [item.clone()]);
+            }
             let reason =
                 "Provider executable claude is not executable in the preserved launch environment";
             answer_start(

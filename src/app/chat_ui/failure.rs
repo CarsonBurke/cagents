@@ -1296,9 +1296,11 @@ impl Runtime {
             .align_y(Alignment::Start)
             .into(),
         ];
-        let blocked_start = self.start_retry_blocked && incident.generic_retry_guidance && incident.sources.iter().any(|source| {
+        let current_local_error = incident.sources.iter().any(|source| {
             matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
         });
+        let blocked_start =
+            self.start_retry_blocked && incident.generic_retry_guidance && current_local_error;
         if !blocked_start {
             rows.push(
                 design::caption(incident.guidance)
