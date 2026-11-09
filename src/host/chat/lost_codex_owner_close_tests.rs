@@ -388,14 +388,29 @@ fn a_receipt_for_another_conversation_keeps_the_refusal() {
 }
 
 /// A holder spawned for the fixture's conversation, serving a provider that
-/// never listens, as Close holds it once it has adopted it.
+/// never listens.
 struct Spawned {
-    owner: chat::native_holder::Detached,
+    holder: Option<chat::native_holder::Holder>,
     _context: Arc<chat::protocol::ExecutionContext>,
     _working: tempfile::TempDir,
 }
 
 impl Spawned {
+    /// The discovery record the holder published for `source`.
+    fn record(source: &Session) -> Record {
+        registry::recovery_candidate(
+            &registry::socket(&registry::directory(Kind::Native).unwrap(), source.id),
+            Kind::Native,
+        )
+        .unwrap()
+        .expect("the spawned holder published its record")
+    }
+
+    /// The owner as Close holds it once it has adopted the holder.
+    fn detach(&mut self) -> chat::native_holder::Detached {
+        self.holder.take().unwrap().preserve()
+    }
+
     fn new(source: &Session) -> Self {
         let working = tempfile::tempdir_in("/var/tmp").unwrap();
         let context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
@@ -416,7 +431,7 @@ impl Spawned {
         let holder = chat::native_holder::spawn(spec, source.clone()).unwrap();
         context.installed();
         Self {
-            owner: holder.preserve(),
+            holder: Some(holder),
             _context: context,
             _working: working,
         }
@@ -440,9 +455,9 @@ fn kill(process: &registry::Process) {
 /// already settled, leaving only the confirmation to fail.
 fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) {
     let fixture = Fixture::new(root);
-    let spawned = Spawned::new(&fixture.source);
-    let record = spawned.owner.record.clone();
-    let owner = spawned.owner.clone();
+    let mut spawned = Spawned::new(&fixture.source);
+    let record = Spawned::record(&fixture.source);
+    let owner = spawned.detach();
     fixture.host.lock().unwrap().native_closing.insert(
         fixture.source.id,
         native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, released),
@@ -474,23 +489,26 @@ fn a_released_close_whose_owner_then_ended_closes() {
     pending_close_whose_owner_then_ended(&root, true);
 }
 
-/// A pending close whose owner is still running is that owner's to settle;
-/// the lost-owner path never takes it over.
+/// A pending close whose holder died while its provider runs on may still be
+/// writing the conversation, so the close keeps refusing and stays pending,
+/// and settles once the provider has ended too.
 #[test]
-fn a_pending_close_of_a_running_owner_keeps_waiting_for_it() {
-    let Some(root) = isolated("a_pending_close_of_a_running_owner_keeps_waiting_for_it") else {
+fn a_pending_close_whose_provider_outlived_its_holder_waits_for_it() {
+    let Some(root) = isolated("a_pending_close_whose_provider_outlived_its_holder_waits_for_it")
+    else {
         return;
     };
     let fixture = Fixture::new(&root);
-    let spawned = Spawned::new(&fixture.source);
-    let record = spawned.owner.record.clone();
-    let owner = spawned.owner.clone();
+    let mut spawned = Spawned::new(&fixture.source);
+    let record = Spawned::record(&fixture.source);
+    // The holder dies while it still serves its provider.
+    kill(&record.holder);
+    assert!(record.root.is_current(), "the provider outlived its holder");
+    let owner = spawned.detach();
     fixture.host.lock().unwrap().native_closing.insert(
         fixture.source.id,
-        native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, true),
+        native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, false),
     );
-    // Its Release was answered, but no receipt confirms it and the provider
-    // still runs, so the conversation may still be written.
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(
         fixture
@@ -500,7 +518,7 @@ fn a_pending_close_of_a_running_owner_keeps_waiting_for_it() {
             .native_closing
             .contains_key(&fixture.source.id)
     );
-    kill(&record.holder);
+    assert!(has_native_owner(&fixture.source).unwrap());
     kill(&record.root);
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
     fixture.assert_settled();
