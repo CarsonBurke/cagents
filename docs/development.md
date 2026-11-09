@@ -244,7 +244,19 @@ harness. Listing still works without one; garbage collection refuses to remove
 instances or storage when harness liveness cannot be checked. Native evidence
 uses the window backend inside its private KWin compositor. With no portal it
 shares that private bus; with `--portal` the harness owns the portal's private
-bus. Named development instances use the headless backend.
+bus. Named development instances use the headless backend. It needs `Xvfb`; on
+Fedora the package is `xorg-x11-server-Xvfb`. On fw16 its signed Fedora RPM is
+extracted under the isolated prefix's `tools/`, with `bin/Xvfb` pointing to
+`../tools/usr/bin/Xvfb`, so no system package or global session is replaced.
+The prefix's `bin/niri-harness` launcher invokes `/usr/bin/python3` directly;
+this avoids mise shims recursing under moved HOME or waiting on checkout trust.
+The source script remains under `lib/niri-harness/bin/niri-harness`.
+
+Named headless instances default to `LIBGL_ALWAYS_SOFTWARE=1` and
+`WGPU_BACKEND=gl`, matching Xvfb's software EGL context. This avoids the observed
+Niri26.04 DMA-BUF import crash on fw16's software backend. Explicit caller values
+win. Ordinary launches and native evidence's window backend retain their
+renderer selection.
 
 ### Parallel instances
 

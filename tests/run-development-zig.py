@@ -600,6 +600,23 @@ exit 83
         self.assertEqual(name, "cagents-ui")
         self.assertTrue(program.endswith("/cagents-ui"))
 
+    def test_headless_instances_select_compatible_rendering_and_keep_explicit_choices(self):
+        started = self.root / "renderer-settings"
+        harness = self.root / "bin/niri-harness"
+        write_harness(harness, f'''#!/bin/sh
+case " $* " in
+ *" start "*) printf '%s %s\\n' "$LIBGL_ALWAYS_SOFTWARE" "$WGPU_BACKEND" >"{started}" ;;
+ *) exit 1 ;;
+esac
+''')
+        harness.chmod(0o755)
+        for key in ("LIBGL_ALWAYS_SOFTWARE", "WGPU_BACKEND"):
+            self.env.pop(key, None)
+        self.launch("--browserless", "--instance", "software")
+        self.assertEqual(started.read_text().strip(), "1 gl")
+        self.launch("--browserless", "--instance", "explicit", LIBGL_ALWAYS_SOFTWARE="0", WGPU_BACKEND="vulkan")
+        self.assertEqual(started.read_text().strip(), "0 vulkan")
+
     def test_an_instance_runs_under_a_memory_limit(self):
         limit = self.runner.with_name("memory-capped")
         limit.write_text('#!/bin/sh\nshift 2\nexec "$@"\n')
