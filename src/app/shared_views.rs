@@ -2463,16 +2463,21 @@ impl Cagents {
         canonical: &crate::chat::Session,
     ) {
         use std::collections::hash_map::Entry;
+        // While this window's own first send is saving, storage is about to
+        // hold the conversation it queued rather than the draft memory still
+        // shows; a peer's start that wins replaces that one. A refused send
+        // leaves the draft, and the writer then expects that instead.
+        let stored = self.draft_start_candidate(card).unwrap_or(saved).clone();
         match self.shared_views.chat_adoptions.entry(card) {
             // Storage decides at the write whether anything is left to adopt,
             // including a return to the conversation it already holds.
             Entry::Occupied(mut entry) => entry.get_mut().canonical = canonical.clone(),
             Entry::Vacant(entry)
-                if crate::persistence::chat_identity_change(saved, canonical).is_some() =>
+                if crate::persistence::chat_identity_change(&stored, canonical).is_some() =>
             {
                 entry.insert(crate::session::ChatIdentityAdoption {
                     card,
-                    expected: saved.id,
+                    expected: stored.id,
                     canonical: canonical.clone(),
                 });
             }

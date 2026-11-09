@@ -3252,9 +3252,6 @@ impl Runtime {
             .unwrap_or(&self.attachments)
     }
 
-    /// A first prompt is still local work until the provider accepts it.
-    /// Keep that source and any later composer edits together as an inert
-    /// recovery draft; restoring it never automatically submits either part.
     /// Checks carried-over unsent text against the first message of the
     /// conversation another window started from this draft, once the
     /// transcript shows it.
@@ -3300,6 +3297,9 @@ impl Runtime {
         }
     }
 
+    /// A first prompt is still local work until the provider accepts it.
+    /// Keep that source and any later composer edits together as an inert
+    /// recovery draft; restoring it never automatically submits either part.
     fn persistent_draft(&self) -> (String, Vec<Attachment>) {
         let mut text = self.unsent_text();
         let mut images = self
@@ -7116,6 +7116,15 @@ impl Cagents {
                     && (runtime.attachment_chooser_pending.is_some() || runtime.pastes_pending != 0))
     }
 
+    /// The conversation this window's own first send from draft `card` has
+    /// already queued for storage, while that send is still saving.
+    pub(super) fn draft_start_candidate(&self, card: CardId) -> Option<&chat::Session> {
+        self.chat_ui
+            .draft_checkpoints
+            .get(&card)
+            .map(|pending| &pending.candidate)
+    }
+
     pub(in crate::app) fn chat_is_draft(&self, card: CardId) -> bool {
         matches!(self.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
     }
@@ -7977,11 +7986,10 @@ impl Cagents {
         self.observe_agent_activity_for_card(card, None);
     }
 
-    /// Captures the unsent text and images of `card`'s chat runtime, which is
-    /// about to be dropped while the card lives on, so whatever runtime the
-    /// card builds next opens with them rather than losing them.
     /// Puts what was composed in `card` before its runtime last left, or
-    /// before its conversation was replaced, in `runtime`'s composer.
+    /// before its conversation was replaced, in `runtime`'s composer. Text
+    /// carried from a draft another window started is checked against that
+    /// conversation's first message, once.
     pub(super) fn restore_unsent_chat(&mut self, card: CardId, runtime: &mut Runtime) {
         if let Some(draft) = self.chat_ui.drafts.remove(&card)
             && !draft.is_empty()
@@ -7998,6 +8006,9 @@ impl Cagents {
         if !attachments.is_empty() {
             runtime.replace_attachments(attachments);
         }
+        if self.chat_ui.started_elsewhere.remove(&card) {
+            runtime.await_first_message_echo();
+        }
     }
 
     /// Keeps what the reader is composing in draft `card`, whose conversation
@@ -8009,12 +8020,16 @@ impl Cagents {
         let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
             return;
         };
-        let files = runtime
-            .unsent_attachments()
-            .iter()
-            .filter(|attachment| attachment.reference.is_none())
-            .cloned()
-            .collect::<Vec<_>>();
+        // Images travel with the saved draft; other files only in memory.
+        // A message still queued behind this window's own start is unsent
+        // too, and its text and images are in the saved draft already.
+        let mut files = Vec::<Attachment>::new();
+        let queued = runtime.queued.iter().flat_map(|queued| &queued.attachments);
+        for attachment in queued.chain(runtime.unsent_attachments()) {
+            if attachment.reference.is_none() && !files.contains(attachment) {
+                files.push(attachment.clone());
+            }
+        }
         if started && runtime.is_draft() {
             self.chat_ui.started_elsewhere.insert(card);
         } else {
@@ -8027,6 +8042,9 @@ impl Cagents {
         }
     }
 
+    /// Captures the unsent text and images of `card`'s chat runtime, which is
+    /// about to be dropped while the card lives on, so whatever runtime the
+    /// card builds next opens with them rather than losing them.
     pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
         if let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) {
             let (draft, images) = runtime.persistent_draft();
@@ -8072,7 +8090,7 @@ impl Cagents {
             return;
         }
         let snapshot = self.persistent_workspace();
-        self.record_shared_chat_identities();
+        self.record_shared_chat_identities(Some(&snapshot));
         if let Some(writer) = self.session.as_ref() {
             writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
         }
@@ -9163,7 +9181,7 @@ impl Cagents {
         // The composer and public source are still A. The snapshot projection
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
-        self.record_shared_chat_identities();
+        self.record_shared_chat_identities(Some(&snapshot));
         let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit
@@ -10733,9 +10751,6 @@ impl Cagents {
                             // Whatever was typed before this card last left the
                             // chat surface comes back with it.
                             self.restore_unsent_chat(target.card, &mut runtime);
-                            if self.chat_ui.started_elsewhere.remove(&target.card) {
-                                runtime.await_first_message_echo();
-                            }
                             runtime.tool_groups_expanded = self.settings.chat_expand_tool_groups;
                             runtime.show(visible);
                             if let Some(CardRuntime::Terminal(terminal)) = self

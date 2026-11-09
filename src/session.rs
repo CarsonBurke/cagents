@@ -787,16 +787,23 @@ impl SessionRuntime {
     /// of the ones this window last saved for them, which other clients
     /// started or replaced. Snapshots refuse such a change on their own.
     ///
-    /// The caller queues the write that shows them right after, which keeps
-    /// it behind them in either queue mode.
-    pub fn adopt_chat_identities(&self, adoptions: impl IntoIterator<Item = ChatIdentityAdoption>) {
+    /// `state`, when given, becomes the newest snapshot under the same lock,
+    /// so the writer can't pair the adoptions with an older snapshot that
+    /// still shows the replaced conversation. A caller that passes `None`
+    /// queues the write that shows them right after, which keeps it behind
+    /// them in either queue mode.
+    pub fn adopt_chat_identities(
+        &self,
+        adoptions: impl IntoIterator<Item = ChatIdentityAdoption>,
+        state: Option<Arc<WorkspaceState>>,
+    ) {
         self.replace_identities(
             adoptions.into_iter().map(|adoption| IdentityReplacement {
                 card_id: adoption.card,
                 expected_terminal_id: adoption.expected,
                 replacement: Replacement::SharedChat(adoption.canonical),
             }),
-            None,
+            state,
         );
     }
 
