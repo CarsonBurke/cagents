@@ -152,7 +152,14 @@ impl Fixture {
             root,
         };
         record.create(&directory).unwrap();
-        assert!(has_native_owner(&self.source).unwrap());
+        assert_eq!(
+            registry::recovery_candidate(
+                &registry::socket(&directory, self.source.id),
+                Kind::Native
+            )
+            .unwrap(),
+            Some(record.clone())
+        );
         record
     }
 
@@ -645,11 +652,36 @@ fn codex_start(fixture: &Fixture) -> Result<ServerResponse, ProtocolError> {
 }
 
 fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
-    let response = codex_start(fixture).unwrap();
+    let response = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatStart {
+            session: fixture.source.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap();
     assert!(matches!(response, ServerResponse::ChatAttached { .. }));
+    if fixture.source.launch.recipe.arguments == ["--remote", "unix://"] {
+        let ServerResponse::ChatAttached { session, .. } = &response else {
+            unreachable!()
+        };
+        assert!(
+            fixture.source.resolved_to_owned_codex_listener(session),
+            "the resumed allocation must pass the saved pane's checkpoint contract"
+        );
+    }
     let expected = format!(
         "app-server\n--listen\nunix://{}\n",
-        fixture.socket().display()
+        fixture.host.lock().unwrap().chats[&fixture.source.id]
+            .session
+            .owned_codex_listener
+            .as_ref()
+            .unwrap()
+            .socket
+            .display()
     );
     let deadline = Instant::now() + Duration::from_secs(5);
     let argv = loop {
@@ -666,11 +698,7 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
     };
     assert_eq!(
         argv.lines().collect::<Vec<_>>(),
-        [
-            "app-server",
-            "--listen",
-            &format!("unix://{}", fixture.socket().display())
-        ]
+        ["app-server", "--listen", expected.lines().nth(2).unwrap()]
     );
     let handle = fixture.host.lock().unwrap().chats[&fixture.source.id]
         .handle
@@ -699,7 +727,9 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     else {
         return;
     };
-    let fixture = codex_start_fixture(&root);
+    let mut fixture = codex_start_fixture(&root);
+    let old_socket = fixture.socket().to_owned();
+    fixture.source.owned_codex_listener = None;
     struct Named(std::process::Child);
     impl Drop for Named {
         fn drop(&mut self) {
@@ -710,7 +740,7 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     let mut named = Named(
         std::process::Command::new("/bin/sh")
             .args(["-c", "printf ready; IFS= read -r release"])
-            .arg(fixture.socket())
+            .arg(&old_socket)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
@@ -725,7 +755,7 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
         .read_exact(&mut ready)
         .unwrap();
     assert_eq!(&ready, b"ready");
-    assert!(!fixture.socket().exists());
+    assert!(!old_socket.exists());
     let failure = codex_start(&fixture).unwrap_err();
     assert!(
         failure
@@ -751,18 +781,175 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
 }
 
 #[test]
-fn codex_start_refuses_legacy_listener_without_old_execution_evidence() {
-    let Some(root) = isolated("codex_start_refuses_legacy_listener_without_old_execution_evidence")
-    else {
+fn codex_start_legacy_pane_without_a_surviving_process_starts() {
+    let Some(root) = isolated("codex_start_legacy_pane_without_a_surviving_process_starts") else {
         return;
     };
     let mut fixture = codex_start_fixture(&root);
     fixture.source.owned_codex_listener = None;
-    let failure = codex_start(&fixture).unwrap_err();
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_start_earlier_boot_legacy_pane_starts() {
+    let Some(root) = isolated("codex_start_earlier_boot_legacy_pane_starts") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    let mut record = fixture.record(current(), current());
+    record.remove(&registry::directory(Kind::Native).unwrap());
+    record.boot = crate::model::BootId::new("earlier-boot");
+    record
+        .create(&registry::directory(Kind::Native).unwrap())
+        .unwrap();
+    fixture.source.proof.as_mut().unwrap().boot_id = record.boot;
+    fixture.source.owned_codex_listener = None;
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_start_legacy_pane_with_an_ended_holder_record_starts() {
+    let Some(root) = isolated("codex_start_legacy_pane_with_an_ended_holder_record_starts") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.record(exited(i32::MAX - 1), exited(i32::MAX - 2));
+    fixture.source.owned_codex_listener = None;
+    let control = registry::socket(
+        &registry::directory(Kind::Native).unwrap(),
+        fixture.source.id,
+    );
+    drop(registry::bind(&control).unwrap());
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_start_paired_console_without_surviving_execution_starts() {
+    let Some(root) = isolated("codex_start_paired_console_without_surviving_execution_starts")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.source.terminal = Some(
+        crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            fixture.source.id,
+            fixture.source.launch.recipe.clone(),
+            None,
+        )
+        .session,
+    );
+    std::os::unix::fs::symlink(root.join("missing-socket"), fixture.socket()).unwrap();
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_picker_resume_of_an_ended_pane_starts() {
+    let Some(root) = isolated("codex_picker_resume_of_an_ended_pane_starts") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a prepared resume");
+    };
+    assert_ne!(session.id, fixture.source.id);
+    assert_eq!(session.launch.session_id, fixture.source.launch.session_id);
+    fixture.source = session;
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_picker_resume_with_earlier_boot_console_evidence_starts() {
+    let Some(root) = isolated("codex_picker_resume_with_earlier_boot_console_evidence_starts")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    let mut proof = fixture.source.proof.clone().unwrap();
+    proof.boot_id = crate::model::BootId::new("prior-boot");
+    fixture.source.proof = Some(proof.clone());
+    fixture
+        .source
+        .owned_codex_listener
+        .as_mut()
+        .unwrap()
+        .allocator = proof.clone();
+    let console_id = fixture.source.id;
+    let mut console = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+        console_id,
+        fixture.source.launch.recipe.clone(),
+        None,
+    )
+    .session;
+    console.continuity = crate::model::TerminalContinuity::Live {
+        host_session_id: proof.host_session_id,
+        boot_id: proof.boot_id.clone(),
+        host_incarnation: proof.host_incarnation,
+    };
+    fixture.source.terminal = Some(console);
+    let directory = registry::directory(Kind::Terminal).unwrap();
+    crate::secure_file::prepare_private_directory(&directory).unwrap();
+    Record {
+        version: 4,
+        build: None,
+        kind: Kind::Terminal,
+        application: crate::instance::APPLICATION_ID.into(),
+        boot: proof.boot_id,
+        terminal: console_id,
+        holder: current(),
+        root: current(),
+    }
+    .create(&directory)
+    .unwrap();
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a prepared resume");
+    };
+    fixture.source = session;
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_picker_reports_unreadable_console_evidence() {
+    let Some(root) = isolated("codex_picker_reports_unreadable_console_evidence") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    let console = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+        fixture.source.id,
+        fixture.source.launch.recipe.clone(),
+        None,
+    )
+    .session;
+    let directory = registry::directory(Kind::Terminal).unwrap();
+    crate::secure_file::prepare_private_directory(&directory).unwrap();
+    let path = registry::socket(&directory, console.id).with_extension("json");
+    std::fs::write(&path, "unreadable record").unwrap();
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+    fixture.source.terminal = Some(console);
+    let failure = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    )
+    .unwrap_err();
     assert!(
-        failure
-            .message
-            .contains("old Codex process could not be checked"),
+        failure.message.contains("Cannot read holder record"),
         "{}",
         failure.message
     );
@@ -770,38 +957,30 @@ fn codex_start_refuses_legacy_listener_without_old_execution_evidence() {
 }
 
 #[test]
-fn codex_start_refuses_unproved_console_without_retiring_the_endpoint() {
-    let Some(root) = isolated("codex_start_refuses_unproved_console_without_retiring_the_endpoint")
-    else {
+fn codex_start_legacy_equals_endpoint_without_survivors_starts() {
+    let Some(root) = isolated("codex_start_legacy_equals_endpoint_without_survivors_starts") else {
         return;
     };
     let mut fixture = codex_start_fixture(&root);
-    // A paired console with no complete boot proof is outside the shared
-    // inspector's evidence, even though the listener itself looks stopped.
-    fixture.source.terminal = Some(
-        crate::terminal_ipc::TerminalDescriptor::relaunchable(
-            TerminalId::new(),
-            fixture.source.launch.recipe.clone(),
-            None,
-        )
-        .session,
-    );
-    std::os::unix::fs::symlink(root.join("missing-socket"), fixture.socket()).unwrap();
-    let failure = codex_start(&fixture).unwrap_err();
-    assert!(
-        failure
-            .message
-            .contains("old Codex process could not be checked"),
-        "{}",
-        failure.message
-    );
-    assert!(
-        std::fs::symlink_metadata(fixture.socket())
-            .unwrap()
-            .file_type()
-            .is_symlink()
-    );
-    assert!(!root.join("started-argv").exists());
+    fixture.source.launch.recipe.arguments =
+        vec![format!("--remote=unix://{}", fixture.socket().display())];
+    fixture.source.owned_codex_listener = None;
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_picker_resume_of_an_ended_legacy_pane_starts() {
+    let Some(root) = isolated("codex_picker_resume_of_an_ended_legacy_pane_starts") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.source.owned_codex_listener = None;
+    // The legacy picker performs this transformation without PrepareResume.
+    fixture.source.reset_owned_codex_listener();
+    fixture.source.id = TerminalId::new();
+    fixture.source.proof = None;
+    fixture.source.terminal = None;
+    assert_codex_started(&fixture, &root);
 }
 
 #[test]
@@ -835,7 +1014,7 @@ fn codex_start_refuses_unreadable_listener_evidence() {
     assert!(
         failure
             .message
-            .contains("old Codex process could not be checked"),
+            .contains("Cannot read Codex listener target"),
         "{}",
         failure.message
     );

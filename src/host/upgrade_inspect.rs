@@ -487,6 +487,9 @@ impl ExecutionEvidence {
     /// twice, before resolution and against the final roster, to narrow it.
     fn classify(&self, source: &Session) -> SavedExecution {
         use crate::daemon::holder_registry::{self, Kind};
+        if source.launch.provider == crate::agent::Provider::Codex {
+            return self.classify_codex(source);
+        }
         if source.proof.is_none() {
             return self.classify_proofless(source);
         }
@@ -495,9 +498,6 @@ impl ExecutionEvidence {
         };
         if proof.boot_id != self.boot {
             return SavedExecution::Ended;
-        }
-        if source.launch.provider == crate::agent::Provider::Codex {
-            return self.classify_codex(source);
         }
         // A paired console runs outside the actor; this roster cannot see it.
         if !matches!(
@@ -608,91 +608,140 @@ impl ExecutionEvidence {
         execution
     }
 
-    /// A Codex pane of this boot is served by one `codex app-server` that
-    /// listens on the pane's own daemon-allocated socket, run either by the
-    /// daemon itself or by a native holder. That socket path names the pane,
-    /// and the server is the only writer of its conversation. It has ended
-    /// when its holder, if one registered, is gone with everything in its
-    /// process group and session, no process of this user still names the
-    /// pane's listener, and no socket is bound at that path or at the socket
-    /// Codex publishes it as a symlink to. Tool work that
-    /// left a dead server's process group writes no conversation. A paired
-    /// console runs outside the server, so a pane whose console was paired in
-    /// this boot stays unproved.
+    /// Classify execution independently of adoption capabilities. Missing
+    /// listener ownership or continuity is not evidence of a surviving writer.
     fn classify_codex(&self, source: &Session) -> SavedExecution {
         match self.codex_execution(source) {
             CodexExecution::Ended => SavedExecution::Ended,
             CodexExecution::Running { .. } => SavedExecution::Running,
-            CodexExecution::Unproved => SavedExecution::Unproved,
+            CodexExecution::Unproved { .. } => SavedExecution::Unproved,
         }
     }
 
     fn codex_execution(&self, source: &Session) -> CodexExecution {
+        self.inspect_codex_execution(source)
+            .unwrap_or_else(|reason| CodexExecution::Unproved { reason })
+    }
+
+    fn inspect_codex_execution(&self, source: &Session) -> Result<CodexExecution, String> {
         use crate::daemon::holder_registry::{self, Kind};
-        // A console paired in an earlier kernel boot cannot still run; one of
-        // this boot, or with incomplete evidence, is outside what this sees.
-        let console_ended = source.terminal.as_ref().is_none_or(|terminal| {
-            terminal
-                .continuity
-                .live_proof()
-                .is_some_and(|proof| proof.is_complete() && proof.boot_id != self.boot)
-        });
-        let Some(listener) = source.owned_codex_listener.as_ref().filter(|_| {
-            source.owns_codex_listener() && source.has_valid_native_continuity() && console_ended
-        }) else {
-            return CodexExecution::Unproved;
-        };
-        let Ok(native_holders) = &self.native_holders else {
-            return CodexExecution::Unproved;
-        };
-        let control = holder_registry::socket(native_holders, source.id);
-        // Discovery refuses a record of another boot.
-        let holder = match holder_registry::recovery_candidate(&control, Kind::Native) {
-            Ok(holder) => holder,
-            Err(_) => return CodexExecution::Unproved,
-        };
-        if let Some(holder) = holder {
-            match crate::chat::runtime::retained_actor_abandoned(&holder.holder, &holder.root) {
-                Ok(true) => {}
-                Ok(false) => return CodexExecution::Running { pid: None },
-                Err(_) => return CodexExecution::Unproved,
+        let native_holders = self.native_holders.as_ref().map_err(Clone::clone)?;
+        let mut controls = vec![holder_registry::socket(native_holders, source.id)];
+        if let Some(terminal) = &source.terminal {
+            let directory = holder_registry::directory(Kind::Terminal)?;
+            controls.push(holder_registry::socket(&directory, terminal.id));
+        }
+        let holders = controls
+            .iter()
+            .map(|control| {
+                holder_registry::execution_record(control)
+                    .map_err(|error| format!("Cannot read holder record: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Session.proof records the native execution's boot, including legacy
+        // panes. The console, allocator and holder each retain their own boot.
+        // Only unanimous earlier-boot evidence skips this boot's kernel scans.
+        let terminal_proof = source
+            .terminal
+            .as_ref()
+            .and_then(|terminal| terminal.continuity.live_proof());
+        let boots = source
+            .proof
+            .iter()
+            .map(|proof| &proof.boot_id)
+            .chain(terminal_proof.iter().map(|proof| &proof.boot_id))
+            .chain(
+                source
+                    .owned_codex_listener
+                    .iter()
+                    .map(|listener| &listener.allocator.boot_id),
+            )
+            .chain(
+                source
+                    .terminal
+                    .iter()
+                    .filter_map(|terminal| terminal.owned_codex_listener.as_ref())
+                    .map(|listener| &listener.allocator.boot_id),
+            )
+            .chain(holders.iter().flatten().map(|holder| &holder.boot))
+            .collect::<Vec<_>>();
+        if !boots.is_empty()
+            && boots
+                .iter()
+                .all(|boot| !boot.as_str().is_empty() && **boot != self.boot)
+        {
+            return Ok(CodexExecution::Ended);
+        }
+        for holder in holders
+            .iter()
+            .flatten()
+            .filter(|holder| holder.boot == self.boot)
+        {
+            if !crate::chat::runtime::codex_execution_abandoned(&holder.holder, &holder.root)? {
+                let pid = [&holder.root, &holder.holder]
+                    .into_iter()
+                    .find(|process| process.is_current())
+                    .and_then(|process| u32::try_from(process.pid).ok());
+                return Ok(CodexExecution::Running { pid });
             }
         }
-        // Recent Codex releases bind a socket in their own runtime directory
-        // and publish the listener path as a symlink to it.
-        let published = match std::fs::read_link(&listener.socket) {
-            Ok(target) => Some(listener.socket.with_file_name(target)),
-            Err(error)
-                if error.kind() == io::ErrorKind::NotFound
-                    || error.raw_os_error() == Some(libc::EINVAL) =>
-            {
-                None
-            }
-            Err(_) => return CodexExecution::Unproved,
-        };
-        // A holder binds its control socket before it starts the server and
-        // publishes its record, so a starting holder is seen by that socket.
-        let mut sockets = vec![listener.socket.as_path(), control.as_path()];
-        sockets.extend(published.as_deref());
-        match codex_listener_survives(&self.processes, source.id, &sockets, self.exec_settle) {
-            Ok(execution) => execution,
-            Err(_) => CodexExecution::Unproved,
+        // Legacy panes still record their endpoint in argv. Inspect it even
+        // without allocator or continuity evidence, including Codex's published
+        // symlink target and sockets unlinked while a server remains bound.
+        let mut endpoints = source
+            .recorded_codex_socket()
+            .into_iter()
+            .collect::<Vec<_>>();
+        endpoints.extend(
+            source
+                .owned_codex_listener
+                .iter()
+                .map(|listener| listener.socket.clone()),
+        );
+        if let Some(terminal) = &source.terminal {
+            endpoints.extend(crate::chat::recorded_codex_socket(&terminal.launch));
+            endpoints.extend(
+                terminal
+                    .owned_codex_listener
+                    .iter()
+                    .map(|listener| listener.socket.clone()),
+            );
         }
+        endpoints.sort();
+        endpoints.dedup();
+        let mut sockets = controls;
+        for endpoint in endpoints {
+            match std::fs::read_link(&endpoint) {
+                Ok(target) => sockets.push(endpoint.with_file_name(target)),
+                Err(error)
+                    if error.kind() == io::ErrorKind::NotFound
+                        || error.raw_os_error() == Some(libc::EINVAL) => {}
+                Err(error) => return Err(format!("Cannot read Codex listener target: {error}")),
+            }
+            sockets.push(endpoint);
+        }
+        let sockets = sockets
+            .iter()
+            .map(|socket| socket.as_path())
+            .collect::<Vec<_>>();
+        codex_listener_survives(&self.processes, source.id, &sockets, self.exec_settle)
     }
 }
 
 /// The same execution proof used by source inspection, close and resume.
 /// A socket or surviving process group need not identify a live process ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CodexExecution {
     Ended,
     Running { pid: Option<u32> },
-    Unproved,
+    Unproved { reason: String },
 }
 
 pub(super) fn codex_execution(source: &Session, boot: &crate::model::BootId) -> CodexExecution {
     if source.launch.provider != crate::agent::Provider::Codex {
-        return CodexExecution::Unproved;
+        return CodexExecution::Unproved {
+            reason: "The pane is not a Codex conversation".into(),
+        };
     }
     ExecutionEvidence::codex(boot).codex_execution(source)
 }
@@ -1548,7 +1597,7 @@ mod tests {
     }
 
     #[test]
-    fn same_boot_execution_without_complete_evidence_is_unproved() {
+    fn same_boot_claude_execution_without_complete_evidence_is_unproved() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let card = retained_card(current_boot());
         let ended = vec![(card.id, owner(&card, ended_process(), ended_process()))];
@@ -1572,7 +1621,14 @@ mod tests {
         reconnect_only.native_continuity = NativeContinuity::ReconnectOnly;
         let mut codex = reconnect_only.clone();
         codex.launch.provider = Provider::Codex;
-        for card in [paired, unowned, reconnect_only, codex] {
+        assert_eq!(
+            LiveProcesses::new()
+                .evidence(holders.path())
+                .classify(&codex),
+            SavedExecution::Ended,
+            "Codex uses process and socket evidence, not the Claude census"
+        );
+        for card in [paired, unowned, reconnect_only] {
             assert_eq!(
                 evidence(holders.path(), ended.clone()).classify(&card),
                 SavedExecution::Unproved
@@ -1613,14 +1669,15 @@ mod tests {
                 live_processes.evidence(holders.path()).classify(&card),
                 SavedExecution::Ended
             );
-            // Discovery refuses a record of another boot; that proves nothing.
+            // A prior-boot record cannot name a surviving holder, even when
+            // its PID and start time happen to match a process of this boot.
             let mut older = owner(&card, running_process(), running_process());
             older.boot = BootId::new("previous-boot");
             let holders = tempfile::tempdir_in("/var/tmp").unwrap();
             older.create(holders.path()).unwrap();
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
-                SavedExecution::Unproved
+                SavedExecution::Ended
             );
         }
     }
@@ -1906,7 +1963,97 @@ mod tests {
     }
 
     #[test]
-    fn codex_pane_without_complete_evidence_is_unproved() {
+    fn codex_earlier_boot_requires_every_recorded_execution_to_have_ended() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let holders = tempfile::tempdir_in("/var/tmp").unwrap();
+        let [mut card, _] = codex_cards(root.path());
+        let prior_boot = BootId::new("prior-boot");
+        card.proof.as_mut().unwrap().boot_id = prior_boot.clone();
+        card.owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = prior_boot.clone();
+        let mut old_holder = owner(&card, running_process(), running_process());
+        old_holder.boot = prior_boot.clone();
+        old_holder.create(holders.path()).unwrap();
+        // No kernel scan is needed when every execution belongs to an ended
+        // boot. Matching PIDs from this boot cannot revive those identities.
+        let unreadable_kernel = ExecutionEvidence {
+            processes: root.path().join("unavailable-proc"),
+            ..evidence(holders.path(), Vec::new())
+        };
+        assert_eq!(
+            unreadable_kernel.codex_execution(&card),
+            CodexExecution::Ended
+        );
+        // The same applies to the original legacy shape: only Session.proof
+        // records the boot, and no allocator/native capability ever existed.
+        let mut legacy = card.clone();
+        legacy.owned_codex_listener = None;
+        assert_eq!(
+            unreadable_kernel.codex_execution(&legacy),
+            CodexExecution::Ended
+        );
+
+        // Each independent record can disprove that shortcut. With this boot
+        // represented, an unreadable process table must remain an explicit
+        // read failure rather than being masked by Session.proof.
+        card.owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = current_boot();
+        assert!(
+            matches!(unreadable_kernel.codex_execution(&card), CodexExecution::Unproved { reason } if reason.contains("Cannot enumerate processes"))
+        );
+        card.owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = prior_boot;
+        let mut console = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            card.launch.recipe.clone(),
+            None,
+        )
+        .session;
+        console.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: "console".into(),
+            boot_id: current_boot(),
+            host_incarnation: "console".into(),
+        };
+        card.terminal = Some(console);
+        assert!(
+            matches!(unreadable_kernel.codex_execution(&card), CodexExecution::Unproved { reason } if reason.contains("Cannot enumerate processes"))
+        );
+        // The console's listener allocator is an independent execution record.
+        let terminal = card.terminal.as_mut().unwrap();
+        if let crate::model::TerminalContinuity::Live { boot_id, .. } = &mut terminal.continuity {
+            *boot_id = BootId::new("prior-boot");
+        }
+        terminal.owned_codex_listener = card.owned_codex_listener.clone();
+        terminal
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = current_boot();
+        assert!(
+            matches!(unreadable_kernel.codex_execution(&card), CodexExecution::Unproved { reason } if reason.contains("Cannot enumerate processes"))
+        );
+        card.terminal = None;
+        old_holder.remove(holders.path());
+        old_holder.boot = current_boot();
+        old_holder.create(holders.path()).unwrap();
+        assert!(matches!(
+            unreadable_kernel.codex_execution(&card),
+            CodexExecution::Running { pid: Some(_) }
+        ));
+    }
+
+    #[test]
+    fn codex_pane_missing_capabilities_uses_execution_evidence() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let [card, _] = codex_cards(root.path());
@@ -1937,7 +2084,7 @@ mod tests {
         for card in [paired, unowned, foreign, unproved, console.clone()] {
             assert_eq!(
                 live_processes.evidence(holders.path()).classify(&card),
-                SavedExecution::Unproved
+                SavedExecution::Ended
             );
         }
         // One paired in an earlier boot cannot, so the server alone decides.
@@ -2540,7 +2687,13 @@ mod tests {
         // is not the absence of one.
         let mut codex = card.clone();
         codex.launch.provider = Provider::Codex;
-        assert_eq!(retired.classify(&codex), SavedExecution::Unproved);
+        assert_eq!(
+            LiveProcesses::new()
+                .evidence(holders.path())
+                .classify(&codex),
+            SavedExecution::Ended,
+            "a proofless Codex pane uses kernel evidence without a Claude census"
+        );
         let mut incomplete = card.clone();
         incomplete.proof = Some(HostSessionProof {
             host_session_id: HostSessionId::new(""),
