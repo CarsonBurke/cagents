@@ -3893,6 +3893,7 @@ mod tests {
                     false,
                     navigation,
                     &shortcuts,
+                    false,
                 ),
                 Size::new(280.0, 900.0),
                 cache,
