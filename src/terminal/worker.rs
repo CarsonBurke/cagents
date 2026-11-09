@@ -902,6 +902,20 @@ impl PublishedState {
         );
     }
 
+    /// Admits commands to what the completed terminal left. Nothing is
+    /// published after this, so the published screen is its screen even when
+    /// it completed hidden and no history could be kept to replace it.
+    fn freeze(
+        &self,
+        history: Result<archive::History, String>,
+        events: Arc<Sender<TerminalEvent>>,
+    ) {
+        self.hidden_through.store(0, Ordering::Release);
+        *self.archive.lock().unwrap_or_else(|p| p.into_inner()) =
+            ArchivePhase::Frozen { history, events };
+        self.archive_ready.notify_all();
+    }
+
     /// Whether `snapshot`, read from this state, is the screen the worker is
     /// showing now rather than one from before it was last hidden.
     fn presents(&self, snapshot: &RenderSnapshot) -> bool {
@@ -1300,8 +1314,8 @@ impl TerminalHandle {
         match receive.recv_timeout(Duration::from_secs(3)) {
             Ok(result) => result,
             // A completed terminal whose history could not be kept reports
-            // that once, as an event, and keeps its marker.
-            Err(RecvTimeoutError::Disconnected) if !drawn => Ok(self.snapshot()),
+            // that as an event and keeps what it published.
+            Err(RecvTimeoutError::Disconnected) if !drawn || default_view => Ok(self.snapshot()),
             Err(error) => Err(error.to_string()),
         }
     }
@@ -3513,15 +3527,7 @@ impl Worker {
             } else if let Err(message) = &history {
                 self.error("retain completed terminal history", message.clone());
             }
-            *self
-                .published
-                .archive
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Frozen {
-                history,
-                events: self.events.clone(),
-            };
-            self.published.archive_ready.notify_all();
+            self.published.freeze(history, self.events.clone());
             self.published
                 .request_wake(self.published.published_generation.load(Ordering::Acquire));
             while let Ok(command) = self.commands.try_recv() {
@@ -8137,6 +8143,35 @@ mod tests {
             .collect::<String>();
         assert_eq!(row.trim_end(), "while hidden");
         worker.run();
+    }
+
+    /// Nothing is published after a terminal completes, so a terminal that
+    /// completed hidden, without history to replace its screen, is shown with
+    /// what it published: no trip to the archive, and no error for each read.
+    #[test]
+    fn a_shown_read_of_a_terminal_that_completed_hidden_shows_its_last_screen() {
+        let fixture = RenderStreamFixture::new(|_| {});
+        let published = &fixture.handle.inner.published;
+        let mut screen = RenderSnapshot::empty();
+        screen.generation = 1;
+        screen.rows = 1;
+        published.publish(Arc::new(screen));
+        published.stop_presenting();
+        published.freeze(
+            Err("The completed terminal view is unavailable".into()),
+            Arc::clone(&fixture.events),
+        );
+        fixture
+            .handle
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+            .unwrap();
+
+        let read = fixture.handle.viewport_snapshot(None, None, true).unwrap();
+        assert_eq!(read.generation, 1);
+        assert!(
+            fixture.handle.events().try_recv().is_err(),
+            "the read went to an archive without history"
+        );
     }
 
     #[test]
