@@ -5696,11 +5696,20 @@ struct HistoryNode {
     /// Where a compaction boundary leads back to. Compaction starts a new
     /// parent chain, so only this leads to the turns it summarised.
     compaction: Option<Compaction>,
+    /// The record's part in a manual compaction, when it has one.
+    compact_record: Option<CompactRecord>,
     visible: bool,
     message: bool,
     range: (u64, u64, usize),
     order: usize,
     tool_refs: Vec<(String, usize, bool)>,
+}
+/// Claude Code records a manual compaction's summary before the `/compact`
+/// the user typed; the live stream shows the command first.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompactRecord {
+    Summary,
+    Command,
 }
 struct Compaction {
     /// The record Claude Code names as the boundary's predecessor.
@@ -5987,6 +5996,17 @@ impl History {
             if message && main {
                 main_message = Some(uuid.to_owned());
             }
+            let compact_record = if !visible {
+                None
+            } else if value["isCompactSummary"].as_bool() == Some(true) {
+                Some(CompactRecord::Summary)
+            } else {
+                value["message"]["content"]
+                    .as_str()
+                    .and_then(slash_command_prompt)
+                    .is_some_and(|command| command == "/compact")
+                    .then_some(CompactRecord::Command)
+            };
             let message_id = value["message"]["id"].as_str().unwrap_or(uuid);
             let base = nodes
                 .get(uuid)
@@ -6039,6 +6059,7 @@ impl History {
                     first_parent,
                     first_order,
                     compaction,
+                    compact_record,
                     visible,
                     message,
                     range,
@@ -6081,6 +6102,7 @@ impl History {
         let mut chain_tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
         let mut compacted = false;
+        let mut newer_record = None;
         while let Some(id) = leaf {
             if !seen.insert(id) {
                 // Turns already found before a compaction boundary that led
@@ -6095,8 +6117,18 @@ impl History {
                 break;
             };
             if node.visible {
-                chain.push(node.range);
-                chain_tools.push((node.range, &node.tool_refs));
+                // The chain is built newest first: put a summary after the
+                // `/compact` recorded just after it, where the user saw it.
+                let position = if node.compact_record == Some(CompactRecord::Summary)
+                    && newer_record == Some(CompactRecord::Command)
+                {
+                    chain.len() - 1
+                } else {
+                    chain.len()
+                };
+                chain.insert(position, node.range);
+                chain_tools.insert(position, (node.range, &node.tool_refs));
+                newer_record = node.compact_record;
             }
             // A compaction boundary has no parent: the turns it summarised
             // continue through its logical parent, when that was recorded
@@ -14878,29 +14910,36 @@ mod tests {
     #[test]
     fn a_reopened_manual_compaction_reads_as_the_command_the_user_typed() {
         // After its summary the transcript records /compact as a command
-        // run in the terminal, and output that repeats the summary.
+        // run in the terminal, and output that repeats the summary. An
+        // automatic compaction has no command, so its summary stays put.
         let mut history = correlation_history(vec![
             json!({"type":"user","uuid":"summary","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"Summary"}}),
             json!({"type":"user","uuid":"caveat","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}),
             json!({"type":"user","uuid":"command","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}),
             json!({"type":"user","uuid":"output","repeatsCompactSummary":true,"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}),
+            json!({"type":"user","uuid":"next","message":{"role":"user","content":"Next"}}),
         ]);
         let mut step = Step::default();
         let mut adapter = Claude::default();
         for record in history.page().unwrap() {
             adapter.history_message(&record, &mut step).unwrap();
         }
+        // The command comes first, as the user saw it live.
         let delivered = deliveries(&step);
-        assert_eq!(delivered.len(), 2, "{delivered:#?}");
+        assert_eq!(delivered.len(), 3, "{delivered:#?}");
+        assert!(
+            matches!(&delivered[0], (Role::User, ItemContent::Text { text, .. }) if text == "/compact"),
+            "{delivered:#?}"
+        );
         assert_eq!(
-            delivered[0],
+            delivered[1],
             (
                 Role::System,
                 compaction_item("summary:0".into(), "Summary".into()).content
             )
         );
         assert!(
-            matches!(&delivered[1], (Role::User, ItemContent::Text { text, .. }) if text == "/compact"),
+            matches!(&delivered[2], (Role::User, ItemContent::Text { text, .. }) if text == "Next"),
             "{delivered:#?}"
         );
     }
