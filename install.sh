@@ -418,6 +418,8 @@ OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
 DAEMON_DEFERRED=0
 DAEMON_START_ATTEMPTED=0
+# Releases before the converter read shared-model store schema 22.
+OLDEST_STORE_SCHEMA=22
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
 ICON_LINK=$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
@@ -503,6 +505,30 @@ cleanup() {
             TRANSACTION_COMMITTED=1
             printf '%s: replacement daemon shutdown is not proven; retained the new installation and recovery state; inspect cagents daemon status before retrying\n' \
                 "$PROGRAM" >&2
+        fi
+    fi
+
+    # A replacement daemon that started may have converted the shared-model
+    # store forward. The replacement converts it back to the schema the
+    # restored daemon reads before that daemon starts; an older daemon that
+    # cannot report its schema reads the oldest convertible one. Without that
+    # conversion the restored daemon could not open the store, so the new
+    # installation is retained instead.
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ] \
+        && [ "$HAD_CURRENT" -eq 1 ] && [ "$DAEMON_START_ATTEMPTED" -eq 1 ] \
+        && [ -x "$NEW_VERSION_DIR/bin/cagentsd" ]; then
+        case $PREVIOUS_CURRENT_TARGET in
+            /*) previous_root=$PREVIOUS_CURRENT_TARGET ;;
+            *) previous_root=$PREFIX/$PREVIOUS_CURRENT_TARGET ;;
+        esac
+        previous_schema=$("$previous_root/bin/cagentsd" --store-schema 2>/dev/null) || previous_schema=
+        case $previous_schema in
+            '' | *[!0-9]*) previous_schema=$OLDEST_STORE_SCHEMA ;;
+        esac
+        if ! "$NEW_VERSION_DIR/bin/cagentsd" --downgrade-store "$previous_schema" >/dev/null; then
+            TRANSACTION_COMMITTED=1
+            printf '%s: the replacement daemon converted the shared-model store and could not convert it back for the previous version; retained the new installation; stop its daemon, then run %s --downgrade-store %s before restoring the previous version\n' \
+                "$PROGRAM" "$NEW_VERSION_DIR/bin/cagentsd" "$previous_schema" >&2
         fi
     fi
 

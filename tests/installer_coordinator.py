@@ -68,10 +68,25 @@ else:
 
 INSPECTOR = r'''
 import json, os, pathlib, sys
-assert sys.argv[1:] == ['--inspect-upgrade-source', 'fixture']
-with pathlib.Path(os.environ['FIXTURE_CALLS']).open('a') as output:
-    output.write(json.dumps({'event': 'inspect', 'source': SOURCE}) + '\n')
-print(json.dumps({'Ok': None}))
+args = sys.argv[1:]
+def record(event, **fields):
+    with pathlib.Path(os.environ['FIXTURE_CALLS']).open('a') as output:
+        output.write(json.dumps(dict(event=event, source=SOURCE, **fields)) + '\n')
+if args == ['--store-schema']:
+    record('store-schema')
+    schema = os.environ.get('FIXTURE_INSTALLED_STORE_SCHEMA')
+    if SOURCE != 'installed' or not schema:
+        # Releases before the converter reject the option.
+        sys.exit(2)
+    print(schema)
+elif args[:1] == ['--downgrade-store']:
+    record('downgrade-store', target=args[1])
+    if os.environ.get('FIXTURE_DOWNGRADE_FAILS'):
+        sys.exit(1)
+else:
+    assert args == ['--inspect-upgrade-source', 'fixture']
+    record('inspect')
+    print(json.dumps({'Ok': None}))
 '''
 
 
@@ -352,6 +367,40 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
         self.assert_no_backups(copy)
         self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
         self.assertFalse((self.prefix / "versions" / VERSION).exists())
+
+    def failed_update(self, **environment):
+        self.installed_cli(guarded=True)
+        self.environment.update(FIXTURE_DAEMON_START_FAILS="1", **environment)
+        result = self.install("--restart-daemon")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("replacement daemon startup failed", result.stderr)
+        events = self.events()
+        started = max(i for i, e in enumerate(events) if e['event'] == 'daemon-start-fixture')
+        conversion = [(e['event'], e['source'], e.get('target')) for e in events[started + 1:]
+                      if e['event'] in ('store-schema', 'downgrade-store')]
+        return result, conversion
+
+    def test_failed_update_converts_the_store_back_for_the_restored_version(self):
+        result, after = self.failed_update(FIXTURE_INSTALLED_STORE_SCHEMA="23")
+        self.assertEqual(
+            after,
+            [("store-schema", "installed", None), ("downgrade-store", "candidate", "23")],
+            "the replacement did not convert the store to the restored version's schema",
+        )
+        self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
+        self.assertFalse((self.prefix / "versions" / VERSION).exists())
+
+    def test_failed_update_converts_the_store_back_for_a_release_before_the_converter(self):
+        _, after = self.failed_update()
+        self.assertIn(("downgrade-store", "candidate", "22"), after)
+        self.assertEqual(os.readlink(self.prefix / "current"), "versions/old")
+
+    def test_store_that_cannot_be_converted_back_keeps_the_new_installation(self):
+        result, _ = self.failed_update(FIXTURE_DOWNGRADE_FAILS="1")
+        self.assertIn("could not convert it back for the previous version", result.stderr)
+        self.assertIn("--downgrade-store 22", result.stderr)
+        self.assertEqual(os.readlink(self.prefix / "current"), f"versions/{VERSION}")
+        self.assertTrue((self.prefix / "versions" / VERSION / "bin/cagentsd").exists())
 
     def test_copy_rewritten_after_the_check_is_kept_and_refused(self):
         previous = self.installed_cli(guarded=True).parent

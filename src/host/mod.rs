@@ -229,7 +229,11 @@ const RUNTIME_COLLECT_INTERVAL: std::time::Duration = std::time::Duration::from_
 /// Reclaims transcript caches whose owners have ended and the transcripts that
 /// retired actors' final receipts no longer need: now, then every interval,
 /// until the daemon is gone. The startup sweep has already run.
-fn collect_runtime_directory(host: std::sync::Weak<state::HostLock>, root: std::path::PathBuf) {
+fn collect_runtime_directory(
+    host: std::sync::Weak<state::HostLock>,
+    root: std::path::PathBuf,
+    model: Option<model::Registry>,
+) {
     let mut first = true;
     loop {
         if !first {
@@ -257,6 +261,15 @@ fn collect_runtime_directory(host: std::sync::Weak<state::HostLock>, root: std::
             Ok(bytes) => tracing::info!(bytes, "released retired actors' final transcripts"),
             Err(error) => tracing::warn!(%error, "retired actor receipts were not compacted"),
         }
+        drop(host);
+        // Its own connection, so a batch never waits on or holds the host lock.
+        if let Some(model) = &model {
+            match model.collect_view_operations() {
+                Ok(0) => {}
+                Ok(rows) => tracing::info!(rows, "forgot pane changes applied over a week ago"),
+                Err(error) => tracing::warn!(%error, "applied pane changes were not collected"),
+            }
+        }
     }
 }
 
@@ -272,6 +285,31 @@ fn listener_before_restore(
     listener.set_nonblocking(true)?;
     restore()?;
     Ok(listener)
+}
+
+/// The shared-model store schema this version writes.
+pub fn store_schema() -> u32 {
+    model::Registry::SCHEMA
+}
+
+/// Converts this installation's shared-model store back to schema `target`, so
+/// a daemon that predates the current schema can open it after a rollback.
+/// Holds the daemon lease throughout, so it refuses while a daemon runs.
+/// Returns the schema it converted from, or `None` if there was nothing to do.
+pub fn downgrade_store(target: u32) -> Result<Option<u32>, String> {
+    let proof = HostSessionProof {
+        host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
+        boot_id: daemon::read_boot_id().map_err(|error| error.to_string())?,
+        host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
+    };
+    let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
+    let _lease = HostLease::acquire(&paths, &proof).map_err(|error| match error {
+        PlatformError::AlreadyRunning { .. } => {
+            "a cagents daemon is running; stop it before converting its store".to_owned()
+        }
+        error => error.to_string(),
+    })?;
+    model::Registry::downgrade(target)
 }
 
 pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
@@ -440,9 +478,20 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
     if !recovery_only {
         let collect_host = Arc::downgrade(&host);
         let runtime_root = paths.directory.clone();
+        let collect_model = host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .independent_model()
+            .and_then(|connection| match connection {
+                Ok(connection) => Some(connection),
+                Err(error) => {
+                    tracing::warn!(%error, "applied pane changes will not be collected");
+                    None
+                }
+            });
         if let Err(error) = std::thread::Builder::new()
             .name("cagents-runtime-collect".into())
-            .spawn(move || collect_runtime_directory(collect_host, runtime_root))
+            .spawn(move || collect_runtime_directory(collect_host, runtime_root, collect_model))
         {
             tracing::warn!(%error, "runtime directory caches will be reclaimed only at startup");
         }

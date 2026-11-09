@@ -21,6 +21,26 @@ use crate::workspace_model::{
 /// cannot miss anything by being late.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// How long after its first send a pane change may still be resent. The daemon
+/// remembers an applied operation for a week (`OPERATION_RETENTION`) so a
+/// resend whose reply was lost is recognized as done; a change older than this
+/// is never resent, so it can never outlive that memory and apply twice, even
+/// across a week-long suspend or a clock a few days off. The window reconciles
+/// from the daemon's model instead, as for any refused change.
+const REPLAY_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// An edit taken from the window, and when it was first sent.
+type Unsent = (ModelEdit, std::time::SystemTime);
+
+/// Whether `edit`, first sent at `first`, may still be sent `now`. A clock
+/// that moved backwards past the first send proves nothing, so it may not.
+fn may_resend(edit: &ModelEdit, first: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    !matches!(edit, ModelEdit::ChangeView { .. })
+        || now
+            .duration_since(first)
+            .is_ok_and(|waited| waited <= REPLAY_LIMIT)
+}
+
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
@@ -219,7 +239,7 @@ pub(super) fn publish_workspace_model(
 fn publish(
     updates: &async_channel::Sender<ModelUpdate>,
     requests: &async_channel::Receiver<ModelEdit>,
-    pending: &mut Option<ModelEdit>,
+    pending: &mut Option<Unsent>,
 ) -> Result<(), String> {
     // Unlike the observer, the publisher starts a daemon: a channel the user
     // just created has to reach the registry, and there is no registry without
@@ -227,15 +247,37 @@ fn publish(
     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
     loop {
-        let request = match pending.take() {
-            Some(request) => request,
-            None => requests
-                .recv_blocking()
-                .map_err(|_| "the window stopped publishing".to_owned())?,
+        let (request, first) = match pending.take() {
+            Some((request, first)) => {
+                if !may_resend(&request, first, std::time::SystemTime::now()) {
+                    tracing::warn!(
+                        "a pane change waited too long for the daemon and was not resent"
+                    );
+                    if let ModelEdit::ChangeView {
+                        scope, operation, ..
+                    } = &request
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                            scope: scope.clone(),
+                            operation: *operation,
+                            error: "The pane change waited too long for the daemon to be resent"
+                                .into(),
+                        });
+                    }
+                    continue;
+                }
+                (request, first)
+            }
+            None => (
+                requests
+                    .recv_blocking()
+                    .map_err(|_| "the window stopped publishing".to_owned())?,
+                std::time::SystemTime::now(),
+            ),
         };
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
-        *pending = Some(request.clone());
+        *pending = Some((request.clone(), first));
         match send(&mut client, request.clone(), updates) {
             Ok(()) => *pending = None,
             Err(error) => {
@@ -1740,6 +1782,37 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_pane_change_is_resent_only_while_the_daemon_still_remembers_it() {
+        use crate::workspace_model::views::{Change, Scope};
+        let first = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let change = ModelEdit::ChangeView {
+            scope: Scope::Channel(ChannelId::new()),
+            expected_revision: 4,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Remove { id: CardId::new() },
+        };
+        assert!(may_resend(&change, first, first));
+        assert!(may_resend(&change, first, first + REPLAY_LIMIT));
+        assert!(!may_resend(
+            &change,
+            first,
+            first + REPLAY_LIMIT + Duration::from_secs(1)
+        ));
+        // A clock that went back cannot show the change is still young.
+        assert!(!may_resend(&change, first, first - Duration::from_secs(1)));
+        // The limit must leave the daemon days of margin for clock skew.
+        assert!(
+            crate::workspace_model::views::OPERATION_RETENTION >= REPLAY_LIMIT * 6,
+            "the daemon must remember an operation well past its last resend"
+        );
+        // Other edits carry their own idempotency and are never dropped.
+        let delete = ModelEdit::DeleteChannel {
+            id: ChannelId::new(),
+        };
+        assert!(may_resend(&delete, first, first + REPLAY_LIMIT * 30));
+    }
 
     #[test]
     fn absent_channel_candidates_preserve_local_order_duplicates_and_shared_flags() {

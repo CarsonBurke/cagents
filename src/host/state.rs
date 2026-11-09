@@ -578,6 +578,14 @@ impl HostState {
         self.model = Some(registry);
     }
 
+    /// Another connection to the shared-model store, for work that must not
+    /// hold the host lock while it writes.
+    pub(super) fn independent_model(&self) -> Option<Result<super::model::Registry, String>> {
+        self.model
+            .as_ref()
+            .map(super::model::Registry::execution_connection)
+    }
+
     /// How many hosted agents are working, and how many are waiting on the
     /// user, across running terminals and native conversations.
     pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {

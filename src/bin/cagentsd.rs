@@ -3,6 +3,22 @@ fn command() -> clap::Command {
         .version(cagents::version())
         .about("Run the cagents terminal and conversation daemon. Prefer `cagents daemon start`.")
         .arg(
+            clap::Arg::new("store-schema")
+                .long("store-schema")
+                .help("Print the shared-model store schema this version writes, then exit")
+                .action(clap::ArgAction::SetTrue),
+        )
+        .arg(
+            clap::Arg::new("downgrade-store")
+                .long("downgrade-store")
+                .value_name("SCHEMA")
+                .help(
+                    "Convert the shared-model store back to SCHEMA for an older daemon, then exit. \
+                     Refuses while a daemon runs.",
+                )
+                .value_parser(clap::value_parser!(u32)),
+        )
+        .arg(
             clap::Arg::new("ceditor-notifications")
                 .long(cagents::instance::CEDITOR_NOTIFICATION_ARGUMENT.trim_start_matches("--"))
                 .hide(true)
@@ -46,7 +62,24 @@ fn main() -> std::process::ExitCode {
     }
     // Informational flags exit before opening runtime state or taking its
     // daemon lease. Internal precheck owners keep their separate entrypoint.
-    command().get_matches();
+    let matches = command().get_matches();
+    if matches.get_flag("store-schema") {
+        println!("{}", cagents::host::store_schema());
+        return std::process::ExitCode::SUCCESS;
+    }
+    if let Some(&target) = matches.get_one::<u32>("downgrade-store") {
+        return match cagents::host::downgrade_store(target) {
+            Ok(Some(from)) => {
+                println!("converted the shared-model store from schema {from} to {target}");
+                std::process::ExitCode::SUCCESS
+            }
+            Ok(None) => std::process::ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("cagentsd: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     // SAFETY: entry is still single-threaded; helper-only mode returned above.
     let admission = match unsafe { cagents::host::prepare_daemon_admission() } {
         Ok(admission) => admission,

@@ -140,7 +140,7 @@ mod placement_hooks {
         let agent = crate::model::AgentId::from_uuid(original.id.as_uuid());
         let first = token(&registry, original.id);
         let before = read(&registry.db, &Scope::Channel(a)).unwrap();
-        registry.db.execute_batch("CREATE TRIGGER reject_fixture_view BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;").unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_fixture_view BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;").unwrap();
         {
             let tx = registry
                 .db
@@ -304,23 +304,23 @@ mod placement_hooks {
         // after agent/index/ledger work. The target's distinct error also proves
         // the real source view was empty before its prepared target was written.
         for fail_source in [true, false] {
-            let (scope, expected, failure) = if fail_source {
+            let (channel, expected, failure) = if fail_source {
                 (
-                    &source,
+                    a,
                     "fixture source publication failure",
                     "SELECT RAISE(ABORT,'fixture source publication failure');".to_owned(),
                 )
             } else {
-                (&target, "fixture target publication failure", format!(
-                    "SELECT CASE WHEN EXISTS(SELECT 1 FROM main.shared_views WHERE scope='{}' AND json_array_length(panes)>0)
+                (b, "fixture target publication failure", format!(
+                    "SELECT CASE WHEN EXISTS(SELECT 1 FROM main.panes p JOIN main.view_scopes s ON s.id=p.scope WHERE s.channel='{a}')
                      THEN RAISE(ABORT,'fixture target preceded source')
-                     ELSE RAISE(ABORT,'fixture target publication failure') END;", key(&source).unwrap()))
+                     ELSE RAISE(ABORT,'fixture target publication failure') END;"))
             };
             registry
                 .db
                 .execute_batch(&format!(
-                "CREATE TEMP TRIGGER reject_fixture_publication BEFORE INSERT ON main.shared_views
-                 WHEN NEW.scope='{}' BEGIN {failure} END;", key(scope).unwrap(),
+                "CREATE TEMP TRIGGER reject_fixture_publication BEFORE UPDATE OF revision ON main.view_scopes
+                 WHEN NEW.channel='{channel}' BEGIN {failure} END;",
             ))
                 .unwrap();
             assert!(registry.apply(&transfer).unwrap_err().contains(expected));
