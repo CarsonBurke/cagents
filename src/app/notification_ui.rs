@@ -1965,7 +1965,7 @@ mod tests {
         assert!(!app.notification_ui.acknowledged_for_test(id));
         assert_eq!(app.durable.focused, app.workspace.focused());
         let resize = app.workspace.resize_viewport(1200.0);
-        drop(app.apply_viewport(resize, true, false));
+        drop(app.apply_viewport(resize, true, DurableChange::None));
         assert!(
             app.sidebar_state.has_card_update(card),
             "an unrelated viewport update cannot bypass visible dwell"

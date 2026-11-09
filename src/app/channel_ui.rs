@@ -477,8 +477,10 @@ impl Cagents {
         })
     }
 
+    /// Opens channel `id` as navigation alone; a caller that also changed the
+    /// workspace saves it.
     fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
-        let scope = self.select_channel(id);
+        let scope = self.navigate_to_channel(id);
         if self.durable.active_channel != Some(id) {
             return scope;
         }
@@ -2652,6 +2654,69 @@ mod tests {
         ));
         app.refresh_sidebar_channels();
         (app, doomed, survivor, conversation)
+    }
+
+    /// Clicking down the channel list changes where this window is and
+    /// nothing else, so the clicks are saved once, after the burst, instead of
+    /// each one projecting and copying the whole workspace on the UI thread.
+    /// Showing a channel on the way back from a change is still saved at once.
+    #[test]
+    fn opening_channels_from_the_sidebar_saves_once_after_the_burst() {
+        use super::super::terminal_output_tests::persists;
+        let (mut app, first, second, _) = channel_with_a_conversation();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut other = durable.cards[0].clone();
+        other.id = CardId::new();
+        other.kind = crate::model::CardKind::Chat(chat_session());
+        durable.cards.push(other.clone());
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == second)
+            .unwrap()
+            .cards
+            .push(other.id);
+        app.refresh_sidebar_channels();
+        drop(app.select_channel(first));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+
+        let saved = persists();
+        let mut armed = None;
+        for channel in [second, first, second] {
+            drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+                channel_id: channel,
+            })));
+            assert_eq!(app.durable.active_channel, Some(channel));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>().len(), 1);
+            assert_eq!(persists(), saved, "a click alone waits for the burst");
+            assert!(app.navigation_save_pending);
+            // The burst's first click arms the one timer; later clicks don't
+            // push it back, so a long burst is still saved within the delay.
+            let generation = *armed.get_or_insert(app.navigation_save_generation);
+            assert_eq!(app.navigation_save_generation, generation);
+        }
+        let burst = app.navigation_save_generation;
+        drop(app.update(Message::NavigationSaveDue(burst)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+        assert!(!app.navigation_save_pending);
+
+        // A timer armed for a burst some other save already wrote does not
+        // cut the next burst short.
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        drop(app.select_channel(second));
+        assert_eq!(persists(), saved + 2, "a programmatic switch saves at once");
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        let stale = app.navigation_save_generation - 1;
+        drop(app.update(Message::NavigationSaveDue(stale)));
+        assert_eq!(persists(), saved + 2, "the earlier burst's timer is spent");
+        assert!(app.navigation_save_pending);
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 3);
+        assert_eq!(app.durable.active_channel, Some(first));
     }
 
     /// A channel's conversations are reachable nowhere else, so deleting one
