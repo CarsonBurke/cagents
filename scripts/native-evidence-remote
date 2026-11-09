@@ -192,7 +192,8 @@ if [ -e "\$owner_record" ]; then
 elif [ -e "\$task" ]; then
     # Such as a task someone runs on the host directly, in the same place,
     # or one this route started before tasks had owners.
-    echo "native-evidence-remote: \$task on \$(uname -n) is not a task this route started; give this task directory another name, or, if an earlier version of this route started it for you, claim it there with: printf '%s\\\\n' '\$owner' >\$owner_record" >&2
+    claim_it=\$(printf 'mkdir -p -- %q && printf %q %q >%q' "\${owner_record%/*}" '%s\\n' "\$owner" "\$owner_record")
+    echo "native-evidence-remote: \$task on \$(uname -n) is not a task this route started; give this task directory another name, or, if an earlier version of this route started it for you, claim it there with: \$claim_it" >&2
     exit 3
 fi
 # In cli and env arguments, {fixture} stands for the fixture's root, in a
@@ -337,6 +338,7 @@ $remote_prelude"'
     case $running in
         0) ;;
         10) die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop" ;;
+        255) die "could not reach $host over ssh, or it lost the connection" 255 ;;
         *) exit "$running" ;;
     esac
     sync_tool

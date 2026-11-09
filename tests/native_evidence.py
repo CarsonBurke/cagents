@@ -1319,11 +1319,26 @@ class RemoteEvidence(unittest.TestCase):
         result = self.run_tool("clean", check=False)
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("is not a task this route started; give this task directory another name", result.stderr)
-        # One it started before tasks had owners can be claimed as it says.
-        owner = f"{os.uname().nodename}:{self.task}"
-        self.assertIn(f"printf '%s\\n' '{owner}' >{self.remote_home}/.local/state/cev-owners/mytask", result.stderr)
         self.assertTrue((self.remote_task / "shots").exists())
-        self.assertFalse((self.remote_home / ".local/state/cev-owners/mytask").exists())
+        self.assertFalse((self.remote_home / ".local/state/cev-owners").exists())
+
+    def test_a_task_an_earlier_route_started_is_claimed_as_the_refusal_says(self) -> None:
+        # Before owner records, the route left a task and no record, and a
+        # host with only such tasks has no record directory either.
+        checkout = self.repository("after", {"src.rs": "\n"})
+        (self.remote_task / "shots").mkdir(parents=True)
+        (self.remote_task / ".native-evidence").touch()
+        refused = self.run_tool("build", "after", str(checkout), check=False)
+        self.assertEqual(refused.returncode, 3, refused.stderr)
+        self.assertFalse((self.remote_home / ".local/state/cev-owners").exists())
+        claim = refused.stderr.rstrip("\n").split("claim it there with: ", 1)[1]
+        # Run as printed, on the host, by the shell a person there would use.
+        subprocess.run(["bash", "-c", claim], check=True, cwd=self.root)
+        owner = f"{os.uname().nodename}:{self.task}"
+        record = self.remote_home / ".local/state/cev-owners/mytask"
+        self.assertEqual(record.read_text(), owner + "\n")
+        self.run_tool("build", "after", str(checkout))
+        self.run_tool("status")
 
     def test_the_hosts_own_task_directory_is_refused(self) -> None:
         self.task = self.remote_task

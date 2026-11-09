@@ -1460,9 +1460,9 @@ harness, it provides:
 
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
 that authority, so a hosted agent shell cannot run it locally; it runs it on the
-build host instead, as the next section describes. Remove the task directory
-when the PR merges, and remove its host side with
-`scripts/native-evidence --remote fw16 --task DIR clean`.
+build host instead, as the next section describes. When the PR merges, remove
+the task's host side with `scripts/native-evidence --remote fw16 --task DIR
+clean`, then the task directory here.
 
 ### Native evidence from a cagents session
 
@@ -1525,13 +1525,14 @@ scripts/native-evidence stop
   `shots/` and `sources.tsv`. `where` prints the host's paths. The host
   records which machine and task directory a task belongs to, and refuses
   every command from another, and leaves alone one it didn't start, such as
-  a task someone runs on the host directly, so two agents that pick the same name don't
-  build, stop or clean each other's work: name the task after your PR, such as
-  `pr2282-reopen`. Only `build` and `pair` take a name on the host; `status`,
-  `fetch` and the rest never claim one. A task an earlier version of the route
-  started has no record: the refusal prints the one-line `printf` that claims
-  it, to run on the host if the task is yours. On the build host itself, run `scripts/native-evidence`
-  without `--remote`; a task directory that is the host's own is refused.
+  a task someone runs on the host directly, so two agents that pick the same
+  name don't build, stop or clean each other's work: name the task after your
+  PR, such as `pr2282-reopen`. Only `build` and `pair` take a name on the
+  host; `status`, `fetch` and the rest never claim one. A task an earlier
+  version of the route started has no record: the refusal prints the one-line
+  command that claims it, to run on the host if the task is yours. On the
+  build host itself, run `scripts/native-evidence` without `--remote`; a task
+  directory that is the host's own is refused.
 - **Fixture paths.** `{fixture}` in `cli` and `env` arguments becomes the
   fixture's root on the host, both on the command line here and in a steps
   file. A path you type into a file chooser is a host path, so put the file to
