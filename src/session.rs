@@ -955,7 +955,13 @@ impl SessionRuntime {
         {
             for replacement in replacements {
                 if queue.ordered_identities {
-                    if let Some(previous) = queue.latest.take() {
+                    // A state that already shows this replacement is the one
+                    // to save after it, not a write that precedes it.
+                    if let Some(previous) = queue.latest.take()
+                        && !state
+                            .as_ref()
+                            .is_some_and(|state| Arc::ptr_eq(state, &previous))
+                    {
                         queue
                             .conversions
                             .push_back(ConversionCheckpoint::Snapshot(previous));
@@ -3935,6 +3941,179 @@ mod tests {
             assert_eq!(restored.cards[0].title, "Claude chat");
             reopened.shutdown();
         }
+    }
+
+    /// A write that records the conversations other windows gave shared chat
+    /// cards and then replaces another card's conversation, both with the
+    /// state that shows them, saves both, whether or not the lane is keeping
+    /// conversions in order.
+    #[test]
+    fn adopted_and_replaced_conversations_save_with_their_one_snapshot() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("adopted-and-replaced.sqlite3");
+            let boot = BootId::new("adopted-and-replaced");
+            let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+            let health = runtime.health_receiver();
+            let mut state = workspace();
+            let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+                unreachable!()
+            };
+            let chat = |provider: crate::agent::Provider| crate::chat::Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider,
+                    recipe: LaunchRecipe {
+                        program: provider.executable().into(),
+                        arguments: Vec::new(),
+                        ..terminal.launch.clone()
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            };
+            let shared_before = chat(crate::agent::Provider::Codex);
+            let own_before = chat(crate::agent::Provider::Codex);
+            let mut own = state.cards[0].clone();
+            own.id = CardId::new();
+            own.kind = CardKind::Chat(own_before.clone());
+            state.cards[0].kind = CardKind::Chat(shared_before.clone());
+            state.cards.push(own.clone());
+            let shared = state.cards[0].id;
+            runtime.snapshot(Arc::new(state.clone()));
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            if ordered {
+                runtime.snapshot_conversion(Arc::new(state.clone()));
+            }
+
+            let theirs = chat(crate::agent::Provider::Claude);
+            let mine = chat(crate::agent::Provider::Claude);
+            state.cards[0].kind = CardKind::Chat(theirs.clone());
+            state.cards[1].kind = CardKind::Chat(mine.clone());
+            let saved = Arc::new(state.clone());
+            runtime.adopt_chat_identities(
+                [ChatIdentityAdoption {
+                    card: shared,
+                    expected: shared_before.id,
+                    canonical: theirs.clone(),
+                }],
+                Some(Arc::clone(&saved)),
+            );
+            runtime.replace_chat_identity(own.id, own_before.id, mine.clone(), saved);
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            runtime.shutdown();
+            assert_eq!(runtime.last_error(), None, "ordered: {ordered}");
+            while let Ok(event) = health.try_recv() {
+                assert!(event.quarantined.is_empty(), "ordered: {ordered}");
+            }
+
+            let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+            let restored = restored.unwrap();
+            assert_eq!(
+                restored
+                    .cards
+                    .iter()
+                    .map(|card| card.kind.clone())
+                    .collect::<Vec<_>>(),
+                [CardKind::Chat(theirs), CardKind::Chat(mine)],
+                "ordered: {ordered}"
+            );
+            reopened.shutdown();
+        }
+    }
+
+    /// On the ordered lane, the state queued with adoptions is not written
+    /// ahead of a replacement queued right after with that same state, which
+    /// storage would refuse because it already shows the replacement.
+    #[test]
+    fn a_state_shared_by_adoptions_and_a_replacement_is_written_after_both() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("shared-snapshot-order.sqlite3");
+        let store =
+            Arc::new(StateStore::open(&path, BootId::new("shared-snapshot-order")).unwrap());
+        let older = Arc::new(workspace());
+        let (health_tx, health) = async_channel::unbounded();
+        drop(health_tx);
+        let runtime = SessionRuntime {
+            queue: Arc::new((
+                Mutex::new(QueueState {
+                    latest: Some(Arc::clone(&older)),
+                    ordered_identities: true,
+                    ..QueueState::default()
+                }),
+                Condvar::new(),
+            )),
+            last_error: Arc::new(Mutex::new(None)),
+            health,
+            worker: None,
+            database_path: path,
+            restored_projects: Vec::new(),
+            restored_worktrees: Vec::new(),
+            restore_warnings: Vec::new(),
+            operation_store: store,
+        };
+        let CardKind::Terminal(terminal) = older.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        let chat = crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: terminal.launch.clone(),
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        };
+        let (shared, own) = (CardId::new(), CardId::new());
+        let saved = Arc::new(workspace());
+        runtime.adopt_chat_identities(
+            [ChatIdentityAdoption {
+                card: shared,
+                expected: TerminalId::new(),
+                canonical: chat.clone(),
+            }],
+            Some(Arc::clone(&saved)),
+        );
+        runtime.replace_chat_identity(own, TerminalId::new(), chat, Arc::clone(&saved));
+
+        let queue = runtime.queue.0.lock().unwrap();
+        let order = queue
+            .conversions
+            .iter()
+            .map(|checkpoint| match checkpoint {
+                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
+                    "older state".to_owned()
+                }
+                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &saved) => {
+                    "shared state".to_owned()
+                }
+                ConversionCheckpoint::IdentityReplacement(replacement)
+                    if replacement.card_id == shared =>
+                {
+                    "adoption".to_owned()
+                }
+                ConversionCheckpoint::IdentityReplacement(replacement)
+                    if replacement.card_id == own =>
+                {
+                    "replacement".to_owned()
+                }
+                other => format!("{other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["older state", "adoption", "replacement"]);
+        assert!(
+            queue
+                .latest
+                .as_ref()
+                .is_some_and(|latest| Arc::ptr_eq(latest, &saved)),
+            "the shared state is written after both"
+        );
     }
 
     #[test]
