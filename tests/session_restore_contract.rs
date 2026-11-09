@@ -97,6 +97,7 @@ impl RestoreFixture {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             repository_navigation: HashMap::new(),
             local_only_cards: Default::default(),
