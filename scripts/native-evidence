@@ -339,6 +339,8 @@ current_side() {
 # Starts from an empty environment. Credentials, agents and the desktop bus in the
 # caller's shell stay out; the authority refusal has already run by this point.
 # Only the app inherits session variables, which belong to the nested desktop.
+# Git reaches only local repositories, so a fixture project's github.com
+# remote, which the offline forge needs, is never fetched from or pushed to.
 session_variables=
 session_path=
 fixture_env() {
@@ -354,7 +356,7 @@ fixture_env() {
         XDG_CACHE_HOME="$fixture/cache" XDG_STATE_HOME="$fixture/state" \
         CARGO_HOME="${CARGO_HOME:-$real_home/.cargo}" RUSTUP_HOME="${RUSTUP_HOME:-$real_home/.rustup}" \
         CARGO_TARGET_DIR="$target" CAGENTS_ZIG="$zig" \
-        CAGENTS_EVIDENCE_FIXTURE="$fixture" \
+        CAGENTS_EVIDENCE_FIXTURE="$fixture" GIT_ALLOW_PROTOCOL=file \
         PATH="$session_path$fixture/bin:$cargo_bin:${zig%/*}:/usr/local/bin:/usr/bin" \
         "$@"
 }
@@ -390,12 +392,17 @@ prepare_fixture() {
             printf '%s\n' 'the provider home is not the one the seed was saved from, so chats in the seed will not reopen; recreate them and save-seed again' >>"$state/notice"
         fi
     fi
-    mkdir -p "$fixture"/{bin,home/.claude,data,config,cache,state,project}
+    # home/.config holds the forge's switch and avatars its seeds; a steps file
+    # writes into both without creating them.
+    mkdir -p "$fixture"/{bin,home/.claude,home/.config,avatars,data,config,cache,state,project}
     # Both sides get this tool's synthetic provider: the data must not differ
     # because an older before checkout carries an older fixture.
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$fixture/bin/claude"
-    printf '#!/bin/sh\necho "gh: the fixture has no forge access" >&2\nexit 1\n' >"$fixture/bin/gh"
-    chmod 755 "$fixture/bin/gh"
+    # Refuses everything until home/.config/fixture-forge exists; see docs/fixtures.md.
+    install -m 755 "$tool_root/tests/fixtures/fixture-gh.sh" "$fixture/bin/gh"
+    # Avatars come only from the seeds the forge copies into the app's cache.
+    printf '#!/bin/sh\necho "curl: (7) the fixture has no network access" >&2\nexit 7\n' >"$fixture/bin/curl"
+    chmod 755 "$fixture/bin/curl"
     if [ ! -e "$fixture/project/.git" ]; then
         (
             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
