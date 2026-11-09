@@ -1665,8 +1665,8 @@ trait SessionStore {
         _expected_id: TerminalId,
         _canonical: &crate::chat::Session,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support shared chat identities".into(),
+        Err(invalid_state!(
+            "This store does not support shared chat identities"
         ))
     }
     fn save_workspace(
