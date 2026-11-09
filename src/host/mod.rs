@@ -290,13 +290,8 @@ fn listener_before_restore(
 /// Runs `work` on this installation's shared-model store while holding the
 /// daemon lease, so no daemon can open or convert the store meanwhile.
 fn with_store_stopped<T>(work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
-    let proof = HostSessionProof {
-        host_session_id: HostSessionId::new(Uuid::new_v4().to_string()),
-        boot_id: daemon::read_boot_id().map_err(|error| error.to_string())?,
-        host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
-    };
     let paths = RuntimePaths::discover().map_err(|error| error.to_string())?;
-    let _lease = HostLease::acquire(&paths, &proof).map_err(|error| match error {
+    let _lease = HostLease::acquire_for_store_maintenance(&paths).map_err(|error| match error {
         PlatformError::AlreadyRunning { .. } => {
             "a cagents daemon is running; stop it before reading or converting its store".to_owned()
         }

@@ -5,7 +5,8 @@
 //! or edited on their own are columns; the pane's `CardKind` is the descriptor,
 //! a launch recipe or session proof that is only ever read and replaced whole.
 //! The columns derived from it (`kind`, `resource`, `provider`,
-//! `provider_session`) are written with it and checked against it on read.
+//! `provider_session`) are written with it; `kind` and `resource` are checked
+//! against it on read.
 //!
 //! Callers keep editing a [`View`] in memory; [`store`] persists the rows that
 //! differ from the stored view, so an edit costs rows in proportion to what it
@@ -863,10 +864,11 @@ fn rebuild_pane_owned(
 /// Schema 23: one row per scope, pane, retired id and applied operation, from
 /// schema 22's per-scope JSON arrays.
 ///
-/// The arrays say which panes are open, so they are converted whole: a pane
-/// two views both hold, or two panes for one resource, refuse the conversion
-/// rather than drop either. Schema 22's ownership index was derived from the
-/// arrays and is not carried over; an index row for a pane no view holds
+/// The arrays say which panes are open, so every pane they hold stays open.
+/// Where they hold one pane twice, or two panes for one resource, the
+/// conversion keeps what schema 22 acted on (see below) rather than refuse
+/// and leave the daemon without a model. Schema 22's ownership index is used
+/// only to choose between two views; an index row for a pane no view holds
 /// leaves with the rows that hung off it, as deleting it would have.
 pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<(), String> {
     tx.execute_batch(&format!(
@@ -897,6 +899,61 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
             .map_err(sql)?
     };
+    // Schema 22 allowed two damaged states its daemon resolved on use rather
+    // than refused: a pane in two views' lists, and two panes presenting one
+    // resource. Neither fits these tables, and refusing would leave the daemon
+    // without a model, so each keeps the place schema 22 acted on. A pane stays
+    // in the view its pane index named, where its edits, transfers and pins
+    // went, or else in the first view that lists it; a resource stays with the
+    // first pane that presents it, the one schema 22 found as its holder.
+    // Every pane stays open in some view.
+    let mut views = views
+        .into_iter()
+        .map(|(key, channel, repository, revision, saved, retired)| {
+            let saved: Vec<Pane> = serde_json::from_str(&saved).map_err(|error| {
+                format!("a saved view is unreadable; the store was not converted: {error}")
+            })?;
+            Ok((key, channel, repository, revision, saved, retired))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    let indexed: HashMap<String, String> = {
+        let mut statement = tx
+            .prepare("SELECT id, scope FROM shared_view_panes")
+            .map_err(sql)?;
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .and_then(Iterator::collect::<rusqlite::Result<_>>)
+            .map_err(sql)?
+    };
+    let mut holders: HashMap<CardId, Vec<&str>> = Default::default();
+    for (key, _, _, _, saved, _) in &views {
+        for pane in saved {
+            holders.entry(pane.id).or_default().push(key);
+        }
+    }
+    let keeper: HashMap<CardId, String> = holders
+        .into_iter()
+        .map(|(id, keys)| {
+            let kept = indexed
+                .get(&id.to_string())
+                .filter(|named| keys.contains(&named.as_str()))
+                .map_or(keys[0], String::as_str);
+            (id, kept.to_owned())
+        })
+        .collect();
+    for (key, _, _, _, saved, _) in &mut views {
+        let before = saved.len();
+        // Within one list too, the first entry for an id is the pane.
+        let mut seen = HashSet::new();
+        saved.retain(|pane| keeper[&pane.id] == *key && seen.insert(pane.id));
+        if saved.len() != before {
+            tracing::warn!(
+                scope = %key,
+                panes = before - saved.len(),
+                "a pane listed again in another view stays only where it was used"
+            );
+        }
+    }
     let mut clock = 0;
     for (key, channel, repository, revision, saved, retired) in views {
         let scope: Scope = serde_json::from_str(&key)
@@ -921,22 +978,21 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
             params![key, id],
         )
         .map_err(sql)?;
-        let saved: Vec<Pane> = serde_json::from_str(&saved).map_err(|error| {
-            format!("a saved view is unreadable; the store was not converted: {error}")
-        })?;
         let retired: Vec<CardId> = serde_json::from_str(&retired).map_err(|error| {
             format!("a saved view is unreadable; the store was not converted: {error}")
         })?;
-        for (index, pane) in saved.iter().enumerate() {
-            // `insert` moves a pane another scope holds; here that is a pane
-            // open in two views, which the conversion cannot choose between.
-            if owner(tx, pane.id)?.is_some() {
-                return Err(format!(
-                    "saved pane {} is open in two views; the store was not converted",
-                    pane.id
-                ));
+        let mut position = 0;
+        for pane in &saved {
+            if let Some(holder) = resource_holder(tx, pane)? {
+                tracing::warn!(
+                    pane = %pane.id,
+                    %holder,
+                    "a second pane for one resource gives way to the pane that held it"
+                );
+                continue;
             }
-            insert(tx, id, (index as i64 + 1) * POSITION_STEP, pane).map_err(|error| {
+            position += POSITION_STEP;
+            insert(tx, id, position, pane).map_err(|error| {
                 format!(
                     "saved pane {} cannot be converted; the store was not converted: {error}",
                     pane.id
@@ -975,6 +1031,12 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
         &format!("{TERMINAL_SOURCES}; {RETENTION_PINS}; {RETENTION_PINS_BY_TERMINAL};"),
         "panes",
     )?;
+    // A pane that gave way above keeps no placement, as a removed pane does not.
+    tx.execute(
+        "DELETE FROM channel_work_placement_epochs WHERE pane NOT IN (SELECT id FROM panes)",
+        [],
+    )
+    .map_err(sql)?;
     tx.execute_batch(
         "DROP TABLE temp.converted_scopes;
          DROP TABLE shared_view_edits; DROP TABLE shared_views;

@@ -409,53 +409,134 @@ fn refuses(path: &Path, reason: &str) {
     assert_eq!(rows_22(&Connection::open(path).unwrap()), before);
 }
 
-#[test]
-fn a_pane_open_in_two_views_refuses_conversion_rather_than_dropping_either() {
-    let directory = tempfile::tempdir().unwrap();
-    let path = directory.path().join("model.sqlite3");
-    let (a, b) = schema_22(&path);
-    let shared = browser("shared");
-    {
-        let db = Connection::open(&path).unwrap();
-        put_22(
-            &db,
-            &Scope::Channel(a),
-            1,
-            std::slice::from_ref(&shared),
-            &[],
-            &[],
-        );
-        // Schema 22's index has one row per id, so the second view holds the
-        // pane only in its array.
-        let key = scope_key(&Scope::Channel(b)).unwrap();
-        put_22(&db, &Scope::Channel(b), 1, &[], &[], &[]);
-        db.execute(
-            "UPDATE shared_views SET panes = ?2 WHERE scope = ?1",
-            params![key, serde_json::to_string(&[shared.clone()]).unwrap()],
-        )
-        .unwrap();
-    }
-    refuses(&path, "open in two views");
+/// Lists `pane` in `scope`'s saved array as well, as a damaged schema 22 store
+/// could: its index has one row per id, so only the array says so.
+fn also_list_22(db: &Connection, scope: &Scope, panes: &[Pane]) {
+    db.execute(
+        "UPDATE shared_views SET panes = ?2 WHERE scope = ?1",
+        params![
+            scope_key(scope).unwrap(),
+            serde_json::to_string(panes).unwrap()
+        ],
+    )
+    .unwrap();
+}
+
+fn epochs(db: &Connection) -> Vec<String> {
+    db.prepare("SELECT pane FROM channel_work_placement_epochs ORDER BY pane")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
 }
 
 #[test]
-fn two_panes_for_one_resource_refuse_conversion_rather_than_dropping_either() {
+fn a_pane_listed_in_two_views_stays_open_in_the_view_schema_22_used() {
+    for indexed_in_second in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("model.sqlite3");
+        let (a, b) = schema_22(&path);
+        let (a, b) = (Scope::Channel(a), Scope::Channel(b));
+        let shared = browser("shared");
+        let own = browser("own");
+        {
+            let db = Connection::open(&path).unwrap();
+            put_22(&db, &a, 3, std::slice::from_ref(&shared), &[], &[]);
+            put_22(&db, &b, 5, std::slice::from_ref(&own), &[], &[]);
+            also_list_22(&db, &b, &[shared.clone(), own.clone()]);
+            if indexed_in_second {
+                db.execute(
+                    "UPDATE shared_view_panes SET scope = ?2 WHERE id = ?1",
+                    params![shared.id.to_string(), scope_key(&b).unwrap()],
+                )
+                .unwrap();
+            }
+        }
+        let registry = Registry::at(&path).expect("a damaged store still converts");
+        let (kept, left) = if indexed_in_second {
+            (&b, &a)
+        } else {
+            (&a, &b)
+        };
+        assert!(
+            read(&registry.db, kept).unwrap().panes.contains(&shared),
+            "the pane left the view its index named"
+        );
+        assert!(!read(&registry.db, left).unwrap().panes.contains(&shared));
+        assert!(read(&registry.db, &b).unwrap().panes.contains(&own));
+        assert_eq!(read(&registry.db, &a).unwrap().revision, 3);
+        assert_eq!(read(&registry.db, &b).unwrap().revision, 5);
+    }
+}
+
+#[test]
+fn a_pane_listed_twice_in_one_view_is_kept_once() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.sqlite3");
     let (a, _) = schema_22(&path);
-    let resource = BrowserId::new();
+    let a = Scope::Channel(a);
+    let (first, second) = (browser("first"), browser("second"));
     {
         let db = Connection::open(&path).unwrap();
-        put_22(
-            &db,
-            &Scope::Channel(a),
-            1,
-            &[browser_of("one", resource), browser_of("two", resource)],
-            &[],
-            &[],
-        );
+        put_22(&db, &a, 2, &[first.clone(), second.clone()], &[], &[]);
+        also_list_22(&db, &a, &[first.clone(), second.clone(), first.clone()]);
     }
-    refuses(&path, "cannot be converted");
+    let registry = Registry::at(&path).unwrap();
+    assert_eq!(read(&registry.db, &a).unwrap().panes, vec![first, second]);
+}
+
+#[test]
+fn a_second_pane_for_one_resource_gives_way_to_the_first_and_keeps_no_placement() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("model.sqlite3");
+    let (a, b) = schema_22(&path);
+    // Schema 22 found a resource's holder in scope order.
+    let mut scopes = [Scope::Channel(a), Scope::Channel(b)];
+    scopes.sort_by_key(|scope| scope_key(scope).unwrap());
+    let [a, b] = scopes;
+    let resource = BrowserId::new();
+    let (one, two, three) = (
+        browser_of("one", resource),
+        browser("unrelated"),
+        browser_of("three", resource),
+    );
+    {
+        let db = Connection::open(&path).unwrap();
+        put_22(&db, &a, 1, &[one.clone(), two.clone()], &[], &[]);
+        put_22(&db, &b, 1, std::slice::from_ref(&three), &[], &[]);
+    }
+    let registry = Registry::at(&path).expect("a damaged store still converts");
+    assert_eq!(
+        read(&registry.db, &a).unwrap().panes,
+        vec![one.clone(), two.clone()]
+    );
+    assert_eq!(read(&registry.db, &b).unwrap().panes, vec![]);
+    assert_eq!(
+        epochs(&registry.db),
+        {
+            let mut kept = vec![one.id.to_string(), two.id.to_string()];
+            kept.sort();
+            kept
+        },
+        "the pane that gave way kept a placement"
+    );
+    drop(registry);
+    Registry::downgrade_at(&path, 22).unwrap();
+}
+
+#[test]
+fn an_unreadable_view_refuses_conversion_and_leaves_the_store_at_22() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("model.sqlite3");
+    let (a, _) = schema_22(&path);
+    {
+        let db = Connection::open(&path).unwrap();
+        put_22(&db, &Scope::Channel(a), 1, &[], &[], &[]);
+        db.execute("UPDATE shared_views SET panes = 'not json'", [])
+            .unwrap();
+    }
+    refuses(&path, "a saved view is unreadable");
 }
 
 #[test]
@@ -528,6 +609,10 @@ fn the_stored_schema_is_what_the_store_holds_and_nothing_when_there_is_none() {
     let path = directory.path().join("model.sqlite3");
     assert_eq!(Registry::stored_schema_at(&path).unwrap(), None);
     assert!(!path.exists(), "reading the schema must not create a store");
+    // A creation that stopped before its first schema is no store either.
+    std::fs::File::create(&path).unwrap();
+    assert_eq!(Registry::stored_schema_at(&path).unwrap(), None);
+    std::fs::remove_file(&path).unwrap();
     schema_22(&path);
     assert_eq!(Registry::stored_schema_at(&path).unwrap(), Some(22));
     drop(Registry::at(&path).unwrap());

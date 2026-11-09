@@ -403,7 +403,7 @@ os.execv({real_tar!r}, [{real_tar!r}, *args])
 
     def test_store_that_cannot_be_converted_back_keeps_the_new_installation(self):
         result, _ = self.failed_update(FIXTURE_DOWNGRADE_FAILS="1")
-        self.assertIn("converting it back to schema 22 failed", result.stderr)
+        self.assertIn("could not convert the shared-model store back to schema 22", result.stderr)
         self.assertEqual(os.readlink(self.prefix / "current"), f"versions/{VERSION}")
         self.assertTrue((self.prefix / "versions" / VERSION / "bin/cagentsd").exists())
 

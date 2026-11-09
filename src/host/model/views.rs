@@ -695,7 +695,16 @@ pub(super) fn adopt_authenticated_agent_pane(
     if pane.kind == replacement {
         return Ok(false);
     }
-    pane.kind = replacement;
+    // Another pane already presenting the successor keeps it, as an insert
+    // of a second pane for one resource would leave it.
+    let adopted = crate::workspace_model::views::Pane {
+        kind: replacement,
+        ..pane.clone()
+    };
+    if store::resource_holder(db, &adopted)?.is_some() {
+        return Ok(false);
+    }
+    *pane = adopted;
     view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
     // Holder continuity does not start a new channel naming choice, including
@@ -737,7 +746,14 @@ pub(super) fn rebind_agent_pane(
             if HostedSession::Chat(current.clone()).same_process(predecessor) => {}
         _ => return Ok(false),
     }
-    pane.kind = CardKind::Chat(next.clone());
+    let rebound = crate::workspace_model::views::Pane {
+        kind: CardKind::Chat(next.clone()),
+        ..pane.clone()
+    };
+    if store::resource_holder(db, &rebound)?.is_some() {
+        return Ok(false);
+    }
+    *pane = rebound;
     view.revision = store::next_revision(db)?;
     channel_work::placement::observe_view_transition(db, &before, &view)?;
     store::store(db, &view)?;

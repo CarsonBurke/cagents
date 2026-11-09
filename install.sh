@@ -512,20 +512,22 @@ cleanup() {
         fi
     fi
 
-    # A replacement daemon that started may have converted the shared-model
-    # store forward, past what the restored daemon reads. The replacement
-    # converts it back to the schema recorded before it started; the previous
-    # release is never run to ask, since releases before the converter take no
-    # options and would start a daemon instead. Without that conversion the
-    # restored daemon could not open the store, so the new installation is
-    # retained instead.
+    # Any daemon of the new version that started after current switched, the
+    # installer's or one a launcher started, may have converted the
+    # shared-model store past what the restored daemon reads. The replacement
+    # converts it back to the schema recorded before the switch; that does
+    # nothing if the store was not converted, and refuses while a daemon runs.
+    # The previous release is never run to ask, since releases before the
+    # converter take no options and would start a daemon instead. Without the
+    # conversion the restored daemon could not open the store, so the new
+    # installation is retained instead.
     if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ] \
-        && [ "$DAEMON_START_ATTEMPTED" -eq 1 ] && [ -n "$STORE_SCHEMA_BEFORE" ]; then
+        && [ -n "$STORE_SCHEMA_BEFORE" ]; then
         restored_schema=$STORE_SCHEMA_BEFORE
         [ "$restored_schema" != none ] || restored_schema=$OLDEST_STORE_SCHEMA
         if ! "$NEW_VERSION_DIR/bin/cagentsd" --downgrade-store "$restored_schema" >/dev/null; then
             TRANSACTION_COMMITTED=1
-            printf '%s: the replacement daemon may have converted the shared-model store past what the previous version reads, and converting it back to schema %s failed; retained the new installation, which reads it\n' \
+            printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store; inspect cagents daemon status before retrying\n' \
                 "$PROGRAM" "$restored_schema" >&2
         fi
     fi

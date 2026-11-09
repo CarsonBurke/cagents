@@ -227,7 +227,9 @@ kept in step by hand. The constraint matches `same_resource`, which compares
 resources only within one kind (chat and terminal ids share a type). A draft
 belongs to its pane and goes with it; closing a pane with a draft keeps the
 draft text in its `closed_panes` row's descriptor, as reopening does today. `shared_view_terminal_sources`, `channel_work_placement_epochs`
-and `shared_terminal_retention_pins` keep their columns and point at `panes`.
+and `shared_terminal_retention_pins` keep their columns; the sources and pins
+reference `panes`, and placement epochs stay keyed by pane id without a
+foreign key, deleted when their pane leaves.
 
 ### What is a column and what is a descriptor
 
@@ -264,7 +266,12 @@ and later recreated therefore never repeats a revision a stale client still
 holds, so its `expected_revision` conflicts and rebases instead of matching by
 accident. The clock is its own row rather than `metadata.sequence` because
 adopting or rebinding a pane changes its view without advancing the model
-sequence. Conversion starts the clock at the largest stored revision.
+sequence. Conversion starts the clock at the largest stored revision. Schema
+22 has no clock, so a store converted back and forward again restarts it at
+the largest revision that survived; a scope deleted under 23 whose revision
+was larger than every surviving one could then be recreated with a revision
+a stale client still holds. That needs a rollback and a re-upgrade between
+the client's last read and its next edit, and is accepted.
 
 Writing a view compares it with the stored rows and changes only those that
 differ: a moved pane updates its `position`, a retitled pane its row, and the
@@ -274,6 +281,12 @@ increase keep them; the rest take midpoints between their neighbors.
 ## Write paths
 
 ### Daemon edits are row changes
+
+This section is the target once closed history moves into the daemon (stage
+5). Stage 3 already writes only the rows an edit changed, by comparing the
+edited view with the stored rows, but still applies the edit to the view in
+memory, keeps no `closed_panes`, and derives placement and retention from the
+whole view before and after.
 
 `ModelEdit::ChangeView` keeps its wire shape. Applying one is O(change):
 
@@ -335,7 +348,7 @@ check, so a stale window cannot overwrite a newer draft from another window.
 | `closed_panes` chat rows with a provider session | 180 days, at most 5000 rows, and never while its resource is hosted or pinned | deleted oldest first |
 | `closed_panes` other rows | 30 days, and never while its resource is hosted or pinned | deleted |
 | `retired_panes`, empty `view_scopes` | until no window can seed from a local copy (stage 5) | then 30 days |
-| `view_operations` | 7 days after `applied_at_unix_ms` (`OPERATION_RETENTION`); conversion from schema 22 starts every existing row's age at the conversion | deleted by the daemon's runtime collector, at most 5000 rows every 10 minutes. `operation_seen` is the only replay guard, and a replay it misses fails the revision check as a *retryable* conflict, so a rebasing client could apply it twice. A window therefore never resends a pane change more than 24 hours (`REPLAY_LIMIT`) after first sending it, and a test holds the retention at six times that |
+| `view_operations` | 7 days after `applied_at_unix_ms` (`OPERATION_RETENTION`); conversion from schema 22 starts every existing row's age at the conversion | deleted by the daemon's runtime collector, at most 5000 rows every 10 minutes. `operation_seen` is the only replay guard, and a replay it misses fails the revision check as a *retryable* conflict, so a rebasing client could apply it twice. A window's publisher therefore never resends a pane change more than 24 hours (`REPLAY_LIMIT`) after first sending it, and a test holds the retention at six times that. A pending terminal's insert, whose operation is the pane's id, is sent again by a restarted window regardless of age; that is safe because an insert of a pane the view holds or retired changes nothing |
 | Worktree scopes whose project is closed | cascade, after their panes become `closed_panes` rows | deleted with the project |
 | `.final` receipt snapshot | until the daemon commits the actor's retirement | rewritten without the transcript and marked `compacted`; the proof fields stay so same-boot readers keep validating, and reading it as a transcript is an error |
 | `.final` of an actor that ended without retiring | until reboot | kept whole: a close whose reply was lost publishes its transcript from it |
@@ -503,9 +516,10 @@ measurement on a realistic-size workspace.
    operation retention, and `cagentsd --downgrade-store`, with which a failed
    update converts the store back to the schema it recorded before the
    replacement daemon started; no wire change.
-   Conversion keeps every pane a view holds, in list order, and refuses
-   (leaving the store at 22) rather than drop one held twice; schema 22's
-   pane index is rebuilt from the views. On a copy of the user's store (1858
+   Conversion keeps every pane a view holds open, in list order. A pane
+   listed in two views stays in the one schema 22's index named, and a second
+   pane for one resource gives way to the first, as schema 22 resolved both;
+   only an unreadable view refuses, leaving the store at 22. On a copy of the user's store (1858
    views, 88 panes, 46012 applied operations; `local` profile on fw16,
    medians of 25, two runs each): an edit to the busiest view costs 7 ms and
    29 to 49 KB of WAL instead of 9 to 11 ms and 58 to 82 KB; a window

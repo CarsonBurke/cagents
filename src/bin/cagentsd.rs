@@ -64,7 +64,9 @@ fn main() -> std::process::ExitCode {
         };
     }
     // Informational flags exit before opening runtime state or taking its
-    // daemon lease. Internal precheck owners keep their separate entrypoint.
+    // daemon lease; the store maintenance flags below hold the lease only for
+    // maintenance and never serve. Internal precheck owners keep their
+    // separate entrypoint.
     let matches = command().get_matches();
     if matches.get_flag("stored-schema") {
         return match cagents::host::stored_schema() {
