@@ -14,11 +14,16 @@ import dataclasses
 EDGE_CASES = {
     "malformed-record": "A Claude record mid-file that is not JSON.",
     "unfinished-line": "A Claude transcript whose last line has no newline and is cut short.",
-    "truncated-record": "A Claude record cut short mid-file, followed by intact records.",
+    "truncated-record": "A Claude message cut short mid-file by a crash, with the next message appended to the same "
+    "line and following on from the message before the cut one, as Claude Code goes on writing.",
     "renamed-file": "A Claude transcript whose file name is not its sessionId.",
     "sidechain": "A Claude transcript that also carries isSidechain records.",
-    "forked": "A Claude fork: its origin's records under the origin sessionId and cwd first, "
-    "filed under another project's folder.",
+    "forked": "A Claude fork, as --resume ID --fork-session writes it: its origin's messages first, with their "
+    "uuids and cwd but the fork's sessionId, filed under another project's folder.",
+    "large-record": "A Claude transcript holding one intact record over 30 MiB (a tool result), followed by a "
+    "message whose parentUuid is that record. Writes about 31 MiB; 'all' leaves it out.",
+    "large-transcripts": "Two Claude transcripts of about 220 MiB each, under the reader's limit, as long agent "
+    "sessions grow. Writes about 440 MiB; name it on its own.",
     "long-project-path": "A project path over 200 characters, so its Claude folder is a prefix plus a hash.",
     "removed-worktree": "History, a closed pane and a shared view for a worktree deleted from disk.",
     "codex-interrupted-turn": "A Codex turn ended by turn_aborted (reason interrupted).",
@@ -29,7 +34,7 @@ EDGE_CASES = {
 }
 
 # Edge cases a profile never gets from "all"; each must be named on its own.
-EXPLICIT_ONLY = {"oversized-transcript"}
+EXPLICIT_ONLY = {"oversized-transcript", "large-transcripts", "large-record"}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,6 +74,8 @@ class Profile:
     dirty_worktrees: int = 0  # Live worktrees with uncommitted changes.
     unread: tuple = ()  # Open chats with unread agent updates, per channel.
     oversized_mib: int = 260
+    large_record_mib: int = 31
+    large_transcript_mib: int = 220
 
 
 EVERY_EDGE_CASE = frozenset(EDGE_CASES) - EXPLICIT_ONLY
@@ -140,7 +147,7 @@ PROFILES = {
         codex_subagent_fraction=0.2,
         titled_fraction=0.45,
         noise_fraction=0.18,
-        edge_cases=EVERY_EDGE_CASE,
+        edge_cases=EVERY_EDGE_CASE | {"large-record"},
         writer_locks=2,
     ),
     "huge": Profile(
@@ -168,7 +175,7 @@ PROFILES = {
         codex_subagent_fraction=0.2,
         titled_fraction=0.45,
         noise_fraction=0.18,
-        edge_cases=EVERY_EDGE_CASE,
+        edge_cases=EVERY_EDGE_CASE | {"large-record"},
         writer_locks=4,
     ),
     "sidebar": Profile(

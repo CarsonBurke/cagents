@@ -137,13 +137,25 @@ class Generated(unittest.TestCase):
         self.assertTrue(0 < bad[0] < len(parsed) - 1)
         self.assertTrue(text.endswith("\n"))
 
-    def test_truncated_record_is_followed_by_intact_records(self):
+    def test_truncated_record_runs_into_the_next_message(self):
+        entry = self.plan["edge_cases"]["truncated-record"]
         text, parsed = records(self.claude_file("truncated-record"))
         bad = [i for i, record in enumerate(parsed) if not isinstance(record, dict)]
         self.assertEqual(len(bad), 1)
-        self.assertTrue(parsed[bad[0]].startswith("{"))
+        line = parsed[bad[0]]
+        self.assertTrue(line.startswith("{"))
         self.assertTrue(isinstance(parsed[-1], dict))
         self.assertTrue(text.endswith("\n"))
+        # The cut message's start, then the next message whole on the same line.
+        start = line.index('{"parentUuid"', 1)
+        joined = json.loads(line[start:])
+        # The cut message's start names the parent the joined one took over.
+        self.assertTrue(line.startswith(f'{{"parentUuid":"{joined["parentUuid"]}"'))
+        self.assertEqual(joined["uuid"], entry["joined"])
+        # It follows on from the message before the cut one, which is intact.
+        before = [r["uuid"] for r in parsed[: bad[0]] if isinstance(r, dict) and r.get("type") in ("user", "assistant")]
+        self.assertEqual(joined["parentUuid"], before[-1])
+        self.assertFalse(any(isinstance(r, dict) and r.get("uuid") == entry["lost"] for r in parsed))
 
     def test_unfinished_line_is_last_and_has_no_newline(self):
         text, parsed = records(self.claude_file("unfinished-line"))
@@ -163,7 +175,7 @@ class Generated(unittest.TestCase):
         self.assertGreater(chains[True], 0)
         self.assertGreater(chains[False], 0)
 
-    def test_fork_starts_with_its_origin_and_lives_in_another_project(self):
+    def test_fork_copies_its_origin_under_its_own_session(self):
         forks = self.plan["edge_cases"]["forked"]
         self.assertTrue(forks)
         by_session = {e["session_id"]: e for e in self.plan["history"]["claude"]}
@@ -171,16 +183,17 @@ class Generated(unittest.TestCase):
             self.assertNotEqual(claude.slug(fork["cwd"]), claude.slug(fork["origin_cwd"]))
             _, parsed = records(by_session[fork["session_id"]]["file"])
             _, origin = records(by_session[fork["origin"]]["file"])
-            sessions = [r["sessionId"] for r in parsed if "sessionId" in r]
-            self.assertEqual(sessions[0], fork["origin"])
-            self.assertEqual(sessions[-1], fork["session_id"])
-            switch = sessions.index(fork["session_id"])
-            self.assertEqual(set(sessions[:switch]), {fork["origin"]})
-            self.assertEqual(set(sessions[switch:]), {fork["session_id"]})
-            # The prefix is the origin's own records, verbatim.
-            prefix = [r for r in parsed if r.get("sessionId") == fork["origin"]]
-            self.assertEqual(prefix, [r for r in origin if r.get("sessionId") == fork["origin"]][: len(prefix)])
-            self.assertTrue(all(r["cwd"] == fork["origin_cwd"] for r in prefix if "cwd" in r))
+            self.assertEqual({r["sessionId"] for r in parsed if "sessionId" in r}, {fork["session_id"]})
+            # The origin's messages first, with their uuids and cwd, only the
+            # sessionId rewritten.
+            messages = [r for r in origin if r.get("type") in ("user", "assistant") and "uuid" in r]
+            self.assertEqual(parsed[: len(messages)],
+                             [{**r, "sessionId": fork["session_id"]} for r in messages])
+            # The fork's own turns follow on from the origin's last message.
+            own = parsed[len(messages)]
+            self.assertEqual(own["parentUuid"], messages[-1]["uuid"])
+            self.assertEqual(own["cwd"], fork["cwd"])
+            self.assertGreater(by_session[fork["session_id"]]["visible"], by_session[fork["origin"]]["visible"])
 
     def test_long_project_path_uses_a_hashed_prefix_folder(self):
         name = self.plan["edge_cases"]["long-project-path"]["project"]
@@ -314,6 +327,23 @@ class Reproducible(unittest.TestCase):
         self.assertLess(latest(early), early)
         self.assertEqual(latest(late) - latest(early), late - early)
 
+    def test_large_record_is_one_intact_record_that_the_next_follows(self):
+        run("generate", "--profile", "small", "--no-edge-cases", "--edge-case", "large-record", "--root", self.root)
+        with open(os.path.join(self.root, "plan.json")) as file:
+            plan = json.load(file)
+        entry = plan["edge_cases"]["large-record"]
+        (history,) = [h for h in plan["history"]["claude"] if h["session_id"] == entry["session_id"]]
+        with open(history["file"]) as file:
+            lines = file.read().splitlines()
+        sizes = [len(line.encode()) for line in lines]
+        (index,) = [i for i, size in enumerate(sizes) if size > 30 * 1024 * 1024]
+        record = json.loads(lines[index])
+        self.assertEqual(record["uuid"], entry["record"])
+        self.assertEqual(record["message"]["content"][0]["type"], "tool_result")
+        following = json.loads(lines[index + 1])
+        self.assertEqual(following["parentUuid"], record["uuid"])
+        self.assertEqual(following["type"], "assistant")
+
     def test_replace_refuses_a_directory_it_did_not_generate(self):
         os.makedirs(self.root)
         Path(self.root, "keep.txt").write_text("not ours")
@@ -350,6 +380,20 @@ class Profiles(unittest.TestCase):
             with self.subTest(case=case):
                 planner = self.plan("small", add=[case], drop_all=True)
                 self.assertEqual(set(planner.edge_cases), {case})
+
+    def test_large_edge_cases_are_planned_only_when_named(self):
+        everything = self.plan("small", add=["all"]).edge_cases
+        for case, size in (("large-record", 30), ("large-transcripts", 200)):
+            with self.subTest(case=case):
+                self.assertNotIn(case, everything)
+                planner = self.plan("small", add=[case], drop_all=True)
+                specs = [s for s in planner.claude if s.get("edge") == case]
+                self.assertEqual(len(specs), 1 if case == "large-record" else 2)
+                for spec in specs:
+                    self.assertGreater(spec.get("large_mib", spec.get("pad_mib")), size)
+                    self.assertLess(spec.get("pad_mib", 0), 256)
+        self.assertIn("large-record", profiles.PROFILES["realistic"].edge_cases)
+        self.assertNotIn("large-transcripts", profiles.PROFILES["huge"].edge_cases)
 
     def test_oversized_transcript_is_only_planned_when_named(self):
         self.assertNotIn("oversized-transcript", self.plan("small", add=["all"]).edge_cases)

@@ -71,9 +71,11 @@ def generate(profile, seed, root, epoch, replace=False, log=print):
     # A fork copies its origin's records, so origins are written first.
     for spec in sorted(planner.claude, key=lambda s: s.get("edge") == "forked"):
         if spec.get("edge") == "forked":
-            spec["origin_lines"] = written[spec["origin"]][: max(2, len(written[spec["origin"]]) // 2)]
+            spec["origin_lines"], spec["origin_shown"] = written[spec["origin"]]
         result = claude.write(home, spec, stream)
-        written[spec["session_id"]] = result["lines"]
+        written[spec["session_id"]] = (result["lines"], result["shown"])
+        if result["details"]:
+            planner.edge_detail(spec, result["details"])
         claude_summary.append({"session_id": spec["session_id"], "file": result["path"], "cwd": spec["cwd"],
                                "edge": spec.get("edge"), "visible": result["visible"],
                                "subagents": result["subagents"], "title": spec["title"]})

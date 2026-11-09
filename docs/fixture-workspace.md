@@ -32,8 +32,8 @@ memory: `realistic` is about 170 MB and `huge` about 1.1 GB.
 | Profile | Shape | Generate |
 | --- | --- | --- |
 | `small` | 3 projects, 6 channels, 33 cards, 24 Claude and 8 Codex conversations. No edge cases. For tests. | 0.1 s, 2 MB |
-| `realistic` | Measured from a long-lived installation: 18 projects, 76 channels, 1856 shared views (76 channel, 1780 worktree; 44 showing 83 panes), 45,970 recorded view edits with outliers of 36,608, 5,891 and 1,320, 1769 cards about 95% closed, a second window holding 1709 cards, 2400 Claude and 700 Codex conversations, and every edge case. | 3.6 s, 170 MB |
-| `huge` | Stress: 24 projects, 150 channels, 3538 cards, 10,000 Claude and 2,000 Codex conversations, every edge case. | 21 s, 1.1 GB |
+| `realistic` | Measured from a long-lived installation: 18 projects, 76 channels, 1856 shared views (76 channel, 1780 worktree; 44 showing 83 panes), 45,970 recorded view edits with outliers of 36,608, 5,891 and 1,320, 1769 cards about 95% closed, a second window holding 1709 cards, 2400 Claude and 700 Codex conversations, every edge case `all` adds, and `large-record`. | 3.6 s, 170 MB |
+| `huge` | Stress: 24 projects, 150 channels, 3538 cards, 10,000 Claude and 2,000 Codex conversations, every edge case `all` adds, and `large-record`. | 21 s, 1.1 GB |
 | `sidebar` | The sidebar's resting states: 10 projects with avatars and initials, dirty worktrees, and unread counts of 3, 12 and 120. | 0.3 s, 6 MB |
 
 Times are from one run on this repository's development host.
@@ -45,7 +45,9 @@ Times are from one run on this repository's development host.
 - `--scale F` multiplies the counts (cards, conversations, edits, worktrees)
   and leaves the structure alone.
 - `--edge-case NAME` adds one edge case, `--edge-case all` adds every one but
-  `oversized-transcript`, and `--no-edge-cases` drops the profile's.
+  the large ones (`large-record`, about 31 MiB; `large-transcripts`, about
+  440 MiB; `oversized-transcript`, about 260 MiB), and `--no-edge-cases` drops
+  the profile's. A large one is added only when named.
   `scripts/fixture-workspace edge-cases` lists them, with the profiles that
   include each.
 - `--epoch SECONDS` moves "now"; every timestamp counts back from it,
@@ -84,9 +86,12 @@ command output, compaction summaries, task notifications, skill bodies),
 long code-heavy replies, tool calls with results, synchronous and background
 subagents with their sidecar files, titles, and Codex harness context
 (`AGENTS.md`, environment context) before the first prompt. Codex subagent
-threads carry the `thread_spawn` source codex 0.166 writes. A fork is filed
-as codex and Claude Code do: a new file starting with its origin's records
-under the origin's session and working directory.
+threads carry the `thread_spawn` source codex 0.166 writes. Damage follows
+what Claude Code 2.1.296 was seen to write: a fork (`--resume ID
+--fork-session`) is a new file starting with its origin's messages, with their
+uuids and working directory but the fork's own sessionId; a crash mid-save
+cuts a message short and appends the next one to the same line, following on
+from the message before the cut one.
 
 `plan.json` names the file each edge case went into (`edge_cases`), each
 conversation's file, visible message count and turns (`history`), and the

@@ -641,9 +641,13 @@ mod tests {
             let mut read = 0;
             let mut mismatched = Vec::new();
             for entry in plan.history["claude"].as_array().unwrap() {
-                // Damaged files and forks are what the resume reader's own
-                // tolerance tests cover; whether they read is that reader's call.
-                if !matches!(entry["edge"].as_str(), None | Some("sidechain")) {
+                // Damaged files are what the resume reader's own tolerance
+                // tests cover; whether they read is that reader's call. A fork
+                // shows its origin's messages and then its own.
+                if !matches!(
+                    entry["edge"].as_str(),
+                    None | Some("sidechain" | "forked" | "large-record")
+                ) {
                     continue;
                 }
                 let session_id = entry["session_id"].as_str().unwrap();

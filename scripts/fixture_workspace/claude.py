@@ -45,7 +45,7 @@ class Conversation:
         self.parent = None
         self.lines = []
         self.sidecars = []  # (agent_id, meta, lines)
-        self.visible = 0  # Records the reader shows as messages.
+        self.shown = []  # uuids of the records the reader shows as messages.
         self.sidechain = False
 
     def tick(self, low=2, high=40):
@@ -78,7 +78,7 @@ class Conversation:
         self.tick()
         self.emit(self.base("user", message={"role": "user", "content": text}, **fields))
         if not fields.get("isMeta") and not self.sidechain:
-            self.visible += 1
+            self.shown.append(self.parent)
 
     def noise(self, name):
         fields, text = content.NOISE[name]
@@ -99,7 +99,7 @@ class Conversation:
                                 "output_tokens": self.stream.randint(20, 4000)}
         self.emit(self.base("assistant", message=message, requestId="req_" + self.stream.token(24)))
         if block["type"] == "text" and not self.sidechain:
-            self.visible += 1
+            self.shown.append(self.parent)
 
     def tool(self, message_id, name, arguments, result, tool_result):
         call = "toolu_" + self.stream.token(24)
@@ -193,6 +193,18 @@ class Conversation:
         field = {"ai-title": "aiTitle", "custom-title": "customTitle"}[kind]
         self.emit({"type": kind, "sessionId": self.session_id, field: text}, chain=False)
 
+    def large_output(self, megabytes):
+        """One intact tool result of `megabytes` MiB, a build log nobody
+        trimmed, and the answer that follows on from it."""
+        log = ("log line " + "x" * 90 + "\n") * (megabytes * 1024 * 1024 // 100 + 1)
+        message_id = "msg_" + self.stream.token(24)
+        self.tool(message_id, "Bash", {"command": "make -j16 V=1 2>&1", "description": "Verbose build"}, log,
+                  {"stdout": log[:4096], "stderr": "", "interrupted": False, "isImage": False})
+        record = self.parent
+        self.assistant({"type": "text", "text": "The build log is long, but the only failure is the linker "
+                                                "warning at the end; the build itself succeeded."}, message_id)
+        return record
+
     def pad(self, megabytes):
         """Large tool output, as long agent sessions accumulate, one MiB per
         record so no single record approaches the reader's record limit."""
@@ -203,17 +215,29 @@ class Conversation:
                       {"stdout": chunk, "stderr": "", "interrupted": False, "isImage": False})
 
 
+def chain_record(line):
+    """The record on `line` if it is part of the parentUuid chain."""
+    record = json.loads(line)
+    return record if "uuid" in record and record.get("type") in ("user", "assistant") else None
+
+
 def write(home, spec, stream):
     """Writes one conversation the workspace plan describes. Returns what a
     reader should find in it."""
     conversation = Conversation(stream, spec["session_id"], spec["cwd"], spec["branch"], spec["started_at"])
     edge = spec.get("edge")
     prefix = []
+    shown_before = []
+    details = {}
     if edge == "forked":
-        # The origin's records, under its own sessionId and cwd, then this one's.
-        prefix = spec["origin_lines"]
-        chained = [json.loads(line) for line in prefix]
-        conversation.parent = next((record["uuid"] for record in reversed(chained) if "uuid" in record), None)
+        # As `claude --resume ID --fork-session` writes it (Claude Code
+        # 2.1.296): the origin's messages with their own uuids, rewritten
+        # under the fork's sessionId, then the fork's own turns.
+        copied = [record for record in map(chain_record, spec["origin_lines"]) if record]
+        prefix = [json.dumps({**record, "sessionId": spec["session_id"]}, separators=(",", ":"), ensure_ascii=False)
+                  for record in copied]
+        shown_before = list(spec["origin_shown"])
+        conversation.parent = copied[-1]["uuid"] if copied else None
     for name in spec.get("noise", ()):
         conversation.noise(name)
     for index, prompt in enumerate(spec["prompts"]):
@@ -226,17 +250,33 @@ def write(home, spec, stream):
             conversation.assistant({"type": "text", "text": "Ready."}, "msg_" + stream.token(24))
             conversation.sidechain = False
             conversation.parent = parent
+        if edge == "large-record" and index == 0:
+            details["record"] = conversation.large_output(spec["large_mib"])
     if spec.get("pad_mib"):
         conversation.pad(spec["pad_mib"])
     if spec.get("title"):
         conversation.title(*spec["title"])
     lines = prefix + conversation.lines
+    shown = shown_before + conversation.shown
     tail = "\n"
     if edge == "malformed-record":
         lines.insert(len(lines) // 2, "this line is not JSON {")
     elif edge == "truncated-record":
-        middle = len(lines) // 2
-        lines[middle] = lines[middle][: len(lines[middle]) // 2]
+        # What a crash mid-save leaves once Claude Code goes on writing: a
+        # message cut short, with the next message appended to the same line
+        # and following on from the message before the cut one.
+        records = [chain_record(line) for line in lines]
+        cut = next(index for index in range(len(lines) // 2, len(lines) - 1)
+                   if records[index] and records[index + 1])
+        lost, joined = records[cut], records[cut + 1]
+        joined["parentUuid"] = lost["parentUuid"]
+        lines[cut + 1] = lines[cut][: len(lines[cut]) // 3] + json.dumps(joined, separators=(",", ":"),
+                                                                         ensure_ascii=False)
+        del lines[cut]
+        # The joined record is intact but shares the damaged line, so whether
+        # it shows is the reader's call; the lost one never can.
+        shown = [uuid for uuid in shown if uuid not in (lost["uuid"], joined["uuid"])]
+        details = {"lost": lost["uuid"], "joined": joined["uuid"]}
     elif edge == "unfinished-line":
         lines[-1] = lines[-1][: len(lines[-1]) // 2]
         tail = ""
@@ -255,5 +295,5 @@ def write(home, spec, stream):
         for sidecar in (records, os.path.join(directory, f"agent-{agent_id}.meta.json")):
             os.utime(sidecar, (conversation.now, conversation.now))
     os.utime(path, (conversation.now, conversation.now))
-    return {"path": path, "lines": conversation.lines, "visible": conversation.visible,
-            "subagents": len(conversation.sidecars), "ended_at": conversation.now}
+    return {"path": path, "lines": lines, "shown": shown, "visible": len(shown),
+            "subagents": len(conversation.sidecars), "ended_at": conversation.now, "details": details}

@@ -435,6 +435,22 @@ class Planner:
                 forks.append({"session_id": fork["session_id"], "origin": origin["session_id"],
                               "cwd": fork["cwd"], "origin_cwd": origin["cwd"]})
             self.edge_cases["forked"] = forks
+        if "large-record" in edge and spare:
+            spec = spare.pop(0)
+            spec["edge"] = "large-record"
+            spec["large_mib"] = self.profile.large_record_mib
+            self.edge_cases["large-record"] = {"session_id": spec["session_id"], "cwd": spec["cwd"],
+                                               "mib": spec["large_mib"]}
+        if "large-transcripts" in edge:
+            large = []
+            for _ in range(2):
+                if not spare:
+                    break
+                spec = spare.pop(0)
+                spec["edge"] = "large-transcripts"
+                spec["pad_mib"] = self.profile.large_transcript_mib
+                large.append({"session_id": spec["session_id"], "cwd": spec["cwd"]})
+            self.edge_cases["large-transcripts"] = large
         if "oversized-transcript" in edge and spare:
             spec = spare.pop(0)
             spec["pad_mib"] = self.profile.oversized_mib
@@ -456,6 +472,10 @@ class Planner:
             for spec in archived:
                 spec["archived"] = True
             self.edge_cases["codex-archived"] = [s["thread_id"] for s in archived]
+
+    def edge_detail(self, spec, details):
+        """What writing an edge case's conversation chose, for tests to find."""
+        self.edge_cases[spec["edge"]].update(details)
 
     # Windows.
 
