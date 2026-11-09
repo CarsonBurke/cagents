@@ -16812,7 +16812,10 @@ mod tests {
             },
         };
         // Nothing saved at all.
-        assert!(create(&launch(id)).is_err());
+        assert!(matches!(
+            create_for_start(&launch(id)),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
         // Too large for cagents to index, though Claude Code reads it.
         std::fs::create_dir_all(config.join("projects")).unwrap();
         let project = config.join("projects").join(
@@ -16827,12 +16830,12 @@ mod tests {
             .unwrap()
             .set_len(257 * 1024 * 1024)
             .unwrap();
-        let (spec, mut adapter) = create(&launch(id)).unwrap();
+        let (spec, mut adapter) = create_for_start(&launch(id)).unwrap();
         assert!(!matches!(
             spec.transport,
             super::super::TransportSpec::History
         ));
-        let step = adapter.initialize().unwrap();
+        let step = adapter.initialize_for_start().unwrap();
         let notice = step.events.iter().find_map(|event| match event {
             Event::History { items, .. } => items.iter().find_map(|item| match &item.content {
                 ItemContent::Delivery { summary, body, .. } => {
@@ -16850,10 +16853,103 @@ mod tests {
         assert!(body.starts_with("cagents could not read"), "{body}");
         assert!(body.contains("Details: "), "{body}");
         // Another conversation in the same project has no transcript.
-        assert!(create(&launch("00000000-0000-4000-8000-000000000002")).is_err());
+        assert!(matches!(
+            create_for_start(&launch("00000000-0000-4000-8000-000000000002")),
+            Err(super::super::SetupError::Unavailable(_))
+        ));
         // A reader with no provider has nothing to show and still refuses.
         std::fs::remove_dir(&cwd).unwrap();
-        assert!(create(&launch(id)).is_err());
+        assert!(matches!(
+            create_for_start(&launch(id)),
+            Err(super::super::SetupError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn typed_start_and_read_only_history_keep_damaged_message_markers() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let config = root.path().join("config");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let project = config.join("projects").join(
+            cwd.to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>(),
+        );
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join(format!("{id}.jsonl")),
+            [
+                claude_line("before", None, "user", "", "Before the damaged message"),
+                cut(&claude_line(
+                    "lost",
+                    Some("before"),
+                    "assistant",
+                    "",
+                    "Interrupted answer",
+                )),
+                claude_line(
+                    "after",
+                    Some("lost"),
+                    "user",
+                    "",
+                    "After the damaged message",
+                ),
+            ]
+            .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let launch = Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd,
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        for read_only in [false, true] {
+            let (spec, mut adapter) = if read_only {
+                create_history_for_start(&launch)
+            } else {
+                create_for_start(&launch)
+            }
+            .unwrap();
+            assert_eq!(
+                matches!(spec.transport, super::super::TransportSpec::History),
+                read_only
+            );
+            let step = adapter.initialize_for_start().unwrap();
+            let items = step
+                .events
+                .iter()
+                .filter_map(|event| match event {
+                    Event::History { items, .. } => Some(items),
+                    _ => None,
+                })
+                .flatten()
+                .collect::<Vec<_>>();
+            for text in ["Before the damaged message", "After the damaged message"] {
+                assert!(items.iter().any(|item| matches!(&item.content, ItemContent::Text { text: body, .. } if body == text)));
+            }
+            assert!(items.iter().any(|item| item.id.starts_with("history-gap:") && matches!(&item.content, ItemContent::Delivery { summary, .. } if summary == "A message here could not be read")));
+            if read_only {
+                assert!(
+                    step.writes.is_empty(),
+                    "paging damaged history must not initialize a provider"
+                );
+            }
+        }
     }
 
     /// Compaction rewrites what the session is carrying, and the context
