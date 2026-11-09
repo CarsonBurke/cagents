@@ -2515,7 +2515,10 @@ class Trim(unittest.TestCase):
         return self.agent["trim"](str(self.slot), budget, pressed)
 
     def session_size(self, crate):
-        return self.agent["tree_size"](str(crate), set())
+        """What trim counts for `crate`: what its sessions hold, not the
+        directories' own blocks, which some file systems give a size."""
+        return sum(self.agent["tree_size"](str(session), set())
+                   for session in crate.iterdir() if session.is_dir())
 
     def test_the_crates_compiled_most_recently_stay_within_the_budget(self):
         oldest = incremental_session(self.slot, "oldest-1", age=3 * 3600)
