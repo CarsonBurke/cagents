@@ -522,6 +522,17 @@ pub(super) fn retained_upgrade_sources(
     sources
         .into_iter()
         .filter(|source| source != successor)
+        .filter(|source| {
+            // Adopt rotates the native proof before the independently recovered
+            // terminal projection is acknowledged. Holders retain that internal
+            // state for exact cleanup, but no pane was issued the mismatched
+            // pair. Keep it out of checkpoints, including older helper journals.
+            let paired_proof = source
+                .terminal
+                .as_ref()
+                .and_then(|terminal| terminal.continuity.live_proof());
+            paired_proof.is_none_or(|proof| source.proof.as_ref() == Some(&proof))
+        })
         .map(|source| crate::upgrade::handoff::ChatSource {
             // The holder authenticated these immutable aliases, including the
             // first descriptor issued before the provider named its thread.
