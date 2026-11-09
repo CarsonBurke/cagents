@@ -38,7 +38,7 @@ both use the same fixture data and synthetic provider.
                   target. scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
-  start SIDE [--width PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
+  start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--portal gtk|kde|gnome|cosmic]
                   Take the native lock and start a headless session. The lock is
                   released by stop, or after --limit seconds (default 2700).
@@ -526,7 +526,7 @@ report_over_limit() {
 }
 
 run_session() {
-    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6
+    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6 height=${7:-900}
     load_side "$side" "$state/source"
     # Open for the whole session, even while it waits for the native lock, so
     # the pruner leaves the target.
@@ -564,6 +564,25 @@ run_session() {
     fi
     mkdir -m 700 "$runtime"
     mkdir -p -- "$compositor_home"/{home,config,data,cache,state}
+    # KWin owns only this task's nested compositor window. Give its client
+    # framebuffer both requested dimensions before niri fits its logical width;
+    # scaling the old fixed 1280x800 frame also scaled away the vertical space.
+    cat >"$compositor_home/config/kwinrulesrc" <<RULES
+[General]
+count=1
+rules=1
+
+[1]
+Description=Native evidence viewport
+wmclassmatch=0
+types=4294967295
+position=0,0
+positionrule=2
+size=$width,$height
+sizerule=2
+noborder=true
+noborderrule=2
+RULES
     prepare_fixture "$keep_state" 9>&-
 
     # The compositor reads and rewrites its settings on exit, so it gets its own
@@ -579,7 +598,7 @@ run_session() {
         CAGENTS_EVIDENCE_REAL_HOME="$real_home" PATH="$(path_without_shims)" \
         setpriv --pdeathsig TERM dbus-run-session -- setpriv --pdeathsig TERM \
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
-        --width 1596 --height 929 --exit-with-session \
+        --width "$width" --height "$height" --exit-with-session \
         "$self --task $task __inner $side $width" \
         >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
     compositor=$!
@@ -725,12 +744,13 @@ run_app() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 keep_state=false wait_lock=1800 limit=2700 portal=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
         case $1 in
             --width) width=${2:?--width needs pixels}; shift 2 ;;
+            --height) height=${2:?--height needs pixels}; shift 2 ;;
             --keep-state) keep_state=true; shift ;;
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
@@ -738,8 +758,8 @@ cmd_start() {
             *) die "unknown start option: $1" 2 ;;
         esac
     done
-    [[ $width =~ ^[0-9]+$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
-        die 'width, lock wait and session limit must be whole numbers' 2
+    [[ $width =~ ^[1-9][0-9]*$ && $height =~ ^[1-9][0-9]*$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
+        die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
@@ -757,10 +777,11 @@ cmd_start() {
         die "$(not_built "$side" "$checkout")"
     printf '%s\n' "$side" >"$state/side"
     printf '%s\n' "$width" >"$state/width"
+    printf '%s\n' "$height" >"$state/height"
     printf '%s\n' "$portal" >"$state/portal"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
-    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" \
+    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" \
         >>"$logs/session-$side.log" 2>&1 </dev/null &
     local pid=$!
     printf '%s\n' "$pid" >"$state/pid"
@@ -819,10 +840,20 @@ cmd_shot() {
     (
         nested_session_env
         local observed
-        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" observe --no-text) ||
+        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" --json observe --no-text) ||
             die "could not observe the session; see $harness_root/session.log and $logs/ui-$side.log"
-        grep -q '^window=' <<<"$observed" ||
-            die "the app has no window to capture; see $logs/ui-$side.log"
+        /usr/bin/python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+window = state.get("window")
+if not window:
+    sys.exit("native-evidence: the app has no window to capture")
+viewport = state["output"]["logical"]
+width, height = viewport["width"], viewport["height"]
+w, h = window["size"]
+if w > width + 2 or h > height + 2:
+    sys.exit(f"native-evidence: app window {w}x{h} exceeds viewport {width}x{height}; restart with a larger --width/--height")
+' <<<"$observed"
         timeout -k 5 60 niri-harness --no-heal --session "$session_name" shot "$side-$name" >/dev/null
     )
     local webp="$shots/$side-$name.webp" manifest="$shots/manifest.tsv"
