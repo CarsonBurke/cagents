@@ -431,6 +431,29 @@ fn epochs(db: &Connection) -> Vec<String> {
         .unwrap()
 }
 
+fn ids(registry: &Registry, scope: &Scope) -> Vec<CardId> {
+    read(&registry.db, scope)
+        .unwrap()
+        .panes
+        .iter()
+        .map(|pane| pane.id)
+        .collect()
+}
+
+/// One edit to `scope`, to show a repaired view still accepts them.
+fn still_edits(registry: &mut Registry, scope: &Scope) {
+    registry
+        .apply(&change(
+            registry,
+            scope,
+            Change::Insert {
+                pane: browser("after"),
+                before: None,
+            },
+        ))
+        .unwrap();
+}
+
 #[test]
 fn a_pane_listed_in_two_views_stays_open_in_the_view_schema_22_used() {
     for indexed_in_second in [false, true] {
@@ -438,7 +461,11 @@ fn a_pane_listed_in_two_views_stays_open_in_the_view_schema_22_used() {
         let path = directory.path().join("model.sqlite3");
         let (a, b) = schema_22(&path);
         let (a, b) = (Scope::Channel(a), Scope::Channel(b));
-        let shared = browser("shared");
+        let shared = terminal("shared");
+        let CardKind::Terminal(session) = &shared.kind else {
+            unreachable!()
+        };
+        let pinned_terminal = session.id.to_string();
         let own = browser("own");
         {
             let db = Connection::open(&path).unwrap();
@@ -452,21 +479,68 @@ fn a_pane_listed_in_two_views_stays_open_in_the_view_schema_22_used() {
                 )
                 .unwrap();
             }
+            db.execute(
+                "INSERT INTO shared_terminal_retention_pins(pane,terminal) VALUES(?1,?2)",
+                params![shared.id.to_string(), pinned_terminal],
+            )
+            .unwrap();
+            db.execute(
+                "INSERT INTO shared_view_terminal_sources(pane,source,ended) VALUES(?1,'source','ended')",
+                [shared.id.to_string()],
+            )
+            .unwrap();
         }
-        let registry = Registry::at(&path).expect("a damaged store still converts");
-        let (kept, left) = if indexed_in_second {
-            (&b, &a)
+        let mut registry = Registry::at(&path).expect("a damaged store still converts");
+        let (kept, left, kept_revision) = if indexed_in_second {
+            (&b, &a, 5)
         } else {
-            (&a, &b)
+            (&a, &b, 3)
         };
         assert!(
-            read(&registry.db, kept).unwrap().panes.contains(&shared),
+            ids(&registry, kept).contains(&shared.id),
             "the pane left the view its index named"
         );
-        assert!(!read(&registry.db, left).unwrap().panes.contains(&shared));
-        assert!(read(&registry.db, &b).unwrap().panes.contains(&own));
-        assert_eq!(read(&registry.db, &a).unwrap().revision, 3);
-        assert_eq!(read(&registry.db, &b).unwrap().revision, 5);
+        assert!(!ids(&registry, left).contains(&shared.id));
+        assert!(ids(&registry, &b).contains(&own.id));
+        // What hung off the pane stays with it.
+        let hung: (String, String, String) = registry
+            .db
+            .query_row(
+                "SELECT (SELECT pane FROM shared_terminal_retention_pins WHERE terminal = ?2),
+                        (SELECT pane FROM shared_view_terminal_sources),
+                        (SELECT pane FROM channel_work_placement_epochs WHERE pane = ?1)",
+                params![shared.id.to_string(), pinned_terminal],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let id = shared.id.to_string();
+        assert_eq!(hung, (id.clone(), id.clone(), id));
+        // The view it left retires it and moves past every stored revision,
+        // so a stale window's edit there conflicts instead of vanishing.
+        let left_view = read(&registry.db, left).unwrap();
+        assert!(left_view.retired.contains(&shared.id));
+        assert!(left_view.revision > 5, "{}", left_view.revision);
+        assert_eq!(read(&registry.db, kept).unwrap().revision, kept_revision);
+        still_edits(&mut registry, kept);
+        still_edits(&mut registry, left);
+
+        // Once it closes where it stayed, a stale window cannot seed it back
+        // into the view it left.
+        registry
+            .apply(&change(&registry, kept, Change::Remove { id: shared.id }))
+            .unwrap();
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: left.clone(),
+                panes: vec![shared.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        assert!(
+            !ids(&registry, left).contains(&shared.id),
+            "a closed pane came back"
+        );
+        assert!(!ids(&registry, kept).contains(&shared.id));
     }
 }
 
@@ -482,12 +556,15 @@ fn a_pane_listed_twice_in_one_view_is_kept_once() {
         put_22(&db, &a, 2, &[first.clone(), second.clone()], &[], &[]);
         also_list_22(&db, &a, &[first.clone(), second.clone(), first.clone()]);
     }
-    let registry = Registry::at(&path).unwrap();
-    assert_eq!(read(&registry.db, &a).unwrap().panes, vec![first, second]);
+    let mut registry = Registry::at(&path).unwrap();
+    let view = read(&registry.db, &a).unwrap();
+    assert_eq!(view.panes, vec![first, second]);
+    assert!(view.retired.is_empty(), "a pane still open was retired");
+    still_edits(&mut registry, &a);
 }
 
 #[test]
-fn a_second_pane_for_one_resource_gives_way_to_the_first_and_keeps_no_placement() {
+fn a_second_pane_for_one_resource_gives_way_to_the_first_and_cannot_return() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.sqlite3");
     let (a, b) = schema_22(&path);
@@ -506,12 +583,15 @@ fn a_second_pane_for_one_resource_gives_way_to_the_first_and_keeps_no_placement(
         put_22(&db, &a, 1, &[one.clone(), two.clone()], &[], &[]);
         put_22(&db, &b, 1, std::slice::from_ref(&three), &[], &[]);
     }
-    let registry = Registry::at(&path).expect("a damaged store still converts");
+    let mut registry = Registry::at(&path).expect("a damaged store still converts");
     assert_eq!(
         read(&registry.db, &a).unwrap().panes,
         vec![one.clone(), two.clone()]
     );
-    assert_eq!(read(&registry.db, &b).unwrap().panes, vec![]);
+    let gave_way = read(&registry.db, &b).unwrap();
+    assert_eq!(gave_way.panes, vec![]);
+    assert_eq!(gave_way.retired, vec![three.id]);
+    assert!(gave_way.revision > 1);
     assert_eq!(
         epochs(&registry.db),
         {
@@ -521,8 +601,39 @@ fn a_second_pane_for_one_resource_gives_way_to_the_first_and_keeps_no_placement(
         },
         "the pane that gave way kept a placement"
     );
+    still_edits(&mut registry, &a);
+    still_edits(&mut registry, &b);
+    // Its holder closing does not let a stale window seed it back.
+    registry
+        .apply(&change(&registry, &a, Change::Remove { id: one.id }))
+        .unwrap();
+    registry
+        .apply(&ModelEdit::SeedView {
+            scope: b.clone(),
+            panes: vec![three.clone()],
+            closed: vec![],
+        })
+        .unwrap();
+    assert!(
+        !ids(&registry, &b).contains(&three.id),
+        "a closed pane came back"
+    );
     drop(registry);
+
+    // Schema 22 gets the repaired views back.
     Registry::downgrade_at(&path, 22).unwrap();
+    let db = Connection::open(&path).unwrap();
+    let (panes, retired): (String, String) = db
+        .query_row(
+            "SELECT panes, retired FROM shared_views WHERE scope = ?1",
+            [scope_key(&b).unwrap()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let panes: Vec<Pane> = serde_json::from_str(&panes).unwrap();
+    let retired: Vec<CardId> = serde_json::from_str(&retired).unwrap();
+    assert!(panes.iter().all(|pane| pane.id != three.id));
+    assert!(retired.contains(&three.id));
 }
 
 #[test]

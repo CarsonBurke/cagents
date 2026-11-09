@@ -906,7 +906,11 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
     // in the view its pane index named, where its edits, transfers and pins
     // went, or else in the first view that lists it; a resource stays with the
     // first pane that presents it, the one schema 22 found as its holder.
-    // Every pane stays open in some view.
+    // Every pane id stays open in some view, and every resource in some pane.
+    // A view a pane leaves retires its id, so a stale window's seed cannot put
+    // it back there once it closes where it stayed, and takes a new revision,
+    // so a stale window's edit to it conflicts and rebases instead of being
+    // acknowledged as a no-op.
     let mut views = views
         .into_iter()
         .map(|(key, channel, repository, revision, saved, retired)| {
@@ -941,11 +945,18 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
             (id, kept.to_owned())
         })
         .collect();
+    let mut left: HashMap<String, Vec<CardId>> = HashMap::new();
     for (key, _, _, _, saved, _) in &mut views {
         let before = saved.len();
         // Within one list too, the first entry for an id is the pane.
         let mut seen = HashSet::new();
-        saved.retain(|pane| keeper[&pane.id] == *key && seen.insert(pane.id));
+        saved.retain(|pane| {
+            if keeper[&pane.id] != *key {
+                left.entry(key.clone()).or_default().push(pane.id);
+                return false;
+            }
+            seen.insert(pane.id)
+        });
         if saved.len() != before {
             tracing::warn!(
                 scope = %key,
@@ -955,6 +966,7 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
         }
     }
     let mut clock = 0;
+    let mut repaired = Vec::new();
     for (key, channel, repository, revision, saved, retired) in views {
         let scope: Scope = serde_json::from_str(&key)
             .map_err(|error| format!("a saved view scope is unreadable: {error}"))?;
@@ -978,9 +990,10 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
             params![key, id],
         )
         .map_err(sql)?;
-        let retired: Vec<CardId> = serde_json::from_str(&retired).map_err(|error| {
+        let mut retired: Vec<CardId> = serde_json::from_str(&retired).map_err(|error| {
             format!("a saved view is unreadable; the store was not converted: {error}")
         })?;
+        let mut gone = left.remove(&key).unwrap_or_default();
         let mut position = 0;
         for pane in &saved {
             if let Some(holder) = resource_holder(tx, pane)? {
@@ -989,6 +1002,7 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
                     %holder,
                     "a second pane for one resource gives way to the pane that held it"
                 );
+                gone.push(pane.id);
                 continue;
             }
             position += POSITION_STEP;
@@ -998,6 +1012,14 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
                     pane.id
                 )
             })?;
+        }
+        if !gone.is_empty() {
+            repaired.push(id);
+        }
+        for pane in gone {
+            if !retired.contains(&pane) {
+                retired.push(pane);
+            }
         }
         for (index, pane) in retired.iter().enumerate() {
             tx.execute(
@@ -1021,6 +1043,14 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
         [now],
     )
     .map_err(sql)?;
+    for id in repaired {
+        clock += 1;
+        tx.execute(
+            "UPDATE view_scopes SET revision = ?2 WHERE id = ?1",
+            params![id, clock],
+        )
+        .map_err(sql)?;
+    }
     tx.execute(
         "INSERT INTO view_revision_clock(id, last) VALUES (1, ?1)",
         [clock],

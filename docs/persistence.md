@@ -519,7 +519,10 @@ measurement on a realistic-size workspace.
    Conversion keeps every pane a view holds open, in list order. A pane
    listed in two views stays in the one schema 22's index named, and a second
    pane for one resource gives way to the first, as schema 22 resolved both;
-   only an unreadable view refuses, leaving the store at 22. On a copy of the user's store (1858
+   the view a pane leaves retires its id and takes a new revision, so neither
+   a stale seed nor a stale edit can bring it back, and a pane that gives way
+   loses its retention pin with its placement. Only an unreadable view
+   refuses, leaving the store at 22. On a copy of the user's store (1858
    views, 88 panes, 46012 applied operations; `local` profile on fw16,
    medians of 25, two runs each): an edit to the busiest view costs 7 ms and
    29 to 49 KB of WAL instead of 9 to 11 ms and 58 to 82 KB; a window
