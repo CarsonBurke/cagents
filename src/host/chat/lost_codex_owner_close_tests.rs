@@ -602,3 +602,136 @@ fn a_finished_resident_whose_owner_ended_closes() {
     fixture.assert_settled();
     assert!(!fixture.socket().parent().unwrap().exists());
 }
+
+/// An open agent bound to `fixture`'s conversation, with its capability, as
+/// `cagents agent spawn --provider codex` leaves one whose provider then died
+/// in this boot with no daemon stop recorded.
+fn bound_agent(fixture: &Fixture, root: &std::path::Path) -> crate::agent_execution::Accepted {
+    use crate::agent_execution::{
+        Destination, HostedSession, Origin, Spec, Submit, Surface, Target,
+    };
+    let directory = fixture.source.launch.recipe.working_directory.clone();
+    let registry = fixture
+        .host
+        .lock()
+        .unwrap()
+        .execution_registry
+        .clone()
+        .unwrap();
+    let mut registry = registry.lock().unwrap();
+    registry
+        .apply(&crate::workspace_model::ModelEdit::OpenProject {
+            repository: directory.clone(),
+            name: "Fixture".into(),
+            kind: crate::model::ProjectKind::Folder,
+        })
+        .unwrap();
+    let submit = Submit {
+        name: None,
+        destination: Destination::New(Spec {
+            provider: Provider::Codex,
+            account: None,
+            target: Target {
+                repository: directory.clone(),
+                directory,
+                placement: None,
+            },
+            surface: Surface::Chat,
+            model: None,
+            permission_mode: None,
+            reasoning_effort: None,
+        }),
+        prompt: "List the files here".into(),
+        idempotency_key: root.display().to_string(),
+    };
+    let accepted = registry.submit_agent(&Origin::User, &submit, 1).unwrap();
+    let source = HostedSession::Chat(fixture.source.clone());
+    registry
+        .bind_agent(accepted.agent.id, None, source.clone())
+        .unwrap();
+    registry.register_agent_authority(&source).unwrap();
+    assert!(!registry.agent_process_ended(accepted.agent.id).unwrap());
+    accepted
+}
+
+fn agent_closed(fixture: &Fixture, id: crate::model::AgentId) -> bool {
+    let registry = fixture
+        .host
+        .lock()
+        .unwrap()
+        .execution_registry
+        .clone()
+        .unwrap();
+    let registry = registry.lock().unwrap();
+    registry.agent(id).unwrap().closed
+        && registry
+            .retained_agent_authority_source(fixture.source.id)
+            .unwrap()
+            .is_none()
+}
+
+/// The pane of a Codex agent whose holder and provider died in this boot.
+/// Nothing settled it: the lost-owner proof refused any conversation an
+/// agent claimed, and the agent's own close found no receipt either. Its
+/// Close now ends the agent with the pane.
+#[test]
+fn a_lost_codex_agents_pane_closes_and_ends_the_agent() {
+    let Some(root) = isolated("a_lost_codex_agents_pane_closes_and_ends_the_agent") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let accepted = bound_agent(&fixture, &root);
+    fixture.record(exited(i32::MAX - 1), exited(i32::MAX - 2));
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+    assert!(agent_closed(&fixture, accepted.agent.id));
+    assert!(!fixture.socket().parent().unwrap().exists());
+}
+
+/// `cagents agent close` takes the same route for that agent.
+#[test]
+fn a_lost_codex_agent_closes_by_command() {
+    let Some(root) = isolated("a_lost_codex_agent_closes_by_command") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let accepted = bound_agent(&fixture, &root);
+    let reply = super::super::agent_execution::process(
+        &fixture.host,
+        Default::default(),
+        crate::agent_execution::Operation::Close(accepted.agent.id),
+    )
+    .unwrap();
+    assert!(matches!(reply, crate::agent_execution::Reply::Closed(agent) if agent.closed));
+    assert!(agent_closed(&fixture, accepted.agent.id));
+    fixture.assert_settled();
+}
+
+/// A Codex agent whose provider outlived its holder may still be working, so
+/// neither its pane nor its agent closes, and both stay as they were.
+#[test]
+fn a_codex_agent_whose_provider_survives_keeps_the_refusal() {
+    let Some(root) = isolated("a_codex_agent_whose_provider_survives_keeps_the_refusal") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let accepted = bound_agent(&fixture, &root);
+    fixture.record(exited(i32::MAX - 1), current());
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    let registry = fixture
+        .host
+        .lock()
+        .unwrap()
+        .execution_registry
+        .clone()
+        .unwrap();
+    assert!(
+        !registry
+            .lock()
+            .unwrap()
+            .agent(accepted.agent.id)
+            .unwrap()
+            .closed
+    );
+    assert!(has_native_owner(&fixture.source).unwrap());
+}

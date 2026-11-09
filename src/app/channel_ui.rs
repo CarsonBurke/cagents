@@ -58,7 +58,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 {
                     client
                         .close_retained_chat(session.clone())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| error.reason())?;
                 }
                 continue;
             };
@@ -72,7 +72,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 if bound_to_open_agent(live, read_open_agents(&mut agents, &mut client)?) {
                     client
                         .close_retained_chat(live.clone())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| error.reason())?;
                 }
             }
             if let Err(error) = closed {
@@ -104,7 +104,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                     // ownership, not process exit. Demand its close receipt.
                     client
                         .close_retained_chat(live.clone())
-                        .map_err(|error| error.to_string())?;
+                        .map_err(|error| error.reason())?;
                 }
             }
         }

@@ -462,7 +462,24 @@ fn prove_not_hosted_at(
         .iter()
         .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
     {
-        return Err(open_agent_refusal(agent, &chats, &current.boot_id));
+        let Some(conversation) = lost_conversation_of_pane(agent, session.id, &chats) else {
+            return Err(open_agent_refusal(agent, &chats, &current.boot_id));
+        };
+        // This pane is the agent's own conversation, whose provider is gone
+        // from the daemon. Closing it is a person closing that conversation,
+        // which ends its agent, as the conversation's own Close does. The
+        // daemon settles it only once nothing of it can still run.
+        client
+            .close_retained_chat(conversation.clone())
+            .map_err(|error| lost_agent_refusal(&error.reason()))?;
+        let model = client.read_workspace_model().map_err(|_| UNREACHABLE)?;
+        if let Some(agent) = model
+            .agents
+            .iter()
+            .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
+        {
+            return Err(open_agent_refusal(agent, &chats, &current.boot_id));
+        }
     }
     // Authenticate the answer: reaching a socket that reports another identity
     // is not evidence that the daemon holding the runtime's lease answered.
@@ -534,6 +551,34 @@ fn survivor_refusal(
     }
 }
 
+/// The conversation of an open agent that this pane is, when the daemon no
+/// longer hosts it: what the pane's Close closes, as the conversation's own
+/// Close would. A scheduled agent is its automation's to end.
+fn lost_conversation_of_pane<'a>(
+    agent: &'a crate::agent_execution::Agent,
+    terminal: crate::model::TerminalId,
+    hosted: &[crate::chat::Session],
+) -> Option<&'a crate::chat::Session> {
+    use crate::agent_execution::{HostedSession, Origin};
+    match &agent.session {
+        Some(HostedSession::Chat(chat))
+            if chat.id == terminal
+                && !matches!(agent.origin, Origin::Automation { .. })
+                && !hosted.iter().any(|hosted| hosted.id == chat.id) =>
+        {
+            Some(chat)
+        }
+        _ => None,
+    }
+}
+
+/// Why closing the agent conversation this pane is was refused, in the
+/// daemon's words.
+fn lost_agent_refusal(reason: &str) -> String {
+    let reason = reason.trim_end_matches('.');
+    format!("This pane is an open agent's conversation, which Cagents couldn't close. {reason}.")
+}
+
 /// Never names a route the daemon is certain to refuse.
 fn open_agent_refusal(
     agent: &crate::agent_execution::Agent,
@@ -571,6 +616,12 @@ fn agent_close_can_release(
         Some(HostedSession::Terminal(_)) => false,
         Some(HostedSession::Chat(session)) => {
             session.closes_without_hosted_actor()
+                // The daemon closes a retained actor that died without its
+                // retirement once nothing of it can still run.
+                || matches!(
+                    session.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+                )
                 || hosted.iter().any(|chat| chat.id == session.id)
                 // A scheduled agent is its automation's to end, so the daemon
                 // doesn't take this route for one.
@@ -1627,12 +1678,15 @@ mod tests {
         recovery_only: bool,
         /// Owner authentication connects once before and once after the scan.
         owner_probes: usize,
+        /// How a pane's Close of a conversation it hosts no longer is
+        /// answered: accepted, which closes its agents, or refused with this.
+        retained_close: Option<Result<(), String>>,
     }
 
     fn inventory(
         socket: &Path,
         proof: HostSessionProof,
-        inventory: Inventory,
+        mut inventory: Inventory,
     ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
@@ -1648,6 +1702,29 @@ mod tests {
                             "Startup recovery retained original ownership",
                             false,
                         ))
+                    }
+                    ClientRequest::ChatCloseRetained { .. } => {
+                        match inventory
+                            .retained_close
+                            .take()
+                            .expect("a Close proof closed a conversation")
+                        {
+                            Ok(()) => {
+                                for agent in &mut inventory.agents {
+                                    agent.closed = true;
+                                }
+                                ServerMessage::Response {
+                                    response: ServerResponse::Accepted,
+                                }
+                            }
+                            Err(refusal) => {
+                                ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(
+                                    crate::terminal::ipc::ProtocolErrorCode::TerminalUnavailable,
+                                    refusal,
+                                    true,
+                                ))
+                            }
+                        }
                     }
                     other => ServerMessage::Response {
                         response: match other {
@@ -2140,10 +2217,17 @@ mod tests {
         ] {
             let served = Inventory {
                 agents: vec![open],
+                // Only the pane that is the agent's conversation asks.
+                retained_close: Some(Err(
+                    "Cagents couldn't confirm this conversation stopped".into()
+                )),
                 ..Default::default()
             };
             let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
-            assert!(refusal.contains("was kept"), "{refusal}");
+            assert!(
+                refusal.contains("was kept") || refusal.contains("which Cagents couldn't close"),
+                "{refusal}"
+            );
         }
         let served = Inventory {
             agents: vec![agent(
@@ -2158,6 +2242,81 @@ mod tests {
             prove(&saved, proof("current"), served, directory.path()),
             Ok(())
         );
+    }
+
+    /// #2102: the pane is an open agent's conversation whose provider the
+    /// daemon no longer hosts. Its Close closes that conversation, and its
+    /// agent with it, as the conversation's own Close does; the daemon keeps
+    /// both when it can't prove nothing of it still runs, and says why.
+    #[test]
+    fn closing_a_lost_agents_own_pane_closes_its_conversation() {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("old"));
+        let agent = |origin| Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/execution/.git".into(),
+                    directory: "/execution/cwd".into(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Channel(crate::model::ChannelId::new()),
+            session: Some(HostedSession::Chat(crate::chat::Session {
+                native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor {
+                    protocol: 2,
+                },
+                ..chat(saved.id, &saved.launch, None)
+            })),
+            console: Some(saved.clone()),
+            created_ms: 1,
+            closed: false,
+        };
+        let served = Inventory {
+            agents: vec![agent(Origin::User)],
+            retained_close: Some(Ok(())),
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("current"), served, directory.path()),
+            Ok(())
+        );
+
+        let reason =
+            "Cagents couldn't confirm this conversation stopped. Its Cagents helper is gone";
+        let served = Inventory {
+            agents: vec![agent(Origin::User)],
+            retained_close: Some(Err(reason.into())),
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(
+            refusal.contains("which Cagents couldn't close"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(reason), "{refusal}");
+
+        // A scheduled agent is its automation's to end: nothing is asked.
+        let served = Inventory {
+            agents: vec![agent(Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            })],
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("Only what started it"), "{refusal}");
     }
 
     #[test]
@@ -2195,7 +2354,17 @@ mod tests {
             closed: false,
         };
         let boot = proof("current").boot_id;
-        let lost = chat_with(NativeContinuity::RetainedClaudeActor { protocol: 2 });
+        // A retained actor that died in this boot closes once the daemon
+        // proves nothing of it runs; a conversation with no owner to prove
+        // that by has no route.
+        assert!(agent_close_can_release(
+            &agent(Some(HostedSession::Chat(chat_with(
+                NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )))),
+            &[],
+            &boot
+        ));
+        let lost = chat_with(NativeContinuity::ReconnectOnly);
         assert!(!agent_close_can_release(
             &agent(Some(HostedSession::Chat(lost.clone()))),
             &[],

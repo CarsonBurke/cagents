@@ -674,11 +674,51 @@ impl ExecutionEvidence {
     }
 }
 
-/// Whether nothing of a Codex pane of `boot` can still run, by the evidence
-/// an upgrade requires before it replaces the service that ran it.
-pub(super) fn codex_execution_ended(source: &Session, boot: &crate::model::BootId) -> bool {
-    source.launch.provider == crate::agent::Provider::Codex
-        && ExecutionEvidence::codex(boot).classify_codex(source) == SavedExecution::Ended
+/// What the evidence an upgrade requires before it replaces a service says
+/// of what `source`'s execution left behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ExecutionEnd {
+    /// Nothing of it can still run: its proof names another kernel boot, or
+    /// every owner of this boot is gone (see [`ExecutionEvidence::classify`]).
+    Ended,
+    /// A process or bound socket of it survives.
+    Running,
+    /// The evidence cannot tell, or does not cover this shape of pane.
+    Unproved,
+}
+
+/// What remains of `source`'s execution. `owners` is the census of this
+/// pane, each owner with whether its retirement is recorded, read from the
+/// daemon's own store. An actor that ended without recording what it
+/// confirmed has still ended: nothing of it remains to close, only nothing to
+/// reopen.
+pub(super) fn execution_end(
+    source: &Session,
+    boot: &crate::model::BootId,
+    owners: Result<Vec<(crate::daemon::holder_registry::Record, bool)>, String>,
+) -> ExecutionEnd {
+    let census = owners.as_ref().map_err(Clone::clone).map(|owners| {
+        owners
+            .iter()
+            .map(|(owner, _)| (source.id, owner.clone()))
+            .collect()
+    });
+    let retired = owners.map(|owners| {
+        owners
+            .into_iter()
+            .filter_map(|(owner, retired)| retired.then_some(owner))
+            .collect()
+    });
+    let evidence = ExecutionEvidence {
+        census,
+        retired,
+        ..ExecutionEvidence::codex(boot)
+    };
+    match evidence.classify(source) {
+        SavedExecution::Ended | SavedExecution::Unrecorded => ExecutionEnd::Ended,
+        SavedExecution::Running => ExecutionEnd::Running,
+        SavedExecution::Unproved => ExecutionEnd::Unproved,
+    }
 }
 
 /// Whether any process of this user names a Codex pane's listener directory

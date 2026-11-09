@@ -1381,8 +1381,28 @@ fn close_with_target(
         .chats
         .contains_key(&requested.id);
     if !present {
-        if let Some(verified) = cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
-            return close_verified_unattached(host, requested, &proof, verified, ending);
+        let exited = match cleanup_retirement(host, requested, &proof, discovered.as_ref())? {
+            CleanupRetirement::Verified(verified) => {
+                return close_verified_unattached(host, requested, &proof, verified, ending);
+            }
+            CleanupRetirement::None => None,
+            CleanupRetirement::ExitedUnproved => {
+                Some("The retained cleanup helper exited without verified retirement")
+            }
+        };
+        // An actor that died - killed, crashed, out of memory - leaves no
+        // verified retirement and nothing to attach. A person's Close settles
+        // once nothing of it can still run; a daemon stop keeps the refusal.
+        if ending == Ending::Closed
+            && match &discovered {
+                Some(owner) => chat::native_holder::retire_abandoned(owner)?,
+                None => true,
+            }
+        {
+            return super::settle_lost_execution(host, requested, &proof);
+        }
+        if let Some(exited) = exited {
+            return Err(exited.into());
         }
         let owner = discovered.as_ref().ok_or("No authenticated retained Claude actor is available; its saved descriptor was preserved")?;
         if !Handle::is_remote_record(owner) {
@@ -1510,7 +1530,17 @@ fn close_with_target(
                 )
             }
             RetirementInspection::ExitedUnproved => {
-                return Err("The closed helper lacks its exact semantic-retirement receipt".into());
+                // The resident's actor died without its retirement. As with
+                // no resident, a person's Close settles once nothing of it
+                // can still run, and then the resident goes too.
+                if ending != Ending::Closed
+                    || paired.is_some()
+                    || !chat::native_holder::retire_abandoned(&identity.record)?
+                {
+                    return Err(RETIREMENT_UNPROVED.into());
+                }
+                super::settle_lost_execution(host, &source, &proof)?;
+                return remove_closed_resident(host, &proof, &source, &target, None, ending);
             }
         };
     verify_close_ownership(
@@ -1583,14 +1613,30 @@ fn close_with_target(
         .map_err(|error| error.message)?;
     // Keep the closed record retryable until durable process retirement succeeds.
     ending.end(host, &source)?;
+    remove_closed_resident(host, &proof, &source, &target, paired.as_ref(), ending)
+}
+
+/// Removes a resident whose retained actor is closed or proved gone, unless
+/// its record, its paired worker or the daemon's proof changed meanwhile.
+fn remove_closed_resident(
+    host: &SharedHost,
+    proof: &HostSessionProof,
+    source: &Session,
+    target: &super::CloseTarget,
+    paired: Option<&(
+        crate::model::TerminalSession,
+        crate::terminal::TerminalHandle,
+    )>,
+    ending: Ending,
+) -> Result<(), String> {
     let removed = {
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.proof() != &proof
+        if state.proof() != proof
             || !state
                 .chats
                 .get(&source.id)
                 .is_some_and(|record| target.matches(record))
-            || paired.as_ref().is_some_and(|(terminal, worker)| {
+            || paired.is_some_and(|(terminal, worker)| {
                 state
                     .terminals
                     .get(&terminal.id)
@@ -1602,7 +1648,7 @@ fn close_with_target(
                     .into(),
             );
         }
-        if let Some((terminal, _)) = &paired {
+        if let Some((terminal, _)) = paired {
             state.retire_terminal(terminal.id);
         }
         let removed = state.chats.remove(&source.id);
@@ -1636,6 +1682,19 @@ fn close_with_target(
     Ok(())
 }
 
+/// Why a resident's Close waits when its helper exited without the receipt.
+const RETIREMENT_UNPROVED: &str = "The closed helper lacks its exact semantic-retirement receipt";
+
+/// What this pane's durable owners record about its retained actor's end.
+enum CleanupRetirement {
+    /// An owner's verified retirement names this exact descriptor.
+    Verified(VerifiedRetirement),
+    /// No owner has ended, or none is registered.
+    None,
+    /// An owner's helper exited without its verified retirement.
+    ExitedUnproved,
+}
+
 /// Discovery disappears at retirement, before the durable HOST transaction.
 /// Consult only this pane's durable owners; absence never authorizes relaunch.
 fn cleanup_retirement(
@@ -1643,7 +1702,7 @@ fn cleanup_retirement(
     requested: &Session,
     proof: &HostSessionProof,
     discovered: Option<&crate::daemon::holder_registry::Record>,
-) -> Result<Option<VerifiedRetirement>, String> {
+) -> Result<CleanupRetirement, String> {
     let registry = super::super::agent_execution::registry(host)?;
     let mut after = None;
     let mut matched = None;
@@ -1653,7 +1712,7 @@ fn cleanup_retirement(
             .unwrap_or_else(|p| p.into_inner())
             .native_actor_ownerships(after, 128)?;
         if page.is_empty() {
-            return Ok(matched);
+            return Ok(matched.map_or(CleanupRetirement::None, CleanupRetirement::Verified));
         }
         for owner in page {
             after = Some(owner.actor());
@@ -1665,9 +1724,7 @@ fn cleanup_retirement(
             match Handle::inspect_retained_retirement(owner.owner(), proof)? {
                 RetirementInspection::Running => {}
                 RetirementInspection::ExitedUnproved => {
-                    return Err(
-                        "The retained cleanup helper exited without verified retirement".into(),
-                    );
+                    return Ok(CleanupRetirement::ExitedUnproved);
                 }
                 RetirementInspection::Verified(verified) => {
                     let receipt = verified.receipt();

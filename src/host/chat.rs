@@ -1037,62 +1037,147 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
     close_retained_native(host, session)
 }
 
-/// Settles the Close of a Codex conversation whose native owner is gone for
-/// good, as exact cleanup's answer when it finds no pending close, receipt or
-/// live holder record, or when its pending close settled without a receipt.
-/// The caller holds the conversation's close claim, and removes a finished
-/// resident once this succeeds.
+/// Settles the Close of a conversation whose native owner ended without a
+/// close receipt, once nothing of it can still run. Exact cleanup comes here
+/// when it has nothing left to act on: a Codex conversation with no pending
+/// close, receipt or live holder record, or whose pending close settled
+/// without a receipt, and a retained Claude actor that exited without its
+/// verified retirement. The caller holds the conversation's close claim, and
+/// removes a finished resident once this succeeds.
 ///
-/// A holder that dies - killed, crashed, or taken down with its provider -
-/// writes no close receipt, and discovery deletes its record once the holder
-/// process has gone. Exact cleanup then has nothing to adopt, retire or
-/// confirm, and refused every Close of the pane again, so the pane could
-/// never be closed.
-fn close_lost_codex_owner(
+/// An owner that dies - killed, crashed, out of memory, or taken down with
+/// its provider - writes no receipt, and discovery deletes its record once it
+/// has gone. Exact cleanup then has nothing to adopt, retire or confirm, and
+/// refused every Close of the pane again, so the pane could never be closed.
+///
+/// An open agent that still runs as this conversation ends with it, as it
+/// would have with a receipt: a person closing the pane closes the agent.
+fn settle_lost_execution(
     host: &SharedHost,
     session: &Session,
     proof: &HostSessionProof,
 ) -> Result<(), String> {
-    if !codex_owner_lost(host, session, proof)? {
-        return Err("No exact native holder or confirmed close receipt is available".into());
+    // A scheduled agent is its automation's to end, as when a changed boot
+    // leaves one behind.
+    if let Ok(registry) = super::agent_execution::registry(host)
+        && registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_for_session(session.id)?
+            .is_some_and(|agent| {
+                matches!(
+                    agent.origin,
+                    crate::agent_execution::Origin::Automation { .. }
+                )
+            })
+    {
+        return Err(SCHEDULED_AGENT.into());
+    }
+    if let Some(holds) = what_holds(host, session, proof)? {
+        return Err(lost_execution_refusal(session, holds));
     }
     // Proving the loss retired any stale endpoint; give back the allocation.
     if let Some(parent) = session
         .owned_codex_listener
         .as_ref()
+        .filter(|_| session.owns_codex_listener())
         .and_then(|listener| listener.socket.parent())
     {
         let _ = std::fs::remove_dir(parent);
     }
+    let Ok(registry) = super::agent_execution::registry(host) else {
+        return Ok(());
+    };
+    let sources = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .retained_agent_sources(session.id)?;
+    for source in sources {
+        let crate::agent_execution::HostedSession::Chat(source) = source else {
+            return Err("Retained execution ownership changed to another surface".into());
+        };
+        // Every descriptor of this allocation, under older conversation
+        // metadata too: the evidence covers the allocation, not one descriptor.
+        super::agent_execution::retired(host, &source)?;
+        registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .retire_agent_process_authority(
+                &crate::agent_execution::HostedSession::Chat(source),
+                true,
+            )?;
+    }
     Ok(())
 }
 
-/// Whether a Codex conversation's native owner ended without its close
-/// receipt and nothing of it can run again, so its Close settles and a
-/// reopened conversation may take over without one.
+/// What still holds a conversation whose native owner ended without its
+/// close receipt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Holds {
+    /// A start, handoff or exact close is under way for it.
+    InProgress,
+    /// Its agent's launch, or that launch's teardown, never confirmed how it
+    /// ended.
+    LaunchUnconfirmed,
+    /// A process of its provider survives the helper that controlled it.
+    Running,
+    /// Nothing proves whether something of it still runs.
+    Unproved,
+}
+
+/// Why a Close of a conversation whose owner is gone was refused, and what
+/// the person can do about it.
+fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
+    let provider = session.launch.provider.label();
+    match holds {
+        Holds::InProgress => "This conversation is still starting, moving or closing elsewhere in Cagents. Close it again once that finishes.".into(),
+        Holds::LaunchUnconfirmed => format!(
+            "{LOST_EXECUTION_UNPROVED}. Its agent's launch never confirmed whether {provider} started or stopped, so the pane and its agent were kept rather than leave {provider} running unseen."
+        ),
+        Holds::Running if session.launch.provider == Provider::Codex => format!(
+            "Codex is still running for this conversation, but the Cagents helper that controlled it is gone, so closing the pane would leave it running. End it with `pkill -f cagents-codex-{}`, then close the pane again.",
+            session.id
+        ),
+        Holds::Running => format!(
+            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing the pane would leave it running. End that {provider} process, then close the pane again."
+        ),
+        Holds::Unproved => format!(
+            "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so the pane was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing the pane will work."
+        ),
+    }
+}
+
+/// The start of what a Close says when nothing proves a conversation whose
+/// owner is gone stopped.
+pub(super) const LOST_EXECUTION_UNPROVED: &str =
+    "Cagents couldn't confirm this conversation stopped";
+
+/// What a Close says of a scheduled agent's conversation whose owner is gone.
+pub(super) const SCHEDULED_AGENT: &str =
+    "A scheduled automation's agent runs this conversation, and only its automation can end it";
+
+/// What still holds a conversation whose native owner ended without its
+/// close receipt, if anything. Its Close settles without one only when
+/// nothing does.
 ///
-/// The owner is lost only when no start, handoff, paired terminal or agent
-/// claims the conversation, no receipt names its terminal, and nothing of it
-/// can still run by the evidence an upgrade requires before replacing its
-/// service: no holder record, no process naming the conversation's listener,
-/// and nothing bound where it listens. Anything else, including an
-/// unavailable agent registry, is not proof of the loss.
-fn codex_owner_lost(
+/// The owner is lost only when no start or handoff claims the conversation,
+/// no unconfirmed agent launch or startup cleanup is pending for it, no
+/// Codex close receipt names its terminal, and nothing of it can still run by
+/// the evidence an upgrade requires before replacing its service: no live
+/// holder record, and for Codex no process naming the conversation's
+/// listener and nothing bound or served where it listens, or for a retained
+/// Claude actor every registered owner gone with its process group and
+/// session. A changed kernel boot proves the same. Anything else, including
+/// an unavailable agent registry, is not proof of the loss.
+fn what_holds(
     host: &SharedHost,
     session: &Session,
     proof: &HostSessionProof,
-) -> Result<bool, String> {
-    let Some(listener) = session
-        .owned_codex_listener
-        .as_ref()
-        .filter(|_| session.owns_codex_listener() && session.terminal.is_none())
-    else {
-        return Ok(false);
-    };
+) -> Result<Option<Holds>, String> {
     // A receipt is exact cleanup's, including when it closed a conversation
     // other than the one asked for.
-    if chat::native_holder::has_receipt(session.id)? {
-        return Ok(false);
+    if session.launch.provider == Provider::Codex && chat::native_holder::has_receipt(session.id)? {
+        return Ok(Some(Holds::InProgress));
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1101,26 +1186,73 @@ fn codex_owner_lost(
                 startup.source.id == session.id || startup.requested.id == session.id
             })
         {
-            return Ok(false);
+            return Ok(Some(Holds::InProgress));
         }
     }
     if has_native_owner(session).map_err(|error| error.message)? {
+        return Ok(Some(Holds::InProgress));
+    }
+    let (agent, owners) = {
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.has_agent_launch_for_session(session.id)? {
+            return Ok(Some(Holds::LaunchUnconfirmed));
+        }
+        (
+            registry.agent_for_session(session.id)?,
+            registry.native_actor_owners_of(session.id),
+        )
+    };
+    // A startup cleanup owner retained for the agent is a launch of this boot
+    // whose teardown is unconfirmed.
+    if agent.is_some_and(|agent| {
+        host.lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .execution_startups
+            .contains_key(&agent.id)
+    }) {
+        return Ok(Some(Holds::LaunchUnconfirmed));
+    }
+    use super::upgrade_inspect::ExecutionEnd;
+    match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners) {
+        ExecutionEnd::Ended => {}
+        ExecutionEnd::Running => return Ok(Some(Holds::Running)),
+        ExecutionEnd::Unproved => return Ok(Some(Holds::Unproved)),
+    }
+    match session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener())
+    {
+        Some(listener)
+            if owned_listener::served(&listener.socket).map_err(|error| error.to_string())? =>
+        {
+            Ok(Some(Holds::Running))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// Whether a Codex conversation no agent claims lost its native owner without
+/// the close receipt, so a reopened conversation may take over without one.
+fn codex_owner_lost(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    if !session.owns_codex_listener() || session.terminal.is_some() {
         return Ok(false);
     }
     {
         let registry = super::agent_execution::registry(host)?;
         let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
         if registry.agent_for_session(session.id)?.is_some()
-            || registry.has_agent_launch_for_session(session.id)?
             || !registry.retained_agent_sources(session.id)?.is_empty()
         {
             return Ok(false);
         }
     }
-    Ok(
-        super::upgrade_inspect::codex_execution_ended(session, &proof.boot_id)
-            && !owned_listener::served(&listener.socket).map_err(|error| error.to_string())?,
-    )
+    Ok(what_holds(host, session, proof)?.is_none())
 }
 
 pub(super) fn require_unreserved_terminals(
