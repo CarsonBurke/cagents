@@ -704,9 +704,10 @@ impl State {
     /// its parser.
     pub(super) fn rank(&self, id: &str, rank: u64) {
         if let Some(entry) = self.entries.get(id) {
-            if entry.shared.priority.swap(rank, Ordering::Relaxed) != rank {
-                entry.shared.workers.rerank(&entry.shared.place, rank);
-            }
+            entry
+                .shared
+                .workers
+                .rank(&entry.shared.priority, &entry.shared.place, rank);
         }
     }
     #[cfg(test)]
@@ -1535,6 +1536,9 @@ struct Pool {
     /// Whether ranks order the queue; measurements compare arrival order.
     #[cfg(test)]
     ranked: bool,
+    /// Runs as a waiter arrives, before it takes its place in the queue.
+    #[cfg(test)]
+    arriving: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 #[derive(Default)]
 struct Queue {
@@ -1616,6 +1620,8 @@ impl Pool {
             wakes: AtomicUsize::new(0),
             #[cfg(test)]
             ranked: true,
+            #[cfg(test)]
+            arriving: Mutex::default(),
         }
     }
     /// Parsing is CPU-bound and each parser owns its input and output, so
@@ -1643,16 +1649,28 @@ impl Pool {
     fn first(&self) -> Option<(u64, u64)> {
         self.lock().waiting.keys().next().copied()
     }
+    /// Rank the input whose wait for a parser `priority` and `place` record.
+    ///
+    /// A waiter reads its rank under the queue's lock as it joins, and a
+    /// waiter in the queue moves under that lock, so a rank given while the
+    /// input joins is either read as it joins or moves it once it is there.
+    fn rank(&self, priority: &AtomicU64, place: &Place, rank: u64) {
+        if priority.swap(rank, Ordering::Relaxed) != rank {
+            self.rerank(place, rank);
+        }
+    }
     /// Move the waiter at `place`, if it is still waiting, to `rank`.
     fn rerank(&self, place: &Place, rank: u64) {
         #[cfg(test)]
         if !self.ranked {
             return;
         }
+        // The queue's lock first: a waiter joining now has either taken its
+        // place by then or will read the rank just stored.
+        let mut queue = self.lock();
         let Some(ticket) = place.0.lock().unwrap_or_else(|e| e.into_inner()).upgrade() else {
             return;
         };
-        let mut queue = self.lock();
         let mut key = ticket.key.lock().unwrap_or_else(|e| e.into_inner());
         if key.0 == rank {
             return;
@@ -1670,13 +1688,22 @@ impl Pool {
         drop(key);
         queue.advance(self.capacity);
     }
+    /// Wait for a parser at the rank `priority` holds when this joins the
+    /// queue, or any rank it is given later through `place`.
     async fn acquire(
         self: &Arc<Self>,
-        rank: u64,
+        priority: &AtomicU64,
         place: Option<&Place>,
     ) -> Result<Permit, tokio::sync::AcquireError> {
         #[cfg(test)]
-        let rank = if self.ranked { rank } else { UNRANKED };
+        if let Some(arriving) = self
+            .arriving
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            arriving();
+        }
         struct Waiting<'a>(&'a Pool, &'a Ticket, bool);
         impl Drop for Waiting<'_> {
             fn drop(&mut self) {
@@ -1691,6 +1718,9 @@ impl Pool {
         }
         let ticket = {
             let mut queue = self.lock();
+            let rank = priority.load(Ordering::Relaxed);
+            #[cfg(test)]
+            let rank = if self.ranked { rank } else { UNRANKED };
             let key = (rank, queue.arrivals);
             queue.arrivals += 1;
             let ticket = Arc::new(Ticket {
@@ -1710,7 +1740,7 @@ impl Pool {
         self.lock().advance(self.capacity);
         loop {
             let turn = ticket.turn.notified();
-            let mut turn = std::pin::pin!(turn);
+            let turn = std::pin::pin!(turn);
             let mine = {
                 let queue = self.lock();
                 queue.head == Some(*ticket.key.lock().unwrap_or_else(|e| e.into_inner()))
@@ -1751,10 +1781,10 @@ impl Pool {
         }
     }
 }
-/// The parser count and whether ranks apply, for pools this thread creates
-/// from now on; measurements compare policies on fresh threads.
 #[cfg(test)]
 thread_local! {
+    /// The parser count and whether ranks apply, for pools this thread
+    /// creates from now on; measurements compare policies on fresh threads.
     pub(super) static POLICY: std::cell::Cell<Option<(usize, bool)>> =
         const { std::cell::Cell::new(None) };
 }
@@ -1774,7 +1804,7 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
     let permit = shared
         .workers
-        .acquire(shared.priority.load(Ordering::Relaxed), Some(&shared.place))
+        .acquire(&shared.priority, Some(&shared.place))
         .await
         .map_err(|_| "Message loading stopped.".to_owned())?;
     if shared.cancelled.load(Ordering::Relaxed) {
@@ -2154,7 +2184,7 @@ mod tests {
             let spawn = |rank: u64| {
                 let (pool, granted) = (pool.clone(), granted.clone());
                 tokio::spawn(async move {
-                    let permit = pool.acquire(rank, None).await.unwrap();
+                    let permit = pool.acquire(&AtomicU64::new(rank), None).await.unwrap();
                     granted.send(rank).unwrap();
                     // Hold the parser briefly, as a worker does.
                     tokio::task::yield_now().await;
@@ -2210,12 +2240,12 @@ mod tests {
             let held = pool.permits.clone().try_acquire_owned().unwrap();
             let first = tokio::spawn({
                 let pool = pool.clone();
-                async move { pool.acquire(1, None).await.map(drop) }
+                async move { pool.acquire(&AtomicU64::new(1), None).await.map(drop) }
             });
             tokio::task::yield_now().await;
             let second = tokio::spawn({
                 let pool = pool.clone();
-                async move { pool.acquire(2, None).await.map(drop) }
+                async move { pool.acquire(&AtomicU64::new(2), None).await.map(drop) }
             });
             tokio::task::yield_now().await;
             // The first in line is cancelled, as when its message is replaced.
@@ -2246,7 +2276,10 @@ mod tests {
         let (release, released) = tokio::sync::oneshot::channel::<()>();
         let (pool, granted) = (pool.clone(), granted.clone());
         let task = tokio::spawn(async move {
-            let permit = pool.acquire(rank, place.as_deref()).await.unwrap();
+            let permit = pool
+                .acquire(&AtomicU64::new(rank), place.as_deref())
+                .await
+                .unwrap();
             granted.send(rank).unwrap();
             let _ = released.await;
             drop(permit);
@@ -2289,6 +2322,29 @@ mod tests {
             }
             // Waiters report the rank they arrived with.
             assert_eq!(grants, [30, 10, 20]);
+        });
+    }
+
+    #[test]
+    fn a_rank_given_as_an_input_joins_the_queue_is_kept() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let _held = pool.permits.clone().try_acquire_owned().unwrap();
+            let priority = Arc::new(AtomicU64::new(30));
+            let place = Arc::new(Place::default());
+            // The UI ranks the input again after its subscription started
+            // waiting, but before it has a place in the queue to move.
+            *pool.arriving.lock().unwrap() = Some(Box::new({
+                let (pool, priority, place) = (pool.clone(), priority.clone(), place.clone());
+                move || pool.rank(&priority, &place, 5)
+            }));
+            let waiting = tokio::spawn({
+                let (pool, priority, place) = (pool.clone(), priority.clone(), place.clone());
+                async move { pool.acquire(&priority, Some(&place)).await.map(drop) }
+            });
+            settle().await;
+            assert_eq!(pool.first(), Some((5, 0)));
+            waiting.abort();
         });
     }
 
@@ -2415,15 +2471,18 @@ mod tests {
             // Their best-ranked waiter is stuck behind their own full pool.
             let stuck = tokio::spawn({
                 let theirs = theirs.clone();
-                async move { theirs.acquire(0, None).await.map(drop) }
+                async move { theirs.acquire(&AtomicU64::new(0), None).await.map(drop) }
             });
             tokio::task::yield_now().await;
             assert_eq!(theirs.first(), Some((0, 0)));
             assert_eq!(ours.first(), None);
-            tokio::time::timeout(Duration::from_secs(5), ours.acquire(UNRANKED, None))
-                .await
-                .expect("our worst-ranked waiter still gets one of our parsers")
-                .unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                ours.acquire(&AtomicU64::new(UNRANKED), None),
+            )
+            .await
+            .expect("our worst-ranked waiter still gets one of our parsers")
+            .unwrap();
             stuck.abort();
         });
     }
