@@ -528,9 +528,10 @@ impl Worker {
                         // A different kernel boot proves old descendants extinct,
                         // but says nothing about command effects before shutdown.
                         return Ok(Status::Complete(Outcome::Stopped {
-                        state: FiringState::Interrupted, skip: None,
-                        diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
-                    }));
+                            state: FiringState::Interrupted,
+                            skip: None,
+                            diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
+                        }));
                     }
                 }
                 Ok(Status::CleanupUnconfirmed)
