@@ -1300,9 +1300,9 @@ if [ -n "$instance" ]; then
     # activation sockets and daemon apart from every other session.
     # Without the caller's display variables, nothing in the session can fall
     # back to the caller's desktop.
-    # Xvfb has a software EGL renderer. Keep clients on its GL path instead
-    # of exporting Vulkan DMA-BUFs that the software compositor cannot import
-    # reliably. Explicit caller choices remain available for diagnosis.
+    # This software GL combination is qualified for Xvfb and avoids the
+    # observed default-path Niri import crash. Explicit caller choices remain
+    # available for diagnosis.
     env -u WAYLAND_DISPLAY -u WAYLAND_SOCKET -u NIRI_SOCKET -u DISPLAY -u XAUTHORITY \
         LIBGL_ALWAYS_SOFTWARE="${LIBGL_ALWAYS_SOFTWARE:-1}" WGPU_BACKEND="${WGPU_BACKEND:-gl}" \
         niri-harness start --backend headless --name "$harness_session" --timeout 180 -- \
