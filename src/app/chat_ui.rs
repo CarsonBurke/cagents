@@ -812,6 +812,8 @@ pub(super) struct State {
     fresh_offers: HashSet<CardId>,
     /// Capacity failures before a chat runtime exists (saved-pane hydration).
     capacity_offers: HashSet<CardId>,
+    /// Starts refused as nonretryable before a runtime exists.
+    blocked_starts: HashMap<CardId, chat::Session>,
     removed_accounts: HashSet<CardId>,
     /// Cards refused because the account list does not name their account,
     /// whose home is still on the device and can be restored.
@@ -842,6 +844,7 @@ impl Default for State {
             parked: HashMap::new(),
             fresh_offers: HashSet::new(),
             capacity_offers: HashSet::new(),
+            blocked_starts: HashMap::new(),
             removed_accounts: HashSet::new(),
             restorable_accounts: HashMap::new(),
             last_models: HashMap::new(),
@@ -2470,9 +2473,11 @@ pub(super) struct Runtime {
     error: Option<String>,
     /// A typed admission refusal, independent of provider/account failures.
     capacity_refused: bool,
-    /// Resuming this card's stopped provider failed, so it offers to try
-    /// again; the failure itself stands in `error`.
+    /// Resuming this card's stopped provider failed; the reason stands in
+    /// `error`, and retry is offered only while it can help.
     resume_failed: bool,
+    /// The daemon says repeating this start cannot help.
+    start_retry_blocked: bool,
     /// Local send errors anchored to the exchange that produced them.
     failures: Vec<failure::Note>,
     /// Notices raised while an earlier page is shown. That page holds
@@ -3427,6 +3432,7 @@ impl Runtime {
             error: None,
             capacity_refused: false,
             resume_failed: false,
+            start_retry_blocked: false,
             failures: Vec::new(),
             unplaced_failures: Vec::new(),
             failure_ui: failure::State::default(),
@@ -5299,7 +5305,8 @@ impl Runtime {
     /// conversation is still being held for it - so it keeps only the
     /// reconnect.
     fn offers_fresh_conversation(&self) -> bool {
-        self.session.launch.session_id.is_some()
+        !self.start_retry_blocked
+            && self.session.launch.session_id.is_some()
             && self.snapshot.exited
             && self.snapshot.session_id != self.session.launch.session_id
     }
@@ -7702,6 +7709,7 @@ impl Cagents {
     /// its provider.
     fn open_chat_draft(&mut self, card: CardId, session: chat::Session) -> Task<Message> {
         self.chat_ui.capacity_offers.remove(&card);
+        self.chat_ui.blocked_starts.remove(&card);
         let mut snapshot = self.chat_draft_snapshot(session.launch.provider);
         snapshot.permission_mode =
             draft_permission_mode(&session.launch.recipe, session.launch.provider);
@@ -8003,6 +8011,7 @@ impl Cagents {
         self.chat_ui.draft_attachments.remove(&card);
         self.chat_ui.parked.remove(&card);
         self.chat_ui.fresh_offers.remove(&card);
+        self.chat_ui.blocked_starts.remove(&card);
         self.chat_ui.removed_accounts.remove(&card);
         self.chat_ui.restorable_accounts.remove(&card);
     }
@@ -8014,6 +8023,21 @@ impl Cagents {
                 Some(CardKind::Chat(_))
             ))
         .then_some(CAPACITY_GUIDANCE)
+    }
+
+    pub(super) fn chat_retry_blocked(&self, card: CardId) -> bool {
+        match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) => runtime.start_retry_blocked,
+            _ => self
+                .chat_ui
+                .blocked_starts
+                .get(&card)
+                .is_some_and(|source| {
+                    self.card_state(card).is_some_and(
+                        |state| matches!(&state.kind, CardKind::Chat(current) if current == source),
+                    )
+                }),
+        }
     }
 
     pub(super) fn chat_start_pending(&self, card: CardId) -> bool {
@@ -10574,6 +10598,7 @@ impl Cagents {
                                 .remove(&target.card);
                         }
                         self.chat_ui.fresh_offers.remove(&target.card);
+                        self.chat_ui.blocked_starts.remove(&target.card);
                         self.chat_ui.removed_accounts.remove(&target.card);
                         self.chat_ui.restorable_accounts.remove(&target.card);
                         let mut session = handle.session();
@@ -10611,6 +10636,7 @@ impl Cagents {
                             runtime.error = None;
                             runtime.capacity_refused = false;
                             runtime.resume_failed = false;
+                            runtime.start_retry_blocked = false;
                             runtime.show(visible);
                             // Show the new connection's state at once, as a
                             // new runtime does, rather than the ended one's
@@ -10752,6 +10778,14 @@ impl Cagents {
                         ]);
                     }
                     Err(failure) => {
+                        let retry_blocked = failure.recovery == chat::Recovery::Blocked;
+                        if retry_blocked {
+                            self.chat_ui
+                                .blocked_starts
+                                .insert(target.card, attempt.session.clone());
+                        } else {
+                            self.chat_ui.blocked_starts.remove(&target.card);
+                        }
                         let terminal_switch = matches!(
                             self.card_state(target.card).map(|state| &state.kind),
                             Some(CardKind::Terminal(_))
@@ -10778,6 +10812,7 @@ impl Cagents {
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.capacity_refused = failure.recovery == chat::Recovery::Capacity;
                             runtime.error = Some(failure.message);
+                            runtime.start_retry_blocked = retry_blocked;
                             // A resume that failed leaves its card where it
                             // was, stopped with its conversation kept, so it
                             // tries again. Reconnecting instead would look for
@@ -11115,7 +11150,7 @@ impl Cagents {
                 return self.resume_after_sign_in(target);
             }
             Action::Reconnect(target) => {
-                if self.chat_start_pending(target.card) {
+                if self.chat_start_pending(target.card) || self.chat_retry_blocked(target.card) {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -11147,7 +11182,7 @@ impl Cagents {
                 return self.start_chat(target.card, session, intent, None, false);
             }
             Action::ResumeSaved(target) => {
-                if self.chat_start_pending(target.card) {
+                if self.chat_start_pending(target.card) || self.chat_retry_blocked(target.card) {
                     return Task::none();
                 }
                 let Some(runtime) = self.chat_runtime_mut(target) else {
@@ -27295,6 +27330,112 @@ mod tests {
             .chain(accessible.children())
             .filter_map(|node| node.node().label().map(str::to_owned))
             .collect()
+    }
+
+    #[test]
+    fn nonretryable_start_refusal_keeps_the_saved_card_without_retry_or_replacement() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("keep this draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        app.chat_forget(card);
+        app.cards.insert(card, CardRuntime::Loading);
+        drop(app.open_chat(card, source.clone(), chat::Intent::Restore));
+        let target = chat_runtime_attempt(&app, card);
+        let reason = "Cannot join existing Codex daemon for this thread";
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: reason.into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        assert_eq!(attach_failure_details(&app, card).as_deref(), Some(reason));
+        assert!(app.chat_retry_blocked(card));
+        assert!(!app.chat_offers_fresh_conversation(card));
+        let labels = capacity_recovery_labels(&app, card);
+        assert!(
+            labels.iter().any(|label| label.contains("Close")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().all(|label| !label.contains("Retry")),
+            "{labels:?}"
+        );
+        drop(app.update(Message::RetryCard(card)));
+        drop(app.handle_chat_ui(Action::StartFresh(card)));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(
+            app.card_state(card).unwrap().kind,
+            CardKind::Chat(source.clone())
+        );
+        assert_eq!(app.chat_ui.drafts.get(&card).unwrap(), "keep this draft");
+
+        // Another authoritative conversation on this card does not inherit
+        // the earlier conversation's refusal.
+        let mut replacement = source;
+        replacement.id = TerminalId::new();
+        app.replace_chat_conversation(card, replacement);
+        assert!(!app.chat_retry_blocked(card));
+    }
+
+    #[test]
+    fn nonretryable_resume_refusal_keeps_runtime_and_rejects_stale_retry_actions() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_draft(text_editor::Content::with_text("keep this draft"));
+        let source = chat_runtime(&app, card).session.clone();
+        drop(app.start_chat(card, source.clone(), chat::Intent::Resume, None, false));
+        let target = chat_runtime_attempt(&app, card);
+        let reason = "This thread still has an active writer";
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: reason.into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert_eq!(runtime.error.as_deref(), Some(reason));
+        assert_eq!(runtime.composer.text(), "keep this draft");
+        assert_eq!(runtime.session, source);
+        let stopped = runtime.stopped(false, false);
+        assert!(stopped.guidance.is_empty());
+        assert_eq!(stopped.primary, None);
+        assert_eq!(stopped.secondary, None);
+        assert!(!app.chat_offers_fresh_conversation(card));
+        let retry = runtime.target;
+        drop(app.update(Message::RetryCard(card)));
+        drop(app.handle_chat_ui(Action::Reconnect(retry)));
+        drop(app.handle_chat_ui(Action::ResumeSaved(retry)));
+        assert!(!app.chat_start_pending(card));
+        assert_eq!(chat_runtime(&app, card).session, source);
+
+        // A valid attachment from an independent recovery clears the refusal;
+        // a delayed reply from the old attempt cannot restore it.
+        drop(app.start_chat(card, source, chat::Intent::Restore, None, false));
+        let recovered = chat_runtime_attempt(&app, card);
+        let handle = fixture_handle(&app, card, Some(KNOWN_THREAD));
+        answer_start(&mut app, recovered, Ok(handle));
+        assert!(!app.chat_retry_blocked(card));
+        answer_start(
+            &mut app,
+            target,
+            Err(chat::StartFailure {
+                message: "stale refusal".into(),
+                recovery: chat::Recovery::Blocked,
+            }),
+        );
+        assert!(!app.chat_retry_blocked(card));
+        assert_eq!(chat_runtime(&app, card).composer.text(), "keep this draft");
     }
 
     #[test]

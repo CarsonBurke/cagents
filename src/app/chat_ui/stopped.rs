@@ -41,6 +41,13 @@ impl Press {
 
 impl Runtime {
     pub(super) fn stopped(&self, transitioning: bool, resuming: bool) -> Stopped {
+        if self.start_retry_blocked {
+            return Stopped {
+                guidance: String::new(),
+                primary: None,
+                secondary: None,
+            };
+        }
         let snapshot = &self.snapshot;
         let provider = self.session.launch.provider.label();
         let unresumable = self.offers_fresh_conversation();
@@ -160,7 +167,10 @@ impl Runtime {
                     .into(),
             );
         }
-        let mut rows = vec![design::caption(guidance).width(Length::Fill).into()];
+        let mut rows = Vec::new();
+        if !guidance.is_empty() {
+            rows.push(design::caption(guidance).width(Length::Fill).into());
+        }
         if !controls.is_empty() {
             rows.push(
                 widget::row::with_children(controls)

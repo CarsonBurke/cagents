@@ -36,7 +36,8 @@ fn start_failure(error: ipc::ProtocolError) -> StartFailure {
         recovery: match error.code {
             ipc::ProtocolErrorCode::AccountRemoved => super::Recovery::Account,
             ipc::ProtocolErrorCode::ChatCapacity => super::Recovery::Capacity,
-            _ => super::Recovery::Retry,
+            _ if error.retryable => super::Recovery::Retry,
+            _ => super::Recovery::Blocked,
         },
     }
 }
@@ -3167,6 +3168,54 @@ mod tests {
     }
 
     #[test]
+    fn start_recovery_uses_retryability_without_losing_typed_recovery() {
+        use super::super::Recovery;
+        use ipc::ProtocolErrorCode;
+
+        for retryable in [false, true] {
+            for (code, recovery) in [
+                (ProtocolErrorCode::AccountRemoved, Recovery::Account),
+                (ProtocolErrorCode::ChatCapacity, Recovery::Capacity),
+                (
+                    ProtocolErrorCode::InvalidRequest,
+                    if retryable {
+                        Recovery::Retry
+                    } else {
+                        Recovery::Blocked
+                    },
+                ),
+                (
+                    ProtocolErrorCode::TerminalUnavailable,
+                    if retryable {
+                        Recovery::Retry
+                    } else {
+                        Recovery::Blocked
+                    },
+                ),
+                (
+                    ProtocolErrorCode::Internal,
+                    if retryable {
+                        Recovery::Retry
+                    } else {
+                        Recovery::Blocked
+                    },
+                ),
+            ] {
+                let failure = start_failure(ipc::ProtocolError::new(
+                    code,
+                    "the daemon's exact reason",
+                    retryable,
+                ));
+                assert_eq!(
+                    failure.recovery, recovery,
+                    "{code:?}, retryable={retryable}"
+                );
+                assert_eq!(failure.message, "the daemon's exact reason");
+            }
+        }
+    }
+
+    #[test]
     fn source_clock_advances_in_daemon_time_despite_delayed_hydration() {
         let received = Instant::now();
         // The daemon can be arbitrarily ahead of or behind the display
@@ -4926,32 +4975,30 @@ mod tests {
         }
     }
 
-    /// A card that cannot bring its conversation back has to show what refused
-    /// it word for word, because the reader decides what to do next from that
-    /// sentence and a generic failure tells them nothing.
+    /// Retry is offered only when the daemon says running the same resume
+    /// can help. Both paths keep its original diagnostic for the reader.
     #[test]
-    fn a_refused_resume_reports_the_daemons_own_sentence() {
-        let failure = restore_against(
-            omp_card(Some(CONVERSATION), Some(host_proof("before-the-update"))),
-            |_| {
-                ServerMessage::Error(crate::terminal_ipc::ProtocolError::new(
-                    crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
-                    "Provider executable omp is not executable in the preserved launch environment",
-                    false,
-                ))
-            },
-        )
-        .err()
-        .expect("the daemon refused this resume");
-        assert_eq!(
-            failure.message,
-            "Provider executable omp is not executable in the preserved launch environment"
-        );
-        assert_eq!(
-            failure.recovery,
-            crate::chat::Recovery::Retry,
-            "a refusal that can pass leaves the card a retry that runs the same resume"
-        );
+    fn a_refused_resume_honors_the_daemons_retryability_and_keeps_its_words() {
+        let reason = "Cannot join existing Codex daemon for this thread";
+        for (retryable, recovery) in [
+            (false, crate::chat::Recovery::Blocked),
+            (true, crate::chat::Recovery::Retry),
+        ] {
+            let failure = restore_against(
+                omp_card(Some(CONVERSATION), Some(host_proof("before-the-update"))),
+                move |_| {
+                    ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::TerminalUnavailable,
+                        reason,
+                        retryable,
+                    ))
+                },
+            )
+            .err()
+            .expect("the daemon refused this resume");
+            assert_eq!(failure.message, reason);
+            assert_eq!(failure.recovery, recovery, "retryable={retryable}");
+        }
     }
 
     /// A conversation the provider has not named yet - one still loading, or

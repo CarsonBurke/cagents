@@ -8747,6 +8747,7 @@ impl Cagents {
             .is_none_or(|state| !state.existence.is_open())
             || self.pane_close_owned(card)
             || self.chat_start_pending(card)
+            || self.chat_retry_blocked(card)
             // One relaunch at a time: a second would replace the identity the
             // first is starting and tear down whatever it launched.
             || self.terminal_start_in_flight(card)
@@ -10642,8 +10643,9 @@ impl Cagents {
                             .map(|guidance| design::caption(guidance).into())
                             .unwrap_or_else(|| iced::widget::Space::new().into()),
                         widget::row::with_children({
-                            let mut controls = if browser_session.is_some()
-                                && self.browser_unavailable_reason().is_some()
+                            let mut controls = if self.chat_retry_blocked(id)
+                                || (browser_session.is_some()
+                                && self.browser_unavailable_reason().is_some())
                             {
                                 Vec::new()
                             } else { vec![
