@@ -1,8 +1,9 @@
 Based on crates.io cosmic-text 0.19.0, checksum
 be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73.
 Source, upstream test targets, font fixtures and licenses are retained. Local
-changes combine the additive snapshot API below, wrapped ellipsis corrections
-and a checkout identity anchor. Screenshot documentation is omitted.
+changes combine the additive snapshot API below, wrapped ellipsis corrections,
+a checkout identity anchor and font matching without reading font files.
+Screenshot documentation is omitted.
 
 Local API: immutable full-context LayoutSnapshot and visual projections.
 This is not an incremental shaper. Creating a snapshot requires existing complete
@@ -54,3 +55,19 @@ End controls do not independently qualify every Start/Middle/Bidi geometry.
 The retained upstream oracles and final composed UI/native/cache qualification
 remain required. Prior separate PR1316/1473 execution is historical evidence,
 not a claim that this source union has been built or run. See PROVENANCE.md.
+
+Font matching without reading font files
+
+Upstream FontMatchKey::new opens every face whose weight differs from the
+requested one to read its wght axis, so the first match of each family, weight,
+style and stretch in a FontSystem reads every installed font file: 1588 faces
+on the build host, 73 to 117 ms each time, on the thread that shapes. FontSystem now asks a face for its weight axis only when fallback
+considers that face, and remembers the answer per face until the database
+changes. Matching and fallback choose the same faces as before: a face of the
+requested weight, or a variable face whose wght range covers it, in the same
+order. A face whose file cannot be read counts as not variable until the
+database changes, where upstream would read it again at the next new match.
+src/font/system/weight_match_tests.rs checks that matching reads no font file,
+and src/font/system/fallback_choice_tests.rs that every fallback choice over
+the repository fonts, for each family, weight, style and script, is the one
+upstream made.
