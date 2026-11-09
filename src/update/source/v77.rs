@@ -20,9 +20,8 @@ pub(super) fn discover_protocol(
     discovered_version(&bytes).map_err(discovery_error)
 }
 
-/// Entry routing may recognize another protocol without decoding its DTOs.
-/// The caller must authenticate the returned peer's original lease and route
-/// only to its matched installed CLI; this is never a wire client admission.
+/// Read the source protocol without decoding its DTOs. The caller must admit
+/// it and authenticate a fresh handshake before inspecting the installation.
 pub(super) fn discover_installed_protocol(
     socket: &Path,
     deadline: Instant,
@@ -65,9 +64,7 @@ fn discovered_version(bytes: &[u8]) -> Result<u16, UpdateError> {
     let (version, _) = postcard::take_from_bytes::<u16>(bytes)
         .map_err(|_| invalid("Malformed source version header"))?;
     if !super::is_qualified_source(version) {
-        return Err(invalid(
-            "Source protocol has no qualified upgrade coordinator",
-        ));
+        return Err(super::unsupported_source(version));
     }
     Ok(version)
 }
@@ -254,10 +251,6 @@ pub(crate) struct Client {
     protocol: u16,
 }
 impl Client {
-    pub(super) fn connect(socket: &Path, deadline: Instant) -> Result<Self, UpdateError> {
-        Self::connect_at_protocol(socket, deadline, 77)
-    }
-
     // Protocol119 changed neither this frozen request subset nor its DTOs.
     // No ordinary requests, spawn budgets or notification DTOs are admitted.
     pub(super) fn connect_at_protocol(
@@ -265,7 +258,7 @@ impl Client {
         deadline: Instant,
         protocol: u16,
     ) -> Result<Self, UpdateError> {
-        if !matches!(protocol, 77 | 119) {
+        if !super::LEGACY_PROTOCOLS.contains(&protocol) {
             return Err(invalid("Unsupported source update protocol"));
         }
         let mut stream = crate::control::connect_control_socket(
@@ -316,6 +309,10 @@ impl Client {
             next: 2,
             protocol,
         })
+    }
+
+    pub(super) fn protocol(&self) -> u16 {
+        self.protocol
     }
 
     pub(super) fn proof(&self) -> &HostSessionProof {
@@ -536,12 +533,10 @@ mod tests {
     fn source_version_header_precedes_old_error_dto_and_rejects_unknown_versions() {
         // A version-mismatch reply from the immutable source may contain an
         // error variant/layout the new normal client cannot decode at all.
-        for version in [
-            77u16,
-            119,
-            crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
-            crate::terminal_ipc::PROTOCOL_VERSION,
-        ] {
+        for &version in super::super::CURRENT_CLIENT_PROTOCOLS
+            .iter()
+            .chain(super::super::LEGACY_PROTOCOLS)
+        {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
             bytes.extend_from_slice(&[255, 255, 255, 255, 255]);
             assert_eq!(discovered_version(&bytes).unwrap(), version);
@@ -559,7 +554,7 @@ mod tests {
     #[cfg(feature = "host")]
     #[test]
     fn authenticated_legacy_preview_keeps_consent_and_preparation_separate() {
-        for protocol in [77, 119] {
+        for &protocol in super::super::LEGACY_PROTOCOLS {
             for (ready, fail_preview) in [(false, false), (true, false), (false, true)] {
                 authenticated_legacy_preview(protocol, ready, fail_preview);
             }
@@ -712,7 +707,6 @@ mod tests {
             super::super::super::installed_update_worker(
                 &current,
                 &current.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
                 Some(&previous),
                 client.protocol(),
                 Some(client.proof()),
@@ -816,14 +810,19 @@ mod tests {
         }
     }
 
-    /// The install candidate line's daemon (128) is reached through discovery
-    /// and then this release's client speaking 128, through the preview and
-    /// the confirmed preparation, and its update is this release's to run.
+    /// Every admitted current-wire source is reached through discovery and
+    /// authenticated at its own protocol through preview and confirmed prepare.
     #[cfg(feature = "host")]
     #[test]
-    fn authenticated_candidate_line_source_previews_and_prepares_at_its_own_protocol() {
+    fn authenticated_current_wire_sources_preview_and_prepare_at_their_own_protocol() {
+        for &protocol in super::super::CURRENT_CLIENT_PROTOCOLS {
+            authenticated_current_wire_source(protocol);
+        }
+    }
+
+    #[cfg(feature = "host")]
+    fn authenticated_current_wire_source(protocol: u16) {
         use std::os::unix::net::UnixListener;
-        let protocol = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
         let paths = crate::daemon::RuntimePaths {
@@ -927,7 +926,6 @@ mod tests {
             super::super::super::installed_update_worker(
                 &current,
                 &current.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
                 Some(&previous),
                 client.protocol(),
                 Some(client.proof()),

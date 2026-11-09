@@ -61,6 +61,9 @@ struct Comparison<'a> {
     /// Variants of the named enum that the connection refuses, so their
     /// contents need not match. Their positions still must.
     refused: Vec<(&'static str, &'static [&'static str])>,
+    /// When present, only these outer variants belong to the proven contract.
+    /// Nested enums remain unrestricted and must agree in full.
+    selected: &'static [(&'static str, &'static [&'static str])],
     visited: BTreeSet<(Direction, String, String)>,
     differences: Vec<String>,
 }
@@ -109,7 +112,24 @@ impl Comparison<'_> {
                 {
                     self.differ(path, format!("the older client has {} variants", old.len()));
                 }
+                let selected = self
+                    .selected
+                    .iter()
+                    .find(|(name, _)| *name == short(current) || *name == current)
+                    .map(|(_, variants)| *variants);
+                if let Some(selected) = selected {
+                    for name in selected {
+                        if !old.iter().any(|(variant, _)| variant == name)
+                            || !new.iter().any(|(variant, _)| variant == name)
+                        {
+                            self.differ(path, format!("required variant {name} was not recorded"));
+                        }
+                    }
+                }
                 for (index, (name, fields)) in old.iter().enumerate() {
+                    if selected.is_some_and(|variants| !variants.contains(&name.as_str())) {
+                        continue;
+                    }
                     let path = format!("{path}::{name}");
                     let Some((next, next_fields)) = new.get(index) else {
                         self.differ(&path, "variant removed".into());
@@ -128,7 +148,11 @@ impl Comparison<'_> {
                         _ => self.differ(&path, "variant was not traced".into()),
                     }
                 }
-                if new.len() > old.len() && direction == Direction::Reply && gate.is_none() {
+                if new.len() > old.len()
+                    && direction == Direction::Reply
+                    && gate.is_none()
+                    && selected.is_none()
+                {
                     self.differ(
                         path,
                         "appended variants the older client cannot decode".into(),
@@ -210,6 +234,7 @@ fn differences(
         current,
         gated,
         refused,
+        selected: &[],
         visited: BTreeSet::new(),
         differences: Vec::new(),
     };
@@ -322,4 +347,97 @@ fn every_older_client_is_proven_against_its_recorded_format() {
             differences.join("\n")
         );
     }
+}
+
+/// Compare the lifecycle in both directions: unlike general older clients,
+/// nested lifecycle enums may neither add nor remove variants. Both envelope
+/// headers are included, so proof fields and request correlation stay frozen.
+fn lifecycle_differences(older: &Shapes, current: &Shapes) -> Vec<String> {
+    let mut changed = Vec::new();
+    for (older, current) in [(older, current), (current, older)] {
+        let mut comparison = Comparison {
+            older,
+            current,
+            gated: Vec::new(),
+            refused: Vec::new(),
+            selected: crate::update::source::LIFECYCLE_VARIANTS,
+            visited: BTreeSet::new(),
+            differences: Vec::new(),
+        };
+        comparison.shape(
+            Direction::Request,
+            &older.client,
+            &current.client,
+            "ClientEnvelope",
+        );
+        comparison.shape(
+            Direction::Reply,
+            &older.server,
+            &current.server,
+            "ServerEnvelope",
+        );
+        changed.extend(comparison.differences);
+    }
+    changed
+}
+
+#[test]
+fn every_current_client_update_source_preserves_the_frozen_lifecycle_wire_format() {
+    let current = traced();
+    let current_recording = recorded(PROTOCOL_VERSION);
+    for &protocol in crate::update::source::CURRENT_CLIENT_PROTOCOLS {
+        let older = recorded(protocol);
+        let mut changed = lifecycle_differences(&older, &current_recording);
+        // Also compare actual Rust types: regenerating the current fixture
+        // cannot bless an incompatible change to an admitted source's subset.
+        changed.extend(lifecycle_differences(&older, &current));
+        assert!(
+            changed.is_empty(),
+            "update source protocol {protocol} no longer has this build's frozen lifecycle wire format:\n{}",
+            changed.join("\n")
+        );
+    }
+}
+
+#[test]
+fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
+    let baseline = recorded(128);
+    let key = |name: &str| {
+        baseline
+            .containers
+            .keys()
+            .find(|key| short(key) == name)
+            .unwrap()
+            .clone()
+    };
+    let mut changed = baseline.clone();
+    let Container::Enum(variants) = changed.containers.get_mut(&key("ClientRequest")).unwrap()
+    else {
+        panic!()
+    };
+    variants.swap(0, 1);
+    assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+
+    let mut changed = baseline.clone();
+    let Container::Struct(fields) = changed.containers.get_mut(&key("DaemonImpact")).unwrap()
+    else {
+        panic!()
+    };
+    fields.push(("future_field".into(), Shape::Bool));
+    assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+
+    let mut changed = baseline.clone();
+    let Container::Enum(variants) = changed.containers.get_mut(&key("Disposition")).unwrap() else {
+        panic!()
+    };
+    variants.push(("future_variant".into(), Some(Fields::Unit)));
+    assert!(!lifecycle_differences(&baseline, &changed).is_empty());
+
+    // The newer daemon can evolve unrelated agent operations independently.
+    let mut changed = baseline.clone();
+    let Container::Enum(variants) = changed.containers.get_mut(AGENT_REPLY).unwrap() else {
+        panic!()
+    };
+    variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
+    assert!(lifecycle_differences(&baseline, &changed).is_empty());
 }
