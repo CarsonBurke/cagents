@@ -759,6 +759,10 @@ fn run_with_slots(
 /// theirs between jobs, so a long paragraph pays only for its own shaping
 /// rather than for that learning again. A font loaded since starts over from
 /// the application's database.
+///
+/// A kept system holds the faces it loaded until the fonts change, even after
+/// transcripts release their caches. Flow runs one worker at a time, so that
+/// is at most one idle system.
 struct Fonts {
     version: graphics_text::Version,
     db: cosmic_text::fontdb::Database,

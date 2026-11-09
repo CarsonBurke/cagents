@@ -443,7 +443,9 @@ impl FontSystem {
     /// every known face of another weight each time a new family, weight,
     /// style or stretch is matched, which opens most of the system's font
     /// files for a first bold or italic span. Reading it here, once per face
-    /// and only for the faces a fallback reaches, finds the same faces.
+    /// and only for the faces a fallback reaches, finds the same faces. A face
+    /// whose file cannot be read counts as not variable until the database
+    /// changes.
     pub(crate) fn matches_weight(&mut self, key: &FontMatchKey, weight: fontdb::Weight) -> bool {
         if key.font_weight_diff == 0 {
             return true;
@@ -531,3 +533,7 @@ mod default_coverage_tests;
 #[cfg(all(test, feature = "std"))]
 #[path = "system/weight_match_tests.rs"]
 mod weight_match_tests;
+
+#[cfg(all(test, feature = "std"))]
+#[path = "system/fallback_choice_tests.rs"]
+mod fallback_choice_tests;

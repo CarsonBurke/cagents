@@ -1388,11 +1388,41 @@ fn first_shape_of_each_face() {
     // The same face again in a fresh system, as the next long paragraph's
     // worker does.
     let attrs = graphics_text::to_attributes(bold);
-    let mut fresh = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
+    let mut fresh = cosmic_text::FontSystem::new_with_locale_and_db(locale.clone(), db.clone());
     let clock = Instant::now();
     std::hint::black_box(fresh.get_font_matches(&attrs));
     println!(
         "bold again, fresh system: matching {:.3} ms",
         clock.elapsed().as_secs_f64() * 1e3
+    );
+    // End to end in a system of its own, as a Flow worker shapes: matching,
+    // fallback reading the faces it reaches, and shaping, for each face's
+    // first paragraph and the next. What that system then holds is what a
+    // kept worker system keeps.
+    let resident_mib = || {
+        let statm = std::fs::read_to_string("/proc/self/statm").unwrap();
+        let pages: f64 = statm.split_whitespace().nth(1).unwrap().parse().unwrap();
+        pages * 4096.0 / (1024.0 * 1024.0)
+    };
+    let before = resident_mib();
+    let mut worker = cosmic_text::FontSystem::new_with_locale_and_db(locale, db);
+    let mut shape_in_worker = |font| {
+        let attrs = graphics_text::to_attributes(font);
+        let mut buffer = cosmic_text::Buffer::new_empty(cosmic_text::Metrics::new(14.0, 20.0));
+        buffer.set_size(Some(720.0), None);
+        let clock = Instant::now();
+        buffer.set_text(&body, &attrs, cosmic_text::Shaping::Advanced, None);
+        buffer.shape_until_scroll(&mut worker, false);
+        std::hint::black_box(&buffer);
+        clock.elapsed().as_secs_f64() * 1e3
+    };
+    for (name, font) in faces {
+        let first = shape_in_worker(font);
+        let next = shape_in_worker(font);
+        println!("{name:>15}: worker system, first paragraph {first:>8.3} ms, next {next:>7.3} ms");
+    }
+    println!(
+        "a worker system after all five faces holds {:.1} MiB more resident memory",
+        resident_mib() - before
     );
 }

@@ -285,10 +285,13 @@ impl<'a> FontFallbackIter<'a> {
 
     fn default_font_match_key(&mut self) -> Option<&'a FontMatchKey> {
         let default_family = self.default_families[self.default_i - 1];
-        let default_family_name = String::from(self.font_system.db().family_name(default_family));
         let keys = self.font_match_keys;
-        keys.iter()
-            .find(|m_key| self.of_family(m_key, &default_family_name))
+        keys.iter().find(|m_key| {
+            // The family's name is looked up again for each face rather than
+            // copied out, as the weight check below needs the font system.
+            self.face_contains_family(m_key.id, self.font_system.db().family_name(default_family))
+                && self.font_system.matches_weight(m_key, self.ideal_weight)
+        })
     }
 
     fn next_item(&mut self, fallbacks: &Fallbacks) -> Option<<Self as Iterator>::Item> {
