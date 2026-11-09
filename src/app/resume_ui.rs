@@ -48,7 +48,8 @@ pub(super) struct State {
     /// conversation takes the place of.
     pub(super) replace: Option<CardId>,
     /// The conversation `/resume` was typed in. It is not listed: the reader
-    /// is already in it.
+    /// is already in it. Its transcript, once found, is folded into this
+    /// saved entry before the entry is dropped, so it is not listed either.
     pub(super) asked_from: Option<CardId>,
     /// Transcripts read so far and transcripts to read, while indexing.
     indexing: Option<(usize, usize)>,
