@@ -4602,9 +4602,10 @@ impl Runtime {
         self.prepare_local_prompt();
         self.refresh_session();
         if !self.visible.load(Ordering::Relaxed) {
-            if let Some((snapshot, clock)) = self
-                .handle()
-                .and_then(|handle| handle.hidden_snapshot_with_clock())
+            if !self.retains_failed_start_body()
+                && let Some((snapshot, clock)) = self
+                    .handle()
+                    .and_then(|handle| handle.hidden_snapshot_with_clock())
             {
                 self.install_snapshot(snapshot, clock);
             }
@@ -4613,13 +4614,18 @@ impl Runtime {
         let Some(handle) = self.handle() else {
             return;
         };
-        let publication = handle.resident_snapshot_with_clock().or_else(|| {
-            // A failed hide can leave the client with metadata while this
-            // runtime still owns the last readable body. Rebuild only its
-            // discarded presentation; a disconnected client cannot hydrate it.
-            (!handle.is_connected() && self.presentation_evicted)
+        let publication = if self.retains_failed_start_body() {
+            self.presentation_evicted
                 .then(|| (self.snapshot.clone(), self.source_clock))
-        });
+        } else {
+            handle.resident_snapshot_with_clock().or_else(|| {
+                // A failed hide can leave the client with metadata while this
+                // runtime still owns the last readable body. Rebuild only its
+                // discarded presentation; a disconnected client cannot hydrate it.
+                (!handle.is_connected() && self.presentation_evicted)
+                    .then(|| (self.snapshot.clone(), self.source_clock))
+            })
+        };
         let Some((snapshot, source_clock)) = publication else {
             return;
         };
@@ -5164,6 +5170,7 @@ impl Runtime {
                 self.refresh();
             }
         } else if result.is_ok()
+            && !self.retains_failed_start_body()
             && self.handle().is_some_and(|handle| {
                 // Notice suppression is not permission to discard the last
                 // body: a lost client may already have installed metadata.
@@ -5237,6 +5244,13 @@ impl Runtime {
             evicted_cache_entries = cache_entries, exposed_presentation_bytes = 0usize);
     }
 
+    /// A failed start may have retired the old actor while its IPC stream
+    /// remains open. That stream cannot reload this conversation; retain its
+    /// last body until an actual attachment replaces it.
+    fn retains_failed_start_body(&self) -> bool {
+        self.resume_failed || self.start_retry_blocked
+    }
+
     /// Tells the connection whether to keep the card's snapshot current.
     ///
     /// A first message waiting to be sent keeps it current while the card is
@@ -5250,7 +5264,7 @@ impl Runtime {
         let retain_body = self.visible.load(Ordering::Relaxed);
         let interested = retain_body || self.queued.is_some() || !self.followups.is_empty();
         match self.handle() {
-            Some(handle) if handle.is_connected() => {
+            Some(handle) if handle.is_connected() && !self.retains_failed_start_body() => {
                 match handle.set_interest(interested, retain_body) {
                     // The connection can drop between the check and the call, and
                     // is then as lost as one found lost: not this pass's to report.
@@ -27448,6 +27462,105 @@ mod tests {
         );
         assert!(!app.chat_retry_blocked(card));
         assert_eq!(chat_runtime(&app, card).composer.text(), "keep this draft");
+    }
+
+    #[test]
+    fn failed_resume_retains_history_and_refusal_when_a_stale_connected_handle_cannot_hydrate() {
+        for recovery in [chat::Recovery::Retry, chat::Recovery::Blocked] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            app.workspace.resize_viewport(1280.0);
+            let card = live_chat_for_provider(&mut app, Provider::Claude, Some(KNOWN_THREAD));
+            let target = chat_runtime(&app, card).target;
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+            let item = Arc::new(chat::Item {
+                id: "retained-answer".into(),
+                role: chat::Role::Assistant,
+                content: text("The original conversation is still readable"),
+                at: None,
+                started_at: None,
+            });
+            let handle = Arc::new(ClientHandle::fixture(
+                source.clone(),
+                Snapshot {
+                    ready: true,
+                    exited: true,
+                    session_id: source.launch.session_id.clone(),
+                    native_continuity: source.native_continuity.clone(),
+                    items: vec![item.clone()],
+                    ..Snapshot::default()
+                },
+            ));
+            let mut runtime = Runtime::new(
+                target,
+                source.clone(),
+                Connection::Live(handle.clone()),
+                true,
+                app.settings.editor_syntax_theme,
+            );
+            runtime.refresh();
+            runtime.replace_draft(text_editor::Content::with_text("keep this draft"));
+            assert!(runtime.resumes_in_place());
+            app.replace_chat_conversation(card, source.clone());
+            app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+            drop(app.start_chat(card, source, chat::Intent::Resume, None, false));
+            let attempt = chat_runtime_attempt(&app, card);
+            let reason =
+                "Provider executable claude is not executable in the preserved launch environment";
+            answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: reason.into(),
+                    recovery,
+                }),
+            );
+            let runtime = match app.cards.get_mut(&card) {
+                Some(CardRuntime::Chat(runtime)) => runtime,
+                _ => panic!("the failed resume keeps its runtime"),
+            };
+            assert!(runtime.resume_failed);
+            assert!(
+                handle.is_connected(),
+                "the IPC socket alone cannot hydrate a retired actor"
+            );
+            // A stale socket can hold metadata without a resident body. It
+            // must never replace the last readable runtime publication.
+            handle.set_interest(false, false).unwrap();
+            assert!(handle.resident_snapshot_with_clock().is_none());
+            runtime.set_visible(false).unwrap();
+            runtime.refresh();
+            assert_eq!(runtime.snapshot.items, [item.clone()]);
+            assert!(runtime.cache.is_empty());
+            runtime.set_visible(true).unwrap();
+            preparation::drain_fixture(runtime);
+            assert_eq!(runtime.snapshot.items, [item]);
+            assert!(
+                shown(&runtime.cache["retained-answer"])
+                    .contains("The original conversation is still readable")
+            );
+            assert_eq!(runtime.failure_ui.local_error.as_deref(), Some(reason));
+            assert!(!runtime.failure_ui.incidents.is_empty());
+            assert_eq!(runtime.composer.text(), "keep this draft");
+            assert_eq!(runtime.error.as_deref(), Some(reason));
+            let incident = runtime.failure_ui.incidents.last().unwrap();
+            let labels = recovery_labels(runtime.failure_view(incident));
+            assert!(
+                labels.iter().any(|label| label.contains("Details")),
+                "{labels:?}"
+            );
+            assert!(
+                labels.iter().any(|label| label.contains("Copy")),
+                "{labels:?}"
+            );
+            assert_eq!(
+                labels
+                    .iter()
+                    .any(|label| label.contains("before trying again")),
+                recovery == chat::Recovery::Retry,
+                "{labels:?}",
+            );
+        }
     }
 
     #[test]

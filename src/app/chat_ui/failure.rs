@@ -218,6 +218,7 @@ pub(super) struct Incident {
     pub key: String,
     pub summary: String,
     pub guidance: &'static str,
+    generic_retry_guidance: bool,
     pub kind: Option<FailureKind>,
     sources: Vec<Source>,
     /// The chronological first transcript source owns the visible notice.
@@ -232,6 +233,7 @@ struct Metadata {
     key: String,
     summary: String,
     guidance: &'static str,
+    generic_retry_guidance: bool,
     kind: Option<FailureKind>,
 }
 
@@ -420,35 +422,40 @@ impl State {
         if text.trim().is_empty() {
             return None;
         }
-        let (key, summary, guidance, kind) = if let Some(failure) = Failure::parse(provider, text) {
-            (
-                diagnostic_key(failure.key.as_ref()),
-                failure.summary,
-                failure.action,
-                Some(failure.kind),
-            )
-        } else if let Some(outcome) = DeliveryOutcome::parse(text) {
-            // The daemon's report already says what to do next.
-            (
-                diagnostic_key(text),
-                outcome.summary.to_owned(),
-                outcome.action,
-                None,
-            )
-        } else if known_only {
-            return None;
-        } else {
-            (
-                diagnostic_key(text),
-                fallback_summary(text),
-                "Review the details before trying again.",
-                None,
-            )
-        };
+        let (key, summary, guidance, kind, generic_retry_guidance) =
+            if let Some(failure) = Failure::parse(provider, text) {
+                (
+                    diagnostic_key(failure.key.as_ref()),
+                    failure.summary,
+                    failure.action,
+                    Some(failure.kind),
+                    false,
+                )
+            } else if let Some(outcome) = DeliveryOutcome::parse(text) {
+                // The daemon's report already says what to do next.
+                (
+                    diagnostic_key(text),
+                    outcome.summary.to_owned(),
+                    outcome.action,
+                    None,
+                    false,
+                )
+            } else if known_only {
+                return None;
+            } else {
+                (
+                    diagnostic_key(text),
+                    fallback_summary(text),
+                    "Review the details before trying again.",
+                    None,
+                    true,
+                )
+            };
         let meta = Metadata {
             key: diagnostic_key(&format!("{context}\0{key}")),
             summary,
             guidance,
+            generic_retry_guidance,
             kind,
         };
         Some(meta)
@@ -485,6 +492,7 @@ impl State {
                 key: meta.key,
                 summary: meta.summary,
                 guidance: meta.guidance,
+                generic_retry_guidance: meta.generic_retry_guidance,
                 kind: meta.kind,
                 sources: vec![source],
                 first_item,
@@ -1287,10 +1295,17 @@ impl Runtime {
             .spacing(space::S)
             .align_y(Alignment::Start)
             .into(),
-            design::caption(incident.guidance)
-                .width(Length::Fill)
-                .into(),
         ];
+        let blocked_start = self.start_retry_blocked && incident.generic_retry_guidance && incident.sources.iter().any(|source| {
+            matches!(source, Source::Local(text) if Some(text.as_ref()) == self.error.as_deref())
+        });
+        if !blocked_start {
+            rows.push(
+                design::caption(incident.guidance)
+                    .width(Length::Fill)
+                    .into(),
+            );
+        }
         rows.push(self.failure_diagnostics(incident));
         widget::container(
             widget::column::with_children(rows)
