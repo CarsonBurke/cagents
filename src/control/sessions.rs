@@ -1,7 +1,7 @@
 use super::*;
 use crate::agent_execution::{
     Authority, Operation, Reply,
-    directory::{Directory, Entry, Member, Members, Relation, Scope},
+    directory::{Entry, Member, Members, Relation, Scope, SessionAccount, Sessions, UsageLimit},
 };
 use crate::model::ChannelId;
 
@@ -23,7 +23,7 @@ pub struct SessionsArgs {
 /// Who is calling, and which other sessions share its channel or checkout.
 pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     let directory = read(Scope::Containing(current_directory()?))?;
-    let channel = directory.caller.as_ref().and_then(|me| me.channel);
+    let channel = directory.caller.as_ref().and_then(|me| me.session.channel);
     let now = now_ms();
     let mut human = match &directory.caller {
         Some(me) => list_human(std::iter::once(me).map(Row::from), channel, now),
@@ -32,7 +32,8 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     let peers: Vec<_> = directory
         .sessions
         .iter()
-        .filter(|entry| {
+        .filter(|member| {
+            let entry = &member.session;
             directory.caller.is_none()
                 || entry.relation != Relation::Peer
                 || channel.is_some() && entry.channel == channel
@@ -54,7 +55,11 @@ pub(super) fn whoami() -> Result<CommandOutput, AppError> {
     }
     Ok(CommandOutput {
         command: "whoami",
-        data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": peers }),
+        data: json!({
+            "me": directory.caller.as_ref().map(session_json),
+            "scope": directory.scope,
+            "sessions": peers.into_iter().map(session_json).collect::<Vec<_>>(),
+        }),
         human,
     })
 }
@@ -79,7 +84,7 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
         Scope::Containing(current_directory()?)
     };
     let directory = read(scope)?;
-    let channel = directory.caller.as_ref().and_then(|me| me.channel);
+    let channel = directory.caller.as_ref().and_then(|me| me.session.channel);
     let mut human = list_human(
         directory
             .caller
@@ -97,9 +102,90 @@ pub(super) fn list(arguments: SessionsArgs) -> Result<CommandOutput, AppError> {
     }
     Ok(CommandOutput {
         command: "sessions",
-        data: json!({ "me": directory.caller, "scope": directory.scope, "sessions": directory.sessions }),
+        data: json!({
+            "me": directory.caller.as_ref().map(session_json),
+            "scope": directory.scope,
+            "sessions": directory.sessions.iter().map(session_json).collect::<Vec<_>>(),
+        }),
         human,
     })
+}
+
+/// A listed session as `--json` reports it: its directory entry, with its
+/// usage limit and account. Its `state` reads `Limited` while a usage limit
+/// stops it, whatever activity the provider last reported.
+pub(super) fn session_json(member: &Member) -> Value {
+    let mut value = json!(member.session);
+    if member.limit.is_some() {
+        value["state"] = json!("Limited");
+    }
+    value["limit"] = json!(member.limit);
+    value["account"] = json!(member.account);
+    value["failure"] = json!(member.failure);
+    value
+}
+
+/// A channel member as `--json` reports it, with its session's `state` as
+/// [`session_json`] names it.
+fn member_json(member: &Member) -> Value {
+    let mut value = json!(member);
+    if member.limit.is_some() {
+        value["session"]["state"] = json!("Limited");
+    }
+    value
+}
+
+/// A usage limit in a phrase: "Claude weekly limit reached, resets in 9 hr".
+/// A reset the account's usage reading dates is given relative to `now`, in
+/// Unix milliseconds; otherwise as the provider worded it.
+pub(super) fn limit_phrase(limit: &UsageLimit, now: u64) -> String {
+    let mut phrase = limit.summary.clone();
+    match (limit.resets_at.filter(|at| *at >= 0), &limit.reset) {
+        (Some(at), _) => {
+            phrase.push_str(", resets ");
+            phrase.push_str(&super::format::relative_time(
+                (at as u64).saturating_mul(1000),
+                now,
+            ));
+        }
+        (None, Some(reset)) => {
+            phrase.push_str(", resets ");
+            phrase.push_str(reset);
+        }
+        (None, None) => {}
+    }
+    phrase
+}
+
+/// An account and what is left of it, in a phrase:
+/// "claude/system: 17% of Weekly left, resets in 3 days".
+pub(super) fn account_phrase(account: &SessionAccount, now: u64) -> String {
+    let name = match &account.label {
+        Some(label) => format!("{} ({label})", account.id),
+        None => account.id.to_string(),
+    };
+    let Some(window) = account.tightest() else {
+        return match account.status {
+            Some(crate::account::UsageStatus::NeedsLogin) => format!("{name}: needs sign-in"),
+            _ => format!("{name}: allowance unknown"),
+        };
+    };
+    let mut phrase = format!(
+        "{name}: {:.0}% of {} left",
+        (window.remaining_fraction * 100.0).floor(),
+        window.window.label
+    );
+    if let Some(at) = window.window.resets_at.filter(|at| *at >= 0) {
+        phrase.push_str(", resets ");
+        phrase.push_str(&super::format::relative_time(
+            (at as u64).saturating_mul(1000),
+            now,
+        ));
+    }
+    if account.stale {
+        phrase.push_str(" (as last read; may be out of date)");
+    }
+    phrase
 }
 
 /// Everyone in a channel, with how recently each worked and how it ended.
@@ -116,7 +202,11 @@ fn members(channel: Option<ChannelId>) -> Result<CommandOutput, AppError> {
     } = &members;
     Ok(CommandOutput {
         command: "sessions",
-        data: json!({ "channel": channel, "me": caller, "sessions": sessions }),
+        data: json!({
+            "channel": channel,
+            "me": caller.as_ref().map(member_json),
+            "sessions": sessions.iter().map(member_json).collect::<Vec<_>>(),
+        }),
         human,
     })
 }
@@ -146,29 +236,22 @@ fn members_human(members: &Members, now: u64) -> String {
 /// One listed session, with what a member view adds to it.
 pub(super) struct Row<'a> {
     entry: &'a Entry,
-    exited: bool,
+    state: &'static str,
     failure: Option<&'a str>,
     active_at: Option<u64>,
-}
-
-impl<'a> From<&'a Entry> for Row<'a> {
-    fn from(entry: &'a Entry) -> Self {
-        Self {
-            entry,
-            exited: false,
-            failure: None,
-            active_at: None,
-        }
-    }
+    limit: Option<&'a UsageLimit>,
+    account: Option<&'a SessionAccount>,
 }
 
 impl<'a> From<&'a Member> for Row<'a> {
     fn from(member: &'a Member) -> Self {
         Self {
             entry: &member.session,
-            exited: member.exited,
+            state: member.state_label(),
             failure: member.failure.as_deref(),
             active_at: member.active_at,
+            limit: member.limit.as_ref(),
+            account: member.account.as_ref(),
         }
     }
 }
@@ -185,7 +268,6 @@ pub(super) fn list_human<'a>(
     channel: Option<crate::model::ChannelId>,
     now: u64,
 ) -> String {
-    use crate::agent::ActivityState;
     use crate::agent_execution::directory::Owner;
     super::format::table(
         ["SESSION", "PROVIDER", "STATE", "CONTEXT"],
@@ -193,6 +275,9 @@ pub(super) fn list_human<'a>(
             .map(|row| {
                 let entry = row.entry;
                 let mut context = Vec::new();
+                if let Some(limit) = row.limit {
+                    context.push(format!("stopped: {}", limit_phrase(limit, now)));
+                }
                 if let Some(project) = &entry.project_name {
                     context.push(format!("[{project}]"));
                 }
@@ -232,20 +317,17 @@ pub(super) fn list_human<'a>(
                 if let Some(at) = row.active_at {
                     context.push(format!("active {}", super::format::relative_time(at, now)));
                 }
-                if let Some(failure) = row.failure {
+                // A limit already says what failed.
+                if let Some(failure) = row.failure.filter(|_| row.limit.is_none()) {
                     context.push(format!("failed: {failure}"));
+                }
+                if let Some(account) = row.account {
+                    context.push(format!("account {}", account_phrase(account, now)));
                 }
                 [
                     entry.id.to_string(),
                     entry.provider.map_or("shell", |p| p.executable()).into(),
-                    match entry.state {
-                        _ if row.exited => "exited",
-                        ActivityState::Unknown => "unknown",
-                        ActivityState::Idle => "idle",
-                        ActivityState::Working => "working",
-                        ActivityState::Waiting => "waiting",
-                    }
-                    .into(),
+                    row.state.into(),
                     context.join("; "),
                 ]
             })
@@ -255,11 +337,11 @@ pub(super) fn list_human<'a>(
 }
 
 /// Peers in the caller's own checkout are the ones most likely to collide.
-fn shares_checkout(directory: &Directory, entry: &Entry) -> bool {
+fn shares_checkout(directory: &Sessions, entry: &Entry) -> bool {
     directory
         .caller
         .as_ref()
-        .and_then(|me| me.worktree.as_ref())
+        .and_then(|me| me.session.worktree.as_ref())
         .is_some_and(|worktree| entry.worktree.as_ref() == Some(worktree))
 }
 
@@ -267,9 +349,9 @@ fn current_directory() -> Result<PathBuf, AppError> {
     std::env::current_dir().map_err(|e| AppError::new("target", e))
 }
 
-fn read(scope: Scope) -> Result<Directory, AppError> {
-    request(Operation::Directory(scope), |reply| match reply {
-        Reply::Directory(directory) => Some(directory),
+fn read(scope: Scope) -> Result<Sessions, AppError> {
+    request(Operation::Sessions(scope), |reply| match reply {
+        Reply::Sessions(sessions) => Some(sessions),
         _ => None,
     })
 }
@@ -325,6 +407,105 @@ mod tests {
         }
     }
 
+    fn live(session: Entry) -> Member {
+        Member {
+            session,
+            exited: false,
+            failure: None,
+            active_at: None,
+            limit: None,
+            account: None,
+        }
+    }
+
+    fn account(remaining: f32, stale: bool) -> SessionAccount {
+        use crate::account::{UsageStatus, UsageWindow, WindowKind, info::RemainingWindow};
+        SessionAccount {
+            id: "claude/system".parse().unwrap(),
+            label: Some("work".into()),
+            status: Some(UsageStatus::Warning),
+            remaining: vec![RemainingWindow {
+                window: UsageWindow {
+                    key: "weekly".into(),
+                    kind: WindowKind::Weekly,
+                    label: "Weekly".into(),
+                    used: 1.0 - remaining,
+                    resets_at: Some(3 * 3600),
+                    span_secs: None,
+                    binding: true,
+                },
+                remaining_fraction: remaining,
+                reset_elapsed: false,
+            }],
+            stale,
+            observed_at: None,
+            ordinary_usage_allowed: None,
+        }
+    }
+
+    #[test]
+    fn a_limited_session_reads_limited_with_its_reset_and_account() {
+        let mut member = live(entry());
+        member.failure = Some("Claude weekly limit reached · resets 3pm".into());
+        member.limit = Some(UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: Some("3pm".into()),
+            resets_at: Some(3 * 3600),
+        });
+        member.account = Some(account(0.0, false));
+        let human = list_human(std::iter::once(Row::from(&member)), None, 3600 * 1000);
+        let row = human.lines().nth(1).unwrap();
+        assert!(row.contains(" limited "), "{row}");
+        assert!(
+            row.contains("stopped: Claude weekly limit reached, resets in 2 hr"),
+            "{row}"
+        );
+        assert!(
+            !row.contains("failed:"),
+            "the limit already says what failed: {row}"
+        );
+        assert!(
+            row.ends_with("; account claude/system (work): 0% of Weekly left, resets in 2 hr"),
+            "{row}"
+        );
+
+        let value = session_json(&member);
+        assert_eq!(value["state"], "Limited");
+        assert_eq!(value["limit"]["summary"], "Claude weekly limit reached");
+        assert_eq!(value["limit"]["resets_at"], 3 * 3600);
+        assert_eq!(value["account"]["id"], "claude/system");
+        assert_eq!(value["account"]["remaining"][0]["remaining_fraction"], 0.0);
+        assert_eq!(value["id"], json!(member.session.id));
+
+        // Without a dated reading, the provider's own words date the reset.
+        member.limit.as_mut().unwrap().resets_at = None;
+        assert_eq!(
+            limit_phrase(member.limit.as_ref().unwrap(), 0),
+            "Claude weekly limit reached, resets 3pm"
+        );
+        member.limit = None;
+        let value = session_json(&member);
+        assert_eq!(value["state"], "Waiting");
+        assert!(value["limit"].is_null());
+    }
+
+    #[test]
+    fn an_account_phrase_says_when_its_reading_is_stale_or_missing() {
+        assert_eq!(
+            account_phrase(&account(0.42, true), 3600 * 1000),
+            "claude/system (work): 42% of Weekly left, resets in 2 hr (as last read; may be out of date)"
+        );
+        let mut unknown = account(0.42, false);
+        unknown.remaining.clear();
+        unknown.label = None;
+        assert_eq!(
+            account_phrase(&unknown, 0),
+            "claude/system: allowance unknown"
+        );
+        unknown.status = Some(crate::account::UsageStatus::NeedsLogin);
+        assert_eq!(account_phrase(&unknown, 0), "claude/system: needs sign-in");
+    }
+
     #[test]
     fn a_channel_lists_how_each_member_ended_and_when_it_last_worked() {
         let mut session = entry();
@@ -338,6 +519,8 @@ mod tests {
             exited: true,
             failure: Some("Claude usage limit reached · resets 3pm".into()),
             active_at: Some(0),
+            limit: None,
+            account: None,
         };
         let mut members = Members {
             channel,
@@ -377,7 +560,8 @@ mod tests {
     fn readable_session_rows_keep_original_identity_and_delegation_context() {
         let entry = entry();
         let before = serde_json::to_value(&entry).unwrap();
-        let human = list_human(std::iter::once(Row::from(&entry)), None, 0);
+        let member = live(entry.clone());
+        let human = list_human(std::iter::once(Row::from(&member)), None, 0);
         assert_eq!(human.lines().count(), 2);
         assert_eq!(
             human
@@ -425,8 +609,9 @@ mod tests {
         entry.project_name = None;
         entry.view_scope = None;
         entry.lineage = Lineage(entry.id);
+        let member = live(entry);
         assert_eq!(
-            list_human(std::iter::once(Row::from(&entry)), None, 0),
+            list_human(std::iter::once(Row::from(&member)), None, 0),
             "SESSION                               PROVIDER  STATE    CONTEXT\n00000000-0000-4000-8000-000000000001  shell     unknown  me"
         );
     }

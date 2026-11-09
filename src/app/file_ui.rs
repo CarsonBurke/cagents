@@ -266,8 +266,6 @@ impl Cagents {
                 title: title.clone(),
                 width_fraction: width,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Repository(view),
             };
             let durable = Arc::make_mut(&mut self.durable);
@@ -285,6 +283,7 @@ impl Cagents {
                 channel.cards.push(card);
                 channel.focused = Some(card);
             }
+            self.set_presence(card, Exposure::Visible, Residency::Hot);
             self.workspace.add_card(
                 WorkspaceCard::new(card, title, CardWidth::Fraction(width))
                     .expect("file pane is valid"),

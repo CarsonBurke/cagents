@@ -74,10 +74,14 @@ fn transcript_body(text: impl Into<String>, target: Target) -> Element<'static, 
 /// fixed, so the two constants have to agree with what the editor draws.
 /// iced's default line height, 1.4 em, at the editor's prose size.
 const COMPOSER_LINE_HEIGHT: f32 = design::TEXT_PROSE * 1.4;
-const COMPOSER_PADDING: f32 = crate::tab_strip::EDGE_INSET + space::S;
-// Icon hit targets include their own centered inset; align the visible glyph.
-const COMPOSER_TOOLBAR_PADDING: f32 =
-    COMPOSER_PADDING - (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
+/// Where the composer's glyphs and captions start: the `+` glyph, and the
+/// suggestion hint and footer aligned beneath it.
+const COMPOSER_PADDING: f32 =
+    COMPOSER_TOOLBAR_PADDING + (design::PRIMARY_CONTROL_SIZE - design::ROW_ICON_SIZE as f32) / 2.0;
+/// The controls' inset from the composer's sides, the same as from its foot,
+/// so the hover square of `+` or send sits evenly in the composer's corner,
+/// concentric with it.
+const COMPOSER_TOOLBAR_PADDING: f32 = COMPOSER_CONTROL_INSET;
 /// The editor's vertical inset in the composer row.
 ///
 /// A single line of text is then as tall as a control with a small margin on
@@ -321,8 +325,8 @@ fn composer_editor_style(
     iced::widget::text_editor::Style {
         background: iced::Background::Color(iced::Color::TRANSPARENT),
         border: iced::Border::default(),
-        placeholder: design::muted_color(theme),
-        value: cosmic.palette.neutral_9.into(),
+        placeholder: design::field_placeholder_color(theme),
+        value: design::field_text_color(theme),
         selection: cosmic.accent.base.into(),
     }
 }
@@ -1472,7 +1476,19 @@ impl Runtime {
         let active = self.reported_errors().find_map(|message| {
             chat::failure::Failure::parse(self.session.launch.provider, message)
         });
-        let failure_label = active.and_then(|failure| match failure.kind {
+        // The reset is when the conversation can carry on, so a limit that
+        // still holds, as the daemon judges it, says it.
+        let limit_reset = self
+            .usage_limit
+            .as_ref()
+            .filter(|_| {
+                active
+                    .as_ref()
+                    .is_some_and(|failure| failure.kind == chat::failure::FailureKind::AccountLimit)
+            })
+            .and_then(|limit| limit.reset.as_deref())
+            .map(|reset| format!("Account limit reached · resets {reset}"));
+        let failure_label = active.as_ref().and_then(|failure| match failure.kind {
             chat::failure::FailureKind::AccountLimit => Some("Account limit reached"),
             chat::failure::FailureKind::Authentication => Some("Sign-in required"),
             chat::failure::FailureKind::Capacity => Some("Provider at capacity"),
@@ -1484,8 +1500,8 @@ impl Runtime {
             chat::failure::FailureKind::Exited => Some("Stopped unexpectedly"),
         });
         let mut parts = Vec::new();
-        if let Some(label) = failure_label {
-            parts.push(label.to_owned());
+        if let Some(label) = limit_reset.as_deref().or(failure_label) {
+            parts.push(Self::short_description(label, 72));
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
@@ -2427,14 +2443,37 @@ impl Runtime {
         if let Some(query) = &self.find {
             content.push(
                 widget::row::with_children(vec![
-                    crate::interaction::focused_escape(
+                    // Enter and Escape are answered by the field that holds
+                    // the keyboard, however it got there: a click, Ctrl+F or
+                    // the Previous and Next buttons handing it back.
+                    crate::interaction::focused_key(
                         crate::ui_controls::field::search("Find in conversation", query)
                             .id(card_control_id(target.card, "chat-find"))
                             .on_input(move |query| action(Action::Find(target, query)))
-                            .on_focus(action(Action::FindFocused(target, true)))
-                            .on_unfocus(action(Action::FindFocused(target, false)))
                             .width(Length::Fill),
-                        move || action(Action::CloseFind(target)),
+                        move |event| {
+                            let keyboard::Event::KeyPressed {
+                                key: keyboard::Key::Named(key),
+                                modifiers,
+                                ..
+                            } = event
+                            else {
+                                return None;
+                            };
+                            match key {
+                                keyboard::key::Named::Escape => {
+                                    Some(action(Action::CloseFind(target)))
+                                }
+                                keyboard::key::Named::Enter
+                                    if !modifiers.control()
+                                        && !modifiers.alt()
+                                        && !modifiers.logo() =>
+                                {
+                                    Some(action(Action::FindNext(target, !modifiers.shift())))
+                                }
+                                _ => None,
+                            }
+                        },
                     ),
                     design::caption(if let Some(error) = self.find_error() {
                         error.to_owned()

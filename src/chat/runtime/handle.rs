@@ -602,6 +602,14 @@ impl Handle {
             Owner::Remote(remote) => remote.state().failure.clone(),
         }
     }
+    /// When the latest turn finished, in daemon Unix milliseconds, which
+    /// dates the failure it may have ended with.
+    pub fn finished_at(&self) -> Option<u64> {
+        match &self.0 {
+            Owner::Local(local) => local.finished_at(),
+            Owner::Remote(remote) => remote.state().finished_at,
+        }
+    }
     pub fn owns_work(&self) -> bool {
         match &self.0 {
             Owner::Local(local) => local.owns_work(),
@@ -612,6 +620,17 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.activity(),
             Owner::Remote(remote) => remote.state().activity,
+        }
+    }
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children.
+    pub(crate) fn turn_accepted(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.turn_accepted(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                state.busy || state.waiting || !state.requests.is_empty()
+            }
         }
     }
     pub(crate) fn update_activity(&self) -> (bool, bool) {

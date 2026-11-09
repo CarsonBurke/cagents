@@ -19,10 +19,10 @@ use thiserror::Error;
 use crate::{
     model::{
         BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-        Existence, Exposure, HostSessionProof, OperationId, ProjectChannel, ProjectId,
-        ProjectState, Residency, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
-        TranscriptMetadata, WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId,
-        WorktreeState, normalize_project_channels,
+        Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
+        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
+        WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
+        normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
@@ -33,6 +33,8 @@ mod refusal;
 #[cfg(feature = "ui")]
 mod review_cache;
 
+#[cfg(test)]
+mod history_scale;
 pub(crate) use refusal::invalid_state;
 pub use refusal::{RefusedCheck, Violation};
 
@@ -647,8 +649,6 @@ impl RefusedClosure {
             title,
             width_fraction,
             existence,
-            exposure: _,
-            residency: _,
             kind,
         } = &self.offered;
         // An open row still has the tombstone to take, so only a row that is
@@ -1607,18 +1607,21 @@ impl StateStore {
         state.card_scopes = manifest.card_scopes;
         copy.project(&mut state)?;
         for (name, value) in [
-            ("chat_drafts", to_json(&manifest.chat_drafts)?),
+            ("chat_drafts", ordered_map_json(&manifest.chat_drafts)?),
             (
                 "chat_draft_attachments",
-                to_json(&manifest.chat_draft_attachments)?,
+                ordered_map_json(&manifest.chat_draft_attachments)?,
             ),
-            ("local_only_cards", to_json(&manifest.local_only_cards)?),
+            (
+                "local_only_cards",
+                ordered_set_json(&manifest.local_only_cards)?,
+            ),
             (
                 "pending_chat_admissions",
-                to_json(&manifest.pending_chat_admissions)?,
+                ordered_map_json(&manifest.pending_chat_admissions)?,
             ),
             (CHANNELS_FIELD, to_json(&state.channels)?),
-            ("card_scopes", to_json(&state.card_scopes)?),
+            ("card_scopes", ordered_map_json(&state.card_scopes)?),
         ] {
             set_metadata(
                 &transaction,
@@ -2061,13 +2064,10 @@ impl StateStore {
             pending_chat_admissions: manifest.pending_chat_admissions,
             pending_terminal_creations: manifest.pending_terminal_creations,
         };
-        state.pending_chat_admissions.retain(|id, source| {
-            state.cards.iter().any(|card| {
-                card.id == *id
-                    && card.existence.is_open()
-                    && matches!(&card.kind, CardKind::Chat(session) if session == source)
-            })
-        });
+        let open_chats = open_chat_sessions(&state.cards);
+        state
+            .pending_chat_admissions
+            .retain(|id, source| open_chats.get(id).is_some_and(|open| **open == *source));
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
@@ -3912,7 +3912,7 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:worktree_focus"),
-        &to_json(&state.worktree_focus)?,
+        &ordered_map_json(&state.worktree_focus)?,
     )?;
     set_metadata(
         transaction,
@@ -3932,7 +3932,7 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:card_scopes"),
-        &to_json(&state.card_scopes)?,
+        &ordered_map_json(&state.card_scopes)?,
     )?;
     set_metadata(
         transaction,
@@ -3947,17 +3947,17 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:chat_drafts"),
-        &to_json(&state.chat_drafts)?,
+        &ordered_map_json(&state.chat_drafts)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:chat_draft_attachments"),
-        &to_json(&state.chat_draft_attachments)?,
+        &ordered_map_json(&state.chat_draft_attachments)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
-        &to_json(&state.repository_navigation)?,
+        &ordered_map_json(&state.repository_navigation)?,
     )?;
     set_metadata(
         transaction,
@@ -3965,17 +3965,13 @@ fn save_workspace_transaction(
         &to_json(&state.workspace_model_identity)?,
     )?;
 
+    let open_chats = open_chat_sessions(&state.cards);
     let pending = state
         .pending_chat_admissions
         .iter()
-        .filter(|(id, source)| {
-            state.cards.iter().any(|card| {
-                card.id == **id
-                    && card.existence.is_open()
-                    && matches!(&card.kind, CardKind::Chat(session) if session == *source)
-            })
-        })
-        .collect::<HashMap<_, _>>();
+        .filter(|(id, source)| open_chats.get(*id) == Some(source))
+        // Ordered, so an unchanged set serializes to the bytes already stored.
+        .collect::<BTreeMap<_, _>>();
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:pending_chat_admissions"),
@@ -3984,12 +3980,12 @@ fn save_workspace_transaction(
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:local_only_cards"),
-        &to_json(&state.local_only_cards)?,
+        &ordered_set_json(&state.local_only_cards)?,
     )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:pending_terminal_creations"),
-        &to_json(&state.pending_terminal_creations)?,
+        &ordered_set_json(&state.pending_terminal_creations)?,
     )?;
 
     let existing = existing_cards(transaction, &workspace_id)?;
@@ -4078,6 +4074,25 @@ fn save_workspace_transaction(
     })
 }
 
+/// Runs a savepoint statement. Every card of every flush passes through one,
+/// so the statement is prepared once per connection rather than parsed anew.
+fn savepoint(transaction: &Transaction<'_>, statement: &str) -> Result<()> {
+    transaction.prepare_cached(statement)?.execute([])?;
+    Ok(())
+}
+
+/// The conversation each open chat card holds, by card.
+fn open_chat_sessions(cards: &[CardState]) -> HashMap<CardId, &crate::chat::Session> {
+    cards
+        .iter()
+        .filter(|card| card.existence.is_open())
+        .filter_map(|card| match &card.kind {
+            CardKind::Chat(session) => Some((card.id, session)),
+            _ => None,
+        })
+        .collect()
+}
+
 /// Writes a card the snapshot holds open.
 ///
 /// Storage refuses content that would break what a stored card promises - a
@@ -4116,7 +4131,7 @@ fn save_open_card(
             timestamp,
         );
     };
-    transaction.execute_batch("SAVEPOINT open_card")?;
+    savepoint(transaction, "SAVEPOINT open_card")?;
     match save_card(
         transaction,
         workspace_id,
@@ -4127,12 +4142,13 @@ fn save_open_card(
         timestamp,
     ) {
         Err(error) if error.refuses_content() => {
-            transaction.execute_batch("ROLLBACK TO open_card; RELEASE open_card")?;
+            savepoint(transaction, "ROLLBACK TO open_card")?;
+            savepoint(transaction, "RELEASE open_card")?;
             refused.push(error.in_card(card.id));
             Ok(stored.generation)
         }
         written => {
-            transaction.execute_batch("RELEASE open_card")?;
+            savepoint(transaction, "RELEASE open_card")?;
             written
         }
     }
@@ -4194,22 +4210,24 @@ fn save_card(
             actual: 0,
         });
     }
+    let write = CardWrite::build(workspace_id, &card_id, ordinal, card, kind)?;
+    // Every value this write would bind, apart from `generation` and
+    // `updated_at_unix_ms`, is already stored byte for byte. Both of those
+    // columns describe the last *content* change, so leaving the rows untouched
+    // is not an approximation of the write — it is the write, with zero dirtied
+    // pages and zero WAL frames.
+    let unchanged = stored.is_some_and(|stored| stored.content_hash == Some(write.content_hash));
     if let CardKind::Chat(session) = &card.kind {
+        // A conversation offered exactly as stored cannot have changed its
+        // identity, so only a changed one is compared with the stored row.
         validate_chat_identity(
             transaction,
             card.id,
             session,
-            stored.map(|stored| stored.kind),
+            stored.filter(|_| !unchanged).map(|stored| stored.kind),
         )?;
     }
-
-    let write = CardWrite::build(workspace_id, &card_id, ordinal, card, kind)?;
-    if stored.is_some_and(|stored| stored.content_hash == Some(write.content_hash)) {
-        // Every value this write would bind, apart from `generation` and
-        // `updated_at_unix_ms`, is already stored byte for byte. Both of
-        // those columns describe the last *content* change, so leaving the
-        // rows untouched is not an approximation of the write — it is the
-        // write, with zero dirtied pages and zero WAL frames.
+    if unchanged {
         return Ok(expected);
     }
 
@@ -4257,11 +4275,7 @@ fn save_closed_card(
 ) -> Result<u64> {
     if let Some(stored) = stored
         && stored.kind == PersistedCardKind::Terminal
-        && transaction.query_row(
-            "SELECT content_json IS NOT NULL FROM cards WHERE card_id = ?1",
-            [card.id.to_string()],
-            |row| row.get::<_, bool>(0),
-        )?
+        && stored.has_content
     {
         if expected != stored.generation {
             return Err(StoreError::StaleGeneration {
@@ -4280,7 +4294,7 @@ fn save_closed_card(
     {
         return Ok(refused.generation);
     }
-    transaction.execute_batch("SAVEPOINT closed_card")?;
+    savepoint(transaction, "SAVEPOINT closed_card")?;
     let written = save_card(
         transaction,
         workspace_id,
@@ -4292,7 +4306,8 @@ fn save_closed_card(
     );
     match written {
         Err(error) if error.refuses_content() => {
-            transaction.execute_batch("ROLLBACK TO closed_card; RELEASE closed_card")?;
+            savepoint(transaction, "ROLLBACK TO closed_card")?;
+            savepoint(transaction, "RELEASE closed_card")?;
             tracing::warn!(
                 card = %card.id,
                 %error,
@@ -4318,7 +4333,7 @@ fn save_closed_card(
             Ok(generation)
         }
         written => {
-            transaction.execute_batch("RELEASE closed_card")?;
+            savepoint(transaction, "RELEASE closed_card")?;
             if written.is_ok() {
                 refused_closures.remove(&card.id);
             }
@@ -5188,6 +5203,9 @@ struct ExistingCard {
     kind: PersistedCardKind,
     existence: Existence,
     generation: u64,
+    /// Whether the row holds `content_json`. A terminal row that does holds the
+    /// archived descriptor of a terminal another card has taken over.
+    has_content: bool,
     /// `None` for rows written before schema v3, and for rows whose content was
     /// changed by a path that does not maintain the fingerprint. Either way it
     /// never matches a computed fingerprint, so the card is simply rewritten.
@@ -5199,7 +5217,8 @@ fn existing_cards(
     workspace_id: &str,
 ) -> Result<BTreeMap<CardId, ExistingCard>> {
     let mut statement = transaction.prepare_cached(
-        "SELECT card_id, kind_tag, existence_json, generation, content_hash
+        "SELECT card_id, kind_tag, existence_json, generation, content_hash,
+                content_json IS NOT NULL
          FROM cards WHERE workspace_id = ?1",
     )?;
     let rows = statement.query_map([workspace_id], |row| {
@@ -5209,17 +5228,19 @@ fn existing_cards(
             row.get::<_, String>(2)?,
             row.get::<_, i64>(3)?,
             row.get::<_, Option<i64>>(4)?,
+            row.get::<_, bool>(5)?,
         ))
     })?;
     let mut cards = BTreeMap::new();
     for row in rows {
-        let (id, kind, existence, generation, content_hash) = row?;
+        let (id, kind, existence, generation, content_hash, has_content) = row?;
         cards.insert(
             parse_id("card", &id)?,
             ExistingCard {
                 kind: PersistedCardKind::parse(&kind)?,
                 existence: from_json("card existence", &existence)?,
                 generation: i64_to_u64(generation, "card generation")?,
+                has_content,
                 content_hash,
             },
         );
@@ -5518,8 +5539,6 @@ fn load_card_connection(
         title,
         width_fraction: width as f32,
         existence: from_json("card existence", &existence)?,
-        exposure: Exposure::Offscreen,
-        residency: Residency::Cold,
         kind,
     }))
 }
@@ -5866,14 +5885,29 @@ fn metadata(connection: &Connection, key: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// Stores `value` under `key`. A value storage already holds is left alone,
+/// so a flush that repeats the window's navigation dirties no page for it.
 fn set_metadata(transaction: &Transaction<'_>, key: &str, value: &str) -> Result<()> {
     transaction
         .prepare_cached(
             "INSERT INTO metadata (key, value) VALUES (?1, ?2)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value
+             WHERE value IS NOT excluded.value",
         )?
         .execute(params![key, value])?;
     Ok(())
+}
+
+/// Serializes a map in key order. A `HashMap` iterates in an order of its own,
+/// so equal navigation would otherwise be stored as different bytes and the
+/// unchanged-value check in [`set_metadata`] could never hold.
+fn ordered_map_json<K: Ord + Serialize, V: Serialize>(map: &HashMap<K, V>) -> Result<String> {
+    to_json(&map.iter().collect::<BTreeMap<_, _>>())
+}
+
+/// Serializes a set in order, for the reason [`ordered_map_json`] gives.
+fn ordered_set_json<T: Ord + Serialize>(set: &HashSet<T>) -> Result<String> {
+    to_json(&set.iter().collect::<BTreeSet<_>>())
 }
 
 fn to_json(value: &impl Serialize) -> Result<String> {
@@ -6056,8 +6090,6 @@ mod tests {
                 title: "terminal".into(),
                 width_fraction: 0.6,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
                     owned_codex_listener: None,
                     recovery_origin: None,
@@ -9131,11 +9163,6 @@ mod tests {
             }
             let mut card = card_template.clone();
             card.id = CardId::new();
-            card.exposure = if index == 0 {
-                Exposure::Visible
-            } else {
-                Exposure::Offscreen
-            };
             card.kind = CardKind::Chat(source);
             workspace
                 .chat_drafts
@@ -10834,8 +10861,6 @@ mod tests {
             title: "browser".into(),
             width_fraction: 0.4,
             existence: Existence::Open,
-            exposure: Exposure::Prefetch,
-            residency: Residency::Hibernated,
             kind: CardKind::Browser(BrowserSession {
                 id: BrowserId::new(),
                 current_url: Url::parse("https://example.com/two").unwrap(),
@@ -10865,13 +10890,6 @@ mod tests {
         assert_eq!(restored.active_worktree, workspace.active_worktree);
         assert_eq!(restored.worktree_focus, workspace.worktree_focus);
         assert_eq!(restored.project_order, workspace.project_order);
-        assert!(
-            restored
-                .cards
-                .iter()
-                .all(|card| card.exposure == Exposure::Offscreen
-                    && card.residency == Residency::Cold)
-        );
         let CardKind::Browser(browser) = &restored.cards[1].kind else {
             panic!("browser card expected");
         };
@@ -11787,8 +11805,6 @@ mod tests {
             title: "browser".into(),
             width_fraction: 0.4,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Browser(BrowserSession {
                 id: BrowserId::new(),
                 current_url: Url::parse("https://example.com/one").unwrap(),
@@ -11872,8 +11888,6 @@ mod tests {
             title: "repository".into(),
             width_fraction: 0.3,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Repository(crate::model::RepositoryView {
                 selected_file: None,
                 project: ProjectId::new(),

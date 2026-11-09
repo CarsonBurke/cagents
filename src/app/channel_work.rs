@@ -1584,7 +1584,6 @@ mod tests {
             durable.channels[0].cards.push(survivor);
             for card in &mut durable.cards {
                 card.width_fraction = 0.5;
-                card.residency = Residency::Hot;
             }
             app.workspace_model.views[0].panes = durable
                 .cards
@@ -1596,6 +1595,9 @@ mod tests {
                 focused: Some(closing),
                 ..WorkspaceState::default()
             });
+            for id in app.workspace.order().collect::<Vec<_>>() {
+                app.set_residency(id, Residency::Hot);
+            }
             let _ = app.workspace.resize_viewport(1000.0);
             assert_eq!(app.workspace.take_widget_focus_request(), Some(closing));
             // A real native frame is mounted, but no terminal or provider is

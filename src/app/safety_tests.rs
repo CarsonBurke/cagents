@@ -918,7 +918,7 @@ fn only_a_terminal_that_was_running_can_be_reopened() {
 #[test]
 fn a_terminal_proven_gone_leaves_through_ordinary_removal() {
     let (mut app, card, terminal, _) = live_app();
-    app.card_state_mut(card).unwrap().residency = Residency::Hot;
+    app.set_residency(card, Residency::Hot);
     let _ = app.update(Message::CloseCard(card));
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(app.terminal_close.as_ref().unwrap().pending);
@@ -1083,7 +1083,7 @@ fn escape_consumes_terminal_confirmation_without_closing_context() {
 #[test]
 fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_card() {
     let (mut app, card, _, _) = live_app();
-    app.card_state_mut(card).unwrap().residency = Residency::Hot;
+    app.set_residency(card, Residency::Hot);
     request_active_close(&mut app, card);
     let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
         unreachable!()

@@ -1170,13 +1170,39 @@ The existing artifact helper reads Cargo's exact executable path, including
 configured target directories/triples. A matching version alone does not prove
 that two dirty source trees match.
 
-For a local HOST run, select an existing private **disk-backed** base with a
-short, physical absolute path. Verify its filesystem with `findmnt -T PATH`;
-`/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can be RAM-backed. Neither the base nor
-any ancestor may contain a `.git` file, directory or symlink. The base must also
-be outside the account home reported by `getent passwd "$(id -u)"`, even when
-`HOME` points elsewhere: bundled-skill tests deliberately refuse installation
-beneath the passwd home. A private `~/.cot` therefore does not qualify.
+Through the gate, which is how a hosted agent runs it, there is no base to
+choose. The build host gives each slot a short, private `TMPDIR` such as
+`/run/user/1000/cof/cagents-0`, which is within the socket budget and outside
+the home and any `.git`, and which the slot's next command clears. It is in
+the runtime directory, which is memory on fw16, unlike the disk-backed base a
+local run uses: the slot holds one command's files at a time. If that
+directory isn't private to you, the slot falls back to its own `tmp` under
+`~/.cache`, which is too long for the socket budget and inside the home, where
+the bundled-skill tests below refuse to install.
+
+```sh
+(
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+)
+```
+
+The gate sends the helper, which is in the target, to the build host and points
+the variable at its copy there. It refuses a `CAGENTS_` setting that names a
+path outside the checkout and its target, which the build host doesn't have;
+`CAGENTS_BUILD_*` settings and the gate's own are exempt.
+
+For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
+private **disk-backed** base with a short, physical absolute path. Verify its
+filesystem with `findmnt -T PATH`; `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can
+be RAM-backed. Neither the base nor any ancestor may contain a `.git` file,
+directory or symlink. The base must also be outside the account home reported
+by `getent passwd "$(id -u)"`, even when `HOME` points elsewhere: bundled-skill
+tests deliberately refuse installation beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
 Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
 with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
@@ -1190,9 +1216,9 @@ fixture layouts need more room; a short base alone is not proof.
 ```sh
 # Set this only after verifying the base above.
 mkdir -p -m 700 /var/tmp/ct
-export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
-    TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
+    export CAGENTS_BUILD_REMOTE=local
+    TMPDIR=$(mktemp -d /var/tmp/ct/tXXXXXX) || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
@@ -1364,6 +1390,9 @@ workloads are described in [Performance](performance.md).
 
 ## Native evidence
 
+For which fixture to use, how they fit together and how to extend or repair
+one, see [Fixtures](fixtures.md).
+
 `scripts/native-evidence` captures before/after screenshots of the actual native
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
@@ -1375,7 +1404,7 @@ fixtures refuse.
 Build before taking the native lock, and never wait for Cargo while holding it: every other native session queues behind you. A `scripts/run-development` launch under that lock, whether an ancestor has it open or it runs in a nested niri session while the lock is held, won't compile or join the Cargo queue: Cargo may confirm the build is current, a compile fails naming the crate, and after `CAGENTS_NATIVE_LOCK_BUILD_SECONDS` (default 180) the launch gives up. `build` holds one of the build host's [shared slots](#building-on-another-host) for its three builds, even on the build host itself, so it reuses what that slot last compiled and leaves the build output there; the side's target gets only the three executables, about 0.5 GiB. With `CAGENTS_BUILD_REMOTE=local` it builds a full Cargo target in the task instead. A session runs the real `scripts/run-development`, but until the harness reports it ready, shortly after its window appears, its `cargo` only accepts what `build` compiled, with the same arguments. Anything else ends the session at once with the reason and releases the lock, and `start` returns once that is done, so `build` can follow straight away. After that it is real Cargo, so a terminal or language server in the app works; one that runs Cargo before then ends the session. Real Cargo run from inside a ready session still holds the native lock while it works, so keep builds out of a session. A hand-written session needs the same care: prebuild, give the runner a private `CAGENTS_BUILD_LOCK` with `CAGENTS_BUILD_SLOTS=1`, close the lock descriptor in children (`9>&-`), bound its stop command with `timeout`, and run `niri-harness` without a mise shim, which re-executes itself forever under a private `XDG_DATA_HOME`.
 
 ```sh
-export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/my-task
+export CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
 git worktree add --detach .worktrees/my-task-before origin/main
 
 # A shared build slot only; the executables come back to the task.
@@ -1431,6 +1460,11 @@ harness, it provides:
   (override with `CAGENTS_EVIDENCE_NATIVE_LOCK`). Stop as soon as you have the
   evidence. A session gives the lock up after `--limit` seconds even if its
   owner has gone. `build` uses `/var/tmp/cagents-fw16-cargo.lock` the same way.
+- **File choosers.** `start SIDE --portal gtk` runs xdg-desktop-portal with
+  the GTK backend on the session's private bus, so the app's Attach dialog
+  opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
+  `drive type PATH`, `drive key Return`. `kde`, `gnome` and `cosmic` select
+  those backends where they are installed.
 - **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
   the holder and whether it is doing anything, when `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that
@@ -1451,8 +1485,91 @@ harness, it provides:
   the pruner on its schedule and is refused when the disk is below its floor.
 
 Like `fixture_env`, it exits 77 under inherited agent authority and never removes
-that authority, so a hosted agent shell cannot use it. Remove the task directory
-when the PR merges.
+that authority, so a hosted agent shell cannot run it locally; it runs it on the
+build host instead, as the next section describes. When the PR merges, remove
+the task's host side with `scripts/native-evidence --remote fw16 --task DIR
+clean`, then the task directory here.
+
+### Native evidence from a cagents session
+
+A terminal or chat that cagents hosts runs `native-evidence` on the build host
+over plain SSH. An SSH login there carries none of the session's agent
+authority, and the host's own copy of `native-evidence` still refuses any that
+reached it. Add `--remote HOST` (or set `CAGENTS_EVIDENCE_REMOTE`); every
+command is the same, and the screenshots come back here:
+
+```sh
+mkdir -p ~/.local/state/cev-steps
+cat >~/.local/state/cev-steps/pr1234-prs.sh <<'STEPS'
+evidence cli project open '{fixture}/project'
+evidence drive click 'Open repository'
+evidence shot channel-prs
+STEPS
+git fetch origin main
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-prs \
+    pair --before origin/main --after . --steps ~/.local/state/cev-steps/pr1234-prs.sh --width 1200
+ls ~/.local/state/cev/pr1234-prs/shots   # before-channel-prs.webp after-channel-prs.webp manifest.tsv
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-prs clean   # once the PR merges
+```
+
+`pair` takes minutes: it builds two sides and may wait up to 30 minutes for
+the host's native lock while another session runs. Run it in the background,
+or with a command timeout of at least an hour. A command killed by a short
+tool timeout drops the SSH connection, and that ends the work on the host too.
+
+`pair` builds both sides, then for each starts a session, runs the steps file
+on the host with `SIDE` set and `evidence` standing for `native-evidence` there,
+stops the session even when a step fails, and brings back the shots. The
+individual commands work too, for a session you drive step by step:
+
+```sh
+export CAGENTS_EVIDENCE_REMOTE=fw16 CAGENTS_EVIDENCE_TASK=$HOME/.local/state/cev/pr1234-prs
+scripts/native-evidence build before origin/main
+scripts/native-evidence build after .
+scripts/native-evidence start after --width 1200
+scripts/native-evidence drive observe
+scripts/native-evidence shot channel-prs    # prints the local path
+scripts/native-evidence stop
+```
+
+- **Sources.** `build SIDE SOURCE` takes a checkout directory or a revision of
+  the repository you run it from. A checkout's uncommitted and untracked files
+  are included, ignored ones are not, and the checkout, its index and its
+  branch are left alone: the tool records the working tree as a commit, pushes
+  it to `refs/native-evidence/TASK/SIDE` in the host's repository (the same path
+  as this one, or `CAGENTS_EVIDENCE_REMOTE_REPOSITORY`), and checks it out at
+  `.worktrees/cev-TASK-SIDE` there. `sources.tsv` in the task records each
+  side's local checkout, its HEAD, and the commit that was built, which is the
+  revision `shots/manifest.tsv` names. Every untracked file that isn't
+  ignored goes to the host, so make sure a stray file, such as a local `.env`,
+  is ignored or removed before you build.
+- **One tool.** Both sides run the `native-evidence` and synthetic provider of
+  the checkout you run it from, copied to `.worktrees/cev-TASK-tool`, as a local
+  run would.
+- **The task.** Its directory's name, 1–18 letters, digits, dots, hyphens or
+  underscores, names `~/.local/state/cev/NAME` on the host. Locally it holds only
+  `shots/` and `sources.tsv`. `where` prints the host's paths. The host
+  records which machine and task directory a task belongs to, and refuses
+  every command from another, and leaves alone one it didn't start, such as
+  a task someone runs on the host directly, so two agents that pick the same
+  name don't build, stop or clean each other's work: name the task after your
+  PR, such as `pr2282-reopen`. Only `build` and `pair` take a name on the
+  host; `status`, `fetch` and the rest never claim one. A task an earlier
+  version of the route started has no record: the refusal prints the one-line
+  command that claims it, to run on the host if the task is yours. On the
+  build host itself, run `scripts/native-evidence` without `--remote`; a task
+  directory that is the host's own is refused.
+- **Fixture paths.** `{fixture}` in `cli` and `env` arguments becomes the
+  fixture's root on the host, both on the command line here and in a steps
+  file. A path you type into a file chooser is a host path, so put the file to
+  attach under the fixture first, as in `evidence env sh -c 'cp ... "$CAGENTS_EVIDENCE_FIXTURE/project/"'`.
+- **Cleaning up.** `clean` stops the task's session, if any, and removes its
+  checkouts, the refs that pinned their commits, and its task directory from
+  the host. The shots here stay. If the session won't stop, `clean` removes
+  nothing and says so. A side can't be rebuilt while its session
+  runs, so the checkout is never rewritten under it. Stop the session first.
+- **Login shells.** Every script travels to `bash -s` on standard input, so the
+  host's login shell may be fish. Commands get no standard input from here.
 
 ## Installer and package checks
 
@@ -1486,7 +1603,9 @@ generation. Each build is incremental, so after the first one only changed
 code is recompiled. The script stages the archive with
 `install.sh --stage-only` and runs `cagents daemon upgrade`, which shows each
 affected session and asks before replacing anything. `--stage-only` stops
-after staging so you can finish from the application's update notice instead.
+after staging; finish later with `cagents daemon upgrade`. A window on an
+older build may still run its own updater, which can refuse panes the staged
+build carries.
 
 The build runs in the repository's `.worktrees/.install-local`, a detached
 checkout the script owns, so its target directory stays warm and edits in your

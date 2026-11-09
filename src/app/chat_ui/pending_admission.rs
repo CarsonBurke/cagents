@@ -277,7 +277,6 @@ impl Cagents {
             // strict upgrade attachment was in flight. The copy still owns
             // the runtime's original source, never that newer descriptor.
             state.kind = CardKind::Chat(runtime.session.clone());
-            state.residency = Residency::Hot;
             let local_card = state.clone();
             runtime.retarget(self.chat_ui.next_target(retained));
             let durable = Arc::make_mut(&mut self.durable);
@@ -293,6 +292,7 @@ impl Cagents {
                 .pending_chat_admissions
                 .insert(retained, runtime.session.clone());
             durable.cards.push(state);
+            self.set_presence(retained, self.exposure(pane.id), Residency::Hot);
             self.retain_local_pane(retained);
             self.cards.insert(retained, CardRuntime::Chat(runtime));
             presentation = self.checkpoint_retained_chat_copy(pane.id, retained);

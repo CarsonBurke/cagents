@@ -2755,6 +2755,10 @@ pub struct SidebarView {
 struct PaneActivity {
     owner: Option<(ProjectId, WorktreeId)>,
     activity: crate::agent::Activity,
+    /// A provider usage limit stops the pane's agent. It outlives activity
+    /// reports, which say nothing of it, until the conversation says the
+    /// limit no longer holds or the pane stops reporting.
+    limited: bool,
 }
 
 /// Persistent interaction state owned by the application.
@@ -3324,11 +3328,16 @@ impl SidebarState {
 
     pub fn set_card_activity(&mut self, card: CardId, activity: crate::agent::Activity) {
         self.change_attention(card, |state| {
+            let limited = state
+                .agent_activity
+                .get(&card)
+                .is_some_and(|entry| entry.limited);
             state.agent_activity.insert(
                 card,
                 PaneActivity {
                     owner: None,
                     activity,
+                    limited,
                 },
             );
             if let Some(owner) = state.agent_updates.get_mut(&card) {
@@ -3346,9 +3355,18 @@ impl SidebarState {
     ) {
         self.change_attention(card, |state| {
             let owner = Some((project, worktree));
-            state
+            let limited = state
                 .agent_activity
-                .insert(card, PaneActivity { owner, activity });
+                .get(&card)
+                .is_some_and(|entry| entry.limited);
+            state.agent_activity.insert(
+                card,
+                PaneActivity {
+                    owner,
+                    activity,
+                    limited,
+                },
+            );
             if let Some(attribution) = state.agent_updates.get_mut(&card) {
                 *attribution = owner;
             }
@@ -3364,11 +3382,30 @@ impl SidebarState {
     }
 
     pub fn card_attention(&self, card: CardId) -> AttentionSummary {
+        let activity = self.agent_activity.get(&card);
         AttentionSummary::card(
-            self.card_activity(card).map(|activity| activity.state),
+            activity.map(|entry| entry.activity.state),
             self.has_card_update(card),
             self.failed_updates.contains(&card),
         )
+        .limited(activity.is_some_and(|entry| entry.limited))
+    }
+
+    /// Whether a usage limit stops `card`'s agent. A pane reporting no
+    /// activity has no agent for a limit to stop.
+    pub fn set_card_limited(&mut self, card: CardId, limited: bool) {
+        if self
+            .agent_activity
+            .get(&card)
+            .is_none_or(|entry| entry.limited == limited)
+        {
+            return;
+        }
+        self.change_attention(card, |state| {
+            if let Some(entry) = state.agent_activity.get_mut(&card) {
+                entry.limited = limited;
+            }
+        });
     }
 
     /// Replaces explicit unacknowledged Failed journal news. This never
@@ -6743,6 +6780,11 @@ pub fn attention_indicator<Message: Clone + 'static>(
         AttentionState::Failed => {
             status_icon(Icon::Error, "Unread failed agent update", BadgeTone::Danger)
         }
+        AttentionState::Limited => status_icon(
+            Icon::Alarm,
+            "An agent is stopped by a usage limit until it resets",
+            BadgeTone::Warning,
+        ),
         AttentionState::Working => crate::interaction::tooltip(
             crate::ui_controls::activity_spinner(f32::from(ROW_ICON_SIZE), design::warning_color),
             "An agent is actively working",
@@ -9783,8 +9825,8 @@ fn commit_description_style(
                 cosmic::iced::widget::text_editor::Status::Focused { .. }
             ),
         ),
-        placeholder: design::muted_color(theme),
-        value: theme.cosmic().palette.neutral_9.into(),
+        placeholder: design::field_placeholder_color(theme),
+        value: design::field_text_color(theme),
         selection: design::accent_color(theme),
     }
 }
@@ -12837,6 +12879,43 @@ pub(crate) mod tests {
             state.project_attention(project.id).state(),
             Some(AttentionState::Working)
         );
+        // A usage limit stops the working agent: it no longer counts as
+        // working, and a later activity report does not lift the limit.
+        state.set_card_limited(working, true);
+        let limited = state.worktree_attention(project.id, worktree);
+        assert_eq!(limited.state(), Some(AttentionState::Limited));
+        assert_eq!((limited.working, limited.limited), (0, 1));
+        assert_eq!(state.project_attention(project.id).limited, 1);
+        state.set_agent_activity(
+            working,
+            project.id,
+            worktree,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Idle,
+            },
+        );
+        assert_eq!(state.project_attention(project.id).limited, 1);
+        state.set_card_limited(working, false);
+        assert_eq!(state.project_attention(project.id).limited, 0);
+        state.set_card_limited(working, true);
+        state.clear_agent_activity(working);
+        assert_eq!(state.project_attention(project.id).limited, 0);
+        state.set_card_limited(working, true);
+        assert_eq!(
+            state.project_attention(project.id).limited,
+            0,
+            "a pane reporting no activity has no agent to stop"
+        );
+        state.set_agent_activity(
+            working,
+            project.id,
+            worktree,
+            Activity {
+                provider: Provider::Claude,
+                state: ActivityState::Working,
+            },
+        );
         state.restore_unread_updates(BTreeMap::from([(working, Some((project.id, worktree)))]));
         assert_eq!(state.worktree_attention(project.id, worktree).unread, 1);
         assert_eq!(state.project_attention(project.id).unread, 1);
@@ -12850,8 +12929,6 @@ pub(crate) mod tests {
             title: "Agent".into(),
             width_fraction: 0.5,
             existence: crate::model::Existence::Open,
-            exposure: crate::model::Exposure::Visible,
-            residency: crate::model::Residency::Hot,
             kind: crate::model::CardKind::Terminal(crate::model::TerminalSession {
                 id: crate::model::TerminalId::new(),
                 launch: launch.clone(),
@@ -19308,6 +19385,7 @@ pub(crate) mod tests {
                 working: 1,
                 waiting: 1,
                 failed: 0,
+                limited: 0,
             }
         );
         let plain = format!("Open project {}", folder.name);

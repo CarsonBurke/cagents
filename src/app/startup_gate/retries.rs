@@ -249,9 +249,8 @@ impl Cagents {
             let waiting = self.startup_pane_held(card) && !self.startup_gate.retained;
             return Some(Some((self.startup_gave_up_title(card), waiting)));
         }
-        let unopened = self
-            .card_state(card)
-            .is_some_and(|state| !matches!(state.residency, Residency::Hydrating { .. }));
+        let unopened = self.card_state(card).is_some()
+            && !matches!(self.residency(card), Residency::Hydrating { .. });
         (self.startup_gate.reported
             && unopened
             && matches!(self.saved_terminal_of(card), Some(_))

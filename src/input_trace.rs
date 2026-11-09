@@ -13,11 +13,46 @@
 use std::{cell::Cell, rc::Rc};
 
 use cosmic::iced::advanced::{
-    Clipboard, Layout, Shell, Widget, layout, overlay, renderer,
+    Clipboard, Layout, Shell, Widget, input_method, layout, overlay, renderer,
     widget::{Operation, Tree},
 };
 use cosmic::iced::{Event, Length, Point, Rectangle, Size, Vector, keyboard, mouse, time::Instant};
 use cosmic::{Element, Renderer, Theme};
+
+/// How long the pointer must stay over a resize handle, or a dragged pane
+/// over a drop position, before it is highlighted. Passing over one on the
+/// way somewhere else shows nothing; a press or a release still acts at
+/// once.
+pub const HIGHLIGHT_DWELL: std::time::Duration = std::time::Duration::from_millis(200);
+
+thread_local! {
+    /// Whether the pointer was over a resize handle at the motion before
+    /// the latest, and at the latest; see [`mark_on_resize_handle`].
+    static ON_RESIZE_HANDLE: Cell<(bool, bool)> = const { Cell::new((false, false)) };
+}
+
+/// Called by a resize handle that the latest pointer motion is over, so hover
+/// activation leaves the panes beside it alone while the pointer rests on it.
+pub fn mark_on_resize_handle() {
+    ON_RESIZE_HANDLE.with(|cell| {
+        let (previous, _) = cell.get();
+        cell.set((previous, true));
+    });
+}
+
+/// Whether the latest pointer motion was over a resize handle. Complete once
+/// every widget has seen that motion, such as when the next frame is drawn.
+#[must_use]
+pub fn on_resize_handle() -> bool {
+    ON_RESIZE_HANDLE.with(|cell| cell.get().1)
+}
+
+/// Whether the motion before the latest was over a resize handle, which a
+/// widget may read while the latest is still being delivered.
+#[must_use]
+pub fn was_on_resize_handle() -> bool {
+    ON_RESIZE_HANDLE.with(|cell| cell.get().0)
+}
 
 /// A shared record of the window's latest input, kept by [`observe`].
 ///
@@ -31,8 +66,12 @@ struct Sample {
     /// Window positions of the two latest pointer samples.
     previous: Option<Point>,
     current: Option<Point>,
-    /// When a key or a mouse button was last pressed.
+    /// When a key or a mouse button was last pressed, or an input method
+    /// last changed what it is composing.
     pressed: Option<Instant>,
+    /// Whether an input method holds uncommitted text, which moving keyboard
+    /// focus would take out from under the person writing it.
+    composing: bool,
 }
 
 impl InputTrace {
@@ -48,14 +87,26 @@ impl InputTrace {
                 }
                 sample.previous = sample.current;
                 sample.current = Some(*position);
+                ON_RESIZE_HANDLE.with(|cell| cell.set((cell.get().1, false)));
             }
             // Where the pointer comes back is no motion from where it left.
             Event::Mouse(mouse::Event::CursorLeft) => {
+                ON_RESIZE_HANDLE.with(|cell| cell.set((false, false)));
                 sample.previous = None;
                 sample.current = None;
             }
             Event::Mouse(mouse::Event::ButtonPressed(_))
             | Event::Keyboard(keyboard::Event::KeyPressed { .. }) => {
+                sample.pressed = Some(Instant::now());
+            }
+            // An input method may consume the keys it composes from, so its
+            // own events count as typing too.
+            Event::InputMethod(event) => {
+                sample.composing = match event {
+                    input_method::Event::Preedit(text, _) => !text.is_empty(),
+                    input_method::Event::Opened => sample.composing,
+                    input_method::Event::Commit(_) | input_method::Event::Closed => false,
+                };
                 sample.pressed = Some(Instant::now());
             }
             _ => return,
@@ -72,8 +123,14 @@ impl InputTrace {
         self.0.get().previous
     }
 
-    /// Whether a key or a mouse button was pressed anywhere in the window at
-    /// or after `instant`.
+    /// Whether an input method is composing text that it has not committed.
+    #[must_use]
+    pub fn composing(&self) -> bool {
+        self.0.get().composing
+    }
+
+    /// Whether a key or a mouse button was pressed, or an input method
+    /// composed, anywhere in the window at or after `instant`.
     #[must_use]
     pub fn pressed_since(&self, instant: Instant) -> bool {
         self.0
@@ -376,5 +433,38 @@ mod tests {
         )));
         assert!(trace.pressed_since(before));
         assert!(!trace.pressed_since(Instant::now() + std::time::Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn uncommitted_input_method_text_is_composing_until_committed() {
+        let trace = InputTrace::default();
+        let before = Instant::now();
+        trace.record(&Event::InputMethod(input_method::Event::Opened));
+        assert!(!trace.composing());
+        trace.record(&Event::InputMethod(input_method::Event::Preedit(
+            "にほ".into(),
+            None,
+        )));
+        assert!(trace.composing());
+        assert!(trace.pressed_since(before), "composing is typing");
+        trace.record(&Event::InputMethod(input_method::Event::Preedit(
+            String::new(),
+            None,
+        )));
+        assert!(!trace.composing());
+        trace.record(&Event::InputMethod(input_method::Event::Preedit(
+            "に".into(),
+            None,
+        )));
+        trace.record(&Event::InputMethod(input_method::Event::Commit(
+            "に".into(),
+        )));
+        assert!(!trace.composing());
+        trace.record(&Event::InputMethod(input_method::Event::Preedit(
+            "ほ".into(),
+            None,
+        )));
+        trace.record(&Event::InputMethod(input_method::Event::Closed));
+        assert!(!trace.composing());
     }
 }

@@ -145,6 +145,22 @@ impl Peer {
                     }
                     // Even a full UUID is resolved against this caller's list
                     // first. Empty is a valid result, not an invalid fixture.
+                    // The agent's standing is read next, in the same scope,
+                    // before the run's turn would clear a usage limit.
+                    let request = next(&mut peer);
+                    let scope = crate::agent_execution::directory::Scope::All;
+                    assert_operation(&request, &authority, &Operation::Sessions(scope.clone()));
+                    response(
+                        &mut peer,
+                        &request,
+                        ServerResponse::Agent(Reply::Sessions(
+                            crate::agent_execution::directory::Sessions {
+                                caller: None,
+                                scope,
+                                sessions: vec![],
+                            },
+                        )),
+                    );
                     let request = next(&mut peer);
                     assert_operation(&request, &authority, &Operation::Submit(original_submit()));
                     // Lose precisely the first Submit reply. Do not fabricate

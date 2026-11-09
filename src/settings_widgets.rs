@@ -404,12 +404,12 @@ mod tests {
     fn search_indexes_keys_values_captions_and_current_shortcuts() {
         let cases = [
             (
-                "Pane activation",
+                "Pane focus",
                 "focus_follows_mouse hover",
                 "focus_follows_mouse",
             ),
             ("Color theme", "dracula nord", "dracula"),
-            ("Pane activation", "focus_follows_mouse hover", "hover"),
+            ("Pane focus", "focus_follows_mouse hover", "hover"),
             (
                 "New chat",
                 "keyboard_shortcuts.new_native_thread Ctrl+T",

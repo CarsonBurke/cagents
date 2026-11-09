@@ -169,6 +169,10 @@ pub(crate) struct Resident {
     pub close: CloseObservation,
     pub idle: bool,
     pub failure: Option<String>,
+    /// When the latest turn finished, in Unix milliseconds. A helper that
+    /// predates it reports none.
+    #[serde(default)]
+    pub finished_at: Option<u64>,
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
     pub interrupt_subagents: Vec<String>,
@@ -446,6 +450,7 @@ impl RemoteActor {
             },
             idle: true,
             failure: None,
+            finished_at: None,
             confirmed_session: None,
             background_subagents: Vec::new(),
             interrupt_subagents: Vec::new(),
@@ -2609,6 +2614,7 @@ impl Server {
             completed,
             idle,
             failure,
+            finished_at: self.actor.finished_at(),
             confirmed_session,
             background_subagents,
             interrupt_subagents,

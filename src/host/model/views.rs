@@ -357,16 +357,44 @@ pub(super) fn read(db: &Connection, scope: &Scope) -> Result<View, String> {
 }
 
 pub(super) fn all(db: &Connection) -> Result<Vec<View>, String> {
-    let scopes = db
-        .prepare("SELECT scope FROM shared_views ORDER BY scope")
-        .map_err(|error| error.to_string())?
-        .query_map([], |row| row.get::<_, String>(0))
-        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+    collect(
+        db,
+        "SELECT scope, revision, panes, retired FROM shared_views ORDER BY scope",
+    )
+}
+
+/// The views holding at least one pane. Nearly every scope a long-lived store
+/// knows is an emptied worktree, so a search for a pane reads only these.
+pub(super) fn occupied(db: &Connection) -> Result<Vec<View>, String> {
+    collect(
+        db,
+        "SELECT scope, revision, panes, retired FROM shared_views
+         WHERE panes <> '[]' ORDER BY scope",
+    )
+}
+
+fn collect(db: &Connection, sql: &str) -> Result<Vec<View>, String> {
+    let mut statement = db.prepare_cached(sql).map_err(|error| error.to_string())?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, u64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
         .map_err(|error| error.to_string())?;
-    scopes
-        .into_iter()
-        .map(|id| read(db, &parse_scope(&id)?))
-        .collect()
+    rows.map(|row| {
+        let (scope, revision, panes, retired) = row.map_err(|error| error.to_string())?;
+        Ok(View {
+            scope: parse_scope(&scope)?,
+            revision,
+            panes: serde_json::from_str(&panes).map_err(|error| error.to_string())?,
+            retired: serde_json::from_str(&retired).map_err(|error| error.to_string())?,
+        })
+    })
+    .collect()
 }
 
 /// Read the pane still presenting this execution agent's resource without
@@ -725,7 +753,7 @@ fn resource_owner(
     db: &Connection,
     pane: &crate::workspace_model::views::Pane,
 ) -> Result<Option<crate::model::CardId>, String> {
-    Ok(all(db)?
+    Ok(occupied(db)?
         .iter()
         .flat_map(|view| &view.panes)
         .find(|other| {
@@ -1020,6 +1048,25 @@ mod tests {
             operation: Uuid::new_v4(),
             change,
         }
+    }
+    #[test]
+    fn view_listings_read_each_view_whole_and_occupied_skips_emptied_views() {
+        let (mut r, _, a, b) = setup();
+        let kept = pane();
+        let emptied = pane();
+        seed(&mut r, a, vec![kept.clone()]);
+        seed(&mut r, b, vec![emptied.clone()]);
+        let remove = edit(&mut r, b, Change::Remove { id: emptied.id });
+        r.apply(&remove).unwrap();
+        let every = all(&r.db).unwrap();
+        assert_eq!(every.len(), 2);
+        for view in &every {
+            assert_eq!(view, &read(&r.db, &view.scope).unwrap());
+        }
+        assert_eq!(
+            occupied(&r.db).unwrap(),
+            vec![read(&r.db, &Scope::Channel(a)).unwrap()]
+        );
     }
     #[test]
     fn migration_and_updates_keep_one_pane_per_hosted_resource() {

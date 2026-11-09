@@ -451,7 +451,6 @@ pub enum Action {
         Option<scroll::LogicalLocation>,
     ),
     CloseFind(Target),
-    FindFocused(Target, bool),
     Tick,
     ClearCopied(Target, Instant),
     DropHover(Target, bool),
@@ -2348,7 +2347,6 @@ const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
-    find_focused: bool,
     find_matches: Vec<String>,
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
@@ -2365,6 +2363,8 @@ pub(super) struct Runtime {
     connection: Connection,
     /// Set only by exact shared-view retirement, independently of transport failure.
     closed_elsewhere: bool,
+    /// The usage limit stopping the conversation, as the daemon judges it.
+    usage_limit: Option<crate::agent_execution::directory::UsageLimit>,
     /// The first message of a draft, while its conversation starts.
     queued: Option<Queued>,
     /// Messages held here for the next turn, oldest first.
@@ -3359,6 +3359,7 @@ impl Runtime {
             finished_stamp: None,
             connection,
             closed_elsewhere: false,
+            usage_limit: None,
             queued: None,
             followups: Vec::new(),
             next_followup: 0,
@@ -3375,7 +3376,6 @@ impl Runtime {
             fork_seen: None,
             files: None,
             find: None,
-            find_focused: false,
             find_matches: Vec::new(),
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
@@ -5275,6 +5275,19 @@ impl Runtime {
         }
     }
 
+    /// Whether a menu or picker of this card is open over the workspace.
+    /// Resting the pointer on another pane then leaves focus where it is,
+    /// rather than moving the keyboard away from the menu still showing.
+    pub(super) fn has_open_menu(&self) -> bool {
+        self.child_picker.is_some()
+            || self.model_picker.is_some()
+            || self.reasoning_picker
+            || self.permission_picker
+            || self.account_picker
+            || self.composer_actions
+            || self.branch_picker
+    }
+
     /// Whether this card should offer to start a new conversation beside the
     /// one it was asked to resume.
     ///
@@ -5987,6 +6000,30 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    /// Whether the focused chat has a menu or picker open; see
+    /// [`Runtime::has_open_menu`]. Only the focused pane counts: a menu is
+    /// opened from the pane that has focus, and one left flagged open in a
+    /// pane no longer shown, a hidden channel's for example, is not drawn
+    /// and must not hold the pointer's focus everywhere.
+    pub(super) fn chat_menu_open(&self) -> bool {
+        self.workspace
+            .focused()
+            .and_then(|card| self.cards.get(&card))
+            .is_some_and(
+                |runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.has_open_menu()),
+            )
+    }
+
+    /// Whether `card` is a chat whose message input, or the picker search
+    /// standing in for it, is in the widget tree: it has a runtime that is
+    /// neither starting, changing session nor waiting for admission.
+    pub(super) fn chat_input_drawn(&self, card: CardId) -> bool {
+        matches!(
+            self.cards.get(&card),
+            Some(CardRuntime::Chat(runtime)) if !runtime.awaiting_admission()
+        ) && !self.chat_ui.phases.contains_key(&card)
+    }
+
     /// Keyboard and palette commands use the same pickers as the composer.
     /// Respect the control's availability before capturing a selection gesture.
     pub(super) fn open_chat_control(
@@ -6143,29 +6180,6 @@ impl Cagents {
         Some(task.map(cosmic::Action::App))
     }
 
-    pub(super) fn chat_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
-        let card = self.workspace.focused()?;
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
-            return None;
-        };
-        if !runtime.find_focused {
-            return None;
-        }
-        let target = runtime.target;
-        let keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key),
-            modifiers,
-            ..
-        } = event
-        else {
-            return None;
-        };
-        match key {
-            keyboard::key::Named::Enter => Some(self.chat_find_next(target, !modifiers.shift())),
-            keyboard::key::Named::Escape => Some(self.handle_chat_ui(Action::CloseFind(target))),
-            _ => None,
-        }
-    }
     pub(super) fn open_chat_find(&mut self) -> Option<Task<Message>> {
         let card = self.workspace.focused()?;
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
@@ -7587,8 +7601,6 @@ impl Cagents {
                     }),
             ),
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Hot,
             kind: CardKind::Chat(session.clone()),
         };
         let (index, durable_index) = beside
@@ -7602,6 +7614,7 @@ impl Cagents {
         }
         durable.focused = Some(card_id);
         durable.cards.insert(durable_index, card.clone());
+        self.set_presence(card_id, Exposure::Visible, Residency::Hot);
         if let Some(title) = user_title {
             self.chrome_ui.user_titles.insert(card_id, title);
         }
@@ -7638,13 +7651,9 @@ impl Cagents {
         } else {
             Task::none()
         };
-        Task::batch([
-            skills,
-            self.apply_viewport(update, true, false),
-            iced::widget::operation::focus(card_control_id(card_id, "chat-composer"))
-                .map(cosmic::Action::App),
-            title,
-        ])
+        // The new pane's input takes the keyboard through the workspace's
+        // focus request, now if it is drawn or once it starts.
+        Task::batch([skills, self.apply_viewport(update, true, false), title])
     }
 
     /// Preserve only the exact explicit launch the failed pane was trying.
@@ -7707,9 +7716,7 @@ impl Cagents {
         // Nothing runs, so there is nothing for the lifecycle to hydrate or
         // hibernate: the card is whole as it stands.
         self.lifecycle.remove(card);
-        if let Some(state) = self.card_state_mut(card) {
-            state.residency = Residency::Hot;
-        }
+        self.set_residency(card, Residency::Hot);
         self.card_chrome.remove(&card);
         self.cards
             .insert(card, CardRuntime::Chat(Box::new(runtime)));
@@ -10654,10 +10661,6 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         // Reports that raced the attachment woke nothing.
                         let usage = self.take_chat_account_usage(target);
-                        let control = match self.cards.get(&target.card) {
-                            Some(CardRuntime::Chat(runtime)) => runtime.focus_control(),
-                            _ => "chat-composer",
-                        };
                         let submitted = automatic_submit
                             .and_then(|(revision, mode)| match self.cards.get(&target.card) {
                                 Some(CardRuntime::Chat(runtime))
@@ -10669,20 +10672,19 @@ impl Cagents {
                             })
                             .map(|mode| self.handle_chat_ui(Action::Submit(target, mode)))
                             .unwrap_or_else(Task::none);
-                        // An attachment that finishes behind another pane
-                        // leaves the keyboard with the one in use.
-                        let focus = if self.card_holds_keyboard(target.card) {
-                            iced::widget::operation::focus(card_control_id(target.card, control))
-                                .map(cosmic::Action::App)
-                        } else {
-                            Task::none()
-                        };
+                        // The focused pane's input takes the keyboard once it
+                        // is drawn, unless the person chose another control
+                        // while it attached. An attachment that finishes
+                        // behind another pane leaves the keyboard with the
+                        // one in use.
+                        if self.workspace.focused() == Some(target.card) {
+                            self.keyboard_owed = Some(target.card);
+                        }
                         return Task::batch([
                             submitted,
                             usage,
                             self.list_chat_models(target.card),
                             self.dispatch_queued(target),
-                            focus,
                         ]);
                     }
                     Err(failure)
@@ -11017,6 +11019,8 @@ impl Cagents {
                             provider: runtime.session.launch.provider,
                             state: handle.take_activity(),
                         };
+                        runtime.usage_limit = handle.limit();
+                        let limited = runtime.usage_limit.is_some();
                         let session = runtime.session.clone();
                         let snapshot = handle.snapshot();
                         // Pane names use the same bounded observation cache as
@@ -11028,6 +11032,7 @@ impl Cagents {
                             self.publish_observed_channel_name(target, name, source);
                         }
                         self.observe_agent_activity_for_card(target.card, Some(activity));
+                        self.sidebar_state.set_card_limited(target.card, limited);
                         self.commit_chat_session(target.card, session);
                         if let Some(title) = title
                             && self.apply_reported_title(target.card, title)
@@ -11064,6 +11069,14 @@ impl Cagents {
                         handle.take_observed();
                         let session = runtime.session.clone();
                         self.commit_chat_session(target.card, session);
+                        return Task::none();
+                    }
+                    // A hidden conversation learns of its limit this way too,
+                    // without reading its transcript.
+                    Wake::Limit => {
+                        runtime.usage_limit = handle.limit();
+                        let limited = runtime.usage_limit.is_some();
+                        self.sidebar_state.set_card_limited(target.card, limited);
                         return Task::none();
                     }
                     Wake::Activity => {
@@ -11842,7 +11855,16 @@ impl Cagents {
                 }
                 return self.chat_find_next(target, true);
             }
-            Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
+            // Pressing the Previous or Next button blurs the search field;
+            // the keyboard goes back to it, so Enter keeps stepping through
+            // matches instead of reaching the composer and sending the draft.
+            Action::FindNext(target, forward) => {
+                return Task::batch([
+                    self.chat_find_next(target, forward),
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-find"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::FindRetry(target) => return self.retry_find(target),
             Action::FindAvailable => {
                 let targets: Vec<_> = self
@@ -11887,7 +11909,6 @@ impl Cagents {
                     runtime.restore_find_disclosures();
                     runtime.find = None;
                     runtime.refresh_failure_previews();
-                    runtime.find_focused = false;
                     runtime.find_matches.clear();
                 }
                 return iced::widget::operation::focus(card_control_id(
@@ -11895,11 +11916,6 @@ impl Cagents {
                     "chat-composer",
                 ))
                 .map(cosmic::Action::App);
-            }
-            Action::FindFocused(target, focused) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_focused = focused;
-                }
             }
             Action::HistoryNewer(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -15501,6 +15517,58 @@ mod tests {
         snapshot.items.clear();
         assert!(observation.observe(&snapshot).is_none());
         assert!(observation.title.is_none());
+    }
+
+    #[test]
+    fn a_usage_limit_the_daemon_judges_reads_limited_until_it_lifts_even_unseen() {
+        use crate::agent_execution::directory::UsageLimit;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let target = chat_runtime(&app, card).target;
+        let handle = chat_runtime(&app, card).handle().unwrap().clone();
+        let failure = "You've hit your weekly limit · resets Nov 8, 8am (America/Vancouver)";
+        let mut snapshot = (*handle.snapshot()).clone();
+        snapshot.generation += 1;
+        snapshot.error = Some(failure.into());
+        handle.publish_snapshot_for_test(snapshot);
+        drop(app.handle_chat_ui(Action::Wake(target, Wake::Changed)));
+        // The provider's words alone do not make it limited: the daemon,
+        // which knows the account's readings, judges that.
+        assert_eq!(app.sidebar_state.card_attention(card).limited, 0);
+        assert_eq!(
+            chat_runtime(&app, card).conversation_status(false).1,
+            "Account limit reached"
+        );
+        let mut judge = |app: &mut Cagents, limit: Option<UsageLimit>| {
+            handle.judge_limit_for_test(limit);
+            // Without a transcript read, as a hidden conversation hears of it.
+            drop(app.handle_chat_ui(Action::Wake(target, Wake::Limit)));
+            app.sidebar_state.card_attention(card)
+        };
+        let limited = judge(
+            &mut app,
+            Some(UsageLimit {
+                summary: "Claude weekly limit reached".into(),
+                reset: Some("Nov 8, 8am (America/Vancouver)".into()),
+                resets_at: None,
+            }),
+        );
+        assert_eq!(
+            limited.state(),
+            Some(crate::sidebar::AttentionState::Limited)
+        );
+        assert_eq!(limited.working, 0);
+        assert_eq!(
+            chat_runtime(&app, card).conversation_status(false).1,
+            "Account limit reached · resets Nov 8, 8am (America/Vancouver)"
+        );
+        // Once the reset passes, the failure is still the last outcome, but
+        // nothing stops the conversation.
+        assert_eq!(judge(&mut app, None).limited, 0);
+        assert_eq!(
+            chat_runtime(&app, card).conversation_status(false).1,
+            "Account limit reached"
+        );
     }
 
     #[test]
@@ -20837,6 +20905,39 @@ mod tests {
         );
     }
 
+    /// Rebuilding the strip hides every surface before it lays the new one
+    /// out. A conversation on screen both before and after is shown again
+    /// rather than left blank.
+    #[test]
+    fn a_chat_on_screen_across_a_strip_rebuild_is_shown_again() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some(KNOWN_THREAD));
+        let handle = Arc::clone(chat_runtime(&app, card).handle().unwrap());
+        drop(app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::Resized(1_600.0),
+        }));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(handle.is_visible_for_test());
+        let directory = super::super::worktree_ui::card_directory(app.card_state(card).unwrap())
+            .expect("a conversation has a directory")
+            .to_path_buf();
+
+        // A strip that no longer matches its scope is rebuilt even when the
+        // same worktree is selected again.
+        app.workspace = Cagents::rebuild_workspace(&Default::default());
+        app.workspace.resize_viewport(1_600.0);
+        drop(app.select_worktree(directory, false));
+        assert_eq!(
+            app.workspace.visibility(card),
+            Some(VisibilityClass::Visible)
+        );
+        assert!(handle.is_visible_for_test(), "the chat is shown again");
+    }
+
     #[test]
     fn late_ready_attaches_behind_main_work_then_returns_to_visible_conversations() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
@@ -20946,7 +21047,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Offscreen)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Offscreen);
+        assert_eq!(app.exposure(card), Exposure::Offscreen);
 
         open_work_over_chat(&mut app);
         answer_start(&mut app, target, Ok(handle.clone()));
@@ -21006,6 +21107,16 @@ mod tests {
     /// issues is shown two controls the way a widget tree would show them:
     /// the one asked about, and another that holds the keyboard.
     fn task_focuses(task: Task<Message>, control: &widget::Id) -> (bool, bool) {
+        task_focuses_from(task, control, &widget::Id::new("the control in use"))
+    }
+
+    /// Whether `task` focuses `control` while `holder` has the keyboard, and
+    /// whether `holder` still has it after, following chained operations.
+    fn task_focuses_from(
+        task: Task<Message>,
+        control: &widget::Id,
+        elsewhere: &widget::Id,
+    ) -> (bool, bool) {
         use cosmic::iced::advanced::widget::operation::Focusable;
         use cosmic::iced::futures::StreamExt;
 
@@ -21024,7 +21135,6 @@ mod tests {
 
         let mut asked = Control(false);
         let mut holder = Control(true);
-        let elsewhere = widget::Id::new("the control in use");
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -21040,9 +21150,17 @@ mod tests {
                 tokio::time::timeout(Duration::from_millis(250), stream.next()).await
             {
                 if let cosmic::iced::runtime::Action::Widget(mut operation) = action {
-                    let bounds = cosmic::iced::Rectangle::default();
-                    operation.focusable(Some(control), bounds, &mut asked);
-                    operation.focusable(Some(&elsewhere), bounds, &mut holder);
+                    loop {
+                        let bounds = cosmic::iced::Rectangle::default();
+                        operation.focusable(Some(control), bounds, &mut asked);
+                        operation.focusable(Some(elsewhere), bounds, &mut holder);
+                        match operation.finish() {
+                            cosmic::iced::advanced::widget::operation::Outcome::Chain(next) => {
+                                operation = next;
+                            }
+                            _ => break,
+                        }
+                    }
                 }
             }
         });
@@ -21093,6 +21211,32 @@ mod tests {
         app.workspace.resize_viewport(1_600.0);
         assert_eq!(app.workspace.focused(), Some(card));
 
+        // While it starts, the pane's title holds the keyboard in the
+        // input's place, and hands it over once the input is drawn.
+        let handle = fixture_handle(&app, card, Some("focused"));
+        let task = app.update(Message::ChatUi(Action::Ready(
+            target,
+            Ready(Arc::new(Mutex::new(Some(Ok(handle))))),
+        )));
+        assert_eq!(
+            task_focuses_from(
+                task,
+                &card_control_id(card, "chat-composer"),
+                &app.card_header_widget_id(card),
+            ),
+            (true, false)
+        );
+    }
+
+    /// A control the person chose while the conversation was starting, such
+    /// as sidebar search, keeps the keyboard when it finishes attaching.
+    #[test]
+    fn an_attachment_in_the_focused_pane_leaves_a_chosen_control_alone() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let (card, target) = starting_chat(&mut app);
+        app.workspace.resize_viewport(1_600.0);
+        assert_eq!(app.workspace.focused(), Some(card));
+
         let handle = fixture_handle(&app, card, Some("focused"));
         let task = app.update(Message::ChatUi(Action::Ready(
             target,
@@ -21100,8 +21244,72 @@ mod tests {
         )));
         assert_eq!(
             task_focuses(task, &card_control_id(card, "chat-composer")),
-            (true, false)
+            (false, true)
         );
+    }
+
+    /// Pressing the find bar's Previous or Next button blurs its field; the
+    /// keyboard goes back to the field, not to the composer, where the next
+    /// Enter would send the draft. Coming back to the pane still lands in the
+    /// composer: an open find bar does not take over the pane's keyboard.
+    #[test]
+    fn stepping_through_find_matches_keeps_the_keyboard_in_the_search() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("find-keyboard"));
+        let target = chat_runtime(&app, card).target;
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "needle".into(),
+        ));
+        let find = card_control_id(card, "chat-find");
+        for forward in [true, false] {
+            let task = app.handle_chat_ui(Action::FindNext(target, forward));
+            assert_eq!(task_focuses(task, &find), (true, false));
+        }
+        assert_eq!(
+            app.card_keyboard_focus(card),
+            card_control_id(card, "chat-composer")
+        );
+    }
+
+    /// Resting the pointer on another pane leaves the keyboard with a chat
+    /// menu that is still open, and follows the pointer again once it closes.
+    #[test]
+    fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.focus_follows_mouse = true;
+        let first = live_chat(&mut app, Some("menu-first"));
+        let second = live_chat(&mut app, Some("menu-second"));
+        let update = app.workspace.resize_viewport(3_000.0);
+        let _ = app.apply_viewport(update, false, true);
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(second),
+        });
+        assert_eq!(app.workspace.focused(), Some(second));
+        let target = chat_runtime(&app, second).target;
+        app.chat_runtime_mut(target).unwrap().composer_actions = true;
+        assert!(app.chat_menu_open());
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(first),
+        });
+        assert_eq!(app.workspace.focused(), Some(second));
+        app.chat_runtime_mut(target).unwrap().composer_actions = false;
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(first),
+        });
+        assert_eq!(app.workspace.focused(), Some(first));
+        // A menu flagged open in a pane without focus is not on screen, and
+        // does not hold focus.
+        app.chat_runtime_mut(target).unwrap().composer_actions = true;
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(second),
+        });
+        assert_eq!(app.workspace.focused(), Some(second));
     }
 
     fn account_commit_reply(task: Task<Message>) -> Message {
@@ -21782,7 +21990,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
         app.set_workspace_surfaces_visible(false);
         preparation::retirement_barrier();
@@ -21809,7 +22017,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.visible.load(Ordering::Relaxed));
         preparation::drain_fixture(runtime);
@@ -21873,7 +22081,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         assert!(chat_runtime(&app, card).visible.load(Ordering::Relaxed));
         app.set_workspace_surfaces_visible(false);
         let runtime = chat_runtime(&app, card);
@@ -21886,7 +22094,7 @@ mod tests {
             app.workspace.visibility(card),
             Some(VisibilityClass::Visible)
         );
-        assert_eq!(app.card_state(card).unwrap().exposure, Exposure::Visible);
+        assert_eq!(app.exposure(card), Exposure::Visible);
         let runtime = app.chat_runtime_mut(target).unwrap();
         assert!(runtime.visible.load(Ordering::Relaxed));
         preparation::drain_fixture(runtime);
@@ -26937,7 +27145,7 @@ mod tests {
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let target = chat_runtime(&app, card).target;
         let source = chat_runtime(&app, card).session.clone();
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(card), Residency::Hot);
         app.lifecycle
             .register(card, Exposure::Offscreen, Residency::Hot, Instant::now());
         // The writer and cached projections can retain a durable snapshot.
@@ -26966,22 +27174,15 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let source = chat_runtime(&app, card).session.clone();
-        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.set_residency(card, Residency::Cold);
         app.lifecycle
             .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
         let retained = app.durable.clone();
         assert_eq!(app.install_chat_session(card, source.clone()), None);
-        assert!(!Arc::ptr_eq(&retained, &app.durable));
-        assert_eq!(
-            retained
-                .cards
-                .iter()
-                .find(|state| state.id == card)
-                .unwrap()
-                .residency,
-            Residency::Cold
-        );
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        // Residency is this run's presence: promoting it neither copies nor
+        // changes the workspace.
+        assert!(Arc::ptr_eq(&retained, &app.durable));
+        assert_eq!(*app.residency(card), Residency::Hot);
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
         assert!(app.lifecycle.state(card).is_none());
     }
@@ -27006,7 +27207,7 @@ mod tests {
             CardKind::Chat(original)
         );
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(changed));
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(card), Residency::Hot);
     }
 
     #[test]
@@ -27018,7 +27219,7 @@ mod tests {
         assert!(!session.is_unstarted());
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
-        app.card_state_mut(card).unwrap().residency = Residency::Cold;
+        app.set_residency(card, Residency::Cold);
         app.lifecycle
             .register(card, Exposure::Offscreen, Residency::Cold, Instant::now());
         let _ = app.open_chat(card, session.clone(), chat::Intent::Restore);
@@ -27041,7 +27242,7 @@ mod tests {
         let runtime = chat_runtime(&app, card);
         assert!(runtime.snapshot.busy);
         assert_eq!(runtime.session, session);
-        assert_eq!(app.card_state(card).unwrap().residency, Residency::Hot);
+        assert_eq!(*app.residency(card), Residency::Hot);
         assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(session));
         assert!(!app.chat_start_pending(card));
     }
@@ -31888,6 +32089,7 @@ mod tests {
             Wake::Observed,
             Wake::Activity,
             Wake::AccountUsage,
+            Wake::Limit,
             Wake::Disconnected("old connection retired".into()),
         ] {
             late_callback(wake);

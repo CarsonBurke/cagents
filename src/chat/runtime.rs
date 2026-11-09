@@ -1317,6 +1317,16 @@ impl LocalHandle {
     pub fn is_completed(&self) -> bool {
         self.0.completed.load(Ordering::Acquire)
     }
+    /// When the latest turn and its delegated work finished, in daemon Unix
+    /// milliseconds; absent while a turn runs or before the first one ends.
+    /// Like [`Self::failure`], this reads no transcript.
+    pub fn finished_at(&self) -> Option<u64> {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .finished_at
+    }
     /// The recorded failure, without rebuilding the transcript window. Restore polls
     /// this; it must never pay for a multi-megabyte snapshot.
     pub fn failure(&self) -> Option<String> {
@@ -1365,6 +1375,17 @@ impl LocalHandle {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .activity()
+    }
+
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children: the states in which it takes no
+    /// prompt.
+    pub(crate) fn turn_accepted(&self) -> bool {
+        self.0
+            .state
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .turn_accepted()
     }
 
     /// Update preflights need activity without loading the transcript window.
@@ -4490,6 +4511,10 @@ mod tests {
         );
         assert_eq!(state.activity(), ActivityState::Waiting);
         assert!(state.is_working());
+        assert!(
+            !state.turn_accepted(),
+            "children at work leave a refused parent's own turn unaccepted"
+        );
         let error = state.error.clone();
         apply(
             &mut state,
