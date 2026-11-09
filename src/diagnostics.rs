@@ -23,6 +23,8 @@ const GENERATIONS: usize = 5;
 const FILE_BYTES: u64 = 2 * 1024 * 1024;
 const RECORD_BYTES: usize = 1024;
 const RECENT_RECORDS: usize = 256;
+/// How many distinct storage refusals the human report lists per product.
+const REPORTED_REFUSALS: usize = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -69,7 +71,102 @@ pub enum Failure {
     Unknown,
 }
 
+/// What a write storage refused by construction would have saved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RefusedWrite {
+    /// The window's layout and panes.
+    Workspace,
+    /// The latest changes to one open pane.
+    Pane,
+    /// The fresh identity of a relaunched terminal.
+    RelaunchedTerminal,
+    /// A new conversation started in a chat pane.
+    NewConversation,
+    Project,
+    Worktree,
+    /// A reviewed repair of which pane owns a terminal.
+    TerminalRepair,
+    /// The read-only copy of a chat kept when its pane moves on.
+    RetainedChatCopy,
+    /// A chat pane's move to a recovered or upgraded conversation.
+    ConversationRecovery,
+}
+
+impl RefusedWrite {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Workspace => "the window's layout and panes",
+            Self::Pane => "the latest changes to pane",
+            Self::RelaunchedTerminal => "the relaunched terminal in pane",
+            Self::NewConversation => "the new conversation in pane",
+            Self::Project => "project",
+            Self::Worktree => "worktree",
+            Self::TerminalRepair => "the terminal ownership repair of pane",
+            Self::RetainedChatCopy => "the retained chat copy",
+            Self::ConversationRecovery => "the conversation recovery in pane",
+        }
+    }
+}
+
+/// The rule storage refused a write for, such as `chat card … changed
+/// conversation identity (identity)`.
+///
+/// It is text written into cagents or its database schema - never the write's
+/// content - and is bounded: longer text is cut at `CHECK_BYTES`, and a record
+/// read back with more, or with control characters, is invalid.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct Check(String);
+
+const CHECK_BYTES: usize = 160;
+
+impl Check {
+    /// Only storage names a rule; it makes one from a
+    /// [`crate::persistence::RefusedCheck`], which never holds content.
+    pub(crate) fn new(rule: &str) -> Self {
+        let mut text = rule.replace(char::is_control, " ");
+        if text.len() > CHECK_BYTES {
+            let mut end = CHECK_BYTES - '…'.len_utf8();
+            while !text.is_char_boundary(end) {
+                end -= 1;
+            }
+            text.truncate(end);
+            text.push('…');
+        }
+        Self(text)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl TryFrom<String> for Check {
+    type Error = &'static str;
+
+    fn try_from(text: String) -> Result<Self, Self::Error> {
+        if text.len() > CHECK_BYTES || text.contains(char::is_control) {
+            Err("invalid refusal check")
+        } else {
+            Ok(Self(text))
+        }
+    }
+}
+
+impl std::fmt::Display for Check {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl From<Check> for String {
+    fn from(check: Check) -> Self {
+        check.0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Event {
     Startup,
@@ -96,6 +193,15 @@ pub enum Event {
     },
     SettingsFailed {
         category: Failure,
+    },
+    /// Storage refused a write by construction and set it aside. Recorded
+    /// when it first refuses the subject, and again only when it refuses a
+    /// newer write of it for a different reason.
+    StorageRefused {
+        write: RefusedWrite,
+        /// The pane, project or worktree, when the write concerns one.
+        id: Option<Uuid>,
+        check: Check,
     },
     ProtocolMismatch,
     EventsSkipped {
@@ -547,7 +653,7 @@ impl ProductReport {
             let mut settings_failed = false;
             let mut unrecovered_failure = false;
             for record in records.iter().filter(|record| record.run == last.run) {
-                match record.event {
+                match &record.event {
                     Event::Startup => {
                         started = true;
                         observed.lifecycle = Lifecycle::Started;
@@ -566,7 +672,7 @@ impl ProductReport {
                     }
                     Event::Exit { success } => {
                         observed.lifecycle = Lifecycle::Exited;
-                        observed.clean_shutdown = Some(success);
+                        observed.clean_shutdown = Some(*success);
                     }
                     Event::PersistenceStarted => {
                         writer_seen = true;
@@ -583,16 +689,16 @@ impl ProductReport {
                     }
                     event @ Event::FinalFlush { complete, .. } => {
                         writer_seen = true;
-                        observed.persistence = if complete {
+                        observed.persistence = if *complete {
                             Persistence::Complete
                         } else {
                             Persistence::Failed
                         };
-                        observed.final_flush = Some(event);
+                        observed.final_flush = Some(event.clone());
                     }
                     Event::SettingsFailed { .. } => settings_failed = true,
                     Event::EventsSkipped { count } => {
-                        observed.skipped_events = observed.skipped_events.saturating_add(count)
+                        observed.skipped_events = observed.skipped_events.saturating_add(*count)
                     }
                     _ => {}
                 }
@@ -719,7 +825,42 @@ impl Report {
             }) {
                 lines.push(format!(
                     "{}: latest retained failure {}, run {}, {} (historical record; may have recovered)",
-                    product.product.name(), relative_time(failure.at_unix_ms, now), failure.run, event_label(failure.event)
+                    product.product.name(), relative_time(failure.at_unix_ms, now), failure.run, event_label(&failure.event)
+                ));
+            }
+            // The final flush of a window that ends with refused writes counts
+            // them, which says nothing about why; each refusal said why.
+            let mut refusals: Vec<(&Record, usize)> = Vec::new();
+            for record in product.records.iter().rev() {
+                if !matches!(record.event, Event::StorageRefused { .. }) {
+                    continue;
+                }
+                match refusals
+                    .iter_mut()
+                    .find(|(newest, _)| newest.event == record.event)
+                {
+                    Some((_, count)) => *count += 1,
+                    None => refusals.push((record, 1)),
+                }
+            }
+            for (record, count) in refusals.iter().take(REPORTED_REFUSALS) {
+                lines.push(format!(
+                    "{}: {}, {}, run {}{} (historical record; may have been saved since)",
+                    product.product.name(),
+                    event_label(&record.event),
+                    relative_time(record.at_unix_ms, now),
+                    record.run,
+                    match count {
+                        1 => String::new(),
+                        count => format!("; recorded {count} times"),
+                    }
+                ));
+            }
+            if refusals.len() > REPORTED_REFUSALS {
+                lines.push(format!(
+                    "{}: {} earlier storage refusals not listed",
+                    product.product.name(),
+                    refusals.len() - REPORTED_REFUSALS
                 ));
             }
         }
@@ -810,8 +951,8 @@ fn failure_label(value: Failure) -> &'static str {
     }
 }
 
-fn event_label(value: Event) -> String {
-    match value {
+fn event_label(value: &Event) -> String {
+    match *value {
         Event::Startup => "startup".into(),
         Event::Ready => "ready".into(),
         Event::StartupFailed => "startup failed".into(),
@@ -855,6 +996,14 @@ fn event_label(value: Event) -> String {
         Event::SettingsFailed { category } => {
             format!("settings failed: {}", failure_label(category))
         }
+        Event::StorageRefused {
+            write,
+            id,
+            ref check,
+        } => match id {
+            Some(id) => format!("storage refused {} {id}: {}", write.label(), check.as_str()),
+            None => format!("storage refused {}: {}", write.label(), check.as_str()),
+        },
         Event::ProtocolMismatch => "protocol mismatch".into(),
         Event::EventsSkipped { count } => format!("{count} skipped events"),
     }
@@ -1413,6 +1562,124 @@ mod tests {
             }
             assert_eq!(std::fs::read(current).unwrap(), before);
         }
+    }
+
+    #[test]
+    fn a_storage_refusal_names_its_subject_and_rule_in_the_report() {
+        let (_root, path) = fixture();
+        let pane = Uuid::from_u128(0x5e71);
+        let project = Uuid::from_u128(0x9c1b);
+        let refused = |write, id, check| Event::StorageRefused {
+            write,
+            id,
+            check: Check::new(check),
+        };
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        recorder.append(Event::Startup).unwrap();
+        recorder.append(Event::PersistenceStarted).unwrap();
+        let identity = "chat card … changed conversation identity (identity)";
+        recorder
+            .append(refused(RefusedWrite::Pane, Some(pane), identity))
+            .unwrap();
+        recorder
+            .append(refused(
+                RefusedWrite::Project,
+                Some(project),
+                "tombstoned project … cannot be resurrected",
+            ))
+            .unwrap();
+        recorder
+            .append(refused(
+                RefusedWrite::Workspace,
+                None,
+                "invalid card ordinal",
+            ))
+            .unwrap();
+        // A later run refuses the same pane for the same rule again.
+        drop(recorder);
+        let mut later = Recorder::open(&path, Product::Ui).unwrap();
+        later
+            .append(refused(RefusedWrite::Pane, Some(pane), identity))
+            .unwrap();
+        later
+            .append(Event::FinalFlush {
+                complete: false,
+                unsaved: 0,
+                refused: 1,
+                category: Some(Failure::InvalidData),
+            })
+            .unwrap();
+
+        let human = inspect_at(path).unwrap().human_at(u64::MAX);
+        assert!(
+            human.contains("final flush incomplete: 0 unsaved, 1 refused; invalid data"),
+            "{human}"
+        );
+        let pane_line =
+            format!("cagents-ui: storage refused the latest changes to pane {pane}: {identity}, ");
+        let lines = human
+            .lines()
+            .filter(|line| line.contains("storage refused"))
+            .collect::<Vec<_>>();
+        assert_eq!(lines.len(), 3, "{human}");
+        assert!(lines[0].starts_with(&pane_line), "{human}");
+        assert!(lines[0].contains("; recorded 2 times"), "{human}");
+        assert!(
+            lines[1].starts_with(
+                "cagents-ui: storage refused the window's layout and panes: invalid card ordinal, "
+            ),
+            "{human}"
+        );
+        assert!(
+            lines[2].starts_with(&format!(
+                "cagents-ui: storage refused project {project}: tombstoned project … cannot be resurrected, "
+            )),
+            "{human}"
+        );
+    }
+
+    #[test]
+    fn a_refusal_check_is_bounded_and_fits_a_record() {
+        let long = format!("{}\u{1b}[31m{}", "é".repeat(100), "x".repeat(400));
+        let check = Check::new(&long);
+        assert!(check.as_str().len() <= CHECK_BYTES);
+        assert!(check.as_str().ends_with('…'));
+        assert!(!check.as_str().contains(char::is_control));
+
+        // JSON escapes a quote to two bytes, so a check of nothing else is
+        // the longest one a record can hold.
+        let quotes = Check::new(&"\"".repeat(CHECK_BYTES));
+        assert_eq!(quotes.as_str().len(), CHECK_BYTES);
+
+        let (_root, path) = fixture();
+        let mut recorder = Recorder::open(&path, Product::Ui).unwrap();
+        for check in [&quotes, &check] {
+            recorder
+                .append(Event::StorageRefused {
+                    write: RefusedWrite::RelaunchedTerminal,
+                    id: Some(Uuid::from_u128(u128::MAX)),
+                    check: check.clone(),
+                })
+                .unwrap();
+        }
+        let report = inspect_at(path.clone()).unwrap();
+        assert!(report.products[0].readable);
+        let checks = report.products[0]
+            .records
+            .iter()
+            .filter_map(|record| match &record.event {
+                Event::StorageRefused { check, .. } => Some(check),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(checks, [&quotes, &check]);
+
+        // A record that holds more than a check can is not evidence.
+        let file = path.join(Product::Ui.filename(0));
+        let mut line = std::fs::read_to_string(&file).unwrap();
+        line = line.replace(check.as_str(), &"x".repeat(CHECK_BYTES + 1));
+        std::fs::write(&file, line).unwrap();
+        assert!(!inspect_at(path).unwrap().products[0].readable);
     }
 }
 
