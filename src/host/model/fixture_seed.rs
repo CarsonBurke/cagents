@@ -10,7 +10,7 @@ use std::{path::Path, time::Instant};
 use crate::{
     fixture_workspace::{
         Plan,
-        destination::{Destination, Directories, Part},
+        destination::{Directories, Instance, Part},
     },
     model::{CardId, ChannelTitleSource, ProjectKind},
     workspace_model::{
@@ -44,6 +44,7 @@ pub(crate) struct Seeded {
 /// a seed never merges into real state.
 pub(crate) fn seed(plan: &Path) -> Result<Seeded, String> {
     let plan = Plan::load(plan)?;
+    let instance = Instance::admit(&plan, Directories::current()?)?;
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
     let _lease =
         crate::daemon::HostLease::acquire_for_seeding(&paths).map_err(|error| match error {
@@ -55,7 +56,7 @@ pub(crate) fn seed(plan: &Path) -> Result<Seeded, String> {
             ),
             error => error.to_string(),
         })?;
-    let destination = Destination::claim(&plan, Part::Daemon, Directories::current()?)?;
+    let destination = instance.claim(&plan, Part::Daemon)?;
     let path = destination.store();
     let mut seeded = destination.write(|staging| seed_at(&plan, staging))?;
     seeded.path = path;
@@ -285,16 +286,17 @@ mod tests {
         let plan = test_support::small(directory.path());
         // Through the destination a seed claims, which renames the closed
         // store into place.
-        let destination = Destination::claim(
+        let destination = Instance::admit(
             &plan,
-            Part::Daemon,
             Directories {
                 data: plan.root.join("data"),
                 config: plan.root.join("config"),
                 cache: plan.root.join("cache"),
+                runtime: Some(plan.root.join("runtime")),
                 instance: None,
             },
         )
+        .and_then(|instance| instance.claim(&plan, Part::Daemon))
         .unwrap();
         let path = destination.store();
         let seeded = destination

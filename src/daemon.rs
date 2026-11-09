@@ -418,9 +418,15 @@ impl HostLease {
     /// the stores, so no daemon can start against them halfway. Unlike
     /// maintenance, the instance may never have run: the runtime directory and
     /// lock file are created as a starting daemon creates them.
-    #[cfg(all(feature = "host", any(debug_assertions, feature = "development")))]
+    ///
+    /// A window seeding the instance holds it too, so no daemon starts while
+    /// the window writes.
+    #[cfg(any(debug_assertions, feature = "development"))]
     pub(crate) fn acquire_for_seeding(paths: &RuntimePaths) -> Result<Self, PlatformError> {
+        #[cfg(feature = "host")]
         prepare_runtime_directory(&paths.directory)?;
+        #[cfg(not(feature = "host"))]
+        crate::secure_file::prepare_private_directory(&paths.directory)?;
         let lock = OpenOptions::new()
             .create(true)
             .read(true)

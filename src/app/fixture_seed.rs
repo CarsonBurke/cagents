@@ -14,7 +14,7 @@ use std::{
 use crate::{
     fixture_workspace::{
         Plan,
-        destination::{Destination, Directories, Part},
+        destination::{Destination, Directories, Instance, Part},
     },
     model::{
         Existence, ProjectChannel, ProjectKind, ProjectState, Tombstone, WorkspaceDestination,
@@ -50,19 +50,23 @@ pub(crate) fn seed(
     identity: Option<uuid::Uuid>,
 ) -> Result<SeededWindow, String> {
     let plan = Plan::load(plan)?;
+    let instance = Instance::admit(&plan, Directories::current()?)?;
     let _lease = crate::instance::WindowLease::acquire(false, Some(slot)).map_err(|error| {
         format!(
             "Cannot take the {slot} window's lease ({error}). Close that cagents window, or stop the \
              native-evidence session, before seeding."
         )
     })?;
-    refuse_running_daemon()?;
-    let destination =
-        Destination::claim(&plan, Part::Window(slot.into()), Directories::current()?)?;
+    let _daemon = hold_daemon_lease()?;
+    let destination = instance.claim(&plan, Part::Window(slot.into()))?;
     let path = destination.store();
     let boot = crate::session::current_boot_id().map_err(|error| error.to_string())?;
-    copy_avatars(&plan, destination.cache())?;
-    let mut seeded = seed_into(destination, &plan, slot, identity, boot)?;
+    let avatars = copy_avatars(&plan, destination.cache())?;
+    let mut seeded = seed_into(destination, &plan, slot, identity, boot).inspect_err(|_| {
+        for avatar in &avatars {
+            let _ = std::fs::remove_file(avatar);
+        }
+    })?;
     seeded.path = path;
     Ok(seeded)
 }
@@ -85,19 +89,19 @@ fn seed_into(
 }
 
 /// A running daemon serves windows from the store a seed would sit beside.
-fn refuse_running_daemon() -> Result<(), String> {
+/// Holds the instance's daemon lease while the window seeds, so no daemon
+/// starts against the instance halfway.
+fn hold_daemon_lease() -> Result<crate::daemon::HostLease, String> {
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
-    let running = crate::instance::private_lock_is_held(&paths.lock)
-        .map_err(|error| format!("Cannot tell whether this instance's daemon runs: {error}"))?;
-    if running {
-        return Err(format!(
+    crate::daemon::HostLease::acquire_for_seeding(&paths).map_err(|error| match error {
+        crate::daemon::PlatformError::AlreadyRunning { path } => format!(
             "A cagents daemon is running for this instance ({}). Stop it before seeding: \
              `scripts/run-development --stop-instance NAME` for an instance, or stop the \
              native-evidence session.",
-            paths.socket.display()
-        ));
-    }
-    Ok(())
+            path.display()
+        ),
+        error => error.to_string(),
+    })
 }
 
 /// Writes the window `slot` describes into `store`.
@@ -293,24 +297,36 @@ pub(crate) fn seed_store(
 
 /// Puts each project's avatar where the app caches GitHub avatars, fresh, so
 /// the sidebar draws it without a download.
-fn copy_avatars(plan: &Plan, cache: &Path) -> Result<(), String> {
+/// Caches each project's avatar as the app caches one it fetched, and
+/// returns the files it created. [`Plan::load`] checked each owner is a
+/// login, not a path.
+fn copy_avatars(plan: &Plan, cache: &Path) -> Result<Vec<std::path::PathBuf>, String> {
     let cache = cache.join("github-avatars");
+    let mut created = Vec::new();
     for project in &plan.projects {
         let Some(avatar) = &project.avatar else {
             continue;
         };
-        std::fs::create_dir_all(&cache).map_err(|error| error.to_string())?;
         let source = plan
             .root
             .join("avatars")
             .join(format!("{}.png", avatar.owner));
-        std::fs::copy(
-            &source,
-            cache.join(format!("github.com-{}.image", avatar.owner)),
-        )
-        .map_err(|error| format!("Cannot cache the avatar {}: {error}", source.display()))?;
+        let target = cache.join(format!("github.com-{}.image", avatar.owner));
+        let fresh = !target.exists();
+        let copied = std::fs::create_dir_all(&cache)
+            .and_then(|()| std::fs::copy(&source, &target))
+            .map_err(|error| format!("Cannot cache the avatar {}: {error}", source.display()));
+        if let Err(error) = copied {
+            for file in &created {
+                let _ = std::fs::remove_file(file);
+            }
+            return Err(error);
+        }
+        if fresh {
+            created.push(target);
+        }
     }
-    Ok(())
+    Ok(created)
 }
 
 #[cfg(test)]
@@ -330,15 +346,14 @@ mod tests {
             data: plan.root.join("data"),
             config: plan.root.join("config"),
             cache: plan.root.join("cache"),
+            runtime: Some(plan.root.join("runtime")),
             instance: None,
         };
+        let mut stores = Vec::new();
         for window in &plan.windows {
-            let destination = Destination::claim(
-                &plan,
-                Part::Window(window.slot.clone()),
-                directories.clone(),
-            )
-            .unwrap();
+            let destination = Instance::admit(&plan, directories.clone())
+                .and_then(|instance| instance.claim(&plan, Part::Window(window.slot.clone())))
+                .unwrap();
             let path = destination.store();
             let seeded = seed_into(
                 destination,
@@ -349,7 +364,12 @@ mod tests {
             )
             .unwrap();
             assert_eq!(seeded.cards, window.cards.len());
-            let store = StateStore::open(&path, BootId::new("next-boot")).unwrap();
+            stores.push(path);
+        }
+        // Opened only once every window is seeded: an opened store is a used
+        // one, which the next seed would refuse.
+        for (window, path) in plan.windows.iter().zip(&stores) {
+            let store = StateStore::open(path, BootId::new("next-boot")).unwrap();
             assert_eq!(store.list_projects().unwrap().len(), plan.projects.len());
             let worktrees: usize = plan.projects.iter().map(|p| p.worktrees.len()).sum();
             assert_eq!(store.list_worktrees().unwrap().len(), worktrees);
