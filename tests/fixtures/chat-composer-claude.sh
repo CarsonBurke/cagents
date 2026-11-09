@@ -367,12 +367,16 @@ busy=false
 fast=off
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
-if [ -n "$launch_model" ]; then model=$launch_model; fi
 # Optional model list: fixture-models.json holds an initialize response's
 # models, such as fixtures/accounts/claude-initialize-models.json, which
-# Claude Code 2.1.296 listed. It replaces the default list, and each turn's
-# init names the full ID the chosen model resolves to, as Claude Code's does.
+# Claude Code 2.1.296 listed. It replaces the default list, a launch without
+# --model starts on its `default` entry as Claude Code's does, and each turn's
+# init names the full ID the chosen model resolves to.
 models_file=$config/fixture-models.json
+if [ -f "$models_file" ] && jq -e 'any(.models[]; .value == "default")' "$models_file" >/dev/null; then
+    model=default
+fi
+if [ -n "$launch_model" ]; then model=$launch_model; fi
 resolved_model() {
     if [ -f "$models_file" ]; then
         jq -r --arg model "$model" \
