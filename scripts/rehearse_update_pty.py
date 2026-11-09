@@ -54,15 +54,18 @@ def main():
                 pending = pending[match.end():]
             pending = pending[-8192:]
     finally:
-        os.close(fd)
         if timed_out:
             for _ in range(30):
                 child, status = os.waitpid(pid, os.WNOHANG)
                 if child:
-                    return 124
+                    break
                 time.sleep(.1)
-            os.killpg(pid, signal.SIGKILL)
-        _, status = os.waitpid(pid, 0)
+            else:
+                os.killpg(pid, signal.SIGKILL)
+                _, status = os.waitpid(pid, 0)
+        else:
+            _, status = os.waitpid(pid, 0)
+        os.close(fd)
     return 124 if timed_out else os.waitstatus_to_exitcode(status)
 
 

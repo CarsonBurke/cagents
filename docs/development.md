@@ -1676,8 +1676,10 @@ Published releases still come from `scripts/build-release-linux`; see
 `scripts/rehearse-update` runs installed archives in a disposable user environment.
 It measures what an update does to two windows, their saved panes, channels,
 agents, chats, terminals and a long-lived terminal child. It never builds or
-changes product code. Use a fresh, absent root outside a checkout, at most 40
-bytes long, such as `/var/tmp/cr/u1`.
+changes product code. Use a fresh, absent root outside a checkout, under
+`/var/tmp`, `/tmp` or `/dev/shm`, at most 40 bytes long, such as `/var/tmp/cr/u1`.
+`init` records its absolute path in `.rehearse-update`; `cleanup` requires that
+marker to match the root before removing it.
 
 Run from a genuine user shell. A hosted agent uses plain `ssh fw16`; never
 remove or forward `CAGENTS_AGENT_AUTHORITY`, `CAGENTS_AGENT_TOKEN` or
@@ -1706,7 +1708,8 @@ both windows, stages NEW, and invokes the staged CLI's `daemon upgrade` on a
 controlling pseudo-terminal. `--answer` responds to each observed confirmation;
 `--yes` instead passes the updater's approval flag. Extra upgrade flags use
 `--upgrade-arg=--interrupt` or `--upgrade-arg=--accept-unreopenable`. The harness
-does not add either policy automatically. Refusals are measured outcomes.
+does not add either policy automatically. Refusals are measured outcomes: even
+a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
 Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch
 that build with its matched `cagents` and `cagentsd`, in the same private runtime.
@@ -1737,10 +1740,21 @@ without an exact resume ID on builds that support that protocol.
 The root owns HOME, XDG directories, XDG_RUNTIME_DIR, CLAUDE_CONFIG_DIR and
 CODEX_HOME. Fakes precede every real provider on PATH. This is environment and
 fixture isolation, not an OS network sandbox. The installed daemon and editor
-service use that private namespace. The desktop holds
+service use that private namespace. Terminals and holders deliberately register
+transient scopes with the real systemd user manager for update fidelity, just
+as the development runner does: `src/daemon/process_scope.rs` and
+`src/upgrade.rs` connect to the hard-coded `/run/user/UID/systemd/private`.
+Before killing private processes, `stop` attributes their cgroup scope names
+using their private HOME or XDG_RUNTIME_DIR. It then checks the real user
+manager's running scopes and fails if any attributed scope survives. It never
+stops a unit it did not attribute to this root.
+
+The desktop holds
 `/var/tmp/cagents-fw16-native.lock` (override with
 `CAGENTS_EVIDENCE_NATIVE_LOCK`), shared with native evidence work. `run` stops
 its desktop and all private processes on completion; keep manual sessions short.
+Do not run the harness inside `native-evidence`: both acquire the same native
+lock, so the inner invocation would wait on its caller.
 
 `report.txt` contains step durations, the complete update transcript, prompts,
 refusals, comparison changes and seed verification. `records/before/` and

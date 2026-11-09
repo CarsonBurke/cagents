@@ -272,8 +272,8 @@ class Rehearsal:
         if self.root.exists():
             raise RuntimeError('run requires a fresh, absent root')
         failure = None
-        self.call('init')
         try:
+            self.call('init')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
             self.call('desktop','start','--limit','900', timeout=1900)
             self.call('launch','main')
@@ -348,6 +348,7 @@ class Rehearsal:
                             run = data.get('run') or {}
                             report.append('status: '+json.dumps({'state':run.get('state'),'result':run.get('result'),'error':details.get('error')},sort_keys=True))
                 report += evidence['errors']
+            self.root.mkdir(parents=True, exist_ok=True)
             (self.root/'report.txt').write_text('\n'.join(report)+'\n')
             (self.root/'steps.json').write_text(json.dumps(self.steps,indent=2)+'\n')
             print(f'Report: {self.root}/report.txt')

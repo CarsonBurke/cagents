@@ -2,6 +2,7 @@
 # Rehearse an installed update end to end in a private user: its own HOME, XDG
 # directories, runtime directory, fake providers and headless desktop. Nothing
 # here reaches the real installation, daemon, provider accounts or desktop.
+# Transient scopes deliberately use the real systemd user manager; stop checks them.
 # See "Rehearsing an update" in docs/development.md.
 set -euo pipefail
 {
@@ -62,6 +63,22 @@ die() {
     exit "${2:-1}"
 }
 
+# Help is read-only and remains available to hosted agents.
+case ${1:-} in -h | --help) usage; exit 0 ;; esac
+if [ "${1:-}" = --root ]; then
+    case ${3:-} in
+        -h | --help) usage; exit 0 ;;
+        run | scenario)
+            for argument in "${@:4}"; do
+                case $argument in
+                    -h | --help)
+                        /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$2" "$self" run --help
+                        exit 0 ;;
+                esac
+            done ;;
+    esac
+fi
+
 # A hosted agent's authority must never reach, or be stripped for, this user.
 for name in CAGENTS_AGENT_AUTHORITY CAGENTS_AGENT_TOKEN CAGENTS_SESSION_TOKEN; do
     if [ "${!name+x}" ]; then
@@ -76,7 +93,8 @@ shift 2
 [[ $root =~ ^/[A-Za-z0-9._/-]+$ ]] || die "root has unsupported characters: $root" 2
 [ "${#root}" -le 40 ] || die "root is over 40 bytes, too long for its sockets: $root" 2
 
-case $root in / | /home | /var | /var/tmp | /tmp | /var/tmp/cr) die 'root must be a dedicated child directory' 2 ;; esac
+case $root in /var/tmp/* | /tmp/* | /dev/shm/*) ;; *) die 'root must be under /var/tmp, /tmp or /dev/shm' 2 ;; esac
+case $root in /var/tmp/cr) die 'root must be a dedicated child directory' 2 ;; esac
 [ "$root" != "$real_home" ] || die 'root must not be the real HOME' 2
 [ ! -L "$root" ] || die 'root must not be a symlink' 2
 
@@ -115,12 +133,17 @@ user_processes() {
 }
 
 require_init() {
-    [ -e "$root/.rehearse-update" ] || die "not initialized; run: --root $root init"
+    [ -f "$root/.rehearse-update" ] && [ ! -L "$root/.rehearse-update" ] &&
+        [ "$(cat -- "$root/.rehearse-update")" = "$root" ] ||
+        die "not initialized with a matching root marker; run: --root $root init"
 }
 
 cmd_init() {
     if [ -e "$root" ] && [ ! -e "$root/.rehearse-update" ]; then
         [ -z "$(ls -A -- "$root")" ] || die "not a rehearsal root, and not empty: $root" 2
+    fi
+    if [ -e "$root/.rehearse-update" ] || [ -L "$root/.rehearse-update" ]; then
+        require_init
     fi
     # Recovery storage refuses to live inside a Git checkout.
     local ancestor=$root
@@ -130,7 +153,7 @@ cmd_init() {
     done
     mkdir -p -- "$root"
     chmod 700 "$root"
-    touch -- "$root/.rehearse-update"
+    printf '%s\n' "$root" >"$root/.rehearse-update"
     mkdir -p -- "$bin" "$logs" "$root/records" "$root/shots" "$user_home"/{.claude,.codex,.config,.cache,.local/bin,.local/share,.local/state}
     mkdir -m 700 -p -- "$runtime"
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$bin/claude"
@@ -191,7 +214,12 @@ cmd_update() {
     done
     local started=$SECONDS status=0 transcript
     transcript=$logs/update-$(date +%H%M%S).log
-    if [ ! -e "$user_home/.local/share/cagents-install/versions/$version" ]; then
+    local prefix=$user_home/.local/share/cagents-install
+    if [[ $prefix/current -ef $prefix/versions/$version ]]; then
+        printf '%s is already current; skipping staging.\n' "$version"
+    elif [ -e "$prefix/versions/$version" ]; then
+        die "$prefix/versions/$version exists but is not current; remove it to reinstall"
+    else
         local stage_status=0
         cmd_install "$archive_dir" "$version" "$installer" --stage-only 2>&1 | tee -a "$transcript" || stage_status=${PIPESTATUS[0]}
         [ "$stage_status" -eq 0 ] || return "$stage_status"
@@ -245,6 +273,8 @@ desktop_start() {
         desktop_live || die "the desktop ended before it was ready; see $logs/desktop.log"
         sleep 1
     done
+    touch -- "$desktop/stop"
+    kill -TERM -- "-$(cat "$desktop/pid")" 2>/dev/null || :
     die 'the desktop was not ready after 30 minutes'
 }
 
@@ -266,11 +296,21 @@ run_desktop() {
     local limit=$1
     exec 9>"$native_lock"
     printf 'waiting for the native lock %s\n' "$native_lock"
-    flock 9
+    while ! flock -w 1 9; do
+        [ ! -e "$desktop/stop" ] || return 0
+    done
+    [ ! -e "$desktop/stop" ] || return 0
     printf 'holding the native lock\n'
     local runtime_desktop=$desktop/rt
     mkdir -m 700 -p -- "$runtime_desktop"
-    env -i PATH=/usr/local/bin:/usr/bin:/bin:$real_home/.local/bin LANG="${LANG:-C.UTF-8}" \
+    # Expose only the desktop helpers, even when installed beside provider CLIs.
+    local tool executable
+    mkdir -p -- "$desktop/tools"
+    for tool in niri-harness niri wtype; do
+        executable=$(command -v "$tool") || die "required desktop tool is not installed: $tool"
+        ln -s -- "$(realpath -- "$executable")" "$desktop/tools/$tool"
+    done
+    env -i PATH="$desktop/tools:/usr/local/bin:/usr/bin:/bin" LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" \
         HOME="$desktop/home" XDG_RUNTIME_DIR="$runtime_desktop" \
         XDG_CONFIG_HOME="$desktop/config" XDG_DATA_HOME="$desktop/data" \
         XDG_CACHE_HOME="$desktop/cache" XDG_STATE_HOME="$desktop/state" \
@@ -310,14 +350,32 @@ run_inner() {
     timeout -k 5 30 niri-harness session stop "$session_name" >>"$logs/harness.log" 2>&1 || :
 }
 
+# Resolve the helper once per invocation, before discarding the caller's PATH.
+resolve_niri_harness() {
+    local harness
+    harness=$(command -v niri-harness) || die 'niri-harness is not installed'
+    realpath -- "$harness"
+}
+
+desktop_env() {
+    local name value variables=()
+    while IFS='=' read -r name value; do
+        case $name in
+            WAYLAND_DISPLAY | DBUS_SESSION_BUS_ADDRESS | XDG_RUNTIME_DIR)
+                variables+=("$name=$value") ;;
+        esac
+    done <"$desktop/env"
+    env -i HOME="$desktop/home" PATH="$desktop/tools:/usr/local/bin:/usr/bin:/bin" \
+        LANG="${LANG:-C.UTF-8}" TERM="${TERM:-dumb}" "${variables[@]}" "$@"
+}
+
 # The nested desktop's display variables, for the app inside it. Its own
 # runtime directory stays the desktop's: the app's is the private user's.
 desktop_variables() {
     desktop_live && [ -e "$desktop/ready" ] || die 'no desktop is running; run: desktop start'
-    (
-        while IFS='=' read -r name value; do export "$name=$value"; done <"$desktop/env"
-        timeout -k 5 30 niri-harness --session "$session_name" session env
-    ) | sed -n 's/^export //p' | grep -E '^(WAYLAND_DISPLAY|NIRI_SOCKET|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE)='
+    local harness
+    harness=$(resolve_niri_harness)
+    desktop_env timeout -k 5 30 "$harness" --session "$session_name" session env | sed -n 's/^export //p' | grep -E '^(WAYLAND_DISPLAY|NIRI_SOCKET|XDG_CURRENT_DESKTOP|XDG_SESSION_TYPE)='
 }
 
 cmd_app() {
@@ -340,10 +398,9 @@ cmd_app() {
 
 cmd_drive() {
     desktop_live || die 'no desktop is running'
-    (
-        while IFS='=' read -r name value; do export "$name=$value"; done <"$desktop/env"
-        exec timeout -k 5 300 niri-harness --no-heal --session "$session_name" "$@"
-    )
+    local harness
+    harness=$(resolve_niri_harness)
+    desktop_env timeout -k 5 300 "$harness" --no-heal --session "$session_name" "$@"
 }
 
 cmd_shot() {
@@ -419,10 +476,31 @@ cmd_ceditor() {
     /usr/bin/python3 "$tool_root/scripts/rehearse_update_run.py" "$root" "$self" wait ceditor
 }
 
+private_process() {
+    grep -qFxz -e "XDG_RUNTIME_DIR=$runtime" -e "HOME=$user_home" \
+        -e "XDG_RUNTIME_DIR=$desktop/rt" -e "HOME=$desktop/home" "/proc/$1/environ" 2>/dev/null
+}
+
+record_private_scopes() {
+    local pid hierarchy controllers group component
+    local -a components
+    for pid in $(user_processes); do
+        private_process "$pid" || continue
+        while IFS=: read -r hierarchy controllers group; do
+            IFS=/ read -ra components <<<"$group"
+            for component in "${components[@]}"; do
+                case $component in *.scope) scopes["$component"]=1 ;; esac
+            done
+        done <"/proc/$pid/cgroup" 2>/dev/null || :
+    done
+}
+
 cmd_stop() {
     require_init
     # Let clients disconnect before their display disappears.
     local pid executable cleanup_status=0
+    local -A scopes=()
+    record_private_scopes
     for pid in $(user_processes); do
         executable=$(readlink "/proc/$pid/exe" 2>/dev/null) || continue
         case $executable in
@@ -451,6 +529,7 @@ cmd_stop() {
     fi
     local remaining attempt
     for attempt in $(seq 1 20); do
+        record_private_scopes
         remaining=$(user_processes)
         [ -n "$remaining" ] || break
         # shellcheck disable=SC2086
@@ -460,9 +539,38 @@ cmd_stop() {
         sleep 0.5
     done
     remaining=$(user_processes)
-    # shellcheck disable=SC2086
-    [ -z "$remaining" ] || kill -KILL $remaining 2>/dev/null || :
-    printf 'stopped everything %s ran\n' "$root"
+    for pid in $remaining; do
+        # A PID can exit and be reused between enumeration and escalation.
+        private_process "$pid" || continue
+        kill -KILL "$pid" 2>/dev/null || :
+    done
+    local running unit surviving
+    for attempt in $(seq 1 20); do
+        if ! running=$(env -i HOME="$real_home" XDG_RUNTIME_DIR="/run/user/$(id -u)" \
+            PATH=/usr/local/bin:/usr/bin:/bin systemctl --user --plain --no-legend --no-pager \
+            list-units --type=scope --state=running); then
+            printf 'rehearse-update: cannot verify private scopes with the systemd user manager\n' >&2
+            cleanup_status=1
+            break
+        fi
+        surviving=
+        while read -r unit _; do
+            if [ -n "$unit" ] && [ "${scopes[$unit]+attributed}" ]; then
+                surviving+="$unit"$'\n'
+            fi
+        done <<<"$running"
+        [ -n "$surviving" ] || break
+        sleep 0.25
+    done
+    if [ -n "${surviving:-}" ]; then
+        printf 'rehearse-update: attributed scopes still running:\n%s' "$surviving" >&2
+        cleanup_status=1
+    fi
+    if [ -n "$(user_processes)" ]; then
+        printf 'rehearse-update: private processes survived stop\n' >&2
+        cleanup_status=1
+    fi
+    [ "$cleanup_status" -ne 0 ] || printf 'stopped everything %s ran; no attributed scopes remain\n' "$root"
     return "$cleanup_status"
 }
 

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import importlib.util
+import json
+import fcntl
 from contextlib import closing
 import os
 from pathlib import Path
@@ -10,6 +12,8 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import time
+import signal
 import unittest
 from unittest.mock import patch
 
@@ -204,6 +208,16 @@ class Pty(unittest.TestCase):
         result = self.run_peer("raise SystemExit(7)")
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
 
+    def test_timeout_allows_peer_to_finish_sigterm_handler_before_pty_closes(self):
+        with tempfile.TemporaryDirectory(prefix="ru-pty-") as temporary:
+            marker = Path(temporary) / "terminated"
+            result = self.run_peer(
+                "import signal,time,pathlib; "
+                f"signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.1), pathlib.Path({str(marker)!r}).write_text('done'), exit(0))); "
+                "print('ready',flush=True); time.sleep(30)", "--timeout", ".3")
+            self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+            self.assertEqual(marker.read_text(), "done")
+
     def test_timeout_kills_peer_that_ignores_sigterm(self):
         result = self.run_peer("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(30)",
                                "--timeout", ".2")
@@ -221,13 +235,22 @@ class Arguments(unittest.TestCase):
                 self.assertEqual(result.returncode, 77)
                 self.assertIn("inherited agent authority was not modified", result.stderr)
 
+    def test_help_is_available_with_inherited_authority(self):
+        for arguments in (["-h"], ["--help"], ["--root", "/var/tmp/unused", "--help"],
+                          ["--root", "/var/tmp/unused", "run", "--help"]):
+            result = subprocess.run([str(SCRIPT), *arguments],
+                                    env={**os.environ, AUTHORITY[0]: "fixture-authority"},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage:", result.stdout.lower())
+
     @unittest.skipIf(any(name in os.environ for name in AUTHORITY),
                      "stop is tested in a genuine user shell; never strip authority")
     def test_stop_restores_only_its_private_preservation_fault(self):
         for fault in ("marker", "interrupted-rename", "unrelated-file", "unrelated-symlink"):
             with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix="ru-stop-", dir="/var/tmp") as temporary:
                 root = Path(temporary)
-                (root / ".rehearse-update").touch()
+                (root / ".rehearse-update").write_text(str(root)+"\n")
                 saved = root / "rt/cagents/holders.rehearsal-saved"
                 saved.mkdir(parents=True)
                 (saved / "private.json").write_text("private registry bytes")
@@ -258,10 +281,178 @@ class Arguments(unittest.TestCase):
     def test_argument_checks(self):
         for arguments in (["--root", "/" + "x" * 41, "init"],
                           ["--root", "/var/tmp/bad space", "init"],
-                          ["--root", "/var/tmp/nonexistent-rehearsal", "unknown"]):
+                          ["--root", "/var/tmp/nonexistent-rehearsal", "unknown"],
+                          ["--root", "/home/rehearsal", "init"],
+                          ["--root", "/dev/shm", "init"]):
             with self.subTest(arguments=arguments):
                 result = subprocess.run([str(SCRIPT), *arguments], capture_output=True, text=True)
                 self.assertEqual(result.returncode, 2)
+
+
+@unittest.skipIf(any(name in os.environ for name in AUTHORITY),
+                 "harness actions require a genuine user shell; never strip authority")
+class PrivateRoot(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="ru-contract-", dir="/var/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def call(self, *args, **kwargs):
+        return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
+                              capture_output=True, text=True, timeout=20, **kwargs)
+
+    def test_init_records_root_and_cleanup_refuses_mismatched_or_symlink_marker(self):
+        result = self.call("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = self.root / ".rehearse-update"
+        self.assertEqual(marker.read_text(), str(self.root)+"\n")
+        for kind in ("mismatch", "symlink"):
+            with self.subTest(kind=kind):
+                marker.unlink()
+                if kind == "mismatch":
+                    marker.write_text("/var/tmp/somewhere-else\n")
+                else:
+                    target = self.root / "other-marker"
+                    target.write_text(str(self.root)+"\n")
+                    marker.symlink_to(target)
+                result = self.call("cleanup")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("matching root marker", result.stderr)
+                self.assertTrue(self.root.exists())
+
+    def test_update_refuses_existing_noncurrent_version(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        prefix = self.root / "home/.local/share/cagents-install"
+        for version in ("old", "new"):
+            (prefix / "versions" / version).mkdir(parents=True)
+        (prefix / "current").symlink_to("versions/old")
+        result = self.call("update", "/missing", "new", "/missing/install.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exists but is not current; remove it to reinstall", result.stderr)
+        self.assertEqual((prefix / "current").readlink(), Path("versions/old"))
+        (prefix / "current").unlink()
+        (prefix / "current").symlink_to("versions/new")
+        result = self.call("update", "/missing", "new", "/missing/install.sh")
+        self.assertIn("already current; skipping staging", result.stdout)
+        self.assertNotIn("exists but is not current", result.stderr)
+
+    def test_desktop_waiting_for_lock_exits_on_stop_without_starting_compositor(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        desktop = self.root / "desktop"
+        desktop.mkdir()
+        with (self.root / "native.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with (self.root / "waiter.log").open("w") as output:
+                peer = subprocess.Popen([str(SCRIPT), "--root", str(self.root), "__desktop", "60"],
+                                        env={**os.environ, "CAGENTS_EVIDENCE_NATIVE_LOCK": str(self.root / "native.lock")},
+                                        stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    deadline = time.monotonic()+5
+                    while "waiting for the native lock" not in (self.root / "waiter.log").read_text():
+                        self.assertIsNone(peer.poll())
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.05)
+                    (desktop / "stop").touch()
+                    self.assertEqual(peer.wait(timeout=5), 0)
+                    self.assertFalse((self.root / "logs/kwin.log").exists())
+                finally:
+                    if peer.poll() is None:
+                        os.killpg(peer.pid, signal.SIGKILL)
+                        peer.wait()
+
+    def test_stop_reports_surviving_attributed_scope_without_stopping_other_members(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        unit = self.root.name+".scope"
+        # The wrapper and second child retain the real environment. Only the
+        # first child's HOME attributes this scope to the private root.
+        body = ('env HOME="$1/home" sleep 60 & echo $! >"$1/private.pid"; '
+                'sleep 60 & echo $! >"$1/unrelated.pid"; wait')
+        peer = subprocess.Popen(["systemd-run", "--user", "--scope", "--unit="+unit,
+                                 "bash", "-c", body, "bash", str(self.root)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            deadline = time.monotonic()+5
+            while not (self.root / "unrelated.pid").exists():
+                if peer.poll() is not None:
+                    self.fail("scope fixture failed: "+peer.communicate()[1])
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            unrelated = int((self.root / "unrelated.pid").read_text())
+            result = self.call("stop")
+            self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertIn("attributed scopes still running:\n"+unit, result.stderr)
+            os.kill(unrelated, 0)
+        finally:
+            # This test created the whole group, unlike stop's attributed PID
+            # cleanup. End it here even when an assertion failed.
+            try:
+                os.killpg(peer.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            peer.communicate(timeout=5)
+
+    def test_drive_and_display_query_only_receive_allowlisted_environment(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        desktop = self.root / "desktop"
+        (desktop / "home").mkdir(parents=True)
+        (desktop / "pid").write_text(str(os.getpid()))
+        (desktop / "ready").touch()
+        (desktop / "env").write_text("WAYLAND_DISPLAY=fixture-wayland\n"
+                                     "DBUS_SESSION_BUS_ADDRESS=unix:path=/fixture\n"
+                                     f"XDG_RUNTIME_DIR={desktop}/rt\n"
+                                     "PRIVATE_SECRET=must-not-pass\n")
+        tools = self.root / "caller-tools"
+        tools.mkdir()
+        harness = tools / "niri-harness"
+        harness.write_text("#!/usr/bin/python3\nimport json,os,sys,pathlib\n"
+                           "value=json.dumps(dict(os.environ))\n"
+                           "if sys.argv[-2:]==['session','env']:\n"
+                           " pathlib.Path(os.environ['HOME'],'seen.json').write_text(value)\n"
+                           " print(\"export WAYLAND_DISPLAY='fixture-wayland'\")\n"
+                           "else: print(value)\n")
+        harness.chmod(0o755)
+        caller = {**os.environ, "PATH": str(tools)+":"+os.environ["PATH"],
+                  "PRIVATE_SECRET": "caller-secret", "CODEX_HOME": "/real-provider"}
+        result = self.call("drive", "observe", env=caller)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environments = [json.loads(result.stdout)]
+        result = self.call("app", "/usr/bin/true", env=caller)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environments.append(json.loads((desktop / "home/seen.json").read_text()))
+        for environment in environments:
+            self.assertEqual(set(environment) - {"LC_CTYPE"},
+                             {"HOME", "PATH", "LANG", "TERM", "WAYLAND_DISPLAY",
+                              "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"})
+            self.assertEqual(environment["HOME"], str(desktop / "home"))
+            self.assertEqual(environment["PATH"], str(desktop / "tools")+":/usr/local/bin:/usr/bin:/bin")
+
+
+class FailedInitialization(unittest.TestCase):
+    def test_partial_init_still_records_failure_and_stops(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        with tempfile.TemporaryDirectory(prefix="ru-run-") as temporary:
+            root = Path(temporary) / "fresh"
+            rehearsal = scenario.Rehearsal(root, str(SCRIPT))
+            commands = []
+            def call(command, *args, **kwargs):
+                commands.append(command)
+                if command == "init":
+                    root.mkdir()
+                    raise RuntimeError("partly failed init")
+                return 1, "not initialized"
+            args = type("Args", (), dict(old_version="old", new_version="new", ceditor=None))()
+            with patch.object(rehearsal, "call", side_effect=call):
+                self.assertEqual(rehearsal.run(args), 1)
+            self.assertEqual(commands, ["init", "record", "stop"])
+            self.assertIn("Outcome: FAIL", (root / "report.txt").read_text())
+            self.assertIn("partly failed init", (root / "report.txt").read_text())
+            with patch.object(rehearsal, "call") as call:
+                with self.assertRaisesRegex(RuntimeError, "fresh, absent root"):
+                    rehearsal.run(args)
+                call.assert_not_called()
 
 
 if __name__ == "__main__":
