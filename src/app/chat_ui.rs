@@ -2354,21 +2354,49 @@ enum QueuedStep {
     Prompt,
 }
 
-/// Whether the provider a conversation reconnected to accounts for a message
-/// its last one was holding: it still lists the message, by id or by the same
-/// words and files (some providers' ids only name a place in the queue), or
-/// its history shows a user message the provider delivered under that id.
-fn accounted_for(snapshot: &chat::Snapshot, message: &chat::QueuedMessage) -> bool {
-    snapshot.queued_messages.iter().any(|queued| {
-        queued.id == message.id
-            || (queued.text == message.text && queued.attachments == message.attachments)
-    }) || snapshot.items.iter().any(|item| {
-        item.role == chat::Role::User
-            && item
-                .id
-                .strip_prefix(message.id.as_str())
-                .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-    })
+/// The messages a conversation's last provider was holding that the provider
+/// it reconnected to does not account for, in their order.
+///
+/// Each message the provider lists accounts for one saved message: first one
+/// with its id and words, then one with its words (some providers' ids only
+/// name a place in the queue, so the same id may now hold another message),
+/// then one with its id alone (a listing may carry only a preview). A saved
+/// message is also accounted for when the provider's history shows a user
+/// message delivered under its id.
+fn unaccounted(
+    snapshot: &chat::Snapshot,
+    saved: Vec<chat::QueuedMessage>,
+) -> Vec<chat::QueuedMessage> {
+    fn same_words(a: &chat::QueuedMessage, b: &chat::QueuedMessage) -> bool {
+        a.text == b.text && a.attachments == b.attachments
+    }
+    type Claim = fn(&chat::QueuedMessage, &chat::QueuedMessage) -> bool;
+    let claims: [Claim; 3] = [
+        |listed, saved| listed.id == saved.id && same_words(listed, saved),
+        |listed, saved| same_words(listed, saved),
+        |listed, saved| listed.id == saved.id,
+    ];
+    let mut listed: Vec<&chat::QueuedMessage> = snapshot.queued_messages.iter().collect();
+    let mut remaining = saved;
+    for claim in claims {
+        remaining.retain(|message| {
+            let Some(index) = listed.iter().position(|queued| claim(queued, message)) else {
+                return true;
+            };
+            listed.swap_remove(index);
+            false
+        });
+    }
+    remaining.retain(|message| {
+        !snapshot.items.iter().any(|item| {
+            item.role == chat::Role::User
+                && item
+                    .id
+                    .strip_prefix(message.id.as_str())
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+        })
+    });
+    remaining
 }
 
 /// What came back to the composer from a provider queue that did not survive.
@@ -2899,7 +2927,10 @@ impl Runtime {
     /// The restored-messages notice describes the draft; once the reader
     /// has cleared the draft away, there is nothing left for it to describe.
     fn settle_restored_notice(&mut self) {
-        if self.attachments.is_empty() && self.composer.text().trim().is_empty() {
+        if self.restored_waiting.is_some()
+            && self.attachments.is_empty()
+            && self.composer.text().trim().is_empty()
+        {
             self.restored_waiting = None;
         }
     }
@@ -10863,7 +10894,7 @@ impl Cagents {
                         // rest may never have reached the agent, or may have
                         // just before the last one went: either way it is the
                         // reader's to send again, edit or discard.
-                        waiting.retain(|message| !accounted_for(&snapshot, message));
+                        let waiting = unaccounted(&snapshot, waiting);
                         let restored_waiting = !waiting.is_empty();
                         if let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&target.card) {
                             runtime.restore_waiting(waiting);
@@ -23510,10 +23541,17 @@ mod tests {
             let (app, card) = reopen_with_saved_queue("old", queue, vec![still]);
             let runtime = chat_runtime(&app, card);
             if renumbered {
-                // Its old place now holds the other message, which may have
-                // been delivered; nothing is resurrected that is listed.
-                assert_eq!(runtime.composer.text().trim(), "typed after");
-                assert_eq!(runtime.restored_waiting, None);
+                // Its old place now holds the other message, which stays
+                // listed; the one the provider no longer holds comes back.
+                assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
+                assert!(runtime.attachments.is_empty());
+                assert_eq!(
+                    runtime.restored_waiting,
+                    Some(RestoredWaiting {
+                        count: 1,
+                        whole: false
+                    })
+                );
                 continue;
             }
             assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
@@ -23555,6 +23593,60 @@ mod tests {
         assert_eq!(runtime.composer.text().trim(), "And summarize\ntyped after");
         assert!(runtime.attachments.is_empty());
         assert_eq!(runtime.restored_waiting.map(|notice| notice.count), Some(1));
+    }
+
+    /// Each message the new provider lists stands for one saved message, so
+    /// a message queued twice comes back once when the provider still holds
+    /// one copy. A listed message's words outrank its id, which a provider
+    /// may have reused for another message, and its id alone still claims a
+    /// message it lists only in preview.
+    #[test]
+    fn each_listed_message_accounts_for_one_saved_message() {
+        let message = |id: &str, text: &str| chat::QueuedMessage {
+            id: id.into(),
+            text: text.into(),
+            editable: true,
+            delivery: chat::QueueDelivery::default(),
+            attachments: Vec::new(),
+        };
+        let left = |listed: Vec<chat::QueuedMessage>, saved: Vec<chat::QueuedMessage>| {
+            let snapshot = Snapshot {
+                queued_messages: listed,
+                ..Snapshot::default()
+            };
+            unaccounted(&snapshot, saved)
+                .into_iter()
+                .map(|message| message.id)
+                .collect::<Vec<_>>()
+        };
+        // "b" claims its own copy; "x" then stands for "a" by its words.
+        assert_eq!(
+            left(
+                vec![message("b", "again"), message("x", "again")],
+                vec![
+                    message("a", "again"),
+                    message("b", "again"),
+                    message("c", "again"),
+                ],
+            ),
+            ["c"]
+        );
+        // A reused id does not hide the message whose words it now holds.
+        assert_eq!(
+            left(
+                vec![message("1", "second")],
+                vec![message("1", "first"), message("2", "second")],
+            ),
+            ["1"]
+        );
+        // A preview listed under the message's id still accounts for it.
+        assert_eq!(
+            left(
+                vec![message("1", "long message, cut")],
+                vec![message("1", "long message, cut short here")],
+            ),
+            Vec::<String>::new()
+        );
     }
 
     /// A queue saved under an earlier daemon than the one the conversation
@@ -23667,6 +23759,14 @@ mod tests {
         runtime.replace_draft(text_editor::Content::with_text("still typing"));
         drop(app.dispatch_queued(target));
         assert!(chat_runtime(&app, card).pending.as_ref().unwrap().followup);
+        // Until the provider takes it, the follow-up is saved with the draft.
+        assert_eq!(
+            app.persistent_workspace()
+                .chat_drafts
+                .get(&card)
+                .map(|draft| draft.trim()),
+            Some("first task\nstill typing")
+        );
         let saves = crate::app::terminal_output_tests::persist_count();
         settle(&mut app, card, Ok(()));
         assert!(crate::app::terminal_output_tests::persist_count() > saves);
