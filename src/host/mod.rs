@@ -196,6 +196,22 @@ pub fn run_automation_helper() -> Option<Result<(), String>> {
     automations::helper_entry()
 }
 
+/// Fills this instance's empty workspace-model store from a fixture plan and
+/// returns what it wrote as one JSON line. Refused by production builds and
+/// while a daemon runs. See docs/fixture-workspace.md.
+pub fn seed_fixture_workspace(plan: &std::path::Path) -> Result<String, String> {
+    #[cfg(any(debug_assertions, feature = "development"))]
+    {
+        let seeded = model::fixture_seed::seed(plan)?;
+        serde_json::to_string(&seeded).map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(debug_assertions, feature = "development")))]
+    {
+        let _ = plan;
+        Err(crate::fixture_workspace::refusal())
+    }
+}
+
 mod upgrade_inspect;
 pub fn run_upgrade_inspection_helper() -> Option<Result<(), String>> {
     upgrade_inspect::entry()

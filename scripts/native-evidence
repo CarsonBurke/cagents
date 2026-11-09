@@ -55,6 +55,12 @@ both use the same fixture data and synthetic provider.
   stop            End the session, its daemon and its processes; release the lock.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
+  seed --profile NAME [--seed N] [--side SIDE]
+                  Generate a workspace with scripts/fixture-workspace (see
+                  docs/fixture-workspace.md) into the fixture, load it through
+                  SIDE's executables (default after), and save it as the seed.
+                  Uses SIDE's own checkout's generator, which matches its
+                  executables. Replaces the fixture and any saved seed.
   status          Report the session and the native lock.
 
 --task may also come from CAGENTS_EVIDENCE_TASK.
@@ -365,6 +371,13 @@ fixture_env() {
 # fixture's when the seed was saved, kept in $seed_home.
 seeded_home_identity() {
     stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
+}
+
+# Keep the stopped fixture as the seed every later start restores.
+save_seed() {
+    rm -rf -- "$seed" "$seed_home"
+    cp -a --reflink=auto -- "$fixture" "$seed"
+    seeded_home_identity >"$seed_home"
 }
 
 prepare_fixture() {
@@ -787,6 +800,42 @@ cmd_start() {
     fi
 }
 
+cmd_seed() {
+    local side=after profile= number=1
+    while [ "$#" -gt 0 ]; do
+        case $1 in
+            --profile) profile=${2:?--profile needs a name}; shift 2 ;;
+            --seed) number=${2:?--seed needs a number}; shift 2 ;;
+            --side) side=${2:?--side needs before or after}; shift 2 ;;
+            *) die "unknown seed option: $1" 2 ;;
+        esac
+    done
+    [ -n "$profile" ] || die 'seed needs --profile NAME; scripts/fixture-workspace generate --help lists them' 2
+    [[ $number =~ ^[0-9]+$ ]] || die '--seed must be a whole number' 2
+    require_side "$side"
+    live_session && die 'stop the session before seeding its fixture'
+    # A lost session's daemon or window may still have the fixture's stores
+    # open; replacing them underneath it would hand it another workspace.
+    [ -z "$(session_processes)" ] ||
+        die 'processes of a lost session still use the fixture; run: stop'
+    mark_used
+    load_side "$side"
+    source_is_current || die "$checkout changed since its build; run: build $side $checkout"
+    local generator=$checkout/scripts/fixture-workspace
+    [ -x "$generator" ] ||
+        die "$checkout has no scripts/fixture-workspace; seed through a side built from a checkout that has it: --side before|after"
+    # The fixture's own directories hold every store, and nothing from this
+    # shell reaches the generator or the executables beyond fixture_env's.
+    rm -rf -- "$fixture"
+    fixture_env "$generator" generate --profile "$profile" --seed "$number" --root "$fixture" ||
+        die "generating the $profile workspace failed; the fixture is incomplete, so seed again"
+    fixture_env "$generator" apply --root "$fixture" --bin-dir "$target/dev-runtime" ||
+        die "loading the $profile workspace through $side's executables failed; the fixture is incomplete, so seed again"
+    save_seed
+    printf 'seeded %s with the %s workspace (seed %s) through %s at %s\n' \
+        "$seed" "$profile" "$number" "$side" "$built_revision"
+}
+
 nested_session_env() {
     local name value
     while IFS='=' read -r name value; do
@@ -919,11 +968,10 @@ case $command in
     save-seed)
         live_session && die 'stop the session before saving its fixture'
         [ -d "$fixture" ] || die 'there is no fixture to save yet'
-        rm -rf -- "$seed" "$seed_home"
-        cp -a --reflink=auto -- "$fixture" "$seed"
-        seeded_home_identity >"$seed_home"
+        save_seed
         printf 'saved %s\n' "$seed"
         ;;
+    seed) cmd_seed "$@" ;;
     status) cmd_status ;;
     __build) run_build "$@" ;;
     __session) run_session "$@" ;;

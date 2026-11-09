@@ -87,6 +87,20 @@ pub(crate) fn main_with_before_start(
         return report(run_internal(&arguments));
     }
 
+    // A fixture seed writes this window's store and exits; it opens no window.
+    if arguments.first().map(String::as_str) == Some(cagents::fixture_workspace::SEED_FLAG) {
+        return match seed_fixture_window(&arguments[1..]) {
+            Ok(summary) => {
+                println!("{summary}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("{PRODUCT}: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
+
     // Argv is settled before the handshake below is armed. A mistyped flag is
     // a shell mistake, not a startup failure: routing it through
     // `report_startup_failure` answered the launcher with an error and, on a
@@ -315,6 +329,30 @@ fn run_internal(arguments: &[String]) -> Result<(), Box<dyn std::error::Error>> 
         return Err("invalid startup error arguments".into());
     }
     run_startup_error_dialog(message, still_starting)
+}
+
+/// `--development-seed-workspace PLAN [--window SLOT]
+/// [--workspace-model-identity UUID]`; see docs/fixture-workspace.md.
+fn seed_fixture_window(arguments: &[String]) -> Result<String, String> {
+    let mut arguments = arguments.iter().map(String::as_str);
+    let plan = arguments.next().ok_or("missing fixture plan path")?;
+    let mut slot = cagents::instance::PRIMARY_WINDOW;
+    let mut identity = None;
+    while let Some(argument) = arguments.next() {
+        match argument {
+            "--window" => slot = arguments.next().ok_or("missing window name")?,
+            "--workspace-model-identity" => {
+                let value = arguments.next().ok_or("missing workspace model identity")?;
+                identity = Some(
+                    value
+                        .parse::<uuid::Uuid>()
+                        .map_err(|error| format!("invalid workspace model identity: {error}"))?,
+                );
+            }
+            _ => return Err(format!("unknown fixture seed argument: {argument}")),
+        }
+    }
+    cagents::app::seed_fixture_window(std::path::Path::new(plan), slot, identity)
 }
 
 struct Options<'a> {

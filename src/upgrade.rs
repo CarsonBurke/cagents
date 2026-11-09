@@ -1337,9 +1337,21 @@ pub(crate) mod handoff {
         pub aliases: Vec<chat::Session>,
     }
 
+    /// The startup budget while no checkpoint names sessions to confirm.
+    const UNCHECKPOINTED_STARTUP: std::time::Duration = std::time::Duration::from_secs(5);
+
     /// Budget sequential provider confirmation without parsing session payloads.
+    /// A window asks this before any daemon has run, so it only reads: the
+    /// storage stays absent until a daemon creates it.
     pub(crate) fn startup_timeout() -> Result<std::time::Duration, String> {
-        Store::discover()?.startup_timeout()
+        startup_timeout_in(&Store::directory()?)
+    }
+
+    fn startup_timeout_in(directory: &Path) -> Result<std::time::Duration, String> {
+        match Store::existing_at(directory)? {
+            Some(store) => store.startup_timeout(),
+            None => Ok(UNCHECKPOINTED_STARTUP),
+        }
     }
 
     #[derive(Deserialize)]
@@ -1384,22 +1396,27 @@ pub(crate) mod handoff {
     }
 
     impl Store {
-        pub fn discover() -> Result<Self, String> {
+        fn directory() -> Result<PathBuf, String> {
             let dirs =
                 crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
-            Self::open(&dirs.data_local_dir().join("daemon-upgrade"))
+            Ok(dirs.data_local_dir().join("daemon-upgrade"))
+        }
+
+        pub fn discover() -> Result<Self, String> {
+            Self::open(&Self::directory()?)
         }
 
         /// Opens the durable storage only if some daemon already created it,
         /// so read-only callers never create it.
         pub fn existing() -> Result<Option<Self>, String> {
-            let dirs =
-                crate::instance::project_dirs().ok_or("Cannot discover durable upgrade storage")?;
-            let directory = dirs.data_local_dir().join("daemon-upgrade");
-            match std::fs::symlink_metadata(&directory) {
+            Self::existing_at(&Self::directory()?)
+        }
+
+        fn existing_at(directory: &Path) -> Result<Option<Self>, String> {
+            match std::fs::symlink_metadata(directory) {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
                 Err(error) => Err(error.to_string()),
-                Ok(_) => Self::open(&directory).map(Some),
+                Ok(_) => Self::open(directory).map(Some),
             }
         }
 
@@ -1446,7 +1463,7 @@ pub(crate) mod handoff {
 
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
             let Some(bytes) = self.read_bytes()? else {
-                return Ok(std::time::Duration::from_secs(5));
+                return Ok(UNCHECKPOINTED_STARTUP);
             };
             let inventory: Inventory =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -1884,6 +1901,20 @@ pub(crate) mod handoff {
             }
             let error = encode_bounded(&Oversized, "evidence byte budget exceeded").unwrap_err();
             assert!(error.contains("evidence byte budget exceeded"), "{error}");
+        }
+
+        #[test]
+        fn startup_budget_never_creates_the_storage_it_reads() {
+            let parent = tempfile::tempdir().unwrap();
+            let directory = parent.path().join("daemon-upgrade");
+            assert_eq!(
+                startup_timeout_in(&directory).unwrap(),
+                UNCHECKPOINTED_STARTUP
+            );
+            assert!(
+                !directory.exists(),
+                "asking the budget created {directory:?}"
+            );
         }
 
         #[test]

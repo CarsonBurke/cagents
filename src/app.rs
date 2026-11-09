@@ -24,6 +24,8 @@ use crate::file_manager::{self, open_system_url};
 mod browser_backend;
 mod browser_host;
 mod file_ui;
+#[cfg(any(debug_assertions, feature = "development"))]
+mod fixture_seed;
 mod git_ui;
 mod history_ui;
 #[cfg(feature = "latency-harness")]
@@ -59,6 +61,26 @@ mod worktree_dialog;
 mod worktree_operations;
 mod worktree_ui;
 pub use daemon_stop::run_daemon_stop_confirmation;
+
+/// Fills the `slot` window's empty session store from a fixture plan and
+/// returns what it wrote as one JSON line. Refused by production builds and
+/// while that window is open. See docs/fixture-workspace.md.
+pub fn seed_fixture_window(
+    plan: &Path,
+    slot: &str,
+    workspace_model_identity: Option<uuid::Uuid>,
+) -> Result<String, String> {
+    #[cfg(any(debug_assertions, feature = "development"))]
+    {
+        let seeded = fixture_seed::seed(plan, slot, workspace_model_identity)?;
+        serde_json::to_string(&seeded).map_err(|error| error.to_string())
+    }
+    #[cfg(not(any(debug_assertions, feature = "development")))]
+    {
+        let _ = (plan, slot, workspace_model_identity);
+        Err(crate::fixture_workspace::refusal())
+    }
+}
 use worktree_dialog::{
     WorktreeDialog, WorktreeDraft, WorktreeField, WorktreeInputError, worktree_dialog_focus_id,
 };

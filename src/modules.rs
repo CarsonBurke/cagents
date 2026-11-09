@@ -72,6 +72,8 @@ pub mod file_manager;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod file_url;
 mod filesystem_recovery_context;
+#[cfg(any(feature = "ui", feature = "host"))]
+pub mod fixture_workspace;
 pub mod fs_safety;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub(crate) mod git_watch;

@@ -8,6 +8,14 @@ fn command() -> clap::Command {
                 .hide(true)
                 .action(clap::ArgAction::SetTrue),
         )
+        .arg(
+            // Development fixtures only; see docs/fixture-workspace.md.
+            clap::Arg::new("development-seed-workspace")
+                .long(cagents::fixture_workspace::SEED_FLAG.trim_start_matches("--"))
+                .value_name("PLAN")
+                .value_parser(clap::value_parser!(std::path::PathBuf))
+                .hide(true),
+        )
 }
 
 cagents::stamp_version!();
@@ -46,7 +54,20 @@ fn main() -> std::process::ExitCode {
     }
     // Informational flags exit before opening runtime state or taking its
     // daemon lease. Internal precheck owners keep their separate entrypoint.
-    command().get_matches();
+    let matches = command().get_matches();
+    // A fixture seed writes the stores and exits; it never serves.
+    if let Some(plan) = matches.get_one::<std::path::PathBuf>("development-seed-workspace") {
+        return match cagents::host::seed_fixture_workspace(plan) {
+            Ok(summary) => {
+                println!("{summary}");
+                std::process::ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("cagentsd: {error}");
+                std::process::ExitCode::FAILURE
+            }
+        };
+    }
     // SAFETY: entry is still single-threaded; helper-only mode returned above.
     let admission = match unsafe { cagents::host::prepare_daemon_admission() } {
         Ok(admission) => admission,
