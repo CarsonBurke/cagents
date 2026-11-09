@@ -1209,9 +1209,15 @@ pub struct EditorNavigation {
 /// holds the snapshot it was last handed, which is from every save until that
 /// save's flush settles. Each card is behind one of these, so that copy shares
 /// every card, and an edit through it copies only the card it changes.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Default, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T: std::fmt::Debug> std::fmt::Debug for Shared<T> {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
 
 impl<T> Shared<T> {
     pub fn new(value: T) -> Self {
@@ -1258,9 +1264,11 @@ impl<T> From<T> for Shared<T> {
     }
 }
 
+/// Compares the values, even when both are the same one: a card holds
+/// floating-point widths, so it need not equal itself.
 impl<T: PartialEq> PartialEq for Shared<T> {
     fn eq(&self, other: &Self) -> bool {
-        Self::ptr_eq(self, other) || *self.0 == *other.0
+        *self.0 == *other.0
     }
 }
 
@@ -1275,10 +1283,16 @@ impl<T: PartialEq<T>> PartialEq<T> for Shared<T> {
 /// Reading a card, or copying the list, never copies a card: the list is
 /// shared with the snapshot the session writer holds, card by card. Changing a
 /// card through `get_mut`, `iter_mut` or indexing copies only that card, and
-/// only while a snapshot still shares it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+/// only while a snapshot still shares it. Moving a card moves it as it is.
+#[derive(Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct Cards(Vec<Shared<CardState>>);
+
+impl std::fmt::Debug for Cards {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.debug_list().entries(self.iter()).finish()
+    }
+}
 
 impl Cards {
     pub fn new() -> Self {
@@ -1297,7 +1311,9 @@ impl Cards {
         CardsIter(self.0.iter())
     }
 
-    /// Each card, copied only when it is written through.
+    /// Each card, copied only when it is written through. Passing one on as
+    /// `&mut CardState` writes through it, so read first and write only the
+    /// cards that change.
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Shared<CardState>> {
         self.0.iter_mut()
     }
@@ -1319,16 +1335,48 @@ impl Cards {
         self.0.last().map(|card| &**card)
     }
 
-    pub fn push(&mut self, card: CardState) {
+    pub fn push(&mut self, card: impl Into<Shared<CardState>>) {
         self.0.push(card.into());
     }
 
-    pub fn insert(&mut self, index: usize, card: CardState) {
+    pub fn insert(&mut self, index: usize, card: impl Into<Shared<CardState>>) {
         self.0.insert(index, card.into());
     }
 
-    pub fn remove(&mut self, index: usize) -> CardState {
-        self.0.remove(index).into_inner()
+    /// Takes the card out as it is, so that putting it back elsewhere copies
+    /// nothing.
+    pub fn remove(&mut self, index: usize) -> Shared<CardState> {
+        self.0.remove(index)
+    }
+
+    /// The cards `keep` accepts, in order, shared with these.
+    pub fn filtered(&self, mut keep: impl FnMut(&CardState) -> bool) -> Self {
+        Self(self.0.iter().filter(|card| keep(card)).cloned().collect())
+    }
+
+    /// Puts the cards `order` names into the places those cards already hold,
+    /// in the order it gives, and leaves every other card where it is. A card
+    /// named twice keeps its first place in `order`.
+    pub fn arrange_within(&mut self, order: &[CardId]) {
+        let mut rank = HashMap::with_capacity(order.len());
+        for (place, id) in order.iter().enumerate() {
+            rank.entry(*id).or_insert(place);
+        }
+        let slots = self
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, card)| rank.contains_key(&card.id))
+            .map(|(slot, _)| slot)
+            .collect::<Vec<_>>();
+        let mut members = slots
+            .iter()
+            .map(|slot| self.0[*slot].clone())
+            .collect::<Vec<_>>();
+        members.sort_by_key(|card| rank[&card.id]);
+        for (slot, card) in slots.into_iter().zip(members) {
+            self.0[slot] = card;
+        }
     }
 
     pub fn retain(&mut self, mut keep: impl FnMut(&CardState) -> bool) {
@@ -1651,6 +1699,34 @@ mod tests {
             assert!(!card.title.is_empty());
         }
         assert_eq!(copy.shared_with(&original), 2);
+    }
+
+    /// Moving, filtering and rearranging cards hands on the cards themselves.
+    #[test]
+    fn moving_cards_copies_none_of_them() {
+        let original = Cards::from([titled("a"), titled("b"), titled("c"), titled("d")]);
+        let ids = original.iter().map(|card| card.id).collect::<Vec<_>>();
+        let mut copy = original.clone();
+        let moved = copy.remove(0);
+        copy.insert(2, moved);
+        assert_eq!(
+            copy.iter().map(|card| card.id).collect::<Vec<_>>(),
+            [ids[1], ids[2], ids[0], ids[3]]
+        );
+        assert!(copy.copied_from(&original).is_empty());
+
+        let filtered = original.filtered(|card| card.title != "b");
+        assert_eq!(filtered.len(), 3);
+        assert!(filtered.copied_from(&original).is_empty());
+
+        // "b" and "d" swap the places they hold; "a" and "c" stay put.
+        let mut arranged = original.clone();
+        arranged.arrange_within(&[ids[3], ids[1], ids[3]]);
+        assert_eq!(
+            arranged.iter().map(|card| card.id).collect::<Vec<_>>(),
+            [ids[0], ids[3], ids[2], ids[1]]
+        );
+        assert!(arranged.copied_from(&original).is_empty());
     }
 
     /// Cards are stored as the plain list they always were.

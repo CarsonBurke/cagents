@@ -120,7 +120,8 @@ fn durable_browser_urls_keep_navigation_authority_across_store_reopen() {
             width_fraction: 1.0,
             existence: Existence::Open,
             kind: CardKind::Browser(expected.clone()),
-        }],
+        }]
+        .into(),
         focused: Some(card),
         ..WorkspaceState::default()
     };
@@ -207,7 +208,8 @@ fn durable_browser_same_location_navigation_rewrites_hidden_url_components() {
                     scroll_y: 0.0,
                     fidelity: BrowserRestoreFidelity::HistoryAndScroll,
                 }),
-            }],
+            }]
+            .into(),
             focused: Some(card),
             ..WorkspaceState::default()
         };

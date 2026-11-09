@@ -144,22 +144,17 @@ fn scope_descriptor(
             .flat_map(|channel| channel.cards.iter().copied())
             .collect::<HashSet<_>>()
     });
-    let cards = state
-        .cards
-        .iter()
-        .filter(|card| {
-            selected_channel.map_or_else(
-                || {
-                    !channel_cards
-                        .as_ref()
-                        .is_some_and(|cards| cards.contains(&card.id))
-                        && belongs_to_scope(card, scope, roots, owners)
-                },
-                |channel| card.existence.is_open() && channel.cards.contains(&card.id),
-            )
-        })
-        .cloned()
-        .collect::<Vec<_>>();
+    let cards = state.cards.filtered(|card| {
+        selected_channel.map_or_else(
+            || {
+                !channel_cards
+                    .as_ref()
+                    .is_some_and(|cards| cards.contains(&card.id))
+                    && belongs_to_scope(card, scope, roots, owners)
+            },
+            |channel| card.existence.is_open() && channel.cards.contains(&card.id),
+        )
+    });
     let focused = preferred_focus
         .filter(|id| cards.iter().any(|card| card.id == *id))
         .or_else(|| {
@@ -182,7 +177,7 @@ fn scope_descriptor(
         id: state.id,
         generation: state.generation,
         existence: state.existence.clone(),
-        cards: cards.into(),
+        cards,
         focused,
         active_worktree: None,
         worktree_focus: HashMap::new(),
