@@ -607,7 +607,7 @@ impl Cagents {
                     .retain(|shared| shared.id != channel);
                 task = Task::batch([task, self.retire_peer_channel(channel)]);
             }
-            self.channel_work.retiring.remove(&channel);
+            self.channel_ui.retiring.remove(&channel);
             return (
                 Task::batch([task, self.finish_channel_reopen(channel)]),
                 applied || retired,
@@ -629,7 +629,7 @@ impl Cagents {
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::RetirementFailed { channel, error } => {
-                self.channel_work.retiring.remove(&channel);
+                self.channel_ui.retiring.remove(&channel);
                 self.fail_channel_reopen(
                     channel,
                     &format!("Could not reopen the channel: {error}. Try reopening again."),
@@ -751,24 +751,11 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
-                // Work commits and metadata announcements can cross between
-                // independent WAL connections. Even an older invalidation
-                // must refresh its exact home; it never replays a model edit.
-                if let ModelEdit::ChannelWorkChanged { home } = &edit {
-                    if home.registry != self.workspace_model.identity {
-                        return Task::none();
-                    }
-                    // This is an independent invalidation, not a folded
-                    // canonical edit. Advancing that watermark could discard
-                    // a delayed, lower-sequence channel/project edit.
-                    return if self.channel_work.view.home() == Some(*home) {
-                        self.channel_work
-                            .view
-                            .refresh()
-                            .map_or_else(Task::none, |effect| self.channel_work_effect(effect))
-                    } else {
-                        Task::none()
-                    };
+                // A channel-work invalidation is not a folded canonical edit,
+                // and nothing in the window shows channel work. Advancing the
+                // watermark could discard a delayed, lower-sequence edit.
+                if matches!(edit, ModelEdit::ChannelWorkChanged { .. }) {
+                    return Task::none();
                 }
 
                 if sequence <= self.workspace_model.sequence {
