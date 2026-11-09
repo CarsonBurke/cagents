@@ -56,14 +56,16 @@ impl Wake {
                 revents: 0,
             });
         }
-        let timeout = retry
-            .map(|wait| {
-                wait.as_millis()
-                    .saturating_add(u128::from(wait.subsec_nanos() % 1_000_000 != 0))
-                    .min(i32::MAX as u128) as i32
-            })
-            .unwrap_or(-1);
+        let deadline = retry.map(|wait| Instant::now() + wait);
         loop {
+            let timeout = deadline
+                .map(|deadline| {
+                    let wait = deadline.saturating_duration_since(Instant::now());
+                    wait.as_millis()
+                        .saturating_add(u128::from(wait.subsec_nanos() % 1_000_000 != 0))
+                        .min(i32::MAX as u128) as i32
+                })
+                .unwrap_or(-1);
             // SAFETY: the initialized descriptors live throughout this call.
             let result =
                 unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, timeout) };
