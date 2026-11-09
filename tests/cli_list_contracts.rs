@@ -55,7 +55,7 @@ impl Listing {
             (
                 Self::Sessions,
                 ClientRequest::Agent {
-                    operation: Operation::Directory(scope),
+                    operation: Operation::Sessions(scope),
                     ..
                 },
             ) => {
@@ -64,28 +64,35 @@ impl Listing {
                 );
                 let sessions = if populated {
                     let id = "00000000-0000-4000-8000-000000000001".parse().unwrap();
-                    vec![agent_execution::directory::Entry {
-                        id,
-                        surface: agent_execution::directory::Surface::Chat,
-                        provider: Some(Provider::Claude),
-                        title: Some("Fixture session".into()),
-                        channel: None,
-                        view_scope: None,
-                        channel_repository: None,
-                        state: cagents::agent::ActivityState::Working,
-                        directory: Some("/fixture".into()),
-                        worktree: Some("/fixture".into()),
-                        project: Some("/fixture/.git".into()),
-                        project_name: Some("Fixture".into()),
-                        delegation: None,
-                        relation: agent_execution::directory::Relation::Peer,
-                        lineage: agent_execution::Lineage(id),
+                    vec![agent_execution::directory::Member {
+                        session: agent_execution::directory::Entry {
+                            id,
+                            surface: agent_execution::directory::Surface::Chat,
+                            provider: Some(Provider::Claude),
+                            title: Some("Fixture session".into()),
+                            channel: None,
+                            view_scope: None,
+                            channel_repository: None,
+                            state: cagents::agent::ActivityState::Working,
+                            directory: Some("/fixture".into()),
+                            worktree: Some("/fixture".into()),
+                            project: Some("/fixture/.git".into()),
+                            project_name: Some("Fixture".into()),
+                            delegation: None,
+                            relation: agent_execution::directory::Relation::Peer,
+                            lineage: agent_execution::Lineage(id),
+                        },
+                        exited: false,
+                        failure: None,
+                        active_at: None,
+                        limit: None,
+                        account: None,
                     }]
                 } else {
                     vec![]
                 };
-                ServerResponse::Agent(agent_execution::Reply::Directory(
-                    agent_execution::directory::Directory {
+                ServerResponse::Agent(agent_execution::Reply::Sessions(
+                    agent_execution::directory::Sessions {
                         caller: None,
                         scope: agent_execution::directory::Scope::All,
                         sessions,
@@ -515,6 +522,14 @@ fn accepted_wait_output(
                             scope: agent_execution::directory::Scope::Project(
                                 accepted.agent.spec.target.repository.clone(),
                             ),
+                            sessions: vec![],
+                        })
+                    }
+                    // The agent's usage limit and account, read beside its run.
+                    Operation::Sessions(scope) => {
+                        Reply::Sessions(agent_execution::directory::Sessions {
+                            caller: None,
+                            scope,
                             sessions: vec![],
                         })
                     }

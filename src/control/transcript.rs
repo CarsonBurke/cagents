@@ -276,6 +276,8 @@ mod tests {
             exited: true,
             failure: Some("You've hit your usage limit".into()),
             active_at: Some(60_000),
+            limit: None,
+            account: None,
         }
     }
 

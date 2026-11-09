@@ -1463,6 +1463,12 @@ impl Snapshot {
             })
     }
 
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children: the states in which it takes no
+    /// prompt, and which no usage limit from an earlier turn stops.
+    pub fn turn_accepted(&self) -> bool {
+        self.busy || self.waiting || !self.requests.is_empty()
+    }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy

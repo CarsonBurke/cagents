@@ -4,7 +4,8 @@ use crate::{
     agent::Provider,
     agent_execution::{
         Accepted, Agent, Authority, Control, Destination, Operation, Reply, Run, Spec, Submit,
-        Summary, Surface, Target, directory::Scope,
+        Summary, Surface, Target,
+        directory::{Member, Scope, UsageLimit},
     },
     model::{AgentId, RunId},
 };
@@ -791,6 +792,27 @@ impl Session {
         }
     }
 
+    /// The sessions of these agents as a listing reports them, with each
+    /// one's usage limit and account. A listing is context for a status, so
+    /// one that fails leaves the status as it was rather than failing it.
+    fn members(&mut self, agents: &[AgentId]) -> Vec<Member> {
+        let Ok(Reply::Sessions(listing)) = self.call(Operation::Sessions(Scope::All)) else {
+            return Vec::new();
+        };
+        listing
+            .caller
+            .into_iter()
+            .chain(listing.sessions)
+            .filter(|member| {
+                member
+                    .session
+                    .delegation
+                    .as_ref()
+                    .is_some_and(|delegation| agents.contains(&delegation.agent))
+            })
+            .collect()
+    }
+
     /// Submits once, and once more with the same key if the daemon's answer
     /// was lost: the key makes the retry return the first acceptance rather
     /// than start the work twice. Says whether it retried.
@@ -1018,22 +1040,43 @@ pub(super) fn execute_with_context(
             show,
         } => {
             let prompt = prompt.read()?;
+            let agent = session.agent(&agent)?;
+            // Read before the run starts a turn, which clears the limit.
+            let limit = member_of(&session.members(&[agent]), agent)
+                .and_then(|member| member.limit.clone());
             let request = Submit {
                 name: None,
-                destination: Destination::Existing(session.agent(&agent)?),
+                destination: Destination::Existing(agent),
                 prompt,
                 idempotency_key: retry.key(),
             };
-            submitted(&mut session, "agent.send", request, wait, show)
+            // The daemon refuses an agent stopped until a known reset, after
+            // answering a retry of an accepted submission with its acceptance.
+            let now = super::sessions::now_ms();
+            let mut output = submitted(&mut session, "agent.send", request, wait, show)
+                .map_err(|error| limited_refusal(error, limit.as_ref(), now))?;
+            if let Some(limit) = limit {
+                let notice = format!(
+                    "Its provider last stopped at a usage limit ({}); the run fails the same way unless the limit has lifted, as when the conversation's account changed.",
+                    super::sessions::limit_phrase(&limit, now)
+                );
+                output.human = format!("{}\n{notice}", output.human);
+                output.data["notice"] = json!(notice);
+            }
+            Ok(output)
         }
         AgentCommand::Status { agent, show } => {
             let agent = session.agent(&agent)?;
             let reply = session.call(Operation::Status(agent))?;
             let (agent, run) = status_reply(reply)?;
-            let human = status_lines(&agent, &run, false, show);
+            let members = session.members(&[agent.id]);
+            let member = member_of(&members, agent.id);
+            let human = with_standing(status_lines(&agent, &run, false, show), member);
+            let mut data = json!({"agent": agent, "run": run, "timed_out": false});
+            standing_json(&mut data, member);
             Ok(CommandOutput {
                 command: "agent.status",
-                data: json!({"agent": agent, "run": run, "timed_out": false}),
+                data,
                 human,
             })
         }
@@ -1067,10 +1110,19 @@ pub(super) fn execute_with_context(
                 .into_iter()
                 .map(status_reply)
                 .collect::<Result<Vec<_>, _>>()?;
+            let members = session.members(
+                &statuses
+                    .iter()
+                    .map(|(agent, _)| agent.id)
+                    .collect::<Vec<_>>(),
+            );
             let mut human = statuses
                 .iter()
                 .map(|(agent, run)| {
-                    status_lines(agent, run, timed_out && !run.state.wait_ready(), show)
+                    with_standing(
+                        status_lines(agent, run, timed_out && !run.state.wait_ready(), show),
+                        member_of(&members, agent.id),
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join("\n\n");
@@ -1168,6 +1220,32 @@ pub(super) fn execute_with_context(
     }
 }
 
+/// The daemon's refusal of a follow-up for an agent a usage limit stops
+/// until a known reset, reported as `agent_limited`. The refusal names the
+/// reset in the provider's words; the limit read before submitting dates it
+/// where the account's usage readings do.
+fn limited_refusal(mut error: AppError, limit: Option<&UsageLimit>, now: u64) -> AppError {
+    if !is_limited_refusal(&error) {
+        return error;
+    }
+    error.kind = "agent_limited";
+    if let Some(limit) = limit.filter(|limit| limit.resets_at.is_some()) {
+        error.message = format!(
+            "{} ({}), so the prompt was not sent. {}",
+            crate::agent_execution::LIMITED_REFUSAL,
+            super::sessions::limit_phrase(limit, now),
+            crate::agent_execution::LIMITED_ADVICE,
+        );
+    }
+    error
+}
+
+fn is_limited_refusal(error: &AppError) -> bool {
+    error
+        .message
+        .starts_with(crate::agent_execution::LIMITED_REFUSAL)
+}
+
 /// Reports an acceptance, after waiting on its run when asked to.
 fn submitted(
     session: &mut Session,
@@ -1186,6 +1264,10 @@ fn submitted(
     // Whether a failed submission was accepted is unknown, so the key that
     // makes retrying it safe goes with the error.
     let (reply, retried) = session.submit(request).map_err(|mut error| {
+        // A limit's refusal is definite: nothing was accepted to retry.
+        if is_limited_refusal(&error) {
+            return error;
+        }
         error.message = format!(
             "{}; retry with --idempotency-key {key} to avoid starting the work twice",
             error.message
@@ -1235,7 +1317,7 @@ fn submitted(
         let (agent, run) = match replies.pop() {
             Some(reply) => status_reply(reply)
                 .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?,
-            None => (accepted.agent, accepted.run),
+            None => (accepted.agent.clone(), accepted.run.clone()),
         };
         human = status_lines(&agent, &run, timed_out, show);
         human.push_str(&arrived_lines(&messages));
@@ -1252,11 +1334,61 @@ fn submitted(
             data["messages"] = json!(messages);
         }
     }
+    // A run that settled says what stops its provider now, and the account.
+    let members = session.members(&[accepted.agent.id]);
+    let member = member_of(&members, accepted.agent.id);
+    if wait.wait {
+        human = with_standing(human, member);
+    }
+    standing_json(&mut data, member);
     Ok(CommandOutput {
         command,
         data,
         human,
     })
+}
+
+/// The listed session of `agent`.
+fn member_of(members: &[Member], agent: AgentId) -> Option<&Member> {
+    members.iter().find(|member| {
+        member
+            .session
+            .delegation
+            .as_ref()
+            .is_some_and(|delegation| delegation.agent == agent)
+    })
+}
+
+/// A status with what stops the agent's provider and the account it runs
+/// on, after its first line, which readers of the output parse.
+fn with_standing(lines: String, member: Option<&Member>) -> String {
+    let Some(member) = member else {
+        return lines;
+    };
+    let now = super::sessions::now_ms();
+    let mut standing = String::new();
+    if let Some(limit) = &member.limit {
+        standing.push_str(&format!(
+            "\nStopped by a usage limit: {}",
+            super::sessions::limit_phrase(limit, now)
+        ));
+    }
+    if let Some(account) = &member.account {
+        standing.push_str(&format!(
+            "\nAccount {}",
+            super::sessions::account_phrase(account, now)
+        ));
+    }
+    match lines.split_once('\n') {
+        Some((head, rest)) => format!("{head}{standing}\n{rest}"),
+        None => format!("{lines}{standing}"),
+    }
+}
+
+/// The agent's usage limit and account, as `sessions --json` reports them.
+fn standing_json(data: &mut Value, member: Option<&Member>) {
+    data["limit"] = json!(member.and_then(|member| member.limit.as_ref()));
+    data["account"] = json!(member.and_then(|member| member.account.as_ref()));
 }
 
 /// A failed observation must not hide work the daemon already accepted.
@@ -1510,6 +1642,43 @@ fn answers(fields: &[String]) -> Result<Vec<crate::chat::Answer>, AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_daemons_limit_refusal_reads_as_agent_limited_and_names_its_reset() {
+        use crate::agent_execution::{LIMITED_ADVICE, LIMITED_REFUSAL};
+        // As the daemon words it: the provider's reset wording, if any.
+        let refused = || {
+            AppError::new(
+                "protocol",
+                format!(
+                    "{LIMITED_REFUSAL} (Claude weekly limit reached), so the prompt was not sent. {LIMITED_ADVICE}"
+                ),
+            )
+        };
+        let now = 1_000_000_000;
+        let dated = UsageLimit {
+            summary: "Claude weekly limit reached".into(),
+            reset: None,
+            resets_at: Some(1_000_000 + 3 * 3600),
+        };
+        let error = limited_refusal(refused(), Some(&dated), now);
+        assert_eq!(error.kind, "agent_limited");
+        assert_eq!(
+            error.message,
+            format!(
+                "{LIMITED_REFUSAL} (Claude weekly limit reached, resets in 3 hr), so the prompt was not sent. {LIMITED_ADVICE}"
+            ),
+            "the reset the account's readings date is named, and no retry is offered"
+        );
+        // Without a dated limit read beforehand, the daemon's words stand.
+        let undated = limited_refusal(refused(), None, now);
+        assert_eq!(undated.kind, "agent_limited");
+        assert_eq!(undated.message, refused().message);
+        let other = AppError::new("protocol", "The agent is not running");
+        let other = limited_refusal(other, Some(&dated), now);
+        assert_eq!(other.kind, "protocol");
+        assert_eq!(other.message, "The agent is not running");
+    }
 
     #[test]
     fn accepted_wait_recovery_keeps_device_routing_and_original_error_details() {
@@ -2778,6 +2947,76 @@ mod tests {
         assert!(
             matches!(parse(&["spawn", "--name", "reviewer", "Review this"]), AgentCommand::Spawn { name: Some(name), .. } if name == "reviewer")
         );
+    }
+
+    #[test]
+    fn a_status_names_the_limit_and_account_without_moving_its_run_line() {
+        use crate::agent_execution::directory::{
+            Delegation, Entry, Member, Owner, Relation, SessionAccount, Surface, UsageLimit,
+        };
+        let agent = AgentId::new();
+        let id = crate::model::TerminalId::new();
+        let member = Member {
+            session: Entry {
+                id,
+                surface: Surface::Chat,
+                provider: Some(Provider::Claude),
+                title: None,
+                channel: None,
+                view_scope: None,
+                channel_repository: None,
+                state: crate::agent::ActivityState::Idle,
+                directory: None,
+                worktree: None,
+                project: None,
+                project_name: None,
+                delegation: Some(Delegation {
+                    agent,
+                    owner: Owner::User,
+                    run: None,
+                    run_state: None,
+                }),
+                relation: Relation::Child,
+                lineage: crate::agent_execution::Lineage(id),
+            },
+            exited: false,
+            failure: None,
+            active_at: None,
+            limit: Some(UsageLimit {
+                summary: "Claude weekly limit reached".into(),
+                reset: Some("3pm".into()),
+                resets_at: None,
+            }),
+            account: Some(SessionAccount {
+                id: "claude/system".parse().unwrap(),
+                label: None,
+                status: None,
+                remaining: Vec::new(),
+                stale: false,
+                observed_at: None,
+                ordinary_usage_allowed: None,
+            }),
+        };
+        let members = [member];
+        assert!(member_of(&members, AgentId::new()).is_none());
+        let found = member_of(&members, agent);
+        let status = "agent 1234 (claude) run 5678 Failed\n\nActual result";
+        let human = with_standing(status.into(), found);
+        assert_eq!(
+            human,
+            "agent 1234 (claude) run 5678 Failed\nStopped by a usage limit: Claude weekly limit reached, resets 3pm\nAccount claude/system: allowance unknown\n\nActual result"
+        );
+        #[cfg(feature = "ui")]
+        {
+            let run = read_run(&human).unwrap();
+            assert_eq!(run.state, Some(crate::agent_execution::State::Failed));
+            assert_eq!(run.result, "Actual result");
+        }
+        assert_eq!(with_standing(status.into(), None), status);
+        let mut data = json!({});
+        standing_json(&mut data, found);
+        assert_eq!(data["limit"]["reset"], "3pm");
+        assert_eq!(data["account"]["id"], "claude/system");
     }
 
     #[test]
