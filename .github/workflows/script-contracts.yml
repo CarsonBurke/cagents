@@ -243,9 +243,13 @@ jobs:
                   if result.returncode:
                       raise SystemExit(result.returncode)
               if source in ("scripts/native-evidence", "scripts/install-local"):
-                  result = subprocess.run(["bash", "-n", source])
-                  if result.returncode:
-                      raise SystemExit(result.returncode)
+                  shells = [source]
+                  if source == "scripts/native-evidence" and present(Path("scripts/native-evidence-remote")):
+                      shells.append("scripts/native-evidence-remote")
+                  for shell in shells:
+                      result = subprocess.run(["bash", "-n", shell])
+                      if result.returncode:
+                          raise SystemExit(result.returncode)
               result = subprocess.run([sys.executable, "-I", "-B", fixture, "-v"])
               if result.returncode:
                   raise SystemExit(result.returncode)
