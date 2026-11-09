@@ -315,10 +315,7 @@ impl Cagents {
                 // no screen. Leaving it there would let one Enter reach both
                 // the button and the screen.
                 if self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
-                    tasks.push(
-                        iced::widget::operation::focus(self.card_keyboard_focus(card))
-                            .map(cosmic::Action::App),
-                    );
+                    tasks.push(self.focus_pane_keyboard(card));
                 }
                 return Task::batch(tasks);
             }
@@ -339,8 +336,7 @@ impl Cagents {
         // Without a screen to type into, the keyboard belongs on the
         // relaunch, so Enter still does what the footer says it does.
         if current && self.workspace.focused() == Some(card) && !self.workspace_inputs_blocked() {
-            return iced::widget::operation::focus(self.card_keyboard_focus(card))
-                .map(cosmic::Action::App);
+            return self.focus_pane_keyboard(card);
         }
         Task::none()
     }

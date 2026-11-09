@@ -417,10 +417,9 @@ impl Cagents {
                 self.palette.recording_error = None;
                 self.palette.move_pane = None;
                 self.palette.selected = None;
-                self.workspace.focused().map_or_else(Task::none, |card| {
-                    iced::widget::operation::focus(self.card_keyboard_focus(card))
-                        .map(cosmic::Action::App)
-                })
+                self.workspace
+                    .focused()
+                    .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
             }
             Action::Query(query) => {
                 self.palette.query = Some(query);
@@ -519,9 +518,10 @@ impl Cagents {
         // A command can move focus to another pane synchronously. Restore
         // that current pane before running the command's explicit focus
         // effects, which may instead land in a dialog or another control.
-        let restore = self.workspace.focused().map_or_else(Task::none, |card| {
-            iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
-        });
+        let restore = self
+            .workspace
+            .focused()
+            .map_or_else(Task::none, |card| self.focus_pane_keyboard(card));
         restore.chain(command)
     }
 
