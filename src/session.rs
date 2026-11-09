@@ -16,7 +16,7 @@ use crate::{
     },
     persistence::{
         SnapshotBase, StateStore, StoreError, StoredGenerations, TranscriptPruneReport,
-        TranscriptRetention,
+        TranscriptRetention, invalid_state,
     },
 };
 
@@ -91,7 +91,7 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
 /// content cannot help, so the remedy is changing it.
 pub const QUARANTINE_GUIDANCE: &str = "Storage refused these changes and will not retry them on \
      its own; everything else keeps saving. Changing or closing the item saves it again. If this \
-     repeats, report the failure category and database path.";
+     repeats, report the rule it broke, which cagents diagnostics keeps, and the database path.";
 
 impl SaveFailureCategory {
     pub fn label(self) -> &'static str {
@@ -261,6 +261,26 @@ impl WriteSubject {
             Self::Worktree { id, .. } => format!("worktree {id}"),
         }
     }
+
+    /// The subject as private diagnostics record it: its kind and identifier.
+    fn diagnostic(&self) -> (crate::diagnostics::RefusedWrite, Option<uuid::Uuid>) {
+        use crate::diagnostics::RefusedWrite;
+
+        match self {
+            Self::Workspace { card } => (RefusedWrite::Workspace, card.map(CardId::as_uuid)),
+            Self::Pane { card } => (RefusedWrite::Pane, Some(card.as_uuid())),
+            Self::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Terminal,
+            } => (RefusedWrite::RelaunchedTerminal, Some(card.as_uuid())),
+            Self::CardIdentity {
+                card,
+                kind: ReplacedIdentity::Chat,
+            } => (RefusedWrite::NewConversation, Some(card.as_uuid())),
+            Self::Project { id, .. } => (RefusedWrite::Project, Some(id.as_uuid())),
+            Self::Worktree { id, .. } => (RefusedWrite::Worktree, Some(id.as_uuid())),
+        }
+    }
 }
 
 /// A write storage refused by construction. It is never retried on its own;
@@ -270,6 +290,9 @@ impl WriteSubject {
 pub struct QuarantinedWrite {
     pub subject: WriteSubject,
     pub category: SaveFailureCategory,
+    /// The rule storage refused the write for, in words that name none of
+    /// its content: see [`crate::persistence::RefusedCheck`].
+    pub check: crate::diagnostics::Check,
     pub refused_at_unix_ms: i64,
     /// Writes that cannot land before this one does and are held back until
     /// it is superseded: the worktree rows of a project storage has no row for.
@@ -1100,9 +1123,11 @@ struct PendingWrites {
 }
 
 /// When storage first refused a subject, and why it refuses it now.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Refusal {
     category: SaveFailureCategory,
+    /// The rule the write broke, which is safe to show and record.
+    check: crate::diagnostics::Check,
     at_unix_ms: i64,
     /// Tells one cause from another without keeping the store error, which
     /// stays on this thread. A subject refused again for a new reason is a new
@@ -1144,6 +1169,12 @@ impl Refusal {
         error.to_string().hash(&mut cause);
         Self {
             category: save_failure_category(error),
+            // Only a refusal by construction is set aside, and each names
+            // the rule it broke.
+            check: error.refused_check().map_or_else(
+                || crate::diagnostics::Check::new("an unnamed storage rule"),
+                Into::into,
+            ),
             at_unix_ms: unix_millis(),
             cause: cause.finish(),
         }
@@ -1165,21 +1196,34 @@ fn refuse<K: Eq + std::hash::Hash, V>(
     error: &StoreError,
 ) {
     let refusal = record_refusal(
-        entries.get(&key).map(|(_, refusal)| *refusal),
+        entries.get(&key).map(|(_, refusal)| refusal.clone()),
         subject,
         error,
     );
     entries.insert(key, (write, refusal));
 }
 
+/// Logs a refusal of `subject` and returns it, keeping the time of the first
+/// of an unbroken run of refusals.
+///
+/// The log is not where a refusal is found after the fact: it is written only
+/// under local debugging, and a window started by `cagents ui` has nowhere to
+/// write it. Private diagnostics keep the subject and the rule it broke each
+/// time the rule is new. A subject whose every edit is refused for the same
+/// rule is one record, not one per edit, so it cannot push the window's other
+/// records out of the bounded ring.
 fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &StoreError) -> Refusal {
     let refusal = Refusal::new(error);
+    if names_a_new_rule(previous.as_ref(), &refusal) {
+        crate::diagnostics::record(refusal_event(&subject, &refusal));
+    }
     match previous {
         None => {
             tracing::warn!(
                 ?subject,
                 %error,
                 category = refusal.category.label(),
+                check = %refusal.check,
                 "storage refused a cagents write by construction; setting it aside so the rest \
                  of the session keeps saving"
             );
@@ -1197,6 +1241,7 @@ fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &Stor
                     ?subject,
                     %error,
                     category = refusal.category.label(),
+                    check = %refusal.check,
                     "storage refused a newer write of a refused subject, for a different reason"
                 );
             }
@@ -1205,6 +1250,42 @@ fn record_refusal(previous: Option<Refusal>, subject: WriteSubject, error: &Stor
                 ..refusal
             }
         }
+    }
+}
+
+/// Whether `refusal` breaks a rule other than the one `previous` refusal of the
+/// same subject broke, which is when private diagnostics record it. Another
+/// value in the same rule, such as a newer edit of the refused pane, is not.
+fn names_a_new_rule(previous: Option<&Refusal>, refusal: &Refusal) -> bool {
+    previous.is_none_or(|previous| previous.check != refusal.check)
+}
+
+/// The private diagnostic of a refusal: what was refused, by identifier, and
+/// the rule it broke. Never a title, name, path or any other content.
+fn refusal_event(subject: &WriteSubject, refusal: &Refusal) -> crate::diagnostics::Event {
+    let (write, id) = subject.diagnostic();
+    crate::diagnostics::Event::StorageRefused {
+        write,
+        id,
+        check: refusal.check.clone(),
+    }
+}
+
+/// Records a refusal of a one-shot write. Its error goes back to whoever asked
+/// for it, and nothing retries it or keeps it on a notice, so this record is
+/// the only one that outlasts the reply.
+fn record_one_shot_refusal(
+    write: crate::diagnostics::RefusedWrite,
+    id: uuid::Uuid,
+    error: &StoreError,
+) {
+    if let Some(check) = error.refused_check() {
+        tracing::warn!(?write, %id, %error, "storage refused a one-shot cagents write");
+        crate::diagnostics::record(crate::diagnostics::Event::StorageRefused {
+            write,
+            id: Some(id),
+            check: check.into(),
+        });
     }
 }
 
@@ -1288,7 +1369,9 @@ impl Quarantine {
             _ => None,
         };
         let refusal = record_refusal(
-            self.workspace.as_ref().map(|(_, _, refusal)| *refusal),
+            self.workspace
+                .as_ref()
+                .map(|(_, _, refusal)| refusal.clone()),
             WriteSubject::Workspace { card },
             error,
         );
@@ -1411,6 +1494,7 @@ impl Quarantine {
         let entry = |subject, refusal: &Refusal, held_back| QuarantinedWrite {
             subject,
             category: refusal.category,
+            check: refusal.check.clone(),
             refused_at_unix_ms: refusal.at_unix_ms,
             held_back,
         };
@@ -1465,16 +1549,16 @@ trait SessionStore {
         _base: SnapshotBase<'_>,
         _recovery: crate::persistence::TerminalPaneAdoption,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support terminal ownership recovery".into(),
+        Err(invalid_state!(
+            "This store does not support terminal ownership recovery"
         ))
     }
     fn preserve_chat_copy(
         &self,
         _copy: &crate::persistence::RetainedChatCopy,
     ) -> Result<crate::persistence::WorkspaceCommit, StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support retained chat copies".into(),
+        Err(invalid_state!(
+            "This store does not support retained chat copies"
         ))
     }
 
@@ -1484,8 +1568,8 @@ trait SessionStore {
         _card_id: CardId,
         _recovery: &crate::chat::client::UpgradeRecovery,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support authenticated chat recovery".into(),
+        Err(invalid_state!(
+            "This store does not support authenticated chat recovery"
         ))
     }
     fn rebind_chat_upgrade(
@@ -1494,8 +1578,8 @@ trait SessionStore {
         _source: &crate::chat::Session,
         _replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support upgrade recovery".into(),
+        Err(invalid_state!(
+            "This store does not support upgrade recovery"
         ))
     }
     fn rebind_chat_resume(
@@ -1504,8 +1588,8 @@ trait SessionStore {
         _source: &crate::chat::Session,
         _replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support resume recovery".into(),
+        Err(invalid_state!(
+            "This store does not support resume recovery"
         ))
     }
     fn rebind_chat_account(
@@ -1514,8 +1598,8 @@ trait SessionStore {
         _source: &crate::chat::Session,
         _replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
-        Err(StoreError::InvalidState(
-            "This store does not support account recovery".into(),
+        Err(invalid_state!(
+            "This store does not support account recovery"
         ))
     }
     fn replace_terminal_identity(
@@ -1544,8 +1628,8 @@ trait SessionStore {
         if adoptions.is_empty() {
             self.save_workspace(state, base)
         } else {
-            Err(StoreError::InvalidState(
-                "This store does not support canonical pane adoption".into(),
+            Err(invalid_state!(
+                "This store does not support canonical pane adoption"
             ))
         }
     }
@@ -1559,8 +1643,8 @@ trait SessionStore {
         if restorations.is_empty() {
             self.save_workspace_with_terminal_adoptions(state, base, adoptions)
         } else {
-            Err(StoreError::InvalidState(
-                "This store does not support restored pane ownership".into(),
+            Err(invalid_state!(
+                "This store does not support restored pane ownership"
             ))
         }
     }
@@ -2079,8 +2163,17 @@ impl PendingWrites {
                     reply,
                 } => {
                     self.translate_chat_rebindings(&mut snapshot);
+                    let canonical = recovery.canonical;
+                    let repair = move |error: &StoreError| {
+                        record_one_shot_refusal(
+                            crate::diagnostics::RefusedWrite::TerminalRepair,
+                            canonical.as_uuid(),
+                            error,
+                        );
+                        error.to_string()
+                    };
                     if let Err(error) = self.project_retained_chat_copies(&mut snapshot) {
-                        let _ = reply.send(Err(error.to_string()));
+                        let _ = reply.send(Err(repair(&error)));
                         continue;
                     }
                     let holds_refused_terminal = |state: &WorkspaceState| {
@@ -2133,7 +2226,7 @@ impl PendingWrites {
                                 self.acknowledge_retained_copy_closures(&snapshot);
                                 Ok(())
                             }
-                            Err(error) => Err(error.to_string()),
+                            Err(error) => Err(repair(&error)),
                         },
                     };
                     if result.is_err() {
@@ -2158,6 +2251,11 @@ impl PendingWrites {
                             }
                         }
                         Err(error) => {
+                            record_one_shot_refusal(
+                                crate::diagnostics::RefusedWrite::RetainedChatCopy,
+                                copy.copy.id.as_uuid(),
+                                &error,
+                            );
                             if let Some(reply) = reply {
                                 let _ = reply.send(Err(error.to_string()));
                             }
@@ -2195,8 +2293,8 @@ impl PendingWrites {
                             if witness.source() != &recovery.source
                                 || witness.replacement() != &recovery.replacement
                             {
-                                Err(StoreError::InvalidState(
-                                    "Authenticated recovery payload changed before commit".into(),
+                                Err(invalid_state!(
+                                    "Authenticated recovery payload changed before commit"
                                 ))
                             } else {
                                 store.rebind_authenticated_chat_upgrade(recovery.card, &witness)
@@ -2210,9 +2308,14 @@ impl PendingWrites {
                     // An explicit identity change is one-shot. In particular an
                     // I/O failure must not silently commit after the UI has
                     // refused activation and retired its candidate.
-                    let _ = recovery
-                        .reply
-                        .send(result.map_err(|error| error.to_string()));
+                    let _ = recovery.reply.send(result.map_err(|error| {
+                        record_one_shot_refusal(
+                            crate::diagnostics::RefusedWrite::ConversationRecovery,
+                            recovery.card.as_uuid(),
+                            &error,
+                        );
+                        error.to_string()
+                    }));
                 }
                 ConversionCheckpoint::IdentityReplacement(mut replacement) => {
                     self.quarantine.continue_refused(&mut replacement);
@@ -2528,7 +2631,7 @@ fn unix_millis() -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum WriterExit {
     Shutdown(crate::diagnostics::Event),
     Unavailable,
@@ -2815,7 +2918,7 @@ fn persistence_loop(
                     )
                 },
             };
-            crate::diagnostics::record(final_flush);
+            crate::diagnostics::record(final_flush.clone());
             return WriterExit::Shutdown(final_flush);
         }
     }
@@ -2945,15 +3048,22 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
 
 /// Why a barrier cannot vouch for a window whose state storage refused.
 ///
-/// It names each refused part of that state. The guidance asks the reader to
-/// change or close "the item", and whoever reads this is often not looking at
-/// the window - an updater relays it to a terminal - so without the names
-/// there is nothing to act on.
+/// It names each refused part of that state and the rule storage refused it
+/// for. The guidance asks the reader to change or close "the item", and
+/// whoever reads this is often not looking at the window - an updater relays
+/// it to a terminal - so without the names there is nothing to act on, and
+/// without the rule nothing to report. Neither carries a title, name or path.
 fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWrite]) -> String {
     let subjects = refused
         .iter()
         .filter(|write| write.subject.is_window_state())
-        .map(|write| write.subject.summary())
+        .map(|write| {
+            format!(
+                "{} (refused by rule: {})",
+                write.subject.summary(),
+                write.check
+            )
+        })
         .collect::<Vec<_>>()
         .join("; ");
     format!(
@@ -3061,7 +3171,7 @@ mod tests {
                     expected: 1,
                     actual: 2,
                 }),
-                FakeWrite::Refuse => Err(StoreError::InvalidState("injected refusal".to_owned())),
+                FakeWrite::Refuse => Err(invalid_state!("injected refusal")),
                 FakeWrite::Panic => panic!("injected writer panic"),
             }
         }
@@ -4658,10 +4768,10 @@ mod tests {
                     rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
                     None,
                 ))),
-                ProjectWrite::Refuse => Err(StoreError::InvalidState(format!(
+                ProjectWrite::Refuse => Err(invalid_state!(
                     "tombstoned project {} cannot be resurrected",
                     project.id
-                ))),
+                )),
             }
         }
 
@@ -5369,7 +5479,7 @@ mod tests {
             ))
         };
         for permanent in [
-            StoreError::InvalidState("tombstoned card cannot be resurrected".into()),
+            invalid_state!("tombstoned card cannot be resurrected"),
             StoreError::Serialization(serde_json::from_str::<u8>("x").unwrap_err()),
             constraint(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
             constraint(rusqlite::ffi::SQLITE_CONSTRAINT_CHECK),
@@ -5377,7 +5487,7 @@ mod tests {
             foreign_key_violation(),
             StoreError::Card {
                 card: CardId::new(),
-                error: Box::new(StoreError::InvalidState("invalid conversion".into())),
+                error: Box::new(invalid_state!("invalid conversion")),
             },
         ] {
             assert!(permanent.refuses_content(), "{permanent:?}");
@@ -5615,6 +5725,7 @@ mod tests {
                     name: "refused".into(),
                 },
                 category: SaveFailureCategory::InvalidData,
+                check: crate::diagnostics::Check::new("tombstoned project … cannot be resurrected"),
                 refused_at_unix_ms: writes.quarantine.projects[&refused.id].1.at_unix_ms,
                 held_back: 1,
             }]
@@ -5749,9 +5860,14 @@ mod tests {
             .expect_err("a barrier cannot vouch for a window storage refused");
         assert!(refusal.contains("refused part of the window"), "{refusal}");
         assert!(
-            refusal.contains(&format!("the latest changes to pane {resurrected}")),
-            "a refused barrier names what the reader has to change: {refusal}"
+            refusal.contains(&format!(
+                "the latest changes to pane {resurrected} (refused by rule: tombstoned card … \
+                 cannot be resurrected)."
+            )),
+            "a refused barrier names what the reader has to change, and the rule it broke: \
+             {refusal}"
         );
+        assert!(!refusal.contains("first draft"), "{refusal}");
         assert!(refusal.contains(QUARANTINE_GUIDANCE), "{refusal}");
         let refused = latest_health(&health);
         assert_eq!(refused.health, SessionSaveHealth::Healthy);
@@ -5963,7 +6079,7 @@ mod tests {
             let unrelated = project("unrelated refusal");
             writes
                 .quarantine
-                .refuse_project(unrelated, &StoreError::InvalidState("unrelated".into()));
+                .refuse_project(unrelated, &invalid_state!("unrelated"));
             let mut reviewed = (*refused).clone();
             reviewed
                 .chat_drafts
@@ -6273,7 +6389,10 @@ mod tests {
         runtime.snapshot(Arc::new(state.clone()));
         let refusal = runtime.flush(timeout).unwrap_err();
         assert!(
-            refusal.contains("(saved state is invalid): the window's layout and panes."),
+            refusal.contains(
+                "(saved state is invalid): the window's layout and panes (refused by rule: \
+                 workspace … focuses missing or closed card …)."
+            ),
             "{refusal}"
         );
         // Asking again changes nothing: the same window is still unsaved.
@@ -6290,11 +6409,97 @@ mod tests {
         assert!(!store.recovery_report().dirty_shutdown);
     }
 
+    /// Private diagnostics keep which subject storage refused, by identifier,
+    /// and the rule it broke - never the content the full error names.
+    #[test]
+    fn a_refusal_is_recorded_by_subject_and_rule_without_its_content() {
+        let project = project("private-client");
+        let worktree = worktree(&project, "secret-branch");
+        let card = CardId::new();
+        let cases = [
+            (
+                project_subject(&project),
+                invalid_state!(
+                    "project {} at {} cannot be saved",
+                    project.name,
+                    project.repository.display()
+                ),
+                "project",
+                Some(project.id.as_uuid()),
+                "project … at … cannot be saved",
+            ),
+            (
+                worktree_subject(&worktree),
+                invalid_state!(
+                    "worktree {} on {:?} is invalid",
+                    worktree.path.display(),
+                    worktree.branch
+                ),
+                "worktree",
+                Some(worktree.id.as_uuid()),
+                "worktree … on … is invalid",
+            ),
+            (
+                WriteSubject::Pane { card },
+                StoreError::Card {
+                    card,
+                    error: Box::new(invalid_state!("chat card {card} changed source identity")),
+                },
+                "pane",
+                Some(card.as_uuid()),
+                "chat card … changed source identity",
+            ),
+            (
+                WriteSubject::CardIdentity {
+                    card,
+                    kind: ReplacedIdentity::Chat,
+                },
+                StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE),
+                    Some("UNIQUE constraint failed: cards.terminal_id".into()),
+                )),
+                "new_conversation",
+                Some(card.as_uuid()),
+                "a SQLite UNIQUE constraint on cards.terminal_id",
+            ),
+            (
+                WriteSubject::Workspace { card: None },
+                StoreError::Serialization(
+                    serde_json::to_string(&HashMap::from([((1, 2), "/home/someone")])).unwrap_err(),
+                ),
+                "workspace",
+                None,
+                "the state could not be encoded as JSON",
+            ),
+        ];
+        for (subject, error, write, id, check) in cases {
+            let refusal = Refusal::new(&error);
+            let event = refusal_event(&subject, &refusal);
+            let json = serde_json::to_value(&event).unwrap();
+            assert_eq!(
+                json,
+                serde_json::json!({
+                    "kind": "storage_refused",
+                    "write": write,
+                    "id": id,
+                    "check": check,
+                }),
+                "{error}"
+            );
+            let text = json.to_string();
+            for private in ["private-client", "secret-branch", "/repo", "/home/someone"] {
+                assert!(!text.contains(private), "{text} leaks {private}");
+            }
+        }
+    }
+
     /// A subject refused again keeps the time of its first refusal, and the
     /// lane can still tell that the reason it is refused for has changed.
     #[test]
     fn a_refusal_for_a_new_reason_is_told_apart_from_a_repeated_one() {
-        let refused = |reason: &str| StoreError::InvalidState(reason.to_owned());
+        let refused = |reason: &'static str| {
+            StoreError::InvalidState(crate::persistence::Violation::new(reason, reason))
+        };
         let mut quarantine = Quarantine::default();
         quarantine.refuse_workspace(Arc::new(workspace()), &refused("first"));
         let (_, _, first) = quarantine.workspace.clone().unwrap();
@@ -6306,6 +6511,26 @@ mod tests {
         assert_eq!(repeated.cause, first.cause);
         assert_ne!(changed.cause, first.cause);
         assert_eq!(changed.at_unix_ms, first.at_unix_ms);
+        assert_eq!(
+            (first.check.as_str(), changed.check.as_str()),
+            ("first", "second"),
+            "the reported rule follows the newest refusal"
+        );
+
+        // Diagnostics record a subject once per rule: the same rule over
+        // other values is logged as a new cause but not recorded again.
+        let card = CardId::new();
+        let pane = |generation: i64| {
+            Refusal::new(&invalid_state!(
+                "card {card} expected generation {generation}"
+            ))
+        };
+        let (earlier, later) = (pane(1), pane(2));
+        assert_ne!(earlier.cause, later.cause);
+        assert!(names_a_new_rule(None, &earlier));
+        assert!(!names_a_new_rule(Some(&earlier), &later));
+        assert!(names_a_new_rule(Some(&first), &changed));
+        assert!(!names_a_new_rule(Some(&first), &repeated));
     }
 
     /// A relaunch storage refused leaves the stored identity where it was, and
@@ -6711,6 +6936,7 @@ mod tests {
         let refused = QuarantinedWrite {
             subject: WriteSubject::Workspace { card: None },
             category: SaveFailureCategory::InvalidData,
+            check: crate::diagnostics::Check::new("injected refusal"),
             refused_at_unix_ms: 1,
             held_back: 0,
         };
