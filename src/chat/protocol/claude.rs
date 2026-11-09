@@ -81,6 +81,38 @@ pub(crate) fn embedded_protocol_frame(line: &[u8]) -> bool {
     false
 }
 
+/// The whole record at the end of a line that opens with a damaged one, and
+/// where it starts. Claude Code appends to a file a crash left mid-record,
+/// so the next record shares that record's line.
+fn trailing_record(line: &[u8]) -> Option<(usize, Value)> {
+    // Inspect a bounded number of objects, however many braces a line has.
+    const CANDIDATES: usize = 256;
+    let end = line.len()
+        - line
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_whitespace())
+            .count();
+    let mut start = 1;
+    for _ in 0..CANDIDATES {
+        let at = start
+            + line
+                .get(start..end)?
+                .iter()
+                .position(|byte| *byte == b'{')?;
+        let mut values = serde_json::Deserializer::from_slice(&line[at..end]).into_iter::<Value>();
+        match values.next() {
+            Some(Ok(value)) if at + values.byte_offset() == end => {
+                return (value.is_object() && value["type"].is_string()).then_some((at, value));
+            }
+            // An object nested in the damaged record ends before the line.
+            Some(Ok(_)) => start = at + values.byte_offset(),
+            _ => start = at + 1,
+        }
+    }
+    None
+}
+
 fn has_frame_shape(value: &Value) -> bool {
     match value["type"].as_str() {
         Some("result" | "system") => value["subtype"].is_string(),
@@ -151,12 +183,29 @@ fn create_inner(
     let mut spec = ProcessSpec::from(&launch.recipe);
     spec.stdout_noise = Some(embedded_protocol_frame);
     spec.arguments = arguments(launch)?;
-    let history = launch
+    let history_only = forced_history || launch.needs_read_only_history();
+    // A conversation whose saved history cannot be shown still resumes: the
+    // provider keeps its own copy. Only a reader with no provider needs it.
+    // An unresolvable launch fails here; only reading the transcript it
+    // names may fall short.
+    let transcript = launch
         .session_id
         .as_deref()
-        .map(|id| History::open(launch, id))
+        .map(|id| History::locate(launch, id).map(|place| (place, id)))
         .transpose()?;
-    let history_only = forced_history || launch.needs_read_only_history();
+    let (history, history_error) = match transcript
+        .map(|((config, cwd), id)| History::open(&config, &cwd, id))
+        .transpose()
+    {
+        Ok(history) => (history, None),
+        Err(HistoryUnavailable::Unreadable(error)) if !history_only => {
+            tracing::warn!(%error, "Resuming a Claude conversation without its saved history");
+            (None, Some(error))
+        }
+        Err(HistoryUnavailable::Missing(error) | HistoryUnavailable::Unreadable(error)) => {
+            return Err(error);
+        }
+    };
     if history_only {
         spec.transport = super::TransportSpec::History;
     }
@@ -182,6 +231,7 @@ fn create_inner(
             turn_visible_content: false,
             cwd: launch.recipe.working_directory.clone(),
             history,
+            history_error,
             titles: super::claude_titles::ClaudeTitles::new(launch),
             ..Claude::default()
         }),
@@ -641,6 +691,9 @@ struct Claude {
     aliases: HashMap<String, String>,
     usage: Usage,
     history: Option<History>,
+    /// Why a resumed conversation's saved history could not be read. The
+    /// provider still resumes it; the transcript says what is missing.
+    history_error: Option<String>,
     /// A saved directory is gone; only its exact persisted history is readable.
     history_only: bool,
     forced_history: bool,
@@ -2526,8 +2579,27 @@ impl Adapter for Claude {
                 json!({"subtype":"initialize", "forwardSubagentText":true, "supportedDialogKinds":[], "promptSuggestions":true}),
             )?
         };
+        if let Some(error) = self.history_error.take() {
+            step.events.push(Event::History {
+                items: vec![history_notice(
+                    "Earlier messages in this conversation could not be shown",
+                    format!(
+                        "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code still has the transcript and continues the conversation with everything said before.\n\nDetails: {error}"
+                    ),
+                )],
+                has_earlier: false,
+            });
+        }
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
+            if let Some(body) =
+                skipped_records(history.damaged, history.oversized, !self.history_only)
+            {
+                step.events.push(Event::History {
+                    items: vec![history_notice("Some saved messages are not shown", body)],
+                    has_earlier: false,
+                });
+            }
             self.history_outcomes = std::mem::take(&mut history.call_outcomes);
             let mut calls = history.agent_ids.iter().collect::<Vec<_>>();
             calls.sort_by_key(|(tool, _)| history.agent_tools.get(*tool));
@@ -3945,6 +4017,59 @@ const COMPACTED: &str = "Context compacted";
 fn notice_item(id: String, summary: &str, body: String) -> Item {
     Item {
         id,
+        role: Role::System,
+        content: ItemContent::Delivery {
+            kind: DeliveryKind::Notice,
+            from: String::new(),
+            sender: String::new(),
+            summary: summary.into(),
+            body,
+        },
+        started_at: None,
+        at: None,
+    }
+}
+
+/// What a transcript's skipped records were, in a sentence each, or `None`
+/// when none were skipped.
+fn skipped_records(damaged: usize, oversized: usize, resumes: bool) -> Option<String> {
+    let count = |count: usize| match count {
+        1 => "One saved message".to_owned(),
+        count => format!("{count} saved messages"),
+    };
+    let mut lines = Vec::new();
+    if damaged > 0 {
+        lines.push(format!(
+            "{} could not be read: {} cut short, for example when Claude Code was stopped while saving.",
+            count(damaged),
+            if damaged == 1 { "it was" } else { "they were" }
+        ));
+    }
+    if oversized > 0 {
+        lines.push(format!(
+            "{} {} too large to show, such as a very long tool output.",
+            count(oversized),
+            if oversized == 1 { "is" } else { "are" }
+        ));
+    }
+    if lines.is_empty() {
+        return None;
+    }
+    lines.push(
+        if resumes {
+            "Everything else in the conversation is shown, and Claude Code continues it as usual."
+        } else {
+            "Everything else in the conversation is shown."
+        }
+        .into(),
+    );
+    Some(lines.join(" "))
+}
+
+/// A disclosure about the saved history itself, ahead of what it shows.
+fn history_notice(summary: &str, body: String) -> Item {
+    Item {
+        id: format!("history-notice:{summary}"),
         role: Role::System,
         content: ItemContent::Delivery {
             kind: DeliveryKind::Notice,
@@ -5671,6 +5796,20 @@ struct History {
     /// Result carriers' preceding call locations in the selected visible
     /// chain. Offset metadata only; no input or patch bodies are retained.
     result_calls: HashMap<u64, Vec<(usize, (u64, u64, usize, usize))>>,
+    /// Records skipped because they were damaged, such as cut short by a
+    /// crash, and so held nothing that could be read.
+    damaged: usize,
+    /// Intact records too large to show, such as a huge tool output.
+    oversized: usize,
+}
+/// Why a conversation's saved history cannot be shown.
+#[derive(Debug)]
+enum HistoryUnavailable {
+    /// There is no transcript, so Claude Code has nothing to resume either.
+    Missing(String),
+    /// The transcript is there, but cagents cannot read it, for example
+    /// because it is too large to index. Claude Code still resumes from it.
+    Unreadable(String),
 }
 type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
 #[derive(Debug)]
@@ -5721,7 +5860,9 @@ struct Compaction {
     preceding: Option<String>,
 }
 impl History {
-    fn open(launch: &Launch, id: &str) -> Result<Self, String> {
+    /// The account configuration and resolved directory whose transcript a
+    /// launch resumes. Only a launch that names neither exactly fails here.
+    fn locate(launch: &Launch, id: &str) -> Result<(PathBuf, PathBuf), String> {
         validate_id(id)?;
         let saved_cwd = &launch.recipe.working_directory;
         let cwd = match saved_cwd.canonicalize() {
@@ -5765,16 +5906,31 @@ impl History {
                 PathBuf::from(home).join(".claude")
             }
         };
-        let path = crate::agent::claude_transcript(&config, &cwd, id)?;
+        Ok((config, cwd))
+    }
+
+    fn open(config: &Path, cwd: &Path, id: &str) -> Result<Self, HistoryUnavailable> {
+        let path = crate::agent::claude_transcript(config, cwd, id).map_err(|error| {
+            if crate::agent::claude_transcript_exists(config, cwd, id) {
+                HistoryUnavailable::Unreadable(error)
+            } else {
+                HistoryUnavailable::Missing(error)
+            }
+        })?;
         let mut options = std::fs::OpenOptions::new();
         use std::os::unix::fs::OpenOptionsExt as _;
         options
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        let file = options
-            .open(&path)
-            .map_err(|e| format!("Cannot open exact Claude transcript: {e}"))?;
-        let mut history = Self::index(file, id)?;
+        let file = options.open(&path).map_err(|error| {
+            let message = format!("Cannot open exact Claude transcript: {error}");
+            if error.kind() == std::io::ErrorKind::NotFound {
+                HistoryUnavailable::Missing(message)
+            } else {
+                HistoryUnavailable::Unreadable(message)
+            }
+        })?;
+        let mut history = Self::index(file, id).map_err(HistoryUnavailable::Unreadable)?;
         history.subagent_dir = Some(path.with_extension("").join("subagents"));
         Ok(history)
     }
@@ -5811,6 +5967,8 @@ impl History {
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
         let mut tool_ref_count = 0_usize;
+        let mut damaged = 0_usize;
+        let mut oversized = 0_usize;
         while position < metadata.len() {
             line.clear();
             let count = std::io::Read::by_ref(&mut reader)
@@ -5821,15 +5979,46 @@ impl History {
                 break;
             }
             if count > MAX_PAYLOAD {
-                return Err("Claude transcript contains a record larger than 30 MiB".into());
+                // An oversized record is a tool's output or an attachment;
+                // skip the rest of it and keep the conversation readable.
+                let mut skipped = count as u64;
+                while line.last() != Some(&b'\n') {
+                    line.clear();
+                    let more = std::io::Read::by_ref(&mut reader)
+                        .take(MAX_PAYLOAD as u64)
+                        .read_until(b'\n', &mut line)
+                        .map_err(|e| e.to_string())?;
+                    if more == 0 {
+                        break;
+                    }
+                    skipped += more as u64;
+                }
+                position += skipped;
+                oversized += 1;
+                continue;
             }
-            let record_offset = position;
+            let mut record_offset = position;
             position += count as u64;
             if line.iter().all(u8::is_ascii_whitespace) {
                 continue;
             }
-            let value: Value = serde_json::from_slice(&line)
-                .map_err(|e| format!("Malformed exact Claude transcript: {e}"))?;
+            let (value, count) = match serde_json::from_slice::<Value>(&line) {
+                Ok(value) => (value, count),
+                // The last record, still being written by a conversation open
+                // elsewhere, is not damage: it is read whole next time.
+                Err(_) if position >= metadata.len() && line.last() != Some(&b'\n') => continue,
+                Err(_) => {
+                    // A record a crash cut short holds nothing that can be
+                    // shown. Claude Code appends its next record to the same
+                    // line, and that one is whole.
+                    damaged += 1;
+                    let Some((start, value)) = trailing_record(&line) else {
+                        continue;
+                    };
+                    record_offset += start as u64;
+                    (value, count - start)
+                }
+            };
             if value["sessionId"].as_str().is_some_and(|value| value != id) {
                 return Err("Claude transcript contains another session identity".into());
             }
@@ -6103,6 +6292,13 @@ impl History {
             }
         }
         leaf = leaf.or(fallback);
+        // Messages in file order, for crossing a record that was skipped.
+        let mut written = nodes
+            .iter()
+            .filter(|(_, node)| node.message)
+            .map(|(id, node)| (node.first_order, id.as_str()))
+            .collect::<Vec<_>>();
+        written.sort_unstable();
         let mut chain = Vec::new();
         let mut chain_tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -6135,33 +6331,46 @@ impl History {
                 chain_tools.insert(position, (node.range, &node.tool_refs));
                 newer_record = node.compact_record;
             }
-            // A compaction boundary has no parent: the turns it summarised
-            // continue through its logical parent, when that was recorded
-            // before it, and otherwise from the message that preceded it.
-            // Messages the compaction kept may already have been read after
-            // the summary; the summarised turns continue before them.
-            leaf = node.parent.as_deref().or_else(|| {
-                let compaction = node.compaction.as_ref()?;
-                compacted = true;
-                let mut previous = compaction
-                    .logical_parent
-                    .as_deref()
-                    .filter(|previous| {
-                        nodes
-                            .get(*previous)
-                            .is_some_and(|previous| previous.first_order < node.first_order)
-                    })
-                    .or(compaction.preceding.as_deref())?;
-                let mut kept = HashSet::new();
-                while seen.contains(previous) {
-                    if !kept.insert(previous) {
-                        return None;
-                    }
-                    let node = nodes.get(previous)?;
-                    previous = node.first_parent.as_deref().or(node.parent.as_deref())?;
+            leaf = match node.parent.as_deref() {
+                // A skipped record leaves its successor's parent unknown. The
+                // conversation goes on from the message written before it,
+                // rather than ending there and hiding everything earlier.
+                Some(parent) if !nodes.contains_key(parent) && damaged + oversized > 0 => {
+                    let before = written.partition_point(|(order, _)| *order < node.first_order);
+                    written[..before]
+                        .iter()
+                        .rev()
+                        .map(|(_, id)| *id)
+                        .find(|id| !seen.contains(id))
                 }
-                Some(previous)
-            });
+                Some(parent) => Some(parent),
+                // A compaction boundary has no parent: the turns it summarised
+                // continue through its logical parent, when that was recorded
+                // before it, and otherwise from the message that preceded it.
+                // Messages the compaction kept may already have been read after
+                // the summary; the summarised turns continue before them.
+                None => node.compaction.as_ref().and_then(|compaction| {
+                    compacted = true;
+                    let mut previous = compaction
+                        .logical_parent
+                        .as_deref()
+                        .filter(|previous| {
+                            nodes
+                                .get(*previous)
+                                .is_some_and(|previous| previous.first_order < node.first_order)
+                        })
+                        .or(compaction.preceding.as_deref())?;
+                    let mut kept = HashSet::new();
+                    while seen.contains(previous) {
+                        if !kept.insert(previous) {
+                            return None;
+                        }
+                        let node = nodes.get(previous)?;
+                        previous = node.first_parent.as_deref().or(node.parent.as_deref())?;
+                    }
+                    Some(previous)
+                }),
+            };
         }
         chain.reverse();
         chain_tools.reverse();
@@ -6195,6 +6404,8 @@ impl History {
             background_agent_tools,
             call_outcomes,
             result_calls,
+            damaged,
+            oversized,
         })
     }
     /// Settles each agent the transcript leaves running that the user stopped,
@@ -15753,6 +15964,158 @@ mod tests {
         assert_eq!(history.offset, 1);
         assert_eq!(history.page().unwrap()[0]["uuid"], "earlier");
         assert_eq!(history.offset, 0);
+    }
+
+    /// A record a crash cut short, or one too large to show, used to make
+    /// the whole conversation unresumable. Each is skipped, and the
+    /// conversation reads on across it, from its first message to its last.
+    #[test]
+    fn skipped_records_do_not_cut_the_conversation_short() {
+        let id = "00000000-0000-4000-8000-000000000001";
+        let record = |uuid: &str, parent: Option<&str>, kind: &str, content: Value| json!({"type":kind,"uuid":uuid,"parentUuid":parent,"sessionId":id,"message":{"content":content}});
+        let mut file = tempfile::tempfile().unwrap();
+        writeln!(file, "{}", record("first", None, "user", json!("First"))).unwrap();
+        // Cut short mid-record by a crash. Claude Code resumed from the last
+        // record it could read and appended the next one to the same line.
+        writeln!(
+            file,
+            "{{\"parentUuid\":\"first\",\"isSidechain\":false,\"message\":{{\"content\":\"lo{}",
+            record("second", Some("first"), "assistant", json!("Second"))
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            record("third", Some("second"), "user", json!("Third"))
+        )
+        .unwrap();
+        // Intact, but too large to show; the next message follows from it.
+        writeln!(
+            file,
+            "{}",
+            record(
+                "huge",
+                Some("third"),
+                "assistant",
+                json!("x".repeat(MAX_PAYLOAD + 10))
+            )
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            record("fourth", Some("huge"), "user", json!("Fourth"))
+        )
+        .unwrap();
+        // Cut short with its line ended; the next message follows from it.
+        writeln!(
+            file,
+            "{{\"type\":\"assistant\",\"uuid\":\"lost\",\"parentUuid\":\"fourth\""
+        )
+        .unwrap();
+        writeln!(
+            file,
+            "{}",
+            record("fifth", Some("lost"), "user", json!("Fifth"))
+        )
+        .unwrap();
+        // Still being written by a conversation open elsewhere.
+        write!(file, "{{\"type\":\"assistant\",\"uuid\":\"pend").unwrap();
+        file.rewind().unwrap();
+        let mut history = History::index(file, id).unwrap();
+        assert_eq!((history.damaged, history.oversized), (2, 1));
+        let page = history.page().unwrap();
+        assert_eq!(
+            page.iter()
+                .map(|value| value["uuid"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["first", "second", "third", "fourth", "fifth"]
+        );
+        assert_eq!(page[1]["message"]["content"], "Second");
+    }
+
+    #[test]
+    fn the_skipped_records_notice_reads_in_plain_words() {
+        assert_eq!(skipped_records(0, 0, true), None);
+        assert_eq!(
+            skipped_records(1, 0, true).unwrap(),
+            "One saved message could not be read: it was cut short, for example when Claude Code was stopped while saving. Everything else in the conversation is shown, and Claude Code continues it as usual."
+        );
+        assert_eq!(
+            skipped_records(2, 3, false).unwrap(),
+            "2 saved messages could not be read: they were cut short, for example when Claude Code was stopped while saving. 3 saved messages are too large to show, such as a very long tool output. Everything else in the conversation is shown."
+        );
+    }
+
+    /// The provider keeps its own copy of a conversation, so one whose saved
+    /// transcript cagents cannot read still resumes, and the transcript says
+    /// so, rather than the card refusing to start at all. One with no
+    /// transcript has nothing to resume, and still refuses.
+    #[test]
+    fn an_unreadable_transcript_still_resumes_and_a_missing_one_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let cwd = root.path().join("project");
+        std::fs::create_dir(&cwd).unwrap();
+        let cwd = cwd.canonicalize().unwrap();
+        let config = root.path().join("config");
+        let id = "00000000-0000-4000-8000-000000000001";
+        let launch = |id: &str| Launch {
+            provider: Provider::Claude,
+            session_id: Some(id.into()),
+            recipe: crate::model::LaunchRecipe {
+                program: "claude".into(),
+                arguments: Vec::new(),
+                working_directory: cwd.clone(),
+                environment: std::collections::BTreeMap::from([(
+                    "CLAUDE_CONFIG_DIR".into(),
+                    config.to_string_lossy().into_owned(),
+                )]),
+                unset_environment: Default::default(),
+            },
+        };
+        // Nothing saved at all.
+        assert!(create(&launch(id)).is_err());
+        // Too large for cagents to index, though Claude Code reads it.
+        std::fs::create_dir_all(config.join("projects")).unwrap();
+        let project = config.join("projects").join(
+            cwd.to_str()
+                .unwrap()
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+                .collect::<String>(),
+        );
+        std::fs::create_dir(&project).unwrap();
+        std::fs::File::create(project.join(format!("{id}.jsonl")))
+            .unwrap()
+            .set_len(257 * 1024 * 1024)
+            .unwrap();
+        let (spec, mut adapter) = create(&launch(id)).unwrap();
+        assert!(!matches!(
+            spec.transport,
+            super::super::TransportSpec::History
+        ));
+        let step = adapter.initialize().unwrap();
+        let notice = step.events.iter().find_map(|event| match event {
+            Event::History { items, .. } => items.iter().find_map(|item| match &item.content {
+                ItemContent::Delivery { summary, body, .. } => {
+                    Some((summary.clone(), body.clone()))
+                }
+                _ => None,
+            }),
+            _ => None,
+        });
+        let (summary, body) = notice.expect("the transcript says what is missing");
+        assert_eq!(
+            summary,
+            "Earlier messages in this conversation could not be shown"
+        );
+        assert!(body.starts_with("cagents could not read"), "{body}");
+        assert!(body.contains("Details: "), "{body}");
+        // Another conversation in the same project has no transcript.
+        assert!(create(&launch("00000000-0000-4000-8000-000000000002")).is_err());
+        // A reader with no provider has nothing to show and still refuses.
+        std::fs::remove_dir(&cwd).unwrap();
+        assert!(create(&launch(id)).is_err());
     }
 
     /// Compaction rewrites what the session is carrying, and the context

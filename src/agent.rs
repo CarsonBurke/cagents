@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 mod claude;
 #[cfg(feature = "host")]
 pub(crate) use claude::transcript as claude_transcript;
+#[cfg(feature = "host")]
+pub(crate) use claude::transcript_exists as claude_transcript_exists;
 mod codex;
 #[cfg(feature = "host")]
 pub(crate) use codex::{archived_rollout as codex_archived_rollout, rollout as codex_rollout};
