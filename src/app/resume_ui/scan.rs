@@ -214,13 +214,31 @@ struct Records<'a> {
     finder: Finders,
 }
 
+/// A `"key":"value"` pair, written compactly, as Claude Code and Codex do,
+/// or with a space after the colon, as other JSON writers do.
+struct Field([memmem::Finder<'static>; 2]);
+
+impl Field {
+    fn new(key: &str, value: &str) -> Self {
+        let finder = |separator: &str| {
+            memmem::Finder::new(format!("\"{key}\"{separator}\"{value}\"").as_bytes()).into_owned()
+        };
+        Self([finder(":"), finder(": ")])
+    }
+
+    fn within(&self, line: &[u8]) -> bool {
+        self.0.iter().any(|finder| finder.find(line).is_some())
+    }
+}
+
 struct Finders {
     session_id: memmem::Finder<'static>,
-    user: memmem::Finder<'static>,
-    assistant: memmem::Finder<'static>,
-    text: memmem::Finder<'static>,
+    user: Field,
+    assistant: Field,
+    text: Field,
     tool_result: memmem::Finder<'static>,
-    titles: [memmem::Finder<'static>; 6],
+    titles: [memmem::Finder<'static>; 4],
+    title_types: [Field; 2],
     codex_meta: memmem::Finder<'static>,
     codex_context: memmem::Finder<'static>,
     codex_user: memmem::Finder<'static>,
@@ -228,27 +246,26 @@ struct Finders {
     codex_agent: memmem::Finder<'static>,
     codex_old_agent: memmem::Finder<'static>,
     codex_complete: memmem::Finder<'static>,
-    omp_session: memmem::Finder<'static>,
-    omp_user: memmem::Finder<'static>,
-    omp_assistant: memmem::Finder<'static>,
+    omp_session: Field,
+    omp_user: Field,
+    omp_assistant: Field,
 }
 
 impl Finders {
     fn new() -> Self {
         Self {
             session_id: memmem::Finder::new(b"\"sessionId\""),
-            user: memmem::Finder::new(b"\"type\":\"user\""),
-            assistant: memmem::Finder::new(b"\"type\":\"assistant\""),
-            text: memmem::Finder::new(b"\"type\":\"text\""),
+            user: Field::new("type", "user"),
+            assistant: Field::new("type", "assistant"),
+            text: Field::new("type", "text"),
             tool_result: memmem::Finder::new(b"\"tool_result\""),
             titles: [
                 memmem::Finder::new(b"\"custom-title\""),
                 memmem::Finder::new(b"\"ai-title\""),
-                memmem::Finder::new(b"\"type\":\"title\""),
                 memmem::Finder::new(b"\"session_info\""),
-                memmem::Finder::new(b"\"type\":\"summary\""),
                 memmem::Finder::new(b"\"thread_name_updated\""),
             ],
+            title_types: [Field::new("type", "title"), Field::new("type", "summary")],
             codex_meta: memmem::Finder::new(b"\"session_meta\""),
             codex_context: memmem::Finder::new(b"\"turn_context\""),
             codex_user: memmem::Finder::new(b"\"UserMessage\""),
@@ -256,9 +273,9 @@ impl Finders {
             codex_agent: memmem::Finder::new(b"\"AgentMessage\""),
             codex_old_agent: memmem::Finder::new(b"\"agent_message\""),
             codex_complete: memmem::Finder::new(b"\"task_complete\""),
-            omp_session: memmem::Finder::new(b"\"type\":\"session\""),
-            omp_user: memmem::Finder::new(b"\"role\":\"user\""),
-            omp_assistant: memmem::Finder::new(b"\"role\":\"assistant\""),
+            omp_session: Field::new("type", "session"),
+            omp_user: Field::new("role", "user"),
+            omp_assistant: Field::new("role", "assistant"),
         }
     }
 }
@@ -285,11 +302,16 @@ impl<'a> Records<'a> {
     fn record(&mut self, line: &[u8]) {
         let has = |finder: &memmem::Finder<'_>| finder.find(line).is_some();
         let declared = self.scan.identity.is_some();
-        let titled = self.finder.titles.iter().any(|finder| has(finder));
+        let titled = self.finder.titles.iter().any(|finder| has(finder))
+            || self
+                .finder
+                .title_types
+                .iter()
+                .any(|field| field.within(line));
         match self.provider {
             Provider::Claude => {
-                let user = has(&self.finder.user) && !has(&self.finder.tool_result);
-                let reply = has(&self.finder.assistant) && has(&self.finder.text);
+                let user = self.finder.user.within(line) && !has(&self.finder.tool_result);
+                let reply = self.finder.assistant.within(line) && self.finder.text.within(line);
                 if reply && declared {
                     self.scan.found.replies += 1;
                     let kept = self.reply.get_or_insert_default();
@@ -340,9 +362,9 @@ impl<'a> Records<'a> {
                 }
             }
             Provider::Omp => {
-                let session = !declared && has(&self.finder.omp_session);
-                let prompt = has(&self.finder.omp_user);
-                let reply = has(&self.finder.omp_assistant);
+                let session = !declared && self.finder.omp_session.within(line);
+                let prompt = self.finder.omp_user.within(line);
+                let reply = self.finder.omp_assistant.within(line);
                 if !(session || prompt || reply || titled) {
                     return;
                 }
@@ -815,6 +837,34 @@ mod tests {
             summary.title().as_deref(),
             Some("Fix the token refresh race")
         );
+    }
+
+    /// A transcript written by a JSON writer that spaces its pairs reads the
+    /// same as Claude Code's compact one.
+    #[test]
+    fn a_spaced_transcript_reads_like_a_compact_one() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("t.jsonl");
+        std::fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{"type": "user", "sessionId": "{id}", "cwd": "/work/api", "message": {{"role": "user", "content": "Fix the token refresh race"}}}}"#,
+                    "\n",
+                    r#"{{"type": "assistant", "sessionId": "{id}", "cwd": "/work/api", "message": {{"model": "m", "role": "assistant", "content": [{{"type": "text", "text": "Fixed"}}]}}}}"#,
+                    "\n",
+                    r#"{{"type": "summary", "summary": "Token refresh", "leafUuid": "x"}}"#,
+                    "\n",
+                ),
+                id = ID
+            ),
+        )
+        .unwrap();
+        let scan = read(Provider::Claude, &path, None);
+        let summary = scan.summary().unwrap();
+        assert_eq!((summary.prompts, summary.replies), (1, 1));
+        assert_eq!(summary.last_reply.as_deref(), Some("Fixed"));
+        assert_eq!(summary.name.as_deref(), Some("Token refresh"));
     }
 
     #[test]

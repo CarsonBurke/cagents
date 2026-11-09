@@ -229,7 +229,7 @@ impl Scope {
                 .as_ref()
                 .map_or_else(String::new, |worktree| worktree.label.clone()),
             Reach::Project => self.project.clone(),
-            Reach::Everywhere => "All projects".into(),
+            Reach::Everywhere => "Everywhere".into(),
         }
     }
 }
@@ -1482,10 +1482,19 @@ impl Cagents {
             Element::from(
                 widget::row::with_children(vec![
                     list,
-                    widget::container(widget::scrollable(preview))
-                        .width(Length::Fixed(PREVIEW_WIDTH))
-                        .height(Length::Fill)
-                        .into(),
+                    widget::container(
+                        widget::scrollable(
+                            widget::container(preview)
+                                .padding(design::with_vertical_rail(Padding::ZERO))
+                                .width(Length::Fill),
+                        )
+                        .direction(
+                            iced::widget::scrollable::Direction::Vertical(design::scrollbar()),
+                        ),
+                    )
+                    .width(Length::Fixed(PREVIEW_WIDTH))
+                    .height(Length::Fill)
+                    .into(),
                 ])
                 .spacing(space::L)
                 .height(Length::Fill),
@@ -1534,7 +1543,7 @@ impl Cagents {
         {
             let line = |text: String| {
                 design::caption(text)
-                    .wrapping(iced::widget::text::Wrapping::None)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .ellipsize(iced::widget::text::Ellipsize::End(
                         EllipsizeHeightLimit::Lines(1),
                     ))
@@ -1542,7 +1551,7 @@ impl Cagents {
             };
             let mut title: Vec<Element<'_, Message>> = vec![
                 design::heading(&row.title)
-                    .wrapping(iced::widget::text::Wrapping::None)
+                    .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                     .ellipsize(iced::widget::text::Ellipsize::End(
                         EllipsizeHeightLimit::Lines(1),
                     ))
@@ -1593,10 +1602,17 @@ impl Cagents {
         if rows.is_empty() {
             rows.push(self.resume_empty());
         }
-        let list = widget::scrollable(widget::column::with_children(rows).spacing(ROW_SPACING))
-            .id(widget::Id::new("conversation-resume.results"))
-            .width(Length::Fill)
-            .height(Length::Fill);
+        let list = widget::scrollable(
+            widget::column::with_children(rows)
+                .spacing(ROW_SPACING)
+                .padding(design::with_vertical_rail(Padding::ZERO)),
+        )
+        .direction(iced::widget::scrollable::Direction::Vertical(
+            design::scrollbar(),
+        ))
+        .id(widget::Id::new("conversation-resume.results"))
+        .width(Length::Fill)
+        .height(Length::Fill);
         // Leaving the list returns the preview to the selection.
         iced::widget::mouse_area(list)
             .on_exit(Message::ResumeConversation(Action::Hover(None)))
@@ -1606,12 +1622,21 @@ impl Cagents {
     /// Why nothing is listed, and where else to look.
     fn resume_empty(&self) -> Element<'_, Message> {
         let state = &self.resume_ui;
+        // The nearest place, in the order Tab visits them, that has matches.
         let elsewhere = state.scope.as_ref().and_then(|scope| {
-            scope
-                .reaches()
-                .filter(|reach| *reach != scope.reach && state.counts[reach.index()] > 0)
-                .last()
-                .map(|reach| (scope.label(reach), state.counts[reach.index()]))
+            let order: Vec<Reach> = scope.reaches().collect();
+            let at = order.iter().position(|reach| *reach == scope.reach)?;
+            (1..order.len()).find_map(|presses| {
+                let reach = order[(at + presses) % order.len()];
+                let count = state.counts[reach.index()];
+                (count > 0).then(|| {
+                    let place = match reach {
+                        Reach::Everywhere => "other projects".to_owned(),
+                        reach => scope.label(reach),
+                    };
+                    (place, count, presses)
+                })
+            })
         });
         let here = state.scope.as_ref().map(|scope| scope.label(scope.reach));
         let mut lines = vec![if state.rows.is_empty() && state.indexing.is_some() {
@@ -1625,13 +1650,14 @@ impl Cagents {
         } else {
             "No conversations yet.".to_owned()
         }];
-        if let Some((label, count)) = elsewhere {
+        if let Some((place, count, presses)) = elsewhere {
             lines.push(format!(
-                "{} in {label}. Press Tab to look there.",
+                "{} in {place}. Press Tab{} to look there.",
                 match count {
                     1 => "1 conversation".to_owned(),
                     count => format!("{count} conversations"),
-                }
+                },
+                if presses == 1 { "" } else { " twice" }
             ));
         }
         widget::column::with_children(
@@ -1751,7 +1777,7 @@ fn resume_exchange(row: &Row) -> Option<Element<'_, Message>> {
     let summary = row.summary.as_deref()?;
     let line = |label: &str, text: &str| -> Element<'static, Message> {
         design::caption(format!("{label}: {text}"))
-            .wrapping(iced::widget::text::Wrapping::None)
+            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
             .ellipsize(iced::widget::text::Ellipsize::End(
                 EllipsizeHeightLimit::Lines(1),
             ))
@@ -1785,15 +1811,34 @@ fn resume_reaches<'a>(scope: &Scope, counts: &[usize; 3]) -> Element<'a, Message
             .reaches()
             .map(|reach| {
                 let label = format!("{} {}", scope.label(reach), counts[reach.index()]);
-                widget::button::custom(design::body(label))
-                    .name(format!("Show conversations from {}", scope.label(reach)))
-                    .padding([space::XXS, space::S])
-                    .class(crate::ui_controls::control_style(
-                        reach == scope.reach,
-                        None,
-                    ))
-                    .on_press(Message::ResumeConversation(Action::Reach(reach)))
-                    .into()
+                // The sidebar's icons: a branch for a worktree, a folder for
+                // a project.
+                let icon = match reach {
+                    Reach::Worktree => Some(crate::ui_controls::Icon::Branch),
+                    Reach::Project => Some(crate::ui_controls::Icon::Folder),
+                    Reach::Everywhere => None,
+                };
+                let mut contents: Vec<Element<'_, Message>> = Vec::new();
+                if let Some(icon) = icon {
+                    contents.push(crate::ui_controls::passive_icon(
+                        icon,
+                        design::COMPACT_ICON_SIZE + 2,
+                    ));
+                }
+                contents.push(design::body(label).into());
+                widget::button::custom(
+                    widget::row::with_children(contents)
+                        .spacing(space::XXS)
+                        .align_y(Alignment::Center),
+                )
+                .name(format!("Show conversations from {}", scope.label(reach)))
+                .padding([space::XXS, space::S])
+                .class(crate::ui_controls::control_style(
+                    reach == scope.reach,
+                    None,
+                ))
+                .on_press(Message::ResumeConversation(Action::Reach(reach)))
+                .into()
             })
             .collect(),
     )
