@@ -26,12 +26,15 @@ use crate::repository::{
 pub mod avatar;
 pub mod checkout;
 pub mod polling;
+pub use crate::github_status as pr_status;
 pub mod review_actions;
 mod review_batches;
 mod review_refresh;
 pub mod review_requests;
+mod sidebar;
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
+pub use sidebar::append_recent_history;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 /// The Work board's view of the user's own pull requests: identity and state
@@ -1498,6 +1501,21 @@ pub fn remote_for_repository(
 }
 
 impl<E: ProcessExecutor> GitHubService<E> {
+    fn with_host_scope<T>(&self, host: &str, read: impl FnOnce() -> T) -> T {
+        if polling::current_scope().is_some() {
+            return read();
+        }
+        // Service reads run on workers. The UI's ready() only consults the
+        // binding installed here, never credential files or keyring services.
+        match crate::github_status::credential_fingerprint() {
+            Ok(scope) => {
+                polling::bind_scope(host, &scope);
+                polling::with_scope(&scope, read)
+            }
+            Err(_) => read(),
+        }
+    }
+
     /// Public GitHub or an enterprise host already known to gh. Arbitrary HTTPS
     /// remotes are not evidence that a repository belongs to GitHub.
     pub fn has_associated_remote(
@@ -1510,40 +1528,45 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .filter_map(|remote| remote.fetch_url.as_deref())
             .filter_map(remote_repository_key)
             .collect();
-        Self::check_remote_rate_limits(remotes)?;
-        if keys.iter().any(|key| key.host == "github.com") {
-            return Ok(true);
-        }
-        if keys.is_empty() {
+        let Some(host) = keys.first().map(|key| key.host.clone()) else {
             return Ok(false);
-        }
-        let output = self.execute(
-            &self.gh_command(["auth", "status", "--json", "hosts"]),
-            cancellation,
-        )?;
-        if !output.success
-            && let Some(limit) = polling::RateLimit::classify(
-                &format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                polling::now(),
-            )
-        {
-            let error = GitHubError::RateLimited { limit };
-            for key in &keys {
-                polling::failed(&key.host, &error);
+        };
+        self.with_host_scope(&host, || {
+            Self::check_remote_rate_limits(remotes)?;
+            if keys.iter().any(|key| key.host == "github.com") {
+                return Ok(true);
             }
-            return Err(error);
-        }
-        require_auth_status_json(&output, &self.gh)?;
-        // gh can return a failing auth exit status while still reporting known
-        // accounts as JSON; those hosts remain associated but cannot authorize.
-        let envelope: GhAuthEnvelope = parse_json(&output.stdout)?;
-        Ok(keys
-            .iter()
-            .any(|key| envelope.hosts.contains_key(&key.authority())))
+            if keys.is_empty() {
+                return Ok(false);
+            }
+            let output = self.execute(
+                &self.gh_command(["auth", "status", "--json", "hosts"]),
+                cancellation,
+            )?;
+            if !output.success
+                && let Some(limit) = polling::RateLimit::classify(
+                    &format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    polling::now(),
+                )
+            {
+                let error = GitHubError::RateLimited { limit };
+                for key in &keys {
+                    polling::failed(&key.host, &error);
+                }
+                return Err(error);
+            }
+            require_auth_status_json(&output, &self.gh)?;
+            // gh can return a failing auth exit status while still reporting known
+            // accounts as JSON; those hosts remain associated but cannot authorize.
+            let envelope: GhAuthEnvelope = parse_json(&output.stdout)?;
+            Ok(keys
+                .iter()
+                .any(|key| envelope.hosts.contains_key(&key.authority())))
+        })
     }
 
     // Discovery has not selected a repository yet. Conservatively pause it if
@@ -1730,18 +1753,25 @@ impl<E: ProcessExecutor> GitHubService<E> {
         remotes: &[crate::repository::RemoteRecord],
         cancellation: &CancellationToken,
     ) -> Result<GitHubRepoKey, GitHubError> {
-        Self::check_remote_rate_limits(remotes)?;
-        let result = self.resolve_repository_inner(repository, cancellation);
-        if let Err(error) = &result {
-            for key in remotes
-                .iter()
-                .filter_map(|remote| remote.fetch_url.as_deref())
-                .filter_map(remote_repository_key)
-            {
-                polling::failed(&key.host, error);
+        let host = remotes
+            .iter()
+            .filter_map(|remote| remote.fetch_url.as_deref())
+            .find_map(remote_repository_key)
+            .map_or_else(|| "github.com".into(), |key| key.host);
+        self.with_host_scope(&host, || {
+            Self::check_remote_rate_limits(remotes)?;
+            let result = self.resolve_repository_inner(repository, cancellation);
+            if let Err(error) = &result {
+                for key in remotes
+                    .iter()
+                    .filter_map(|remote| remote.fetch_url.as_deref())
+                    .filter_map(remote_repository_key)
+                {
+                    polling::failed(&key.host, error);
+                }
             }
-        }
-        result
+            result
+        })
     }
 
     fn resolve_repository_inner(
@@ -1781,24 +1811,26 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
         cancellation: &CancellationToken,
     ) -> Result<GhAuthStatus, GitHubError> {
-        let command = self.auth_status_command(repository);
-        repository.validate()?;
-        if let Some(limit) = polling::rate_limit(&repository.host) {
-            return Err(GitHubError::RateLimited { limit });
-        }
-        let result = (|| {
-            let output = self.execute(&command, cancellation)?;
-            require_auth_status_json(&output, &self.gh)?;
-            let output = self.checked_output(output, repository)?;
-            attach_process(
-                parse_auth_status(&output.stdout, &repository.authority()),
-                &output,
-            )
-        })();
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+        self.with_host_scope(&repository.host, || {
+            let command = self.auth_status_command(repository);
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.host) {
+                return Err(GitHubError::RateLimited { limit });
+            }
+            let result = (|| {
+                let output = self.execute(&command, cancellation)?;
+                require_auth_status_json(&output, &self.gh)?;
+                let output = self.checked_output(output, repository)?;
+                attach_process(
+                    parse_auth_status(&output.stdout, &repository.authority()),
+                    &output,
+                )
+            })();
+            if let Err(error) = &result {
+                polling::failed(&repository.host, error);
+            }
+            result
+        })
     }
 
     pub fn list(
@@ -2021,13 +2053,15 @@ impl<E: ProcessExecutor> GitHubService<E> {
         variables: Vec<(&str, GraphQlValue)>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
-        let command = self.graphql_command(repository, query, variables);
-        let output = self.run_checked(&command, repository, cancellation)?;
-        let result = attach_process(parse_graphql(&output.stdout), &output);
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+        self.with_host_scope(&repository.host, || {
+            let command = self.graphql_command(repository, query, variables);
+            let output = self.run_checked(&command, repository, cancellation)?;
+            let result = attach_process(parse_graphql(&output.stdout), &output);
+            if let Err(error) = &result {
+                polling::failed(&repository.host, error);
+            }
+            result
+        })
     }
 
     /// Like [`Self::graphql`], but a response whose only errors are
@@ -2039,39 +2073,44 @@ impl<E: ProcessExecutor> GitHubService<E> {
         variables: Vec<(&str, GraphQlValue)>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
-        repository.validate()?;
-        if let Some(limit) = polling::rate_limit(&repository.host) {
-            return Err(GitHubError::RateLimited { limit });
-        }
-        let command = self.graphql_command(repository, query, variables);
-        let output = self
-            .execute(&command, cancellation)
-            .map_err(GitHubError::from);
-        if let Ok(output) = &output
-            && !output.success
-            && let Some(data) = not_found_data(graphql_body(&output.stdout))
-        {
-            // The answer is complete, but its headers can still exhaust the
-            // host's quota, exactly as for a successful request.
-            let headers =
-                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
-            match polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now()) {
-                Some(limit) => {
-                    polling::failed(&repository.host, &GitHubError::RateLimited { limit })
-                }
-                None => polling::succeeded(&repository.host),
+        self.with_host_scope(&repository.host, || {
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.host) {
+                return Err(GitHubError::RateLimited { limit });
             }
-            return Ok(data);
-        }
-        let output = charge_host(
-            repository,
-            output.and_then(|output| self.checked_output(output, repository)),
-        )?;
-        let result = attach_process(parse_graphql(&output.stdout), &output);
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+            let command = self.graphql_command(repository, query, variables);
+            let output = self
+                .execute(&command, cancellation)
+                .map_err(GitHubError::from);
+            if let Ok(output) = &output
+                && !output.success
+                && let Some(data) = not_found_data(graphql_body(&output.stdout))
+            {
+                // The answer is complete, but its headers can still exhaust the
+                // host's quota, exactly as for a successful request.
+                let headers =
+                    &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+                match polling::RateLimit::classify(
+                    &String::from_utf8_lossy(headers),
+                    polling::now(),
+                ) {
+                    Some(limit) => {
+                        polling::failed(&repository.host, &GitHubError::RateLimited { limit })
+                    }
+                    None => polling::succeeded(&repository.host),
+                }
+                return Ok(data);
+            }
+            let output = charge_host(
+                repository,
+                output.and_then(|output| self.checked_output(output, repository)),
+            )?;
+            let result = attach_process(parse_graphql(&output.stdout), &output);
+            if let Err(error) = &result {
+                polling::failed(&repository.host, error);
+            }
+            result
+        })
     }
 
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
@@ -2363,7 +2402,16 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 message: "operation was cancelled before launch".into(),
                 started: false,
             })?;
-        self.executor.execute(command, cancellation)
+        let output = self.executor.execute(command, cancellation)?;
+        // The installed coordinator can refuse before it execs the real gh.
+        // This reserved exit/protocol is proof a mutation was not submitted;
+        // a timeout or an ordinary gh error retains its existing ambiguity.
+        if output.exit_code == Some(75) && output.stderr.starts_with(b"cagents-gh: deferred ") {
+            let mut failure = output.require_success(&self.gh).unwrap_err();
+            failure.started = false;
+            return Err(failure);
+        }
+        Ok(output)
     }
 
     fn run_checked(
@@ -2372,15 +2420,17 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
-        repository.validate()?;
-        if let Some(limit) = polling::rate_limit(&repository.host) {
-            return Err(GitHubError::RateLimited { limit });
-        }
-        let result = self
-            .execute(command, cancellation)
-            .map_err(GitHubError::from)
-            .and_then(|output| self.checked_output(output, repository));
-        charge_host(repository, result)
+        self.with_host_scope(&repository.host, || {
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.host) {
+                return Err(GitHubError::RateLimited { limit });
+            }
+            let result = self
+                .execute(command, cancellation)
+                .map_err(GitHubError::from)
+                .and_then(|output| self.checked_output(output, repository));
+            charge_host(repository, result)
+        })
     }
 
     fn checked_output(
@@ -2430,6 +2480,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .env("GH_PAGER", "cat")
             .env("NO_COLOR", "1")
             .env("GH_SPINNER_DISABLED", "1")
+            .env("CAGENTS_GH_NONBLOCKING", "1")
             .env_remove("GH_FORCE_TTY")
             .env_remove("GH_REPO")
             .env_remove("GH_HOST")
@@ -2484,98 +2535,104 @@ impl<E: ProcessExecutor> GitHubService<E> {
         payload: &str,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<serde_json::Value>, GitHubError> {
-        repository.validate()?;
-        let command = self.graphql_command(repository, mutation, variables);
-        let output = match self.execute(&command, cancellation) {
-            Ok(output) => output,
-            Err(failure) if failure.started => {
-                return Ok(ReviewMutationOutcome::OutcomeUnknown { failure });
+        self.with_host_scope(&repository.host, || {
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.host) {
+                return Err(GitHubError::RateLimited { limit });
             }
-            Err(failure) => return Ok(ReviewMutationOutcome::NotApplied { failure }),
-        };
-        if output.exit_code == Some(4) {
-            return Err(GitHubError::AuthenticationRequired {
-                host: repository.host.clone(),
-                failure: Box::new(output.require_success(&self.gh).unwrap_err()),
-            });
-        }
-        let body: Option<serde_json::Value> =
-            serde_json::from_slice(graphql_body(&output.stdout)).ok();
-        let headers = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
-        let error_text = body
-            .as_ref()
-            .and_then(|body| body.get("errors"))
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        if let Some(limit) = polling::RateLimit::classify(
-            &format!(
-                "{}\n{}\n{}",
-                String::from_utf8_lossy(headers),
-                error_text,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            polling::now(),
-        ) {
-            polling::failed(&repository.host, &GitHubError::RateLimited { limit });
-        }
-        let applied = body
-            .as_ref()
-            .and_then(|body| body.pointer(&format!("/data{payload}")))
-            .filter(|value| !value.is_null())
-            .cloned();
-        if let Some(value) = applied {
-            return Ok(ReviewMutationOutcome::Applied(value));
-        }
-        let errors: Vec<&serde_json::Value> = body
-            .as_ref()
-            .and_then(|body| body.get("errors"))
-            .and_then(serde_json::Value::as_array)
-            .map(|errors| errors.iter().collect())
-            .unwrap_or_default();
-        if errors.is_empty() {
-            return Ok(if output.success {
+            let command = self.graphql_command(repository, mutation, variables);
+            let output = match self.execute(&command, cancellation) {
+                Ok(output) => output,
+                Err(failure) if failure.started => {
+                    return Ok(ReviewMutationOutcome::OutcomeUnknown { failure });
+                }
+                Err(failure) => return Ok(ReviewMutationOutcome::NotApplied { failure }),
+            };
+            if output.exit_code == Some(4) {
+                return Err(GitHubError::AuthenticationRequired {
+                    host: repository.host.clone(),
+                    failure: Box::new(output.require_success(&self.gh).unwrap_err()),
+                });
+            }
+            let body: Option<serde_json::Value> =
+                serde_json::from_slice(graphql_body(&output.stdout)).ok();
+            let headers =
+                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            let error_text = body
+                .as_ref()
+                .and_then(|body| body.get("errors"))
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            if let Some(limit) = polling::RateLimit::classify(
+                &format!(
+                    "{}\n{}\n{}",
+                    String::from_utf8_lossy(headers),
+                    error_text,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                polling::now(),
+            ) {
+                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+            }
+            let applied = body
+                .as_ref()
+                .and_then(|body| body.pointer(&format!("/data{payload}")))
+                .filter(|value| !value.is_null())
+                .cloned();
+            if let Some(value) = applied {
+                return Ok(ReviewMutationOutcome::Applied(value));
+            }
+            let errors: Vec<&serde_json::Value> = body
+                .as_ref()
+                .and_then(|body| body.get("errors"))
+                .and_then(serde_json::Value::as_array)
+                .map(|errors| errors.iter().collect())
+                .unwrap_or_default();
+            if errors.is_empty() {
+                return Ok(if output.success {
+                    ReviewMutationOutcome::OutcomeUnknown {
+                        failure: parse_warning(
+                            &self.gh,
+                            output,
+                            "GitHub returned no mutation payload".into(),
+                        ),
+                    }
+                } else {
+                    ReviewMutationOutcome::OutcomeUnknown {
+                        failure: output.require_success(&self.gh).unwrap_err(),
+                    }
+                });
+            }
+            let message = errors
+                .iter()
+                .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            // Only evidence proves the write did not happen: a response with no
+            // `data` member never reached execution, and a typed refusal names a
+            // check the forge runs before writing. An untyped error beside a null
+            // payload is how GitHub reports a timeout or an internal failure, and
+            // those can land after the write — retrying them would post twice.
+            let refused = body.as_ref().is_some_and(|body| body.get("data").is_none())
+                || errors.iter().all(|error| {
+                    error
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(mutation_refusal_type)
+                });
+            Ok(if refused {
+                ReviewMutationOutcome::NotApplied {
+                    failure: parse_warning(&self.gh, output, format!("GitHub refused: {message}")),
+                }
+            } else {
                 ReviewMutationOutcome::OutcomeUnknown {
                     failure: parse_warning(
                         &self.gh,
                         output,
-                        "GitHub returned no mutation payload".into(),
+                        format!("GitHub did not confirm the change: {message}"),
                     ),
                 }
-            } else {
-                ReviewMutationOutcome::OutcomeUnknown {
-                    failure: output.require_success(&self.gh).unwrap_err(),
-                }
-            });
-        }
-        let message = errors
-            .iter()
-            .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("; ");
-        // Only evidence proves the write did not happen: a response with no
-        // `data` member never reached execution, and a typed refusal names a
-        // check the forge runs before writing. An untyped error beside a null
-        // payload is how GitHub reports a timeout or an internal failure, and
-        // those can land after the write — retrying them would post twice.
-        let refused = body.as_ref().is_some_and(|body| body.get("data").is_none())
-            || errors.iter().all(|error| {
-                error
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(mutation_refusal_type)
-            });
-        Ok(if refused {
-            ReviewMutationOutcome::NotApplied {
-                failure: parse_warning(&self.gh, output, format!("GitHub refused: {message}")),
-            }
-        } else {
-            ReviewMutationOutcome::OutcomeUnknown {
-                failure: parse_warning(
-                    &self.gh,
-                    output,
-                    format!("GitHub did not confirm the change: {message}"),
-                ),
-            }
+            })
         })
     }
 

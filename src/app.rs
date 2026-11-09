@@ -19922,37 +19922,15 @@ fn load_repository_github(
             return Err(GitHubAvailability::Unauthenticated);
         }
         let mut pull_requests = github
-            .list(
-                &ListPullRequestsRequest {
-                    repository: key.clone(),
-                    state: PullRequestStateFilter::Open,
-                    limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-                },
-                &cancellation,
-            )
+            .sidebar_open(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
             .map_err(GitHubAvailability::from_error)?;
         // Closed history must not consume the open-PR page. Its failure also
         // must not discard successfully refreshed open conversation authority.
-        if let Ok(history) = github.list(
-            &ListPullRequestsRequest {
-                repository: key.clone(),
-                state: PullRequestStateFilter::All,
-                limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-            },
-            &cancellation,
-        ) {
-            for entry in history {
-                if let Some(current) = pull_requests
-                    .iter_mut()
-                    .find(|current| current.number == entry.number)
-                {
-                    *current = entry;
-                } else {
-                    pull_requests.push(entry);
-                }
-            }
+        if let Ok(history) =
+            github.recent_history(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
+        {
+            crate::github::append_recent_history(&mut pull_requests, history);
         }
-        crate::github::polling::succeeded(&key.host);
         Ok(GitHubAvailability::Ready {
             repository_key: key,
             pull_requests: pull_requests

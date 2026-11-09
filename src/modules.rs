@@ -76,6 +76,8 @@ pub(crate) mod git_watch;
 #[cfg(any(feature = "ui", feature = "host"))]
 pub mod github;
 pub mod github_identity;
+pub(crate) mod github_rate_limit;
+pub mod github_status;
 #[cfg(feature = "host")]
 pub mod host;
 #[cfg(feature = "ui")]

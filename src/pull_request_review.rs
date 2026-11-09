@@ -1141,9 +1141,6 @@ impl State {
                             });
                         self.force_conversation = false;
                         self.loaded_snapshot = Some(loaded.clone());
-                        if let Some(target) = &self.target {
-                            crate::github::polling::succeeded(&target.repository.host);
-                        }
                         self.adopt(&loaded);
                         if unchanged_conversation {
                             return ActionTask::none();
@@ -1510,9 +1507,6 @@ impl State {
                 return ActionTask::none();
             }
         };
-        if let Some(source) = &self.source {
-            crate::github::polling::succeeded(&source.repository.host);
-        }
         self.list_cursor = page.next_cursor;
         let mut rows = if self.list_request.appending {
             match std::mem::replace(&mut self.list, ListState::Idle) {
@@ -1562,9 +1556,6 @@ impl State {
                 return;
             }
         };
-        if let Some(source) = &self.source {
-            crate::github::polling::succeeded(&source.repository.host);
-        }
         let mut rows = match self.search.take() {
             Some(search) if self.search_request.appending && search.query == query => search.rows,
             _ => Vec::new(),
@@ -1759,22 +1750,6 @@ impl State {
                         previous.as_deref(),
                         &cancellation,
                     );
-                    match &result {
-                        Ok(_) => {}
-                        Err(message)
-                            if !cancellation.is_cancelled()
-                                && crate::github::polling::ready(
-                                    &target.repository.host,
-                                    false,
-                                ) =>
-                        {
-                            crate::github::polling::failed(
-                                &target.repository.host,
-                                &crate::github::GitHubError::Inspection(message.clone()),
-                            )
-                        }
-                        Err(_) => {}
-                    }
                     result.map(Arc::new)
                 })
                 .await

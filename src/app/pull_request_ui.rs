@@ -336,11 +336,6 @@ impl State {
                 self.loaded = true;
                 match result {
                     Ok(inspection) => {
-                        if inspection.as_ref().is_none_or(|inspection| {
-                            inspection.checks.is_ok() && inspection.conversation.is_ok()
-                        }) {
-                            crate::github::polling::succeeded(&target.repository().host);
-                        }
                         self.comment_markdown.clear();
                         if let Some(inspection) = &inspection
                             && let Ok(conversation) = &inspection.conversation

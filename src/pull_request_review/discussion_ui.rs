@@ -478,9 +478,6 @@ impl State {
                             })
                             .collect();
                         self.discussion.conversation = Some(conversation);
-                        if let Some(target) = &self.target {
-                            crate::github::polling::succeeded(&target.repository.host);
-                        }
                     }
                     Err(error) => {
                         self.notice = Some(format!("Could not load review discussion. {error}"))

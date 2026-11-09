@@ -32,7 +32,9 @@ mod chat;
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
+mod gh;
 pub use agents::AgentCommand;
+pub use gh::GhCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
@@ -140,6 +142,11 @@ pub enum TopCommand {
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
+    /// Read GitHub status through a shared local cache.
+    Gh {
+        #[command(subcommand)]
+        command: GhCommand,
+    },
     /// Show this session, its parent and agents, and peers in its channel or checkout.
     Whoami,
     /// Inspect account plan allowances and the calling session’s context.
@@ -2575,6 +2582,32 @@ where
         };
     }
 
+    // This cache belongs to gh's local credential context, not the daemon.
+    // Reading it must not prepare a remote backend or recover a staged owner.
+    if let TopCommand::Gh { command } = cli.command {
+        if cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote() {
+            emit_error(
+                cli.json,
+                &AppError::new(
+                    "github_status_local_only",
+                    "Run GitHub status on the device containing the gh credentials; --device is not supported",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        return match gh::execute(command) {
+            Ok(output) => {
+                let code = output.exit_code();
+                emit_success(cli.json, output);
+                code
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let _device_cleanup = crate::device::Cleanup;
     if let Err(error) = crate::device::select(cli.device.as_deref()) {
         emit_error(cli.json, &AppError::new("device", error));
@@ -2732,6 +2765,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
         command,
         TopCommand::Completions { .. }
             | TopCommand::Diagnostics
+            | TopCommand::Gh { .. }
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
@@ -2783,6 +2817,7 @@ fn execute_with_model_context(
             })
         }
         TopCommand::Linear(command) => linear::execute(command),
+        TopCommand::Gh { command } => gh::execute(command),
         TopCommand::Automation { command } => match service_context {
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),

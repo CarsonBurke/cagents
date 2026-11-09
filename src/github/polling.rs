@@ -1,71 +1,64 @@
 //! One host budget shared by review, inspector and review-request polling.
 use super::*;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::cell::RefCell;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RateLimit {
-    pub retry_at: u64,
+thread_local! {
+    /// Shared workers already captured their credential context off the UI
+    /// thread. Keep that context through all service-level pacing decisions.
+    static SCOPE: RefCell<Option<String>> = const { RefCell::new(None) };
 }
-impl std::fmt::Display for RateLimit {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // UTC is explicit so the reset time remains unambiguous without a
-        // platform-specific clock dependency in the shared CLI boundary.
-        let time = format!(
-            "{:02}:{:02} UTC",
-            (self.retry_at / 3600) % 24,
-            (self.retry_at / 60) % 60
-        );
-        write!(f, "GitHub rate limit reached. Retrying at {time}")
-    }
-}
-pub fn now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs()
-}
-impl RateLimit {
-    pub fn classify(text: &str, now: u64) -> Option<Self> {
-        let lower = text.to_ascii_lowercase();
-        let header = |name: &str| {
-            lower.lines().find_map(|line| {
-                let (key, value) = line.trim().split_once(':')?;
-                (key.trim() == name)
-                    .then(|| value.trim().parse::<u64>().ok())
-                    .flatten()
-            })
-        };
-        let retry_after = header("retry-after");
-        // Access-Control-Expose-Headers lists Retry-After on ordinary GitHub
-        // responses; only a real Retry-After header is a pacing instruction.
-        if ![
-            "rate limit",
-            "rate_limit",
-            "rate-limited",
-            "abuse detection",
-        ]
-        .iter()
-        .any(|word| lower.contains(word))
-            && header("x-ratelimit-remaining") != Some(0)
-            && retry_after.is_none()
-        {
-            return None;
+
+pub(crate) fn with_scope<T>(scope: &str, read: impl FnOnce() -> T) -> T {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            SCOPE.with(|current| *current.borrow_mut() = self.0.take());
         }
-        Some(Self {
-            retry_at: (if header("x-ratelimit-remaining") == Some(0) {
-                header("x-ratelimit-reset")
-                    .into_iter()
-                    .chain(retry_after.map(|seconds| now.saturating_add(seconds)))
-                    .max()
-            } else {
-                retry_after.map(|seconds| now.saturating_add(seconds))
-            })
-            .or_else(|| header("x-ratelimit-reset"))
-            .unwrap_or_else(|| now.saturating_add(60))
-            .max(now.saturating_add(1)),
-        })
+    }
+    let _restore = Restore(SCOPE.with(|current| current.replace(Some(scope.to_owned()))));
+    read()
+}
+
+pub(crate) fn current_scope() -> Option<String> {
+    SCOPE.with(|scope| scope.borrow().clone())
+}
+
+static ACTIVE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
+
+/// Workers capture credentials before starting a read. UI admission follows
+/// that context without reading credential files on the UI thread. Completion
+/// of an older scoped request must never change this binding.
+pub(crate) fn bind_scope(host: &str, scope: &str) {
+    let host = host.to_ascii_lowercase();
+    let first = ACTIVE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(host.clone(), scope.into())
+        .is_none();
+    if first {
+        let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(budget) = budgets.remove(&host) {
+            budgets.insert(format!("{host}:{scope}"), budget);
+        }
     }
 }
+
+fn budget_key(host: &str) -> String {
+    SCOPE.with(|scope| match scope.borrow().as_deref() {
+        Some(scope) => format!("{}:{scope}", host.to_ascii_lowercase()),
+        None => {
+            let host = host.to_ascii_lowercase();
+            ACTIVE
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&host)
+                .map_or_else(|| host.clone(), |scope| format!("{host}:{scope}"))
+        }
+    })
+}
+
+pub use crate::github_rate_limit::{RateLimit, now};
+
 #[derive(Default)]
 struct Budget {
     failures: u32,
@@ -78,14 +71,14 @@ pub fn ready(host: &str, manual: bool) -> bool {
     BUDGETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&host.to_ascii_lowercase())
+        .get(&budget_key(host))
         .is_none_or(|b| b.due <= now() || (manual && !b.rate_limited))
 }
 pub fn rate_limit(host: &str) -> Option<RateLimit> {
     BUDGETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&host.to_ascii_lowercase())
+        .get(&budget_key(host))
         .filter(|budget| budget.rate_limited && budget.due > now())
         .map(|budget| RateLimit {
             retry_at: budget.due,
@@ -102,7 +95,7 @@ pub fn failed(host: &str, error: &GitHubError) {
         return;
     }
     let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
-    let budget = budgets.entry(host.to_ascii_lowercase()).or_default();
+    let budget = budgets.entry(budget_key(host)).or_default();
     budget.failures = budget.failures.saturating_add(1);
     if let Some(limit) = rate_limit {
         budget.due = budget.due.max(limit.retry_at);
@@ -120,16 +113,209 @@ pub fn failed(host: &str, error: &GitHubError) {
 }
 pub fn succeeded(host: &str) {
     let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
+    let key = budget_key(host);
     if budgets
-        .get(&host.to_ascii_lowercase())
+        .get(&key)
         .is_none_or(|b| !b.rate_limited || b.due <= now())
     {
-        budgets.remove(&host.to_ascii_lowercase());
+        budgets.remove(&key);
     }
 }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_coordination_refusal_proves_no_mutation_was_submitted() {
+        struct Deferred;
+        impl ProcessExecutor for Deferred {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                assert_eq!(
+                    command
+                        .environment
+                        .get(&OsString::from("CAGENTS_GH_NONBLOCKING")),
+                    Some(&OsString::from("1"))
+                );
+                Ok(ProcessOutput { success: false, exit_code: Some(75), signal: None, stdout: vec![],
+                    stderr: b"cagents-gh: deferred GitHub requests are paused by the shared rate limit.\nRetry-After: 3600\n".to_vec() })
+            }
+        }
+        let repository =
+            GitHubRepoKey::new("local-deferral.invalid", None, "owner", "repo").unwrap();
+        let service = GitHubService::new("gh", Arc::new(Deferred));
+        let outcome = service
+            .mutate(
+                &repository,
+                "mutation{test}",
+                vec![],
+                "/test",
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let ReviewMutationOutcome::NotApplied { failure } = outcome else {
+            panic!("local refusal is never an unknown write outcome")
+        };
+        assert!(!failure.started);
+        assert!(GitHubError::Process(failure).rate_limit().unwrap().retry_at >= now() + 3599);
+        BUDGETS
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(&repository.host));
+        ACTIVE.lock().unwrap().remove(&repository.host);
+    }
+
+    #[test]
+    fn late_old_account_error_does_not_poison_the_current_account_budget() {
+        struct Delayed {
+            started: mpsc::Sender<()>,
+            release: Mutex<mpsc::Receiver<()>>,
+        }
+        impl ProcessExecutor for Delayed {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.started.send(()).unwrap();
+                self.release.lock().unwrap().recv().unwrap();
+                Ok(ProcessOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    signal: None,
+                    stdout: br#"HTTP/2.0 200 OK
+Retry-After: 120
+
+{"data":null,"errors":[{"type":"RATE_LIMITED","message":"secondary rate limit"}]}"#
+                        .to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        struct Healthy;
+        impl ProcessExecutor for Healthy {
+            fn execute(
+                &self,
+                _: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                Ok(ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: br#"{"data":{"viewer":{"login":"current"}}}"#.to_vec(),
+                    stderr: vec![],
+                })
+            }
+        }
+        let host = "late-account-error.invalid";
+        let repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        let (started, wait_started) = mpsc::channel();
+        let (release, wait_release) = mpsc::channel();
+        bind_scope(host, "old-account");
+        let old_repository = repository.clone();
+        let old = thread::spawn(move || {
+            with_scope("old-account", || {
+                GitHubService::new(
+                    "gh",
+                    Arc::new(Delayed {
+                        started,
+                        release: Mutex::new(wait_release),
+                    }),
+                )
+                .graphql(
+                    &old_repository,
+                    "query{viewer{login}}",
+                    vec![],
+                    &CancellationToken::new(),
+                )
+            })
+        });
+        wait_started.recv_timeout(Duration::from_secs(5)).unwrap();
+        let current = GitHubService::new("gh", Arc::new(Healthy));
+        current
+            .graphql(
+                &repository,
+                "query{viewer{login}}",
+                vec![],
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        release.send(()).unwrap();
+        assert!(old.join().unwrap().is_err());
+        assert!(
+            ready(host, false),
+            "an old in-flight response cannot pause the new account"
+        );
+        with_scope("old-account", || assert!(!ready(host, false)));
+        current
+            .graphql(
+                &repository,
+                "query{viewer{login}}",
+                vec![],
+                &CancellationToken::new(),
+            )
+            .unwrap();
+        let current_scope = crate::github_status::credential_fingerprint().unwrap();
+        with_scope(&current_scope, || {
+            failed(
+                host,
+                &GitHubError::RateLimited {
+                    limit: RateLimit {
+                        retry_at: now() + 120,
+                    },
+                },
+            )
+        });
+        assert!(
+            !ready(host, false),
+            "shared scan limits still pause ordinary app reads"
+        );
+        assert!(
+            current
+                .graphql(
+                    &repository,
+                    "query{viewer{login}}",
+                    vec![],
+                    &CancellationToken::new()
+                )
+                .is_err()
+        );
+        BUDGETS
+            .lock()
+            .unwrap()
+            .retain(|key, _| !key.starts_with(host));
+        ACTIVE.lock().unwrap().remove(host);
+    }
+
+    #[test]
+    fn captured_credentials_isolate_pacing_and_restore_scope_after_unwind() {
+        let host = "credential-scope.invalid";
+        let limit = GitHubError::RateLimited {
+            limit: RateLimit {
+                retry_at: now() + 120,
+            },
+        };
+        failed(host, &limit);
+        assert!(!ready(host, false));
+        with_scope("first", || {
+            assert!(ready(host, false));
+            failed(host, &limit);
+            assert!(!ready(host, false));
+            with_scope("second", || assert!(ready(host, false)));
+            assert!(!ready(host, false));
+        });
+        let _ = std::panic::catch_unwind(|| with_scope("panic", || panic!("scope test")));
+        assert_eq!(budget_key(host), host);
+        with_scope("first", || {
+            assert!(!ready(host, false));
+            BUDGETS.lock().unwrap().remove(&budget_key(host));
+        });
+        BUDGETS.lock().unwrap().remove(host);
+    }
     #[test]
     fn classifies_primary_secondary_graphql_and_abuse_limits() {
         for text in [
