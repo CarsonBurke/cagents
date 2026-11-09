@@ -54,8 +54,6 @@ pub(super) struct State {
     pub(super) error: Option<String>,
     limit: usize,
     selected: usize,
-    /// The row under the pointer, which the preview shows over the selection.
-    hovered: Option<CardId>,
     /// What earlier openings read, so reopening reads only what changed.
     cache: Arc<catalog::Cache>,
     indexer: Option<iced::task::Handle>,
@@ -268,8 +266,9 @@ pub enum Action {
     Resume(CardId),
     More,
     Submit,
-    /// The pointer entered a row, or left the list.
-    Hover(Option<CardId>),
+    /// The pointer entered the row at this position among the matches, which
+    /// becomes the selection.
+    Point(usize, CardId),
     /// The service's answer to preparing a resume. `Ok(None)` means it could
     /// not be reached to prepare an unstarted successor, which then resumes as
     /// a conversation of its own, as it would without one.
@@ -650,8 +649,6 @@ impl Cagents {
             Named::PageUp => state.selected.saturating_sub(PAGE_STEP),
             _ => return None,
         };
-        // The keyboard takes the preview back from the pointer.
-        state.hovered = None;
         Some(self.reveal_resume_selection())
     }
 
@@ -833,7 +830,6 @@ impl Cagents {
         state.seed_accounts.clear();
         state.scope = scope;
         state.missing.clear();
-        state.hovered = None;
         state.counts = [0; 3];
         state.replace = None;
         state.error = None;
@@ -957,8 +953,16 @@ impl Cagents {
                     iced::widget::operation::focus(focus_id()).map(cosmic::Action::App),
                 ])
             }
-            Action::Hover(card) => {
-                self.resume_ui.hovered = card;
+            Action::Point(index, card) => {
+                // Only the row drawn there: the matches may have changed since.
+                let state = &mut self.resume_ui;
+                if state
+                    .visible
+                    .get(index)
+                    .is_some_and(|&row| state.rows[row].card == card)
+                {
+                    state.selected = index;
+                }
                 Task::none()
             }
             Action::More => {
@@ -1158,7 +1162,6 @@ impl Cagents {
         let state = &mut self.resume_ui;
         state.limit = PAGE;
         state.selected = 0;
-        state.hovered = None;
         let (visible, counts) = resume_matches(&state.rows, &state.query, state.scope.as_ref());
         state.visible = visible;
         state.counts = counts;
@@ -1466,14 +1469,9 @@ impl Cagents {
         }
         let list = self.resume_list(now);
         let chosen = state
-            .hovered
-            .and_then(|card| state.rows.iter().find(|row| row.card == card))
-            .or_else(|| {
-                state
-                    .visible
-                    .get(state.selected)
-                    .map(|&index| &state.rows[index])
-            });
+            .visible
+            .get(state.selected)
+            .map(|&index| &state.rows[index]);
         content = content.push(if wide {
             let preview: Element<'_, Message> = match chosen {
                 Some(row) => self.resume_preview(row, now),
@@ -1586,9 +1584,12 @@ impl Cagents {
                     (!state.loading)
                         .then_some(Message::ResumeConversation(Action::Resume(row.card))),
                 );
+            // Pointing at a row selects it, so the preview always describes
+            // the highlighted row. A row does not hear the pointer leave the
+            // list, so a pointer-only preview could outlive the pointer.
             rows.push(
                 iced::widget::mouse_area(button)
-                    .on_enter(Message::ResumeConversation(Action::Hover(Some(row.card))))
+                    .on_enter(Message::ResumeConversation(Action::Point(index, row.card)))
                     .into(),
             );
         }
@@ -1602,7 +1603,7 @@ impl Cagents {
         if rows.is_empty() {
             rows.push(self.resume_empty());
         }
-        let list = widget::scrollable(
+        widget::scrollable(
             widget::column::with_children(rows)
                 .spacing(ROW_SPACING)
                 .padding(design::with_vertical_rail(Padding::ZERO)),
@@ -1612,11 +1613,8 @@ impl Cagents {
         ))
         .id(widget::Id::new("conversation-resume.results"))
         .width(Length::Fill)
-        .height(Length::Fill);
-        // Leaving the list returns the preview to the selection.
-        iced::widget::mouse_area(list)
-            .on_exit(Message::ResumeConversation(Action::Hover(None)))
-            .into()
+        .height(Length::Fill)
+        .into()
     }
 
     /// Why nothing is listed, and where else to look.
@@ -2705,5 +2703,95 @@ mod tests {
             .provider
             .session_root(&seed.launch.recipe)
             .unwrap()
+    }
+
+    #[test]
+    fn pointing_at_a_row_selects_it_and_leaving_keeps_preview_and_highlight_together() {
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Size, mouse};
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.resume_ui.open = true;
+        app.resume_ui.limit = PAGE;
+        for index in 0..20 {
+            let mut entry = saved(std::path::Path::new("/fixture"));
+            entry.title = format!("Row {index}");
+            app.resume_ui
+                .rows
+                .push(Row::saved(entry, "Fixture".into(), "fixture".into()));
+        }
+        app.resume_ui.visible = (0..20).collect();
+        let mut renderer = crate::app::tests::headless_renderer();
+        let size = Size::new(1396.0, 873.0);
+        // Moves the real pointer to `to` over the mounted picker and applies
+        // what it reports, as the application would.
+        let mut point = |app: &mut Cagents, cache: Cache, to: Point| {
+            let mut ui =
+                UserInterface::build(app.resume_dialog().unwrap(), size, cache, &mut renderer);
+            let mut messages = Vec::new();
+            let _ = ui.update(
+                &[Event::Mouse(mouse::Event::CursorMoved { position: to })],
+                mouse::Cursor::Available(to),
+                &mut renderer,
+                &mut cosmic::iced::advanced::clipboard::Null,
+                &mut messages,
+            );
+            let cache = ui.into_cache();
+            for message in messages {
+                if let Message::ResumeConversation(action) = message {
+                    let _ = app.update_resume(action);
+                }
+            }
+            cache
+        };
+        let row = |app: &Cagents, title: &str| {
+            let ui = UserInterface::build(
+                app.resume_dialog().unwrap(),
+                size,
+                Cache::new(),
+                &mut crate::app::tests::headless_renderer(),
+            );
+            let nodes = ui.a11y_nodes(mouse::Cursor::Unavailable);
+            let name = format!("Resume {title}");
+            let rect = nodes
+                .root()
+                .iter()
+                .chain(nodes.children())
+                .find(|node| node.node().label() == Some(name.as_str()))
+                .unwrap_or_else(|| panic!("mounted {name}"))
+                .node()
+                .bounds()
+                .unwrap();
+            Point::new(
+                ((rect.x0 + rect.x1) / 2.0) as f32,
+                ((rect.y0 + rect.y1) / 2.0) as f32,
+            )
+        };
+        let selected = |app: &Cagents| {
+            app.resume_ui.rows[app.resume_ui.visible[app.resume_ui.selected]]
+                .title
+                .clone()
+        };
+        let mut cache = Cache::new();
+        let second = row(&app, "Row 2");
+        cache = point(&mut app, cache, second);
+        assert_eq!(selected(&app), "Row 2");
+        // Leaving by any side, including below the dialog where the list
+        // hears nothing, leaves the selection where it was.
+        for outside in [
+            Point::new(1300.0, 860.0),
+            Point::new(1300.0, 500.0),
+            Point::new(600.0, 30.0),
+        ] {
+            cache = point(&mut app, cache, outside);
+            assert_eq!(selected(&app), "Row 2", "{outside:?}");
+        }
+        let fourth = row(&app, "Row 4");
+        cache = point(&mut app, cache, fourth);
+        assert_eq!(selected(&app), "Row 4");
+        drop(cache);
+        // A row reported after the matches changed under it selects nothing.
+        let stale = app.resume_ui.rows[app.resume_ui.visible[7]].card;
+        let _ = app.update_resume(Action::Point(3, stale));
+        assert_eq!(selected(&app), "Row 4");
     }
 }

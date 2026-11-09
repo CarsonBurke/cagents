@@ -1412,7 +1412,7 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
     ),
     (
         "Resume conversation",
-        "Search saved conversations across projects and accounts",
+        "Pick up an earlier conversation in this project or another",
         NewTab::Resume,
         "chrome.new-tab.resume",
     ),
