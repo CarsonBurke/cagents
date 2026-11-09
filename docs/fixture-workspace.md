@@ -64,21 +64,43 @@ ROOT/
   home/.claude/      Claude Code projects/<slug>/<session>.jsonl and subagent sidecars
   home/.codex/       Codex sessions/YYYY/MM/DD/rollout-*.jsonl, archived_sessions/, session_index.jsonl
   avatars/           GitHub avatar images for projects with a github.com remote
-  bin/               on every generated chat and terminal's PATH; empty
+  bin/               first on every generated chat and terminal's PATH; empty
 ```
 
-After `apply` without `--instance`, it also holds `data/`, `config/`,
-`cache/` and `state/`: the app's XDG directories for this root.
+After `apply` without `--instance`, and once the app runs on the root, it also
+holds `data/`, `config/`, `cache/` and `state/`: the app's XDG directories for
+this root.
 
-Every chat and terminal card carries a launch environment with `HOME`,
+Every chat and terminal card carries a launch environment that names `HOME`,
 `CLAUDE_CONFIG_DIR` (`ROOT/home/.claude`), `CODEX_HOME` (`ROOT/home/.codex`)
-and the XDG directories inside the root, and removes the providers' API keys
-and tokens. The app layers a recipe over its own inherited environment, so
-naming the provider homes matters: a provider launched from a seeded card reads
-the fixture's history, never `~/.claude`, `~/.codex` or a signed-in account's
-home, and never runs on the person's keys, even from a shell that exports
-them. A seeded card's provider is therefore signed out; native-evidence puts
-its synthetic provider on the fixture's `PATH`.
+and the four XDG base directories inside the root; the appliers refuse a plan
+whose environment names any of them elsewhere or with `..`. The app layers a
+recipe over its own inherited environment, so a recipe also removes what that
+environment may carry to the person's accounts and desktop: the providers' API
+keys and tokens, `GH_TOKEN` and the other forge tokens, the SSH agent,
+askpass helpers, `DISPLAY`, `WAYLAND_DISPLAY` and the session bus. A provider
+launched from a seeded card therefore reads the fixture's history and is
+signed out.
+
+The generator leaves `bin/` empty, so the provider a card launches is the first
+`claude` or `codex` on the rest of the recipe's `PATH`
+(`/usr/local/bin:/usr/bin:/bin`); native-evidence puts its synthetic Claude in
+`bin/`. When a window opens, it reconnects every open chat card in every
+channel, not only those on screen, as it does for any workspace. A seeded
+daemon has hosted none of them, so none reconnects:
+
+- a Claude chat shows "Saved Claude history could not be opened without
+  starting a provider" and starts nothing;
+- a Codex chat that has a session asks for a Codex app-server under the
+  fixture's `CODEX_HOME`. In native-evidence, with no `codex` on the recipe's
+  `PATH`, it shows "Cannot join existing Codex daemon" and no `codex` runs.
+  The app sends a start for each such card, so with `codex` on that `PATH`
+  expect one signed-out `codex` per open Codex card, confined to the fixture.
+
+Signing in or switching accounts from a seeded window is not confined: the
+account flow resolves the provider's home from the window's own environment,
+which under `--instance` is your real one. Do not sign in from a seeded
+instance.
 
 The conversations follow the providers' current formats, including what
 makes real transcripts hard to read: harness noise (system reminders, local
@@ -103,8 +125,8 @@ Codex threads a live writer would lock (`history.writer_locks`).
 reports its identity, then each window in the plan with that identity, so the
 windows know the registry already holds their channels.
 
-Without `--instance`, every store goes inside the root with a private runtime
-directory that is removed afterwards, and no running daemon is involved:
+Without `--instance`, every store goes inside the root, and each run takes its
+leases in a private runtime directory there that is removed afterwards:
 
 ```sh
 scripts/fixture-workspace apply --root "$root" --bin-dir target/dev-runtime
@@ -115,20 +137,34 @@ The seeding flags (`cagentsd --development-seed-workspace PLAN`,
 development builds; a production executable refuses them. Each seed also
 refuses:
 
-- while this instance's daemon runs, or the window it seeds is open;
-- an instance holding anything earlier seeds of the same plan did not write.
-  The check covers the whole data directory, every window's store included,
-  not only the store being written: a seed never merges into real state. The
-  seeds record what they wrote in `fixture-seed.json` there, so the daemon and
-  each window can seed one after another;
+- while this instance's daemon runs, or the window it seeds is open. Each
+  seed holds the daemon's lease while it writes, the window seed too, and the
+  window's own lease. Without `--instance` those leases are the run's own, so
+  they cannot see a daemon or window started on the root's directories by
+  hand; the next point catches one, since an open store has its WAL beside it;
+- an instance whose data directory differs in any way from what earlier seeds
+  of the same plan left there. The seeds record every entry of that directory,
+  at any depth, with its size and modification time, in `fixture-seed.json`
+  there, and each seed compares the directory with it: anything added, changed
+  or gone means the instance was used, and a seed never merges into real
+  state. This is how the daemon and each window seed one after another;
+- an instance another plan seeded, or the same path since generated again
+  (`generate --replace`): the ledger names the plan by its path and the SHA-256
+  of its bytes;
+- an instance another seed is writing: each seed locks the data directory;
 - the unnamed development instance, the login daemon's, unless every XDG
-  directory it would write is inside the plan's root, as `apply` without
-  `--instance` and native-evidence arrange;
-- a plan in another format, or one moved from where it was generated, whose
-  paths would name the wrong repositories.
+  directory it would write, and `XDG_RUNTIME_DIR` where it takes its leases,
+  is inside the plan's root, as `apply` without `--instance` arranges;
+- a plan in another format, one moved from where it was generated, whose
+  paths would name the wrong repositories, or one whose avatar owners are not
+  GitHub logins.
 
-A store is written beside its final name and renamed into place once closed,
-so a seed that fails leaves nothing behind for a launch to open.
+A store is written beside its final name, renamed into place once closed and
+synced, and kept only once the ledger, synced too, records it. A seed that
+fails removes what it wrote, avatars included; its directories above the
+store's own stay. A seed killed between the rename and the record leaves a
+store the ledger does not name, which every later seed of that instance
+refuses until its data directory is deleted.
 
 ### A development instance
 
@@ -147,12 +183,13 @@ scripts/run-development --browserless --instance seeded
 
 `--bin-dir` is `dev-runtime` under the checkout's Cargo target directory,
 `target/` unless `CARGO_TARGET_DIR` or the Cargo configuration moves it. To
-seed an instance again, stop it with `--stop-instance seeded` and delete
-its storage (`~/.local/share/cagents-development-seeded` and its config and
-state siblings) first; a seed refuses an instance that has been used. The instance keeps
-your real `HOME` for provider sign-ins, but every seeded card launches with
-the fixture's `HOME`. `apply` refuses the unnamed development instance, which
-is the login daemon's.
+seed an instance again, stop it with `--stop-instance seeded` and delete its
+data directory (`~/.local/share/cagents-development-seeded`) first, and its
+cache (`~/.cache/cagents-development-seeded`) for fresh avatars; a seed refuses
+an instance that has been used. The instance runs with your real `HOME`, so
+its own windows and account flow use your real provider homes, but every
+seeded card launches with the fixture's. `apply` refuses the unnamed
+development instance, which is the login daemon's.
 
 ### A native-evidence fixture
 
@@ -182,11 +219,13 @@ live process is absent:
 | Dirty worktrees | An agent waiting for attention |
 | Unread counts per worktree and project, including the `99+` cap | A failed update, which comes from the daemon's journal |
 | Open, closed and retired cards; channel order and titles; drafts | Terminal scrollback and running processes |
-| Conversation history for resume and read-only history | Codex history in the app, which a `codex` binary serves |
+| Conversation history the resume reader reads from the providers' files | A seeded chat card's history when a window opens, which needs a daemon that hosted it |
 
-A seeded chat opens its conversation's history from the fixture's files. A
-Codex chat needs `codex` on `PATH` to show it; `check-codex` below verifies the
-rollouts a real one reads.
+The Claude transcripts read back through the app's resume reader with the
+messages `plan.json` counts, which the Rust tests check for every intact one.
+A seeded chat card does not show its history when a window opens (see the
+launch environment above). `check-codex` below verifies the rollouts a real
+`codex` reads.
 
 ## Other commands
 
