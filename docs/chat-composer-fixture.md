@@ -127,6 +127,16 @@ goes on from the last record it could read, a simplification: Claude Code
 follows the `parentUuid` chain to its leaf. A last line cut short without a newline
 is ended first, so the next record starts its own line.
 
+A prompt of exactly `/compact` compacts the conversation as Claude Code
+does: the stream gets a `compact_boundary` and the summary, and the history
+gets a boundary that starts a new parent chain, linked back to the earlier
+turns only by `logicalParentUuid`, then the summary and the command recorded
+as one run in the terminal, with its output. To offer **Compact** in the composer,
+advertise the command in `fixture-commands.json`, such as
+`{"commands":[{"name":"compact","description":"Compact"}]}`. Reopen the
+conversation afterwards to check that the turns before the compaction are
+still there, followed by **Context compacted** with the summary inside.
+
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
 streamed MCP call with a large prompt, a Skill call, a failed MCP call, and a
 multiline Bash command. It records complete tool inputs and results in the
