@@ -1170,13 +1170,39 @@ The existing artifact helper reads Cargo's exact executable path, including
 configured target directories/triples. A matching version alone does not prove
 that two dirty source trees match.
 
-For a local HOST run, select an existing private **disk-backed** base with a
-short, physical absolute path. Verify its filesystem with `findmnt -T PATH`;
-`/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can be RAM-backed. Neither the base nor
-any ancestor may contain a `.git` file, directory or symlink. The base must also
-be outside the account home reported by `getent passwd "$(id -u)"`, even when
-`HOME` points elsewhere: bundled-skill tests deliberately refuse installation
-beneath the passwd home. A private `~/.cot` therefore does not qualify.
+Through the gate, which is how a hosted agent runs it, there is no base to
+choose. The build host gives each slot a short, private `TMPDIR` such as
+`/run/user/1000/cof/cagents-0`, which is within the socket budget and outside
+the home and any `.git`, and which the slot's next command clears. It is in
+the runtime directory, which is memory on fw16, unlike the disk-backed base a
+local run uses: the slot holds one command's files at a time. If that
+directory isn't private to you, the slot falls back to its own `tmp` under
+`~/.cache`, which is too long for the socket budget and inside the home, where
+the bundled-skill tests below refuse to install.
+
+```sh
+(
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+)
+```
+
+The gate sends the helper, which is in the target, to the build host and points
+the variable at its copy there. It refuses a `CAGENTS_` setting that names a
+path outside the checkout and its target, which the build host doesn't have;
+`CAGENTS_BUILD_*` settings and the gate's own are exempt.
+
+For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
+private **disk-backed** base with a short, physical absolute path. Verify its
+filesystem with `findmnt -T PATH`; `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can
+be RAM-backed. Neither the base nor any ancestor may contain a `.git` file,
+directory or symlink. The base must also be outside the account home reported
+by `getent passwd "$(id -u)"`, even when `HOME` points elsewhere: bundled-skill
+tests deliberately refuse installation beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
 Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
 with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
@@ -1190,9 +1216,9 @@ fixture layouts need more room; a short base alone is not proof.
 ```sh
 # Set this only after verifying the base above.
 mkdir -p -m 700 /var/tmp/ct
-export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
-    TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
+    export CAGENTS_BUILD_REMOTE=local
+    TMPDIR=$(mktemp -d /var/tmp/ct/tXXXXXX) || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
