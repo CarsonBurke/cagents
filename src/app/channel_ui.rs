@@ -82,7 +82,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                 // one out of step with the daemon.
                 let Some(fresh) = connect(&socket)? else {
                     return if may_have_retained_owner(live) {
-                        Err(error.to_string())
+                        Err(error.reason())
                     } else {
                         no_daemon_close_result(&sessions)
                     };
@@ -94,7 +94,7 @@ fn close_sessions_with(sessions: Vec<CardKind>, open_agents: OpenAgents) -> Resu
                     .iter()
                     .any(|chat| chat.id == live.id)
                 {
-                    return Err(error.to_string());
+                    return Err(error.reason());
                 }
                 if may_have_retained_owner(live)
                     || (open_agents == OpenAgents::Retire

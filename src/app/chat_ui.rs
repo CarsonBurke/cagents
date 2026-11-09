@@ -5695,9 +5695,10 @@ fn end_conversation(
     let Some(session) = session else {
         return refused.map_or(Ok(()), Err);
     };
+    // The daemon usually refuses both the same way; say it once.
     close(vec![CardKind::Chat(session)]).map_err(|error| match refused {
-        Some(refused) => format!("{refused}; {error}"),
-        None => error,
+        Some(refused) if refused != error => format!("{refused}; {error}"),
+        _ => error,
     })
 }
 
