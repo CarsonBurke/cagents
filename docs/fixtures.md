@@ -14,6 +14,7 @@ person.
 | Before/after screenshots of the native app | [`scripts/native-evidence`](development.md#native-evidence), or with `--remote fw16` from a cagents session |
 | Drive the app by hand for a while, or run several at once | [`scripts/run-development --instance NAME`](development.md#parallel-instances) |
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
+| A populated saved Claude conversation before starting a provider | `tests/fixtures/claude-resume-history.py`, described below |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
 | A Codex app-server peer that plays scripted items | `tests/fixtures/terminal-escape-codex.py` and the peers built on its transport, such as `codex-tool-rows.py` |
@@ -147,6 +148,24 @@ evidence cli project open '{fixture}/project'
 sleep 12
 evidence shot sidebar-avatar
 ```
+
+## Saved Claude history
+
+Seed a fresh private fixture with a parent-linked conversation before its first
+native start:
+
+```sh
+python3 tests/fixtures/claude-resume-history.py /path/to/private/fixture --turns 50
+python3 tests/fixtures/check-claude-resume-history.py
+```
+
+The generator writes 100 invented messages for 50 turns and prints the exact
+thread, transcript and project paths as JSON. It launches no provider and uses
+no credentials. It refuses an existing provider home and aliases of the real
+account's Claude home. Use a fresh evidence task when its provider home already
+exists. Save the stopped fixture with `native-evidence save-seed` so both sides
+restore the same transcript and physical provider-home identity, then open its
+project and choose **Resume conversation** in the app.
 
 ## Adding a provider behaviour
 
