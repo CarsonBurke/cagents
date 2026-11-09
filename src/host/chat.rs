@@ -2059,19 +2059,27 @@ fn start_with_execution(
             chat::protocol::codex::thread_writer_lock(&process_launch, thread).as_deref(),
             thread,
         )
-        .map_err(unavailable)?
+        .map_err(|message| {
+            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+        })?
     {
-        return Err(error(if writer.hosted {
-            format!(
-                "This conversation is still open in another chat or terminal here (pid {}). Close it there, then resume it here.",
-                writer.pid
-            )
-        } else {
-            format!(
-                "This conversation is open in another Codex process ({}, pid {}). Close it there, then resume it here.",
-                writer.name, writer.pid
-            )
-        }));
+        // Refuse every attempt while the writer remains. The same card can
+        // retry after that writer closes; this never authorizes a second one.
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::InvalidRequest,
+            if writer.hosted {
+                format!(
+                    "This conversation is still open in another chat or terminal here (pid {}). Close it there, then resume it here.",
+                    writer.pid
+                )
+            } else {
+                format!(
+                    "This conversation is open in another Codex process ({}, pid {}). Close it there, then resume it here.",
+                    writer.name, writer.pid
+                )
+            },
+            true,
+        ));
     }
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;

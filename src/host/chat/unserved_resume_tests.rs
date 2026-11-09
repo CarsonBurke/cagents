@@ -321,16 +321,16 @@ fn a_reopened_codex_thread_another_process_has_open_is_refused() {
         None,
         Default::default(),
     )
-    .unwrap_err()
-    .message;
+    .unwrap_err();
     cli.kill().unwrap();
     cli.wait().unwrap();
+    assert!(refusal.retryable, "{refusal:?}");
     assert!(
-        refusal.contains(&format!(
+        refusal.message.contains(&format!(
             "pid {}). Close it there, then resume it here.",
             cli.id()
         )),
-        "{refusal}"
+        "{refusal:?}"
     );
     assert!(
         !root.join("codex-arguments").exists(),
@@ -389,15 +389,17 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     .expect("the private server holds the real kernel writer lock");
     assert_eq!(writer.pid, server.id() as libc::pid_t);
     host.lock().unwrap().register_client(1);
+    let requested = reopened(&root);
     let result = start(
         &host,
         1,
-        reopened(&root),
+        requested.clone(),
         None,
         false,
         None,
         Default::default(),
     );
+    let repeated = start(&host, 1, requested, None, false, None, Default::default());
     // Clean up the fixture before checking the result, including a mutant
     // that incorrectly tries to launch the installed Codex stand-in.
     server.kill().unwrap();
@@ -407,13 +409,63 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
         "no second private server was launched"
     );
     let refusal = result.unwrap_err();
+    let repeated = repeated.unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert_eq!(
+        repeated, refusal,
+        "Retry while held must repeat the refusal"
+    );
     assert!(
         refusal.message.contains(&format!("pid {})", writer.pid)),
         "{refusal:?}"
     );
     assert!(
-        !refusal.retryable,
-        "a second server cannot help while the writer owns it"
+        refusal.retryable,
+        "the same card may retry after its writer closes"
+    );
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+}
+
+#[test]
+fn a_reopened_codex_thread_with_uninspectable_writer_evidence_refuses_retryably() {
+    const NAME: &str = "host::chat::unserved_resume_tests::a_reopened_codex_thread_with_uninspectable_writer_evidence_refuses_retryably";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    install_codex(&root);
+    let locks = root.join("home/.codex/thread-writer-locks");
+    std::fs::create_dir_all(&locks).unwrap();
+    let lock = locks.join(format!("{}.lock", thread_id()));
+    // A loop reliably makes the real lock lookup fail, including under root.
+    // It must not be interpreted as evidence that the thread has no writer.
+    std::os::unix::fs::symlink(&lock, &lock).unwrap();
+    host.lock().unwrap().register_client(1);
+    let refusal = start(
+        &host,
+        1,
+        reopened(&root),
+        None,
+        false,
+        None,
+        Default::default(),
+    )
+    .unwrap_err();
+    assert_eq!(refusal.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(
+        refusal
+            .message
+            .contains("Cannot inspect Codex thread writer lock"),
+        "{refusal:?}"
+    );
+    assert!(
+        refusal.retryable,
+        "inspection may be repaired before retrying"
+    );
+    assert!(
+        !root.join("codex-arguments").exists(),
+        "an inspection failure must never launch a server"
     );
     assert!(host.lock().unwrap().chat_spawning.is_empty());
 }
