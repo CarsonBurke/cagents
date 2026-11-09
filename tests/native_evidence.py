@@ -1169,6 +1169,18 @@ class Evidence(unittest.TestCase):
         # Under its seven-day freshness, so the app does not try to download it.
         self.assertLess(time.time() - cached.stat().st_mtime, 60)
 
+        # A cache it can't write leaves the avatar out, not the repository.
+        cached.unlink()
+        cached.parent.chmod(0o555)
+        try:
+            seed.write_bytes(b"\x89PNG\r\n\x1a\nchanged")
+            viewed = self.fixture_shell("gh repo view --json nameWithOwner,url")
+            self.assertEqual(json.loads(viewed.stdout)["nameWithOwner"], "Octo-Org/app")
+            self.assertEqual(viewed.stderr, "")
+            self.assertEqual(list(cached.parent.iterdir()), [])
+        finally:
+            cached.parent.chmod(0o755)
+
     def test_the_forge_lists_seeded_pull_requests_of_each_repository(self) -> None:
         if shutil.which("jq") is None:
             self.skipTest("jq is not installed")
@@ -1213,11 +1225,13 @@ class Evidence(unittest.TestCase):
         # So does one missing a field the app requires, or with a state gh never prints.
         complete = {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
                     "url": "https://github.com/octo-org/app/pull/7"}
-        for broken in ({k: v for k, v in complete.items() if k != "title"}, {**complete, "state": "open"}):
+        for broken in ({k: v for k, v in complete.items() if k != "title"}, {**complete, "state": "open"},
+                       {k: v for k, v in complete.items() if k != "headRepositoryOwner"}):
             (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([broken]))
             refused = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
             self.assertEqual(refused.returncode, 1, broken)
-            self.assertIn("title, state (OPEN, CLOSED or MERGED), headRefName", refused.stderr)
+            self.assertIn("title, state (OPEN, CLOSED or MERGED), headRefName, baseRefName, updatedAt, "
+                          "headRepositoryOwner.login and headRepository.name", refused.stderr)
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()

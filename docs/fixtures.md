@@ -14,7 +14,7 @@ person.
 | Before/after screenshots of the native app | [`scripts/native-evidence`](development.md#native-evidence), or with `--remote fw16` from a cagents session |
 | Drive the app by hand for a while, or run several at once | [`scripts/run-development --instance NAME`](development.md#parallel-instances) |
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
-| GitHub availability, project avatars or pull request rows in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
+| GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A Codex app-server peer that plays scripted items | `tests/fixtures/terminal-escape-codex.py` and the peers built on its transport, such as `codex-tool-rows.py` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
@@ -93,21 +93,36 @@ app reads it instead of downloading. Write the seed first, as below. The app
 loads each owner's avatar once, as soon as an open project has both the remote
 and the switch, and remembers a missing one until it restarts.
 
-For pull request rows, `home/.config/fixture-forge-prs.json` holds an array in
-the shape `gh pr list --json` prints; copy the fields of `PR_VIEW_FIELDS` in
-`src/github.rs` and the examples in its tests. Each entry needs at least
+For a worktree's pull request, `home/.config/fixture-forge-prs.json` holds an
+array in the shape `gh pr list --json` prints; `PR_VIEW_FIELDS` in
+`src/github.rs` names every field the app asks for. Each entry needs at least
 `number`, `url`, `title`, `state` (`OPEN`, `CLOSED` or `MERGED`),
-`headRefName`, `baseRefName` and `updatedAt`, as the app's parser does; the
-forge refuses a file without them, naming it, instead of letting the app fail
-to parse it. Each repository lists the
-entries whose `url` is under `https://github.com/OWNER/NAME/pull/`, filtered by
-`--state`, `--head`, `--author` and `--limit`, in file order rather than
-gh's newest first. Reading the file needs `jq`.
-The pull request browser still lists none of them. Opening one's review needs
-its conversation queries, which the forge answers as not found; like any failed
-GitHub read, that pauses the app's GitHub refreshes for a while.
+`headRefName`, `baseRefName`, `updatedAt`, `headRepositoryOwner.login` and
+`headRepository.name`; the forge refuses a file without them, naming it,
+instead of letting the app fail to read it. Each repository lists the entries
+whose `url` is under `https://github.com/OWNER/NAME/pull/`, filtered by
+`--state`, `--head`, `--author` and `--limit`, in file order rather than gh's
+newest first. Reading the file needs `jq` on the build host.
 
-A steps file for a sidebar with an avatar. It turns the switch on before the
+A seeded pull request belongs to a worktree only when all of these match it:
+
+- `headRefName` is the worktree's branch: `main` in the fixture's project.
+- `headRepositoryOwner.login` and `headRepository.name` are the owner and name
+  of the remote the branch pushes to: its `pushRemote`, `remote.pushDefault`,
+  its upstream's remote, or else `origin` or the only remote.
+- `url` is under the project's repository, as above.
+
+Entries that match no worktree still answer `gh pr list`, but nothing in the
+sidebar shows them.
+
+Seeds cannot support evidence of the review flow. The pull request browser
+lists none of them, and opening a seeded pull request's review asks for its
+conversation, which the forge answers as not found. Like any failed GitHub
+read, that pauses the app's GitHub refreshes for a while.
+
+A steps file for a sidebar with an avatar and the fixture worktree's pull
+request. The avatar step needs ImageMagick's `magick` on the build host. It
+turns the switch on before the
 project gets its github.com remote, since a read that fails while the remote
 is there makes the app wait 30 seconds or more before the next. `{fixture}`
 is replaced only on the `--remote` route, in forwarded commands and `pair`
@@ -117,6 +132,12 @@ itself, write `"$CAGENTS_EVIDENCE_FIXTURE"` inside `env sh -c` instead.
 ```sh
 evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge"'
 evidence env sh -c 'magick -size 64x64 gradient:"#2f6feb"-"#a371f7" "png:$CAGENTS_EVIDENCE_FIXTURE/avatars/octo-org.image"'
+prs='[{"number": 12, "title": "Teach the sidebar about avatars", "state": "OPEN",
+  "isDraft": false, "headRefName": "main", "baseRefName": "trunk",
+  "headRepositoryOwner": {"login": "octo-org"}, "headRepository": {"name": "fixture-app"},
+  "author": {"login": "fixture"}, "updatedAt": "2026-11-02T00:00:00Z",
+  "url": "https://github.com/octo-org/fixture-app/pull/12"}]'
+evidence env sh -c 'printf "%s\n" "$1" >"$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge-prs.json"' sh "$prs"
 evidence env git -C '{fixture}/project' remote add origin https://github.com/octo-org/fixture-app
 evidence cli project open '{fixture}/project'
 # The app reads GitHub in the background; give it time before the shot.

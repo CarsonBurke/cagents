@@ -210,4 +210,12 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
             .unwrap()
             .is_none()
     );
+    // A checkout attaches it only when its remote is the seed's head repository.
+    let fork = GitHubRepoKey::new("github.com", None, "Someone", "fixture-app").unwrap();
+    assert!(
+        service
+            .resolve_branch_head(&key, &fork, "feature", &head, &cancellation)
+            .unwrap()
+            .is_none()
+    );
 }

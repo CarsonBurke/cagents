@@ -9,7 +9,8 @@
 # Optional, with the switch on:
 #   home/.config/fixture-forge-prs.json  An array of pull requests in the shape
 #       `gh pr list --json` prints, each with at least number, url, title,
-#       state, headRefName, baseRefName and updatedAt. Each repository lists
+#       state, headRefName, baseRefName, updatedAt, headRepositoryOwner and
+#       headRepository. Each repository lists
 #       those whose url is under https://github.com/OWNER/NAME/pull/, in file
 #       order.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
@@ -17,8 +18,9 @@
 #       JPEG, GIF or WebP up to 1 MiB and 1024x1024 pixels.
 set -eu
 
-# Installed as $FIXTURE/bin/gh; the daemon removes CAGENTS_* variables from
-# the environment of what it starts, so the location is the reliable root.
+# Installed as $FIXTURE/bin/gh. Its own location is the root: gh runs from
+# the app and from the daemon, and neither promises to pass the fixture's
+# CAGENTS_EVIDENCE_FIXTURE on to what it starts.
 fixture=$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)
 config=$fixture/home/.config
 if [ ! -e "$config/fixture-forge" ]; then
@@ -81,13 +83,16 @@ seed_avatars() {
         [ -f "$image" ] || continue
         owner=$(basename -- "$image" .image | tr '[:upper:]' '[:lower:]')
         cached=$cache/github.com-$owner.image
-        mkdir -p -- "$cache"
+        # A seed that can't be written leaves the app without that avatar,
+        # as a failed download would; it never fails the repository's read.
+        mkdir -p -- "$cache" 2>/dev/null || return 0
         if cmp -s -- "$image" "$cached"; then
-            touch -- "$cached"
+            touch -- "$cached" 2>/dev/null || :
         else
             # Published whole: the app may be reading the previous copy.
-            cp -- "$image" "$cached.$$"
-            mv -f -- "$cached.$$" "$cached"
+            cp -- "$image" "$cached.$$" 2>/dev/null &&
+                mv -f -- "$cached.$$" "$cached" 2>/dev/null ||
+                rm -f -- "$cached.$$"
         fi
     done
 }
@@ -194,8 +199,10 @@ check_seed() {
     if ! jq -e 'type == "array" and all(.[]; type == "object"
             and (.number | type) == "number"
             and all(.url, .title, .headRefName, .baseRefName, .updatedAt; type == "string")
-            and (.state | IN("OPEN", "CLOSED", "MERGED")))' "$pull_requests" >/dev/null 2>&1; then
-        printf 'gh: %s must be a JSON array of pull requests, each with a number, url, title, state (OPEN, CLOSED or MERGED), headRefName, baseRefName and updatedAt\n' "$pull_requests" >&2
+            and (.state | IN("OPEN", "CLOSED", "MERGED"))
+            and (.headRepositoryOwner.login | type) == "string"
+            and (.headRepository.name | type) == "string")' "$pull_requests" >/dev/null 2>&1; then
+        printf 'gh: %s must be a JSON array of pull requests, each with a number, url, title, state (OPEN, CLOSED or MERGED), headRefName, baseRefName, updatedAt, headRepositoryOwner.login and headRepository.name\n' "$pull_requests" >&2
         exit 1
     fi
 }
