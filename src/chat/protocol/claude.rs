@@ -1460,6 +1460,10 @@ impl Claude {
         self.message_with_tools(frame, step, &HashMap::new(), false)
     }
     fn history_message(&mut self, record: &HistoryRecord, step: &mut Step) -> Result<(), String> {
+        if let Some(gap) = record.gap {
+            step.events.push(Event::Item(gap_item(gap)));
+            return Ok(());
+        }
         self.message_with_tools(&record.frame, step, &record.tool_calls, true)
     }
     fn message_with_tools(
@@ -2584,7 +2588,7 @@ impl Adapter for Claude {
                 items: vec![history_notice(
                     "Earlier messages in this conversation could not be shown",
                     format!(
-                        "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code still has the transcript and continues the conversation with everything said before.\n\nDetails: {error}"
+                        "cagents could not read this conversation's saved transcript, so its earlier messages are not shown here. Claude Code reads the transcript itself when it resumes, so it may still have the earlier context.\n\nDetails: {error}"
                     ),
                 )],
                 has_earlier: false,
@@ -2592,9 +2596,12 @@ impl Adapter for Claude {
         }
         if let Some(mut history) = self.history.take() {
             history.settle_stopped();
-            if let Some(body) =
-                skipped_records(history.damaged, history.oversized, !self.history_only)
-            {
+            if let Some(body) = skipped_records(
+                history.damaged,
+                history.oversized,
+                history.marked,
+                !self.history_only,
+            ) {
                 step.events.push(Event::History {
                     items: vec![history_notice("Some saved messages are not shown", body)],
                     has_earlier: false,
@@ -4030,30 +4037,51 @@ fn notice_item(id: String, summary: &str, body: String) -> Item {
     }
 }
 
-/// What a transcript's skipped records were, in a sentence each, or `None`
-/// when none were skipped.
-fn skipped_records(damaged: usize, oversized: usize, resumes: bool) -> Option<String> {
+/// Why messages were skipped, in a sentence for each reason.
+fn skipped_reasons(damaged: usize, oversized: usize) -> Vec<String> {
     let count = |count: usize| match count {
         1 => "One saved message".to_owned(),
         count => format!("{count} saved messages"),
     };
-    let mut lines = Vec::new();
+    let mut reasons = Vec::new();
     if damaged > 0 {
-        lines.push(format!(
+        reasons.push(format!(
             "{} could not be read: {} cut short, for example when Claude Code was stopped while saving.",
             count(damaged),
             if damaged == 1 { "it was" } else { "they were" }
         ));
     }
     if oversized > 0 {
-        lines.push(format!(
+        reasons.push(format!(
             "{} {} too large to show, such as a very long tool output.",
             count(oversized),
             if oversized == 1 { "is" } else { "are" }
         ));
     }
+    reasons
+}
+
+/// What a transcript's skipped messages were, or `None` when none were
+/// skipped. `marked` says each is marked where it was in the conversation.
+fn skipped_records(
+    damaged: usize,
+    oversized: usize,
+    marked: bool,
+    resumes: bool,
+) -> Option<String> {
+    let mut lines = skipped_reasons(damaged, oversized);
     if lines.is_empty() {
         return None;
+    }
+    if marked {
+        lines.push(
+            if damaged + oversized == 1 {
+                "It is marked where it was."
+            } else {
+                "Each is marked where it was."
+            }
+            .into(),
+        );
     }
     lines.push(
         if resumes {
@@ -4066,21 +4094,31 @@ fn skipped_records(damaged: usize, oversized: usize, resumes: bool) -> Option<St
     Some(lines.join(" "))
 }
 
+/// Marks where messages that could not be shown were in a conversation.
+fn gap_item(gap: Gap) -> Item {
+    let Gap {
+        at,
+        damaged,
+        oversized,
+    } = gap;
+    let total = damaged + oversized;
+    let summary = match (damaged, oversized) {
+        (1, 0) => "A message here could not be read".to_owned(),
+        (_, 0) => format!("{damaged} messages here could not be read"),
+        (0, 1) => "A message here is too large to show".to_owned(),
+        (0, _) => format!("{oversized} messages here are too large to show"),
+        _ => format!("{total} messages here are not shown"),
+    };
+    notice_item(
+        format!("history-gap:{at}"),
+        &summary,
+        skipped_reasons(damaged, oversized).join(" "),
+    )
+}
+
 /// A disclosure about the saved history itself, ahead of what it shows.
 fn history_notice(summary: &str, body: String) -> Item {
-    Item {
-        id: format!("history-notice:{summary}"),
-        role: Role::System,
-        content: ItemContent::Delivery {
-            kind: DeliveryKind::Notice,
-            from: String::new(),
-            sender: String::new(),
-            summary: summary.into(),
-            body,
-        },
-        started_at: None,
-        at: None,
-    }
+    notice_item(format!("history-notice:{summary}"), summary, body)
 }
 
 fn unsupported_content_item(result: String) -> Item {
@@ -5774,7 +5812,7 @@ fn sidecar_meta(path: &Path) -> Option<Value> {
 // index rather than retaining the full transcript. Never scan other sessions.
 struct History {
     file: File,
-    chain: Vec<(u64, u64, usize)>,
+    chain: Vec<Link>,
     offset: usize,
     session_id: String,
     subagent_dir: Option<PathBuf>,
@@ -5796,11 +5834,210 @@ struct History {
     /// Result carriers' preceding call locations in the selected visible
     /// chain. Offset metadata only; no input or patch bodies are retained.
     result_calls: HashMap<u64, Vec<(usize, (u64, u64, usize, usize))>>,
-    /// Records skipped because they were damaged, such as cut short by a
-    /// crash, and so held nothing that could be read.
+    /// Messages in this conversation that were skipped because they were
+    /// damaged, such as cut short by a crash.
     damaged: usize,
-    /// Intact records too large to show, such as a huge tool output.
+    /// Messages in this conversation too large to show, such as a huge tool
+    /// output.
     oversized: usize,
+    /// Whether each skipped message is marked where it was. One whose
+    /// parent could not be read has no known place.
+    marked: bool,
+}
+/// One step of the conversation, oldest first once indexed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Link {
+    /// A record's offset, length and first content block.
+    Record(u64, u64, usize),
+    /// Where messages that could not be shown were.
+    Gap(Gap),
+}
+/// Messages skipped at one place in a conversation.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Gap {
+    /// Where the first of them was written, which names the gap.
+    at: u64,
+    damaged: usize,
+    oversized: usize,
+}
+impl Link {
+    fn offset(&self) -> Option<u64> {
+        match self {
+            Self::Record(offset, ..) => Some(*offset),
+            Self::Gap(_) => None,
+        }
+    }
+}
+impl Gap {
+    fn add(&mut self, skipped: &Skipped) {
+        if skipped.oversized {
+            self.oversized += 1;
+        } else {
+            self.damaged += 1;
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.damaged + self.oversized == 0
+    }
+}
+/// A record that could not be read, with what its start still says. Claude
+/// Code writes a record's parent, branch and kind before its content, so a
+/// record cut short, or one too large to read, usually still names them.
+#[derive(Debug, Default)]
+struct Skipped {
+    /// Where the record started.
+    at: usize,
+    uuid: Option<String>,
+    /// The record's parent, `Some(None)` when it recorded none.
+    parent: Option<Option<String>>,
+    logical_parent: Option<String>,
+    /// The record's `type`, or its message's role when its type, written
+    /// after the message, was lost.
+    kind: Option<String>,
+    subtype: Option<String>,
+    sidechain: bool,
+    team: bool,
+    oversized: bool,
+}
+impl Skipped {
+    /// Whether the record could have been a message shown in this
+    /// conversation: a cut progress or system record, or a subagent's or
+    /// teammate's message, loses nothing the reader would have seen.
+    fn shown(&self) -> bool {
+        !self.sidechain
+            && !self.team
+            && self
+                .kind
+                .as_deref()
+                .is_none_or(|kind| matches!(kind, "user" | "assistant"))
+    }
+    /// Whether the record began a compacted conversation, which leads back
+    /// to the turns it summarised rather than to a parent.
+    fn compaction(&self) -> bool {
+        self.parent == Some(None)
+            && (self.subtype.as_deref() == Some("compact_boundary")
+                || self.logical_parent.is_some())
+    }
+}
+/// Reads what the start of a record that could not be read still says.
+fn skipped_record(bytes: &[u8], at: usize, oversized: bool) -> Skipped {
+    struct Record<'a>(&'a mut Skipped);
+    impl<'de> serde::de::DeserializeSeed<'de> for Record<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_map(self)
+        }
+    }
+    impl<'de> serde::de::Visitor<'de> for Record<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a transcript record")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            use serde::de::IgnoredAny;
+            let record = self.0;
+            // Each field is kept as soon as it is read, so whatever came
+            // before the point the record was cut at survives the error.
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                match &*key {
+                    "parentUuid" => record.parent = Some(map.next_value()?),
+                    "logicalParentUuid" => record.logical_parent = map.next_value()?,
+                    "uuid" => record.uuid = map.next_value()?,
+                    "type" => record.kind = map.next_value()?,
+                    "subtype" => record.subtype = map.next_value()?,
+                    "isSidechain" => {
+                        record.sidechain = map.next_value::<Option<bool>>()? == Some(true);
+                    }
+                    "teamName" => {
+                        record.team = map
+                            .next_value::<Option<String>>()?
+                            .is_some_and(|team| !team.is_empty());
+                    }
+                    "message" => map.next_value_seed(Message(&mut record.kind))?,
+                    _ => {
+                        map.next_value::<IgnoredAny>()?;
+                    }
+                }
+            }
+            Ok(())
+        }
+    }
+    struct Message<'a>(&'a mut Option<String>);
+    impl<'de> serde::de::DeserializeSeed<'de> for Message<'_> {
+        type Value = ();
+        fn deserialize<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<(), D::Error> {
+            deserializer.deserialize_any(self)
+        }
+    }
+    impl<'de> serde::de::Visitor<'de> for Message<'_> {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("a message")
+        }
+        fn visit_map<A: serde::de::MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<std::borrow::Cow<'de, str>>()? {
+                if key == "role" {
+                    let role = map.next_value::<Option<String>>()?;
+                    // The record's own type, when it came first, decides.
+                    if self.0.is_none() {
+                        *self.0 = role;
+                    }
+                } else {
+                    map.next_value::<serde::de::IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+        fn visit_unit<E>(self) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_str<E>(self, _: &str) -> Result<(), E> {
+            Ok(())
+        }
+        fn visit_seq<A: serde::de::SeqAccess<'de>>(self, mut seq: A) -> Result<(), A::Error> {
+            while seq.next_element::<serde::de::IgnoredAny>()?.is_some() {}
+            Ok(())
+        }
+    }
+    let mut skipped = Skipped {
+        at,
+        oversized,
+        ..Skipped::default()
+    };
+    let mut deserializer = serde_json::Deserializer::from_slice(bytes);
+    let _ = serde::de::DeserializeSeed::deserialize(Record(&mut skipped), &mut deserializer);
+    skipped
+}
+/// The skipped record that was a message's parent: the one with the parent's
+/// UUID, or else, as Claude Code writes a record just after its parent, the
+/// latest one written before the message, unless a main conversation message
+/// came between them. A subagent's or teammate's record is never a main
+/// conversation message's parent.
+fn skipped_parent(
+    skipped: &[Skipped],
+    crossed: &[bool],
+    written: &[(usize, &str)],
+    parent: &str,
+    before: usize,
+) -> Option<usize> {
+    let open = |index: &usize| {
+        let record = &skipped[*index];
+        !crossed[*index] && !record.sidechain && !record.team
+    };
+    if let Some(index) = (0..skipped.len())
+        .filter(open)
+        .find(|index| skipped[*index].uuid.as_deref() == Some(parent))
+    {
+        return Some(index);
+    }
+    let message = written[..written.partition_point(|(order, _)| *order < before)]
+        .last()
+        .map(|(order, _)| *order);
+    (0..skipped.len())
+        .rev()
+        .filter(open)
+        .find(|index| skipped[*index].at < before && skipped[*index].uuid.is_none())
+        .filter(|index| message.is_none_or(|message| message < skipped[*index].at))
 }
 /// Why a conversation's saved history cannot be shown.
 #[derive(Debug)]
@@ -5808,7 +6045,8 @@ enum HistoryUnavailable {
     /// There is no transcript, so Claude Code has nothing to resume either.
     Missing(String),
     /// The transcript is there, but cagents cannot read it, for example
-    /// because it is too large to index. Claude Code still resumes from it.
+    /// because it is too large to index. Claude Code may still resume from
+    /// it.
     Unreadable(String),
 }
 type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
@@ -5816,6 +6054,8 @@ type HistoryCalls = HashMap<usize, std::sync::Arc<Value>>;
 struct HistoryRecord {
     frame: Value,
     tool_calls: HistoryCalls,
+    /// Messages that could not be shown at this point, in place of a record.
+    gap: Option<Gap>,
 }
 impl std::ops::Deref for HistoryRecord {
     type Target = Value;
@@ -5825,6 +6065,9 @@ impl std::ops::Deref for HistoryRecord {
 }
 struct HistoryNode {
     parent: Option<String>,
+    /// Whether the record belongs to the main conversation rather than to a
+    /// subagent or teammate.
+    main: bool,
     /// The parent this record was first written with, when a rewrite moved
     /// it. On resume Claude Code rewrites the messages a compaction kept
     /// with the summary as their parent; only this still leads to the turns
@@ -5967,8 +6210,7 @@ impl History {
         let mut line = Vec::new();
         let mut tool_ref_bytes = 0_usize;
         let mut tool_ref_count = 0_usize;
-        let mut damaged = 0_usize;
-        let mut oversized = 0_usize;
+        let mut skipped = Vec::<Skipped>::new();
         while position < metadata.len() {
             line.clear();
             let count = std::io::Read::by_ref(&mut reader)
@@ -5981,7 +6223,8 @@ impl History {
             if count > MAX_PAYLOAD {
                 // An oversized record is a tool's output or an attachment;
                 // skip the rest of it and keep the conversation readable.
-                let mut skipped = count as u64;
+                skipped.push(skipped_record(&line, position as usize, true));
+                let mut length = count as u64;
                 while line.last() != Some(&b'\n') {
                     line.clear();
                     let more = std::io::Read::by_ref(&mut reader)
@@ -5991,10 +6234,9 @@ impl History {
                     if more == 0 {
                         break;
                     }
-                    skipped += more as u64;
+                    length += more as u64;
                 }
-                position += skipped;
-                oversized += 1;
+                position += length;
                 continue;
             }
             let mut record_offset = position;
@@ -6011,8 +6253,10 @@ impl History {
                     // A record a crash cut short holds nothing that can be
                     // shown. Claude Code appends its next record to the same
                     // line, and that one is whole.
-                    damaged += 1;
-                    let Some((start, value)) = trailing_record(&line) else {
+                    let trailing = trailing_record(&line);
+                    let end = trailing.as_ref().map_or(line.len(), |(start, _)| *start);
+                    skipped.push(skipped_record(&line[..end], record_offset as usize, false));
+                    let Some((start, value)) = trailing else {
                         continue;
                     };
                     record_offset += start as u64;
@@ -6250,6 +6494,7 @@ impl History {
                 uuid.into(),
                 HistoryNode {
                     parent,
+                    main,
                     first_parent,
                     first_order,
                     compaction,
@@ -6292,13 +6537,34 @@ impl History {
             }
         }
         leaf = leaf.or(fallback);
-        // Messages in file order, for crossing a record that was skipped.
-        let mut written = nodes
-            .iter()
-            .filter(|(_, node)| node.message)
-            .map(|(id, node)| (node.first_order, id.as_str()))
-            .collect::<Vec<_>>();
-        written.sort_unstable();
+        // A skipped record whose later copy was read lost nothing.
+        skipped.retain(|record| {
+            record
+                .uuid
+                .as_ref()
+                .is_none_or(|uuid| !nodes.contains_key(uuid))
+        });
+        // The main conversation's messages in file order, to find the one a
+        // skipped record followed when its parent could not be read.
+        let written = if skipped.is_empty() {
+            Vec::new()
+        } else {
+            let mut written = nodes
+                .iter()
+                .filter(|(_, node)| node.message && node.main)
+                .map(|(id, node)| (node.first_order, id.as_str()))
+                .collect::<Vec<_>>();
+            written.sort_unstable();
+            written
+        };
+        let preceding = |at: usize, seen: &HashSet<&str>| {
+            written[..written.partition_point(|(order, _)| *order < at)]
+                .iter()
+                .rev()
+                .map(|(_, id)| *id)
+                .find(|id| !seen.contains(id))
+        };
+        let mut crossed = vec![false; skipped.len()];
         let mut chain = Vec::new();
         let mut chain_tools = Vec::new();
         let mut seen = std::collections::HashSet::new();
@@ -6327,21 +6593,64 @@ impl History {
                 } else {
                     chain.len()
                 };
-                chain.insert(position, node.range);
-                chain_tools.insert(position, (node.range, &node.tool_refs));
+                let (offset, len, base) = node.range;
+                // Gaps hold no tools, so the tools list counts from its end.
+                let tools = chain_tools.len() - (chain.len() - position);
+                chain.insert(position, Link::Record(offset, len, base));
+                chain_tools.insert(tools, (node.range, &node.tool_refs));
                 newer_record = node.compact_record;
             }
             leaf = match node.parent.as_deref() {
-                // A skipped record leaves its successor's parent unknown. The
-                // conversation goes on from the message written before it,
+                // The parent was skipped. The conversation goes on across it,
+                // and any skipped records it followed, from where they did,
                 // rather than ending there and hiding everything earlier.
-                Some(parent) if !nodes.contains_key(parent) && damaged + oversized > 0 => {
-                    let before = written.partition_point(|(order, _)| *order < node.first_order);
-                    written[..before]
-                        .iter()
-                        .rev()
-                        .map(|(_, id)| *id)
-                        .find(|id| !seen.contains(id))
+                Some(parent) if !nodes.contains_key(parent) && !skipped.is_empty() => {
+                    let mut gap = Gap::default();
+                    let mut missing = parent;
+                    let mut before = node.first_order;
+                    let next = loop {
+                        let Some(index) =
+                            skipped_parent(&skipped, &crossed, &written, missing, before)
+                        else {
+                            break None;
+                        };
+                        crossed[index] = true;
+                        let record = &skipped[index];
+                        if record.shown() {
+                            gap.add(record);
+                            gap.at = record.at as u64;
+                        }
+                        if record.compaction() {
+                            compacted = true;
+                            break record
+                                .logical_parent
+                                .as_deref()
+                                .filter(|previous| {
+                                    nodes
+                                        .get(*previous)
+                                        .is_some_and(|previous| previous.first_order < record.at)
+                                })
+                                .or_else(|| preceding(record.at, &seen));
+                        }
+                        match &record.parent {
+                            Some(Some(parent)) if nodes.contains_key(parent) => {
+                                break Some(parent.as_str());
+                            }
+                            Some(Some(parent)) => {
+                                missing = parent;
+                                before = record.at;
+                            }
+                            Some(None) => break None,
+                            // Cut before it named its parent: it followed the
+                            // message written before it.
+                            None => break preceding(record.at, &seen),
+                        }
+                    };
+                    if !gap.is_empty() {
+                        chain.push(Link::Gap(gap));
+                        newer_record = None;
+                    }
+                    next
                 }
                 Some(parent) => Some(parent),
                 // A compaction boundary has no parent: the turns it summarised
@@ -6374,6 +6683,57 @@ impl History {
         }
         chain.reverse();
         chain_tools.reverse();
+        // A skipped message nothing went on from, such as the last one before
+        // a crash that Claude Code's next record replaced, is marked after
+        // the message it followed. One that followed a message on another
+        // branch is not part of this conversation.
+        let mut marked = true;
+        let mut unplaced = Gap::default();
+        for (record, _) in skipped
+            .iter()
+            .zip(&crossed)
+            .filter(|(record, crossed)| !**crossed && record.shown())
+        {
+            match &record.parent {
+                Some(Some(parent)) if !seen.contains(parent.as_str()) => continue,
+                Some(_) => {}
+                None => {
+                    marked = false;
+                    unplaced.add(record);
+                    continue;
+                }
+            }
+            let index = chain
+                .iter()
+                .position(
+                    |link| matches!(link, Link::Record(offset, ..) if *offset > record.at as u64),
+                )
+                .unwrap_or(chain.len());
+            match index
+                .checked_sub(1)
+                .and_then(|previous| chain.get_mut(previous))
+            {
+                Some(Link::Gap(gap)) => gap.add(record),
+                _ => {
+                    let mut gap = Gap {
+                        at: record.at as u64,
+                        ..Gap::default()
+                    };
+                    gap.add(record);
+                    chain.insert(index, Link::Gap(gap));
+                }
+            }
+        }
+        let (damaged, oversized) = chain
+            .iter()
+            .filter_map(|link| match link {
+                Link::Gap(gap) => Some(gap),
+                Link::Record(..) => None,
+            })
+            .chain([&unplaced])
+            .fold((0, 0), |(damaged, oversized), gap| {
+                (damaged + gap.damaged, oversized + gap.oversized)
+            });
         let mut tool_calls = HashMap::new();
         let mut result_calls = HashMap::<u64, Vec<(usize, (u64, u64, usize, usize))>>::new();
         for (range, refs) in chain_tools {
@@ -6406,6 +6766,7 @@ impl History {
             result_calls,
             damaged,
             oversized,
+            marked,
         })
     }
     /// Settles each agent the transcript leaves running that the user stopped,
@@ -6621,7 +6982,10 @@ impl History {
         let mut total = 0;
         let mut charged = HashSet::new();
         while start > 0 && self.offset - start < 100 {
-            let (offset, len, _) = self.chain[start - 1];
+            let Link::Record(offset, len, _) = self.chain[start - 1] else {
+                start -= 1;
+                continue;
+            };
             let mut records = HashMap::new();
             if !charged.contains(&offset) {
                 records.insert(offset, len);
@@ -6654,18 +7018,31 @@ impl History {
         let mut result = Vec::new();
         let mut positions = HashMap::new();
         for index in start..self.offset {
-            let (offset, len, base) = self.chain[index];
-            positions.insert(offset, result.len());
-            result.push(HistoryRecord {
-                frame: self.read_record(offset, len, base)?,
-                tool_calls: HashMap::new(),
-            });
+            let record = match self.chain[index] {
+                Link::Record(offset, len, base) => {
+                    positions.insert(offset, result.len());
+                    HistoryRecord {
+                        frame: self.read_record(offset, len, base)?,
+                        tool_calls: HashMap::new(),
+                        gap: None,
+                    }
+                }
+                Link::Gap(gap) => HistoryRecord {
+                    frame: Value::Null,
+                    tool_calls: HashMap::new(),
+                    gap: Some(gap),
+                },
+            };
+            result.push(record);
         }
         let mut dependencies = std::collections::BTreeMap::<
             u64,
             (u64, usize, std::collections::BTreeSet<usize>),
         >::new();
-        for &(offset, _, _) in &self.chain[start..self.offset] {
+        for offset in self.chain[start..self.offset]
+            .iter()
+            .filter_map(Link::offset)
+        {
             if let Some(calls) = self.result_calls.get(&offset) {
                 for &(_, (call, len, base, index)) in calls {
                     dependencies
@@ -6707,7 +7084,10 @@ impl History {
                 call_blocks.insert((offset, index), std::sync::Arc::new(block));
             }
         }
-        for &(offset, _, _) in &self.chain[start..self.offset] {
+        for offset in self.chain[start..self.offset]
+            .iter()
+            .filter_map(Link::offset)
+        {
             if let Some(calls) = self.result_calls.get(&offset) {
                 let record = &mut result[positions[&offset]];
                 for &(result_index, (call, _, _, call_index)) in calls {
@@ -7109,6 +7489,7 @@ mod tests {
         let record = HistoryRecord {
             frame: frame(content),
             tool_calls: HashMap::new(),
+            gap: None,
         };
         let mut adapter = Claude::default();
         let mut step = Step::default();
@@ -13569,6 +13950,7 @@ mod tests {
         let record = HistoryRecord {
             frame: frame.clone(),
             tool_calls: HashMap::new(),
+            gap: None,
         };
         let mut step = Step::default();
         adapter.history_message(&record, &mut step).unwrap();
@@ -16024,27 +16406,274 @@ mod tests {
         file.rewind().unwrap();
         let mut history = History::index(file, id).unwrap();
         assert_eq!((history.damaged, history.oversized), (2, 1));
+        assert!(history.marked);
         let page = history.page().unwrap();
         assert_eq!(
-            page.iter()
-                .map(|value| value["uuid"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            vec!["first", "second", "third", "fourth", "fifth"]
+            shown(&page),
+            [
+                "first", "1 cut", "second", "third", "1 large", "fourth", "1 cut", "fifth"
+            ]
         );
-        assert_eq!(page[1]["message"]["content"], "Second");
+        assert_eq!(page[2]["message"]["content"], "Second");
+    }
+
+    /// Each record's uuid, or what a gap in its place skipped.
+    fn shown(page: &[HistoryRecord]) -> Vec<String> {
+        page.iter()
+            .map(|record| match record.gap {
+                Some(gap) => [(gap.damaged, "cut"), (gap.oversized, "large")]
+                    .into_iter()
+                    .filter(|(count, _)| *count > 0)
+                    .map(|(count, kind)| format!("{count} {kind}"))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                None => record["uuid"].as_str().unwrap().to_owned(),
+            })
+            .collect()
+    }
+
+    /// A transcript line in the field order Claude Code writes: parent and
+    /// branch first, then the message, and its type and UUID after it.
+    fn claude_line(
+        uuid: &str,
+        parent: Option<&str>,
+        kind: &str,
+        extra: &str,
+        content: &str,
+    ) -> String {
+        let id = "00000000-0000-4000-8000-000000000001";
+        format!(
+            "{{\"parentUuid\":{},\"isSidechain\":false{extra},\"message\":{{\"role\":\"{kind}\",\"content\":{}}},\"type\":\"{kind}\",\"uuid\":\"{uuid}\",\"sessionId\":\"{id}\"}}",
+            json!(parent),
+            json!(content),
+        )
+    }
+
+    fn index_lines(lines: &[String]) -> History {
+        let mut file = tempfile::tempfile().unwrap();
+        for line in lines {
+            writeln!(file, "{line}").unwrap();
+        }
+        file.rewind().unwrap();
+        History::index(file, "00000000-0000-4000-8000-000000000001").unwrap()
+    }
+
+    /// The line cut short where its message's content begins.
+    fn cut(line: &str) -> String {
+        line[..line.find("\"content\":").unwrap() + 14].to_owned()
+    }
+
+    #[test]
+    fn a_record_cut_short_still_names_its_parent_and_kind() {
+        let line = claude_line("lost", Some("before"), "assistant", "", "Answer");
+        let record = skipped_record(cut(&line).as_bytes(), 7, false);
+        assert_eq!(record.at, 7);
+        assert_eq!(record.parent, Some(Some("before".into())));
+        // The type is written after the message; the role says it.
+        assert_eq!(record.kind.as_deref(), Some("assistant"));
+        assert_eq!(record.uuid, None);
+        assert!(record.shown());
+        let record = skipped_record(br#"{"parentUuid":null,"isSide"#, 0, false);
+        assert_eq!(record.parent, Some(None));
+        assert!(
+            record.shown(),
+            "what was cut is unknown, so it may have been seen"
+        );
+        let record = skipped_record(br#"{"parentU"#, 0, false);
+        assert_eq!(record.parent, None);
+        let side = claude_line("s", Some("p"), "user", "", "x")
+            .replace("\"isSidechain\":false", "\"isSidechain\":true");
+        assert!(!skipped_record(cut(&side).as_bytes(), 0, false).shown());
+        let progress =
+            br#"{"parentUuid":"a1","isSidechain":false,"type":"progress","data":{"output":"buil"#;
+        assert!(!skipped_record(progress, 0, false).shown());
+        let boundary = br#"{"parentUuid":null,"logicalParentUuid":"a1","isSidechain":false,"type":"system","subtype":"compact_boundary","content":"Conversation comp"#;
+        let record = skipped_record(boundary, 0, false);
+        assert!(record.compaction() && !record.shown());
+    }
+
+    /// Older Claude Code wrote a subagent's records into the main transcript.
+    /// The message a skipped record followed is found by its parent, never
+    /// in a subagent's records written between them.
+    #[test]
+    fn a_skipped_record_next_to_a_subagent_keeps_the_conversation_whole() {
+        let side = |uuid: &str, parent: Option<&str>| {
+            claude_line(uuid, parent, "assistant", "", "Subagent work")
+                .replace("\"isSidechain\":false", "\"isSidechain\":true")
+        };
+        let lines = [
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+            side("s1", None),
+            side("s2", Some("s1")),
+            claude_line(
+                "huge",
+                Some("a1"),
+                "user",
+                "",
+                &"x".repeat(MAX_PAYLOAD + 10),
+            ),
+            claude_line("a2", Some("huge"), "assistant", "", "After"),
+        ];
+        let mut history = index_lines(&lines);
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["u1", "a1", "1 large", "a2"]
+        );
+        // Cut before it named its parent, it followed the main conversation's
+        // last message, not the subagent's.
+        let mut lines = lines;
+        lines[4] = r#"{"parentU"#.into();
+        let mut history = index_lines(&lines);
+        assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "1 cut", "a2"]);
+    }
+
+    /// After a rewind, a skipped first prompt of the new branch leads back to
+    /// where the branch began, not to the abandoned branch written before it.
+    #[test]
+    fn a_skipped_record_after_a_rewind_follows_its_own_parent() {
+        let mut history = index_lines(&[
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+            claude_line("u2", Some("a1"), "user", "", "Abandoned"),
+            claude_line("a2", Some("u2"), "assistant", "", "Abandoned answer"),
+            cut(&claude_line("u2b", Some("a1"), "user", "", "Instead")),
+            claude_line("a3", Some("u2b"), "assistant", "", "New answer"),
+        ]);
+        assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "1 cut", "a3"]);
+        assert_eq!((history.damaged, history.oversized), (1, 0));
+    }
+
+    /// A crash cuts the record being written; on resume Claude Code goes on
+    /// from the last one it could read. The lost message is marked where it
+    /// was, and a missing parent unrelated to any skipped record still ends
+    /// the conversation as it always has.
+    #[test]
+    fn a_message_lost_in_a_crash_is_marked_where_it_was() {
+        let mut history = index_lines(&[
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+            cut(&claude_line("u2", Some("a1"), "user", "", "Lost prompt")),
+            claude_line("u2b", Some("a1"), "user", "", "Asked again"),
+            claude_line("a2", Some("u2b"), "assistant", "", "Reply"),
+        ]);
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["u1", "a1", "1 cut", "u2b", "a2"]
+        );
+        assert!(history.marked);
+        let mut history = index_lines(&[
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+            cut(&claude_line("u2", Some("a1"), "user", "", "Lost prompt")),
+            claude_line("u2b", Some("a1"), "user", "", "Asked again"),
+            claude_line("a2", Some("never-written"), "assistant", "", "Reply"),
+        ]);
+        assert_eq!(shown(&history.page().unwrap()), ["a2"]);
+        assert_eq!((history.damaged, history.oversized), (0, 0));
+    }
+
+    #[test]
+    fn several_skipped_records_in_a_row_are_crossed_together() {
+        let lines = [
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+            cut(&claude_line("d1", Some("a1"), "user", "", "One")),
+            cut(&claude_line("d2", Some("d1"), "assistant", "", "Two")),
+            cut(&claude_line("d3", Some("d2"), "user", "", "Three")),
+            claude_line("a2", Some("d3"), "assistant", "", "After"),
+        ];
+        let mut history = index_lines(&lines);
+        assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "3 cut", "a2"]);
+        // One cut before its parent still lands in the same place.
+        let mut lines = lines;
+        lines[3] = r#"{"parentUuid":"d"#.into();
+        let mut history = index_lines(&lines);
+        assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "3 cut", "a2"]);
+        assert!(history.marked);
+    }
+
+    /// Cut progress, system or subagent records lose nothing the reader
+    /// would have seen, so nothing is reported missing.
+    #[test]
+    fn a_cut_record_that_was_never_shown_is_not_reported() {
+        let mut history = index_lines(&[
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line("a1", Some("u1"), "assistant", "", "Answer"),
+            r#"{"parentUuid":"a1","isSidechain":false,"type":"progress","data":{"output":"buil"#
+                .into(),
+            claude_line("u2", Some("a1"), "user", "", "Next"),
+        ]);
+        assert_eq!(shown(&history.page().unwrap()), ["u1", "a1", "u2"]);
+        assert_eq!((history.damaged, history.oversized), (0, 0));
+    }
+
+    /// A damaged compaction boundary still leads back to the turns it
+    /// summarised.
+    #[test]
+    fn a_damaged_compaction_boundary_keeps_the_turns_before_it() {
+        let mut history = index_lines(&[
+            claude_line("old", None, "user", "", "Old question"),
+            claude_line("old-a", Some("old"), "assistant", "", "Old answer"),
+            r#"{"parentUuid":null,"logicalParentUuid":"old-a","isSidechain":false,"type":"system","subtype":"compact_boundary","content":"Conversation comp"#.into(),
+            claude_line("summary", Some("compact"), "user", ",\"isCompactSummary\":true", "Summary"),
+            claude_line("a1", Some("summary"), "assistant", "", "Answer"),
+        ]);
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["old", "old-a", "summary", "a1"]
+        );
+        assert_eq!((history.damaged, history.oversized), (0, 0));
+    }
+
+    /// A record more than twice the read limit is skipped whole, and the
+    /// records after it are still read from where they start.
+    #[test]
+    fn a_record_longer_than_several_reads_is_skipped_whole() {
+        let mut history = index_lines(&[
+            claude_line("u1", None, "user", "", "Question"),
+            claude_line(
+                "huge",
+                Some("u1"),
+                "assistant",
+                "",
+                &"x".repeat(2 * MAX_PAYLOAD + 10),
+            ),
+            claude_line("u2", Some("huge"), "user", "", "Next"),
+            claude_line("a2", Some("u2"), "assistant", "", "Reply"),
+        ]);
+        assert_eq!(
+            shown(&history.page().unwrap()),
+            ["u1", "1 large", "u2", "a2"]
+        );
+        assert_eq!((history.damaged, history.oversized), (0, 1));
     }
 
     #[test]
     fn the_skipped_records_notice_reads_in_plain_words() {
-        assert_eq!(skipped_records(0, 0, true), None);
+        assert_eq!(skipped_records(0, 0, true, true), None);
         assert_eq!(
-            skipped_records(1, 0, true).unwrap(),
-            "One saved message could not be read: it was cut short, for example when Claude Code was stopped while saving. Everything else in the conversation is shown, and Claude Code continues it as usual."
+            skipped_records(1, 0, true, true).unwrap(),
+            "One saved message could not be read: it was cut short, for example when Claude Code was stopped while saving. It is marked where it was. Everything else in the conversation is shown, and Claude Code continues it as usual."
         );
         assert_eq!(
-            skipped_records(2, 3, false).unwrap(),
+            skipped_records(2, 3, false, false).unwrap(),
             "2 saved messages could not be read: they were cut short, for example when Claude Code was stopped while saving. 3 saved messages are too large to show, such as a very long tool output. Everything else in the conversation is shown."
         );
+        let gap = |damaged, oversized| match gap_item(Gap {
+            at: 9,
+            damaged,
+            oversized,
+        })
+        .content
+        {
+            ItemContent::Delivery { summary, .. } => summary,
+            _ => unreachable!(),
+        };
+        assert_eq!(gap(1, 0), "A message here could not be read");
+        assert_eq!(gap(3, 0), "3 messages here could not be read");
+        assert_eq!(gap(0, 1), "A message here is too large to show");
+        assert_eq!(gap(1, 1), "2 messages here are not shown");
     }
 
     /// The provider keeps its own copy of a conversation, so one whose saved
@@ -16662,7 +17291,7 @@ mod tests {
         let prior = history.offset;
         // Synthetic offset metadata tests the aggregate guard without allocating
         // multiple30MiB inputs. It fails before attempting any dependency read.
-        let offset = history.chain[prior - 1].0;
+        let offset = history.chain[prior - 1].offset().unwrap();
         history.result_calls.insert(
             offset,
             vec![
