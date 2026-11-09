@@ -621,6 +621,9 @@ struct Claude {
     /// cannot turn a stop into a failure.
     ended_agents: VecDeque<(String, ToolStatus)>,
     models: Vec<Model>,
+    /// The full model ID each listed model resolves to, where Claude Code
+    /// said: `opus` to `claude-opus-5-5`, `fable` to `claude-fable-5-1`.
+    resolved: HashMap<String, String>,
     selected: Option<String>,
     cache_read_tokens: u64,
     cache_write_tokens: u64,
@@ -1265,6 +1268,27 @@ impl Claude {
             ..Step::default()
         })
     }
+    /// The listed model a turn running on `model` is on. A turn names the
+    /// full ID it runs on, `claude-opus-5-5`, while the list offers aliases
+    /// that resolve to it, such as `default` and `opus`. The model already
+    /// chosen keeps its place when it resolves there, so choosing Opus goes
+    /// on showing Opus; otherwise the first listed model that resolves there
+    /// stands for it. A model the list does not name is shown as it is.
+    fn listed<'a>(&'a self, model: &'a str) -> &'a str {
+        let resolves = |id: &str| self.resolved.get(id).is_some_and(|full| full == model);
+        if self.models.iter().any(|listed| listed.id == model) {
+            return model;
+        }
+        if let Some(selected) = self.selected.as_deref().filter(|id| resolves(id)) {
+            return selected;
+        }
+        self.models
+            .iter()
+            .map(|listed| listed.id.as_str())
+            .find(|id| resolves(id))
+            .unwrap_or(model)
+    }
+
     fn metadata(&mut self, data: &Value, step: &mut Step) {
         if let Some(version) = data["claude_code_version"].as_str() {
             let mut parts = version
@@ -1276,6 +1300,15 @@ impl Claude {
         }
         if let Some(models) = data["models"].as_array() {
             self.models = models.iter().filter_map(Model::from_claude).collect();
+            self.resolved = models
+                .iter()
+                .filter_map(|model| {
+                    Some((
+                        model["value"].as_str()?.to_owned(),
+                        model["resolvedModel"].as_str()?.to_owned(),
+                    ))
+                })
+                .collect();
         }
         if let Some(commands) = data["commands"].as_array() {
             let mut authored = HashSet::new();
@@ -1341,7 +1374,7 @@ impl Claude {
                 })
         });
         if let Some(model) = data["model"].as_str() {
-            self.selected = Some(model.into());
+            self.selected = Some(self.listed(model).to_owned());
         }
         step.events.extend([
             Event::Models {
@@ -14690,6 +14723,54 @@ mod tests {
                 .unwrap();
             assert!(second.events.iter().any(|event| matches!(event, Event::TurnFinished { key, outcome: crate::notifications::Kind::Succeeded } if key.as_deref() == Some("claude:second"))));
         }
+    }
+
+    /// As Claude Code 2.1.296 listed its models: aliases such as `default`,
+    /// `opus` and `fable`, each with the full ID it resolves to, and full IDs
+    /// such as `claude-fable-5-2`. A turn names the full ID it runs on, which
+    /// is shown as the listed model that stands for it, never as a raw ID
+    /// beside a picker that lists no such model.
+    #[test]
+    fn a_turns_full_model_id_is_shown_as_its_listed_model() {
+        let catalog: Value = serde_json::from_slice(
+            &std::fs::read(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("fixtures/accounts/claude-initialize-models.json"),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let mut adapter = Claude::default();
+        adapter.metadata(&catalog, &mut Step::default());
+        let fable = adapter
+            .models
+            .iter()
+            .find(|model| model.id == "claude-fable-5-2")
+            .expect("Fable 5.2 is listed by its full ID");
+        assert_eq!(fable.label, "Fable 5.2");
+        assert!(fable.reasoning.contains(&"max".to_owned()));
+        let turn = |adapter: &mut Claude, model: &str| {
+            let mut step = Step::default();
+            adapter.metadata(&json!({"model": model}), &mut step);
+            let selected = step.events.iter().find_map(|event| match event {
+                Event::Models { selected, .. } => selected.clone(),
+                _ => None,
+            });
+            assert_eq!(selected, adapter.selected);
+            adapter.selected.clone().unwrap()
+        };
+        // Nothing chosen: the default runs Opus 5.5.
+        assert_eq!(turn(&mut adapter, "claude-opus-5-5"), "default");
+        // Choosing Opus, which resolves to the same model, keeps Opus.
+        adapter.selected = Some("opus".into());
+        assert_eq!(turn(&mut adapter, "claude-opus-5-5"), "opus");
+        // Fable 5.2 is listed under its own ID.
+        assert_eq!(turn(&mut adapter, "claude-fable-5-2"), "claude-fable-5-2");
+        // This version's `fable` alias still runs Fable 5.1.
+        adapter.selected = Some("fable".into());
+        assert_eq!(turn(&mut adapter, "claude-fable-5-1"), "fable");
+        // A model the list does not name is shown as it is.
+        assert_eq!(turn(&mut adapter, "claude-mythos-5-2"), "claude-mythos-5-2");
     }
 
     #[test]
