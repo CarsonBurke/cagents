@@ -274,7 +274,12 @@ fn a_provider_that_outlived_its_holder_keeps_the_refusal() {
     };
     let fixture = Fixture::new(&root);
     let record = fixture.record(exited(i32::MAX - 1), current());
-    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    // It names what still runs and how to end it.
+    assert!(
+        refusal.contains(&format!("pkill -f cagents-codex-{}", fixture.source.id)),
+        "{refusal}"
+    );
     assert_eq!(
         registry::recovery_candidate(
             &registry::socket(
@@ -286,6 +291,25 @@ fn a_provider_that_outlived_its_holder_keeps_the_refusal() {
         .unwrap(),
         Some(record)
     );
+}
+
+/// A provider must not hold its holder's channel to the daemon: if it does,
+/// the holder's death never reaches the daemon while the provider runs on,
+/// and every Close of the pane waits on the dead holder until it times out.
+#[test]
+fn a_provider_inherits_nothing_from_its_holder() {
+    let Some(root) = isolated("a_provider_inherits_nothing_from_its_holder") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let _spawned = Spawned::new(&fixture.source);
+    let record = Spawned::record(&fixture.source);
+    let descriptors = std::fs::read_dir(format!("/proc/{}/fd", record.root.pid))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .filter(|fd| !["0", "1", "2"].contains(&fd.as_str()))
+        .collect::<Vec<_>>();
+    assert!(descriptors.is_empty(), "inherited {descriptors:?}");
 }
 
 /// A server still accepting connections at the conversation's endpoint is
