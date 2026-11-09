@@ -298,6 +298,7 @@ wayland-client = { version = "=0.31.15", features = ["system"], optional = true 
 wayland-protocols = { version = "=0.32.13", features = ["client"], optional = true }
 
 [dev-dependencies]
+tokio = { version = "1.47", features = ["test-util"] }
 tracing-log = "0.2"
 
 [profile.dev]
