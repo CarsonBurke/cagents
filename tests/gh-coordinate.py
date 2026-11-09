@@ -37,13 +37,32 @@ class CoordinationTests(unittest.TestCase):
         self.environment.stop()
         self.directory.cleanup()
 
+    def test_nondefault_port_is_shared_by_response_and_nonblocking_admission(self):
+        with patch.dict(os.environ, {"CAGENTS_GH_NONBLOCKING": "1"}):
+            coordinate.observed(self.root, {"host": "ghe.example:8443", "status": 429, "headers": {"retry-after": "120"}})
+            with self.assertRaises(coordinate.Deferred) as result:
+                coordinate.before(self.root, ["api", "graphql", "--hostname", "ghe.example:8443", "-f", "query={viewer{id}}"])
+            self.assertGreaterEqual(result.exception.retry_after, 119)
+            # A distinct port is a distinct service, so it retains its budget.
+            self.assertIsNone(coordinate.before(self.root, ["api", "graphql", "--hostname", "ghe.example:9443", "-f", "query={viewer{id}}"] ))
+        self.assertEqual(coordinate.normalize_authority("https://ghe.example:443/graphql"), "ghe.example")
+        self.assertEqual(coordinate.normalize_authority("ghe.example:443"), "ghe.example")
+        self.assertEqual(coordinate.normalize_authority("http://ghe.example:80/graphql"), "ghe.example")
+        for value in ("https://ghe.example:443", "http://ghe.example:443", "http://ghe.example:80", "ghe.example:8443", "https://[::1]:8443/graphql"):
+            canonical = coordinate.normalize_authority(value)
+            self.assertEqual(coordinate.normalize_authority(canonical), canonical)
+        self.assertEqual(coordinate.normalize_authority("api.internal:8443"), "api.internal:8443")
+        self.assertEqual(coordinate.normalize_authority("https://api.github.com:443/graphql"), "github.com")
+        self.assertEqual(coordinate.host_for(["api", "https://ghe.example:8443/api/graphql"]), "ghe.example:8443")
+        self.assertEqual(coordinate.host_for(["pr", "view", "https://ghe.example:8443/o/r/pull/1"]), "ghe.example:8443")
+
     def test_comment_body_urls_do_not_select_the_budget(self):
         self.assertEqual(coordinate.host_for(["pr", "comment", "42", "--repo", "CarsonBurke/cagents", "--body", "https://example.com/evidence"]), "github.com")
         self.assertEqual(coordinate.host_for(["pr", "comment", "42", "--body", "--hostname=wrong.example"]), "github.com")
         self.assertEqual(coordinate.host_for(["pr", "comment", "42", "--repo=forge.example/o/r", "--body", "https://wrong.example"]), "forge.example")
         self.assertEqual(coordinate.host_for(["pr", "comment", "42", "-Rforge.example/o/r", "--body", "https://wrong.example"]), "forge.example")
         self.assertEqual(coordinate.host_for(["pr", "comment", "https://forge.example/o/r/pull/42", "--body", "https://wrong.example"]), "forge.example")
-        self.assertEqual(coordinate.host_for(["api", "https://api.forge.example/repos/o/r/issues", "-f", "body=https://wrong.example"]), "forge.example")
+        self.assertEqual(coordinate.host_for(["api", "https://api.forge.example/repos/o/r/issues", "-f", "body=https://wrong.example"]), "api.forge.example")
 
     def test_read_and_content_classification(self):
         for args in [

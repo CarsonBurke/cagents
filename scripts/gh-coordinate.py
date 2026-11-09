@@ -21,6 +21,22 @@ WRITE_INTERVAL = 8.0
 VALUE_FLAGS = {"--hostname", "-R", "--repo", "-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header", "--jq", "-q", "--template", "-t", "--cache", "--body", "-b", "--body-file", "--title", "--head", "--base", "--reviewer", "--assignee", "--label", "--project", "--milestone", "--search", "--author", "--state", "--limit"}
 
 
+def normalize_authority(value):
+    """Canonical API budget authority, retaining nondefault service ports."""
+    url = urlsplit(value if "://" in value else "//" + value)
+    host = (url.hostname or "").lower()
+    if host == "api.github.com":
+        host = "github.com"
+    try:
+        port = url.port
+    except ValueError:
+        port = None
+    defaults = {80, 443} if url.scheme == "http" else {443}
+    if ":" in host:
+        host = "[" + host + "]"
+    return host + (f":{port}" if port is not None and port not in defaults else "")
+
+
 def enabled(root):
     setting = os.environ.get("CAGENTS_GH_COORDINATE")
     return setting == "1" or (setting != "0" and (root / "coordination.enabled").exists())
@@ -28,7 +44,7 @@ def enabled(root):
 
 def repository_host(value):
     if value.startswith(("http://", "https://")):
-        return urlsplit(value).hostname
+        return normalize_authority(value)
     parts = value.split("/")
     return parts[0] if len(parts) >= 3 else None
 
@@ -56,8 +72,8 @@ def host_for(args):
     words = positionals(args)
     target = words[1] if len(words) > 1 and words[0] == "api" else words[2] if len(words) > 2 and words[0] in {"pr", "issue", "repo"} else ""
     if target.startswith(("http://", "https://")):
-        host = urlsplit(target).hostname or host
-    return host.lower().removeprefix("api.")
+        host = normalize_authority(target) or host
+    return normalize_authority(host)
 
 
 def query_from(args):
@@ -121,7 +137,7 @@ def is_write(args):
     command = words[0]
     if command == "api":
         endpoint = words[1] if len(words) > 1 else ""
-        if endpoint == "graphql" or urlsplit(endpoint).path == "/graphql":
+        if endpoint == "graphql" or urlsplit(endpoint).path in {"/graphql", "/api/graphql"}:
             query = query_from(args)
             # A body supplied through --input may contain a mutation. Do not
             # read stdin, which belongs exclusively to the real command.
@@ -210,7 +226,7 @@ def retry_deadline(row, now, failures):
 def observed(root, row, now=None):
     if not enabled(root) or row.get("cached_response"):
         return
-    host = (row.get("host") or "github.com").lower().removeprefix("api.")
+    host = normalize_authority(row.get("host") or "github.com")
     now = time.time() if now is None else now
     try:
         with locked(root, host) as state:

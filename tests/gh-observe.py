@@ -72,6 +72,12 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(rows[0]["operation"], "Find")
         self.assertEqual(rows[0]["primary_cost"], 3)
 
+    def test_endpoint_authority_preserves_nondefault_ports(self):
+        self.assertEqual(observe.safe_endpoint("https://ghe.example:8443/api/graphql?query=secret"), {"host": "ghe.example:8443", "path": "/api/graphql"})
+        self.assertEqual(observe.safe_endpoint("https://ghe.example:443/api/graphql"), {"host": "ghe.example", "path": "/api/graphql"})
+        self.assertEqual(observe.safe_endpoint("https://api.internal:8443/graphql")["host"], "api.internal:8443")
+        self.assertEqual(observe.safe_endpoint("https://api.github.com/graphql")["host"], "github.com")
+
     def test_anonymous_query_groups_argument_values(self):
         first = observe.operation('{repository(owner:"one", name:"two"){pullRequests(first:100){totalCount}}}')
         second = observe.operation('{ repository(owner:"three", name:"four") { pullRequests(first:20) {totalCount} } }')

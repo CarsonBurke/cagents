@@ -4,6 +4,7 @@ import argparse
 import collections
 import datetime
 import email.utils
+import functools
 import hashlib
 import importlib.util
 import json
@@ -111,7 +112,9 @@ def safe_endpoint(target):
     # No URL query values (search terms, credentials); path only, bounded.
     if not re.fullmatch(r"/[A-Za-z0-9_./%~:@+-]*", path):
         path = "<redacted>"
-    return {"host": url.hostname, "path": path[:512]}
+    guard = coordinator()
+    authority = guard.normalize_authority(target) if guard is not None else url.netloc
+    return {"host": authority, "path": path[:512]}
 
 
 class Traffic:
@@ -234,6 +237,7 @@ class Traffic:
         return True
 
 
+@functools.lru_cache(maxsize=1)
 def coordinator():
     path = Path(__file__).resolve().with_name("gh-coordinate.py")
     if not path.is_file():
@@ -365,7 +369,9 @@ def report(args):
     logical_count = cached_count = duplicate_count = unattributed = network_count = 0
     for instant, row in sorted(requests, key=lambda entry: entry[0]):
         request_id = row.get("headers", {}).get("x-github-request-id")
-        identity = (row.get("host"), request_id) if request_id else None
+        guard = coordinator()
+        authority = guard.normalize_authority(row.get("host") or "") if guard is not None else row.get("host")
+        identity = (authority, request_id) if request_id else None
         repeated = identity is not None and identity in seen
         if identity is not None:
             seen.add(identity)
