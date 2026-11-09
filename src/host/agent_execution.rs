@@ -165,6 +165,9 @@ pub(super) fn submit(
     {
         return Ok(previous);
     }
+    if let Destination::Existing(agent) = &request.destination {
+        refuse_limited(host, &registry, *agent)?;
+    }
     let selected = if let Destination::New(spec) = &request.destination {
         let mut selected = spec.clone();
         let model = registry.lock().unwrap_or_else(|p| p.into_inner()).model()?;
@@ -187,6 +190,59 @@ pub(super) fn submit(
     announce(host, &registry);
     dispatch_accepted(host, accepted.clone())?;
     Ok(accepted)
+}
+
+/// Refuses a follow-up run for an agent whose conversation a usage limit stops
+/// until a known reset: its provider would refuse the prompt at once, and the
+/// caller is better told now. A limit of unknown end is let through, since a
+/// new turn is what shows whether it still holds, as after the conversation's
+/// account changed.
+fn refuse_limited(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: crate::model::AgentId,
+) -> Result<(), String> {
+    let agent = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .agent(agent)?;
+    let Some(HostedSession::Chat(session)) = &agent.session else {
+        return Ok(());
+    };
+    let Some((provider, handle)) = host
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .chats
+        .get(&session.id)
+        .filter(|record| !record.handle.is_completed())
+        .map(|record| (record.session.launch.provider, record.handle.clone()))
+    else {
+        return Ok(());
+    };
+    let now = now();
+    let Some(limit) = directory::chat_limit(
+        provider,
+        &handle,
+        || {
+            account_info::Accounts::load(now)
+                .and_then(|accounts| accounts.of(provider, &handle.execution_environment().0))
+        },
+        now,
+    )
+    .filter(|limit| limit.resets_at.is_some()) else {
+        return Ok(());
+    };
+    let reset = limit
+        .reset
+        .as_deref()
+        .map(|reset| format!(", resets {reset}"))
+        .unwrap_or_default();
+    Err(format!(
+        "{} ({}{reset}), so the prompt was not sent. {}",
+        crate::agent_execution::LIMITED_REFUSAL,
+        limit.summary,
+        crate::agent_execution::LIMITED_ADVICE,
+    ))
 }
 
 /// Accepts only an exact committed record. The once-only dispatch claim itself
@@ -506,12 +562,11 @@ fn dispatch(
             .recipe
             .arguments
             .extend(launch_options(&accepted.agent.spec));
-        let proof = host
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .proof()
-            .clone();
-        session.claim_owned_codex_listener(&std::env::temp_dir(), &proof);
+        let (proof, listeners) = {
+            let state = host.lock().unwrap_or_else(|p| p.into_inner());
+            (state.proof().clone(), state.codex_listeners.clone())
+        };
+        listeners.claim(&mut session, &proof);
         session.proof = Some(proof);
         registry
             .lock()
@@ -1226,6 +1281,9 @@ pub(super) fn process_request(
         crate::agent_execution::Operation::SendMessage(outgoing) => {
             mailbox::send(host, &authority, outgoing).map(crate::agent_execution::Reply::Sent)
         }
+        crate::agent_execution::Operation::Send(outgoing) => {
+            mailbox::post(host, &authority, outgoing).map(crate::agent_execution::Reply::Delivered)
+        }
         other => process(host, authority, other).map_err(Into::into),
     }
 }
@@ -1300,6 +1358,12 @@ pub(super) fn process(
         Operation::Members(channel) => {
             directory::channel(host, &authority, channel).map(Reply::Members)
         }
+        Operation::Sessions(scope) => {
+            directory::sessions(host, &authority, scope).map(Reply::Sessions)
+        }
+        Operation::Send(outgoing) => mailbox::post(host, &authority, outgoing)
+            .map(Reply::Delivered)
+            .map_err(|error| error.to_string()),
     }
 }
 

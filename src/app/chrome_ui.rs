@@ -1711,9 +1711,9 @@ impl Cagents {
         if self.chrome_ui.rename.take().is_none() {
             return Task::none();
         }
-        self.workspace.focused().map_or_else(Task::none, |card| {
-            iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
-        })
+        self.workspace
+            .focused()
+            .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
     }
 
     /// Keep Tab traversal and global shortcuts inside the open popup.
@@ -1854,6 +1854,7 @@ impl Cagents {
                 // popup's suppressed traversal as its own restore point, and
                 // it owns Tab now: hand it the reader's real choice instead.
                 if !self.adopt_terminal_close_keyboard_nav(restore)
+                    && !self.adopt_chat_close_keyboard_nav(restore)
                     && !self.adopt_daemon_health_keyboard_nav(restore)
                     && !self.adopt_automation_approval_keyboard_nav(restore)
                     && !self.adopt_session_recovery_keyboard_nav(restore)

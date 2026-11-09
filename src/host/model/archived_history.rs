@@ -170,7 +170,7 @@ impl Registry {
             )
             .map_err(|e| e.to_string())?;
         if blocked
-            || super::views::all(&tx)?.iter().any(|view| {
+            || super::views::occupied(&tx)?.iter().any(|view| {
                 view.panes.iter().any(|pane| {
                     matches!(&pane.kind,
                 crate::model::CardKind::Chat(chat) if chat.id == source.id)

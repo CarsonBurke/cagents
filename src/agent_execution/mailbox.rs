@@ -158,6 +158,17 @@ pub struct Sent {
     pub reach: Reach,
 }
 
+/// A sent message and what its recipient can do with it now.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Delivery {
+    pub sent: Sent,
+    /// The recipient's session as a listing reports it: a usage limit holds
+    /// the message until the limit resets, and the sender does not wait on a
+    /// reply that cannot come before then. Absent for the user and for a
+    /// recipient no session of which runs.
+    pub recipient: Option<super::directory::Member>,
+}
+
 /// A read of the caller's messages. Each message it returns that its recipient
 /// had not yet received is marked read.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -2,6 +2,9 @@
 # Native before/after evidence for a checkout, in an isolated fixture session.
 # See "Native evidence" in docs/development.md.
 set -euo pipefail
+# Read whole before any of it runs: a build or session runs for minutes, and
+# a checkout updated meanwhile must not change what the rest of this does.
+{
 
 self=$(readlink -f "$0")
 tool_root=${self%/scripts/*}
@@ -36,8 +39,12 @@ both use the same fixture data and synthetic provider.
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
+        [--portal gtk|kde|gnome|cosmic]
                   Take the native lock and start a headless session. The lock is
                   released by stop, or after --limit seconds (default 2700).
+                  --portal runs xdg-desktop-portal with that backend inside the
+                  session, so the app's file chooser opens there for drive to
+                  operate.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -73,6 +80,7 @@ refuse_inherited_authority() {
     for name in CAGENTS_AGENT_AUTHORITY CAGENTS_AGENT_TOKEN CAGENTS_SESSION_TOKEN; do
         if [ "${!name+x}" ]; then
             printf '%s\n' "This fixture requires a genuine User shell; inherited agent authority was not modified." >&2
+            printf '%s\n' "From a cagents session, run it on the build host over SSH instead: scripts/native-evidence --remote fw16 --task DIR COMMAND (see \"Native evidence from a cagents session\" in docs/development.md)." >&2
             exit 77
         fi
     done
@@ -104,6 +112,7 @@ select_task() {
     mkdir -p -- "$task"
     fixture=$task/fixture
     seed=$task/fixture-seed
+    seed_home=$task/fixture-seed.home
     runtime=$task/rt
     state=$task/session
     logs=$task/logs
@@ -356,12 +365,42 @@ fixture_env() {
         "$@"
 }
 
+# The provider home a seed's chats recorded, as device and inode: the
+# fixture's when the seed was saved, kept in $seed_home.
+seeded_home_identity() {
+    stat -c '%d:%i' -- "$fixture/home/.claude" 2>/dev/null || :
+}
+
+# Keep the stopped fixture as the seed every later start restores.
+save_seed() {
+    rm -rf -- "$seed" "$seed_home"
+    cp -a --reflink=auto -- "$fixture" "$seed"
+    seeded_home_identity >"$seed_home"
+}
+
 prepare_fixture() {
     local keep_state=$1
     if [ "$keep_state" = false ]; then
-        rm -rf -- "$fixture"
-        if [ -d "$seed" ]; then
-            cp -a --reflink=auto -- "$seed" "$fixture"
+        if [ -d "$seed" ] && [ -d "$fixture" ]; then
+            # Restore the seed into the fixture rather than replacing it: a
+            # chat records its provider home's identity, its device and
+            # inode, and refuses to reopen once that directory is replaced,
+            # and a transcript's location records its file's. Syncing in
+            # place keeps every directory and file both share, so a
+            # conversation saved in the seed reopens on either side.
+            if ! rsync -aH --inplace --delete --force -- "$seed/" "$fixture/" 2>"$logs/seed.log"; then
+                printf 'could not restore the seed into the fixture; see %s\n' "$logs/seed.log" >"$state/failed"
+                return 1
+            fi
+        else
+            rm -rf -- "$fixture"
+            if [ -d "$seed" ]; then
+                cp -a --reflink=auto -- "$seed" "$fixture"
+            fi
+        fi
+        # The session runs detached; start shows this once it is ready.
+        if [ -d "$seed" ] && [ "$(seeded_home_identity)" != "$(cat -- "$seed_home" 2>/dev/null)" ]; then
+            printf '%s\n' 'the provider home is not the one the seed was saved from, so chats in the seed will not reopen; recreate them and save-seed again' >>"$state/notice"
         fi
     fi
     mkdir -p "$fixture"/{bin,home/.claude,data,config,cache,state,project}
@@ -581,8 +620,10 @@ run_session() {
 run_inner() {
     local side=$1 width=$2 failure=
     load_side "$side" "$state/source"
+    local portal
+    portal=$(cat "$state/portal" 2>/dev/null) || portal=
     if ! timeout -k 5 240 niri-harness session start "$session_name" --root "$harness_root" --timeout 180 \
-        --width "$width" --cmd "exec $self --task $task __app $side" \
+        --width "$width" ${portal:+--portal "$portal"} --cmd "exec $self --task $task __app $side" \
         >"$logs/harness-$side.log" 2>&1; then
         failure="the app window did not appear; see $logs/harness-$side.log, $harness_root/session.log and $logs/ui-$side.log"
     elif ! source_is_current; then
@@ -690,7 +731,7 @@ run_app() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 keep_state=false wait_lock=1800 limit=2700
+    local side=${1:-} width=1500 keep_state=false wait_lock=1800 limit=2700 portal=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -699,23 +740,30 @@ cmd_start() {
             --keep-state) keep_state=true; shift ;;
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
+            --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
     [[ $width =~ ^[0-9]+$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
         die 'width, lock wait and session limit must be whole numbers' 2
+    [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
+        die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     live_session && die 'a session is already running for this task; stop it first'
+    if [ "$keep_state" = false ] && [ -d "$seed" ] && [ -d "$fixture" ] && ! command -v rsync >/dev/null 2>&1; then
+        die 'restoring the seed needs rsync, which keeps the directories its chats recorded; install rsync'
+    fi
     # Before anything reads it: the pruner leaves a target written meanwhile.
     mark_used
     load_side "$side"
     source_is_current || die "$checkout changed since its build; run: build $side $checkout"
-    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit"
+    rm -f -- "$state/ready" "$state/failed" "$state/stop" "$state/env" "$state/over-limit" "$state/notice"
     # Fix what this session runs: everything it reports reads this copy.
     cp -- "$(target_of "$side")/evidence-source" "$state/source" 2>/dev/null ||
         die "$(not_built "$side" "$checkout")"
     printf '%s\n' "$side" >"$state/side"
     printf '%s\n' "$width" >"$state/width"
+    printf '%s\n' "$portal" >"$state/portal"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" \
@@ -740,6 +788,9 @@ cmd_start() {
     fi
     printf 'session ready: %s at %s, width %s, stopping itself after %s seconds\n' \
         "$side" "$built_revision" "$width" "$limit"
+    if [ -s "$state/notice" ]; then
+        sed 's/^/native-evidence: /' "$state/notice" >&2
+    fi
 }
 
 cmd_seed() {
@@ -769,8 +820,7 @@ cmd_seed() {
         die "generating the $profile workspace failed; the fixture is incomplete, so seed again"
     fixture_env "$generator" apply --root "$fixture" --bin-dir "$target/dev-runtime" ||
         die "loading the $profile workspace through $side's executables failed; the fixture is incomplete, so seed again"
-    rm -rf -- "$seed"
-    cp -a --reflink=auto -- "$fixture" "$seed"
+    save_seed
     printf 'seeded %s with the %s workspace (seed %s) through %s at %s\n' \
         "$seed" "$profile" "$number" "$side" "$built_revision"
 }
@@ -868,6 +918,13 @@ cmd_status() {
     fi
 }
 
+# On another host, over SSH; nothing native runs here. See native-evidence-remote.
+# Only as a leading option, beside --task: a later --remote is a command's.
+if [ "${1:-}" = --remote ] || { [ "${1:-}" = --task ] && [ "${3:-}" = --remote ]; }; then
+    exec "$tool_root/scripts/native-evidence-remote" "$@"
+fi
+[ -z "${CAGENTS_EVIDENCE_REMOTE:-}" ] || exec "$tool_root/scripts/native-evidence-remote" "$@"
+
 refuse_inherited_authority
 
 task_argument=${CAGENTS_EVIDENCE_TASK:-}
@@ -900,8 +957,7 @@ case $command in
     save-seed)
         live_session && die 'stop the session before saving its fixture'
         [ -d "$fixture" ] || die 'there is no fixture to save yet'
-        rm -rf -- "$seed"
-        cp -a --reflink=auto -- "$fixture" "$seed"
+        save_seed
         printf 'saved %s\n' "$seed"
         ;;
     seed) cmd_seed "$@" ;;
@@ -912,3 +968,5 @@ case $command in
     __app) run_app "$@" ;;
     *) usage >&2; exit 2 ;;
 esac
+exit
+}

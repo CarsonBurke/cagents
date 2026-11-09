@@ -918,7 +918,7 @@ fn only_a_terminal_that_was_running_can_be_reopened() {
 #[test]
 fn a_terminal_proven_gone_leaves_through_ordinary_removal() {
     let (mut app, card, terminal, _) = live_app();
-    app.card_state_mut(card).unwrap().residency = Residency::Hot;
+    app.set_residency(card, Residency::Hot);
     let _ = app.update(Message::CloseCard(card));
     assert!(app.card_state(card).unwrap().existence.is_open());
     assert!(app.terminal_close.as_ref().unwrap().pending);
@@ -1053,33 +1053,37 @@ fn pointer_and_keyboard_close_preserve_live_card_until_confirmation() {
     }
 }
 
+/// Escape keeps the terminal, even when the terminal the question opened over
+/// still has focus and captured the key.
 #[test]
 fn escape_consumes_terminal_confirmation_without_closing_context() {
-    let (mut app, card, _, _) = live_app();
-    request_active_close(&mut app, card);
-    let key = keyboard::Key::Named(keyboard::key::Named::Escape);
-    let _ = app.update(Message::KeyEvent {
-        event: keyboard::Event::KeyPressed {
-            key: key.clone(),
-            modified_key: key,
-            physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
-            location: keyboard::Location::Standard,
-            modifiers: keyboard::Modifiers::empty(),
-            text: None,
-            repeat: false,
-        },
-        captured: false,
-    });
-    assert!(app.terminal_close.is_none());
-    assert!(app.card_state(card).unwrap().existence.is_open());
-    assert!(app.terminal_close_attempts.is_empty());
-    assert_eq!(app.workspace.focused(), Some(card));
+    for captured in [false, true] {
+        let (mut app, card, _, _) = live_app();
+        request_active_close(&mut app, card);
+        let key = keyboard::Key::Named(keyboard::key::Named::Escape);
+        let _ = app.update(Message::KeyEvent {
+            event: keyboard::Event::KeyPressed {
+                key: key.clone(),
+                modified_key: key,
+                physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+                location: keyboard::Location::Standard,
+                modifiers: keyboard::Modifiers::empty(),
+                text: None,
+                repeat: false,
+            },
+            captured,
+        });
+        assert!(app.terminal_close.is_none(), "captured={captured}");
+        assert!(app.card_state(card).unwrap().existence.is_open());
+        assert!(app.terminal_close_attempts.is_empty());
+        assert_eq!(app.workspace.focused(), Some(card));
+    }
 }
 
 #[test]
 fn exit_during_confirmation_releases_completed_holder_and_proof_change_keeps_card() {
     let (mut app, card, _, _) = live_app();
-    app.card_state_mut(card).unwrap().residency = Residency::Hot;
+    app.set_residency(card, Residency::Hot);
     request_active_close(&mut app, card);
     let CardKind::Terminal(session) = &mut app.card_state_mut(card).unwrap().kind else {
         unreachable!()

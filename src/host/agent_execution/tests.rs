@@ -148,6 +148,11 @@ while IFS= read -r frame; do
       case "$frame" in
         # Ends the provider mid-turn, as a usage limit does.
         *EXIT_NOW*) exit 3 ;;
+        # Refuses the turn as Claude does when the account is out of usage.
+        *USAGE_LIMIT*)
+          printf '{"type":"result","uuid":"result-%s","subtype":"success","is_error":true,"result":"You'"'"'ve hit your weekly limit · resets Nov 8, 8am (America/Vancouver)","session_id":"%s","usage":{"input_tokens":0,"output_tokens":0}}\n' "$n" "$session"
+          continue
+          ;;
       esac
       case "$frame" in
         *HOLD_CLEANUP_BUSY*)
@@ -4415,6 +4420,213 @@ fn queued_mail_wakes_when_parent_settles_with_a_running_background_child() {
         "one original prompt and one courier prompt, including after another scan"
     );
     drop(courier);
+    close(&host, &Authority::default(), accepted.agent.id).unwrap();
+}
+
+#[test]
+fn a_usage_limited_session_lists_its_limit_and_holds_its_messages() {
+    use crate::agent_execution::mailbox::{Outgoing, State as Delivery, To};
+    if isolated("a_usage_limited_session_lists_its_limit_and_holds_its_messages").is_some() {
+        return;
+    }
+    let (host, mut request, path) = fixture();
+    let root = path.parent().unwrap();
+    request.prompt = "USAGE_LIMIT".into();
+    let accepted = submit(&host, &Authority::default(), request).unwrap();
+    settled(&host, accepted.run.id);
+    let session = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .agent(accepted.agent.id)
+        .unwrap()
+        .session
+        .unwrap()
+        .id();
+    let Reply::Sessions(listing) = process(
+        &host,
+        Authority::default(),
+        Operation::Sessions(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("sessions reply");
+    };
+    let member = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session)
+        .expect("the limited session is listed");
+    let limit = member.limit.as_ref().expect("its limit is reported");
+    assert_eq!(limit.summary, "Claude weekly limit reached");
+    assert_eq!(
+        limit.reset.as_deref(),
+        Some("Nov 8, 8am (America/Vancouver)")
+    );
+    // The fixture has no usage reading to date the reset by.
+    assert_eq!(limit.resets_at, None);
+    assert_eq!(member.state_label(), "limited");
+    // The read older CLIs make keeps its layout and reports no limit.
+    let Reply::Directory(directory) = process(
+        &host,
+        Authority::default(),
+        Operation::Directory(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("directory reply");
+    };
+    assert!(directory.sessions.iter().any(|entry| entry.id == session));
+
+    let Reply::Delivered(delivery) = process(
+        &host,
+        Authority::default(),
+        Operation::Send(Outgoing {
+            to: To::Session(session.to_string()),
+            body: "Can you look at this?".into(),
+            wait_ms: Some(60_000),
+        }),
+    )
+    .unwrap() else {
+        panic!("delivery reply");
+    };
+    let recipient = delivery
+        .recipient
+        .as_ref()
+        .expect("the recipient is reported");
+    assert_eq!(recipient.session.id, session);
+    assert_eq!(recipient.limit.as_ref(), Some(limit));
+    assert_eq!(
+        delivery.sent.message.wait_until_ms, None,
+        "no reply can come before the limit resets, so none is held for the asker"
+    );
+    // A surface showing the conversation, hidden as most are, hears of its
+    // limit from the courier without reading the transcript.
+    let subscriber = 9_001;
+    let queue = {
+        let mut state = host.lock().unwrap();
+        let queue = state.register_client(subscriber);
+        state
+            .chats
+            .get_mut(&session)
+            .unwrap()
+            .subscribers
+            .insert(subscriber, false);
+        queue
+    };
+    let (limits, heard) = std::sync::mpsc::channel();
+    let reader = {
+        let queue = queue.clone();
+        std::thread::spawn(move || {
+            while let Some(outbound) = queue.pop() {
+                if let crate::terminal_ipc::ServerMessage::ChatLimit { chat_id, limit } =
+                    outbound.message
+                {
+                    limits.send((chat_id, limit)).unwrap();
+                }
+            }
+        })
+    };
+    let courier = mailbox::Courier::start(&host).unwrap();
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (session, Some(limit.clone())),
+        "the subscriber is told of the limit"
+    );
+    courier.wake_and_wait_for_scan();
+    assert!(
+        heard.recv_timeout(Duration::from_millis(200)).is_err(),
+        "a limit it was told of is not repeated"
+    );
+    let stored = registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(delivery.sent.message.id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.state,
+        Delivery::Pending,
+        "the limit holds the message"
+    );
+    assert_eq!(
+        std::fs::read_to_string(root.join("prompts"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "the limited provider received no courier prompt"
+    );
+
+    // A limit of unknown end is no reason to refuse a follow-up run, which
+    // is what shows whether it still holds. While that run works, the
+    // provider's last error is not its fate: the session is not limited, and
+    // the subscriber hears so. The run succeeds, so the limit stays lifted
+    // and the held message is delivered.
+    let follow_up = submit(
+        &host,
+        &Authority::default(),
+        Submit {
+            name: None,
+            destination: Destination::Existing(accepted.agent.id),
+            prompt: "carry on HOLD_CLEANUP_BUSY".into(),
+            idempotency_key: "after-the-limit".into(),
+        },
+    )
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !root.join("cleanup-busy").exists() {
+        assert!(Instant::now() < deadline, "the follow-up turn starts");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let Reply::Sessions(listing) = process(
+        &host,
+        Authority::default(),
+        Operation::Sessions(crate::agent_execution::directory::Scope::All),
+    )
+    .unwrap() else {
+        panic!("sessions reply");
+    };
+    let working = listing
+        .sessions
+        .iter()
+        .find(|member| member.session.id == session)
+        .expect("the working session is listed");
+    assert_eq!(working.limit, None, "a working session is not limited");
+    courier.wake_and_wait_for_scan();
+    assert_eq!(
+        heard.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (session, None),
+        "the subscriber hears the limit lifted while the turn works"
+    );
+    std::fs::write(root.join("cleanup-release"), "").unwrap();
+    assert_eq!(settled(&host, follow_up.run.id).state, State::Succeeded);
+    courier.wake_and_wait_for_scan();
+    assert!(
+        heard.try_recv().is_err(),
+        "a lifted limit that stays lifted is not told again"
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while registry(&host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .message(delivery.sent.message.id)
+        .unwrap()
+        .unwrap()
+        .state
+        == Delivery::Pending
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the held message is delivered once the limit lifts"
+        );
+        courier.wake_and_wait_for_scan();
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    drop(courier);
+    queue.close_after_drain();
+    reader.join().unwrap();
     close(&host, &Authority::default(), accepted.agent.id).unwrap();
 }
 

@@ -837,7 +837,7 @@ fn default_managed_worktree_directory() -> String {
 }
 
 const fn default_focus_follows_mouse() -> bool {
-    false
+    true
 }
 
 const fn default_editor_auto_save() -> bool {
@@ -885,6 +885,10 @@ const fn default_check_for_updates() -> bool {
 
 const fn default_shortcut_defaults_revision() -> u32 {
     SHORTCUT_DEFAULTS_REVISION
+}
+
+const fn default_preference_defaults_revision() -> u32 {
+    PREFERENCE_DEFAULTS_REVISION
 }
 
 /// Main stays first; imported worktrees without creation evidence sort by path.
@@ -1118,6 +1122,13 @@ pub struct AppSettings {
     /// old default again. A newer build's revision is kept as it is.
     #[serde(default = "default_shortcut_defaults_revision")]
     pub shortcut_defaults_revision: u32,
+    /// The revision of the built-in preference defaults this file has been
+    /// brought up to; see [`PREFERENCE_DEFAULTS_REVISION`]. Like
+    /// `shortcut_defaults_revision`, it lets a changed default reach a file
+    /// that wrote the old one out without a choice behind it, and keeps a
+    /// value chosen afterwards.
+    #[serde(default = "default_preference_defaults_revision")]
+    pub preference_defaults_revision: u32,
     /// Seconds to keep a language server warm after its last document closes.
     #[serde(default = "default_lsp_idle_timeout")]
     pub lsp_idle_timeout_seconds: u64,
@@ -1197,6 +1208,7 @@ impl Default for AppSettings {
             check_for_updates: default_check_for_updates(),
             work_stale_after_days: default_work_stale_after_days(),
             shortcut_defaults_revision: SHORTCUT_DEFAULTS_REVISION,
+            preference_defaults_revision: PREFERENCE_DEFAULTS_REVISION,
             lsp_idle_timeout_seconds: default_lsp_idle_timeout(),
             lsp_max_sessions: default_lsp_max_sessions(),
             editor_find_options: EditorFindOptions::default(),
@@ -1387,6 +1399,25 @@ pub const SHORTCUT_DEFAULTS_REVISION: u32 = 5;
 
 /// The first revision, and the one a file without a recorded revision is at.
 const FIRST_SHORTCUT_DEFAULTS_REVISION: u32 = 1;
+
+/// The revision of the built-in preference defaults this build writes.
+///
+/// Every save used to write each preference out, so a file holding an old
+/// default cannot say whether anyone chose it. A file records the revision
+/// its preferences were last brought up to as `preference_defaults_revision`;
+/// one without it is at revision 1. Loading a file at an older revision
+/// replaces each preference still holding a default that a later revision
+/// changed with this build's default.
+///
+/// Revision 2 turned on `focus_follows_mouse`.
+pub const PREFERENCE_DEFAULTS_REVISION: u32 = 2;
+
+/// The revision a file without `preference_defaults_revision` is at.
+const FIRST_PREFERENCE_DEFAULTS_REVISION: u32 = 1;
+
+/// A preference default that a later revision changed: the key, the first
+/// revision with the new default, and the default it replaced.
+const RETIRED_PREFERENCE_DEFAULTS: &[(&str, u32, bool)] = &[("focus_follows_mouse", 2, false)];
 
 /// A built-in default that a later revision replaced.
 struct RetiredShortcutDefault {
@@ -2323,6 +2354,7 @@ fn normalize_current(table: &mut toml::Table) {
             i64::from(SHORTCUT_DEFAULTS_REVISION).into(),
         );
     }
+    adopt_preference_defaults(table);
     if !table.contains_key("terminal_scroll_size")
         && matches!(
             table.get("terminal_scroll_speed"),
@@ -2336,6 +2368,36 @@ fn normalize_current(table: &mut toml::Table) {
         };
         table.insert("terminal_scroll_size".to_owned(), value);
     }
+}
+
+/// Brings preferences written against older defaults up to this build's; see
+/// [`PREFERENCE_DEFAULTS_REVISION`]. A preference still holding a retired
+/// default is removed, so decoding fills in the current one and saving keeps
+/// it out of the file. A newer build's revision is left as it is.
+fn adopt_preference_defaults(table: &mut toml::Table) {
+    let revision = match table.get("preference_defaults_revision") {
+        None => FIRST_PREFERENCE_DEFAULTS_REVISION,
+        Some(value) => match value
+            .as_integer()
+            .and_then(|revision| u32::try_from(revision).ok())
+        {
+            Some(revision) => revision,
+            // Unreadable: decoding sets it aside like any other value.
+            None => return,
+        },
+    };
+    if revision >= PREFERENCE_DEFAULTS_REVISION {
+        return;
+    }
+    for (key, changed_at, retired) in RETIRED_PREFERENCE_DEFAULTS {
+        if revision < *changed_at && table.get(*key) == Some(&toml::Value::Boolean(*retired)) {
+            table.remove(*key);
+        }
+    }
+    table.insert(
+        "preference_defaults_revision".to_owned(),
+        i64::from(PREFERENCE_DEFAULTS_REVISION).into(),
+    );
 }
 
 fn load_current_toml(document: &str) -> Result<Loaded, SettingsError> {
@@ -3543,7 +3605,7 @@ mod tests {
         table.remove("relaunch_agents_on_upgrade");
         let decoded: AppSettings = old.try_into().unwrap();
         assert!(decoded.confirm_terminal_close);
-        assert!(!decoded.focus_follows_mouse);
+        assert!(decoded.focus_follows_mouse);
         assert!(decoded.relaunch_agents_on_upgrade);
         assert_eq!(decoded.default_column_fraction, 0.65);
     }
@@ -3717,7 +3779,7 @@ mod tests {
             assert_eq!(loaded.schema_version, SETTINGS_SCHEMA_VERSION);
             assert_eq!(loaded.sidebar_width, expected_width);
             assert_eq!(loaded.default_column_fraction, 0.72);
-            assert!(!loaded.focus_follows_mouse);
+            assert!(loaded.focus_follows_mouse);
             assert_eq!(loaded.keyboard_shortcuts, KeyboardShortcuts::default());
         }
     }
@@ -3753,7 +3815,7 @@ cycle_pane_width = ["Alt+R"]
         assert_eq!(migrated.sidebar_width, 376.0);
         assert_eq!(migrated.terminal_font_size, 15.0);
         assert_eq!(migrated.default_column_fraction, 0.72);
-        assert!(!migrated.focus_follows_mouse);
+        assert!(migrated.focus_follows_mouse);
         // Every shortcut the file held was a default then, so each takes
         // today's default.
         assert_eq!(migrated.keyboard_shortcuts, KeyboardShortcuts::default());
@@ -4172,6 +4234,73 @@ new_thread = "Alt+Shift+G"
         assert_eq!(
             saved(&path)["shortcut_defaults_revision"],
             i64::from(SHORTCUT_DEFAULTS_REVISION + 1).into()
+        );
+    }
+
+    /// A file written before revision 2 of the preference defaults, as every
+    /// save wrote it: each preference out, `focus_follows_mouse` among them.
+    fn revision_one_preferences(path: &Path, focus_follows_mouse: bool) {
+        let mut document = written(&AppSettings::default()).unwrap();
+        let table = document.as_table_mut().unwrap();
+        table.remove("preference_defaults_revision");
+        table.insert("focus_follows_mouse".into(), focus_follows_mouse.into());
+        fs::write(path, toml::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn hover_activation_reaches_files_that_wrote_the_old_default() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_preferences(&path, false);
+        let loaded = load(&path).unwrap();
+        assert!(loaded.focus_follows_mouse);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION
+        );
+        save(&path, &loaded).unwrap();
+        let file = saved(&path);
+        assert_eq!(
+            file["preference_defaults_revision"],
+            i64::from(PREFERENCE_DEFAULTS_REVISION).into()
+        );
+        // The default this build filled in stays out of the file.
+        assert!(!file.contains_key("focus_follows_mouse"));
+
+        // Choosing click activation afterwards is a choice, and is kept.
+        let chosen = AppSettings {
+            focus_follows_mouse: false,
+            ..loaded
+        };
+        save(&path, &chosen).unwrap();
+        assert_eq!(saved(&path)["focus_follows_mouse"], false.into());
+        assert!(!load(&path).unwrap().focus_follows_mouse);
+    }
+
+    #[test]
+    fn an_old_file_that_turned_hover_activation_on_keeps_it() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_preferences(&path, true);
+        assert!(load(&path).unwrap().focus_follows_mouse);
+    }
+
+    #[test]
+    fn a_newer_preference_defaults_revision_is_left_as_it_is() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        revision_one_preferences(&path, false);
+        let mut document = saved(&path);
+        document.insert(
+            "preference_defaults_revision".into(),
+            i64::from(PREFERENCE_DEFAULTS_REVISION + 1).into(),
+        );
+        fs::write(&path, toml::to_string_pretty(&document).unwrap()).unwrap();
+        let loaded = load(&path).unwrap();
+        assert!(!loaded.focus_follows_mouse);
+        assert_eq!(
+            loaded.preference_defaults_revision,
+            PREFERENCE_DEFAULTS_REVISION + 1
         );
     }
 

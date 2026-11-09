@@ -440,8 +440,10 @@ impl ImageReference {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Attachment {
     pub path: std::path::PathBuf,
-    /// Absent on legacy provider files and non-image attachments. Legacy text
-    /// that happens to say `[Image N]` never manufactures an image reference.
+    /// Absent on files the person chose that are not images, which a draft
+    /// keeps by path, and on legacy provider files such as images a provider
+    /// names by a path cagents does not own. Legacy text that happens to say
+    /// `[Image N]` never manufactures an image reference.
     #[serde(default)]
     pub reference: Option<ImageReference>,
 }
@@ -1461,6 +1463,12 @@ impl Snapshot {
             })
     }
 
+    /// Whether the conversation's own turn is under way or awaiting the user,
+    /// apart from its background children: the states in which it takes no
+    /// prompt, and which no usage limit from an earlier turn stops.
+    pub fn turn_accepted(&self) -> bool {
+        self.busy || self.waiting || !self.requests.is_empty()
+    }
     /// Parent prompt controls use `busy`; card activity includes delegated work.
     pub fn is_working(&self) -> bool {
         self.busy

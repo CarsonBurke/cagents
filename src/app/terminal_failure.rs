@@ -337,9 +337,9 @@ impl Cagents {
             return None;
         };
         let mut details = if failed {
-            Details::capture_failure(session, Some(&state.residency))
+            Details::capture_failure(session, Some(self.residency(card)))
         } else {
-            Details::capture(session, Some(&state.residency))
+            Details::capture(session, Some(self.residency(card)))
         };
         if self.completed_terminal_has_native_owner(card) {
             details.consequence = "Open the existing conversation in the chat view.";
@@ -398,7 +398,7 @@ impl Cagents {
                 matches!(
                     self.cards.get(&state.id),
                     Some(CardRuntime::Failed(Failure::Terminal(_)) | CardRuntime::Completed)
-                ) || ended_terminal(Some(state)).is_some()
+                ) || self.ended_terminal(state.id).is_some()
                     || self.saved_terminal_diagnostics_allowed(state.id)
             })
             .filter_map(|state| {
@@ -853,14 +853,16 @@ mod tests {
     #[test]
     fn failure_capture_preserves_typed_code_before_generic_residency_is_written() {
         let (mut app, card, _) = app_and_session();
-        let state = app.card_state_mut(card).unwrap();
-        state.residency = Residency::Failed {
-            typed_error: RuntimeError {
-                code: "start_failed".into(),
-                message: "secret raw error".into(),
+        app.set_residency(
+            card,
+            Residency::Failed {
+                typed_error: RuntimeError {
+                    code: "start_failed".into(),
+                    message: "secret raw error".into(),
+                },
+                retryable: true,
             },
-            retryable: true,
-        };
+        );
         app.fail_runtime(card, "different secret".into());
         let Some(CardRuntime::Failed(Failure::Terminal(details))) = app.cards.get(&card) else {
             panic!("typed terminal failure missing")
@@ -881,22 +883,28 @@ mod tests {
     #[test]
     fn new_failure_on_same_identity_captures_current_typed_state() {
         let (mut app, card, session) = app_and_session();
-        app.card_state_mut(card).unwrap().residency = Residency::Failed {
-            typed_error: RuntimeError {
-                code: "start_failed".into(),
-                message: "old secret".into(),
+        app.set_residency(
+            card,
+            Residency::Failed {
+                typed_error: RuntimeError {
+                    code: "start_failed".into(),
+                    message: "old secret".into(),
+                },
+                retryable: true,
             },
-            retryable: true,
-        };
+        );
         app.fail_runtime(card, "old secret".into());
         assert_eq!(app.terminal_details(card).unwrap().code, "start_failed");
-        app.card_state_mut(card).unwrap().residency = Residency::Failed {
-            typed_error: RuntimeError {
-                code: "runtime_hydration_failed".into(),
-                message: "new secret".into(),
+        app.set_residency(
+            card,
+            Residency::Failed {
+                typed_error: RuntimeError {
+                    code: "runtime_hydration_failed".into(),
+                    message: "new secret".into(),
+                },
+                retryable: true,
             },
-            retryable: true,
-        };
+        );
         app.fail_runtime(card, "new secret".into());
         let details = app.terminal_details(card).unwrap();
         assert_eq!(details.terminal, session.id);
@@ -920,15 +928,18 @@ mod tests {
 
         let relaunched = fresh_terminal_relaunch(&previous);
         assert_ne!(relaunched.id, previous.id);
+        app.set_residency(
+            card,
+            Residency::Failed {
+                typed_error: RuntimeError {
+                    code: "start_failed".into(),
+                    message: "new failure secret".into(),
+                },
+                retryable: true,
+            },
+        );
         let state = app.card_state_mut(card).unwrap();
         state.kind = CardKind::Terminal(relaunched.clone());
-        state.residency = Residency::Failed {
-            typed_error: RuntimeError {
-                code: "start_failed".into(),
-                message: "new failure secret".into(),
-            },
-            retryable: true,
-        };
         app.fail_runtime(card, "backend secret".into());
         let Some(CardRuntime::Failed(Failure::Terminal(details))) = app.cards.get(&card) else {
             panic!("terminal failure missing")
@@ -1116,7 +1127,7 @@ mod tests {
                 occurred_at_unix_ms: 42,
             },
         );
-        app.card_state_mut(card).unwrap().residency = Residency::Hot;
+        app.set_residency(card, Residency::Hot);
         app.cards.insert(card, CardRuntime::Completed);
         assert_eq!(
             app.terminal_details(card).unwrap().consequence,
@@ -1408,7 +1419,7 @@ mod completion_tests {
             app.cards.get(&card),
             Some(CardRuntime::Terminal(_))
         ));
-        assert!(ended_terminal(app.card_state(card)).is_some());
+        assert!(app.ended_terminal(card).is_some());
     }
 }
 

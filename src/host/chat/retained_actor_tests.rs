@@ -2802,8 +2802,6 @@ fn unnamed_actor_adopts_without_forging_pane_writer_authority_before_first_provi
             title: "Pending conversation".into(),
             width_fraction: 1.0,
             existence: crate::model::Existence::Open,
-            exposure: crate::model::Exposure::Visible,
-            residency: crate::model::Residency::Hot,
             kind: crate::model::CardKind::Chat(source.clone()),
         }],
         focused: Some(pane),
