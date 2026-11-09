@@ -177,7 +177,7 @@ pub fn align_resume_identity(arguments: &mut Vec<String>, id: &str) -> Result<()
 const SHARED_CONTROL_SOCKET: &str = "app-server-control/app-server-control.sock";
 
 /// The account home a Codex process launched from `spec` keeps its state in.
-fn account_home(spec: &ProcessSpec) -> Result<PathBuf, String> {
+fn account_home(spec: &ProcessSpec) -> Result<PathBuf, &'static str> {
     let home = spec
         .environment
         .get("CODEX_HOME")
