@@ -230,12 +230,16 @@ if [ -n "$prune" ] && open7 "$state"; then
             # Idle offload slots are trimmed beside it, within the same budget.
             trimming=
             if [ -n "$offload" ]; then
-                # Without timeout, it is not waited for: only the budget is.
+                # Without timeout, nothing bounds a wait, so it runs on its
+                # own like the scheduled one.
                 if command -v timeout >/dev/null 2>&1; then
                     eval "timeout $budget $offload --trim-slots $floor --wait" >&2 &
                     trimming=$!
                 else
-                    eval "$offload --trim-slots $floor" >&2 || :
+                    (
+                        exec </dev/null >"$pruner_state.slots.log" 2>&1 7>&-
+                        eval "exec $offload --trim-slots $floor"
+                    ) &
                 fi
             fi
             sh -c "$prune" >&2 || :

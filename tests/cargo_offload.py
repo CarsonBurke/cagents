@@ -2583,40 +2583,55 @@ class Trim(unittest.TestCase):
                 self.trim(self.session_size(crate) + 1)
                 self.assertTrue(older.exists())
 
-    def test_dependencies_unread_for_days_go_every_few_hours_or_at_once_when_pressed(self):
+    def test_units_no_build_looked_at_for_days_go_every_few_hours_or_at_once_when_pressed(self):
         if os.statvfs(self.slot).f_flag & os.ST_NOATIME:
             self.skipTest("this file system keeps no access times")
-        deps = self.slot / "src/target/debug/deps"
-        deps.mkdir(parents=True)
-        def dependency(name, days):
-            path = deps / name
-            path.write_bytes(b"rlib")
+        profile = self.slot / "src/target/debug"
+        def written(path, days):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"output")
             then = time.time() - days * 86400
             os.utime(path, (then, then))
             return path
-        stale, used = dependency("libold-1.rlib", 4), dependency("libnew-1.rlib", 1)
-        # A unit goes whole or not at all: its rmeta was read lately.
-        partly = [dependency("libpart-1.rlib", 4), dependency("libpart-1.rmeta", 1),
-                  dependency("part-1.d", 4)]
-        build = self.slot / "src/target/debug/build"
-        scripts = []
-        for name, days in (("old-1", 4), ("new-1", 1)):
-            (build / name / "out").mkdir(parents=True)
-            output = build / name / "out" / "generated.rs"
-            output.write_bytes(b"fn x() {}")
-            then = time.time() - days * 86400
-            os.utime(output, (then, then))
-            scripts.append(build / name)
+        def unit(package, crate, unit_hash, *, looked, built=4):
+            """A unit laid out as Cargo leaves it; a build reads its
+            fingerprint `looked` days ago, its outputs only when it is built."""
+            written(profile / f".fingerprint/{package}-{unit_hash}/lib-{crate}", looked)
+            return [profile / f".fingerprint/{package}-{unit_hash}",
+                    written(profile / f"deps/lib{crate}-{unit_hash}.rlib", built),
+                    written(profile / f"deps/{crate}-{unit_hash}.d", built),
+                    written(profile / f"build/{package}-{unit_hash}/build-script-build",
+                            built).parent]
+        stale = unit("old-crate", "old_crate", "1a", looked=4)
+        # A build dependency and a compiled build script: every build looks
+        # at their fingerprints, though none reads them until they change.
+        needed = unit("build-helper", "build_helper", "2b", looked=1)
+        # Nothing dates what no fingerprint names.
+        unnamed = written(profile / "deps/libloose-3c.rlib", 4)
         self.trim(2**40)
-        self.assertEqual((stale.exists(), used.exists()), (False, True))
-        self.assertTrue(all(path.exists() for path in partly))
-        self.assertEqual([path.exists() for path in scripts], [False, True])
+        self.assertEqual([path.exists() for path in stale], [False] * 4)
+        self.assertEqual([path.exists() for path in needed], [True] * 4)
+        self.assertTrue(unnamed.exists())
         # Not again for hours, unless the disk is low.
-        later = dependency("libold-2.rlib", 4)
+        later = unit("later-crate", "later_crate", "4d", looked=4)
         self.trim(2**40)
-        self.assertTrue(later.exists())
+        self.assertTrue(all(path.exists() for path in later))
         self.trim(2**40, pressed=True)
-        self.assertFalse(later.exists())
+        self.assertFalse(any(path.exists() for path in later))
+
+    def test_a_removal_a_build_waits_for_does_not_wait_behind_an_idle_one(self):
+        evicted = self.slot / "evicted"
+        (evicted / "1-1-crate-1" / "s-1").mkdir(parents=True)
+        (evicted / "1-1-crate-1" / "s-1" / "query-cache.bin").write_bytes(b"x" * 4096)
+        (evicted / "2-1-libold-1.rlib").write_bytes(b"rlib")
+        with open(self.slot / "evicted.lock", "a") as idle:
+            fcntl.flock(idle, fcntl.LOCK_EX)
+            # Another idle one passes over a slot whose remover is at work.
+            self.agent["remove_evicted"]([str(self.slot)])
+            time.sleep(0.5)
+            self.assertEqual(len(list(evicted.iterdir())), 2)
+            self.agent["remove_evicted"]([str(self.slot)], wait=True)
+            self.assertEqual(list(evicted.iterdir()), [])
 
     def test_a_slot_held_shared_by_a_trim_is_not_taken_for_a_running_build(self):
         lock = self.slot / "lock"

@@ -262,6 +262,29 @@ class BuildDiskGuard(unittest.TestCase):
         self.assertEqual(sorted(self.calls(trims, 2)),
                          [f"--trim-slots {10**9}", f"--trim-slots {10**9} --wait"])
 
+    def test_without_timeout_the_trim_below_the_floor_is_not_waited_for(self):
+        guard, calls = self.stand_in_pruner()
+        trims = self.root / "trims"
+        offload = guard.with_name("cargo-offload")
+        offload.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {trims}\nsleep 5\n')
+        offload.chmod(0o755)
+        # Every command the guard could find but timeout.
+        tools = self.root / "tools"
+        tools.mkdir()
+        for directory in os.environ["PATH"].split(os.pathsep):
+            for entry in os.scandir(directory) if os.path.isdir(directory) else ():
+                if entry.name != "timeout" and not (tools / entry.name).exists():
+                    (tools / entry.name).symlink_to(entry.path)
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(guard), str(self.root / "absent/build/target")],
+            env={**self.env, "PATH": str(tools), "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)},
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(self.calls(trims, 2), [f"--trim-slots {10**9}"] * 2)
+
     def test_a_reclaim_command_of_its_own_leaves_offload_slots_alone(self):
         guard = self.alone()
         trims = self.stand_in_offload(guard)

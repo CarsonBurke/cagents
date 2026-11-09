@@ -769,11 +769,15 @@ earlier command of the slot's is still running, it keeps the incremental
 state of the crates the slot compiled most recently until they fill
 `CAGENTS_BUILD_REMOTE_INCREMENTAL_GIB` (default 20), the one that crosses it
 included, and moves the rest out of the target; with `0` it keeps none. Every
-6 hours it also moves out compiled units nothing has read or written for 3
-days, such as old versions after a dependency update: all the files of one
-`<crate>-<hash>` in a profile's `deps` together, and a build script's
-directory in its `build`, judged by its newest file. It skips this where the
-file system keeps no access times. Below twice the host's floor, the larger of
+6 hours it also moves out compiled units no build has looked at for 3 days,
+such as old versions after a dependency update. Cargo reads the fingerprint
+of every unit in a build's graph, even one it doesn't compile, so a unit is
+dated by its `.fingerprint/<package>-<hash>` directory and its outputs: a
+build dependency's rlib or a compiled build script is read only when it is
+rebuilt, so judged alone it would look unused in a lane that builds daily.
+A stale unit's fingerprint goes first, then its `deps/<crate>-<hash>` files
+and `build/<package>-<hash>` directory, so a unit moved out only in part is
+rebuilt. It skips this where the file system keeps no access times. Below twice the host's floor, the larger of
 `CAGENTS_BUILD_REMOTE_FREE_FLOOR_GIB` and the [guard's](#compilation-jobs-and-shared-build-directories)
 default, a slot keeps a quarter of the budget, its dependencies are looked
 through at once, and the lease does the same to every other slot no lease
@@ -782,8 +786,9 @@ lease, admission or hold takes for a running build. A crate whose session a `rus
 whatever started it. Each crate's state is moved out with one rename into the
 slot's `evicted` directory, which Cargo never reads, so a build never finds
 part of one; a process of its own then removes it at idle CPU and I/O
-priority, and the next trim of the slot finishes a removal that was cut
-short. Rustc remakes an evicted session, so that crate's next build compiles
+priority, or, when a build waits for the space, at low priority beside any
+idle removal already under way. The next trim of the slot finishes a removal
+that was cut short. Rustc remakes an evicted session, so that crate's next build compiles
 it in full rather than incrementally; Cargo rebuilds a removed dependency.
 Measuring a full slot's sessions takes 1–2 seconds; a finalized session
 never changes, so each is measured once and recorded in the slot's
