@@ -498,6 +498,11 @@ struct PublishedState {
     /// reveal forces.
     announced_generation: AtomicU64,
     visible: AtomicBool,
+    /// The newest generation published before the worker last stopped
+    /// showing the terminal. `visible` turns on when a reveal starts, before
+    /// its capture is published or while a synchronized update holds it back;
+    /// until a later generation is published, the screen is from before.
+    hidden_through: AtomicU64,
     wake: Arc<WakeCallback>,
     output_observer: OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
     output_armed: AtomicBool,
@@ -584,6 +589,7 @@ impl PublishedState {
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
+            hidden_through: AtomicU64::new(0),
             wake,
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
@@ -886,8 +892,21 @@ impl PublishedState {
         }
     }
 
-    fn suppress_wakes(&self) {
+    /// Stops announcing frames and marks what is published as the screen
+    /// from before, which a reveal must replace before reads can trust it.
+    fn stop_presenting(&self) {
         self.visible.store(false, Ordering::Release);
+        self.hidden_through.store(
+            self.published_generation.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    /// Whether `snapshot`, read from this state, is the screen the worker is
+    /// showing now rather than one from before it was last hidden.
+    fn presents(&self, snapshot: &RenderSnapshot) -> bool {
+        self.visible.load(Ordering::Acquire)
+            && snapshot.generation > self.hidden_through.load(Ordering::Acquire)
     }
 
     /// Records the generation the subscriber drew and releases the capture
@@ -1239,9 +1258,10 @@ impl TerminalHandle {
     }
 
     /// `shown` says the host has asked this worker to show the terminal.
-    /// Until the worker has done so, what it published is a hibernation
-    /// marker, nothing, or the screen from before it was hidden. Such a read
-    /// is answered on the worker, after the reveal queued ahead of it.
+    /// Until the worker has published a screen since, what it published is a
+    /// hibernation marker, nothing, or the screen from before it was hidden.
+    /// Such a read is answered on the worker, after the reveal queued ahead
+    /// of it.
     pub(crate) fn viewport_snapshot(
         &self,
         offset: Option<u64>,
@@ -1253,7 +1273,10 @@ impl TerminalHandle {
         if !shown && !drawn {
             return Ok(published);
         }
-        let current = !shown || self.inner.published.visible.load(Ordering::Acquire);
+        // A reveal turns `visible` on before its capture is published, and a
+        // synchronized update can hold that capture back; until then the
+        // published screen is the one from before the terminal was hidden.
+        let current = !shown || self.inner.published.presents(&published);
         let default_view = drawn
             && offset.is_none()
             && rows.is_none_or(|rows| rows == published.rows)
@@ -4201,7 +4224,7 @@ impl Worker {
 
     fn set_hidden(&mut self) {
         self.visibility = Visibility::Hidden;
-        self.published.suppress_wakes();
+        self.published.stop_presenting();
         // Nothing is published while away, so there is no update to time.
         self.synchronized_since = None;
     }
@@ -4232,7 +4255,7 @@ impl Worker {
 
     fn hibernate_visuals(&mut self) {
         self.visibility = Visibility::Hibernated;
-        self.published.suppress_wakes();
+        self.published.stop_presenting();
         self.synchronized_since = None;
         self.visual = None;
         self.generation = self.generation.saturating_add(1);
@@ -8071,6 +8094,48 @@ mod tests {
         assert_eq!(worker.generation, before, "a half-drawn frame was revealed");
         worker.process_output(b" done\x1b[?2026l".to_vec());
         assert_eq!(published_row(&worker, 0), "half done");
+        worker.run();
+    }
+
+    /// A reveal shows the terminal before its capture is published, and an
+    /// update in progress holds that capture back. A read that asked to see
+    /// the terminal meanwhile must show what arrived while it was hidden, not
+    /// the screen from before (#2521).
+    #[test]
+    fn a_read_during_a_reveal_shows_output_from_while_hidden() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"before".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.handle_command(Command::Hide);
+        worker.process_output(b"\r\nwhile hidden\x1b[?2026h".to_vec());
+        worker.handle_command(Command::Reveal);
+        assert!(worker.published.visible.load(Ordering::Acquire));
+        assert_eq!(published_row(&worker, 1), "", "the reveal was not held");
+
+        let (commands, pending) = command_channel(1);
+        let published = Arc::clone(&worker.published);
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: crossbeam_channel::never(),
+                worker: joins::JoinOwner::empty(Arc::clone(&published)),
+                published,
+            }),
+        };
+        let read = std::thread::spawn(move || handle.viewport_snapshot(None, None, true));
+        let command = pending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read was answered with the screen from before");
+        worker.handle_command(command);
+        worker.process_output(b"\x1b[?2026l".to_vec());
+        let screen = read.join().unwrap().unwrap();
+        let row = screen.lines[1]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert_eq!(row.trim_end(), "while hidden");
         worker.run();
     }
 
