@@ -1176,9 +1176,9 @@ choose. The build host gives each slot a short, private `TMPDIR` such as
 the home and any `.git`, and which the slot's next command clears. It is in
 the runtime directory, which is memory on fw16, unlike the disk-backed base a
 local run uses: the slot holds one command's files at a time. If that
-directory can't be made private, the slot falls back to its own `tmp` under
-`~/.cache`, inside the home, where the bundled-skill tests below refuse to
-install.
+directory isn't private to you, the slot falls back to its own `tmp` under
+`~/.cache`, which is too long for the socket budget and inside the home, where
+the bundled-skill tests below refuse to install.
 
 ```sh
 (
@@ -1200,10 +1200,9 @@ For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
 private **disk-backed** base with a short, physical absolute path. Verify its
 filesystem with `findmnt -T PATH`; `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can
 be RAM-backed. Neither the base nor any ancestor may contain a `.git` file,
-directory or symlink. The base must also
-be outside the account home reported by `getent passwd "$(id -u)"`, even when
-`HOME` points elsewhere: bundled-skill tests deliberately refuse installation
-beneath the passwd home. A private `~/.cot` therefore does not qualify.
+directory or symlink. The base must also be outside the account home reported
+by `getent passwd "$(id -u)"`, even when `HOME` points elsewhere: bundled-skill
+tests deliberately refuse installation beneath the passwd home. A private `~/.cot` therefore does not qualify.
 
 Use a directory of our own under `/var/tmp`, such as `/var/tmp/ct`, created
 with `mkdir -m 700`. `/var/tmp` is disk-backed on fw16; verify it on another
