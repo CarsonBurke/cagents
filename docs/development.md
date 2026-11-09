@@ -790,6 +790,10 @@ priority, or, when a build waits for the space, at low priority beside any
 idle removal already under way. The next trim of the slot finishes a removal
 that was cut short. Rustc remakes an evicted session, so that crate's next build compiles
 it in full rather than incrementally; Cargo rebuilds a removed dependency.
+Incremental compilation stays on in every lane: on fw16, a one-line edit in
+the UI crate rebuilt in 19–31 s for `check`, 50–60 s for the `dev-runtime`
+build and 68–74 s for the library tests, against 54–79 s, 104–145 s and
+166–217 s with `CARGO_INCREMENTAL=0`.
 Measuring a full slot's sessions takes 1–2 seconds; a finalized session
 never changes, so each is measured once and recorded in the slot's
 `incremental-sizes`, and a lease measures only what the last build made. One
