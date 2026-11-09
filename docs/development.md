@@ -1170,7 +1170,28 @@ The existing artifact helper reads Cargo's exact executable path, including
 configured target directories/triples. A matching version alone does not prove
 that two dirty source trees match.
 
-For a local HOST run, select an existing private **disk-backed** base with a
+Through the gate, which is how a hosted agent runs it, there is no base to
+choose: the build host gives each slot a short, private `TMPDIR` under its
+runtime directory (`$XDG_RUNTIME_DIR/cof`), which meets the limits below and
+which the slot's next command clears. A HOST lane leaves about 12 MB there.
+
+```sh
+(
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+)
+```
+
+The gate sends the helper to the build host and points the variable at its
+copy there. It refuses any other `CAGENTS_` setting that names a path outside
+the checkout and its target, because the build host doesn't have that path.
+
+For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
+private **disk-backed** base with a
 short, physical absolute path. Verify its filesystem with `findmnt -T PATH`;
 `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can be RAM-backed. Neither the base nor
 any ancestor may contain a `.git` file, directory or symlink. The base must also
@@ -1190,9 +1211,9 @@ fixture layouts need more room; a short base alone is not proof.
 ```sh
 # Set this only after verifying the base above.
 mkdir -p -m 700 /var/tmp/ct
-export CAGENTS_TEST_TMP_BASE=/var/tmp/ct
 (
-    TMPDIR=$(mktemp -d "${CAGENTS_TEST_TMP_BASE:?}/tXXXXXX") || exit
+    export CAGENTS_BUILD_REMOTE=local
+    TMPDIR=$(mktemp -d /var/tmp/ct/tXXXXXX) || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
     CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
