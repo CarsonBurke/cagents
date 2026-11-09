@@ -12180,11 +12180,15 @@ fn canonical_future_path(path: &Path) -> io::Result<PathBuf> {
     }
 }
 
-fn worktree_lease(path: &Path, create: bool) -> io::Result<fs::File> {
+fn worktree_lease(path: &Path, create: bool) -> io::Result<crate::instance::OwnedLock> {
     worktree_lease_with_grace(path, create, Duration::ZERO)
 }
 
-fn worktree_lease_with_grace(path: &Path, create: bool, grace: Duration) -> io::Result<fs::File> {
+fn worktree_lease_with_grace(
+    path: &Path,
+    create: bool,
+    grace: Duration,
+) -> io::Result<crate::instance::OwnedLock> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let file = fs::OpenOptions::new()
         .read(true)
@@ -12204,24 +12208,37 @@ fn worktree_lease_with_grace(path: &Path, create: bool, grace: Duration) -> io::
     }
     let deadline = Instant::now() + grace;
     loop {
-        // SAFETY: the descriptor belongs to the live file returned to the caller.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            break;
+        match crate::instance::owned_file_lock(file.try_clone()?, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(guard) => return Ok(guard),
+            Err(error) => {
+                if error.kind() != io::ErrorKind::WouldBlock || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                // Only a live owner or independently locked child now contends.
+                thread::sleep(
+                    Duration::from_millis(2)
+                        .min(deadline.saturating_duration_since(Instant::now())),
+                );
+            }
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock || Instant::now() >= deadline {
-            return Err(error);
-        }
-        // CLOEXEC descriptors remain inherited by unrelated concurrent forks
-        // until exec, and a `posix_spawn` suspends only the spawning thread;
-        // any other thread's `flock` meets the copy in the meantime. Allow
-        // that interval to finish without weakening evidence. The grace is
-        // consumed only while the lease is actually contended.
-        thread::sleep(
-            Duration::from_millis(2).min(deadline.saturating_duration_since(Instant::now())),
-        );
     }
-    Ok(file)
+}
+
+/// Prepare a child handoff while retaining the parent's scoped ownership.
+/// Settlement always requests EX, so SH still fences it. The process opens its
+/// independent SH description only after fork: unrelated parent forks can copy
+/// this guard, but cannot inherit an intended child's independent lock.
+fn inherited_worktree_lease(lease: &fs::File) -> Result<i32, RepositoryError> {
+    // flock conversion is not atomic. On contention the caller must abort the
+    // operation before executing another command, even if EX was lost.
+    if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(ValidationError::Io(format!(
+            "cannot prepare child lease: {}",
+            io::Error::last_os_error()
+        ))
+        .into());
+    }
+    Ok(lease.as_raw_fd())
 }
 
 /// Git lock files are evidence, never debris this service is entitled to remove.
@@ -12692,7 +12709,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                             &format!("+refs/heads/{branch}:{reference}"),
                         ],
                     );
-                    fetch.inherited_lease = Some(lease.as_raw_fd());
+                    fetch.inherited_lease = Some(inherited_worktree_lease(&lease)?);
                     if let Err(failure) = self.run_checked(&fetch, cancellation) {
                         if !cached || cancellation.is_cancelled() {
                             return Err(failure.into());
@@ -12847,7 +12864,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                 }
                 self.create_worktree_command(&journal.request, &oid)?
             };
-            command.inherited_lease = Some(lease.as_raw_fd());
+            command.inherited_lease = Some(inherited_worktree_lease(&lease)?);
             emit(WorktreeProgressStage::RunningGit);
             self.run_checked(&command, cancellation)?;
             if journal
@@ -12859,7 +12876,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     &journal.request.destination,
                     ["merge", "--ff-only", "--no-edit", oid.as_str()],
                 );
-                advance.inherited_lease = Some(lease.as_raw_fd());
+                advance.inherited_lease = Some(inherited_worktree_lease(&lease)?);
                 self.run_checked(&advance, cancellation)?;
             }
             journal.checkout_completed = true;
@@ -12889,7 +12906,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     )?;
                 }
                 let mut upstream = self.set_upstream_command(&journal.request)?;
-                upstream.inherited_lease = Some(lease.as_raw_fd());
+                upstream.inherited_lease = Some(inherited_worktree_lease(&lease)?);
                 self.run_checked(&upstream, cancellation)?;
             }
             // Keep Git's operation-id lock until after durable settlement. It is
@@ -13237,7 +13254,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
                     journal.request.destination.as_os_str().to_owned(),
                 ],
             );
-            unlock.inherited_lease = Some(lease.as_raw_fd());
+            unlock.inherited_lease = Some(inherited_worktree_lease(&lease)?);
             self.run_checked(&unlock, &CancellationToken::new())?;
             if let Some(WorktreeCreationOutcome::Created { worktree, .. }) = &mut journal.outcome {
                 worktree.lock = WorktreeLock::default();
@@ -14568,7 +14585,7 @@ mod worktree_journal_tests {
         journal.base_oid = Some("a".repeat(40));
         journal.persist(&fixture.store, &payload).unwrap();
         let mut command = CommandSpec::new("/bin/sh").args(["-c", "read line"]);
-        command.inherited_lease = Some(lease.as_raw_fd());
+        command.inherited_lease = Some(inherited_worktree_lease(&lease).unwrap());
         let mut child_command = command.to_command();
         child_command.stdin(Stdio::piped());
         let mut child = child_command.spawn().unwrap();
@@ -14644,7 +14661,7 @@ mod worktree_journal_tests {
             .service
             .create_worktree_command(&fixture.request, &oid)
             .unwrap();
-        command.inherited_lease = Some(lease.as_raw_fd());
+        command.inherited_lease = Some(inherited_worktree_lease(&lease).unwrap());
         assert!(
             SystemProcessExecutor
                 .execute(&command, &CancellationToken::new())
@@ -15024,7 +15041,7 @@ mod worktree_journal_tests {
                     .unwrap();
                 command.arguments.insert(add + 1, "--no-checkout".into());
             }
-            command.inherited_lease = Some(lease.as_raw_fd());
+            command.inherited_lease = Some(inherited_worktree_lease(&lease).unwrap());
             assert!(
                 SystemProcessExecutor
                     .execute(&command, &CancellationToken::new())
@@ -15059,18 +15076,22 @@ mod worktree_journal_tests {
     }
 
     #[test]
-    fn post_executor_settlement_waits_for_unrelated_pre_exec_descriptor_inheritance() {
+    fn child_lease_outlives_owner_but_not_an_unrelated_pre_exec_fork() {
         use std::os::unix::{net::UnixStream, process::CommandExt};
         let fixture = Fixture::new();
         let (journal, _) = fixture.prepare();
         let lease = worktree_lease(&journal.lease_path, true).unwrap();
+        let mut intended = CommandSpec::new("/bin/sh").args(["-c", "read line"]);
+        intended.inherited_lease = Some(inherited_worktree_lease(&lease).unwrap());
+        let mut intended_command = intended.to_command();
+        intended_command.stdin(Stdio::piped());
+        let mut intended_child = intended_command.spawn().unwrap();
         let (ready_write, mut ready_read) = UnixStream::pair().unwrap();
         let (gate_read, mut gate_write) = UnixStream::pair().unwrap();
-        let mut command = Command::new("/bin/true");
-        // SAFETY: child uses only async-signal-safe read/write on inherited
-        // descriptors, with initialized one-byte stack buffers.
+        let mut unrelated = Command::new("/bin/true");
+        // SAFETY: only async-signal-safe read/write on live inherited fds.
         unsafe {
-            command.pre_exec(move || {
+            unrelated.pre_exec(move || {
                 let byte = [1_u8];
                 if libc::write(ready_write.as_raw_fd(), byte.as_ptr().cast(), 1) != 1 {
                     return Err(io::Error::last_os_error());
@@ -15082,23 +15103,27 @@ mod worktree_journal_tests {
                 Ok(())
             });
         }
-        let child = thread::spawn(move || command.status().unwrap());
+        let unrelated_child = thread::spawn(move || unrelated.status().unwrap());
         ready_read.read_exact(&mut [0_u8]).unwrap();
         drop(lease);
+        let while_intended_lives = worktree_lease(&journal.lease_path, false);
+        intended_child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"exit\n")
+            .unwrap();
+        let intended_status = intended_child.wait().unwrap();
+        // Keep the unrelated child paused until after this acquisition.
+        let after_intended_exits = worktree_lease(&journal.lease_path, false);
+        gate_write.write_all(&[1]).unwrap();
+        assert!(unrelated_child.join().unwrap().success());
+        assert!(intended_status.success());
         assert_eq!(
-            worktree_lease(&journal.lease_path, false)
-                .unwrap_err()
-                .kind(),
+            while_intended_lives.unwrap_err().kind(),
             io::ErrorKind::WouldBlock
         );
-        let release = thread::spawn(move || {
-            thread::sleep(Duration::from_millis(10));
-            gate_write.write_all(&[1]).unwrap();
-        });
-        let settled = worktree_lease_with_grace(&journal.lease_path, false, CLEANUP_GRACE);
-        release.join().unwrap();
-        assert!(child.join().unwrap().success());
-        assert!(settled.is_ok(), "{settled:?}");
+        assert!(after_intended_exits.is_ok(), "{after_intended_exits:?}");
     }
 }
 
