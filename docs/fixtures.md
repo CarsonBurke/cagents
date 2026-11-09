@@ -112,8 +112,10 @@ A seeded pull request belongs to a worktree only when all of these match it:
   its upstream's remote, or else `origin` or the only remote.
 - `url` is under the project's repository, as above.
 
-Entries that match no worktree still answer `gh pr list`, but nothing in the
-sidebar shows them.
+The worktree's row then shows a pull request icon in place of the branch
+icon, and the branch's tooltip names the pull request, its state and its
+checks. Entries that match no worktree still answer `gh pr list`, but nothing
+in the sidebar shows them.
 
 Seeds cannot support evidence of the review flow. The pull request browser
 lists none of them, and opening a seeded pull request's review asks for its
