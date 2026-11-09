@@ -39,27 +39,49 @@ impl Scale {
     };
 }
 
-/// A provider launch carries the caller's environment, which is most of the
-/// size of a saved card.
-fn environment(index: usize) -> BTreeMap<String, String> {
-    (0..60)
-        .map(|variable| {
-            (
-                format!("VARIABLE_{variable}"),
-                format!("/home/user/.local/share/value-{index}-{variable}/bin:/usr/local/bin"),
-            )
-        })
-        .collect()
-}
+/// A native chat launch saves the allowlisted runtime variables of the
+/// environment it started in (`fresh_native_environment`): locale, XDG and
+/// display variables, the SSH agent and the like, about this many on a
+/// desktop session. Terminals start from a login shell with none.
+const CHAT_ENVIRONMENT: [&str; 16] = [
+    "HOME",
+    "PATH",
+    "LANG",
+    "USER",
+    "LOGNAME",
+    "SHELL",
+    "XDG_CONFIG_HOME",
+    "XDG_RUNTIME_DIR",
+    "DISPLAY",
+    "WAYLAND_DISPLAY",
+    "DBUS_SESSION_BUS_ADDRESS",
+    "SSH_AUTH_SOCK",
+    "LC_ALL",
+    "LC_CTYPE",
+    "TMPDIR",
+    "CLAUDE_CONFIG_DIR",
+];
 
-fn recipe(directory: &Path, index: usize) -> LaunchRecipe {
+fn recipe(directory: &Path, environment: BTreeMap<String, String>) -> LaunchRecipe {
     LaunchRecipe {
         unset_environment: Default::default(),
         program: "claude".into(),
         arguments: vec!["--model".into(), "haiku".into()],
         working_directory: directory.to_path_buf(),
-        environment: environment(index),
+        environment,
     }
+}
+
+fn chat_environment(index: usize) -> BTreeMap<String, String> {
+    CHAT_ENVIRONMENT
+        .iter()
+        .map(|name| {
+            (
+                (*name).to_owned(),
+                format!("/home/user/.local/share/{name}-{index}"),
+            )
+        })
+        .collect()
 }
 
 fn chat(directory: &Path, index: usize) -> CardKind {
@@ -69,7 +91,7 @@ fn chat(directory: &Path, index: usize) -> CardKind {
         id: TerminalId::new(),
         launch: crate::chat::Launch {
             provider: crate::agent::Provider::Claude,
-            recipe: recipe(directory, index),
+            recipe: recipe(directory, chat_environment(index)),
             session_id: Some(uuid::Uuid::new_v4().to_string()),
         },
         proof: None,
@@ -77,8 +99,12 @@ fn chat(directory: &Path, index: usize) -> CardKind {
     })
 }
 
-fn terminal(directory: &Path, index: usize) -> CardKind {
-    CardKind::Terminal(fresh_terminal_session(recipe(directory, index)))
+fn terminal(directory: &Path) -> CardKind {
+    CardKind::Terminal(fresh_terminal_session(LaunchRecipe {
+        program: "bash".into(),
+        arguments: Vec::new(),
+        ..recipe(directory, BTreeMap::new())
+    }))
 }
 
 fn card(title: String, kind: CardKind, existence: Existence) -> CardState {
@@ -173,7 +199,7 @@ pub(super) fn large_workspace(scale: &Scale) -> (Cagents, Vec<ChannelId>, tempfi
             if index % 3 == 0 {
                 members.push(card(
                     format!("cargo test {index}"),
-                    terminal(directory, index),
+                    terminal(directory),
                     Existence::Open,
                 ));
             }
@@ -208,7 +234,7 @@ pub(super) fn large_workspace(scale: &Scale) -> (Cagents, Vec<ChannelId>, tempfi
         let directory = &worktree_paths[0][1 + index * 7 % (worktree_paths[0].len() - 1)];
         let state = card(
             format!("shell {index}"),
-            terminal(directory, index),
+            terminal(directory),
             Existence::Open,
         );
         durable.cards.push(state);
@@ -219,7 +245,7 @@ pub(super) fn large_workspace(scale: &Scale) -> (Cagents, Vec<ChannelId>, tempfi
         let kind = if index % 2 == 0 {
             chat(directory, index)
         } else {
-            terminal(directory, index)
+            terminal(directory)
         };
         durable.cards.push(card(
             format!("historical {index}"),
