@@ -8,7 +8,10 @@
 use std::{path::Path, time::Instant};
 
 use crate::{
-    fixture_workspace::Plan,
+    fixture_workspace::{
+        Plan,
+        destination::{Destination, Directories, Part},
+    },
     model::{CardId, ChannelTitleSource, ProjectKind},
     workspace_model::{
         ModelEdit,
@@ -17,6 +20,10 @@ use crate::{
 };
 
 use super::{Registry, SCHEMA_VERSION, views};
+
+/// What an ID [`derived`] from the plan stands for.
+const OPERATION: u8 = 0;
+const IDLE_CARD: u8 = 1;
 
 /// What a seed wrote, as the single JSON line the generator reads.
 #[derive(serde::Serialize)]
@@ -32,8 +39,9 @@ pub(crate) struct Seeded {
     pub(crate) seconds: f64,
 }
 
-/// Seeds this instance's store. Refuses while a daemon runs, and refuses a
-/// store that already exists: a seed never merges into real state.
+/// Seeds this instance's store. Refuses while a daemon runs, and refuses an
+/// instance that holds anything an earlier seed of this plan did not write:
+/// a seed never merges into real state.
 pub(crate) fn seed(plan: &Path) -> Result<Seeded, String> {
     let plan = Plan::load(plan)?;
     let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
@@ -47,35 +55,14 @@ pub(crate) fn seed(plan: &Path) -> Result<Seeded, String> {
             ),
             error => error.to_string(),
         })?;
-    let dirs = crate::instance::project_dirs().ok_or("the data directory is unavailable")?;
-    let path = dirs.data_dir().join("workspace-model.sqlite3");
-    refuse_existing(&path)?;
-    seed_at(&plan, &path)
+    let destination = Destination::claim(&plan, Part::Daemon, Directories::current()?)?;
+    let path = destination.store();
+    let mut seeded = destination.write(|staging| seed_at(&plan, staging))?;
+    seeded.path = path;
+    Ok(seeded)
 }
 
-fn refuse_existing(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let version = rusqlite::Connection::open_with_flags(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .and_then(|db| db.pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0)))
-    .map_or_else(
-        |error| format!("unreadable: {error}"),
-        |version| format!("schema {version}"),
-    );
-    Err(format!(
-        "{} already exists ({version}; this executable writes schema {SCHEMA_VERSION}). A seed only \
-         fills an empty instance. Seed a fresh fixture, or delete this instance's data directory \
-         ({}) first.",
-        path.display(),
-        path.parent().unwrap_or(path).display()
-    ))
-}
-
-/// Seeds the store at `path`, which must not exist yet.
+/// Seeds the store at `path`, which must not exist yet, and closes it.
 pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
     let started = Instant::now();
     let mut registry = Registry::at(path)?;
@@ -138,6 +125,12 @@ pub(crate) fn seed_at(plan: &Plan, path: &Path) -> Result<Seeded, String> {
         )?;
         edits += record_edits(&mut registry, plan, index, &scope, view)?;
     }
+    let planned: u64 = plan.views.iter().map(|view| view.edits).sum();
+    if edits != planned {
+        return Err(format!(
+            "The registry recorded {edits} of the plan's {planned} view edits"
+        ));
+    }
     // A channel's automatic name follows its primary conversation, so seeding
     // and rotating its panes cleared it. Name each one last, as the window
     // does once it has read the conversation, or as the person did.
@@ -186,7 +179,8 @@ fn seed_commit(registry: &mut Registry, edit: &ModelEdit) -> Result<(u64, bool),
     registry.commit_checked(edit, false)
 }
 
-/// Records `view.edits` operations on the view, leaving its panes as seeded.
+/// Records `view.edits` operations on the view, leaving its panes as seeded,
+/// and returns how many the registry recorded.
 ///
 /// A view of n panes takes rotations in whole cycles of n, each moving the
 /// first pane to the end, so its revision grows as a busy view's does while
@@ -214,7 +208,9 @@ fn record_edits(
         .first()
         .copied()
         .or_else(|| view.retired.first().copied())
-        .unwrap_or_else(|| CardId::from_uuid(operation(plan, index, u64::MAX)));
+        .map(Ok)
+        .unwrap_or_else(|| derived(plan, IDLE_CARD, index, 0).map(CardId::from_uuid))?;
+    let before = recorded(registry)?;
     for number in 0..view.edits {
         let change = if number < rotations {
             Change::Move {
@@ -233,25 +229,46 @@ fn record_edits(
             &ModelEdit::ChangeView {
                 scope: scope.clone(),
                 expected_revision,
-                operation: operation(plan, index, number),
+                operation: derived(plan, OPERATION, index, number)?,
                 change,
             },
         )?;
     }
-    Ok(view.edits)
+    Ok(recorded(registry)? - before)
 }
 
-/// A stable operation ID per view and edit, so the same plan records the
-/// same operations.
-fn operation(plan: &Plan, view: usize, number: u64) -> uuid::Uuid {
+fn recorded(registry: &Registry) -> Result<u64, String> {
+    registry
+        .db
+        .query_row("SELECT COUNT(*) FROM shared_view_edits", [], |row| {
+            row.get(0)
+        })
+        .map_err(|error| error.to_string())
+}
+
+/// A stable ID for the `number`th thing of `kind` in view `view`, so the same
+/// plan records the same operations. The registry ignores an operation it has
+/// seen, so no two may share one.
+///
+/// Bytes 0..6 carry `number` and bytes 9..16 `view`, each XORed with the
+/// plan's namespace, and byte 7 carries `kind`. Neither touches the version
+/// (the top of byte 6) or variant (the top of byte 8) bits the builder sets,
+/// so distinct inputs give distinct IDs.
+fn derived(plan: &Plan, kind: u8, view: usize, number: u64) -> Result<uuid::Uuid, String> {
+    if number >= 1 << 48 || view as u64 >= 1 << 56 {
+        return Err(format!(
+            "View {view}'s edit {number} is past what a seeded operation ID can number"
+        ));
+    }
     let mut bytes = plan.operation_namespace.into_bytes();
-    for (byte, value) in bytes[..8].iter_mut().zip(number.to_le_bytes()) {
+    for (byte, value) in bytes[..6].iter_mut().zip(number.to_le_bytes()) {
         *byte ^= value;
     }
-    for (byte, value) in bytes[8..].iter_mut().zip((view as u64).to_le_bytes()) {
+    bytes[7] ^= kind;
+    for (byte, value) in bytes[9..].iter_mut().zip((view as u64).to_le_bytes()) {
         *byte ^= value;
     }
-    uuid::Builder::from_random_bytes(bytes).into_uuid()
+    Ok(uuid::Builder::from_random_bytes(bytes).into_uuid())
 }
 
 #[cfg(test)]
@@ -266,8 +283,24 @@ mod tests {
     fn small_round_trips_through_the_registry() {
         let directory = tempfile::tempdir().unwrap();
         let plan = test_support::small(directory.path());
-        let path = directory.path().join("workspace-model.sqlite3");
-        let seeded = seed_at(&plan, &path).unwrap();
+        // Through the destination a seed claims, which renames the closed
+        // store into place.
+        let destination = Destination::claim(
+            &plan,
+            Part::Daemon,
+            Directories {
+                data: plan.root.join("data"),
+                config: plan.root.join("config"),
+                cache: plan.root.join("cache"),
+                instance: None,
+            },
+        )
+        .unwrap();
+        let path = destination.store();
+        let seeded = destination
+            .write(|staging| seed_at(&plan, staging))
+            .unwrap();
+        assert!(!destination_staging(&path).exists());
 
         let registry = Registry::at(&path).unwrap();
         let model = registry.model().unwrap();
@@ -315,32 +348,27 @@ mod tests {
         assert_eq!(recorded, seeded.edits);
     }
 
-    #[test]
-    fn a_seed_never_merges_into_an_existing_store() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("workspace-model.sqlite3");
-        drop(Registry::at(&path).unwrap());
-        let error = refuse_existing(&path).unwrap_err();
-        assert!(
-            error.contains(&format!("schema {SCHEMA_VERSION}")),
-            "{error}"
-        );
-        assert!(
-            error.contains("delete this instance's data directory"),
-            "{error}"
-        );
+    fn destination_staging(store: &Path) -> std::path::PathBuf {
+        store.with_file_name("workspace-model.sqlite3.seeding")
     }
 
+    /// The registry ignores an operation it has seen, so a repeated ID would
+    /// silently drop an edit. Views past 64 and 128 once collided.
     #[test]
-    fn operations_are_stable_and_distinct() {
+    fn derived_ids_are_stable_and_distinct() {
         let directory = tempfile::tempdir().unwrap();
         let plan = test_support::small(directory.path());
-        assert_eq!(operation(&plan, 3, 7), operation(&plan, 3, 7));
+        let id = |kind, view, number| derived(&plan, kind, view, number).unwrap();
+        assert_eq!(id(OPERATION, 3, 7), id(OPERATION, 3, 7));
+        assert_ne!(id(OPERATION, 0, 5), id(OPERATION, 64, 5));
+        assert_ne!(id(OPERATION, 1, 5), id(OPERATION, 129, 5));
         let mut seen = std::collections::HashSet::new();
-        for view in 0..20 {
-            for number in 0..50 {
-                assert!(seen.insert(operation(&plan, view, number)));
+        for view in (0..300).chain([1 << 20, (1 << 56) - 1]) {
+            for number in (0..200).chain([1 << 40, (1 << 48) - 1]) {
+                assert!(seen.insert(id(OPERATION, view, number)), "{view} {number}");
             }
+            assert!(seen.insert(id(IDLE_CARD, view, 0)), "idle {view}");
         }
+        assert!(derived(&plan, OPERATION, 0, 1 << 48).is_err());
     }
 }

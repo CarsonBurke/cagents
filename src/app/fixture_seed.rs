@@ -12,12 +12,15 @@ use std::{
 };
 
 use crate::{
-    fixture_workspace::Plan,
+    fixture_workspace::{
+        Plan,
+        destination::{Destination, Directories, Part},
+    },
     model::{
         Existence, ProjectChannel, ProjectKind, ProjectState, Tombstone, WorkspaceDestination,
         WorkspaceState, WorktreeState,
     },
-    persistence::{CURRENT_SCHEMA_VERSION, SnapshotBase, StateStore},
+    persistence::{SnapshotBase, StateStore},
 };
 
 use super::{ContextTab, WindowView};
@@ -37,6 +40,10 @@ pub(crate) struct SeededWindow {
 /// Seeds the `slot` window of this instance. `identity` is the workspace
 /// model the daemon was seeded with; with it the window's channels are known
 /// to be shared, and without it they are this window's own.
+///
+/// Refuses while that window is open or the instance's daemon runs, and
+/// refuses an instance holding anything an earlier seed of this plan did not
+/// write.
 pub(crate) fn seed(
     plan: &Path,
     slot: &str,
@@ -49,27 +56,48 @@ pub(crate) fn seed(
              native-evidence session, before seeding."
         )
     })?;
-    let path = crate::instance::window_database_path(slot).map_err(|error| error.to_string())?;
-    refuse_existing(&path)?;
+    refuse_running_daemon()?;
+    let destination =
+        Destination::claim(&plan, Part::Window(slot.into()), Directories::current()?)?;
+    let path = destination.store();
     let boot = crate::session::current_boot_id().map_err(|error| error.to_string())?;
-    let store = StateStore::open(&path, boot).map_err(|error| error.to_string())?;
-    let mut seeded = seed_store(&plan, slot, identity, &store)?;
+    copy_avatars(&plan, destination.cache())?;
+    let mut seeded = seed_into(destination, &plan, slot, identity, boot)?;
     seeded.path = path;
-    copy_avatars(&plan)?;
     Ok(seeded)
 }
 
-fn refuse_existing(path: &Path) -> Result<(), String> {
-    if !path.exists() {
-        return Ok(());
+/// Writes the window's store where `destination` stages it, closes it as a
+/// closing window does, and moves it into place.
+fn seed_into(
+    destination: Destination,
+    plan: &Plan,
+    slot: &str,
+    identity: Option<uuid::Uuid>,
+    boot: crate::model::BootId,
+) -> Result<SeededWindow, String> {
+    destination.write(|staging| {
+        let store = StateStore::open(staging, boot).map_err(|error| error.to_string())?;
+        let seeded = seed_store(plan, slot, identity, &store)?;
+        store.shutdown().map_err(|error| error.to_string())?;
+        Ok(seeded)
+    })
+}
+
+/// A running daemon serves windows from the store a seed would sit beside.
+fn refuse_running_daemon() -> Result<(), String> {
+    let paths = crate::daemon::RuntimePaths::discover().map_err(|error| error.to_string())?;
+    let running = crate::instance::private_lock_is_held(&paths.lock)
+        .map_err(|error| format!("Cannot tell whether this instance's daemon runs: {error}"))?;
+    if running {
+        return Err(format!(
+            "A cagents daemon is running for this instance ({}). Stop it before seeding: \
+             `scripts/run-development --stop-instance NAME` for an instance, or stop the \
+             native-evidence session.",
+            paths.socket.display()
+        ));
     }
-    Err(format!(
-        "{} already exists. A seed only fills an empty window (this executable writes session schema \
-         {CURRENT_SCHEMA_VERSION}). Seed a fresh fixture, or delete this instance's data directory ({}) \
-         first.",
-        path.display(),
-        path.parent().unwrap_or(path).display()
-    ))
+    Ok(())
 }
 
 /// Writes the window `slot` describes into `store`.
@@ -265,11 +293,8 @@ pub(crate) fn seed_store(
 
 /// Puts each project's avatar where the app caches GitHub avatars, fresh, so
 /// the sidebar draws it without a download.
-fn copy_avatars(plan: &Plan) -> Result<(), String> {
-    let Some(dirs) = crate::instance::project_dirs() else {
-        return Ok(());
-    };
-    let cache = dirs.cache_dir().join("github-avatars");
+fn copy_avatars(plan: &Plan, cache: &Path) -> Result<(), String> {
+    let cache = cache.join("github-avatars");
     for project in &plan.projects {
         let Some(avatar) = &project.avatar else {
             continue;
@@ -301,14 +326,29 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let plan = test_support::small(directory.path());
         let identity = uuid::Uuid::new_v4();
+        let directories = Directories {
+            data: plan.root.join("data"),
+            config: plan.root.join("config"),
+            cache: plan.root.join("cache"),
+            instance: None,
+        };
         for window in &plan.windows {
-            let path = directory.path().join(format!("{}.sqlite3", window.slot));
-            {
-                let store = StateStore::open(&path, BootId::new("seed")).unwrap();
-                let seeded = seed_store(&plan, &window.slot, Some(identity), &store).unwrap();
-                assert_eq!(seeded.cards, window.cards.len());
-                store.shutdown().unwrap();
-            }
+            let destination = Destination::claim(
+                &plan,
+                Part::Window(window.slot.clone()),
+                directories.clone(),
+            )
+            .unwrap();
+            let path = destination.store();
+            let seeded = seed_into(
+                destination,
+                &plan,
+                &window.slot,
+                Some(identity),
+                BootId::new("seed"),
+            )
+            .unwrap();
+            assert_eq!(seeded.cards, window.cards.len());
             let store = StateStore::open(&path, BootId::new("next-boot")).unwrap();
             assert_eq!(store.list_projects().unwrap().len(), plan.projects.len());
             let worktrees: usize = plan.projects.iter().map(|p| p.worktrees.len()).sum();
@@ -348,14 +388,5 @@ mod tests {
                 serde_json::from_str(&store.load_window_view().unwrap().unwrap()).unwrap();
             assert_eq!(view.user_titles.len(), window.user_titles.len());
         }
-    }
-
-    #[test]
-    fn a_seed_never_merges_into_an_existing_session() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("session.sqlite3");
-        drop(StateStore::open(&path, BootId::new("seed")).unwrap());
-        let error = refuse_existing(&path).unwrap_err();
-        assert!(error.contains("already exists"), "{error}");
     }
 }

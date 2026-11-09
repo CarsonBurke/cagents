@@ -302,6 +302,18 @@ class Reproducible(unittest.TestCase):
         self.assertEqual(subprocess.run(["git", "-C", checkout, "rev-parse", "HEAD"], capture_output=True,
                                         text=True, check=True).stdout, head)
 
+    def test_epoch_moves_repository_history(self):
+        def latest(epoch):
+            run("generate", "--profile", "small", "--root", self.root, "--replace", "--epoch", str(epoch))
+            with open(os.path.join(self.root, "plan.json")) as file:
+                checkout = json.load(file)["projects"][0]["checkout"]
+            return int(subprocess.run(["git", "-C", checkout, "log", "-1", "--format=%ct", "main"],
+                                      capture_output=True, text=True, check=True).stdout)
+
+        early, late = 1700000000, 1800000000
+        self.assertLess(latest(early), early)
+        self.assertEqual(latest(late) - latest(early), late - early)
+
     def test_replace_refuses_a_directory_it_did_not_generate(self):
         os.makedirs(self.root)
         Path(self.root, "keep.txt").write_text("not ours")

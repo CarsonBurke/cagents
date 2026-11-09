@@ -17,7 +17,7 @@ def parser():
 
     make = commands.add_parser("generate", help="Write repositories, conversation history and plan.json.")
     make.add_argument("--profile", default="small", help=f"One of: {', '.join(profiles.PROFILES)}.")
-    make.add_argument("--seed", type=int, default=1, help="The same seed writes the same bytes.")
+    make.add_argument("--seed", type=int, default=1, help="The same profile, seed and root write the same bytes.")
     make.add_argument("--root", required=True, help="An empty directory, or one generated before with --replace.")
     make.add_argument("--scale", type=float, default=1.0, help="Multiply the profile's counts.")
     make.add_argument("--edge-case", action="append", default=[], metavar="NAME",

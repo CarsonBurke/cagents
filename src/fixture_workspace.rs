@@ -28,6 +28,9 @@ use crate::model::{
 };
 use crate::workspace_model::views::Scope;
 
+#[cfg(any(debug_assertions, feature = "development"))]
+pub mod destination;
+
 /// The plan format these appliers understand. The generator writes its own
 /// (`PLAN_FORMAT` in scripts/fixture_workspace/generate.py); the two change
 /// together.
@@ -64,6 +67,9 @@ pub struct Plan {
     pub views: Vec<View>,
     pub windows: Vec<Window>,
     pub history: serde_json::Value,
+    /// Where the plan was read from, resolved.
+    #[serde(skip)]
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Deserialize)]
@@ -217,6 +223,22 @@ impl PlanScope {
     }
 }
 
+/// What every seeded recipe points inside the root, as HOME is.
+const PROVIDER_HOMES: [&str; 3] = ["HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"];
+
+/// The credentials a provider would prefer over its (fixture) login. A seeded
+/// launch removes them, so it never runs on the person's keys.
+fn unset_credentials() -> std::collections::BTreeSet<String> {
+    [
+        crate::agent::Provider::Claude,
+        crate::agent::Provider::Codex,
+    ]
+    .into_iter()
+    .flat_map(crate::account::credential_overrides)
+    .map(|variable| (*variable).to_owned())
+    .collect()
+}
+
 impl Plan {
     /// Reads and checks a plan. Every failure names what to do about it.
     pub fn load(path: &Path) -> Result<Self, String> {
@@ -233,13 +255,28 @@ impl Plan {
                 path.display()
             ));
         }
-        serde_json::from_str(&text).map_err(|error| {
+        let mut plan: Self = serde_json::from_str(&text).map_err(|error| {
             format!(
                 "{} does not match plan format {PLAN_FORMAT}: {error}. Generate it again with \
                  this checkout's scripts/fixture-workspace.",
                 path.display()
             )
-        })
+        })?;
+        plan.path = path
+            .canonicalize()
+            .map_err(|error| format!("Cannot resolve {}: {error}", path.display()))?;
+        // Every path in the plan names something under the root it was
+        // generated in. A copied or moved plan would name the original's.
+        let here = plan.path.parent().map(Path::to_owned);
+        if plan.root.canonicalize().ok() != here {
+            return Err(format!(
+                "{} was generated for {}, and its paths name the repositories and history there. \
+                 Generate it again where it is to be applied.",
+                path.display(),
+                plan.root.display()
+            ));
+        }
+        Ok(plan)
     }
 
     pub fn card(&self, id: CardId) -> Result<&Card, String> {
@@ -263,16 +300,33 @@ impl Plan {
         cwd: &Path,
         environment: &str,
     ) -> Result<LaunchRecipe, String> {
+        let name = environment;
+        let environment = self
+            .environments
+            .get(name)
+            .cloned()
+            .ok_or_else(|| format!("The plan names environment {name} but lacks it"))?;
+        // Each layer the app adds sits under the recipe: the daemon's and the
+        // window's own environments, which may name the person's provider
+        // homes or credentials. A seeded launch must only reach the fixture's.
+        for variable in PROVIDER_HOMES {
+            if !environment
+                .get(variable)
+                .is_some_and(|path| Path::new(path).starts_with(&self.root))
+            {
+                return Err(format!(
+                    "The plan's environment {name} does not set {variable} inside {}. Generate it \
+                     again with this checkout's scripts/fixture-workspace.",
+                    self.root.display()
+                ));
+            }
+        }
         Ok(LaunchRecipe {
             program: program.to_owned(),
             arguments: arguments.to_vec(),
             working_directory: cwd.to_owned(),
-            environment: self
-                .environments
-                .get(environment)
-                .cloned()
-                .ok_or_else(|| format!("The plan names environment {environment} but lacks it"))?,
-            unset_environment: Default::default(),
+            environment,
+            unset_environment: unset_credentials(),
         })
     }
 
@@ -436,6 +490,66 @@ mod tests {
         let error = Plan::load(&path).unwrap_err();
         assert!(error.contains("format 99"), "{error}");
         assert!(error.contains("scripts/fixture-workspace"), "{error}");
+    }
+
+    /// The app layers a recipe over its own inherited environment, which may
+    /// name the person's provider homes and keys.
+    #[test]
+    fn seeded_launches_reach_only_the_fixture() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let mut launches = 0;
+        for card in &plan.cards {
+            let state = plan.card_state(card).unwrap();
+            let recipe = match &state.kind {
+                CardKind::Chat(session) => session.launch.recipe.clone(),
+                CardKind::Terminal(TerminalSession {
+                    continuity: TerminalContinuity::RelaunchAvailable { recipe, .. },
+                    ..
+                }) => recipe.clone(),
+                _ => continue,
+            };
+            for variable in PROVIDER_HOMES {
+                let path = Path::new(&recipe.environment[variable]);
+                assert!(
+                    path.starts_with(&plan.root),
+                    "{variable}={}",
+                    path.display()
+                );
+            }
+            assert_eq!(
+                recipe.environment["CLAUDE_CONFIG_DIR"],
+                format!("{}/.claude", plan.home.display())
+            );
+            assert_eq!(
+                recipe.environment["CODEX_HOME"],
+                format!("{}/.codex", plan.home.display())
+            );
+            for key in [
+                "ANTHROPIC_API_KEY",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+            ] {
+                assert!(recipe.unset_environment.contains(key), "{key}");
+            }
+            launches += 1;
+        }
+        assert!(launches > 10, "{launches}");
+    }
+
+    #[test]
+    fn a_moved_plan_is_refused() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let moved = directory.path().join("moved");
+        std::fs::create_dir(&moved).unwrap();
+        std::fs::copy(&plan.path, moved.join("plan.json")).unwrap();
+        let error = Plan::load(&moved.join("plan.json")).unwrap_err();
+        assert!(
+            error.contains("Generate it again where it is to be applied"),
+            "{error}"
+        );
     }
 
     #[test]

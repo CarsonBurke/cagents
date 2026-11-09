@@ -2,7 +2,7 @@
 
 Every part of the generator draws from its own named stream, so adding records
 to one part (say, Codex rollouts) leaves every other part byte-identical for
-the same seed. Identifiers come from those streams too; nothing reads the
+the same profile, seed and root (paths in the files name the root). Identifiers come from those streams too; nothing reads the
 clock or the process's own randomness.
 """
 
@@ -11,8 +11,8 @@ import random
 import uuid
 
 # Every timestamp is an offset back from this instant (2026-06-01T00:00:00Z),
-# not from the time the generator ran, so the same seed always writes the same
-# bytes. Pass --epoch to move it, for example to make history look recent.
+# not from the time the generator ran, so the same profile, seed and root
+# always write the same bytes. Pass --epoch to move it, for example to make history look recent.
 EPOCH = 1780272000
 
 

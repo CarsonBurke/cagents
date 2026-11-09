@@ -59,7 +59,7 @@ def generate(profile, seed, root, epoch, replace=False, log=print):
     os.makedirs(os.path.join(root, "bin"), exist_ok=True)
     os.makedirs(os.path.join(root, "home"), exist_ok=True)
     for project in planner.projects:
-        repositories.create(root, project)
+        repositories.create(root, project, epoch)
     timings = {"repositories": time.monotonic() - started}
 
     mark = time.monotonic()

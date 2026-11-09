@@ -9,7 +9,6 @@ import os
 import shutil
 import subprocess
 
-from .determinism import EPOCH
 
 AUTHOR = "Fixture Author <fixture@example.invalid>"
 
@@ -28,7 +27,7 @@ COMMIT_MESSAGES = [
 ]
 
 
-def environment(root):
+def environment(root, epoch):
     return {
         "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
         "HOME": os.path.join(root, "home"),
@@ -39,8 +38,8 @@ def environment(root):
         "GIT_AUTHOR_EMAIL": "fixture@example.invalid",
         "GIT_COMMITTER_NAME": "Fixture Author",
         "GIT_COMMITTER_EMAIL": "fixture@example.invalid",
-        "GIT_AUTHOR_DATE": f"{EPOCH} +0000",
-        "GIT_COMMITTER_DATE": f"{EPOCH} +0000",
+        "GIT_AUTHOR_DATE": f"{epoch} +0000",
+        "GIT_COMMITTER_DATE": f"{epoch} +0000",
         "LC_ALL": "C",
     }
 
@@ -81,15 +80,16 @@ def hash_index(text):
     return sum(text.encode())
 
 
-def create(root, project):
-    """Creates one project's checkout and worktrees as the plan describes."""
-    env = environment(root)
+def create(root, project, epoch):
+    """Creates one project's checkout and worktrees as the plan describes, with
+    history that ends a month before `epoch`."""
+    env = environment(root, epoch)
     checkout = project["checkout"]
     os.makedirs(checkout, exist_ok=True)
     git(env, "init", "--quiet", "--initial-branch=main", cwd=checkout)
     commits = project["commits"]
     git(env, "fast-import", "--quiet", cwd=checkout,
-        stdin=history(project["name"], commits, EPOCH - commits * 86400 - 30 * 86400))
+        stdin=history(project["name"], commits, epoch - commits * 86400 - 30 * 86400))
     git(env, "reset", "--quiet", "--hard", "main", cwd=checkout)
     with open(os.path.join(checkout, ".git", "info", "exclude"), "a") as exclude:
         exclude.write(".worktrees/\n")

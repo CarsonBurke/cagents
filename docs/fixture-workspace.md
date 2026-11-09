@@ -48,8 +48,8 @@ Times are from one run on this repository's development host.
   `oversized-transcript`, and `--no-edge-cases` drops the profile's.
   `scripts/fixture-workspace edge-cases` lists them, with the profiles that
   include each.
-- `--epoch SECONDS` moves "now"; every timestamp counts back from it
-  (default 2026-06-01).
+- `--epoch SECONDS` moves "now"; every timestamp counts back from it,
+  repository history included (default 2026-06-01).
 - `--replace` regenerates a root generated before. It refuses a directory
   without the `.fixture-workspace` marker the generator writes first.
 
@@ -68,10 +68,15 @@ ROOT/
 After `apply` without `--instance`, it also holds `data/`, `config/`,
 `cache/` and `state/`: the app's XDG directories for this root.
 
-Every chat and terminal card carries a launch environment with `HOME` set to
-`ROOT/home` and the XDG directories inside the root, so a provider launched
-from a seeded card reads the fixture's history, never `~/.claude` or
-`~/.codex`.
+Every chat and terminal card carries a launch environment with `HOME`,
+`CLAUDE_CONFIG_DIR` (`ROOT/home/.claude`), `CODEX_HOME` (`ROOT/home/.codex`)
+and the XDG directories inside the root, and removes the providers' API keys
+and tokens. The app layers a recipe over its own inherited environment, so
+naming the provider homes matters: a provider launched from a seeded card reads
+the fixture's history, never `~/.claude`, `~/.codex` or a signed-in account's
+home, and never runs on the person's keys, even from a shell that exports
+them. A seeded card's provider is therefore signed out; native-evidence puts
+its synthetic provider on the fixture's `PATH`.
 
 The conversations follow the providers' current formats, including what
 makes real transcripts hard to read: harness noise (system reminders, local
@@ -105,11 +110,20 @@ The seeding flags (`cagentsd --development-seed-workspace PLAN`,
 development builds; a production executable refuses them. Each seed also
 refuses:
 
-- while a daemon or window holds this instance's lease;
-- a store that already exists, naming its schema: a seed never merges into
-  real state;
+- while this instance's daemon runs, or the window it seeds is open;
+- an instance holding anything earlier seeds of the same plan did not write.
+  The check covers the whole data directory, every window's store included,
+  not only the store being written: a seed never merges into real state. The
+  seeds record what they wrote in `fixture-seed.json` there, so the daemon and
+  each window can seed one after another;
+- the unnamed development instance, the login daemon's, unless every XDG
+  directory it would write is inside the plan's root, as `apply` without
+  `--instance` and native-evidence arrange;
 - a plan in another format, or one moved from where it was generated, whose
   paths would name the wrong repositories.
+
+A store is written beside its final name and renamed into place once closed,
+so a seed that fails leaves nothing behind for a launch to open.
 
 ### A development instance
 
@@ -130,7 +144,7 @@ scripts/run-development --browserless --instance seeded
 `target/` unless `CARGO_TARGET_DIR` or the Cargo configuration moves it. To
 seed an instance again, stop it with `--stop-instance seeded` and delete
 its storage (`~/.local/share/cagents-development-seeded` and its config and
-state siblings) first; a seed refuses stores that exist. The instance keeps
+state siblings) first; a seed refuses an instance that has been used. The instance keeps
 your real `HOME` for provider sign-ins, but every seeded card launches with
 the fixture's `HOME`. `apply` refuses the unnamed development instance, which
 is the login daemon's.
