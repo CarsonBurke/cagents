@@ -1044,7 +1044,7 @@ class Evidence(unittest.TestCase):
 
     def switch_forge_on(self) -> Path:
         fixture = self.task / "fixture"
-        (fixture / "home" / ".config").mkdir(parents=True, exist_ok=True)
+        # The fixture provides the directory, as a steps file's touch relies on.
         (fixture / "home" / ".config" / "fixture-forge").touch()
         return fixture
 
@@ -1154,7 +1154,6 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after")
         fixture = self.switch_forge_on()
         seed = fixture / "avatars" / "Octo-Org.image"
-        seed.parent.mkdir()
         seed.write_bytes(b"\x89PNG\r\n\x1a\nseeded")
         old = time.time() - 30 * 24 * 60 * 60
         os.utime(seed, (old, old))

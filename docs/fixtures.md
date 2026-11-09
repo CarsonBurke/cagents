@@ -98,8 +98,7 @@ GitHub read, that pauses the app's GitHub refreshes for a while.
 A steps file for a sidebar with an avatar:
 
 ```sh
-evidence env sh -c 'mkdir -p "$CAGENTS_EVIDENCE_FIXTURE/avatars" &&
-    magick -size 64x64 gradient:"#2f6feb"-"#a371f7" "png:$CAGENTS_EVIDENCE_FIXTURE/avatars/octo-org.image"'
+evidence env sh -c 'magick -size 64x64 gradient:"#2f6feb"-"#a371f7" "png:$CAGENTS_EVIDENCE_FIXTURE/avatars/octo-org.image"'
 evidence env git -C '{fixture}/project' remote add origin https://github.com/octo-org/fixture-app
 evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge"'
 evidence cli project open '{fixture}/project'

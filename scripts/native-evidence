@@ -392,7 +392,9 @@ prepare_fixture() {
             printf '%s\n' 'the provider home is not the one the seed was saved from, so chats in the seed will not reopen; recreate them and save-seed again' >>"$state/notice"
         fi
     fi
-    mkdir -p "$fixture"/{bin,home/.claude,data,config,cache,state,project}
+    # home/.config holds the forge's switch and avatars its seeds; a steps file
+    # writes into both without creating them.
+    mkdir -p "$fixture"/{bin,home/.claude,home/.config,avatars,data,config,cache,state,project}
     # Both sides get this tool's synthetic provider: the data must not differ
     # because an older before checkout carries an older fixture.
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$fixture/bin/claude"
