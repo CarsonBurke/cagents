@@ -396,3 +396,50 @@ fn a_matching_helper_sends_its_transcript_as_an_encoded_response() {
         ));
     });
 }
+
+#[test]
+fn input_recovery_waits_only_for_work_with_a_retry_deadline() {
+    let actor = RemoteActor::fixture();
+    assert_eq!(actor.retry_after(false), None);
+    let identity = InputIdentity {
+        sequence: 1,
+        id: uuid::Uuid::new_v4(),
+        hash: [0; 32],
+    };
+    let (reply, _receiver) = crossbeam_channel::bounded(1);
+    actor.0.pending.lock().unwrap().push(Pending {
+        identity: identity.clone(),
+        payload: Value::Null,
+        bytes: 0,
+        reply: Some(reply),
+    });
+    assert_eq!(
+        actor.retry_after(false),
+        None,
+        "accepted input awaits its helper publication"
+    );
+    *actor.0.uncertain_input.lock().unwrap() = Some(UncertainInput {
+        identity: identity.clone(),
+        acknowledgement_deadline: Instant::now() + ACKNOWLEDGEMENT_WAIT,
+        retransmit: Some(Retransmit {
+            next: Instant::now() + TIMEOUT,
+            delay: RETRANSMIT_DELAY,
+        }),
+        refusal: None,
+        settle_failures: 0,
+        settling_since: None,
+        unsettleable: false,
+    });
+    assert!(
+        actor
+            .retry_after(false)
+            .is_some_and(|wait| wait > Duration::from_secs(4))
+    );
+    actor.stop_settling(&identity, "fixture exhausted recovery");
+    assert_eq!(
+        actor.retry_after(false),
+        None,
+        "exhausted recovery must not poll forever"
+    );
+    assert_eq!(actor.retry_after(true), Some(Duration::from_millis(50)));
+}

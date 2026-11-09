@@ -39,7 +39,11 @@ impl Wake {
     pub(super) fn notify(&self) {
         let _ = (&self.writer).write(&[1]);
     }
-    pub(super) fn wait(&self, watch: Option<&UnixStream>, retry: bool) -> Result<(), String> {
+    pub(super) fn wait(
+        &self,
+        watch: Option<&UnixStream>,
+        retry: Option<Duration>,
+    ) -> Result<(), String> {
         let mut events = vec![libc::pollfd {
             fd: self.reader.as_raw_fd(),
             events: libc::POLLIN,
@@ -52,14 +56,17 @@ impl Wake {
                 revents: 0,
             });
         }
+        let timeout = retry
+            .map(|wait| {
+                wait.as_millis()
+                    .saturating_add(u128::from(wait.subsec_nanos() % 1_000_000 != 0))
+                    .min(i32::MAX as u128) as i32
+            })
+            .unwrap_or(-1);
         loop {
-            let result = unsafe {
-                libc::poll(
-                    events.as_mut_ptr(),
-                    events.len() as libc::nfds_t,
-                    if retry { 50 } else { -1 },
-                )
-            };
+            // SAFETY: the initialized descriptors live throughout this call.
+            let result =
+                unsafe { libc::poll(events.as_mut_ptr(), events.len() as libc::nfds_t, timeout) };
             if result >= 0 {
                 break;
             }

@@ -1203,7 +1203,7 @@ impl RemoteActor {
                     }
                     let old = actor.state();
                     let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
-                    let failed = response.is_err();
+                    let mut retry_housekeeping = response.is_err();
                     if actor.0.stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -1218,7 +1218,7 @@ impl RemoteActor {
                             break;
                         }
                     }
-                    let _ = actor.reconcile_acknowledged_inputs();
+                    retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -1228,15 +1228,20 @@ impl RemoteActor {
                         .filter(|pending| pending.reply.is_some())
                         .map(|pending| pending.identity.clone())
                         .collect();
-                    if !identities.is_empty()
-                        && let Ok(receipts) =
-                            actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
-                    {
-                        actor.apply_receipts(&receipts);
+                    if !identities.is_empty() {
+                        match actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
+                        {
+                            Ok(receipts) => actor.apply_receipts(&receipts),
+                            Err(_) => retry_housekeeping = true,
+                        }
                     }
                     actor.resolve_uncertain_input();
-                    let _ = actor.flush_input_retirements();
-                    let retry = watch.is_none() || failed || actor.needs_recovery();
+                    retry_housekeeping |= actor.flush_input_retirements().is_err();
+                    let retry = if watch.is_none() {
+                        Some(Duration::from_millis(50))
+                    } else {
+                        actor.retry_after(retry_housekeeping)
+                    };
                     drop(actor);
                     if let Err(error) = wake.wait(watch.as_ref(), retry) {
                         if let Some(inner) = weak.upgrade() {
@@ -1250,8 +1255,11 @@ impl RemoteActor {
         *remote.0.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(remote)
     }
-    fn needs_recovery(&self) -> bool {
-        self.0.recovering_inputs.load(Ordering::Acquire)
+    fn retry_after(&self, failed: bool) -> Option<Duration> {
+        // Accepted inputs finish through helper publication. Only work that
+        // failed, or has a scheduled retransmission, needs a timer.
+        if failed
+            || self.0.recovering_inputs.load(Ordering::Acquire)
             || self.state().acknowledged_input_count > 0
             || self.0.desired_observe.load(Ordering::Acquire)
             || self
@@ -1266,19 +1274,16 @@ impl RemoteActor {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty()
-            || self
-                .0
-                .uncertain_input
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .is_some()
-            || self
-                .0
-                .pending
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .iter()
-                .any(|p| p.reply.is_some())
+        {
+            return Some(Duration::from_millis(50));
+        }
+        self.0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|input| input.retransmit.as_ref())
+            .map(|retry| retry.next.saturating_duration_since(Instant::now()))
     }
     fn watch(&self) -> Result<Option<UnixStream>, String> {
         let deadline = Instant::now() + TIMEOUT;
