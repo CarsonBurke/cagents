@@ -72,6 +72,9 @@ impl Directories {
 struct Ledger {
     plan: PathBuf,
     parts: Vec<String>,
+    /// What the seeds left in the data directory, relative to it: their
+    /// stores, and whatever the executables create as they start.
+    entries: Vec<PathBuf>,
 }
 
 /// A part of an instance this seed may write, until it is [`complete`]d.
@@ -104,6 +107,7 @@ impl Destination {
             Err(error) if error.kind() == io::ErrorKind::NotFound => Ledger {
                 plan: plan.path.clone(),
                 parts: Vec::new(),
+                entries: Vec::new(),
             },
             Err(error) => return Err(format!("Cannot read {}: {error}", ledger_path.display())),
         };
@@ -160,6 +164,7 @@ impl Destination {
         let store = self.store();
         let parent = store.parent().unwrap().to_owned();
         let created = !parent.exists();
+        let before = entries(&self.directories.data)?;
         remove_store(&staging);
         let result = write(&staging).and_then(|value| {
             if store.exists() {
@@ -194,7 +199,11 @@ impl Destination {
         });
         match result {
             Ok(value) => {
+                let after = entries(&self.directories.data)?;
                 self.ledger.parts.push(self.part.label());
+                self.ledger
+                    .entries
+                    .extend(after.into_iter().filter(|entry| !before.contains(entry)));
                 self.record()?;
                 Ok(value)
             }
@@ -206,7 +215,22 @@ impl Destination {
                         let _ = std::fs::remove_dir(parent.parent().unwrap());
                     }
                 }
-                Err(error)
+                let left = entries(&self.directories.data)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|entry| !before.contains(entry))
+                    .map(|entry| entry.display().to_string())
+                    .collect::<Vec<_>>();
+                if left.is_empty() {
+                    Err(error)
+                } else {
+                    Err(format!(
+                        "{error}. The failed seed left {} in {}; delete that directory before seeding \
+                         again.",
+                        left.join(", "),
+                        self.directories.data.display()
+                    ))
+                }
             }
         }
     }
@@ -221,50 +245,18 @@ impl Destination {
     }
 
     /// Refuses anything in the data directory that earlier seeds of this plan
-    /// did not write: any state of a used instance, including every window's
+    /// did not leave: any state of a used instance, including every window's
     /// session store ([`crate::instance::window_database_paths`]).
     fn refuse_unrecorded(&self) -> Result<(), String> {
         let data = &self.directories.data;
-        let seeded = |part: &Part| self.ledger.parts.contains(&part.label());
-        let mut unrecorded = Vec::new();
-        let entries = match std::fs::read_dir(data) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(format!("Cannot read {}: {error}", data.display())),
-        };
-        for entry in entries {
-            let entry = entry.map_err(|error| error.to_string())?;
-            let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let recorded = match name.as_ref() {
-                LEDGER => !self.ledger.parts.is_empty(),
-                DAEMON_STORE => seeded(&Part::Daemon),
-                PRIMARY_STORE => seeded(&Part::Window(crate::instance::PRIMARY_WINDOW.into())),
-                "windows" => {
-                    for slot in
-                        std::fs::read_dir(entry.path()).map_err(|error| error.to_string())?
-                    {
-                        let slot = slot.map_err(|error| error.to_string())?.file_name();
-                        let slot = slot.to_string_lossy();
-                        let path = data.join("windows").join(slot.as_ref());
-                        let only_store = std::fs::read_dir(&path)
-                            .map_err(|error| error.to_string())?
-                            .map(|entry| entry.map(|entry| entry.file_name()))
-                            .collect::<Result<Vec<_>, _>>()
-                            .map_err(|error| error.to_string())?
-                            == [std::ffi::OsString::from(PRIMARY_STORE)];
-                        if !(only_store && seeded(&Part::Window(slot.clone().into_owned()))) {
-                            unrecorded.push(path);
-                        }
-                    }
-                    true
-                }
-                _ => false,
-            };
-            if !recorded {
-                unrecorded.push(entry.path());
-            }
-        }
+        let mut unrecorded = entries(data)?
+            .into_iter()
+            .filter(|entry| {
+                !(self.ledger.entries.contains(entry)
+                    || entry == Path::new(LEDGER) && !self.ledger.parts.is_empty())
+            })
+            .map(|entry| data.join(entry))
+            .collect::<Vec<_>>();
         if unrecorded.is_empty() {
             return Ok(());
         }
@@ -283,6 +275,35 @@ impl Destination {
             data.display()
         ))
     }
+}
+
+/// The data directory's entries, relative to it: each top-level entry, and
+/// each entry of every window slot's directory, where a window's store lives.
+fn entries(data: &Path) -> Result<Vec<PathBuf>, String> {
+    let list = |directory: &Path| -> Result<Vec<std::ffi::OsString>, String> {
+        match std::fs::read_dir(directory) {
+            Ok(entries) => entries
+                .map(|entry| entry.map(|entry| entry.file_name()))
+                .collect::<Result<_, _>>()
+                .map_err(|error| format!("Cannot read {}: {error}", directory.display())),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(error) => Err(format!("Cannot read {}: {error}", directory.display())),
+        }
+    };
+    let mut found = Vec::new();
+    for name in list(data)? {
+        found.push(PathBuf::from(&name));
+        if name == "windows" {
+            for slot in list(&data.join("windows"))? {
+                let relative = Path::new("windows").join(&slot);
+                for entry in list(&data.join(&relative))? {
+                    found.push(relative.join(entry));
+                }
+                found.push(relative);
+            }
+        }
+    }
+    Ok(found)
 }
 
 /// The unnamed development instance belongs to the login session's daemon.
@@ -385,6 +406,26 @@ mod tests {
         assert!(dirs.data.join("windows/window-2/sessions.sqlite3").exists());
         let again = seed(&plan, window("window-2"), &dirs).unwrap_err();
         assert!(again.contains("already seeded"), "{again}");
+    }
+
+    /// The daemon creates storage of its own as it starts (its upgrade
+    /// directory, say); what a seed's executable leaves belongs to the seed.
+    #[test]
+    fn what_a_seeding_executable_creates_belongs_to_the_seed() {
+        let directory = tempfile::tempdir().unwrap();
+        let plan = test_support::small(directory.path());
+        let dirs = directories(&plan.root, None);
+        Destination::claim(&plan, Part::Daemon, dirs.clone())
+            .unwrap()
+            .write(|path| {
+                std::fs::create_dir_all(dirs.data.join("daemon-upgrade")).unwrap();
+                std::fs::write(path, b"store").map_err(|error| error.to_string())
+            })
+            .unwrap();
+        seed(&plan, window("primary"), &dirs).unwrap();
+        std::fs::create_dir(dirs.data.join("transcripts")).unwrap();
+        let error = seed(&plan, window("window-2"), &dirs).unwrap_err();
+        assert!(error.contains("transcripts"), "{error}");
     }
 
     /// A used instance has state no seed recorded: another window's store,
