@@ -4,6 +4,7 @@ use super::*;
 
 struct Proxy {
     actor: RemoteActor,
+    local: LocalHandle,
     startup: UnixStream,
     helper: Option<thread::JoinHandle<Result<(), String>>>,
     updates: Arc<dyn Fn(Update) + Send + Sync>,
@@ -23,6 +24,7 @@ impl Proxy {
         let (mut server, root) = tests::resident_server(body);
         server.proof = proof.clone();
         server.installed = false;
+        let local = server.actor.clone();
         let reads = server.state_reads.clone();
         let fail_reads = server.fail_state_reads.clone();
         let updates = Arc::new(server.notifier());
@@ -36,6 +38,7 @@ impl Proxy {
             RemoteActor::from_attached_at(attached, proof.clone(), None, socket, notify).unwrap();
         Self {
             actor,
+            local,
             startup,
             helper: Some(helper),
             updates,
@@ -56,6 +59,7 @@ impl Drop for Proxy {
     fn drop(&mut self) {
         self.actor.0.stop.store(true, Ordering::Release);
         self.actor.0.wake.notify();
+        self.local.close().unwrap();
         // Startup EOF ends the uninstalled fixture's real serve loop.
         let _ = self.startup.shutdown(std::net::Shutdown::Both);
         self.helper.take().unwrap().join().unwrap().unwrap();
@@ -79,6 +83,23 @@ fn idle_retained_proxies_wait_for_a_publication() {
     });
 }
 
+/// Real helpers have separate processes. These thread-hosted helpers share
+/// a process-wide orphan reaper, so finish every provider before any serve
+/// loop performs its final orphan check.
+struct Proxies(Vec<Proxy>);
+impl std::ops::Deref for Proxies {
+    type Target = Vec<Proxy>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+impl Drop for Proxies {
+    fn drop(&mut self) {
+        for proxy in &self.0 {
+            proxy.local.close().unwrap();
+        }
+    }
+}
 fn proxy_cost() -> (u64, u64) {
     let mut cpu = 0;
     let mut switches = 0;
@@ -123,17 +144,19 @@ fn retained_transport_cost() {
         let mut proof = RemoteActor::fixture().0.proof.clone();
         let _lease = leased_proof(&mut proof);
         let (sent, received) = crossbeam_channel::unbounded();
-        let proxies: Vec<_> = (0..12)
-            .map(|id| {
-                let sent = sent.clone();
-                Proxy::start(&proof, move |update| {
-                    if matches!(update, Update::Presentation) {
-                        let _ = sent.send((id, Instant::now()));
-                    }
+        let proxies = Proxies(
+            (0..12)
+                .map(|id| {
+                    let sent = sent.clone();
+                    Proxy::start(&proof, move |update| {
+                        if matches!(update, Update::Presentation) {
+                            let _ = sent.send((id, Instant::now()));
+                        }
+                    })
                 })
-            })
-            .collect();
-        for proxy in &proxies {
+                .collect(),
+        );
+        for proxy in proxies.iter() {
             settled(proxy);
         }
         while received.try_recv().is_ok() {}
@@ -342,5 +365,34 @@ fn retained_presentation_cost() {
                 samples[23].as_micros()
             );
         }
+    });
+}
+
+#[test]
+fn a_matching_helper_sends_its_transcript_as_an_encoded_response() {
+    isolated("CAGENTS_RETAINED_BINARY_RELAY_TEST", || {
+        use crate::terminal_ipc::{PreparedResponse, ServerResponse};
+        let mut proof = RemoteActor::fixture().0.proof.clone();
+        let _lease = leased_proof(&mut proof);
+        let body = "A retained answer λ\n\n**Keep its bytes.**";
+        let proxy = Proxy::start_with_body(&proof, Some(body.into()), |_| {});
+        let response = proxy
+            .actor
+            .presentation_wire(proxy.actor.0.source.id, None)
+            .unwrap();
+        assert!(
+            matches!(response, PreparedResponse::EncodedChat { .. }),
+            "matching helpers must not fall back to JSON"
+        );
+        let ServerResponse::ChatSnapshot {
+            snapshot: Some(snapshot),
+            ..
+        } = response.decode().unwrap()
+        else {
+            panic!("missing snapshot");
+        };
+        assert!(snapshot.items.iter().any(
+            |item| matches!(&item.content, chat::ItemContent::Text { text, .. } if text == body)
+        ));
     });
 }
