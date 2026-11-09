@@ -4871,6 +4871,14 @@ impl Runtime {
             return;
         };
         self.install_snapshot(snapshot, source_clock);
+        if self.warm.is_some() && !self.visible.load(Ordering::Relaxed) {
+            // A warm chat with queued work reads while hidden, so it can grow.
+            if self.warm_bytes() > warm::CHAT_BYTES {
+                self.cool();
+            } else {
+                warm::grew();
+            }
+        }
     }
 
     /// Install an authoritative hydrated publication without replacing reader
@@ -5448,15 +5456,23 @@ impl Runtime {
             && self.warm_bytes() <= warm::CHAT_BYTES
     }
 
-    /// What this chat keeps while warm: its transcript and what was prepared
-    /// from it. Logical bytes, not process memory.
+    /// The heap this chat holds while warm: its transcript, and what was
+    /// prepared from it, with parsed documents estimated from their size
+    /// (see [`warm::NODE_BYTES`]). Constant work per item.
     pub(super) fn warm_bytes(&self) -> usize {
+        let prepared = |cached: &CachedItem| {
+            let [text, nodes, _] = cached
+                .document
+                .as_ref()
+                .map_or([0; 3], prose_document::Document::census);
+            cached.retained_bytes() + text + nodes * warm::NODE_BYTES + warm::ITEM_BYTES
+        };
         self.snapshot.transcript_bytes()
             + self
                 .cache
                 .values()
                 .chain(self.child_cache.values())
-                .map(CachedItem::retained_bytes)
+                .map(prepared)
                 .sum::<usize>()
     }
 
@@ -11537,6 +11553,7 @@ impl Cagents {
                         self.observe_agent_activity_for_card(target.card, Some(activity));
                         self.sidebar_state.set_card_limited(target.card, limited);
                         self.commit_chat_session(target.card, session);
+                        self.trim_warm_chats();
                         if title.is_some_and(|title| self.apply_reported_title(target.card, title))
                             || queue_changed
                         {
@@ -13855,6 +13872,7 @@ impl Cagents {
                         .map(|message| message.id.clone())
                         .collect();
                     self.chat_ui.parked.insert(target.card, runtime);
+                    self.trim_warm_chats();
                 }
                 // Enqueue the returned live proof checkpoint. The host retains
                 // the transition receipt independently of this UI attachment.

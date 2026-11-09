@@ -11,10 +11,23 @@
 //!
 //! Warmth is bounded. A chat whose transcript is too large to keep goes cold as
 //! it hides, and [`Budget`] keeps at most [`CHATS`] warm chats within
-//! [`BYTES`], releasing the least recently hidden first. The estimate is the
-//! runtime's own count of what it retains, not process memory; see
-//! `docs/performance.md` for how it compares with measured RSS.
+//! [`BYTES`], releasing the least recently hidden first. The estimate is of
+//! the heap a warm chat holds: its transcript, what its prepared items count
+//! of themselves, and its parsed documents by their text and node count,
+//! calibrated against the heap cooling actually frees. Process RSS can stay
+//! higher once heap is freed; see `docs/performance.md`.
 use std::cell::Cell;
+
+/// What a parsed document holds beyond its text, per node: the parse and
+/// its document share each node's spans, but each keeps its own item, text
+/// cells, metadata and outline. Measured by
+/// `frame_cost::what_a_warm_hidden_chat_holds`, which counts the heap
+/// cooling frees: about 1.8 KiB a paragraph.
+pub(super) const NODE_BYTES: usize = 2 << 10;
+/// What a prepared item holds whatever its content: its cached state, flow
+/// cache and reader memory. Measured the same way, about 10 KiB an item in a
+/// window of ordinary exchanges.
+pub(super) const ITEM_BYTES: usize = 12 << 10;
 
 /// How many hidden chats keep their presentation at once.
 pub(super) const CHATS: usize = 8;
@@ -28,40 +41,62 @@ thread_local! {
     static DIRTY: Cell<bool> = const { Cell::new(false) };
 }
 
-/// The order a chat was hidden in; later hides are larger.
+/// The order a chat was hidden in; later hides are larger. Chats hidden
+/// together, such as every pane of the channel a person left, share one
+/// stamp until the budget is next applied, so they stay warm or go cold
+/// together and a return never finds part of a channel still loading.
 pub(super) fn stamp() -> u64 {
     DIRTY.with(|dirty| dirty.set(true));
-    NEXT.with(|next| {
-        let stamp = next.get();
-        next.set(stamp + 1);
-        stamp
-    })
+    NEXT.with(Cell::get)
 }
 
-/// Whether a chat went warm since the budget was last applied.
+/// A warm chat's retained bytes changed, so the budget is applied again.
+pub(super) fn grew() {
+    DIRTY.with(|dirty| dirty.set(true));
+}
+
+/// Whether a chat went warm since the budget was last applied. Taking it
+/// closes the current hide, so chats hidden after it are newer.
 pub(super) fn take_dirty() -> bool {
-    DIRTY.with(|dirty| dirty.replace(false))
+    let dirty = DIRTY.with(|dirty| dirty.replace(false));
+    if dirty {
+        NEXT.with(|next| next.set(next.get() + 1));
+    }
+    dirty
 }
 
 /// Which warm chats to release, given each one's hide stamp and retained
-/// bytes: the positions of those outside the budget. Chats are kept from the
-/// most recently hidden back, each while it still fits.
+/// bytes: the positions of those outside the budget. Hides are kept from the
+/// most recent back, each whole while it still fits. Only the most recent
+/// hide, when it alone exceeds the budget, is kept in part.
 pub(super) fn over_budget(warm: &[(u64, usize)]) -> Vec<usize> {
     let mut order: Vec<usize> = (0..warm.len()).collect();
-    order.sort_unstable_by_key(|&index| std::cmp::Reverse(warm[index].0));
+    order.sort_unstable_by_key(|&index| (std::cmp::Reverse(warm[index].0), index));
     let (mut kept, mut bytes) = (0, 0usize);
-    order
-        .into_iter()
-        .filter(|&index| {
-            let size = warm[index].1;
-            let fits = kept < CHATS && bytes.saturating_add(size) <= BYTES;
-            if fits {
-                kept += 1;
-                bytes += size;
+    let mut released = Vec::new();
+    for hide in order.chunk_by(|&a, &b| warm[a].0 == warm[b].0) {
+        let size = hide
+            .iter()
+            .map(|&index| warm[index].1)
+            .fold(0usize, usize::saturating_add);
+        if kept + hide.len() <= CHATS && bytes.saturating_add(size) <= BYTES {
+            kept += hide.len();
+            bytes += size;
+        } else if kept == 0 {
+            for &index in hide {
+                let size = warm[index].1;
+                if kept < CHATS && bytes.saturating_add(size) <= BYTES {
+                    kept += 1;
+                    bytes += size;
+                } else {
+                    released.push(index);
+                }
             }
-            !fits
-        })
-        .collect()
+        } else {
+            released.extend_from_slice(hide);
+        }
+    }
+    released
 }
 
 #[cfg(test)]
@@ -178,6 +213,48 @@ mod tests {
     }
 
     #[test]
+    fn a_warm_return_keeps_the_readers_place_disclosure_and_draft() {
+        let (mut runtime, _handle) = shown(items());
+        runtime.replace_draft(text_editor::Content::with_text("Unsent draft"));
+        runtime.scroll = view::Scroll::new(200.0, 1000.0, 400.0);
+        runtime.expanded.insert("answer-2".into());
+        let turn = runtime.turns[0].key.clone();
+        runtime.opened.insert(turn.clone(), false);
+        runtime.unseen_activity = false;
+        let scroll = runtime.scroll;
+        let turns: Vec<_> = runtime.turns.iter().map(|turn| turn.key.clone()).collect();
+        let prepared = revisions(&runtime);
+
+        runtime.set_visible(false).unwrap();
+        assert!(runtime.warm_stamp().is_some());
+        runtime.refresh();
+        runtime.set_visible(true).unwrap();
+        runtime.refresh();
+
+        assert_eq!(runtime.composer.text().trim_end(), "Unsent draft");
+        assert_eq!(runtime.scroll, scroll, "the reader's place is kept");
+        assert!(runtime.expanded.contains("answer-2"));
+        assert_eq!(
+            runtime.opened.get(&turn),
+            Some(&false),
+            "a closed turn stays closed"
+        );
+        assert_eq!(
+            runtime
+                .turns
+                .iter()
+                .map(|turn| turn.key.clone())
+                .collect::<Vec<_>>(),
+            turns
+        );
+        assert_eq!(revisions(&runtime), prepared);
+        assert!(
+            !runtime.unseen_activity,
+            "an unchanged return is not new activity"
+        );
+    }
+
+    #[test]
     fn a_full_snapshot_after_a_warm_return_keeps_unchanged_items_prepared() {
         let (mut runtime, handle) = shown(items());
         let prepared = revisions(&runtime);
@@ -260,14 +337,16 @@ mod tests {
     fn the_budget_keeps_the_most_recently_hidden_chats_warm() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let mut cards = Vec::new();
+        // One chat hidden per channel switch, as each switch applies the
+        // budget once.
         for _ in 0..CHATS + 2 {
             let (mut runtime, _handle) = shown(items());
             runtime.set_visible(false).unwrap();
             let card = runtime.target.card;
             app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
             cards.push(card);
+            app.trim_warm_chats();
         }
-        app.trim_warm_chats();
         let warm = |app: &Cagents, card: &CardId| match app.cards.get(card) {
             Some(CardRuntime::Chat(runtime)) => runtime.warm_stamp().is_some(),
             _ => unreachable!(),
@@ -281,7 +360,7 @@ mod tests {
 
     #[test]
     fn the_most_recently_hidden_chats_stay_warm_within_the_budget() {
-        // Ten small chats: the eight hidden last stay warm.
+        // Ten small chats hidden one at a time: the eight hidden last stay.
         let small: Vec<_> = (1..=10).map(|stamp| (stamp, 1 << 20)).collect();
         assert_eq!(over_budget(&small), [1, 0]);
         // Bytes bind before the count does: the newest chat is large, so
@@ -294,5 +373,26 @@ mod tests {
         let mixed = [(1, 1 << 20), (2, 60 << 20), (3, 40 << 20)];
         assert_eq!(over_budget(&mixed), [1]);
         assert!(over_budget(&[]).is_empty());
+    }
+
+    #[test]
+    fn chats_hidden_together_stay_warm_or_go_cold_together() {
+        // Three channels of three panes, hidden in turn: the oldest channel
+        // goes whole, rather than one pane of the middle one.
+        let channels: Vec<_> = (1..=3)
+            .flat_map(|stamp| std::iter::repeat_n((stamp, 1 << 20), 3))
+            .collect();
+        let mut released = over_budget(&channels);
+        released.sort_unstable();
+        assert_eq!(released, [0, 1, 2]);
+        // A channel over the budget by itself keeps what fits of it.
+        let crowded: Vec<_> = std::iter::repeat_n((1, 1 << 20), CHATS + 1).collect();
+        assert_eq!(over_budget(&crowded), [CHATS]);
+        // Hides stamped between applications of the budget are distinct.
+        let first = super::stamp();
+        assert_eq!(super::stamp(), first);
+        assert!(super::take_dirty());
+        assert!(super::stamp() > first);
+        assert!(super::take_dirty());
     }
 }

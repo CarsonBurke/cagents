@@ -1561,3 +1561,83 @@ fn a_reveal_of_a_hidden_full_window() {
         ready.report("ready");
     }
 }
+
+/// What a warm hidden chat really holds, against what its budget counts.
+/// Each workload is shown and settled, then hidden while it stays warm; the
+/// heap that cooling it releases is what keeping it warm cost. Run it alone:
+/// the heap count is process-wide.
+#[test]
+#[ignore = "a measurement, not a check; see the module documentation"]
+fn what_a_warm_hidden_chat_holds() {
+    let megabyte = |atom: &str, fence: bool| {
+        let mut body = atom.repeat((1024 * 1024usize).div_ceil(atom.len()));
+        body.truncate(1024 * 1024);
+        if fence {
+            body = format!("```text\n{body}\n```\n");
+        }
+        vec![
+            item(
+                "huge-prompt".into(),
+                chat::Role::User,
+                prose("Write a long answer.".into(), false, chat::Phase::Final),
+            ),
+            item(
+                "huge-answer".into(),
+                chat::Role::Assistant,
+                prose(body, false, chat::Phase::Final),
+            ),
+        ]
+    };
+    let workloads = [
+        ("window of 16 exchanges", transcript(16)),
+        (
+            "1 MiB answer of paragraphs",
+            megabyte("A measured **plain** paragraph with `code`.\n\n", false),
+        ),
+        (
+            "1 MiB answer in one fence",
+            megabyte("let measured = fence_line(1);\n", true),
+        ),
+    ];
+    for (name, items) in workloads {
+        let mut pane = Pane::new(items);
+        pane.settle_geometry();
+        for _ in 0..4 {
+            pane.frame();
+        }
+        pane.cache = Cache::new();
+        // What the budget would charge; a chat over a chat's share goes cold
+        // as it hides, so what it frees is measured either way.
+        let counted = pane.runtime.warm_bytes();
+        let transcript = pane.runtime.snapshot.transcript_bytes();
+        let census = pane
+            .runtime
+            .cache
+            .values()
+            .filter_map(|cached| cached.document.as_ref())
+            .map(prose_document::Document::census)
+            .fold([0; 3], |sum, one| std::array::from_fn(|i| sum[i] + one[i]));
+        crate::test_heap::start();
+        let before = crate::test_heap::live();
+        pane.runtime.set_visible(false).expect("hide");
+        preparation::retirement_barrier();
+        let kept = pane.runtime.warm_stamp().is_some();
+        pane.runtime.cool();
+        preparation::retirement_barrier();
+        let freed = before - crate::test_heap::live();
+        crate::test_heap::stop();
+        let mib = |bytes: f64| bytes / f64::from(1u32 << 20);
+        println!(
+            "{name}: budget counts {:.2} MiB ({:.2} MiB transcript), {}, cooling frees {:.2} MiB, \
+             {:.1}x; documents hold {} text bytes in {} nodes and {} code rows",
+            mib(counted as f64),
+            mib(transcript as f64),
+            if kept { "kept warm" } else { "cold as it hid" },
+            mib(freed as f64),
+            freed as f64 / counted.max(1) as f64,
+            census[0],
+            census[1],
+            census[2],
+        );
+    }
+}
