@@ -529,7 +529,15 @@ impl Cagents {
 
     /// Moves focus off a card whose removal the workspace has reserved, then
     /// commits that removal.
-    pub(super) fn card_removal(&self, handoff: crate::workspace::FocusHandoff) -> Task<Message> {
+    pub(super) fn card_removal(
+        &mut self,
+        handoff: crate::workspace::FocusHandoff,
+    ) -> Task<Message> {
+        // A neighbour that is a chat still starting has no input to take the
+        // keyboard yet; it is owed the keyboard once the input is drawn.
+        if let crate::workspace::FocusTarget::Card(next) = handoff.target {
+            self.keyboard_owed = self.owes_chat_input(next).then_some(next);
+        }
         if !self.workspace_surfaces_visible() {
             // The accepted close still commits, but its hidden pane cannot
             // take native focus from Work or the contextual inspector.
@@ -663,13 +671,11 @@ impl Cagents {
             && handoff
                 .is_some_and(|handoff| handoff.target != crate::workspace::FocusTarget::Unchanged)
         {
-            iced::widget::operation::focus(
-                self.workspace
-                    .focused()
-                    .map(|card| self.card_keyboard_focus(card))
-                    .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-            )
-            .map(cosmic::Action::App)
+            match self.workspace.focused() {
+                Some(card) => self.focus_pane_keyboard(card),
+                None => iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                    .map(cosmic::Action::App),
+            }
         } else {
             Task::none()
         };
@@ -709,11 +715,11 @@ impl Cagents {
         if let Some(card) = card {
             let _ = self.workspace.focus(card);
         }
-        iced::widget::operation::focus(
-            card.map(|card| self.card_keyboard_focus(card))
-                .unwrap_or_else(|| widget::Id::new(TOOLBAR_FOCUS_ID)),
-        )
-        .map(cosmic::Action::App)
+        match card {
+            Some(card) => self.focus_pane_keyboard(card),
+            None => iced::widget::operation::focus(widget::Id::new(TOOLBAR_FOCUS_ID))
+                .map(cosmic::Action::App),
+        }
         .chain(self.next_queued_card_close())
     }
 

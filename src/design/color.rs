@@ -165,6 +165,13 @@ pub fn selection_wash(theme: &Theme) -> Color {
     mix(base(theme), theme.cosmic().accent.base.into(), 0.4)
 }
 
+/// The tray a project's rows share in the navigation rail: one step off the
+/// Primary layer the rail is drawn on, enough to group without boxing.
+pub fn rail_tray(theme: &Theme) -> Color {
+    let primary = theme.cosmic().primary(theme.transparent);
+    mix(primary.base.into(), primary.on.into(), 0.06)
+}
+
 pub fn accent_color(theme: &Theme) -> Color {
     theme.cosmic().accent.base.into()
 }
@@ -192,6 +199,21 @@ pub fn muted_color(theme: &Theme) -> Color {
     let mut color: Color = theme.current_container().on.into();
     color.a *= 0.88;
     color
+}
+
+/// What a person has typed into a field: the surface's full-strength ink, so
+/// their own words never read as secondary to anything around them.
+pub fn field_text_color(theme: &Theme) -> Color {
+    theme.current_container().on.into()
+}
+
+/// A field's placeholder: halfway to the surface, clearly weaker than
+/// [`field_text_color`] so an empty field never looks filled in. A muted
+/// label is too strong for this; beside a field's own text it read as the
+/// stronger of the two.
+pub fn field_placeholder_color(theme: &Theme) -> Color {
+    let container = theme.current_container();
+    mix(container.base.into(), container.on.into(), 0.5)
 }
 
 /// The ink of a control that cannot be used now: mixed toward its surface

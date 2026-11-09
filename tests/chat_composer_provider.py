@@ -79,6 +79,44 @@ class Provider(unittest.TestCase):
         self.assertEqual(lines[1], b"\0" * 64)
         self.assertEqual(json.loads(lines[2])["parentUuid"], "prompt-0")
 
+    def test_compact_starts_a_new_chain_that_a_resumed_provider_goes_on_from(self):
+        session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        compact = {"type": "user", "uuid": "compact", "origin": {"kind": "human"},
+                   "message": {"role": "user", "content": [{"type": "text", "text": "/compact"}]}}
+        # The first turn stays busy until it is interrupted.
+        interrupt = {"type": "control_request", "request_id": "stop",
+                     "request": {"subtype": "interrupt"}}
+        result, output, _ = self.run_provider(frames=(prompt(1), interrupt, compact))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        live = [frame for frame in output if frame.get("type") in ("system", "user", "result")
+                and frame.get("subtype") != "init"]
+        # Live, the boundary comes first, then the summary and the result.
+        compaction = next(index for index, frame in enumerate(live)
+                          if frame.get("subtype") == "compact_boundary")
+        self.assertTrue(live[compaction + 1].get("isSynthetic"), live)
+        self.assertEqual(live[compaction + 2]["type"], "result", live)
+        mangled = "".join(c if c.isalnum() else "-" for c in str(self.project.resolve()))
+        history = self.config / "projects" / mangled / f"{session}.jsonl"
+        records = [json.loads(line) for line in history.read_text().splitlines()]
+        boundary = next(index for index, record in enumerate(records)
+                        if record.get("subtype") == "compact_boundary")
+        # The boundary starts a new chain, linked back only logically.
+        self.assertIsNone(records[boundary]["parentUuid"])
+        self.assertEqual(records[boundary]["logicalParentUuid"], records[boundary - 1]["uuid"])
+        summary, caveat, command, stdout = records[boundary + 1:boundary + 5]
+        self.assertTrue(summary["isCompactSummary"])
+        self.assertEqual(summary["parentUuid"], records[boundary]["uuid"])
+        self.assertTrue(caveat["isMeta"])
+        self.assertTrue(command["message"]["content"].startswith("<command-name>/compact</command-name>"))
+        self.assertTrue(stdout["repeatsCompactSummary"])
+        resumed, _, _ = self.run_provider("--resume", session, frames=(prompt(3),))
+        self.assertEqual(resumed.returncode, 0, resumed.stderr)
+        later = [json.loads(line) for line in history.read_text().splitlines()][len(records):]
+        self.assertEqual(later[0]["parentUuid"], stdout["uuid"])
+        # Its records keep their own numbers after the compaction's.
+        ids = [record["uuid"] for record in records + later]
+        self.assertEqual(len(ids), len(set(ids)), ids)
+
     def test_an_exit_line_ends_the_provider_mid_turn_without_a_result(self):
         self.frames({"type": "assistant", "uuid": "partial-@TURN@",
                      "message": {"id": "partial-@TURN@", "role": "assistant",

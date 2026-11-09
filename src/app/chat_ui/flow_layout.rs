@@ -693,34 +693,7 @@ fn run_with_slots(
     let epoch = COMPLETED.load(Ordering::Acquire);
     let permit = WorkSlot(Some(slots.try_acquire_owned().map_err(|_| epoch)?));
     request.admission = Some(OutputAdmission::new(request.source.clone(), permit));
-    // Share this font-version input snapshot. Repeated paragraph requests
-    // clone one Arc on the UI; each worker's private font DB clone happens below.
-    struct Fonts {
-        db: cosmic_text::fontdb::Database,
-        locale: String,
-    }
-    static FONTS: std::sync::OnceLock<Mutex<Option<(graphics_text::Version, Arc<Fonts>)>>> =
-        std::sync::OnceLock::new();
-    let fonts = {
-        let mut cached = FONTS
-            .get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if cached
-            .as_ref()
-            .is_none_or(|(version, _)| *version != request.key.version)
-        {
-            let mut system = graphics_text::font_system().write().expect("font system");
-            *cached = Some((
-                system.version(),
-                Arc::new(Fonts {
-                    db: system.db().clone(),
-                    locale: system.raw().locale().to_owned(),
-                }),
-            ));
-        }
-        cached.as_ref().expect("font inputs").1.clone()
-    };
+    let fonts = Fonts::of(request.key.version);
     Ok(cosmic::task::future(async move {
         let work = request.clone();
         let ready = tokio::task::spawn_blocking(move || {
@@ -741,10 +714,7 @@ fn run_with_slots(
                 work.outcome != Some(WorkerOutcome::Panic),
                 "deliberate private Flow worker panic"
             );
-            let mut fonts = cosmic_text::FontSystem::new_with_locale_and_db(
-                fonts.locale.clone(),
-                fonts.db.clone(),
-            );
+            let mut system = fonts.system();
             let (spans, plain) = work.source.materialize();
             let prepared = Prepared::with_fonts(
                 spans,
@@ -757,8 +727,9 @@ fn run_with_slots(
                 } else {
                     iced::widget::text::Wrapping::WordOrGlyph
                 },
-                &mut fonts,
+                &mut system,
             );
+            fonts.keep(system);
             *prepared.admission.lock().unwrap_or_else(|e| e.into_inner()) = work.admission.clone();
             #[cfg(test)]
             if work.outcome == Some(WorkerOutcome::CancelAfterShape) {
@@ -779,6 +750,63 @@ fn run_with_slots(
         .flatten();
         action(Action::FlowReady(target, request, ready))
     }))
+}
+
+/// The fonts Flow workers shape with, for one version of the application's.
+///
+/// A font system learns as it shapes: which faces match each family, weight
+/// and style, the loaded faces themselves, and shaping scratch. Workers keep
+/// theirs between jobs, so a long paragraph pays only for its own shaping
+/// rather than for that learning again. A font loaded since starts over from
+/// the application's database.
+///
+/// A kept system holds the faces it loaded until the fonts change, even after
+/// transcripts release their caches. Flow runs one worker at a time, so that
+/// is at most one idle system.
+struct Fonts {
+    version: graphics_text::Version,
+    db: cosmic_text::fontdb::Database,
+    locale: String,
+    idle: Mutex<Vec<cosmic_text::FontSystem>>,
+}
+impl Fonts {
+    /// The fonts for `version`. Called on the UI thread, which owns the
+    /// application's font system.
+    fn of(version: graphics_text::Version) -> Arc<Self> {
+        static CURRENT: Mutex<Option<Arc<Fonts>>> = Mutex::new(None);
+        let mut current = CURRENT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(fonts) = current.as_ref().filter(|fonts| fonts.version == version) {
+            return fonts.clone();
+        }
+        let mut system = graphics_text::font_system().write().expect("font system");
+        let fonts = Arc::new(Self {
+            version: system.version(),
+            db: system.db().clone(),
+            locale: system.raw().locale().to_owned(),
+            idle: Mutex::default(),
+        });
+        *current = Some(fonts.clone());
+        fonts
+    }
+    /// A font system to shape with, one a previous job kept if any.
+    fn system(&self) -> cosmic_text::FontSystem {
+        self.idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_else(|| {
+                cosmic_text::FontSystem::new_with_locale_and_db(
+                    self.locale.clone(),
+                    self.db.clone(),
+                )
+            })
+    }
+    fn keep(&self, system: cosmic_text::FontSystem) {
+        self.idle
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .push(system);
+    }
 }
 
 /// Immutable source/width/font-specific geometry. Retaining this is more
