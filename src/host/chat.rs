@@ -1133,33 +1133,56 @@ enum Holds {
     /// ended.
     LaunchUnconfirmed,
     /// A process of its provider survives the helper that controlled it,
-    /// with the provider's process group when it is known.
-    Running(Option<i32>),
+    /// with that helper and provider when they are known.
+    Running(Option<Survivors>),
     /// Nothing proves whether something of it still runs.
     Unproved,
 }
 
+/// The helper and provider whose processes outlived the helper. A process is
+/// still the conversation's while it is in the helper's session or the
+/// provider's process group (see `retained_actor_abandoned`). The helper
+/// leads its own session and its provider's group is part of it, so ending
+/// both sessions ends exactly what holds the conversation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Survivors {
+    helper: i32,
+    provider: i32,
+}
+
+impl Survivors {
+    fn of(owner: &crate::daemon::holder_registry::Record) -> Self {
+        Self {
+            helper: owner.holder.pid,
+            provider: owner.root.pid,
+        }
+    }
+}
+
 /// Why a Close of a conversation whose owner is gone was refused, and what
-/// the person can do about it.
+/// the person can do about it. Both a pane's Close and `cagents agent close`
+/// show it.
 fn lost_execution_refusal(session: &Session, holds: Holds) -> String {
     let provider = session.launch.provider.label();
     match holds {
         Holds::InProgress => "This conversation is still starting, moving or closing elsewhere in Cagents. Close it again once that finishes.".into(),
         Holds::LaunchUnconfirmed => format!(
-            "{LOST_EXECUTION_UNPROVED}. Its agent's launch never confirmed whether {provider} started or stopped, so the pane and its agent were kept rather than leave {provider} running unseen."
+            "{LOST_EXECUTION_UNPROVED}. Its agent's launch never confirmed whether {provider} started or stopped, so it and its agent were kept rather than leave {provider} running unseen."
         ),
-        Holds::Running(_) if session.launch.provider == Provider::Codex => format!(
-            "Codex is still running for this conversation, but the Cagents helper that controlled it is gone, so closing the pane would leave it running. End it with `pkill -f cagents-codex-{}`, then close the pane again.",
+        Holds::Running(Some(Survivors { helper, provider: root })) => format!(
+            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing now would leave {provider} running unseen. End {provider} with `pkill -s {helper},{root}`, then close again."
+        ),
+        // Only Codex is found running with no owner: something still names or
+        // serves the conversation's listener.
+        Holds::Running(None) if session.launch.provider == Provider::Codex => format!(
+            "Codex is still running for this conversation, but the Cagents helper that controlled it is gone, so closing now would leave Codex running unseen. End Codex with `pkill -f cagents-codex-{}`, then close again.",
             session.id
         ),
-        Holds::Running(Some(group)) => format!(
-            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing the pane would leave it running. End it with `kill -- -{group}`, then close the pane again."
-        ),
         Holds::Running(None) => format!(
-            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing the pane would leave it running. End what is left of it, then close the pane again."
+            "{provider} is still running for this conversation, but the Cagents helper that controlled it is gone, so closing now would leave {provider} running unseen. End what is left of it, then close again."
         ),
         Holds::Unproved => format!(
-            "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so the pane was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing the pane will work."
+            "{LOST_EXECUTION_UNPROVED}. Its Cagents helper is gone, and Cagents can't tell whether its {provider} process stopped, so it was kept rather than leave {provider} running unseen. After the computer restarts nothing of it can run, so closing it will work."
         ),
     }
 }
@@ -1181,8 +1204,23 @@ fn holder_lost_refusal(
     }
     Ok(Some(lost_execution_refusal(
         source,
-        Holds::Running(Some(owner.root.pid)),
+        Holds::Running(Some(Survivors::of(owner))),
     )))
+}
+
+/// Runs the command a refusal tells the person to run, as they would, and
+/// requires it to have ended something.
+#[cfg(test)]
+fn run_recovery_command(refusal: &str) {
+    let command = refusal
+        .split('`')
+        .nth(1)
+        .unwrap_or_else(|| panic!("the refusal names no command: {refusal}"));
+    let status = std::process::Command::new("/bin/sh")
+        .args(["-c", command])
+        .status()
+        .unwrap();
+    assert!(status.success(), "`{command}` ended nothing: {status}");
 }
 
 /// [`holder_lost_refusal`] for the native owner registered for `source`.
@@ -1223,9 +1261,12 @@ fn what_holds(
     proof: &HostSessionProof,
 ) -> Result<Option<Holds>, String> {
     // A receipt is exact cleanup's, including when it closed a conversation
-    // other than the one asked for.
+    // other than the one asked for. Exact cleanup has consumed any receipt of
+    // this one before it comes here, so this one names another descriptor of
+    // the terminal, which no close of this one consumes. Only a restart, which
+    // clears the runtime directory, says anything more.
     if session.launch.provider == Provider::Codex && chat::native_holder::has_receipt(session.id)? {
-        return Ok(Some(Holds::InProgress));
+        return Ok(Some(Holds::Unproved));
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1265,9 +1306,9 @@ fn what_holds(
     match super::upgrade_inspect::execution_end(session, &proof.boot_id, owners.clone()) {
         ExecutionEnd::Ended => {}
         ExecutionEnd::Running => {
-            // The provider group of an owner of this boot that left
-            // something running, for the person to end.
-            let group = owners.ok().and_then(|owners| {
+            // The owner of this boot that left something running, for the
+            // person to end.
+            let survivors = owners.ok().and_then(|owners| {
                 owners
                     .into_iter()
                     .map(|(owner, _)| owner)
@@ -1276,9 +1317,9 @@ fn what_holds(
                         crate::chat::runtime::retained_actor_abandoned(&owner.holder, &owner.root)
                             .is_ok_and(|abandoned| !abandoned)
                     })
-                    .map(|owner| owner.root.pid)
+                    .map(|owner| Survivors::of(&owner))
             });
-            return Ok(Some(Holds::Running(group)));
+            return Ok(Some(Holds::Running(survivors)));
         }
         ExecutionEnd::Unproved => return Ok(Some(Holds::Unproved)),
     }

@@ -306,14 +306,13 @@ fn retired_execution_routes_cold_close_reconcile_and_disk_resume_without_live_ad
             .is_none(),
         "unproved actor must remain retained without blocking daemon reconciliation"
     );
-    // A Close here would settle the conversation as lost (#2484), as
-    // `a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_survives`
-    // shows; this test goes on to the receipt reappearing instead.
-    //
     // Without its receipt the exit stays unproved for retirement, but the
     // helper, provider and their process group are all gone: that proves the
     // actor abandoned, so the conversation reopens as a distinct successor
-    // instead of stranding the card.
+    // instead of stranding the card. A Close here would settle it as lost
+    // (#2484, see
+    // `a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_survives`);
+    // this test goes on to the receipt reappearing instead.
     let ServerResponse::ChatResumePrepared { session: abandoned } = process_inner(
         &successor,
         0,

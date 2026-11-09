@@ -312,9 +312,13 @@ fn a_provider_that_outlived_its_holder_keeps_the_refusal() {
     let fixture = Fixture::new(&root);
     let record = fixture.record(exited(i32::MAX - 1), current());
     let refusal = close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
-    // It names what still runs and how to end it.
+    // It names what still runs and how to end it: everything left in the
+    // dead helper's session and the provider's.
     assert!(
-        refusal.contains(&format!("pkill -f cagents-codex-{}", fixture.source.id)),
+        refusal.contains(&format!(
+            "`pkill -s {},{}`",
+            record.holder.pid, record.root.pid
+        )),
         "{refusal}"
     );
     assert_eq!(
@@ -631,7 +635,10 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
     assert!(record.root.is_current(), "the provider outlived its holder");
     let refusal = close().err().expect("Close refused").message;
     assert!(
-        refusal.contains(&format!("pkill -f cagents-codex-{}", fixture.source.id)),
+        refusal.contains(&format!(
+            "`pkill -s {},{}`",
+            record.holder.pid, record.root.pid
+        )),
         "{refusal}"
     );
     assert!(
@@ -643,7 +650,15 @@ fn an_open_pane_whose_holder_died_names_what_runs_then_closes() {
             .contains_key(&fixture.source.id)
     );
     // The person ends it as told, and closes the pane again.
-    kill(&record.root);
+    run_recovery_command(&refusal);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while record.root.is_current() {
+        assert!(
+            Instant::now() < deadline,
+            "the named command left it running"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
     close().unwrap();
     fixture.assert_settled();
     assert!(!has_native_owner(&fixture.source).unwrap());

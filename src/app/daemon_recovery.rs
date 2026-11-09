@@ -340,8 +340,13 @@ fn reconcile_with(
 }
 
 /// Decides whether Close may retire a saved pane whose terminal is gone, without
-/// starting, attaching to or stopping anything. `Err` is the reason to show the
-/// person, and always means the pane stays: unknown is not dead.
+/// starting or attaching to anything. `Err` is the reason to show the person,
+/// and always means the pane stays: unknown is not dead.
+///
+/// It stops nothing either, with one exception: a pane that is an open agent's
+/// own conversation, which the daemon no longer hosts, is closed with that
+/// agent as the conversation's own Close would, and only once every check has
+/// let the pane go.
 pub(super) fn prove_not_hosted(session: &TerminalSession) -> Result<(), String> {
     // A remote or agent-scoped window sees neither this daemon's lease nor the
     // processes behind it, so nothing it can read here would prove an absence.
@@ -456,7 +461,12 @@ fn prove_not_hosted_at(
     }) {
         return Err("A conversation still uses this terminal, so the pane was kept. Close that conversation, then close this pane.".into());
     }
-    // Removing the pane would leave an open agent with no way to show it.
+    // Removing the pane would leave an open agent with no way to show it,
+    // unless the pane is that agent's own conversation, whose provider is gone
+    // from the daemon: closing it is then a person closing that conversation,
+    // which ends its agent. It is closed last, once nothing below has kept the
+    // pane, so a refusal never leaves the agent closed with its pane still open.
+    let mut agent_conversation = None;
     if let Some(agent) = model
         .agents
         .iter()
@@ -465,21 +475,7 @@ fn prove_not_hosted_at(
         let Some(conversation) = lost_conversation_of_pane(agent, session.id, &chats) else {
             return Err(open_agent_refusal(agent, &chats, &current.boot_id));
         };
-        // This pane is the agent's own conversation, whose provider is gone
-        // from the daemon. Closing it is a person closing that conversation,
-        // which ends its agent, as the conversation's own Close does. The
-        // daemon settles it only once nothing of it can still run.
-        client
-            .close_retained_chat(conversation.clone())
-            .map_err(|error| lost_agent_refusal(&error.reason()))?;
-        let model = client.read_workspace_model().map_err(|_| UNREACHABLE)?;
-        if let Some(agent) = model
-            .agents
-            .iter()
-            .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
-        {
-            return Err(open_agent_refusal(agent, &chats, &current.boot_id));
-        }
+        agent_conversation = Some(conversation.clone());
     }
     // Authenticate the answer: reaching a socket that reports another identity
     // is not evidence that the daemon holding the runtime's lease answered.
@@ -510,6 +506,20 @@ fn prove_not_hosted_at(
     }
     if crate::daemon::replacement_owner(socket, &current).map_err(|_| UNREACHABLE)? != owner {
         return Err(UNREACHABLE.into());
+    }
+    if let Some(conversation) = agent_conversation {
+        // The daemon settles it only once nothing of it can still run.
+        client
+            .close_retained_chat(conversation)
+            .map_err(|error| lost_agent_refusal(&error.reason()))?;
+        let model = client.read_workspace_model().map_err(|_| UNREACHABLE)?;
+        if let Some(agent) = model
+            .agents
+            .iter()
+            .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
+        {
+            return Err(open_agent_refusal(agent, &chats, &current.boot_id));
+        }
     }
     Ok(())
 }
@@ -2299,6 +2309,7 @@ mod tests {
         let served = Inventory {
             agents: vec![agent(Origin::User)],
             retained_close: Some(Err(reason.into())),
+            owner_probes: 2,
             ..Default::default()
         };
         let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
@@ -2317,6 +2328,21 @@ mod tests {
         };
         let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
         assert!(refusal.contains("Only what started it"), "{refusal}");
+
+        // A pane kept for another reason keeps its agent too: nothing is
+        // closed until every check has let the pane go. The inventory panics
+        // on any conversation Close.
+        process_with(
+            directory.path(),
+            format!("CAGENTS_TERMINAL_ID={}", saved.id),
+        );
+        let served = Inventory {
+            agents: vec![agent(Origin::User)],
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("4242"), "{refusal}");
     }
 
     #[test]
