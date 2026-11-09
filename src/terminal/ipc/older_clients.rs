@@ -94,6 +94,12 @@ thread_local! {
 /// Runs `encode` with this thread encoding for a client of `protocol`, so that
 /// values a later protocol changed encode as that client decodes them. The
 /// recorded wire format proof checks the rest still matches.
+///
+/// The restatement applies only to what `encode` serializes on this thread.
+/// A server message serialized anywhere else, such as ahead of time or on
+/// another thread, is sent in the current protocol's encoding, so every
+/// write to a client must serialize inside this scope (as
+/// `ServerEnvelopeRef::serialize` does).
 pub(crate) fn encoding_for<R>(protocol: u16, encode: impl FnOnce() -> R) -> R {
     struct Restore(Option<u16>);
     impl Drop for Restore {
