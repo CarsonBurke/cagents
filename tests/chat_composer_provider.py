@@ -63,8 +63,21 @@ class Provider(unittest.TestCase):
         self.assertEqual(lines[4], '{"type": "user", "uuid": "cut')
         appended = [json.loads(line) for line in lines[5:]]
         self.assertTrue(appended, lines)
-        # It goes on from the last record it could read.
+        # The fixture goes on from the last record it could read.
         self.assertEqual(appended[0]["parentUuid"], "bare")
+
+    def test_a_transcript_ending_in_nuls_gets_its_next_record_on_a_line_of_its_own(self):
+        # A crash can leave a file's last block zero-filled.
+        session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+        mangled = "".join(c if c.isalnum() else "-" for c in str(self.project.resolve()))
+        history = self.config / "projects" / mangled / f"{session}.jsonl"
+        history.parent.mkdir(parents=True)
+        history.write_bytes(json.dumps({**prompt(0), "sessionId": session}).encode() + b"\n" + b"\0" * 64)
+        result, _, _ = self.run_provider("--resume", session)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        lines = history.read_bytes().split(b"\n")
+        self.assertEqual(lines[1], b"\0" * 64)
+        self.assertEqual(json.loads(lines[2])["parentUuid"], "prompt-0")
 
     def test_an_exit_line_ends_the_provider_mid_turn_without_a_result(self):
         self.frames({"type": "assistant", "uuid": "partial-@TURN@",

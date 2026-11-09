@@ -76,7 +76,10 @@ if [ -f "$history" ]; then
         and ((.message.content | type) == "string" or ((.message.content | type) == "array"
             and any(.message.content[]; .type != "tool_result"))))] | length')
     # A line cut short has no newline, and the next record must not join it.
-    if [ -n "$(tail -c 1 -- "$history")" ]; then printf '\n' >>"$history"; fi
+    # Counted in bytes: a crash can leave NULs, which a shell string drops.
+    if [ -s "$history" ] && [ "$(tail -c 1 -- "$history" | wc -l)" -eq 0 ]; then
+        printf '\n' >>"$history"
+    fi
 fi
 persist_record() {
     record=$(printf '%s' "$1" | jq -c --arg session "$session" --arg parent "$parent" \

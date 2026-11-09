@@ -118,8 +118,9 @@ resumed start exits before it answers, and the card offers **Try again**. The
 file is removed first, so pressing it resumes normally.
 
 A resumed transcript may be damaged, as a crash leaves one. The provider
-skips each line that isn't a JSON record, as Claude Code does, and goes on
-from the last record it could read. A last line cut short without a newline
+skips each line that isn't a JSON record, as Claude Code does. It then
+goes on from the last record it could read, a simplification: Claude Code
+follows the `parentUuid` chain to its leaf. A last line cut short without a newline
 is ended first, so the next record starts its own line.
 
 For tool disclosure checks, create `fixture-verbosity`. Each turn emits a
