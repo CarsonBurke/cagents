@@ -297,6 +297,8 @@ struct Remote {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
     desired_visible: Mutex<Option<bool>>,
+    wake: Arc<push::Wake>,
+    binary_codec: std::sync::OnceLock<bool>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
@@ -495,6 +497,8 @@ impl RemoteActor {
             launch_account_scope: Err("fixture has no account scope".into()),
             recovery_environment: Default::default(),
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new().unwrap()),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(1),
@@ -793,9 +797,11 @@ impl RemoteActor {
             .desired_visible
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(visible);
+        self.0.wake.notify();
     }
     pub fn observe_next_update(&self) -> u64 {
         self.0.desired_observe.store(true, Ordering::Release);
+        self.0.wake.notify();
         self.state().generation
     }
     pub fn attachment_snapshot(&self) -> Snapshot {
@@ -1135,6 +1141,8 @@ impl RemoteActor {
             proof,
             socket,
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new()?),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(attached.resident.next_input),
@@ -1158,6 +1166,8 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
         }));
+        let watch = remote.watch()?;
+        let wake = remote.0.wake.clone();
         let weak = Arc::downgrade(&remote.0);
         let worker = thread::Builder::new()
             .name("cagents-actor-proxy".into())
@@ -1193,6 +1203,7 @@ impl RemoteActor {
                     }
                     let old = actor.state();
                     let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
+                    let failed = response.is_err();
                     if actor.0.stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -1225,13 +1236,86 @@ impl RemoteActor {
                     }
                     actor.resolve_uncertain_input();
                     let _ = actor.flush_input_retirements();
+                    let retry = watch.is_none() || failed || actor.needs_recovery();
                     drop(actor);
-                    thread::sleep(Duration::from_millis(50));
+                    if let Err(error) = wake.wait(watch.as_ref(), retry) {
+                        if let Some(inner) = weak.upgrade() {
+                            Self(inner).publish_unavailable(&error);
+                        }
+                        break;
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
         *remote.0.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(remote)
+    }
+    fn needs_recovery(&self) -> bool {
+        self.0.recovering_inputs.load(Ordering::Acquire)
+            || self.state().acknowledged_input_count > 0
+            || self.0.desired_observe.load(Ordering::Acquire)
+            || self
+                .0
+                .desired_visible
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            || !self
+                .0
+                .retiring_inputs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+            || self
+                .0
+                .uncertain_input
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            || self
+                .0
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .any(|p| p.reply.is_some())
+    }
+    fn watch(&self) -> Result<Option<UnixStream>, String> {
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|e| e.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "watch".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let (result, mut fds) =
+            crate::descriptor_frame::receive_json_with_fds_until::<Result<(), String>>(
+                &control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        match result {
+            Err(error) if error == UNKNOWN_METHOD => Ok(None),
+            Err(error) => Err(error),
+            Ok(()) => {
+                if fds.len() != 1 {
+                    return Err("Retained watcher did not transfer exactly one descriptor".into());
+                }
+                let watch = UnixStream::from(fds.remove(0));
+                watch.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok(Some(watch))
+            }
+        }
     }
     fn publish_resident(&self, resident: Resident) -> bool {
         self.publish_resident_inner(resident, false)
@@ -1324,6 +1408,7 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(mut resident) = resident {
             // A close response may also have been issued before installation
@@ -1390,6 +1475,7 @@ impl RemoteActor {
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
     }
     pub(in crate::chat::runtime) fn pinned_launch_directory(
         &self,
@@ -1636,6 +1722,7 @@ impl RemoteActor {
             });
             break;
         }
+        self.0.wake.notify();
         // Preserve the exact identity and envelope before crossing the socket.
         // An ambiguous write keeps the receipt pending and fences new input
         // until the metadata pump observes, retransmits or settles it.
@@ -1677,6 +1764,7 @@ impl RemoteActor {
             });
             uncertain.refusal = refusal;
         }
+        self.0.wake.notify();
         Ok(response)
     }
     /// Inputs reach the helper one at a time, so a caller who arrives while
@@ -1946,6 +2034,9 @@ impl RemoteActor {
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        if !completed.is_empty() {
+            self.0.wake.notify();
+        }
         for identity in completed {
             if !retiring.contains(&identity) {
                 retiring.push(identity);
@@ -2082,6 +2173,7 @@ impl RemoteActor {
         self.call::<()>("preserve", Value::Null)?;
         self.0.preserved.store(true, Ordering::Release);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         Ok(())
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
@@ -2153,6 +2245,7 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(worker) = self
             .worker
             .get_mut()
@@ -2198,10 +2291,13 @@ fn close_only_method(method: &str) -> bool {
     matches!(
         method,
         "state"
+            | "watch"
             | "execution_environment"
             | "recognize_sources"
             | "snapshot"
             | "presentation"
+            | "presentation_codec"
+            | "presentation_binary"
             | "visible"
             | "observe"
             | "readiness"
@@ -2293,6 +2389,11 @@ struct Server {
     installed: bool,
     journal: Arc<Mutex<Journal>>,
     changed: Arc<std::sync::atomic::AtomicU64>,
+    watcher: Arc<push::Watcher>,
+    #[cfg(test)]
+    state_reads: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    fail_state_reads: Arc<std::sync::atomic::AtomicU64>,
     prompt_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: Vec<(
         InputIdentity,
@@ -2381,6 +2482,8 @@ impl Server {
         let journal = Arc::new(Mutex::new(Journal::open(store.directory())?));
         let changed = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let published = changed.clone();
+        let watcher = Arc::new(push::Watcher::default());
+        let published_watcher = watcher.clone();
         let prompt_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let available = prompt_revision.clone();
         let outcomes = journal.clone();
@@ -2414,6 +2517,7 @@ impl Server {
                     }
                 }
                 published.fetch_add(1, Ordering::Release);
+                published_watcher.notify();
             },
         )?;
         let provider = actor
@@ -2461,6 +2565,11 @@ impl Server {
             installed: false,
             journal,
             changed,
+            watcher,
+            #[cfg(test)]
+            state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_revision,
             pending: Vec::new(),
             account_reports,
@@ -2477,11 +2586,47 @@ impl Server {
             detached: DetachedWork::Stop,
         })
     }
+    fn presentation_response(
+        &mut self,
+        id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
+        if id != self.source.id {
+            return Err("Retained presentation names another chat".into());
+        }
+        // Loss is outside the reducer's transcript generation. Refuse
+        // even an unchanged-generation read instead of hiding it as
+        // an empty publication or inventing a transcript revision.
+        if let Some(loss) = self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .continuity_loss()?
+        {
+            return Err(loss.reason);
+        }
+        let response = self.actor.presentation(id, after);
+        let snapshot = match &response {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            }) => Some(snapshot),
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
+                Some(&update.metadata)
+            }
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
+        }
+        Ok(response)
+    }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();
         let changed = self.changed.clone();
         let available = self.prompt_revision.clone();
         let reports = self.account_reports.clone();
+        let watcher = self.watcher.clone();
         move |update| {
             if matches!(update, Update::PromptAvailable) {
                 available.fetch_add(1, Ordering::Release);
@@ -2501,6 +2646,7 @@ impl Server {
                 }
             }
             changed.fetch_add(1, Ordering::Release);
+            watcher.notify();
         }
     }
     fn revision(&self) -> u64 {
@@ -2717,6 +2863,7 @@ impl Server {
         let journal = self.journal.clone();
         let completed = self.actor.is_completed();
         let changed = self.changed.clone();
+        let revision = self.revision();
         self.pending.retain(|(identity,response,effects)| {
             if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
             let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
@@ -2730,6 +2877,9 @@ impl Server {
                 false
             } else {true}
         });
+        if self.revision() != revision {
+            self.watcher.notify();
+        }
     }
     fn pinned_launch_directory(
         &self,
@@ -2795,6 +2945,7 @@ impl Server {
                     "Retained actor source/account identity does not match this chat".into(),
                 );
             }
+            self.watcher.clear();
             self.epoch = uuid::Uuid::new_v4();
             self.close_only = close_only;
             self.attachment_preserved = false;
@@ -2839,6 +2990,11 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "watch" => Ok(Value::Null),
+            "presentation_codec" => {
+                let (version,) = decode!((u16,));
+                value!(version == crate::terminal_ipc::PROTOCOL_VERSION)
+            }
             "account_switch_generation"
             | "completed_account_options"
             | "account_switch_notice"
@@ -2892,6 +3048,17 @@ impl Server {
             }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
+                #[cfg(test)]
+                {
+                    self.state_reads.fetch_add(1, Ordering::Release);
+                    if self
+                        .fail_state_reads
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return Err("Temporary fixture observation failure".into());
+                    }
+                }
                 let (after,) = decode!((u64,));
                 if after == self.revision() {
                     Ok(Value::Null)
@@ -3125,37 +3292,7 @@ impl Server {
             }
             "presentation" => {
                 let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
-                if id != self.source.id {
-                    return Err("Retained presentation names another chat".into());
-                }
-                // Loss is outside the reducer's transcript generation. Refuse
-                // even an unchanged-generation read instead of hiding it as
-                // an empty publication or inventing a transcript revision.
-                if let Some(loss) = self
-                    .journal
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .continuity_loss()?
-                {
-                    return Err(loss.reason);
-                }
-                let response = self.actor.presentation(id, after);
-                let snapshot = match &response {
-                    Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
-                        snapshot: Some(snapshot),
-                        ..
-                    }) => Some(snapshot),
-                    Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
-                        Some(&update.metadata)
-                    }
-                    _ => None,
-                };
-                if let Some(snapshot) = snapshot {
-                    self.remember_publication(
-                        snapshot.session_id.as_deref(),
-                        &snapshot.native_continuity,
-                    )?;
-                }
+                let response = self.presentation_response(id, after)?;
                 value!(response)
             }
             "text_copy" => {
@@ -3521,7 +3658,23 @@ impl Server {
                 }
                 let (request, reply) = call.into_parts();
                 let close = request.method == "retire";
+                if request.method == "presentation_binary" {
+                    let response = self.binary_presentation(request);
+                    reply.send(connections::Answer::Binary(response));
+                    orphans.run();
+                    continue;
+                }
+                if request.method == "watch" {
+                    let watch = self.invoke(request).and_then(|_| self.watcher.subscribe());
+                    reply.send(connections::Answer::Watch(watch));
+                    orphans.run();
+                    continue;
+                }
+                let revision = self.revision();
                 let response = self.invoke(request);
+                if self.revision() != revision {
+                    self.watcher.notify();
+                }
                 // Only an explicit retirement after durable semantic ACK exits
                 // the helper; a lost provider-close reply retains its journal.
                 let finished = close && response.is_ok();
@@ -4374,6 +4527,10 @@ while IFS= read -r frame; do :; done
                 installed: true,
                 journal: Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),
                 changed: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                watcher: Arc::new(push::Watcher::default()),
+                state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(test)]
+                fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 prompt_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 pending: Vec::new(),
                 account_reports: Arc::new(Mutex::new(Vec::new())),
@@ -6027,6 +6184,11 @@ exec /bin/sleep 60
         let (processed, poll_processed) = crossbeam_channel::bounded(1);
         let (stop, stopped) = crossbeam_channel::bounded(1);
         let peer = thread::spawn(move || {
+            // This ordering fixture models an older helper without readiness.
+            let (watch, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&watch, TIMEOUT).unwrap();
+            assert_eq!(request.method, "watch");
+            send(&watch, &Err::<Value, _>(UNKNOWN_METHOD.to_owned()), TIMEOUT).unwrap();
             // Hold the observer's response to force refresh_state to publish
             // the new resident before that observer returns an unchanged poll.
             let (observer, _) = listener.accept().unwrap();
@@ -6575,7 +6737,12 @@ exec /bin/sleep 60
                             .lock()
                             .unwrap()
                             .push((request.method.clone(), request.args.clone()));
-                        let response = fixture.server.invoke(request);
+                        // This deliberately models a pre-readiness protocol-2 helper.
+                        let response = if request.method == "watch" {
+                            Err(UNKNOWN_METHOD.into())
+                        } else {
+                            fixture.server.invoke(request)
+                        };
                         let _ = send(&control, &response, TIMEOUT);
                     }
                 })
@@ -6616,6 +6783,7 @@ exec /bin/sleep 60
         fn drop(&mut self) {
             self.actor.0.stop.store(true, Ordering::Release);
             self.stop.store(true, Ordering::Release);
+            self.actor.0.wake.notify();
             if let Some(helper) = self.helper.take() {
                 let _ = helper.join();
             }
@@ -7211,3 +7379,13 @@ mod connections;
 #[cfg(test)]
 #[path = "transport_connection_tests.rs"]
 mod connection_tests;
+
+#[cfg(test)]
+#[path = "transport_push_tests.rs"]
+mod push_tests;
+
+#[path = "transport_push.rs"]
+mod push;
+
+#[path = "transport_binary.rs"]
+mod binary;
