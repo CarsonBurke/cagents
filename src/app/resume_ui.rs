@@ -60,6 +60,9 @@ pub(super) struct State {
     /// Tells the indexer's thread to stop reading, which aborting its
     /// listing alone leaves to the next batch.
     cancel: Arc<AtomicBool>,
+    /// The reader's Tab traversal setting while the picker owns Tab, which
+    /// chooses where to look and must leave the keyboard in the search.
+    restore_keyboard_nav: Option<bool>,
 }
 
 /// A conversation as the picker lists it.
@@ -822,6 +825,13 @@ impl Cagents {
             return None;
         }
         self.chrome_ui.close();
+        // Tab chooses where to look. COSMIC's own traversal would also move
+        // the keyboard out of the search, onto a scope button that Enter
+        // then presses instead of resuming.
+        if self.resume_ui.restore_keyboard_nav.is_none() {
+            self.resume_ui.restore_keyboard_nav = Some(self.core.keyboard_nav());
+            self.core.set_keyboard_nav(false);
+        }
         let state = &mut self.resume_ui;
         state.cancel.store(true, Ordering::Relaxed);
         if let Some(indexer) = state.indexer.take() {
@@ -1397,6 +1407,9 @@ impl Cagents {
     /// Closes the picker and stops indexing. Focus is left to whatever the
     /// caller shows next.
     fn close_resume(&mut self) {
+        if let Some(restore) = self.resume_ui.restore_keyboard_nav.take() {
+            self.core.set_keyboard_nav(restore);
+        }
         let state = &mut self.resume_ui;
         state.open = false;
         state.indexing = None;
@@ -1411,6 +1424,17 @@ impl Cagents {
         state.visible = Vec::new();
         state.seeds = Arc::from([]);
         state.seed_accounts = Vec::new();
+    }
+
+    /// Takes over Tab again from a popup that closed under the picker and
+    /// recorded its suppressed traversal: `restore` is the reader's choice.
+    pub(super) fn adopt_resume_keyboard_nav(&mut self, restore: bool) -> bool {
+        if !self.resume_ui.open {
+            return false;
+        }
+        self.resume_ui.restore_keyboard_nav = Some(restore);
+        self.core.set_keyboard_nav(false);
+        true
     }
 
     fn resume_error(&mut self, error: &str) {
@@ -2448,6 +2472,25 @@ mod tests {
 
     /// The picker opens on its project, with its worktree and every
     /// project a keystroke away, each counted.
+    /// Tab chooses where to look, so COSMIC's traversal is off while the
+    /// picker is open: otherwise the keyboard leaves the search for a scope
+    /// button, and Enter presses it instead of resuming.
+    #[test]
+    fn the_picker_owns_tab_while_open() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.core.set_keyboard_nav(true);
+        drop(app.update_resume(Action::Open));
+        assert!(app.resume_ui.open);
+        assert!(!app.core.keyboard_nav());
+        drop(app.update_resume(Action::Close));
+        assert!(app.core.keyboard_nav(), "the reader's setting comes back");
+
+        app.core.set_keyboard_nav(false);
+        drop(app.update_resume(Action::Open));
+        drop(app.update_resume(Action::Close));
+        assert!(!app.core.keyboard_nav(), "an existing choice is kept");
+    }
+
     #[test]
     fn the_picker_looks_in_its_project_until_told_to_look_wider() {
         let project = tempfile::tempdir().unwrap();
