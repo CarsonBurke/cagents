@@ -38,8 +38,8 @@ const INELIGIBLE: [Case; 6] = [
 /// The census in actor order, which is the order it is paged in 128s.
 ///
 /// Pages one and two interleave ineligible actors with retired ones, and a
-/// retired actor sits on each side of their boundary, so a page that drops or
-/// repeats its first or last row compacts the wrong set. Page three holds no
+/// retired actor sits on each side of their boundary, so a page that drops its
+/// first or last row leaves a retired actor uncompacted. Page three holds no
 /// retired actor at all, and page four is a partial page that starts with one,
 /// so a pass that stops at an empty page, or skips the row after one, falls
 /// short of all 300.
