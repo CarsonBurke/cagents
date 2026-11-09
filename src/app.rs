@@ -19534,13 +19534,18 @@ impl Application for Cagents {
                         Some(CardRuntime::Repository(runtime)) => Some(runtime.inspector_context()),
                         _ => None,
                     };
-                    let model = inspector::model_for_card(
+                    let mut model = inspector::model_for_card(
                         state,
                         self.inspector_runtime_status(card),
                         self.residency(card),
                         &self.sidebar_model.projects,
                         repository.as_ref(),
                     );
+                    if self.chat_retry_blocked(card) {
+                        model
+                            .actions
+                            .retain(|action| !matches!(action.message, InspectorAction::Retry(_)));
+                    }
                     let model = if self.inspector_diagnostics_card == Some(card) {
                         match self.cards.get(&card) {
                             Some(CardRuntime::Chat(runtime)) => {

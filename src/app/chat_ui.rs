@@ -27310,8 +27310,11 @@ mod tests {
     }
 
     fn capacity_recovery_labels(app: &Cagents, card: CardId) -> Vec<String> {
+        recovery_labels(app.card_view(card, true, false))
+    }
+
+    fn recovery_labels(mut element: Element<'_, Message>) -> Vec<String> {
         use iced::advanced::{Layout, layout, widget::Tree};
-        let mut element = app.card_view(card, true, false);
         let renderer = crate::app::tests::headless_renderer();
         let mut tree = Tree::new(element.as_widget());
         let node = element.as_widget_mut().layout(
@@ -27366,7 +27369,16 @@ mod tests {
             labels.iter().all(|label| !label.contains("Retry")),
             "{labels:?}"
         );
+        app.workspace.resize_viewport(1280.0);
+        app.context_tab = crate::app::ContextTab::Details;
+        assert!(app.context_inspector_visible());
+        let labels = recovery_labels(cosmic::Application::view(&app));
+        assert!(
+            labels.iter().all(|label| !label.contains("Retry")),
+            "the inspector must honor the same refusal: {labels:?}"
+        );
         drop(app.update(Message::RetryCard(card)));
+        drop(app.handle_context_inspector_action(crate::inspector::InspectorAction::Retry(card)));
         drop(app.handle_chat_ui(Action::StartFresh(card)));
         assert!(!app.chat_start_pending(card));
         assert_eq!(
