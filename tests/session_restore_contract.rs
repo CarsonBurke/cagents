@@ -11,10 +11,9 @@ use cagents::{
     chat::{Attachment, ImageReference, Launch, Session},
     model::{
         BootId, BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState,
-        ChannelId, Existence, Exposure, HostIncarnation, HostSessionId, HostSessionProof,
-        LaunchRecipe, ProjectChannel, ProjectId, ProjectState, RepositoryView, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, WorkspaceId, WorkspaceState, WorktreeId,
-        WorktreeState,
+        ChannelId, Existence, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe,
+        ProjectChannel, ProjectId, ProjectState, RepositoryView, TerminalContinuity, TerminalId,
+        TerminalSession, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
     },
     persistence::StateStore,
     session::SessionRuntime,
@@ -111,8 +110,6 @@ impl RestoreFixture {
                     title: "Build shell".into(),
                     width_fraction: 0.38,
                     existence: Existence::Open,
-                    exposure: Exposure::Visible,
-                    residency: Residency::Hot,
                     kind: CardKind::Terminal(TerminalSession {
                         owned_codex_listener: None,
                         recovery_origin: None,
@@ -134,8 +131,6 @@ impl RestoreFixture {
                     title: "Project activity".into(),
                     width_fraction: 0.34,
                     existence: Existence::Open,
-                    exposure: Exposure::Prefetch,
-                    residency: Residency::Hibernated,
                     kind: CardKind::Browser(BrowserSession {
                         id: browser_id,
                         current_url: browser_history[1].clone(),
@@ -152,8 +147,6 @@ impl RestoreFixture {
                     title: "Working tree".into(),
                     width_fraction: 0.28,
                     existence: Existence::Open,
-                    exposure: Exposure::Offscreen,
-                    residency: Residency::Cold,
                     kind: CardKind::Repository(RepositoryView {
                         selected_file: None,
                         project: project_id,
@@ -331,8 +324,6 @@ fn managed_image_drafts_survive_debounced_shutdown_navigation_and_metadata_only_
             title: "Unsent image draft".into(),
             width_fraction: 0.5,
             existence: Existence::Open,
-            exposure: Exposure::Offscreen,
-            residency: Residency::Cold,
             kind: CardKind::Chat(Session {
                 id: TerminalId::new(),
                 launch: Launch {

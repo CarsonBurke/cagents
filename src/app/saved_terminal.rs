@@ -375,13 +375,8 @@ impl Cagents {
         // Inspection is metadata-only. Keep unopened panes hibernated while
         // the exact owner is checked; the saved-entry fence prevents a
         // visibility transition from starting a replacement in the meantime.
-        let exposure = self.card_state(card).map(|state| state.exposure);
-        if let Some(exposure) = exposure {
-            self.lifecycle
-                .register(card, exposure, Residency::Hibernated, Instant::now());
-            if let Some(state) = self.card_state_mut(card) {
-                state.residency = Residency::Hibernated;
-            }
+        if self.card_state(card).is_some() {
+            self.register_presence(card, self.exposure(card), Residency::Hibernated);
         }
         self.cards.insert(card, CardRuntime::Loading);
         true
@@ -695,10 +690,7 @@ impl Cagents {
         match result {
             Ok(Some(started)) => {
                 self.saved_terminals.entries.remove(&card);
-                let exposure = self
-                    .card_state(card)
-                    .map(|state| state.exposure)
-                    .unwrap_or(Exposure::Offscreen);
+                let exposure = self.exposure(card);
                 let residency = if exposure == Exposure::Offscreen {
                     Residency::Hibernated
                 } else {
@@ -706,11 +698,7 @@ impl Cagents {
                         epoch: unix_millis().max(1) as u64,
                     }
                 };
-                self.lifecycle
-                    .register(card, exposure, residency.clone(), Instant::now());
-                if let Some(state) = self.card_state_mut(card) {
-                    state.residency = residency;
-                }
+                self.register_presence(card, exposure, residency);
                 self.terminal_started(card, source.id, Ok(started))
             }
             result => {

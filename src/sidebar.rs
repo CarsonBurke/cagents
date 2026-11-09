@@ -12929,8 +12929,6 @@ pub(crate) mod tests {
             title: "Agent".into(),
             width_fraction: 0.5,
             existence: crate::model::Existence::Open,
-            exposure: crate::model::Exposure::Visible,
-            residency: crate::model::Residency::Hot,
             kind: crate::model::CardKind::Terminal(crate::model::TerminalSession {
                 id: crate::model::TerminalId::new(),
                 launch: launch.clone(),

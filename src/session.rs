@@ -2982,8 +2982,8 @@ mod tests {
     use tempfile::tempdir;
 
     use crate::model::{
-        CardId, CardKind, CardState, Existence, Exposure, LaunchRecipe, Residency,
-        TerminalContinuity, TerminalId, TerminalSession, Tombstone, WorkspaceId,
+        CardId, CardKind, CardState, Existence, LaunchRecipe, TerminalContinuity, TerminalId,
+        TerminalSession, Tombstone, WorkspaceId,
     };
 
     use super::*;
@@ -3222,8 +3222,6 @@ mod tests {
                 title: "shell".into(),
                 width_fraction: 0.7,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Hot,
                 kind: CardKind::Terminal(TerminalSession {
                     owned_codex_listener: None,
                     recovery_origin: None,

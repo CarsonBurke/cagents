@@ -133,7 +133,11 @@ impl Cagents {
                             && source.continuity.live_proof().as_ref() == Some(&proof)
                     })
                 {
-                    reconnect.push((card.id, saved.clone(), card.exposure == Exposure::Visible));
+                    reconnect.push((
+                        card.id,
+                        saved.clone(),
+                        self.exposure(card.id) == Exposure::Visible,
+                    ));
                 }
             }
             if !terminal.upgrade_relaunches.is_empty() {
@@ -149,9 +153,7 @@ impl Cagents {
             let residency = Residency::Hydrating {
                 epoch: unix_millis().max(1) as u64,
             };
-            if let Some(state) = self.card_state_mut(card) {
-                state.residency = residency.clone();
-            }
+            self.set_residency(card, residency.clone());
             self.lifecycle.register(
                 card,
                 if visible {
@@ -248,16 +250,14 @@ impl Cagents {
                         && matches!(self.cards.get(&card.id), Some(CardRuntime::Failed(_)))
                         && !self.terminal_start_in_flight(card.id)
                 })
-                .map(|card| (card.id, card.exposure))
+                .map(|card| (card.id, self.exposure(card.id)))
                 .collect::<Vec<_>>();
             for (id, exposure) in &waiting {
                 if let Some(card) = self.card_state_mut(*id) {
                     card.kind = CardKind::Terminal(session.clone());
-                    card.residency = Residency::Cold;
                 }
                 self.cards.insert(*id, CardRuntime::Loading);
-                self.lifecycle
-                    .register(*id, *exposure, Residency::Cold, Instant::now());
+                self.register_presence(*id, *exposure, Residency::Cold);
             }
             if !waiting.is_empty() {
                 tasks.push(self.lifecycle_sweep());
@@ -371,12 +371,6 @@ impl Cagents {
                 .unwrap_or_else(|| "Terminal".into()),
             width_fraction: self.settings.default_column_fraction,
             existence: Existence::Open,
-            // Adoption is not a user action, so it claims no camera and no
-            // focus. The card enters offscreen - cold, or hibernated for an
-            // agent's row - and is hydrated by the ordinary lifecycle sweep,
-            // which is also what admits it when the strip scrolls it into view.
-            exposure: Exposure::Offscreen,
-            residency: residency.clone(),
             kind: CardKind::Terminal(session),
         };
         let durable = Arc::make_mut(&mut self.durable);
@@ -390,8 +384,11 @@ impl Cagents {
             durable.card_scopes.insert(card_id, scope.clone());
         }
         self.cards.insert(card_id, CardRuntime::Loading);
-        self.lifecycle
-            .register(card_id, Exposure::Offscreen, residency, Instant::now());
+        // Adoption is not a user action, so it claims no camera and no focus.
+        // The card enters offscreen - cold, or hibernated for an agent's row -
+        // and is hydrated by the ordinary lifecycle sweep, which is also what
+        // admits it when the strip scrolls it into view.
+        self.register_presence(card_id, Exposure::Offscreen, residency);
         if observed {
             self.restored_agent_attaches.push_back(card_id);
         }

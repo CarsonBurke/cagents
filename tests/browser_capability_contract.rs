@@ -7,7 +7,7 @@ use cagents::{
     location::SanitizedLocation,
     model::{
         BootId, BrowserId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState,
-        Existence, Exposure, Residency, WorkspaceState,
+        Existence, WorkspaceState,
     },
     persistence::{SnapshotBase, StateStore},
 };
@@ -119,8 +119,6 @@ fn durable_browser_urls_keep_navigation_authority_across_store_reopen() {
             title: "Browser persistence fixture".into(),
             width_fraction: 1.0,
             existence: Existence::Open,
-            exposure: Exposure::Visible,
-            residency: Residency::Cold,
             kind: CardKind::Browser(expected.clone()),
         }],
         focused: Some(card),
@@ -200,8 +198,6 @@ fn durable_browser_same_location_navigation_rewrites_hidden_url_components() {
                 title: "Same-location navigation fixture".into(),
                 width_fraction: 1.0,
                 existence: Existence::Open,
-                exposure: Exposure::Visible,
-                residency: Residency::Cold,
                 kind: CardKind::Browser(BrowserSession {
                     id: BrowserId::new(),
                     current_url: original.clone(),

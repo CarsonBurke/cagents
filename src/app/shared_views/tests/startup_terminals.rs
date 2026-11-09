@@ -141,8 +141,6 @@ fn offscreen(session: &TerminalSession) -> CardState {
         title: "Terminal".into(),
         width_fraction: 1.0,
         existence: Existence::Open,
-        exposure: Exposure::Offscreen,
-        residency: Residency::Hibernated,
         kind: CardKind::Terminal(session.clone()),
     }
 }
@@ -735,8 +733,6 @@ fn reopened_observed_window(with_projected: bool) -> Window {
         title: pane.title,
         width_fraction: pane.width_fraction,
         existence: Existence::Open,
-        exposure: Exposure::Visible,
-        residency: Residency::Hot,
         kind: pane.kind,
     };
     let mut cached = offscreen(&live_terminal());
