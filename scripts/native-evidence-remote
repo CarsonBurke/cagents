@@ -178,18 +178,22 @@ if [ "\$owner" = "\$(uname -n):\$task" ]; then
     echo "native-evidence-remote: this task directory is the host's own, so the host would overwrite and clean it; run scripts/native-evidence here without --remote" >&2
     exit 3
 fi
+# Only build takes a name, so a mistyped status or fetch leaves none taken.
+# The record is created exclusively: of two first builds, one gets it.
+if [ "\${claim:-}" = true ] && [ ! -e "\$owner_record" ] && [ ! -e "\$task" ]; then
+    mkdir -p -- "\${owner_record%/*}"
+    (set -C; printf '%s\\n' "\$owner" >"\$owner_record") 2>/dev/null || :
+fi
 if [ -e "\$owner_record" ]; then
     if [ "\$(cat -- "\$owner_record")" != "\$owner" ]; then
         echo "native-evidence-remote: task \$name on \$(uname -n) belongs to \$(cat -- "\$owner_record"); give this task directory another name" >&2
         exit 3
     fi
 elif [ -e "\$task" ]; then
-    # Such as a task someone runs on the host directly, in the same place.
-    echo "native-evidence-remote: \$task on \$(uname -n) is not a task this route started; give this task directory another name" >&2
+    # Such as a task someone runs on the host directly, in the same place,
+    # or one this route started before tasks had owners.
+    echo "native-evidence-remote: \$task on \$(uname -n) is not a task this route started; give this task directory another name, or, if an earlier version of this route started it for you, claim it there with: printf '%s\\\\n' '\$owner' >\$owner_record" >&2
     exit 3
-else
-    mkdir -p -- "\${owner_record%/*}"
-    printf '%s\\n' "\$owner" >"\$owner_record"
 fi
 # In cli and env arguments, {fixture} stands for the fixture's root, in a
 # forwarded command and a steps file alike.
@@ -217,8 +221,9 @@ snapshot() {
         return
     fi
     index=$(mktemp)
-    # This runs in a command substitution, so the trap is its own.
-    trap 'rm -f -- "$index"' EXIT
+    # This runs in a command substitution, so the trap is its own; it names
+    # the file itself, as the function's variable is gone by then.
+    trap "rm -f -- $(printf '%q' "$index")" EXIT
     # A copy of its index, so unchanged files need no rehashing.
     cp -- "$(git -C "$checkout" rev-parse --path-format=absolute --git-path index)" "$index" 2>/dev/null || :
     GIT_INDEX_FILE=$index git -C "$checkout" add --all &&
@@ -288,7 +293,10 @@ fetch_shots() {
         rm -f -- "$task/.shots.tar"
         die "could not bring back the shots from $host"
     }
-    tar -C "$task/shots" -xf "$task/.shots.tar"
+    # Nothing comes back from a host with no shots yet.
+    if [ -s "$task/.shots.tar" ]; then
+        tar -C "$task/shots" -xf "$task/.shots.tar"
+    fi
     rm -f -- "$task/.shots.tar"
 }
 
@@ -315,16 +323,22 @@ cmd_build() {
     case $side in before | after) ;; *) die 'side must be before or after' 2 ;; esac
     [ -n "$source" ] || die 'build needs a checkout or revision' 2
     resolve_source "$source"
-    # Before its checkout is rewritten under a session started from it.
-    if on_host "$remote_prelude"'
-        [ -x "$tool/scripts/native-evidence" ] || exit 1
+    # Take the task's name on the host, or be refused, before anything is
+    # sent there; and not while a session runs from what would be rewritten.
+    local running=0
+    on_host "claim=true
+$remote_prelude"'
+        [ -x "$tool/scripts/native-evidence" ] || exit 0
         # Read whole: grep -q would end the pipe early, and status, killed
         # by SIGPIPE under pipefail, would read as no session.
         status=$(evidence status 2>/dev/null) || :
-        grep -q "^session: $1," <<<"$status"
-    ' "$side"; then
-        die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop"
-    fi
+        if grep -q "^session: $1," <<<"$status"; then exit 10; fi
+    ' "$side" || running=$?
+    case $running in
+        0) ;;
+        10) die "the $side side is running on $host; stop it before rebuilding what it was started from: scripts/native-evidence --remote $host --task $task stop" ;;
+        *) exit "$running" ;;
+    esac
     sync_tool
     checkout=$(sync_checkout "$side" "$source_checkout" "$source_commit")
     if [ "$source_commit" != "$source_head" ]; then
@@ -396,7 +410,10 @@ cmd_pair() {
             status=0
             SIDE=$side bash -euo pipefail "$steps" || status=$?
             trap - EXIT
-            evidence stop >/dev/null 2>&1
+            if ! stopped=$(evidence stop 2>&1); then
+                printf "%s\n" "$stopped" >&2
+                [ "$status" -ne 0 ] || status=1
+            fi
             exit "$status"
         ' "$side" "$(cat -- "$steps")" "${options[@]}" || status=$?
         fetch_shots

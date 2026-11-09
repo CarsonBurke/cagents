@@ -1214,7 +1214,9 @@ class RemoteEvidence(unittest.TestCase):
         (checkout / ".gitignore").write_text("ignored\n")
         (checkout / "ignored").write_text("secret\n")
         status = self.git(checkout, "status", "--porcelain")
-        self.run_tool("build", "after", str(checkout))
+        result = self.run_tool("build", "after", str(checkout))
+        # The copy of its index goes, and says nothing as it does.
+        self.assertNotIn("unbound variable", result.stderr)
         remote = self.remote_repository / ".worktrees" / "cev-mytask-after"
         self.assertEqual((remote / "src.rs").read_text(), "fn main() { changed(); }\n")
         self.assertTrue((remote / "new.rs").exists())
@@ -1289,8 +1291,11 @@ class RemoteEvidence(unittest.TestCase):
         owner = self.remote_home / ".local/state/cev-owners/mytask"
         self.assertTrue(owner.read_text().endswith(f":{self.task}\n"))
         # Another agent's task directory of the same name, elsewhere.
+        tool_ref = self.git(self.remote_repository, "rev-parse", "refs/native-evidence/mytask/tool")
         other = self.task
         self.task = self.root / "elsewhere" / "mytask"
+        # Its own tool, so a push would show.
+        self.git(self.tool, "commit", "-q", "--allow-empty", "-m", "another tool")
         (checkout / "src.rs").write_text("two\n")
         for command in (["build", "after", str(checkout)], ["start", "after"], ["clean"], ["status"]):
             with self.subTest(command=command[0]):
@@ -1299,7 +1304,14 @@ class RemoteEvidence(unittest.TestCase):
                 self.assertIn(f"task mytask on {os.uname().nodename} belongs to {os.uname().nodename}:{other}; "
                               "give this task directory another name", result.stderr)
         self.assertEqual((self.remote_repository / ".worktrees/cev-mytask-after/src.rs").read_text(), "one\n")
+        # Nothing was sent: the owner's refs are as they were.
+        self.assertEqual(self.git(self.remote_repository, "rev-parse", "refs/native-evidence/mytask/tool"), tool_ref)
         self.assertTrue(self.remote_task.exists())
+
+    def test_only_a_build_takes_a_name_on_the_host(self) -> None:
+        self.run_tool("status", check=False)
+        self.run_tool("fetch")
+        self.assertFalse((self.remote_home / ".local/state/cev-owners/mytask").exists())
 
     def test_a_task_the_host_runs_directly_is_left_alone(self) -> None:
         # Someone on the host runs native-evidence with a task of this name.
@@ -1307,6 +1319,9 @@ class RemoteEvidence(unittest.TestCase):
         result = self.run_tool("clean", check=False)
         self.assertEqual(result.returncode, 3, result.stderr)
         self.assertIn("is not a task this route started; give this task directory another name", result.stderr)
+        # One it started before tasks had owners can be claimed as it says.
+        owner = f"{os.uname().nodename}:{self.task}"
+        self.assertIn(f"printf '%s\\n' '{owner}' >{self.remote_home}/.local/state/cev-owners/mytask", result.stderr)
         self.assertTrue((self.remote_task / "shots").exists())
         self.assertFalse((self.remote_home / ".local/state/cev-owners/mytask").exists())
 

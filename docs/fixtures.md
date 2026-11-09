@@ -120,6 +120,9 @@ Every refusal names its cause and the next command. The common ones:
 | `memory-capped: stopped` | The session exceeded its memory limit; the log names the process. |
 | `session: lost` in `status` | Its supervisor was killed. `stop` ends what remains. |
 | `the SIDE side is running on HOST; stop it before rebuilding` | A side's checkout can't change under its session. Run the `stop` it names, then build. |
+| `task NAME on HOST belongs to OWNER` | Another agent's task has that name on the host. Give your task directory another name, such as your PR's. |
+| `... is not a task this route started` | A task of that name exists on the host without an owner: someone runs it there directly, or an earlier version of the route started it. If it is yours, run the `printf` the message gives on the host; otherwise rename yours. |
+| `this task directory is the host's own` | You are on the build host. Run `scripts/native-evidence` without `--remote`. |
 
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
