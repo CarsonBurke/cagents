@@ -354,9 +354,15 @@ refuse while a daemon runs.
 The installer only asks through the replacement's command line, and only when
 its `--help` shows these commands. It never gives a daemon an option it may
 not know: released daemons through v0.1.3 ignore their arguments and would start
-serving. A replacement without the commands predates every store conversion,
-so there is nothing to convert back and the installer does not record the
-schema. If the schema cannot be read, the installation is not changed; if the
+serving. A replacement without the commands predates every store downgrade a
+release ships, so the installer neither records the schema nor converts
+anything back.
+
+Installing an older release on purpose is not a rollback: its daemon cannot
+open a store a newer release converted, and runs without the shared model
+until the newer release is back. To keep it, stop the daemon and run the
+newer release's `cagents daemon downgrade-store SCHEMA` first, with the
+schema the older release reads (22 for releases before the conversion). If the schema cannot be read, the installation is not changed; if the
 conversion fails, the installer keeps the new installation, which reads the
 store, rather than restore a daemon that cannot.
 
