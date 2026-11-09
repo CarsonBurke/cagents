@@ -1798,10 +1798,13 @@ fn interrupt_unowned_turn(
             "The agent has no active run and its main turn is idle, so there is nothing to interrupt. Its latest run is {:?}.",
             run.state
         );
-        let background = handle.background_subagents().len();
-        if background > 0 {
+        let hold = handle.work_hold();
+        let background = hold.subagents();
+        if !background.is_empty() {
             message.push_str(&format!(
-                " This provider's interrupt doesn't reach its {background} running background subagent(s); stop them from its chat, or close the agent."
+                " This provider's interrupt doesn't reach its {}; stop {} in its chat, or close the agent.",
+                background.count(),
+                background.where_to_stop()
             ));
         }
         let requests = handle.requests().len();
