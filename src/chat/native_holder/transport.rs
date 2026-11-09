@@ -377,26 +377,31 @@ impl Holder {
             Request::Release
         };
         let report = send(control, &request, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
-        match report {
+        let unanswered = match report {
             Ok(Some(Report::Released)) => {
                 if !self.identity.receipt(retain)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
                 self.control.take();
                 self.release_on_drop = false;
-                Ok(())
+                return Ok(());
             }
-            Ok(Some(Report::Failed(error))) => Err(error),
-            // A holder that exited with its provider closes its control
-            // connection without answering, and never will.
-            Err(_) | Ok(None) if self.identity.retire_exited() => {
-                self.control.take();
-                self.release_on_drop = false;
-                Ok(())
+            Ok(Some(Report::Failed(error))) => return Err(error),
+            Ok(Some(_)) => {
+                return Err("Native holder did not acknowledge server teardown".into());
             }
-            Err(error) => Err(error),
-            _ => Err("Native holder did not acknowledge server teardown".into()),
+            Ok(None) => "Native holder did not acknowledge server teardown".to_owned(),
+            Err(error) => error,
+        };
+        // A holder that exited with its provider closes its control connection
+        // without answering, and never will. If it wrote its receipt first,
+        // that receipt settles the close as a reply would have.
+        if !self.identity.receipt(retain)? && !self.identity.retire_exited() {
+            return Err(unanswered);
         }
+        self.control.take();
+        self.release_on_drop = false;
+        Ok(())
     }
 }
 

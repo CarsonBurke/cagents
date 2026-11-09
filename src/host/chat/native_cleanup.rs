@@ -11,6 +11,22 @@ pub(in crate::host) struct NativeClose {
 }
 
 impl NativeClose {
+    /// A retained close of `source`'s unpaired owner, as Close records it once
+    /// it adopts that owner, and once its Release is answered when `closed`.
+    #[cfg(test)]
+    pub(in crate::host) fn adopted(
+        source: Session,
+        owner: chat::native_holder::Detached,
+        closed: bool,
+    ) -> Self {
+        Self {
+            source,
+            owner,
+            closed,
+            paired: None,
+        }
+    }
+
     pub(in crate::host) fn working_directory(&self) -> &std::path::Path {
         &self.source.launch.recipe.working_directory
     }
@@ -278,6 +294,15 @@ fn close_retained_inner(
             expected
                 .require_current(host)
                 .map_err(|error| error.message)?;
+        }
+        // An owner that ended before its Release, or with its provider during
+        // it, settled this close without a receipt, so there is none to
+        // confirm. Its close stays pending until the loss is proved; an owner
+        // still running keeps its record, which refuses the loss.
+        if pending.paired.is_none() && chat::native_holder::closed_source(source, &proof)?.is_none()
+        {
+            chat::native_holder::retire_abandoned(&pending.owner.record)?;
+            return super::close_lost_codex_owner(host, source, &proof);
         }
         if let Some(pair) = &pending.paired {
             if let Some(source) = &pair.source {

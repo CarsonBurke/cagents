@@ -3,6 +3,8 @@
 
 mod cleanup;
 mod transport;
+#[cfg(test)]
+pub(crate) use cleanup::publish_closed_source;
 pub(crate) use cleanup::{
     Detached, closed_pair_holder, closed_source, confirm_pair_closed, has_receipt, retire_abandoned,
 };

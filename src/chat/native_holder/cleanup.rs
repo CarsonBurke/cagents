@@ -68,6 +68,23 @@ pub(super) fn publish(
     save(&path, &receipt)
 }
 
+/// Publishes the receipt a holder of `record` writes as it closes `source`.
+#[cfg(test)]
+pub(crate) fn publish_closed_source(
+    record: &Record,
+    proof: &HostSessionProof,
+    source: &crate::chat::Session,
+) -> Result<(), String> {
+    let receipt = Receipt {
+        record: record.clone(),
+        proof: proof.clone(),
+        sources: vec![source_digest(source)?],
+        paired_closed: source.terminal.is_none(),
+        paired_holder: None,
+    };
+    save(&path(record.terminal, &record.holder)?, &receipt)
+}
+
 fn save(path: &std::path::Path, receipt: &Receipt) -> Result<(), String> {
     let parent = path
         .parent()

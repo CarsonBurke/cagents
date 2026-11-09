@@ -302,7 +302,8 @@ fn a_listener_still_being_served_keeps_the_refusal() {
 }
 
 /// A start or close that holds the conversation's allocation may be about to
-/// publish a server; the pane waits for it rather than declaring the owner lost.
+/// publish a server. Close's claim refuses while it is held, before any loss
+/// is considered, and the pane closes once it is released.
 #[test]
 fn a_start_holding_the_allocation_keeps_the_refusal() {
     let Some(root) = isolated("a_start_holding_the_allocation_keeps_the_refusal") else {
@@ -369,14 +370,187 @@ fn a_receipt_for_another_conversation_keeps_the_refusal() {
         return;
     };
     let fixture = Fixture::new(&root);
-    let receipt = registry::directory(Kind::Native).unwrap().join(format!(
-        "{}-{}-1.closed",
-        fixture.source.id,
-        i32::MAX - 1
-    ));
-    std::fs::write(&receipt, b"{}").unwrap();
+    let record = fixture.record(exited(i32::MAX - 1), exited(i32::MAX - 2));
+    let mut other = fixture.source.clone();
+    other.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
+    let proof = fixture.source.proof.clone().unwrap();
+    chat::native_holder::publish_closed_source(&record, &proof, &other).unwrap();
+    // The holder retires its record once its receipt is published.
+    record.remove(&registry::directory(Kind::Native).unwrap());
+    // The receipt is well formed: it proves the other conversation's close.
+    assert!(
+        chat::native_holder::closed_source(&other, &proof)
+            .unwrap()
+            .is_some()
+    );
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().parent().unwrap().exists());
+}
+
+/// A holder spawned for the fixture's conversation, serving a provider that
+/// never listens, as Close holds it once it has adopted it.
+struct Spawned {
+    owner: chat::native_holder::Detached,
+    _context: Arc<chat::protocol::ExecutionContext>,
+    _working: tempfile::TempDir,
+}
+
+impl Spawned {
+    fn new(source: &Session) -> Self {
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = Arc::new(chat::protocol::ExecutionContext::new(Some(Arc::new(
+            std::fs::File::open(working.path()).unwrap(),
+        ))));
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let spec = chat::protocol::ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context.clone()),
+            messages: None,
+            transport: chat::protocol::TransportSpec::OwnedUnixWebSocket { socket },
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let holder = chat::native_holder::spawn(spec, source.clone()).unwrap();
+        context.installed();
+        Self {
+            owner: holder.preserve(),
+            _context: context,
+            _working: working,
+        }
+    }
+}
+
+fn kill(process: &registry::Process) {
+    unsafe { libc::kill(process.pid, libc::SIGKILL) };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while process.is_current() {
+        assert!(Instant::now() < deadline, "the killed process never exited");
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// Close adopted a live holder, then its Release failed or was never
+/// answered, and the holder died with its provider before the retry. That
+/// close can never be confirmed by a receipt, and every retry refused it with
+/// "The native cleanup receipt is unavailable"; it now settles as the lost
+/// owner it is. `released` is whether the earlier attempt's Release had
+/// already settled, leaving only the confirmation to fail.
+fn pending_close_whose_owner_then_ended(root: &std::path::Path, released: bool) {
+    let fixture = Fixture::new(root);
+    let spawned = Spawned::new(&fixture.source);
+    let record = spawned.owner.record.clone();
+    let owner = spawned.owner.clone();
+    fixture.host.lock().unwrap().native_closing.insert(
+        fixture.source.id,
+        native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, released),
+    );
+    // A pending close of a live owner waits for it.
+    if !released {
+        assert!(has_native_owner(&fixture.source).unwrap());
+    }
+    kill(&record.holder);
+    kill(&record.root);
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+    assert!(!has_native_owner(&fixture.source).unwrap());
+}
+
+#[test]
+fn a_pending_close_whose_owner_then_ended_closes() {
+    let Some(root) = isolated("a_pending_close_whose_owner_then_ended_closes") else {
+        return;
+    };
+    pending_close_whose_owner_then_ended(&root, false);
+}
+
+#[test]
+fn a_released_close_whose_owner_then_ended_closes() {
+    let Some(root) = isolated("a_released_close_whose_owner_then_ended_closes") else {
+        return;
+    };
+    pending_close_whose_owner_then_ended(&root, true);
+}
+
+/// A pending close whose owner is still running is that owner's to settle;
+/// the lost-owner path never takes it over.
+#[test]
+fn a_pending_close_of_a_running_owner_keeps_waiting_for_it() {
+    let Some(root) = isolated("a_pending_close_of_a_running_owner_keeps_waiting_for_it") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let spawned = Spawned::new(&fixture.source);
+    let record = spawned.owner.record.clone();
+    let owner = spawned.owner.clone();
+    fixture.host.lock().unwrap().native_closing.insert(
+        fixture.source.id,
+        native_cleanup::NativeClose::adopted(fixture.source.clone(), owner, true),
+    );
+    // Its Release was answered, but no receipt confirms it and the provider
+    // still runs, so the conversation may still be written.
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(
+        fixture
+            .host
+            .lock()
+            .unwrap()
+            .native_closing
+            .contains_key(&fixture.source.id)
+    );
+    kill(&record.holder);
+    kill(&record.root);
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    fixture.assert_settled();
+}
+
+/// Reopening a conversation whose pane closed this way: its owner left no
+/// receipt, and the old refusal asked the user to restore the pane they had
+/// just closed and close it again.
+#[test]
+fn a_conversation_closed_after_losing_its_owner_reopens() {
+    let Some(root) = isolated("a_conversation_closed_after_losing_its_owner_reopens") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap();
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        &fixture.host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected a prepared resume");
+    };
+    assert_ne!(session.id, fixture.source.id);
+    // The same conversation, on a listener of its own.
+    assert_eq!(session.launch.provider, Provider::Codex);
+    assert_eq!(session.launch.session_id, fixture.source.launch.session_id);
+    assert!(session.owned_codex_listener.is_none());
+}
+
+/// While anything of the old conversation may still run, reopening it keeps
+/// refusing, as it does without a receipt.
+#[test]
+fn a_conversation_whose_listener_is_served_does_not_reopen() {
+    let Some(root) = isolated("a_conversation_whose_listener_is_served_does_not_reopen") else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    let _server = std::os::unix::net::UnixListener::bind(fixture.socket()).unwrap();
+    process_inner(
+        &fixture.host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    )
+    .err()
+    .expect("a served conversation was reopened");
 }
 
 /// #2426: a turn finished and its provider exited with it, taking the holder
