@@ -2431,14 +2431,37 @@ impl Runtime {
         if let Some(query) = &self.find {
             content.push(
                 widget::row::with_children(vec![
-                    crate::interaction::focused_escape(
+                    // Enter and Escape are answered by the field that holds
+                    // the keyboard, however it got there: a click, Ctrl+F or
+                    // the Previous and Next buttons handing it back.
+                    crate::interaction::focused_key(
                         crate::ui_controls::field::search("Find in conversation", query)
                             .id(card_control_id(target.card, "chat-find"))
                             .on_input(move |query| action(Action::Find(target, query)))
-                            .on_focus(action(Action::FindFocused(target, true)))
-                            .on_unfocus(action(Action::FindFocused(target, false)))
                             .width(Length::Fill),
-                        move || action(Action::CloseFind(target)),
+                        move |event| {
+                            let keyboard::Event::KeyPressed {
+                                key: keyboard::Key::Named(key),
+                                modifiers,
+                                ..
+                            } = event
+                            else {
+                                return None;
+                            };
+                            match key {
+                                keyboard::key::Named::Escape => {
+                                    Some(action(Action::CloseFind(target)))
+                                }
+                                keyboard::key::Named::Enter
+                                    if !modifiers.control()
+                                        && !modifiers.alt()
+                                        && !modifiers.logo() =>
+                                {
+                                    Some(action(Action::FindNext(target, !modifiers.shift())))
+                                }
+                                _ => None,
+                            }
+                        },
                     ),
                     design::caption(if let Some(error) = self.find_error() {
                         error.to_owned()

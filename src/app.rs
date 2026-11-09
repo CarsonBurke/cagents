@@ -17952,11 +17952,6 @@ impl Application for Cagents {
                 if let Some(task) = self.account_key_event(&event) {
                     return task;
                 }
-                if !self.workspace_inputs_blocked()
-                    && let Some(task) = self.chat_find_key(&event)
-                {
-                    return task;
-                }
                 // A widget that consumed Escape has already answered it - a
                 // focused terminal clearing its selection, for one. Running the
                 // chain anyway would close the inspector behind it in the same
@@ -18216,6 +18211,7 @@ impl Application for Cagents {
                         if previous == self.workspace.focused()
                             && let Some(card) = previous
                         {
+                            self.keyboard_owed = self.owes_chat_input(card).then_some(card);
                             Task::batch([
                                 task,
                                 workspace_widget::focus_card_if_outside(

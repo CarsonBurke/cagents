@@ -451,7 +451,6 @@ pub enum Action {
         Option<scroll::LogicalLocation>,
     ),
     CloseFind(Target),
-    FindFocused(Target, bool),
     Tick,
     ClearCopied(Target, Instant),
     DropHover(Target, bool),
@@ -2348,7 +2347,6 @@ const CAPACITY_GUIDANCE: &str = "Inspect usage with cagents chat capacity. Check
 pub(super) struct Runtime {
     preparation: preparation::State,
     find: Option<String>,
-    find_focused: bool,
     find_matches: Vec<String>,
     find_disclosure: find::Disclosure,
     child_find_disclosure: HashMap<String, find::Disclosure>,
@@ -3380,7 +3378,6 @@ impl Runtime {
             fork_seen: None,
             files: None,
             find: None,
-            find_focused: false,
             find_matches: Vec::new(),
             find_disclosure: find::Disclosure::default(),
             child_find_disclosure: HashMap::new(),
@@ -5269,15 +5266,12 @@ impl Runtime {
         }
     }
 
-    /// The named control that should receive the keyboard for this card:
-    /// an open picker's search, then an open find bar, then the composer.
+    /// The named control that should receive the keyboard for this card.
     pub(super) fn focus_control(&self) -> &'static str {
         if self.child_picker.is_some() {
             "chat-subagent-search"
         } else if self.model_picker.is_some() {
             "chat-model-search"
-        } else if self.find.is_some() {
-            "chat-find"
         } else {
             "chat-composer"
         }
@@ -6008,11 +6002,18 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
-    /// Whether a chat's menu or picker is open; see [`Runtime::has_open_menu`].
+    /// Whether the focused chat has a menu or picker open; see
+    /// [`Runtime::has_open_menu`]. Only the focused pane counts: a menu is
+    /// opened from the pane that has focus, and one left flagged open in a
+    /// pane no longer shown, a hidden channel's for example, is not drawn
+    /// and must not hold the pointer's focus everywhere.
     pub(super) fn chat_menu_open(&self) -> bool {
-        self.cards
-            .values()
-            .any(|runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.has_open_menu()))
+        self.workspace
+            .focused()
+            .and_then(|card| self.cards.get(&card))
+            .is_some_and(
+                |runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.has_open_menu()),
+            )
     }
 
     /// Whether `card` is a chat whose message input, or the picker search
@@ -6181,29 +6182,6 @@ impl Cagents {
         Some(task.map(cosmic::Action::App))
     }
 
-    pub(super) fn chat_find_key(&mut self, event: &keyboard::Event) -> Option<Task<Message>> {
-        let card = self.workspace.focused()?;
-        let Some(CardRuntime::Chat(runtime)) = self.cards.get(&card) else {
-            return None;
-        };
-        if !runtime.find_focused {
-            return None;
-        }
-        let target = runtime.target;
-        let keyboard::Event::KeyPressed {
-            key: keyboard::Key::Named(key),
-            modifiers,
-            ..
-        } = event
-        else {
-            return None;
-        };
-        match key {
-            keyboard::key::Named::Enter => Some(self.chat_find_next(target, !modifiers.shift())),
-            keyboard::key::Named::Escape => Some(self.handle_chat_ui(Action::CloseFind(target))),
-            _ => None,
-        }
-    }
     pub(super) fn open_chat_find(&mut self) -> Option<Task<Message>> {
         let card = self.workspace.focused()?;
         let Some(CardRuntime::Chat(runtime)) = self.cards.get_mut(&card) else {
@@ -11881,7 +11859,16 @@ impl Cagents {
                 }
                 return self.chat_find_next(target, true);
             }
-            Action::FindNext(target, forward) => return self.chat_find_next(target, forward),
+            // Pressing the Previous or Next button blurs the search field;
+            // the keyboard goes back to it, so Enter keeps stepping through
+            // matches instead of reaching the composer and sending the draft.
+            Action::FindNext(target, forward) => {
+                return Task::batch([
+                    self.chat_find_next(target, forward),
+                    iced::widget::operation::focus(card_control_id(target.card, "chat-find"))
+                        .map(cosmic::Action::App),
+                ]);
+            }
             Action::FindRetry(target) => return self.retry_find(target),
             Action::FindAvailable => {
                 let targets: Vec<_> = self
@@ -11926,7 +11913,6 @@ impl Cagents {
                     runtime.restore_find_disclosures();
                     runtime.find = None;
                     runtime.refresh_failure_previews();
-                    runtime.find_focused = false;
                     runtime.find_matches.clear();
                 }
                 return iced::widget::operation::focus(card_control_id(
@@ -11934,11 +11920,6 @@ impl Cagents {
                     "chat-composer",
                 ))
                 .map(cosmic::Action::App);
-            }
-            Action::FindFocused(target, focused) => {
-                if let Some(runtime) = self.chat_runtime_mut(target) {
-                    runtime.find_focused = focused;
-                }
             }
             Action::HistoryNewer(target) => {
                 if let Some(runtime) = self.chat_runtime_mut(target) {
@@ -21089,28 +21070,25 @@ mod tests {
         );
     }
 
-    /// With the find bar open, the pane's keyboard belongs to the find
-    /// field: pressing its Previous or Next button hands the keyboard back
-    /// there, not to the composer, where the next Enter would send the draft.
+    /// Pressing the find bar's Previous or Next button blurs its field; the
+    /// keyboard goes back to the field, not to the composer, where the next
+    /// Enter would send the draft. Coming back to the pane still lands in the
+    /// composer: an open find bar does not take over the pane's keyboard.
     #[test]
-    fn an_open_find_bar_keeps_the_pane_keyboard() {
+    fn stepping_through_find_matches_keeps_the_keyboard_in_the_search() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some("find-keyboard"));
         let target = chat_runtime(&app, card).target;
-        assert_eq!(
-            app.card_keyboard_focus(card),
-            card_control_id(card, "chat-composer")
-        );
         drop(find_navigation::find_for_test(
             &mut app,
             target,
             "needle".into(),
         ));
-        assert_eq!(
-            app.card_keyboard_focus(card),
-            card_control_id(card, "chat-find")
-        );
-        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        let find = card_control_id(card, "chat-find");
+        for forward in [true, false] {
+            let task = app.handle_chat_ui(Action::FindNext(target, forward));
+            assert_eq!(task_focuses(task, &find), (true, false));
+        }
         assert_eq!(
             app.card_keyboard_focus(card),
             card_control_id(card, "chat-composer")
@@ -21146,6 +21124,14 @@ mod tests {
             event: WorkspaceViewportEvent::PointerRested(first),
         });
         assert_eq!(app.workspace.focused(), Some(first));
+        // A menu flagged open in a pane without focus is not on screen, and
+        // does not hold focus.
+        app.chat_runtime_mut(target).unwrap().composer_actions = true;
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(second),
+        });
+        assert_eq!(app.workspace.focused(), Some(second));
     }
 
     fn account_commit_reply(task: Task<Message>) -> Message {
