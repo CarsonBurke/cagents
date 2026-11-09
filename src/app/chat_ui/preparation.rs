@@ -1158,7 +1158,7 @@ impl Prepared {
 }
 
 /// A single background reclaimer drops only Send data. Installed output
-/// retirement retains one of the two global parser/output permits; detached
+/// retirement retains one of its application's two parser/output permits; detached
 /// canonical owners retain their existing source/item admission until dropped.
 /// Reader Rc state and renderer trees never leave the event thread.
 struct Retired {
@@ -1814,15 +1814,15 @@ mod tests {
             |_, _| false,
         );
         let (_, shared) = job(&state);
-        let originating_workers: Arc<tokio::sync::Semaphore> = workers().clone();
+        let originating_workers: Arc<tokio::sync::Semaphore> = workers();
         let observed_workers = originating_workers.clone();
         let held = hold_retirement();
         let (report, observed) = std::sync::mpsc::channel();
         let (proceed, resumed) = tokio::sync::oneshot::channel();
         let executor_thread = std::thread::spawn(move || {
-            // This executor thread represents a different test application.
-            // Exhausting its pool must not borrow the constructing UI's pool.
-            let _foreign_application = workers().clone().try_acquire_many_owned(2).unwrap();
+            // A fresh thread is a different test application with its own
+            // pool. Exhausting that pool must not touch the constructing UI's.
+            let _foreign_application = workers().try_acquire_many_owned(2).unwrap();
             let executor = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
