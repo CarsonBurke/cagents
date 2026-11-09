@@ -1312,8 +1312,8 @@ fn a_copy_of_the_first_message_leaves_the_composer_and_other_writing_stays() {
 }
 
 /// A file choice under way when the other window's first send arrives under
-/// a new identity keeps the draft until it ends, and the chosen file, which a
-/// saved draft leaves out, comes along to the attached conversation.
+/// a new identity keeps the draft until it ends, and the chosen file comes
+/// along to the attached conversation.
 #[test]
 fn a_file_chosen_while_another_window_sends_comes_along() {
     const FILE: &str = "/repo/notes.txt";
@@ -1382,8 +1382,8 @@ fn a_file_chosen_while_another_window_sends_comes_along() {
 
 /// This window's own first message, still queued behind its provider's start
 /// when the other window's start replaces the pane, stays this window's
-/// writing: its text and its attached file, which a saved draft leaves out,
-/// are both kept for the composer that opens next.
+/// writing: its text and its attached file are both kept for the composer
+/// that opens next.
 #[test]
 fn a_file_queued_behind_this_windows_own_start_comes_along() {
     const FILE: &str = "/repo/queued.txt";

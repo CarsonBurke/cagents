@@ -7663,17 +7663,15 @@ impl Cagents {
         self.snapshot_workspace_scope();
         publish(self);
         let saved = self.persistent_workspace();
-        self.record_shared_chat_identities(Some(&saved));
+        self.record_shared_chat_identities();
         saved
     }
 
-    /// Queues the conversations shared views re-pointed chat cards to since
-    /// the last save. Every write of the window's state makes this first, then
-    /// queues itself behind them: storage refuses a write that re-points a
-    /// chat card unless the change is recorded. `saved`, the state about to be
-    /// written, is queued with them as the newest snapshot; pass `None` only
-    /// when that state must reach storage through another write.
-    pub(super) fn record_shared_chat_identities(&mut self, saved: Option<&Arc<WorkspaceState>>) {
+    /// Records the conversations shared views re-pointed chat cards to since
+    /// the last save, for the write of the window's state that has to follow:
+    /// storage refuses a write that re-points a chat card unless the change
+    /// is recorded, and that write queues them ahead of itself.
+    pub(super) fn record_shared_chat_identities(&mut self) {
         if self.shared_views.chat_adoptions.is_empty() {
             return;
         }
@@ -7681,7 +7679,7 @@ impl Cagents {
             return;
         };
         let adoptions = std::mem::take(&mut self.shared_views.chat_adoptions);
-        writer.adopt_chat_identities(adoptions.into_values(), saved.cloned());
+        writer.stage_chat_adoptions(adoptions.into_values());
     }
 
     fn commit_chat_session(&mut self, card: CardId, session: crate::chat::Session) {

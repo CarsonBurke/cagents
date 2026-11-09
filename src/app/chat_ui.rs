@@ -8065,7 +8065,7 @@ impl Cagents {
             return;
         }
         let snapshot = self.persistent_workspace();
-        self.record_shared_chat_identities(Some(&snapshot));
+        self.record_shared_chat_identities();
         if let Some(writer) = self.session.as_ref() {
             writer.replace_chat_identity(card, pending.candidate.id, current, snapshot);
         }
@@ -9155,7 +9155,7 @@ impl Cagents {
         // The composer and public source are still A. The snapshot projection
         // contains the exact candidate B and the still-editable text/images.
         let snapshot = self.persistent_workspace();
-        self.record_shared_chat_identities(Some(&snapshot));
+        self.record_shared_chat_identities();
         let writer = self.session.as_ref().expect("writer was checked above");
         // Exact replacement equality is idempotent when B already landed;
         // otherwise the original A identity must still match. This explicit

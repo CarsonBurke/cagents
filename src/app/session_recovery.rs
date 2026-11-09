@@ -207,8 +207,7 @@ impl Cagents {
                     return recovery_focus(0);
                 }
                 let snapshot = self.persistent_workspace();
-                // The snapshot reaches storage only through the recovery.
-                self.record_shared_chat_identities(None);
+                self.record_shared_chat_identities();
                 let receipt = self
                     .session
                     .as_ref()

@@ -465,9 +465,40 @@ struct QueueState {
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
     identity_replacements: HashMap<CardId, IdentityReplacement>,
+    /// Conversations shared views re-pointed chat cards to, waiting for the
+    /// write that shows them. The writer never takes them on its own: they
+    /// are queued ahead of that write under its lock, so the writer can pair
+    /// them neither with an older state that still shows the replaced
+    /// conversations nor with a state that shows a change queued after them.
+    staged_adoptions: Vec<IdentityReplacement>,
     retry_requested: bool,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
+}
+
+impl QueueState {
+    /// Queues `replacement` behind everything already offered: after the
+    /// pending snapshot while conversions are kept in order, merged with the
+    /// other pending replacements otherwise.
+    fn queue_identity_replacement(&mut self, replacement: IdentityReplacement) {
+        if self.ordered_identities {
+            if let Some(previous) = self.latest.take() {
+                self.conversions
+                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            self.conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        } else {
+            merge_identity_replacement(&mut self.identity_replacements, replacement);
+        }
+    }
+
+    /// Queues the staged adoptions ahead of the write being queued.
+    fn admit_staged_adoptions(&mut self) {
+        for adoption in std::mem::take(&mut self.staged_adoptions) {
+            self.queue_identity_replacement(adoption);
+        }
+    }
 }
 
 pub struct SessionRuntime {
@@ -610,6 +641,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.admit_staged_adoptions();
             queue.latest = Some(state);
             changed.notify_one();
         }
@@ -623,6 +655,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.admit_staged_adoptions();
             queue.ordered_identities = true;
             for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
                 queue
@@ -659,6 +692,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.admit_staged_adoptions();
             queue.ordered_identities = true;
             for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
                 queue
@@ -696,6 +730,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
+        queue.admit_staged_adoptions();
         queue.ordered_identities = true;
         for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
             queue
@@ -787,24 +822,21 @@ impl SessionRuntime {
     /// of the ones this window last saved for them, which other clients
     /// started or replaced. Snapshots refuse such a change on their own.
     ///
-    /// `state`, when given, becomes the newest snapshot under the same lock,
-    /// so the writer can't pair the adoptions with an older snapshot that
-    /// still shows the replaced conversation. A caller that passes `None`
-    /// queues the write that shows them right after, which keeps it behind
-    /// them in either queue mode.
-    pub fn adopt_chat_identities(
-        &self,
-        adoptions: impl IntoIterator<Item = ChatIdentityAdoption>,
-        state: Option<Arc<WorkspaceState>>,
-    ) {
-        self.replace_identities(
-            adoptions.into_iter().map(|adoption| IdentityReplacement {
-                card_id: adoption.card,
-                expected_terminal_id: adoption.expected,
-                replacement: Replacement::SharedChat(adoption.canonical),
-            }),
-            state,
-        );
+    /// They are staged for the next write of the window's state, which must
+    /// follow: it queues them ahead of itself under its own lock.
+    pub fn stage_chat_adoptions(&self, adoptions: impl IntoIterator<Item = ChatIdentityAdoption>) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut queue) = lock.lock()
+            && !queue.shutdown
+        {
+            queue
+                .staged_adoptions
+                .extend(adoptions.into_iter().map(|adoption| IdentityReplacement {
+                    card_id: adoption.card,
+                    expected_terminal_id: adoption.expected,
+                    replacement: Replacement::SharedChat(adoption.canonical),
+                }));
+        }
     }
 
     /// Commit an exact account transition once, in order with queued snapshots.
@@ -855,6 +887,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
+        queue.admit_staged_adoptions();
         queue.ordered_identities = true;
         for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
             queue
@@ -909,6 +942,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
+        queue.admit_staged_adoptions();
         queue.ordered_identities = true;
         for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
             queue
@@ -953,25 +987,9 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.admit_staged_adoptions();
             for replacement in replacements {
-                if queue.ordered_identities {
-                    // A state that already shows this replacement is the one
-                    // to save after it, not a write that precedes it.
-                    if let Some(previous) = queue.latest.take()
-                        && !state
-                            .as_ref()
-                            .is_some_and(|state| Arc::ptr_eq(state, &previous))
-                    {
-                        queue
-                            .conversions
-                            .push_back(ConversionCheckpoint::Snapshot(previous));
-                    }
-                    queue
-                        .conversions
-                        .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-                } else {
-                    merge_identity_replacement(&mut queue.identity_replacements, replacement);
-                }
+                queue.queue_identity_replacement(replacement);
             }
             if let Some(state) = state {
                 queue.latest = Some(state);
@@ -1120,6 +1138,9 @@ impl SessionRuntime {
     pub fn shutdown(&mut self) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock() {
+            // Nothing will write them now; what storage holds should still
+            // follow what the shared views showed.
+            queue.admit_staged_adoptions();
             queue.shutdown = true;
             changed.notify_one();
         }
@@ -3994,14 +4015,11 @@ mod tests {
             state.cards[0].kind = CardKind::Chat(theirs.clone());
             state.cards[1].kind = CardKind::Chat(mine.clone());
             let saved = Arc::new(state.clone());
-            runtime.adopt_chat_identities(
-                [ChatIdentityAdoption {
-                    card: shared,
-                    expected: shared_before.id,
-                    canonical: theirs.clone(),
-                }],
-                Some(Arc::clone(&saved)),
-            );
+            runtime.stage_chat_adoptions([ChatIdentityAdoption {
+                card: shared,
+                expected: shared_before.id,
+                canonical: theirs.clone(),
+            }]);
             runtime.replace_chat_identity(own.id, own_before.id, mine.clone(), saved);
             runtime.flush(Duration::from_secs(10)).unwrap();
             runtime.shutdown();
@@ -4025,95 +4043,110 @@ mod tests {
         }
     }
 
-    /// On the ordered lane, the state queued with adoptions is not written
-    /// ahead of a replacement queued right after with that same state, which
-    /// storage would refuse because it already shows the replacement.
+    /// Adoptions wait, out of the writer's reach, for the write that shows
+    /// them, and are queued ahead of it under the same lock: never behind an
+    /// older state that still shows the replaced conversation on its own,
+    /// nor ahead of a replacement queued with a state that shows both.
     #[test]
-    fn a_state_shared_by_adoptions_and_a_replacement_is_written_after_both() {
-        let directory = tempdir().unwrap();
-        let path = directory.path().join("shared-snapshot-order.sqlite3");
-        let store =
-            Arc::new(StateStore::open(&path, BootId::new("shared-snapshot-order")).unwrap());
-        let older = Arc::new(workspace());
-        let (health_tx, health) = async_channel::unbounded();
-        drop(health_tx);
-        let runtime = SessionRuntime {
-            queue: Arc::new((
-                Mutex::new(QueueState {
-                    latest: Some(Arc::clone(&older)),
-                    ordered_identities: true,
-                    ..QueueState::default()
-                }),
-                Condvar::new(),
-            )),
-            last_error: Arc::new(Mutex::new(None)),
-            health,
-            worker: None,
-            database_path: path,
-            restored_projects: Vec::new(),
-            restored_worktrees: Vec::new(),
-            restore_warnings: Vec::new(),
-            operation_store: store,
-        };
-        let CardKind::Terminal(terminal) = older.cards[0].kind.clone() else {
-            unreachable!()
-        };
-        let chat = crate::chat::Session {
-            native_continuity: Default::default(),
-            owned_codex_listener: None,
-            id: TerminalId::new(),
-            launch: crate::chat::Launch {
-                provider: crate::agent::Provider::Claude,
-                recipe: terminal.launch.clone(),
-                session_id: None,
-            },
-            proof: None,
-            terminal: None,
-        };
-        let (shared, own) = (CardId::new(), CardId::new());
-        let saved = Arc::new(workspace());
-        runtime.adopt_chat_identities(
-            [ChatIdentityAdoption {
+    fn adoptions_are_queued_with_the_write_that_shows_them() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("staged-adoptions.sqlite3");
+            let store = Arc::new(StateStore::open(&path, BootId::new("staged-adoptions")).unwrap());
+            let older = Arc::new(workspace());
+            let (health_tx, health) = async_channel::unbounded();
+            drop(health_tx);
+            let runtime = SessionRuntime {
+                queue: Arc::new((
+                    Mutex::new(QueueState {
+                        latest: Some(Arc::clone(&older)),
+                        ordered_identities: ordered,
+                        ..QueueState::default()
+                    }),
+                    Condvar::new(),
+                )),
+                last_error: Arc::new(Mutex::new(None)),
+                health,
+                worker: None,
+                database_path: path,
+                restored_projects: Vec::new(),
+                restored_worktrees: Vec::new(),
+                restore_warnings: Vec::new(),
+                operation_store: store,
+            };
+            let CardKind::Terminal(terminal) = older.cards[0].kind.clone() else {
+                unreachable!()
+            };
+            let chat = crate::chat::Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Claude,
+                    recipe: terminal.launch.clone(),
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            };
+            let (shared, own) = (CardId::new(), CardId::new());
+            runtime.stage_chat_adoptions([ChatIdentityAdoption {
                 card: shared,
                 expected: TerminalId::new(),
                 canonical: chat.clone(),
-            }],
-            Some(Arc::clone(&saved)),
-        );
-        runtime.replace_chat_identity(own, TerminalId::new(), chat, Arc::clone(&saved));
+            }]);
+            {
+                let queue = runtime.queue.0.lock().unwrap();
+                assert!(
+                    queue.conversions.is_empty() && queue.identity_replacements.is_empty(),
+                    "the writer cannot take a staged adoption, ordered: {ordered}"
+                );
+            }
+            let saved = Arc::new(workspace());
+            runtime.replace_chat_identity(own, TerminalId::new(), chat, Arc::clone(&saved));
 
-        let queue = runtime.queue.0.lock().unwrap();
-        let order = queue
-            .conversions
-            .iter()
-            .map(|checkpoint| match checkpoint {
-                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
-                    "older state".to_owned()
+            let queue = runtime.queue.0.lock().unwrap();
+            let name = |card: CardId| {
+                if card == shared {
+                    "adoption"
+                } else {
+                    "replacement"
                 }
-                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &saved) => {
-                    "shared state".to_owned()
-                }
-                ConversionCheckpoint::IdentityReplacement(replacement)
-                    if replacement.card_id == shared =>
-                {
-                    "adoption".to_owned()
-                }
-                ConversionCheckpoint::IdentityReplacement(replacement)
-                    if replacement.card_id == own =>
-                {
-                    "replacement".to_owned()
-                }
-                other => format!("{other:?}"),
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(order, ["older state", "adoption", "replacement"]);
-        assert!(
-            queue
-                .latest
-                .as_ref()
-                .is_some_and(|latest| Arc::ptr_eq(latest, &saved)),
-            "the shared state is written after both"
-        );
+            };
+            let order = queue
+                .conversions
+                .iter()
+                .map(|checkpoint| match checkpoint {
+                    ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
+                        "older state"
+                    }
+                    ConversionCheckpoint::IdentityReplacement(replacement) => {
+                        name(replacement.card_id)
+                    }
+                    _ => "something else",
+                })
+                .collect::<Vec<_>>();
+            if ordered {
+                assert_eq!(order, ["older state", "adoption", "replacement"]);
+            } else {
+                assert!(order.is_empty());
+                let mut merged = queue
+                    .identity_replacements
+                    .keys()
+                    .map(|card| name(*card))
+                    .collect::<Vec<_>>();
+                merged.sort_unstable();
+                assert_eq!(merged, ["adoption", "replacement"]);
+            }
+            assert!(
+                queue
+                    .latest
+                    .as_ref()
+                    .is_some_and(|latest| Arc::ptr_eq(latest, &saved)),
+                "the state that shows both is written after them, ordered: {ordered}"
+            );
+            assert!(queue.staged_adoptions.is_empty());
+        }
     }
 
     #[test]
