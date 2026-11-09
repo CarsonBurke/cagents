@@ -8,8 +8,10 @@
 #
 # Optional, with the switch on:
 #   home/.config/fixture-forge-prs.json  An array of pull requests in the shape
-#       `gh pr list --json` prints. Each repository lists those whose url is
-#       under https://github.com/OWNER/NAME/pull/, in file order.
+#       `gh pr list --json` prints, each with at least number, url, title,
+#       state, headRefName, baseRefName and updatedAt. Each repository lists
+#       those whose url is under https://github.com/OWNER/NAME/pull/, in file
+#       order.
 #   avatars/OWNER.image  Copied into the app's avatar cache, with a fresh
 #       modification time, whenever the app resolves a repository. Any PNG,
 #       JPEG, GIF or WebP up to 1 MiB and 1024x1024 pixels.
@@ -116,7 +118,11 @@ repo_view() {
         printf '%s\n' 'no git remotes found' >&2
         exit 1
     fi
-    for name in upstream github origin $(printf '%s\n' "$remotes" | grep -vx -e upstream -e github -e origin || :); do
+    # As gh does, the remote `gh repo set-default` marked comes first, then
+    # upstream, github, origin and the rest.
+    resolved=$(git config --get-regexp '^remote\..*\.gh-resolved$' 2>/dev/null |
+        sed -n 's/^remote\.\(.*\)\.gh-resolved base$/\1/p' || :)
+    for name in $resolved upstream github origin $(printf '%s\n' "$remotes" | grep -vx -e upstream -e github -e origin || :); do
         printf '%s\n' "$remotes" | grep -qxF -- "$name" || continue
         slug=$(github_slug "$(git remote get-url -- "$name")")
         if [ -n "$slug" ]; then
@@ -180,12 +186,16 @@ select_fields() {
         if type == "array" then map(pick) else pick end'
 }
 
-# A seed that is not an array of pull requests fails here, not in the app.
+# A seed the app could not parse fails here, naming the file: in the app it
+# would be a failed read, which pauses that host's refreshes. These are the
+# fields src/github.rs's PullRequest requires.
 check_seed() {
     [ -f "$pull_requests" ] || return 0
-    if ! jq -e 'type == "array" and all(.[]; type == "object" and (.url | type) == "string"
-            and (.number | type) == "number")' "$pull_requests" >/dev/null 2>&1; then
-        printf 'gh: %s must be a JSON array of pull requests, each with a number and url\n' "$pull_requests" >&2
+    if ! jq -e 'type == "array" and all(.[]; type == "object"
+            and (.number | type) == "number"
+            and all(.url, .title, .headRefName, .baseRefName, .updatedAt; type == "string")
+            and (.state | IN("OPEN", "CLOSED", "MERGED")))' "$pull_requests" >/dev/null 2>&1; then
+        printf 'gh: %s must be a JSON array of pull requests, each with a number, url, title, state (OPEN, CLOSED or MERGED), headRefName, baseRefName and updatedAt\n' "$pull_requests" >&2
         exit 1
     fi
 }
@@ -202,11 +212,17 @@ pr() {
     while [ "$#" -gt 0 ]; do
         case $1 in
             -R | --repo) need "$#" "$1"; shift; slug=${1#github.com/} ;;
+            --repo=*) slug=${1#*=}; slug=${slug#github.com/} ;;
             -s | --state) need "$#" "$1"; shift; state=$1 ;;
+            --state=*) state=${1#*=} ;;
             -H | --head) need "$#" "$1"; shift; head=$1 ;;
+            --head=*) head=${1#*=} ;;
             -A | --author) need "$#" "$1"; shift; author=$1 ;;
+            --author=*) author=${1#*=} ;;
             -L | --limit) need "$#" "$1"; shift; limit=$1 ;;
+            --limit=*) limit=${1#*=} ;;
             --json) need "$#" "$1"; shift; fields=$1 ;;
+            --json=*) fields=${1#*=} ;;
             -S | --search | -B | --base | -l | --label | -a | --assignee | --app | -q | --jq | -t | --template) need "$#" "$1"; shift ;;
             -*) ;;
             *) number=$1 ;;

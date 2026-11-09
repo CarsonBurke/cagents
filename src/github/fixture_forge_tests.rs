@@ -2,6 +2,11 @@
 //! must answer every read the sidebar, review-request poll and pull request
 //! browser make in shapes these parsers accept. Its own contract suite compares
 //! against copied strings; this runs the script through the real service.
+//!
+//! The calls mirror the app's GitHub entry points: `load_repository_github` and
+//! `attached_worktree_pull_requests` in src/app.rs, `read` in
+//! src/host/work/forge.rs, and the `GitHubReviewApi` pages. When one of them
+//! starts a new gh read, add it here and teach the forge to answer it.
 use super::*;
 use std::process::Command;
 
@@ -9,6 +14,7 @@ struct Forge {
     _root: tempfile::TempDir,
     gh: PathBuf,
     switch: PathBuf,
+    seed: PathBuf,
     project: PathBuf,
 }
 
@@ -44,6 +50,7 @@ fn forge() -> Forge {
         assert!(status.success());
     }
     Forge {
+        seed: root.path().join("home/.config/fixture-forge-prs.json"),
         _root: root,
         gh,
         switch,
@@ -128,4 +135,79 @@ fn without_its_switch_the_fixture_forge_refuses() {
         panic!("{error:?}");
     };
     assert_eq!(failure.stderr, b"gh: the fixture has no forge access\n");
+}
+
+#[test]
+fn the_fixture_forge_answers_with_a_seeded_pull_request() {
+    // The forge filters its seed with jq, as the fixture's documentation says.
+    if Command::new("jq").arg("--version").output().is_err() {
+        eprintln!("skipped: jq is not installed");
+        return;
+    }
+    let forge = forge();
+    let head = "b".repeat(40);
+    let seed = serde_json::json!([{
+        "id": "PR_kwDOFixture7",
+        "number": 7,
+        "title": "Teach the sidebar about avatars",
+        "body": "",
+        "state": "OPEN",
+        "isDraft": false,
+        "headRefName": "feature",
+        "headRefOid": head,
+        "headRepository": {"name": "fixture-app"},
+        "headRepositoryOwner": {"login": "Fixture-Owner"},
+        "baseRefName": "main",
+        "author": {"login": "fixture"},
+        "createdAt": "2026-11-01T00:00:00Z",
+        "updatedAt": "2026-11-02T00:00:00Z",
+        "url": "https://github.com/Fixture-Owner/fixture-app/pull/7",
+        "labels": [],
+    }]);
+    std::fs::write(&forge.seed, seed.to_string()).unwrap();
+    let service = GitHubService::system(&forge.gh);
+    let cancellation = CancellationToken::new();
+    let key = service
+        .resolve_repository(&forge.project, &[], &cancellation)
+        .unwrap();
+
+    let request = ListPullRequestsRequest {
+        repository: key.clone(),
+        state: PullRequestStateFilter::Open,
+        limit: 30,
+    };
+    let listed = service.list(&request, &cancellation).unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].title, "Teach the sidebar about avatars");
+    let authored = service
+        .list_authored(
+            &AuthoredPullRequestsRequest {
+                repository: key.clone(),
+                state: PullRequestStateFilter::Open,
+                limit: 30,
+                review: true,
+            },
+            &cancellation,
+        )
+        .unwrap();
+    assert_eq!(authored.len(), 1);
+
+    let viewed = service
+        .view(&PullRequestKey::new(key.clone(), 7).unwrap(), &cancellation)
+        .unwrap();
+    assert_eq!(
+        (viewed.number, viewed.head_ref_oid.as_str()),
+        (7, head.as_str())
+    );
+    let attached = service
+        .resolve_branch_head(&key, &key, "feature", &head, &cancellation)
+        .unwrap()
+        .expect("the seeded pull request of the checkout's branch");
+    assert_eq!(attached.number, 7);
+    assert!(
+        service
+            .resolve_branch_head(&key, &key, "other", &head, &cancellation)
+            .unwrap()
+            .is_none()
+    );
 }

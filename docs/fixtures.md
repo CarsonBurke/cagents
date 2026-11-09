@@ -56,8 +56,11 @@ The app shows GitHub state, including a project's owner avatar in the sidebar,
 only once `gh` reports the project's repository as signed in and readable.
 The fixture's `gh` is [`tests/fixtures/fixture-gh.sh`](../tests/fixtures/fixture-gh.sh),
 the same file on both sides. It refuses every command until
-`$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge` exists; it reads the
-switch on every call, so a step can turn it on in a running session. Then it
+`$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge` exists. That is the
+fixture HOME's `.config`, not the app's `XDG_CONFIG_HOME`, which is the
+fixture's `config/`, so no app setting can switch it on. The fixture creates
+the directory; the forge reads the switch on every call, so a step can turn it
+on in a running session. Then it
 answers as a gh signed in to github.com as `fixture`, whose repositories have
 no pull requests and no review requests:
 
@@ -65,7 +68,7 @@ no pull requests and no review requests:
 | --- | --- |
 | `gh auth status --json hosts`, with or without `--hostname` | a successful `fixture` account for github.com; `{"hosts":{}}` for any other host |
 | `gh repo view --json nameWithOwner,url` | the repository of the checkout's first github.com remote, in gh's order (`upstream`, `github`, `origin`, then the rest), or gh's own error when there is none |
-| `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below |
+| `gh pr list ... --json FIELDS` | `[]`, or the seeded pull requests below; `--author @me` means `fixture` |
 | `gh pr view N` | a seeded pull request, or gh's error for an unknown number |
 | `gh pr checks N` | gh's `no checks reported` for a seeded pull request, which the app reads as no checks |
 | `gh api graphql` | empty pages for the review-request poll, the pull request browser and its search; not found for a pull request's own queries |
@@ -76,7 +79,11 @@ shows as connected to GitHub only when its checkout has a github.com remote,
 so add one: `git remote add origin https://github.com/OWNER/NAME`. The fixture
 sets `GIT_ALLOW_PROTOCOL=file`, so Git never fetches from or pushes to it.
 
-Avatars never come from the network: the fixture's `curl` always fails. Put an
+Whether or not the switch is on, the fixture's `curl` always fails and Git
+reaches only local paths, so a step cannot download a file or clone over https;
+copy what it needs from the host's disk instead.
+
+Avatars never come from the network. Put an
 image at `$CAGENTS_EVIDENCE_FIXTURE/avatars/OWNER.image`, PNG, JPEG, GIF or
 WebP, at most 1 MiB and 1024×1024 pixels. Each time the app resolves a
 repository, the forge copies every seed into the app's avatar cache,
@@ -88,19 +95,29 @@ and the switch, and remembers a missing one until it restarts.
 
 For pull request rows, `home/.config/fixture-forge-prs.json` holds an array in
 the shape `gh pr list --json` prints; copy the fields of `PR_VIEW_FIELDS` in
-`src/github.rs` and the examples in its tests. Each repository lists the
+`src/github.rs` and the examples in its tests. Each entry needs at least
+`number`, `url`, `title`, `state` (`OPEN`, `CLOSED` or `MERGED`),
+`headRefName`, `baseRefName` and `updatedAt`, as the app's parser does; the
+forge refuses a file without them, naming it, instead of letting the app fail
+to parse it. Each repository lists the
 entries whose `url` is under `https://github.com/OWNER/NAME/pull/`, filtered by
-`--state`, `--head`, `--author` and `--limit`. Reading the file needs `jq`.
+`--state`, `--head`, `--author` and `--limit`, in file order rather than
+gh's newest first. Reading the file needs `jq`.
 The pull request browser still lists none of them. Opening one's review needs
 its conversation queries, which the forge answers as not found; like any failed
 GitHub read, that pauses the app's GitHub refreshes for a while.
 
-A steps file for a sidebar with an avatar:
+A steps file for a sidebar with an avatar. It turns the switch on before the
+project gets its github.com remote, since a read that fails while the remote
+is there makes the app wait 30 seconds or more before the next. `{fixture}`
+is replaced only on the `--remote` route, in forwarded commands and `pair`
+steps; typing these commands into `scripts/native-evidence` on the host
+itself, write `"$CAGENTS_EVIDENCE_FIXTURE"` inside `env sh -c` instead.
 
 ```sh
+evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge"'
 evidence env sh -c 'magick -size 64x64 gradient:"#2f6feb"-"#a371f7" "png:$CAGENTS_EVIDENCE_FIXTURE/avatars/octo-org.image"'
 evidence env git -C '{fixture}/project' remote add origin https://github.com/octo-org/fixture-app
-evidence env sh -c 'touch "$CAGENTS_EVIDENCE_FIXTURE/home/.config/fixture-forge"'
 evidence cli project open '{fixture}/project'
 # The app reads GitHub in the background; give it time before the shot.
 sleep 12

@@ -1148,6 +1148,9 @@ class Evidence(unittest.TestCase):
         # As gh does, an upstream remote names the base repository over origin.
         self.fixture_shell("git remote add upstream https://github.com/upstream-org/app")
         self.assertEqual(json.loads(self.fixture_shell(view).stdout)["nameWithOwner"], "upstream-org/app")
+        # And the remote `gh repo set-default` marked comes before both.
+        self.fixture_shell("git config remote.origin.gh-resolved base")
+        self.assertEqual(json.loads(self.fixture_shell(view).stdout)["nameWithOwner"], "Octo-Org/my.app")
 
     def test_the_forge_seeds_owner_avatars_into_the_apps_cache(self) -> None:
         self.built()
@@ -1194,6 +1197,7 @@ class Evidence(unittest.TestCase):
         self.assertEqual(numbers("--state all --limit 1 --json number"), [7])
         self.assertEqual(numbers("--state all --head done --json number"), [8])
         self.assertEqual(numbers("--state all --author @me --json number"), [7])
+        self.assertEqual(numbers("--state=all --head=done --json=number"), [8])
         # Only the requested fields, as gh prints them.
         self.assertEqual(json.loads(self.fixture_shell(
             f"gh pr view 7 {selector} --json number,headRefName").stdout),
@@ -1206,6 +1210,14 @@ class Evidence(unittest.TestCase):
         malformed = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
         self.assertEqual(malformed.returncode, 1)
         self.assertIn("fixture-forge-prs.json must be a JSON array", malformed.stderr)
+        # So does one missing a field the app requires, or with a state gh never prints.
+        complete = {**pull, "number": 7, "title": "Open", "state": "OPEN", "headRefName": "feature",
+                    "url": "https://github.com/octo-org/app/pull/7"}
+        for broken in ({k: v for k, v in complete.items() if k != "title"}, {**complete, "state": "open"}):
+            (fixture / "home" / ".config" / "fixture-forge-prs.json").write_text(json.dumps([broken]))
+            refused = self.fixture_shell(f"gh pr list {selector} --json number", check=False)
+            self.assertEqual(refused.returncode, 1, broken)
+            self.assertIn("title, state (OPEN, CLOSED or MERGED), headRefName", refused.stderr)
 
     def test_a_forgotten_session_releases_the_lock_at_its_limit(self) -> None:
         self.built()
