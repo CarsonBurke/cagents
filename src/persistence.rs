@@ -328,7 +328,8 @@ pub struct RetainedChatCopy {
     pub source: crate::chat::Session,
     pub copy: CardState,
     pub draft: String,
-    /// Exact managed-image draft metadata, committed with this inert copy.
+    /// The draft's exact attachments, committed with this inert copy: managed
+    /// images with their receipts, and the files it names by path.
     /// Empty omission preserves the digest of pre-image retained-copy receipts.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachments: Vec<crate::chat::Attachment>,
@@ -351,10 +352,12 @@ impl RetainedChatCopy {
             ));
         }
         let mut identities = std::collections::HashSet::new();
-        for attachment in &self.attachments {
-            let reference = attachment.reference.as_ref().ok_or_else(|| {
-                invalid_state!("Retained image copies require explicit image identity")
-            })?;
+        // A file the person chose has no identity beyond its path.
+        for reference in self
+            .attachments
+            .iter()
+            .filter_map(|attachment| attachment.reference.as_ref())
+        {
             reference.validate().map_err(|message| {
                 StoreError::InvalidState(Violation::new(
                     "Retained image copy has an invalid image reference",
@@ -406,7 +409,7 @@ impl RetainedChatCopy {
             .is_some_and(|attachments| attachments != &self.attachments)
         {
             return Err(invalid_state!(
-                "Retained chat copy images changed before saving"
+                "Retained chat copy attachments changed before saving"
             ));
         }
         state.chat_drafts.insert(self.copy.id, self.draft.clone());
@@ -5398,7 +5401,7 @@ fn load_workspace_manifest_connection(
             connection,
             &format!("workspace:{id}:navigation:chat_draft_attachments"),
         )?
-        .map(|value| from_json("workspace chat image drafts", &value))
+        .map(|value| from_json("workspace chat draft attachments", &value))
         .transpose()?
         .unwrap_or_default(),
         local_only_cards: metadata(
@@ -7647,7 +7650,11 @@ mod tests {
                 source: source.clone(),
                 copy: card,
                 draft: "Exact saved text  \nsecond line 🦀".into(),
-                attachments: vec![retained_image_fixture(29)],
+                // A chosen file is kept beside the managed image (#2202).
+                attachments: vec![
+                    retained_image_fixture(29),
+                    crate::chat::Attachment::file("/project/notes.txt"),
+                ],
                 scope: None,
                 channel: None,
             };
@@ -7669,6 +7676,7 @@ mod tests {
                 "image-path",
                 "image-label",
                 "image-duplicate",
+                "file-path",
                 "source",
                 "descriptor",
                 "origin",
@@ -7681,6 +7689,7 @@ mod tests {
                     "image-path" => changed.attachments[0].path = "/other/image.png".into(),
                     "image-label" => changed.attachments[0].reference.as_mut().unwrap().number += 1,
                     "image-duplicate" => changed.attachments.push(changed.attachments[0].clone()),
+                    "file-path" => changed.attachments[1].path = "/project/other.txt".into(),
                     "source" => {
                         changed
                             .source

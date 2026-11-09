@@ -34,7 +34,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=20
+gate_version=21
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -411,9 +411,56 @@ cpu_allows() {
     if [ "$pressure_announced" = false ]; then
         printf '%s: CPUs busy (%s%% pressure, limit %s%%); waiting to start beside the running builds\n' \
             "$program" "$some" "$pressure_limit" >&2
+        # What else holds them is named once the decision is released.
+        culprits_due=yes
+        culprit_holders=$claims
         pressure_announced=true
     fi
     return 1
+}
+
+# Names what holds the CPUs besides the running builds, once a CPU wait has
+# been announced: a runaway loop otherwise looks like builds. Sampling takes a
+# second, so it runs once per wait, with the host's decision and the slot
+# released, so no other family's build waits it out, and the helper holds no
+# lock descriptor. This gate keeps its place at the head of its family's
+# queue meanwhile, as it does throughout its wait. The running
+# builds are their holders in `culprit_holders` and whatever holds this
+# family's slots, such as a plain `flock`.
+name_culprits() {
+    [ -n "$culprits_due" ] || return 0
+    culprits_due=
+    [ -x "$here/cargo-offload" ] || return 0
+    set --
+    for claim in $culprit_holders; do
+        holder=${claim%%:*}
+        [ "$holder" = 0 ] || set -- "$@" "$holder"
+    done
+    other=0
+    while [ "$other" -lt "$slots" ]; do
+        set -- "$@" "$(slot_path "$other")"
+        other=$((other + 1))
+    done
+    # Where a workload left running can be bounded to its session: beside
+    # this gate, or in the checkout it runs for, when that is this project's.
+    bounded=$here/bounded
+    if [ ! -x "$bounded" ]; then
+        top=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; git rev-parse --show-toplevel) || top=
+        bounded=
+        [ -z "$top" ] || [ ! -f "$top/scripts/cargo-gate" ] || bounded=$top/scripts/bounded
+    fi
+    if [ -x "$bounded" ]; then
+        set -- --bounded "$bounded" "$@"
+    fi
+    # Reading a process stuck on a hung mount can block, so the sample has a
+    # limit, where the host has timeout(1).
+    if command -v timeout >/dev/null 2>&1; then
+        set -- timeout 10 "$here/cargo-offload" --busiest "$@"
+    else
+        set -- "$here/cargo-offload" --busiest "$@"
+    fi
+    culprits=$(exec 6>&- 7>&- 8>&- 9>&- </dev/null 2>/dev/null; exec "$@") || culprits=
+    [ -z "$culprits" ] || printf '%s: %s\n' "$program" "$culprits" >&2
 }
 
 # Whether memory has room for one more build beside running ones: tasks are
@@ -686,6 +733,7 @@ memory_fits() {
 acquire() {
     announced=false
     pressure_announced=false
+    culprits_due=
     memory_announced=false
     waited_since=$(date +%s)
     waiter=
@@ -740,6 +788,7 @@ acquire() {
             decided
             flock -u 9
             exec 9>&-
+            name_culprits
             sleep 0.5
             continue
         fi
@@ -779,6 +828,7 @@ acquire() {
         done
         [ "$fit" != no ] || record_refusal
         decided
+        name_culprits
         announce
         sleep 0.2
     done

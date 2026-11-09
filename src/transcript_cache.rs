@@ -202,8 +202,20 @@ pub(crate) fn sweep(root: &Path) -> io::Result<Usage> {
     sweep_with_procfs(root, Path::new("/proc"))
 }
 
+/// How long a dead helper's undrained journal stays as evidence after its
+/// last write. Nothing reopens such a journal (each helper creates its own
+/// exclusively), so after this it only holds RAM in the runtime directory.
+#[cfg(feature = "host")]
+pub(crate) const ORPHANED_JOURNAL_RETENTION: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+
 #[cfg(feature = "host")]
 fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
+    sweep_at(root, proc_root, std::time::SystemTime::now())
+}
+
+#[cfg(feature = "host")]
+fn sweep_at(root: &Path, proc_root: &Path, now: std::time::SystemTime) -> io::Result<Usage> {
     let gate = private_file(&root.join("transcript-cache.lock"))?;
     lock(&gate, libc::LOCK_EX)?;
     let directories = cache_directories(root)?;
@@ -232,7 +244,10 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
             Err(error) => return Err(error),
         }
-        if !actor_journal::reclaimable(&directory)? {
+        // The lease is ours, so no helper or store owns this cache now.
+        if !actor_journal::reclaimable(&directory)?
+            && !actor_journal::orphan_expired(&directory, now, ORPHANED_JOURNAL_RETENTION)?
+        {
             continue;
         }
         let mut entries = match fs::read_dir(&directory) {
@@ -271,6 +286,35 @@ fn sweep_with_procfs(root: &Path, proc_root: &Path) -> io::Result<Usage> {
 /// after a hang guard instead of blocking the test forever.
 #[cfg(all(test, feature = "host"))]
 pub(crate) fn sweep_reclaiming(root: &Path, proc_root: &Path, directory: &Path) -> Usage {
+    sweep_reclaiming_at(root, proc_root, directory, std::time::SystemTime::now)
+}
+
+/// Waits until no descriptor holds `directory`'s lease, failing after a hang
+/// guard. A fork can copy the lease again afterwards, so this only makes a
+/// keep caused by a stray copy unlikely; it does not exclude it.
+#[cfg(all(test, feature = "host"))]
+pub(crate) fn wait_unleased(directory: &Path) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let probe = private_file(&directory.join(LEASE)).unwrap();
+    while let Err(error) = lock(&probe, libc::LOCK_EX | libc::LOCK_NB) {
+        assert_eq!(error.raw_os_error(), Some(libc::EWOULDBLOCK), "{error}");
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{} stayed leased",
+            directory.display()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// [`sweep_reclaiming`] with the sweep's clock supplied by `now`.
+#[cfg(all(test, feature = "host"))]
+pub(crate) fn sweep_reclaiming_at(
+    root: &Path,
+    proc_root: &Path,
+    directory: &Path,
+    now: impl Fn() -> std::time::SystemTime,
+) -> Usage {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
     let mut swept = Usage::default();
     for _ in 0..100 {
@@ -285,7 +329,7 @@ pub(crate) fn sweep_reclaiming(root: &Path, proc_root: &Path, directory: &Path) 
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         drop(probe);
-        let attempt = sweep_with_procfs(root, proc_root).unwrap();
+        let attempt = sweep_at(root, proc_root, now()).unwrap();
         swept.count += attempt.count;
         swept.bytes += attempt.bytes;
         if !directory.exists() {

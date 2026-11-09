@@ -280,6 +280,7 @@ impl Cagents {
                 .queued_card_closes
                 .iter()
                 .any(|queued| queued.card == card)
+            || self.chat_close_asked(card)
     }
 
     /// The daemon has been asked to close this pane's terminal and hasn't said
@@ -336,6 +337,15 @@ impl Cagents {
     }
 
     fn close_card_as(&mut self, card: CardId, allow_active: bool, unasked: bool) -> Task<Message> {
+        // Any pane waits behind a chat's question, so no second dialog opens
+        // underneath it and takes its keys.
+        if self.chat_close_asked(card) {
+            return Task::none();
+        }
+        if self.chat_close_dialog_visible() {
+            self.queue_card_close(card, unasked);
+            return Task::none();
+        }
         if self.pane_transfer_pending(card) {
             self.status = Some(TransientNotice::warning(
                 "This pane is moving to a channel. Wait for the move to finish before closing it.",
@@ -430,6 +440,9 @@ impl Cagents {
                 return close_focus(0);
             }
             return self.start_terminal_close(allow_active);
+        }
+        if !unasked && let Some(asked) = self.ask_before_chat_close(card) {
+            return asked;
         }
         self.request_card_removal(card)
     }

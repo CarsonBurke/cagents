@@ -7,6 +7,7 @@ mod branch_ui;
 mod browser_import_ui;
 mod channel_ui;
 mod channel_work;
+mod chat_close;
 mod chat_ui;
 mod chrome_ui;
 mod daemon_health_ui;
@@ -2851,6 +2852,8 @@ fn user_message_blocked_during_update(message: &Message) -> bool {
                 | Message::CommitClose(_)
                 | Message::ConfirmTerminalClose
                 | Message::CancelTerminalClose
+                | Message::ConfirmChatClose
+                | Message::CancelChatClose
                 | Message::TerminalCloseDontAskChanged(_)
                 | Message::SaveAndCloseRepository(_)
                 | Message::OverwriteAndCloseRepository(_)
@@ -4451,6 +4454,8 @@ pub enum Message {
     CommitClose(CardId),
     ConfirmTerminalClose,
     CancelTerminalClose,
+    ConfirmChatClose,
+    CancelChatClose,
     TerminalCloseDontAskChanged(bool),
     TerminalCloseFinished {
         card: CardId,
@@ -5370,6 +5375,7 @@ pub struct Cagents {
     /// Opening or dismissing a newer draft supersedes in-flight draft recovery.
     pull_request_dialog_generation: u64,
     dirty_repository_close: Option<DirtyRepositoryClose>,
+    chat_close_confirm: Option<chat_close::ChatCloseConfirm>,
     transient_work_close: Option<window::Id>,
     automation_close_generation: u64,
     terminal_close: Option<terminal_close::CloseIntent>,
@@ -12742,6 +12748,7 @@ impl Cagents {
             || self.chat_ui.image_viewer.is_some()
             || self.terminal_paste.is_some()
             || self.terminal_close_dialog_visible()
+            || self.chat_close_dialog_visible()
             || self.settings_reset_confirm
             || self.project_ui.modal_open()
             || self.channel_ui.modal_open()
@@ -14363,6 +14370,7 @@ impl Cagents {
             && !self.daemon_health_ui.confirmation
             && self.update_ui.confirmation.is_none()
             && !self.terminal_close_dialog_visible()
+            && !self.chat_close_dialog_visible()
     }
 
     fn close_settings_reset(&mut self) -> Task<Message> {
@@ -14677,6 +14685,7 @@ impl Application for Cagents {
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
+            chat_close_confirm: None,
             transient_work_close: None,
             automation_close_generation: 0,
             terminal_close: None,
@@ -14855,6 +14864,17 @@ impl Application for Cagents {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if let Some(settled) = self.settle_chat_close_confirm() {
+            // An answer to the question that just ended must not answer the
+            // next one, which the reader has not seen.
+            if matches!(
+                message,
+                Message::ConfirmChatClose | Message::CancelChatClose
+            ) {
+                return settled;
+            }
+            return Task::batch([settled, self.update(message)]);
+        }
         // Pane callbacks retain their rendering origin while queued. Unwrap
         // once before all message-dependent policy and completion bookkeeping.
         let (message, pane_origin) = match message {
@@ -16905,12 +16925,14 @@ impl Application for Cagents {
                     .is_some_and(|state| matches!(state.kind, CardKind::Chat(_)))
                     || self.chat_has_parked_runtime(id) =>
             {
-                self.begin_chat_close(id)
+                self.request_chat_close(id)
             }
             Message::CloseCard(id) => self.begin_card_close(id),
             Message::CloseCardUnasked(id) => self.close_card_unasked(id),
             Message::ConfirmTerminalClose => self.confirm_terminal_close(),
             Message::CancelTerminalClose => self.cancel_terminal_close(),
+            Message::ConfirmChatClose => self.confirm_chat_close(),
+            Message::CancelChatClose => self.cancel_chat_close(),
             Message::TerminalCloseDontAskChanged(value) => {
                 if let Some(intent) = self.terminal_close.as_mut()
                     && !intent.pending
@@ -17754,6 +17776,17 @@ impl Application for Cagents {
                 if is_escape_press(&event) && self.form_dialog_on_top() {
                     return self.cancel_form_dialog();
                 }
+                // A close question opens over the composer or terminal it asks
+                // about, which keeps its focus and captures Escape under the
+                // dialog. The question answers it all the same.
+                if is_escape_press(&event) && self.update_ui.confirmation.is_none() {
+                    if self.terminal_close_dialog_visible() {
+                        return self.cancel_terminal_close();
+                    }
+                    if self.chat_close_dialog_visible() {
+                        return cosmic::task::message(Message::CancelChatClose);
+                    }
+                }
                 if self.form_dialog_on_top()
                     && let Some(task) = self.resume_key_event(&event)
                 {
@@ -17805,6 +17838,9 @@ impl Application for Cagents {
                     if self.terminal_close_dialog_visible() {
                         return self.cancel_terminal_close();
                     }
+                    if self.chat_close_dialog_visible() {
+                        return cosmic::task::message(Message::CancelChatClose);
+                    }
                     if self.sidebar_state.pending_discard().is_some() {
                         return cosmic::task::message(Message::Sidebar(
                             SidebarAction::CancelDiscard,
@@ -17852,6 +17888,9 @@ impl Application for Cagents {
                     && self.terminal_close_dialog_visible()
                 {
                     return self.cycle_terminal_close_focus(backwards);
+                }
+                if is_tab_press(&event).is_some() && self.chat_close_dialog_visible() {
+                    return self.cycle_chat_close_focus();
                 }
                 if let Some(backwards) = is_tab_press(&event)
                     && self.dirty_repository_close.is_some()
@@ -18758,6 +18797,9 @@ impl Application for Cagents {
         }
         if let Some(dialog) = self.update_dialog() {
             return Some(dialog);
+        }
+        if self.chat_close_dialog_visible() {
+            return Some(self.chat_close_dialog());
         }
         if let Some(intent) = &self.terminal_close
             && self.terminal_close_dialog_visible()
@@ -30599,6 +30641,7 @@ mod tests {
             pull_request_dialog: None,
             pull_request_dialog_generation: 0,
             dirty_repository_close: None,
+            chat_close_confirm: None,
             transient_work_close: None,
             automation_close_generation: 0,
             terminal_close: None,

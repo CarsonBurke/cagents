@@ -5,6 +5,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 ## Deliver changes through pull requests
 
 - Use Issues, worktrees and PRs to manage your work.
+- Many agents share one GitHub account and its API limits. Poll CI and PR state at most every two minutes, keep at most one watch per PR, and prefer a single `gh` call that returns several fields over repeated calls. When GitHub reports a rate limit, wait for the reset shown by `gh api rate_limit` instead of retrying.
 - Do your work in PRs against `main`.
 - The lead owns the complete user outcome through implementation, independent review, validation and merge. Give parallel workers explicit boundaries; review the assembled experience before calling it ready. A subtask passing tests does not establish that the feature works well.
 - For a change people interact with, state the user's task and intended before/after behavior in the PR. Follow the latest approved design and corrections across the affected flow; preserve necessary controls and information when simplifying it.
@@ -13,7 +14,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 ## Pull request screenshots
 
 - PRs that change something people see must include before and after screenshots in the PR description. Use only two side-by-side image columns, labeled Before and After; put the page or interaction-state description beneath each pair. Do not add a State, explanation, or other text column beside the images: it reduces their display size.
-- Capture each pair through the actual native app, using the development runner, with the same viewport, scale, theme, data, and interaction state. `scripts/native-evidence` does this from an SSH shell; see `docs/development.md`. Identify the before revision and the tested after head. Capture the affected states, including expanded, empty, error, and narrow layouts when the change affects them.
+- Capture each pair through the actual native app, using the development runner, with the same viewport, scale, theme, data, and interaction state. `scripts/native-evidence` does this from an SSH shell; see `docs/development.md`. A hosted agent runs it over plain `ssh fw16`: its own shell carries `CAGENTS_AGENT_AUTHORITY`, which the script refuses. Never unset, strip or forward that authority to get past a refusal. Identify the before revision and the tested after head. Capture the affected states, including expanded, empty, error, and narrow layouts when the change affects them.
 - Save images as WebP with descriptive names such as `before-channel-prs.webp` and `after-channel-prs.webp`. Check that they show the intended change and contain no secrets or private user content.
 - Keep screenshots off the product PR branch. Commit only the images under `pr-screenshots/` on a separate `<branch>-screenshots` branch, and embed immutable links in the description: `https://github.com/CarsonBurke/cagents/blob/<sha>/pr-screenshots/<name>.webp?raw=true`. Keep the screenshot branch so the images remain reachable.
 - Refresh the comparison when a later change alters the visible result. If a state could not be captured, say exactly what is missing; mockups and component-rendered fixtures must be labeled and do not establish actual native UI validation. Fixtures loaded into the running native app can validate interaction; identify which provider or production behavior they do not exercise.
@@ -42,6 +43,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 
 ## Run the application through the development runner
 
+- Run native instances, profiling and measurements on fw16 where possible, keeping this host free for the user.
 - Use `scripts/run-development --browserless` for ordinary UI, session, sidebar, settings, and terminal work.
 - Use `scripts/run-development` when the changed behavior requires the embedded browser.
 - Do not use a direct `cargo run` as the normal UI workflow. The runner builds the three matched executables with separate feature sets, then selects the isolated development application ID, state, and daemon.
@@ -61,6 +63,7 @@ You are a senior app developer tasked with creating a great Agent Development En
 - A bare `cargo test` runs only the shared CLI lane: the `ui` and `host` unit tests and every gated integration target are compiled out under the default `full` feature. Run `scripts/cargo-gate test --locked --no-default-features --all-targets`, then the same with `--features host` and with `--features ui`, to cover the boundaries the change touches.
 - For UI changes, launch the actual native UI with the development runner and exercise the changed path. A successful compile alone is insufficient.
   - If you need live testing with an agent (fixture isn't sufficient) you must use the cheapest model, such as haiku/luna on low reasoning.
+- Fixtures, fake providers and the development runner are yours to maintain, like product code. When one is missing a state, is flaky, leaks processes or refuses a legitimate use, fix or extend it in your PR rather than working around it, and leave it easier for the next agent. Point fixture providers at their own config directory; never write fixture files into the real `~/.claude` or `~/.codex`.
 - For browser or feature-boundary changes, verify both browserless and integrated lanes.
 - Use `scripts/check-format` after Rust edits. It checks Cargo roots and the Rust source trees hidden behind `include!` macros without rewriting files.
 

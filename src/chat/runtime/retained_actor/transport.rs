@@ -606,6 +606,16 @@ impl RemoteActor {
         validate_evidence_record(record, proof)?;
         super::execution_exit::abandoned(&record.holder, &record.root)
     }
+    /// Release the transcript a verified retirement's final receipt no longer
+    /// needs. Returns the bytes released; anything not yet retired is kept.
+    pub fn compact_retired_receipt(
+        record: &Record,
+        proof: &HostSessionProof,
+    ) -> Result<u64, String> {
+        authorize_reader(proof)?;
+        validate_evidence_record(record, proof)?;
+        final_snapshot::compact_retired(record, proof)
+    }
     pub fn retired_actor_receipt(
         record: &Record,
         proof: &HostSessionProof,

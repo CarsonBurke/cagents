@@ -139,7 +139,11 @@ scripts/run-development                 # with the embedded browser
 | `--log-file PATH` | Write UI tracing and panic output to `PATH` (relative to the calling directory); build diagnostics stay in the terminal |
 | `--instance NAME` | Run an isolated instance in a headless niri-harness session; see [Parallel instances](#parallel-instances) |
 | `--stop-instance NAME` | Stop that instance's daemon, its jobs and its harness session; keep its storage |
-| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
+| `--list-instances` | List the development daemons running on this computer, with checkout, age, instance, who started them, when they stop and how to stop them; see [Finding and stopping instances](#finding-and-stopping-instances) |
+| `--keep` | With `--instance`: keep the instance after the session that started it ends; see [How long an instance runs](#how-long-an-instance-runs) |
+| `--ttl SECONDS` | With `--instance`: stop the instance that long after it starts |
+| `--gc` | Stop instances whose starter ended longer ago than their grace period, other than kept ones, and clear what dead harness sessions left. Fails without stopping anything or removing storage when `niri-harness list` fails |
+| `--storage DAYS` | With `--gc`: also delete the storage of instances that are not running and that nothing touched for `DAYS` days |
 | `-- ARGS...` | Pass remaining arguments to the UI |
 
 ```sh
@@ -251,8 +255,9 @@ what `niri-harness exec` provides.
 Stopping a harness session deletes its runtime directory, so stop an instance
 with `--stop-instance`, which stops its daemon first. `niri-harness stop` alone
 leaves that daemon running without a socket. An instance's storage remains
-for its next launch; delete `~/.local/share/cagents-development-NAME` and its
-config and state siblings to discard it.
+for its next launch; `--gc --storage DAYS` deletes what has gone unused, or
+delete `~/.local/share/cagents-development-NAME` and its config, state and
+cache siblings to discard one.
 
 #### Stopping instances from a cagents session
 
@@ -298,6 +303,7 @@ pr2064, pid 1118559, running 02:17:40
   checkout:   /home/me/cagents/.worktrees/pr2064
   runtime:    /run/user/1000/nh-MwPpz5r1
   started by: claude (pid 2417058), which has ended, in a cagents session
+  lifetime:   stops 600 seconds after its starter ends
   stop:       scripts/run-development --stop-instance pr2064
 ```
 
@@ -315,9 +321,57 @@ whose hosts can't be told, it offers none. It finds development daemons by the
 instance lock they hold, so it also lists those built outside a checkout's
 `target/`.
 
-An instance keeps running when the session that started it ends, so that
-another agent or a person can go on using it. Stop it when you're done, and
-check `--list-instances` for instances left behind.
+#### How long an instance runs
+
+An instance stops by itself 10 minutes after the session that started it ends:
+the agent's provider process for a hosted caller, otherwise the shell that ran
+the runner. The grace period is meant to leave an instance alone while its
+agent moves on to its next step. A restarted provider is a new process,
+though, so the instance doesn't pass to it: it still stops 10 minutes after the
+first one ended. Outside a cagents session the starter is the runner's parent
+process. A tool that runs each command in a shell of its own, as an agent in a
+plain terminal does, ends that shell as soon as the command returns, so its
+instance stops 10 minutes later; start it with `--keep` or `--ttl` instead. `CAGENTS_INSTANCE_GRACE_SECONDS` changes the 10 minutes for
+the instances a launch starts.
+
+- `--keep` keeps it until someone stops it, so another agent or a person can
+  go on using it. Use it when you start an instance for someone else, or
+  from a one-shot shell such as `ssh fw16 'scripts/run-development ...'`, whose
+  shell ends at once.
+- `--ttl SECONDS` stops it that long after it starts, kept or not, which suits
+  a measurement or a review with a known length.
+
+A watcher that the launch leaves detached applies this every 30 seconds, and
+ends with the session however that ends. Each stop is logged, with its
+reason, in `~/.local/state/cagents-development-NAME/run-development.log`. The
+watcher doesn't ask the daemon to stop, as `--stop-instance` does, because the
+CLI that would ask may no longer be able to tell its hosts. Instead it sends
+`TERM`, the signal `daemon stop-for-rebuild` sends, to every process started
+with the instance's runtime directory. Ten seconds later it sends `KILL` to
+what remains, then stops the harness session and removes the runtime
+directory. Jobs the daemon started in systemd scopes of their own are found
+the same way, by that directory in their environment. Their scopes are not
+stopped as units, so a job that cleared its environment is missed. An instance started with
+`--keep` and no `--ttl` has no watcher.
+
+The next `--instance` launch and `--gc` repair what a watcher could not:
+
+- A harness session that ended without being stopped, such as a killed
+  compositor, is cleared: what still runs in its runtime is stopped and the
+  directory removed, so the name can be launched again rather than refused.
+  A session that changed in the last minute may still be starting, so it is
+  left alone, as `niri-harness gc` does.
+- An instance whose watcher was killed is stopped once its lifetime has
+  passed, measured from its start.
+- `--gc` also stops instances started by older runners, which recorded no
+  lifetime, once their starter has ended; it names any running instance with
+  no record at all, and leaves it.
+
+None of them stops an instance whose daemon hosts the caller, or one that a
+session it descends from runs in; a hosted caller whose hosts can't be told
+stops nothing. `--gc --storage 14` also deletes the storage of instances that
+aren't running and that nothing touched for 14 days. An instance counts as
+running while its harness session is live or any process was started for it.
 
 Instances started from one checkout run that checkout's executables, so start
 them all in the same lane: all `--browserless` or all integrated. The two lanes
@@ -427,8 +481,64 @@ the last 10 seconds in which some task waited for a CPU) is below 60%
 (`CAGENTS_BUILD_CPU_PRESSURE`; `0` disables this check and the next), and not
 within 10 seconds of the newest build starting
 (`CAGENTS_BUILD_CPU_SETTLE_SECS`), before that 10 second average can show it. A
-host that does not report pressure is treated as having room. Each build has an
-expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
+host that does not report pressure is treated as having room.
+
+When a build starts waiting for CPU, the gate says what holds the CPUs. Once
+it has released its admission decision, it samples the host's processes for
+about a second. It reports how many CPUs the running builds use and how many
+everything else uses. It then names up to three process sessions outside the
+builds that use at least half a CPU each, and the kernel's own threads when
+they do. For each session it gives the command that started it and how long
+ago, the CPUs it uses, how many processes it has and its busiest process. If
+the session's leader has exited, it says so. Other sessions are summed. The
+message ends with how to look at the first session, `ps -s SESSION`, and to
+end it, `pkill -s SESSION`. It never offers `pkill` for a session holding
+cagents itself, such as the installed daemon that hosts every terminal and
+agent; for the session of the wait or of anything that started it, such as
+the waiting agent; or for the system's session, one started from the desktop
+or a terminal's. It says which it is instead. The process count is
+everything in the session, as `pkill -s` would end it. The message points at
+`scripts/bounded --list` when the checkout has that script. Sampling gives up
+after 10 seconds, as reading a process stuck on a hung mount can block:
+
+```
+cargo-gate: builds use 6.2 CPUs and everything else 9.3 CPUs; besides builds, the CPUs go to session 2270967 (bash -s, started 1d12h ago): 8.9 CPUs in 11 processes, most in pid 2272069 (python3 -I stress.py --workers 8); and 4 more sessions using 0.4 CPUs. `ps -s 2270967` lists session 2270967's processes, and `pkill -s 2270967` ends them
+```
+
+When no other session uses half a CPU, and everything else together uses
+less than one CPU, or less than a quarter of what the builds use when that is
+more, the message begins `nothing else uses much; the running builds hold
+them` instead. It begins `nothing uses much at the moment` when the builds
+use less than half a CPU, less than everything else, or, with everything
+else, less than half the host's CPUs: pressure is a ten-second average, so a
+wait can follow a burst that has already ended. When everything else uses more than that, but no
+session half a CPU, it ends `though no session outside them uses half a
+CPU`.
+
+A session is what one login, ssh command or terminal started. A loop that
+keeps starting short-lived commands is one session, and the time of the
+commands it has reaped counts as its own. The builds are:
+
+- the processes below a running build's holder, or below a process holding
+  a slot lock, which includes one taken by a plain `flock`. The slot locks
+  are the waiting family's, those the build registry names, and on the host
+  each `/var/tmp/cagents-*.lock` slot family with a `.queue` beside it; other
+  locks there, such as a native-evidence session's, are not builds;
+- processes whose environment marks them as a running build's:
+  `CAGENTS_BUILD_SLOT_HELD` for a gated command, `CAGENTS_OFFLOAD_SLOT` for an
+  offloaded one;
+- processes working in a leased offload slot, as its file copies do.
+
+A process in an offload slot, or with its mark, that started before the
+process holding the slot's lock is left from an earlier build, and it is
+named.
+Whatever a gated command detaches stays below the gate's command supervisor,
+which is a subreaper. A plain `flock` holder's command carries no mark, so
+whatever it detaches without the lock's descriptor is named as something else.
+An offloaded build's wait says the same about the build host, whose commands
+it says to run `there`.
+
+Each build has an expected peak: 3 GiB for anything in the CLI lane, 4 GiB for other checks, 7
 GiB for a host build or test build, 9 GiB for a UI one, 8 GiB for an `exec`
 script and 9 GiB for an `exec --hold` one such as the development runner's; a
 slot held by a plain `flock` counts as 9 GiB. `CAGENTS_BUILD_COST_GIB`
@@ -949,6 +1059,59 @@ result as a held approval rather than a slow command.
 Where no scope can be made, as without a user manager, the command runs without a
 limit and says so.
 
+### Time limits for stress and repro workloads
+
+A workload started over SSH outlives the connection: sshd's per-connection
+process exits when the client goes, but nothing tells the shell and loop it
+started. One probe loop kept FW16's CPUs about 71% busy for 36 hours, and every
+build waited behind it. Run a stress loop, a reproduction, a soak or a
+measurement under `scripts/bounded`:
+
+```sh
+scripts/bounded --ttl 1800 --name terminal-close-probe -- ./probe-loop
+```
+
+It stops the workload when the first of these happens:
+
+- its owner ends. That is the nearest SSH connection above it. Failing that, it
+  is the process a cagents daemon runs for the session above it, such as an
+  agent's provider. Failing both, it is the shell that ran it. `--owner PID`
+  names another process.
+- `--ttl` seconds pass. The default is 3600.
+- the wrapper itself gets TERM, INT or HUP.
+
+It sends TERM to everything the workload started, then KILL after 10 seconds.
+That covers every process still in the workload's process group, and any
+process that left the group but still carries the workload's `CAGENTS_BOUNDED`
+environment mark. When the command exits by itself, whatever it left running
+in the background goes too. The exit status is the command's own. It is 124
+when `--ttl` stopped the workload, 143 when the owner ended or the wrapper was
+stopped, and 127 or 126 when the command could not be run. A stop for any of
+those reasons prints why. Clearing up after a command that exited by itself
+prints nothing.
+
+`scripts/bounded --list` shows what runs bounded on the host: whose it is, how
+long it has left, and how to stop it. If the wrapper itself was killed with
+KILL, its workload has lost its watcher. `--list` says so, and
+`scripts/bounded --reap` stops what it left.
+
+The workload runs in a session of its own, without the terminal. Ctrl-C stops
+it, but it can't prompt on `/dev/tty`, and Ctrl-Z pauses only the wrapper.
+Nesting is safe: an inner `scripts/bounded` adds its mark to the outer one's,
+so stopping the outer one stops both. Cap memory as well by nesting
+`scripts/memory-capped` inside it:
+`scripts/bounded --ttl 1800 -- scripts/memory-capped ./probe-loop`.
+
+Three things escape it:
+
+- a process that both left the group and cleared its environment, such as a
+  daemon started with `env -i`.
+- a setuid or non-dumpable process outside the group, whose environment can't
+  be read.
+- a connection that dies silently, such as a network drop. Its `sshd-session`
+  lives on until SSH's keepalive gives up, so only `--ttl` stops the workload
+  in time.
+
 ### Process scope isolation
 
 Optional systemd user scopes receive numeric PIDs in the OS user manager's PID
@@ -1248,6 +1411,16 @@ harness, it provides:
   behaviors. `env CMD` runs your own setup in this environment, with the fixture's
   root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
+- **Seeded chats reopen.** A chat records its provider home's device and inode
+  and won't reopen once that directory is replaced, and a transcript's
+  location records its file's. So `start` restores the seed into the existing
+  fixture in place, with `rsync --inplace --delete`, instead of recreating it,
+  and a chat saved in the seed reopens on both sides. `start` needs rsync
+  whenever there is a seed and a fixture. `save-seed` records the provider
+  home's identity; while the fixture's differs, as it does once the fixture
+  directory is removed or for a seed saved by an older tool, every `start` says
+  the seed's chats won't reopen. Recreate them and save the seed again.
+  Extended attributes and ACLs are not restored.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
   width and size, so a pair can be compared and named in the PR.
