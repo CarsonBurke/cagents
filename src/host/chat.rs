@@ -4,6 +4,7 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+mod codex_owners;
 #[cfg(test)]
 mod lost_agent_close_tests;
 #[cfg(test)]
@@ -39,6 +40,8 @@ mod retained_resolution_tests;
 mod retained_resume;
 #[cfg(test)]
 mod startup_tests;
+#[cfg(test)]
+mod unserved_resume_tests;
 pub(super) mod upgrade_resolution;
 use crate::{
     agent::Provider,
@@ -2004,7 +2007,7 @@ fn start_with_execution(
     // Saved read-only history receives recorded removals, never fresh defaults
     // or transient execution credentials.
     let empty_execution_environment = BTreeMap::new();
-    let process_launch = prepare_native_process_launch(
+    let mut process_launch = prepare_native_process_launch(
         recorded_process_launch,
         (!saved_history_only && source.is_none()).then(|| {
             crate::model::agent_recovery::fresh_native_environment(session.launch.provider, false)
@@ -2020,6 +2023,56 @@ fn start_with_execution(
             source_execution.as_ref()
         },
     )?;
+    // A begun thread's bare remote joins the account's shared daemon, which
+    // owns the thread while it runs. With nothing serving that daemon, the
+    // thread is reopened from its history on a listener of its own instead of
+    // failing to join a daemon that is absent.
+    let owned_socket = match owned_socket {
+        None if !owned
+            && source.is_none()
+            && restart_launch.is_none()
+            && !saved_history_only
+            && process_launch.provider == Provider::Codex
+            && chat::protocol::codex::shared_daemon_socket(&process_launch)
+                .is_some_and(|shared| owned_listener::stopped(&shared))
+            && listeners.claim_for_unserved_thread(&mut session, &allocator) =>
+        {
+            process_launch.recipe.arguments = session.launch.recipe.arguments.clone();
+            let socket = session
+                .owned_codex_listener
+                .as_ref()
+                .unwrap()
+                .socket
+                .clone();
+            (!served_owned_listener(&socket)?).then_some(socket)
+        }
+        owned_socket => owned_socket,
+    };
+    // A server launched on an existing thread would be a second writer beside
+    // any process still writing it: a Codex CLI, the desktop app, or a server
+    // an earlier daemon left running. A checkpointed restart replaces the
+    // server it was taken from, so it is not checked.
+    if owned_socket.is_some()
+        && restart_launch.is_none()
+        && let Some(thread) = session.launch.session_id.as_deref()
+        && let Some(writer) = codex_owners::writer(
+            chat::protocol::codex::thread_writer_lock(&process_launch, thread).as_deref(),
+            thread,
+        )
+        .map_err(unavailable)?
+    {
+        return Err(error(if writer.hosted {
+            format!(
+                "This conversation is still open in another chat or terminal here (pid {}). Close it there, then resume it here.",
+                writer.pid
+            )
+        } else {
+            format!(
+                "This conversation is open in another Codex process ({}, pid {}). Close it there, then resume it here.",
+                writer.name, writer.pid
+            )
+        }));
+    }
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }
@@ -4464,6 +4517,13 @@ fn restore_selection(
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Whether this daemon's allocated listener at `socket` is still served,
+/// retiring an endpoint its stopped server left behind.
+fn served_owned_listener(socket: &std::path::Path) -> Result<bool, ProtocolError> {
+    owned_listener::served(socket)
+        .map_err(|failure| unavailable(format!("Cannot retire stopped provider socket: {failure}")))
 }
 
 /// The environment a conversation started without a proven source runs with:

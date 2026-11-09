@@ -84,6 +84,16 @@ impl Roots {
             .any(|root| session.claim_owned_codex_listener(root, allocator))
     }
 
+    /// Points a begun Codex thread's bare `--remote` at a listener of its own
+    /// at the current root. Its bare remote names no earlier allocation.
+    pub(crate) fn claim_for_unserved_thread(
+        &self,
+        session: &mut crate::chat::Session,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        session.claim_owned_codex_listener_for_unserved_thread(&self.current, allocator)
+    }
+
     /// Whether `socket` is the listener this daemon allocates for `id`.
     pub(crate) fn allocates(&self, id: crate::model::TerminalId, socket: &Path) -> bool {
         self.each().any(|root| {
@@ -298,6 +308,24 @@ pub(super) fn served_before_retire(
     }
 }
 
+/// Whether nothing can be serving at an endpoint this conversation does not own.
+///
+/// Such an endpoint, like an account's shared daemon or another conversation's
+/// listener, is only probed, never retired. An absent endpoint, or a socket
+/// that refuses connections, proves no server there holds a thread; anything
+/// else might. A server binds before it listens, so one starting at this
+/// instant reads as stopped, but it holds no thread until a client opens one.
+pub(super) fn stopped(endpoint: &Path) -> bool {
+    match std::fs::metadata(endpoint) {
+        Ok(bound) => {
+            bound.file_type().is_socket()
+                && socket::connect(endpoint, bound.dev(), bound.ino())
+                    .is_err_and(|failure| failure.not_listening)
+        }
+        Err(failure) => failure.kind() == io::ErrorKind::NotFound,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +466,29 @@ mod tests {
             format!("unix://{}", socket.display())
         );
         assert!(roots.allocates(new.id, &socket));
+    }
+
+    #[test]
+    fn a_reopened_thread_is_allocated_under_the_runtime_directory() {
+        let roots = layout();
+        let mut reopened = codex(&["resume", "thread", "--remote", "unix://"], Some("thread"));
+        assert!(
+            !roots.claim(&mut reopened.clone(), &allocator()),
+            "a begun thread's bare remote is not claimed as a new thread's"
+        );
+        assert!(roots.claim_for_unserved_thread(&mut reopened, &allocator()));
+        let socket = Path::new("/run/user/1000/cagents/codex")
+            .join(format!("cagents-codex-{}", reopened.id))
+            .join("control.sock");
+        assert_eq!(
+            reopened.owned_codex_listener.as_ref().unwrap().socket,
+            socket
+        );
+        assert_eq!(
+            reopened.launch.recipe.arguments[3],
+            format!("unix://{}", socket.display())
+        );
+        assert!(roots.allocates(reopened.id, &socket));
     }
 
     #[test]
@@ -643,5 +694,27 @@ mod tests {
         std::fs::write(&socket, b"").unwrap();
         assert!(served(&socket).unwrap());
         assert!(socket.is_file());
+    }
+
+    #[test]
+    fn an_endpoint_is_stopped_only_when_absent_or_refusing() {
+        let (_root, allocation, runtime) = directories();
+        let socket = allocation.join("app-server-control.sock");
+        assert!(stopped(&socket));
+
+        drop(UnixListener::bind(&socket).unwrap());
+        assert!(stopped(&socket));
+        assert!(
+            std::fs::symlink_metadata(&socket).is_ok(),
+            "an account's endpoint is never retired"
+        );
+        std::fs::remove_file(&socket).unwrap();
+
+        let _listening = UnixListener::bind(&socket).unwrap();
+        assert!(!stopped(&socket));
+
+        let file = runtime.join("not-a-socket");
+        std::fs::write(&file, b"").unwrap();
+        assert!(!stopped(&file));
     }
 }

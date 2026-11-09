@@ -1219,7 +1219,8 @@ fn restore(
         if let Some(hosted) = sessions.into_iter().find(|hosted| hosted.id == session.id) {
             if hosted.proof.as_ref() != Some(proof)
                 || hosted.launch.provider != session.launch.provider
-                || hosted.launch.recipe != session.launch.recipe
+                || (hosted.launch.recipe != session.launch.recipe
+                    && !session.resolved_to_owned_codex_listener(&hosted))
                 || (session.launch.session_id.is_some()
                     && session.launch.session_id != hosted.launch.session_id)
             {
