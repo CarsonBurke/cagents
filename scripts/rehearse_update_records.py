@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 """Read-only rehearsal snapshots and deterministic before/after comparisons."""
 from __future__ import annotations
 
