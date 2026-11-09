@@ -177,9 +177,13 @@ spawn() {
     channel=$(channel_id "$project" "$title")
     [ -n "$channel" ] || { printf 'no channel %s in %s\n' "$title" "$2" >&2; return 1; }
     frames_for "$state"
-    evidence cli agent spawn --provider claude --model haiku --surface chat \
+    if ! evidence cli agent spawn --provider claude --model haiku --surface chat \
         --repository "$project" ${directory:+--directory "$directory"} --channel "$channel" \
-        --prompt "Fixture: $state" >/dev/null
+        --prompt "Fixture: $state" >/dev/null; then
+        # The daemon caps one caller's unsettled runs; say which are open.
+        cli_json agent list | jq -r '.data.agents[] | "open: \(.state) \(.agent.spec.target.directory | split("/") | last)"' >&2
+        return 1
+    fi
     # Each agent reads the frames as its first turn starts; give it that turn
     # before the next state replaces them.
     sleep 4
