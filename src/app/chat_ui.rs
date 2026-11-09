@@ -10421,7 +10421,10 @@ impl Cagents {
                         }
                         return self.retire_chat(target.card, Some(handle), None);
                     }
-                    return Task::none();
+                    // A winning peer may have gained proof while this start
+                    // was pending. Its model edge deferred attachment until
+                    // the losing start answered; finish that catch-up now.
+                    return self.adopt_stored_draft_session(target.card);
                 }
                 if result.is_err() && attempt.upgrade_admission.is_some() {
                     // Unproved lineage cannot bind the saved Content to the

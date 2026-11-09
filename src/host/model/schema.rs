@@ -1061,7 +1061,8 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20, run-attention21 and history22.
+            // This current opener also applies retention20, run-attention21, history22
+            // and private pane ownership23.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1073,6 +1074,8 @@ mod tests {
                 "automation_retired_manual_requests",
                 "automation_removed_history",
                 "automation_firing_successors",
+                "pane_chat_starts",
+                "pane_chat_allocations",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1087,6 +1090,8 @@ mod tests {
                 "automation_run_attention",
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
+                "pane_chat_starts",
+                "pane_chat_allocations",
             ] {
                 assert_eq!(
                     registry
@@ -1113,7 +1118,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
+                "only lifecycle/run outboxes, retention and pane ownership objects, and the exact history column may be added"
             );
             assert!(
                 registry
