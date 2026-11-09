@@ -905,9 +905,10 @@ fn quarantined_write_line<'a>(
             None => format!("Worktree {}", path.display()),
         },
     };
+    // The notice's title already says storage refused it, and the rule
+    // below says why, so the line names only what and since when.
     let mut line = format!(
-        "{subject} — {} · since {}",
-        write.category.label(),
+        "{subject} · since {}",
         unix_time_label(write.refused_at_unix_ms),
     );
     // Changing the card cannot supersede a refusal of the card
@@ -20909,7 +20910,7 @@ mod tests {
     fn refused_writes_keep_save_health_visible_beside_a_healthy_lane() {
         let refused = |subject| QuarantinedWrite {
             subject,
-            category: crate::session::SaveFailureCategory::InvalidData,
+            category: crate::session::SaveFailureCategory::Refused,
             check: crate::diagnostics::Check::new(
                 "chat card … changed conversation identity (identity)",
             ),
@@ -20975,7 +20976,7 @@ mod tests {
         let card = CardId::new();
         let write = |subject| QuarantinedWrite {
             subject,
-            category: crate::session::SaveFailureCategory::InvalidData,
+            category: crate::session::SaveFailureCategory::Refused,
             check: crate::diagnostics::Check::new(
                 "chat card … changed conversation identity (identity)",
             ),
@@ -21006,7 +21007,12 @@ mod tests {
         assert!(line.contains("closing the pane clears it"), "{line}");
         let line = quarantined_write_line(&pane, &untitled);
         assert!(line.starts_with("Latest changes to a pane ("), "{line}");
-        assert!(line.contains("— saved state is invalid · since"), "{line}");
+        assert!(
+            line.starts_with(
+                "Latest changes to a pane (storage keeps its last saved state) · since"
+            ),
+            "{line}"
+        );
         assert!(
             line.ends_with("\nRule: chat card … changed conversation identity (identity)"),
             "the rule storage refused it for is named on its own line: {line}"

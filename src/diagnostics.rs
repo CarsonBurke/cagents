@@ -65,7 +65,11 @@ pub enum Failure {
     Corrupt,
     Conflict,
     Serialization,
-    InvalidData,
+    /// Storage refused a change that breaks one of its rules. Recorded as
+    /// `invalid_data` before the label named what happened.
+    #[serde(rename = "invalid_data")]
+    Refused,
+    NewerSchema,
     Io,
     Database,
     Unknown,
@@ -944,7 +948,8 @@ fn failure_label(value: Failure) -> &'static str {
         Failure::Corrupt => "corrupt",
         Failure::Conflict => "conflict",
         Failure::Serialization => "serialization",
-        Failure::InvalidData => "invalid data",
+        Failure::Refused => "change refused",
+        Failure::NewerSchema => "database from a newer cagents",
         Failure::Io => "I/O",
         Failure::Database => "database",
         Failure::Unknown => "unknown",
@@ -1565,6 +1570,19 @@ mod tests {
     }
 
     #[test]
+    fn a_refused_change_keeps_the_category_older_records_wrote() {
+        assert_eq!(
+            serde_json::to_string(&Failure::Refused).unwrap(),
+            "\"invalid_data\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Failure>("\"invalid_data\"").unwrap(),
+            Failure::Refused
+        );
+        assert_eq!(failure_label(Failure::Refused), "change refused");
+    }
+
+    #[test]
     fn a_storage_refusal_names_its_subject_and_rule_in_the_report() {
         let (_root, path) = fixture();
         let pane = Uuid::from_u128(0x5e71);
@@ -1606,13 +1624,13 @@ mod tests {
                 complete: false,
                 unsaved: 0,
                 refused: 1,
-                category: Some(Failure::InvalidData),
+                category: Some(Failure::Refused),
             })
             .unwrap();
 
         let human = inspect_at(path).unwrap().human_at(u64::MAX);
         assert!(
-            human.contains("final flush incomplete: 0 unsaved, 1 refused; invalid data"),
+            human.contains("final flush incomplete: 0 unsaved, 1 refused; change refused"),
             "{human}"
         );
         let pane_line =

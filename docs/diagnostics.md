@@ -60,6 +60,12 @@ are historical, because the subject may have saved since. A reader older than
 this event cannot parse these records and reports that product's evidence as
 unreadable rather than guessing.
 
+A refused change is classified `invalid_data`, which the report reads as
+"change refused": storage refused the new write, and what it already holds is
+untouched. A database that a newer cagents migrated is classified
+`newer_schema` ("database from a newer cagents") instead; an older reader
+reports a record with that category as unreadable.
+
 JSON reports contain up to 256 redacted recent records per product and a
 `last_observed` summary for the most recently recorded run. Versions, protocol,
 and health are **last observed**, not live sibling executable or process checks.

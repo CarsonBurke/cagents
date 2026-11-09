@@ -10228,7 +10228,7 @@ mod tests {
 
     /// A native Codex thread returns through a CLI view the daemon opens
     /// under the chat's own identity; refusing it left every later save of
-    /// the window failing with "saved state is invalid".
+    /// the window failing as refused by storage.
     #[test]
     fn a_native_codex_thread_converts_to_the_cli_view_the_daemon_opened_for_it() {
         // The app records the view as the chat's source before it converts

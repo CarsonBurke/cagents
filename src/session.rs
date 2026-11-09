@@ -64,7 +64,11 @@ pub enum SaveFailureCategory {
     Corrupt,
     Conflict,
     Serialization,
-    InvalidData,
+    /// Storage refused the change itself: it breaks one of storage's rules.
+    /// What storage already holds is untouched.
+    Refused,
+    /// The database was migrated by a newer cagents than this one.
+    NewerSchema,
     Io,
     Database,
 }
@@ -80,7 +84,8 @@ impl From<SaveFailureCategory> for crate::diagnostics::Failure {
             SaveFailureCategory::Corrupt => Self::Corrupt,
             SaveFailureCategory::Conflict => Self::Conflict,
             SaveFailureCategory::Serialization => Self::Serialization,
-            SaveFailureCategory::InvalidData => Self::InvalidData,
+            SaveFailureCategory::Refused => Self::Refused,
+            SaveFailureCategory::NewerSchema => Self::NewerSchema,
             SaveFailureCategory::Io => Self::Io,
             SaveFailureCategory::Database => Self::Database,
         }
@@ -103,8 +108,9 @@ impl SaveFailureCategory {
             Self::StorageUnavailable => "storage path is unavailable",
             Self::Corrupt => "database is corrupt",
             Self::Conflict => "saved state changed unexpectedly",
-            Self::Serialization => "state could not be encoded",
-            Self::InvalidData => "saved state is invalid",
+            Self::Serialization => "the change could not be encoded",
+            Self::Refused => "storage refused the change",
+            Self::NewerSchema => "the database is from a newer cagents",
             Self::Io => "storage I/O failed",
             Self::Database => "database operation failed",
         }
@@ -134,8 +140,16 @@ impl SaveFailureCategory {
                 "Retry the save; if this repeats, close anything else using the database and \
                  report the failure category and database path."
             }
-            Self::Serialization | Self::InvalidData => {
-                "Restart cagents; if this repeats, report the failure category and database path."
+            // Storage refused the change by construction, so retrying or
+            // restarting offers it the same content again.
+            Self::Serialization | Self::Refused => {
+                "Storage keeps the last saved version. Change or close the refused item to save \
+                 it again; if this repeats, report the rule cagents diagnostics records and the \
+                 database path."
+            }
+            Self::NewerSchema => {
+                "Open this database with the newer cagents that last used it, or update this \
+                 one; this version cannot save into it."
             }
             Self::Io | Self::Database => {
                 "Check the database directory and system storage, then retry."
@@ -149,13 +163,14 @@ impl SaveFailureCategory {
             Self::ReadOnly => 1,
             Self::PermissionDenied => 2,
             Self::StorageUnavailable => 3,
-            Self::Corrupt => 4,
-            Self::Busy => 5,
-            Self::Conflict => 6,
-            Self::Serialization => 7,
-            Self::InvalidData => 8,
-            Self::Io => 9,
-            Self::Database => 10,
+            Self::NewerSchema => 4,
+            Self::Corrupt => 5,
+            Self::Busy => 6,
+            Self::Conflict => 7,
+            Self::Serialization => 8,
+            Self::Refused => 9,
+            Self::Io => 10,
+            Self::Database => 11,
         }
     }
 }
@@ -2589,7 +2604,7 @@ fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
             ErrorCode::CannotOpen | ErrorCode::NotFound => SaveFailureCategory::StorageUnavailable,
             ErrorCode::DatabaseCorrupt | ErrorCode::NotADatabase => SaveFailureCategory::Corrupt,
             ErrorCode::SystemIoFailure => SaveFailureCategory::Io,
-            ErrorCode::ConstraintViolation => SaveFailureCategory::InvalidData,
+            ErrorCode::ConstraintViolation => SaveFailureCategory::Refused,
             _ => SaveFailureCategory::Database,
         },
         StoreError::CorruptRow { .. }
@@ -2613,9 +2628,8 @@ fn save_failure_category(error: &StoreError) -> SaveFailureCategory {
         }
         StoreError::Io(_) => SaveFailureCategory::Io,
         StoreError::StaleGeneration { .. } => SaveFailureCategory::Conflict,
-        StoreError::UnsupportedSchema { .. } | StoreError::InvalidState(_) => {
-            SaveFailureCategory::InvalidData
-        }
+        StoreError::UnsupportedSchema { .. } => SaveFailureCategory::NewerSchema,
+        StoreError::InvalidState(_) => SaveFailureCategory::Refused,
         StoreError::InvalidBusyTimeout { .. } | StoreError::MutexPoisoned | StoreError::Closed => {
             SaveFailureCategory::Database
         }
@@ -2817,12 +2831,12 @@ fn persistence_loop(
         for checkpoint in checkpoints {
             let result = if !writes.is_settled() {
                 Err(save_refusal(failure))
-            } else if let Some(category) = writes.quarantine.window_state() {
+            } else if writes.quarantine.window_state().is_some() {
                 // A barrier vouches for the window's state - a terminal handoff
                 // releases the daemon's replay evidence on the strength of it -
                 // so a refused snapshot fails it. A refused catalog row does
                 // not: waiting cannot save it, and the window state is whole.
-                let refusal = window_state_refusal(category, &writes.quarantined());
+                let refusal = window_state_refusal(&writes.quarantined());
                 tracing::warn!(%refusal, "a save barrier was refused");
                 Err(refusal)
             } else {
@@ -3053,7 +3067,7 @@ fn save_refusal(failure: Option<SaveFailureCategory>) -> String {
 /// whoever reads this is often not looking at the window - an updater relays
 /// it to a terminal - so without the names there is nothing to act on, and
 /// without the rule nothing to report. Neither carries a title, name or path.
-fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWrite]) -> String {
+fn window_state_refusal(refused: &[QuarantinedWrite]) -> String {
     let subjects = refused
         .iter()
         .filter(|write| write.subject.is_window_state())
@@ -3067,10 +3081,8 @@ fn window_state_refusal(category: SaveFailureCategory, refused: &[QuarantinedWri
         .collect::<Vec<_>>()
         .join("; ");
     format!(
-        "workspace could not be saved: storage refused part of the window's own state ({}): \
-         {subjects}. {}",
-        category.label(),
-        QUARANTINE_GUIDANCE
+        "workspace could not be saved: storage refused part of the window's own state: \
+         {subjects}. {QUARANTINE_GUIDANCE}"
     )
 }
 
@@ -5521,12 +5533,36 @@ mod tests {
         }
         assert_eq!(
             save_failure_category(&constraint(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE)),
-            SaveFailureCategory::InvalidData
+            SaveFailureCategory::Refused
         );
         assert_eq!(
             save_failure_category(&foreign_key_violation()),
-            SaveFailureCategory::InvalidData
+            SaveFailureCategory::Refused
         );
+        // A database a newer cagents migrated is about storage, not the
+        // change, and its remedy is the other version, not editing.
+        let newer = StoreError::UnsupportedSchema {
+            found: crate::persistence::CURRENT_SCHEMA_VERSION + 1,
+            supported: crate::persistence::CURRENT_SCHEMA_VERSION,
+        };
+        assert!(!newer.refuses_content());
+        assert_eq!(
+            save_failure_category(&newer),
+            SaveFailureCategory::NewerSchema
+        );
+        assert!(
+            SaveFailureCategory::NewerSchema
+                .guidance()
+                .contains("newer cagents")
+        );
+        // Neither a refused change nor its guidance blames what is stored.
+        for refused in [
+            SaveFailureCategory::Refused,
+            SaveFailureCategory::Serialization,
+        ] {
+            assert!(!refused.label().contains("invalid"), "{}", refused.label());
+            assert!(refused.guidance().contains("Change or close"));
+        }
     }
 
     #[test]
@@ -5627,7 +5663,7 @@ mod tests {
         );
         assert_eq!(
             refused.quarantined[0].category,
-            SaveFailureCategory::InvalidData
+            SaveFailureCategory::Refused
         );
 
         let unrelated = project("unrelated");
@@ -5723,7 +5759,7 @@ mod tests {
                     id: refused.id,
                     name: "refused".into(),
                 },
-                category: SaveFailureCategory::InvalidData,
+                category: SaveFailureCategory::Refused,
                 check: crate::diagnostics::Check::new("tombstoned project … cannot be resurrected"),
                 refused_at_unix_ms: writes.quarantine.projects[&refused.id].1.at_unix_ms,
                 held_back: 1,
@@ -5815,7 +5851,7 @@ mod tests {
         assert_eq!(first[0].subject, WriteSubject::Workspace { card: None });
         assert_eq!(
             writes.quarantine.window_state(),
-            Some(SaveFailureCategory::InvalidData)
+            Some(SaveFailureCategory::Refused)
         );
 
         // The reader's retry offers the refused snapshot again; refused
@@ -6389,11 +6425,13 @@ mod tests {
         let refusal = runtime.flush(timeout).unwrap_err();
         assert!(
             refusal.contains(
-                "(saved state is invalid): the window's layout and panes (refused by rule: \
-                 workspace … focuses missing or closed card …)."
+                "storage refused part of the window's own state: the window's layout and panes \
+                 (refused by rule: workspace … focuses missing or closed card …)."
             ),
             "{refusal}"
         );
+        // Storage refused the new change; it says nothing against what it holds.
+        assert!(!refusal.contains("invalid"), "{refusal}");
         // Asking again changes nothing: the same window is still unsaved.
         runtime.flush(timeout).unwrap_err();
 
@@ -6934,7 +6972,7 @@ mod tests {
 
         let refused = QuarantinedWrite {
             subject: WriteSubject::Workspace { card: None },
-            category: SaveFailureCategory::InvalidData,
+            category: SaveFailureCategory::Refused,
             check: crate::diagnostics::Check::new("injected refusal"),
             refused_at_unix_ms: 1,
             held_back: 0,
