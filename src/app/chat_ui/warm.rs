@@ -358,53 +358,82 @@ mod tests {
         assert!(cards[2..].iter().all(|card| warm(&app, card)));
     }
 
+    /// Switching scope hides every pane of the one left before the returning
+    /// panes are laid out and shown. The budget must wait for them: with eight
+    /// others hidden since, the chat being returned to is otherwise the one
+    /// hidden longest, and would be cooled just as it is shown.
     #[test]
-    fn switching_back_to_a_channel_keeps_its_chat_warm_while_it_is_shown() {
-        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
-        let mut app = crate::app::tests::context_inspector_test_app(false);
+    fn returning_to_a_channel_after_eight_others_keeps_its_chat_ready() {
+        use crate::model::{ChannelId, ProjectChannel, ProjectId};
+        use crate::repository::RepositoryId;
+        let mut app = crate::app::tests::context_inspector_test_app(true);
+        let project = ProjectId::new();
+        app.sidebar_model
+            .projects
+            .push(crate::sidebar::SidebarProject::new(
+                project,
+                RepositoryId::new(),
+                "project".into(),
+                "/repo".into(),
+                vec![crate::sidebar::SidebarWorktree::from_durable(
+                    crate::model::WorktreeId::new(),
+                    "/repo".into(),
+                    Some("main".into()),
+                )],
+                Vec::new(),
+            ));
+        let mut channels = Vec::new();
         let mut cards = Vec::new();
-        let hide = |app: &mut Cagents| {
-            let (mut runtime, _handle) = shown(items());
-            runtime.set_visible(false).unwrap();
+        for ordinal in 0..=CHATS {
+            let (runtime, _handle) = shown(items());
             let card = runtime.target.card;
+            let channel = ChannelId::new();
+            let durable = Arc::make_mut(&mut app.durable);
+            let mut state = durable.cards[0].clone();
+            state.id = card;
+            state.kind = crate::model::CardKind::Chat(runtime.session.clone());
+            durable.cards.push(state);
+            durable.channels.push(ProjectChannel {
+                title_source: Default::default(),
+                id: channel,
+                project_id: project,
+                title: format!("Channel {ordinal}"),
+                ordinal: ordinal as u32,
+                shared: false,
+                cards: vec![card],
+                focused: Some(card),
+            });
             app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
-            card
-        };
-        // The reader left the first chat, then visited eight others.
-        for _ in 0..CHATS {
-            cards.push(hide(&mut app));
-            app.trim_warm_chats();
+            channels.push(channel);
+            cards.push(card);
         }
-        // Returning to the first chat hides the eighth before the first's
-        // pane is laid out and shown, so in that pass nine chats are hidden.
-        let channel = ChannelId::new();
-        let durable = Arc::make_mut(&mut app.durable);
-        durable.channels.push(ProjectChannel {
-            id: channel,
-            project_id: ProjectId::new(),
-            title: "Returning".into(),
-            title_source: ChannelTitleSource::Manual,
-            ordinal: 1,
-            shared: false,
-            cards: vec![cards[0]],
-            focused: Some(cards[0]),
-        });
-        durable.active_channel = Some(channel);
-        cards.push(hide(&mut app));
-        app.trim_warm_chats();
-        let warm = |app: &Cagents, card: &CardId| match app.cards.get(card) {
-            Some(CardRuntime::Chat(runtime)) => runtime.warm_stamp().is_some(),
+        app.refresh_sidebar_channels();
+        app.workspace.resize_viewport(1200.0);
+        let runtime = |app: &Cagents, card: &CardId| match app.cards.get(card) {
+            Some(CardRuntime::Chat(runtime)) => {
+                let ready = !runtime.cache.is_empty()
+                    && runtime.cache.values().all(|cached| !cached.placeholder);
+                (runtime.visible.load(Ordering::Relaxed), ready)
+            }
             _ => unreachable!(),
         };
-        assert!(
-            warm(&app, &cards[0]),
-            "the chat being returned to stays warm"
+        // Read the first channel, then visit the other eight in turn.
+        for channel in &channels {
+            drop(app.select_channel(*channel));
+        }
+        assert_eq!(runtime(&app, &cards[0]), (false, true), "kept warm");
+        drop(app.select_channel(channels[0]));
+        assert_eq!(
+            runtime(&app, &cards[0]),
+            (true, true),
+            "the chat returned to is shown as it was left"
         );
         assert!(
-            !warm(&app, &cards[1]),
-            "the chat hidden longest goes instead"
+            cards[1..]
+                .iter()
+                .all(|card| runtime(&app, card) == (false, true)),
+            "the eight hidden since stay within the budget"
         );
-        assert!(cards[2..].iter().all(|card| warm(&app, card)));
     }
 
     #[test]

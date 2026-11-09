@@ -12770,6 +12770,15 @@ impl Cagents {
     }
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+        self.apply_workspace_surface_visibility(workspace_visible);
+        self.trim_warm_chats();
+    }
+
+    /// [`Self::set_workspace_surfaces_visible`] without applying the warm
+    /// chat budget, for a caller that shows the next panes before the budget
+    /// is applied: hiding everything first must not cool the chats about to
+    /// be shown again.
+    fn apply_workspace_surface_visibility(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .presence
             .iter()
@@ -12816,7 +12825,6 @@ impl Cagents {
                 failures.push((*id, visible, error));
             }
         }
-        self.trim_warm_chats();
         self.report_surface_visibility(failures);
     }
 

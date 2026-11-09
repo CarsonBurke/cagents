@@ -8111,16 +8111,6 @@ impl Cagents {
         if !warm::take_dirty() {
             return;
         }
-        // The channel being shown counts as hidden most recently: switching to
-        // it hides the channel left before its own panes are laid out and
-        // shown, and the chats about to be read must not be the ones cooled.
-        let showing: HashSet<CardId> = self
-            .durable
-            .channels
-            .iter()
-            .find(|channel| Some(channel.id) == self.durable.active_channel)
-            .map(|channel| channel.cards.iter().copied().collect())
-            .unwrap_or_default();
         let mut runtimes: Vec<&mut Runtime> = self
             .cards
             .values_mut()
@@ -8133,14 +8123,7 @@ impl Cagents {
             .collect();
         let warm: Vec<_> = runtimes
             .iter()
-            .map(|runtime| {
-                let stamp = if showing.contains(&runtime.target.card) {
-                    u64::MAX
-                } else {
-                    runtime.warm_stamp().unwrap_or(0)
-                };
-                (stamp, runtime.warm_bytes())
-            })
+            .map(|runtime| (runtime.warm_stamp().unwrap_or(0), runtime.warm_bytes()))
             .collect();
         for index in warm::over_budget(&warm) {
             runtimes[index].cool();
