@@ -80,7 +80,8 @@ fn lock_holder(lock: &Path, table: &str) -> Result<Option<libc::pid_t>, String> 
         .metadata()
         .map_err(|error| format!("Cannot inspect Codex thread writer lock: {error}"))?
         .ino();
-    let (major, minor) = kernel_device(&file)?;
+    let stat = file.metadata().map_err(|error| error.to_string())?;
+    let (major, minor) = (libc::major(stat.dev()), libc::minor(stat.dev()));
     Ok(table.lines().find_map(|line| {
         let fields: Vec<_> = line.split_whitespace().collect();
         let [_, kind, _, _, pid, identity, ..] = fields[..] else {
