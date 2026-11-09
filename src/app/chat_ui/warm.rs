@@ -473,4 +473,301 @@ mod tests {
         assert!(super::stamp() > first);
         assert!(super::take_dirty());
     }
+
+    /// A long working conversation: each exchange reasons before answering,
+    /// every third one runs a command, and each answer is mostly short code
+    /// lines, which its row's height estimate counts as far fewer lines than
+    /// it lays out.
+    fn long_conversation() -> Vec<Arc<chat::Item>> {
+        let code: String = (0..34)
+            .map(|line| format!("    let value_{line} = state.next({line});\n"))
+            .collect();
+        let mut items = Vec::new();
+        for step in 1..=30 {
+            items.push(Arc::new(chat::Item {
+                id: format!("{step}-prompt"),
+                role: chat::Role::User,
+                content: ItemContent::Text {
+                    text: format!("Next, step {step}: keep going and show the code."),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                started_at: None,
+                at: None,
+            }));
+            items.push(Arc::new(chat::Item {
+                id: format!("{step}-thinking"),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: "I should read the stream first, then its caller. ".repeat(6),
+                    thinking: true,
+                    phase: chat::Phase::Final,
+                },
+                started_at: None,
+                at: None,
+            }));
+            if step % 3 == 0 {
+                items.push(Arc::new(chat::Item {
+                    id: format!("{step}-command"),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Command {
+                        label: String::new(),
+                        command: "cargo test -p ledger".into(),
+                        working_directory: "/project".into(),
+                        action: chat::CommandAction::Run,
+                        status: chat::ToolStatus::Succeeded,
+                        exit_code: Some(0),
+                        duration_ms: Some(1_250),
+                        output: "test ledger::case ... ok\n".repeat(14),
+                    },
+                    started_at: None,
+                    at: None,
+                }));
+            }
+            items.push(answer(
+                &format!("{step}-answer"),
+                format!(
+                    "## {step}. Stream the ledger\n\nThe failure comes from \
+                     **LedgerStream** holding state across calls.\n\n- One.\n- Two.\n\n\
+                     ```rust\n{code}```\n\nTo check it locally:\n\n```sh\ncargo test\n```\n\n\
+                     | Check | Before | After |\n| --- | --- | --- |\n| Tests | 37 | 39 |\n"
+                ),
+            ));
+        }
+        items
+    }
+
+    /// Switching channel drops a pane's widget tree, so the returning
+    /// transcript is laid out afresh with only the rows near its end mounted:
+    /// the rows the reader left are placeholders at first. Whether the chat
+    /// stayed warm or went cold, the reader sees the same row at the top, at
+    /// the same offset within it, as when they left.
+    #[test]
+    fn returning_to_a_channel_shows_the_reader_the_same_place() {
+        use crate::model::{ChannelId, ProjectChannel, ProjectId};
+        use crate::repository::RepositoryId;
+        use cosmic::iced::advanced::widget::{Operation, operation};
+        use cosmic::iced::runtime::{UserInterface, user_interface::Cache};
+        use cosmic::iced::{Event, Point, Rectangle, Size, Vector, mouse};
+
+        /// The transcript's top, and the bounds of each message laid out.
+        struct Reader {
+            scroll: widget::Id,
+            ids: Vec<(widget::Id, String)>,
+            content: Option<Rectangle>,
+            top: f32,
+            rows: Vec<(String, Rectangle)>,
+        }
+        impl Operation for Reader {
+            fn traverse(&mut self, visit: &mut dyn FnMut(&mut dyn Operation)) {
+                visit(self);
+            }
+            fn custom(
+                &mut self,
+                _: Option<&widget::Id>,
+                _: Rectangle,
+                state: &mut dyn std::any::Any,
+            ) {
+                // Only messages laid out, not their placeholders' bounds.
+                if let Some(policy) = state.downcast_mut::<virtualized::PlaceholderPolicy>() {
+                    policy.visit = false;
+                }
+            }
+            fn scrollable(
+                &mut self,
+                id: Option<&widget::Id>,
+                _: Rectangle,
+                content: Rectangle,
+                translation: Vector,
+                _: &mut dyn operation::Scrollable,
+            ) {
+                if id == Some(&self.scroll) {
+                    self.content = Some(content);
+                    self.top = translation.y;
+                }
+            }
+            fn container(&mut self, id: Option<&widget::Id>, bounds: Rectangle) {
+                if let Some((_, item)) = self.ids.iter().find(|(known, _)| Some(known) == id) {
+                    self.rows.push((item.clone(), bounds));
+                }
+            }
+        }
+        impl Reader {
+            /// The innermost message at the top of the transcript, or the next
+            /// one below it, and how far into it the top is.
+            fn place(&self) -> Option<(String, f32)> {
+                let content = self.content?;
+                let rows = || {
+                    self.rows
+                        .iter()
+                        .map(|(item, bounds)| (item, bounds.y - content.y, bounds.height))
+                };
+                rows()
+                    .filter(|(_, y, height)| *y <= self.top && y + height > self.top)
+                    .max_by(|a, b| a.1.total_cmp(&b.1))
+                    .or_else(|| {
+                        rows()
+                            .filter(|(_, y, _)| *y > self.top)
+                            .min_by(|a, b| a.1.total_cmp(&b.1))
+                    })
+                    .map(|(item, y, _)| (item.clone(), self.top - y))
+            }
+        }
+
+        let items = long_conversation();
+        for cold in [false, true] {
+            let mut app = crate::app::tests::context_inspector_test_app(true);
+            let project = ProjectId::new();
+            app.sidebar_model
+                .projects
+                .push(crate::sidebar::SidebarProject::new(
+                    project,
+                    RepositoryId::new(),
+                    "project".into(),
+                    "/repo".into(),
+                    vec![crate::sidebar::SidebarWorktree::from_durable(
+                        crate::model::WorktreeId::new(),
+                        "/repo".into(),
+                        Some("main".into()),
+                    )],
+                    Vec::new(),
+                ));
+            let mut channels = Vec::new();
+            let mut handles = Vec::new();
+            for (ordinal, items) in [items.clone(), self::items()].into_iter().enumerate() {
+                let (runtime, handle) = shown(items);
+                let card = runtime.target.card;
+                let durable = Arc::make_mut(&mut app.durable);
+                let mut state = durable.cards[0].clone();
+                state.id = card;
+                state.kind = crate::model::CardKind::Chat(runtime.session.clone());
+                durable.cards.push(state);
+                let channel = ChannelId::new();
+                durable.channels.push(ProjectChannel {
+                    title_source: Default::default(),
+                    id: channel,
+                    project_id: project,
+                    title: format!("Channel {ordinal}"),
+                    ordinal: ordinal as u32,
+                    shared: false,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+                app.cards.insert(card, CardRuntime::Chat(Box::new(runtime)));
+                channels.push((channel, card));
+                handles.push(handle);
+            }
+            app.refresh_sidebar_channels();
+            app.workspace.resize_viewport(1200.0);
+            let (reading, card) = channels[0];
+            let mut renderer = crate::app::tests::headless_renderer();
+            let mut cache = Cache::default();
+            // One frame of the whole window, as the shell runs it after an
+            // update, with the pointer over the transcript.
+            let mut frame = |app: &mut Cagents, cache: &mut Cache, events: &[Event]| {
+                let pointer = Point::new(700.0, 500.0);
+                let mut ui = UserInterface::build(
+                    app.view(),
+                    Size::new(1500.0, 940.0),
+                    std::mem::take(cache),
+                    &mut renderer,
+                );
+                let mut messages = Vec::new();
+                let mut redraw = vec![Event::Window(cosmic::iced::window::Event::RedrawRequested(
+                    cosmic::iced::time::Instant::now(),
+                ))];
+                redraw.extend_from_slice(events);
+                ui.update(
+                    &redraw,
+                    mouse::Cursor::Available(pointer),
+                    &mut renderer,
+                    &mut cosmic::iced::advanced::clipboard::Null,
+                    &mut messages,
+                );
+                ui.draw(
+                    &mut renderer,
+                    &cosmic::Theme::dark(),
+                    &cosmic::iced::advanced::renderer::Style::default(),
+                    mouse::Cursor::Available(pointer),
+                );
+                let mut reader = Reader {
+                    scroll: card_control_id(card, "chat-transcript"),
+                    ids: items
+                        .iter()
+                        .map(|item| (scroll::item_id(&item.id), item.id.clone()))
+                        .collect(),
+                    content: None,
+                    top: 0.0,
+                    rows: Vec::new(),
+                };
+                ui.operate(&renderer, &mut reader);
+                *cache = ui.into_cache();
+                for message in messages {
+                    drop(app.update(message));
+                }
+                reader.place()
+            };
+
+            drop(app.select_channel(reading));
+            for _ in 0..3 {
+                frame(&mut app, &mut cache, &[]);
+            }
+            let wheel = Event::Mouse(mouse::Event::WheelScrolled {
+                delta: mouse::ScrollDelta::Lines { x: 0.0, y: 1.0 },
+            });
+            for _ in 0..240 {
+                frame(&mut app, &mut cache, std::slice::from_ref(&wheel));
+            }
+            // Read on up to a place well into an answer, not at its start.
+            let mut left = frame(&mut app, &mut cache, &[]).expect("the reader's place");
+            for _ in 0..40 {
+                if left.0.ends_with("-answer") && left.1 > 200.0 {
+                    break;
+                }
+                frame(&mut app, &mut cache, std::slice::from_ref(&wheel));
+                left = frame(&mut app, &mut cache, &[]).expect("the reader's place");
+            }
+            assert!(
+                left.0.ends_with("-answer") && left.1 > 200.0,
+                "the reader is well into an answer: {left:?}"
+            );
+
+            drop(app.select_channel(channels[1].0));
+            frame(&mut app, &mut cache, &[]);
+            let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                unreachable!()
+            };
+            assert!(runtime.warm_stamp().is_some(), "the chat left stays warm");
+            if cold {
+                runtime.cool();
+            }
+            drop(app.select_channel(reading));
+            if cold {
+                // The daemon hydrates the cold chat again, and its messages are
+                // prepared while the reader waits.
+                frame(&mut app, &mut cache, &[]);
+                let mut hydrated = handles[0].snapshot().as_ref().clone();
+                hydrated.items = items.clone();
+                handles[0].deliver_snapshot_for_test(hydrated);
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                    unreachable!()
+                };
+                runtime.refresh();
+                frame(&mut app, &mut cache, &[]);
+                let Some(CardRuntime::Chat(runtime)) = app.cards.get_mut(&card) else {
+                    unreachable!()
+                };
+                preparation::drain_fixture(runtime);
+            }
+            let returned = frame(&mut app, &mut cache, &[]).expect("the reader's place");
+            assert_eq!(returned.0, left.0, "cold: {cold}");
+            assert!(
+                (returned.1 - left.1).abs() <= 1.0,
+                "cold: {cold}: the reader left {left:?} and returned to {returned:?}"
+            );
+            for _ in 0..3 {
+                assert_eq!(frame(&mut app, &mut cache, &[]), Some(returned.clone()));
+            }
+        }
+    }
 }
