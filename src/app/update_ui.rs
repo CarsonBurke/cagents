@@ -1012,7 +1012,7 @@ impl Cagents {
                 self.update_ui.error = None;
                 cosmic::task::future(async move {
                     let result = tokio::task::spawn_blocking(move || {
-                        crate::update::apply_installed(&installed, false)
+                        crate::update::apply_installed(&installed)
                             .map_err(|error| error.to_string())
                     })
                     .await
@@ -1249,6 +1249,11 @@ mod tests {
         let confirmation = crate::update::UpdateConfirmation {
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
                 candidate: crate::update::impact::Candidate {
                     version: "new".into(),
                     protocol: 32,
@@ -1367,6 +1372,11 @@ mod tests {
         app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,
@@ -1411,6 +1421,11 @@ mod tests {
         crate::update::UpdateConfirmation {
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                from_version: String::new(),
+                windows: 0,
+                stopped: Vec::new(),
+                stopped_windows: Vec::new(),
+                labels: Default::default(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,

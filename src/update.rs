@@ -416,9 +416,7 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
     )
 }
 
-// The ignored argument retains the existing window call signature until that
-// flow is changed; it grants no authority and is never sent to the worker.
-pub fn apply_installed(executable: &Path, _compatibility: bool) -> Result<UpdateJob, UpdateError> {
+pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
@@ -512,7 +510,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
     }
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
-    let initial = apply_installed(&candidate, false)?;
+    let initial = apply_installed(&candidate)?;
     let mut policy = if interrupt {
         impact::Policy::Interrupt
     } else {
