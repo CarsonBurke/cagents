@@ -1,5 +1,5 @@
 use super::*;
-use crate::model::ChannelId;
+use crate::model::{Cards, ChannelId};
 
 /// Ownership comes from the launch recipe, never a shell's current directory or
 /// OSC title. Component-aware matching also keeps `repo-fix` outside `repo`.
@@ -182,7 +182,7 @@ fn scope_descriptor(
         id: state.id,
         generation: state.generation,
         existence: state.existence.clone(),
-        cards,
+        cards: cards.into(),
         focused,
         active_worktree: None,
         worktree_focus: HashMap::new(),
@@ -208,7 +208,7 @@ fn scope_descriptor(
 
 fn insertion_indices(
     visible: &[WorkspaceCard],
-    durable: &[CardState],
+    durable: &Cards,
     focused: Option<CardId>,
 ) -> (usize, usize) {
     let anchor = focused.and_then(|id| {
@@ -1043,7 +1043,8 @@ mod tests {
                 loose.clone(),
                 companion.clone(),
                 channeled.clone(),
-            ],
+            ]
+            .into(),
             active_worktree: Some("/repo".into()),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
@@ -1092,7 +1093,7 @@ mod tests {
         let a = ChannelId::new();
         let b = ChannelId::new();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![main.clone(), first.clone(), focused.clone(), second.clone()],
+            cards: vec![main.clone(), first.clone(), focused.clone(), second.clone()].into(),
             focused: Some(focused.id),
             active_worktree: Some("/repo".into()),
             active_channel: Some(a),
@@ -1157,7 +1158,7 @@ mod tests {
         let closed = terminal("/repo");
         let main = terminal("/repo");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![main.clone(), closed.clone()],
+            cards: vec![main.clone(), closed.clone()].into(),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
                 id,
@@ -1264,7 +1265,7 @@ mod tests {
         let nested = terminal("/repo/worktree/src");
         let channeled = terminal("/repo/idle");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![root.clone(), nested.clone(), channeled.clone()],
+            cards: vec![root.clone(), nested.clone(), channeled.clone()].into(),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
                 id: ChannelId::new(),
@@ -1313,7 +1314,7 @@ mod tests {
         let shell = terminal("/repo");
         let id = shell.id;
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![shell],
+            cards: vec![shell].into(),
             ..WorkspaceState::default()
         });
         // Any message that reaches the end of `update` derives the rows.
@@ -1348,7 +1349,7 @@ mod tests {
         let channeled = terminal("/home/user");
         let channel = ChannelId::new();
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![main.clone(), nested.clone(), channeled.clone()],
+            cards: vec![main.clone(), nested.clone(), channeled.clone()].into(),
             active_worktree: Some("/repo".into()),
             channels: vec![ProjectChannel {
                 title_source: Default::default(),
@@ -1605,7 +1606,7 @@ mod tests {
             terminal: Some(source),
         });
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![card.clone()],
+            cards: vec![card.clone()].into(),
             ..WorkspaceState::default()
         });
         let _ = app.select_worktree("/repo/nested".into(), true);
@@ -1639,7 +1640,7 @@ mod tests {
         let a = terminal("/a");
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a, b],
+            cards: vec![a, b].into(),
             ..WorkspaceState::default()
         });
         let mut workspace = Workspace::default();
@@ -1737,7 +1738,7 @@ mod tests {
         let a = [terminal("/a"), terminal("/a/src"), terminal("/a")];
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a[0].clone(), b.clone(), a[1].clone(), a[2].clone()],
+            cards: vec![a[0].clone(), b.clone(), a[1].clone(), a[2].clone()].into(),
             focused: Some(a[2].id),
             ..WorkspaceState::default()
         });
@@ -1807,7 +1808,7 @@ mod tests {
         let a = [terminal("/a/src"), terminal("/a/src"), terminal("/a/src")];
         let b = terminal("/b");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a[0].clone(), a[1].clone(), a[2].clone(), b.clone()],
+            cards: vec![a[0].clone(), a[1].clone(), a[2].clone(), b.clone()].into(),
             focused: Some(a[0].id),
             ..WorkspaceState::default()
         });
@@ -1832,7 +1833,7 @@ mod tests {
             let editor = repository("/a");
             let shell = terminal("/a");
             app.durable = Arc::new(WorkspaceState {
-                cards: vec![editor.clone(), shell.clone()],
+                cards: vec![editor.clone(), shell.clone()].into(),
                 focused: Some(shell.id),
                 ..WorkspaceState::default()
             });
@@ -1871,7 +1872,7 @@ mod tests {
         let legacy = terminal("/home/user");
         let owned = terminal("/repo");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![legacy.clone(), owned.clone()],
+            cards: vec![legacy.clone(), owned.clone()].into(),
             focused: Some(owned.id),
             ..WorkspaceState::default()
         });
@@ -1906,7 +1907,7 @@ mod tests {
             &[root.to_str().unwrap(), nested.to_str().unwrap()],
         );
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![shell.clone(), editor.clone()],
+            cards: vec![shell.clone(), editor.clone()].into(),
             ..WorkspaceState::default()
         });
         let _ = app.select_worktree(alias.join("worktrees/feature"), false);
@@ -1926,7 +1927,7 @@ mod tests {
         let shell = terminal(missing.to_str().unwrap());
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![shell.clone()],
+            cards: vec![shell.clone()].into(),
             ..WorkspaceState::default()
         });
         let _ = app.select_worktree(directory.path().into(), false);
@@ -1973,7 +1974,7 @@ mod tests {
             let parent = terminal("/repo");
             let retained = terminal("/repo/worktrees/deleted/src");
             app.durable = Arc::new(WorkspaceState {
-                cards: vec![parent.clone(), retained.clone()],
+                cards: vec![parent.clone(), retained.clone()].into(),
                 ..WorkspaceState::default()
             });
             if restored_without_row {
@@ -2002,7 +2003,7 @@ mod tests {
         let source = repository(nested.to_str().unwrap());
         let mut app = super::super::tests::context_inspector_test_app(false);
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![source.clone()],
+            cards: vec![source.clone()].into(),
             focused: Some(source.id),
             active_worktree: Some(root.clone()),
             card_scopes: HashMap::from([(source.id, root.clone())]),
@@ -2147,7 +2148,8 @@ mod tests {
                 browser.clone(),
                 b.clone(),
                 b_editor.clone(),
-            ],
+            ]
+            .into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         };
@@ -2157,8 +2159,8 @@ mod tests {
         let a_view = scope_descriptor(&state, roots[0], &roots, &owners, Some(a.id));
         let b_view = scope_descriptor(&state, roots[1], &roots, &owners, Some(b.id));
         let returned = scope_descriptor(&state, roots[0], &roots, &owners, a_view.focused);
-        assert_eq!(a_view.cards, vec![a, a_editor, browser.clone()]);
-        assert_eq!(b_view.cards, vec![browser, b, b_editor]);
+        assert_eq!(a_view.cards, vec![a, a_editor, browser.clone()].into());
+        assert_eq!(b_view.cards, vec![browser, b, b_editor].into());
         assert_eq!(returned, a_view);
         assert_eq!(state, before);
     }
@@ -2169,7 +2171,7 @@ mod tests {
         let hidden = terminal("/b");
         let next = terminal("/a");
         let state = WorkspaceState {
-            cards: vec![a.clone(), hidden.clone(), next.clone()],
+            cards: vec![a.clone(), hidden.clone(), next.clone()].into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         };
@@ -2183,7 +2185,7 @@ mod tests {
         inserted.cards.insert(indices.1, added.clone());
         let restored =
             scope_descriptor(&inserted, roots[0], &roots, &HashMap::new(), Some(added.id));
-        assert_eq!(restored.cards, vec![a, added, next]);
+        assert_eq!(restored.cards, vec![a, added, next].into());
         assert_eq!(inserted.cards[2], hidden);
         assert_eq!(
             insertion_indices(workspace.cards(), &state.cards, None),
@@ -2198,7 +2200,7 @@ mod tests {
         let a_focused = terminal("/repo");
         let b = terminal("/repo/nested/src");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a_first.clone(), b.clone(), a_focused.clone()],
+            cards: vec![a_first.clone(), b.clone(), a_focused.clone()].into(),
             focused: Some(a_focused.id),
             ..WorkspaceState::default()
         });
@@ -2366,7 +2368,7 @@ mod tests {
         register_worktrees(&mut app, &["/a", "/b"]);
         let editor = repository("/a");
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![editor.clone(), terminal("/b")],
+            cards: vec![editor.clone(), terminal("/b")].into(),
             focused: Some(editor.id),
             ..WorkspaceState::default()
         });
@@ -2400,7 +2402,7 @@ mod tests {
             fidelity: BrowserRestoreFidelity::UrlOnly,
         });
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![a.clone(), b.clone(), browser.clone()],
+            cards: vec![a.clone(), b.clone(), browser.clone()].into(),
             focused: Some(a.id),
             ..WorkspaceState::default()
         });
@@ -2430,7 +2432,7 @@ mod tests {
         app.settings.default_worktree_pane = settings::DefaultPane::Terminal;
         let parent_terminal = terminal(root.path().to_str().unwrap());
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![parent_terminal.clone()],
+            cards: vec![parent_terminal.clone()].into(),
             focused: Some(parent_terminal.id),
             ..WorkspaceState::default()
         });

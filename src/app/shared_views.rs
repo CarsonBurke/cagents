@@ -2348,7 +2348,7 @@ impl Cagents {
                     let durable = Arc::make_mut(&mut self.durable);
                     if let Some(existing) = durable.cards.iter_mut().find(|card| card.id == pane.id)
                     {
-                        *existing = card;
+                        *existing = card.into();
                     } else {
                         durable.cards.push(card);
                     }
@@ -2406,7 +2406,7 @@ impl Cagents {
         for card in &mut Arc::make_mut(&mut self.durable).cards {
             if members.contains(&card.id) {
                 if let Some(next) = ordered.next() {
-                    *card = next;
+                    *card = next.into();
                 }
             }
         }

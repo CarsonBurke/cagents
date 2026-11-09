@@ -1202,13 +1202,300 @@ pub struct EditorNavigation {
     pub scroll_horizontal: f32,
 }
 
+/// A value shared between copies of the workspace until one of them changes
+/// it.
+///
+/// The durable workspace is copied on write whenever the session writer still
+/// holds the snapshot it was last handed, which is from every save until that
+/// save's flush settles. Each card is behind one of these, so that copy shares
+/// every card, and an edit through it copies only the card it changes.
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Shared<T>(std::sync::Arc<T>);
+
+impl<T> Shared<T> {
+    pub fn new(value: T) -> Self {
+        Self(std::sync::Arc::new(value))
+    }
+
+    /// Whether `self` and `other` are the same value, not merely equal ones.
+    pub fn ptr_eq(this: &Self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&this.0, &other.0)
+    }
+}
+
+impl<T: Clone> Shared<T> {
+    /// The value, copied only if another workspace still shares it.
+    pub fn into_inner(self) -> T {
+        std::sync::Arc::unwrap_or_clone(self.0)
+    }
+}
+
+impl<T> Clone for Shared<T> {
+    fn clone(&self) -> Self {
+        Self(std::sync::Arc::clone(&self.0))
+    }
+}
+
+impl<T> std::ops::Deref for Shared<T> {
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: Clone> std::ops::DerefMut for Shared<T> {
+    /// Copies the value first if another workspace still shares it.
+    fn deref_mut(&mut self) -> &mut T {
+        std::sync::Arc::make_mut(&mut self.0)
+    }
+}
+
+impl<T> From<T> for Shared<T> {
+    fn from(value: T) -> Self {
+        Self::new(value)
+    }
+}
+
+impl<T: PartialEq> PartialEq for Shared<T> {
+    fn eq(&self, other: &Self) -> bool {
+        Self::ptr_eq(self, other) || *self.0 == *other.0
+    }
+}
+
+impl<T: PartialEq<T>> PartialEq<T> for Shared<T> {
+    fn eq(&self, other: &T) -> bool {
+        *self.0 == *other
+    }
+}
+
+/// A workspace's cards, in order.
+///
+/// Reading a card, or copying the list, never copies a card: the list is
+/// shared with the snapshot the session writer holds, card by card. Changing a
+/// card through `get_mut`, `iter_mut` or indexing copies only that card, and
+/// only while a snapshot still shares it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct Cards(Vec<Shared<CardState>>);
+
+impl Cards {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> CardsIter<'_> {
+        CardsIter(self.0.iter())
+    }
+
+    /// Each card, copied only when it is written through.
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Shared<CardState>> {
+        self.0.iter_mut()
+    }
+
+    pub fn get(&self, index: usize) -> Option<&CardState> {
+        self.0.get(index).map(|card| &**card)
+    }
+
+    /// The card at `index`, copied first if a snapshot still shares it.
+    pub fn get_mut(&mut self, index: usize) -> Option<&mut CardState> {
+        self.0.get_mut(index).map(|card| &mut **card)
+    }
+
+    pub fn first(&self) -> Option<&CardState> {
+        self.get(0)
+    }
+
+    pub fn last(&self) -> Option<&CardState> {
+        self.0.last().map(|card| &**card)
+    }
+
+    pub fn push(&mut self, card: CardState) {
+        self.0.push(card.into());
+    }
+
+    pub fn insert(&mut self, index: usize, card: CardState) {
+        self.0.insert(index, card.into());
+    }
+
+    pub fn remove(&mut self, index: usize) -> CardState {
+        self.0.remove(index).into_inner()
+    }
+
+    pub fn retain(&mut self, mut keep: impl FnMut(&CardState) -> bool) {
+        self.0.retain(|card| keep(card));
+    }
+
+    pub fn clear(&mut self) {
+        self.0.clear();
+    }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.0.truncate(len);
+    }
+
+    pub fn swap(&mut self, a: usize, b: usize) {
+        self.0.swap(a, b);
+    }
+
+    pub fn sort_by_key<K: Ord>(&mut self, mut key: impl FnMut(&CardState) -> K) {
+        self.0.sort_by_key(|card| key(card));
+    }
+
+    pub fn sort_by(
+        &mut self,
+        mut compare: impl FnMut(&CardState, &CardState) -> std::cmp::Ordering,
+    ) {
+        self.0.sort_by(|a, b| compare(a, b));
+    }
+}
+
+#[cfg(test)]
+impl Cards {
+    /// How many of these are the very cards `other` holds at the same place,
+    /// shared rather than copied.
+    pub(crate) fn shared_with(&self, other: &Self) -> usize {
+        self.0
+            .iter()
+            .zip(&other.0)
+            .filter(|(a, b)| Shared::ptr_eq(a, b))
+            .count()
+    }
+
+    /// The cards both lists hold that these hold a copy of rather than the
+    /// very card `other` holds, wherever each sits.
+    pub(crate) fn copied_from(&self, other: &Self) -> Vec<CardId> {
+        let theirs = other
+            .0
+            .iter()
+            .map(|card| (card.id, card))
+            .collect::<HashMap<_, _>>();
+        self.0
+            .iter()
+            .filter(|card| {
+                theirs
+                    .get(&card.id)
+                    .is_some_and(|their| !Shared::ptr_eq(card, their))
+            })
+            .map(|card| card.id)
+            .collect()
+    }
+}
+
+impl std::ops::Index<usize> for Cards {
+    type Output = CardState;
+
+    fn index(&self, index: usize) -> &CardState {
+        &self.0[index]
+    }
+}
+
+impl std::ops::IndexMut<usize> for Cards {
+    /// Copies the card first if a snapshot still shares it.
+    fn index_mut(&mut self, index: usize) -> &mut CardState {
+        &mut self.0[index]
+    }
+}
+
+impl From<Vec<CardState>> for Cards {
+    fn from(cards: Vec<CardState>) -> Self {
+        cards.into_iter().collect()
+    }
+}
+
+impl<const N: usize> From<[CardState; N]> for Cards {
+    fn from(cards: [CardState; N]) -> Self {
+        cards.into_iter().collect()
+    }
+}
+
+impl FromIterator<CardState> for Cards {
+    fn from_iter<I: IntoIterator<Item = CardState>>(cards: I) -> Self {
+        Self(cards.into_iter().map(Shared::new).collect())
+    }
+}
+
+impl Extend<CardState> for Cards {
+    fn extend<I: IntoIterator<Item = CardState>>(&mut self, cards: I) {
+        self.0.extend(cards.into_iter().map(Shared::new));
+    }
+}
+
+impl IntoIterator for Cards {
+    type Item = CardState;
+    type IntoIter =
+        std::iter::Map<std::vec::IntoIter<Shared<CardState>>, fn(Shared<CardState>) -> CardState>;
+
+    /// Each card, copied only if a snapshot still shares it.
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.into_iter().map(Shared::into_inner)
+    }
+}
+
+impl<'a> IntoIterator for &'a Cards {
+    type Item = &'a CardState;
+    type IntoIter = CardsIter<'a>;
+
+    fn into_iter(self) -> CardsIter<'a> {
+        self.iter()
+    }
+}
+
+/// The cards of a [`Cards`], in order.
+#[derive(Debug, Clone)]
+pub struct CardsIter<'a>(std::slice::Iter<'a, Shared<CardState>>);
+
+impl<'a> Iterator for CardsIter<'a> {
+    type Item = &'a CardState;
+
+    fn next(&mut self) -> Option<&'a CardState> {
+        self.0.next().map(|card| &**card)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.0.size_hint()
+    }
+
+    fn nth(&mut self, n: usize) -> Option<&'a CardState> {
+        self.0.nth(n).map(|card| &**card)
+    }
+}
+
+impl DoubleEndedIterator for CardsIter<'_> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.0.next_back().map(|card| &**card)
+    }
+}
+
+impl ExactSizeIterator for CardsIter<'_> {}
+
+impl std::iter::FusedIterator for CardsIter<'_> {}
+
+impl<'a> IntoIterator for &'a mut Cards {
+    type Item = &'a mut Shared<CardState>;
+    type IntoIter = std::slice::IterMut<'a, Shared<CardState>>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter_mut()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkspaceState {
     pub schema_version: u32,
     pub id: WorkspaceId,
     pub generation: u64,
     pub existence: Existence,
-    pub cards: Vec<CardState>,
+    pub cards: Cards,
     pub focused: Option<CardId>,
     #[serde(default)]
     pub active_worktree: Option<PathBuf>,
@@ -1278,7 +1565,7 @@ impl Default for WorkspaceState {
             id: WorkspaceId::new(),
             generation: 0,
             existence: Existence::Open,
-            cards: Vec::new(),
+            cards: Cards::new(),
             focused: None,
             active_worktree: None,
             worktree_focus: HashMap::new(),
@@ -1336,6 +1623,48 @@ mod durable_save_workload;
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    fn titled(title: &str) -> CardState {
+        CardState {
+            id: CardId::new(),
+            generation: 0,
+            title: title.into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            kind: CardKind::Settings,
+        }
+    }
+
+    /// A copy of the cards shares each of them; changing one through the copy
+    /// copies that card alone and leaves the original as it was.
+    #[test]
+    fn a_copy_of_the_cards_copies_only_the_card_it_changes() {
+        let original = Cards::from([titled("a"), titled("b"), titled("c")]);
+        let mut copy = original.clone();
+        assert_eq!(copy.shared_with(&original), 3);
+        copy[1].title = "changed".into();
+        assert_eq!(copy.shared_with(&original), 2);
+        assert_eq!(original[1].title, "b");
+        assert_ne!(copy, original);
+        for card in copy.iter_mut() {
+            // Reading through a mutable reference copies nothing.
+            assert!(!card.title.is_empty());
+        }
+        assert_eq!(copy.shared_with(&original), 2);
+    }
+
+    /// Cards are stored as the plain list they always were.
+    #[test]
+    fn cards_serialize_as_a_plain_list() {
+        let cards = vec![titled("a"), titled("b")];
+        assert_eq!(
+            serde_json::to_value(Cards::from(cards.clone())).unwrap(),
+            serde_json::to_value(&cards).unwrap()
+        );
+        let restored: Cards =
+            serde_json::from_value(serde_json::to_value(&cards).unwrap()).unwrap();
+        assert_eq!(restored, Cards::from(cards));
+    }
 
     #[test]
     fn legacy_repository_descriptor_remains_a_browser() {

@@ -230,7 +230,7 @@ mod tests {
             .collect();
         let durable = Arc::make_mut(&mut app.durable);
         durable.focused = cards.first().map(|card| card.id);
-        durable.cards = cards;
+        durable.cards = cards.into();
         app.workspace = Cagents::rebuild_workspace(&app.durable);
         app.workspace.resize_viewport(width);
         drop(app.sync_chrome());

@@ -374,6 +374,35 @@ fn the_workload_opens_each_channel_with_its_own_panes() {
     }
 }
 
+/// The session writer holds the last snapshot from each save until its flush
+/// settles, so a channel opened meanwhile copies the workspace. The copy
+/// shares every card the switch does not change, rather than copying all of
+/// them on the UI thread. (Opening an empty channel adds its default chat,
+/// and leaving it removes that chat again, which moves the others along.)
+#[test]
+fn opening_a_channel_while_a_save_is_in_flight_copies_no_card() {
+    let scale = Scale {
+        worktrees: 40,
+        channels: 8,
+        chats: 5,
+        loose_terminals: 3,
+        closed_cards: 30,
+    };
+    let (mut app, channels, _directory) = large_workspace(&scale);
+    drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+        channel_id: channels[0],
+    })));
+    for channel in &channels[1..] {
+        let held = Arc::clone(&app.durable);
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: *channel,
+        })));
+        assert!(!Arc::ptr_eq(&held, &app.durable), "the switch is saved");
+        let copied = app.durable.cards.copied_from(&held.cards);
+        assert!(copied.is_empty(), "a channel switch copied {copied:?}");
+    }
+}
+
 #[test]
 #[ignore = "timing workload; run optimized with --ignored --nocapture"]
 fn channel_open_timing() {

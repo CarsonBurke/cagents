@@ -18,11 +18,11 @@ use thiserror::Error;
 
 use crate::{
     model::{
-        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, ChannelId,
-        Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId, ProjectState,
-        TerminalContinuity, TerminalId, TerminalSession, Tombstone, TranscriptMetadata,
-        WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId, WorktreeState,
-        normalize_project_channels,
+        BootId, BrowserRestoreFidelity, BrowserSession, CardId, CardKind, CardState, Cards,
+        ChannelId, Existence, HostSessionProof, OperationId, ProjectChannel, ProjectId,
+        ProjectState, TerminalContinuity, TerminalId, TerminalSession, Tombstone,
+        TranscriptMetadata, WorkspaceDestination, WorkspaceId, WorkspaceState, WorktreeId,
+        WorktreeState, normalize_project_channels,
     },
     secure_file::{
         migrate_existing_private_file, prepare_private_directory, validate_and_privatize_open_file,
@@ -2159,7 +2159,7 @@ impl StateStore {
             id: manifest.id,
             generation: manifest.generation,
             existence: manifest.existence,
-            cards,
+            cards: cards.into(),
             focused: manifest.focused,
             active_worktree: manifest.active_worktree,
             worktree_focus: manifest.worktree_focus,
@@ -4218,7 +4218,7 @@ fn savepoint(transaction: &Transaction<'_>, statement: &str) -> Result<()> {
 }
 
 /// The conversation each open chat card holds, by card.
-fn open_chat_sessions(cards: &[CardState]) -> HashMap<CardId, &crate::chat::Session> {
+fn open_chat_sessions(cards: &Cards) -> HashMap<CardId, &crate::chat::Session> {
     cards
         .iter()
         .filter(|card| card.existence.is_open())
@@ -6391,7 +6391,8 @@ mod tests {
                         host_incarnation: HostIncarnation::new("incarnation-a"),
                     },
                 }),
-            }],
+            }]
+            .into(),
             focused: Some(card_id),
             active_worktree: None,
             worktree_focus: HashMap::new(),
@@ -8839,7 +8840,8 @@ mod tests {
             existence: Existence::Open,
             kind: CardKind::Chat(draft),
             ..workspace.cards[0].clone()
-        }];
+        }]
+        .into();
         let base = store.stored_generations(workspace.id).unwrap();
         store
             .save_workspace(

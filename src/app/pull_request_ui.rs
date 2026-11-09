@@ -2413,7 +2413,7 @@ mod tests {
         let terminal_id = terminal.id;
         let chat_id = chat.id;
         app.durable = Arc::new(WorkspaceState {
-            cards: vec![chat, terminal],
+            cards: vec![chat, terminal].into(),
             focused: Some(chat_id),
             ..WorkspaceState::default()
         });

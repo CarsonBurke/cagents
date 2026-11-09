@@ -177,7 +177,7 @@ pub(super) fn long_lived_workspace() -> WorkspaceState {
             .iter()
             .find(|card| card.existence.is_open())
             .map(|card| card.id),
-        cards,
+        cards: cards.into(),
         active_worktree: None,
         worktree_focus,
         project_order: Vec::new(),
