@@ -266,12 +266,16 @@ fn publish_with_client(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
-                        && let Ok(model) = client.read_workspace_model()
-                    {
+                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
                         // A refused suggestion is not replayed against a newer
                         // owner. Restore the authoritative name after optimism.
-                        let _ = updates.send_blocking(ModelUpdate::Read(model));
+                        match client.read_workspace_model() {
+                            Ok(model) => {
+                                let _ = updates.send_blocking(ModelUpdate::Read(model));
+                            }
+                            Err(ControlError::Remote { .. }) => {}
+                            Err(error) => return Err(error.to_string()),
+                        }
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
@@ -1753,6 +1757,213 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::terminal::ipc::{
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+        ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+    };
+
+    fn publisher_reply(
+        peer: &mut std::os::unix::net::UnixStream,
+        proof: &crate::model::HostSessionProof,
+        request_id: u64,
+        message: ServerMessage,
+    ) {
+        write_frame(
+            peer,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request_id),
+                proof: proof.clone(),
+                message,
+            },
+        )
+        .unwrap();
+    }
+
+    fn publisher_connection(
+        serve: impl FnOnce(&mut std::os::unix::net::UnixStream, &crate::model::HostSessionProof)
+        + Send
+        + 'static,
+    ) -> (ControlClient, std::thread::JoinHandle<()>) {
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "publisher-refusal".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "owner".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            publisher_reply(
+                &mut peer,
+                &proof,
+                hello.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            serve(&mut peer, &proof);
+        });
+        (ControlClient::from_stream(stream).unwrap(), server)
+    }
+
+    #[test]
+    fn failed_title_restore_reconnects_before_sending_later_edits() {
+        let id = ChannelId::new();
+        let title = ModelEdit::SuggestConversationTitle {
+            id,
+            card: CardId::new(),
+            expected_revision: 1,
+            title: "First prompt".into(),
+            source: crate::model::ChannelTitleSource::Prompt,
+        };
+        let next = ModelEdit::RetitleChannel {
+            id,
+            title: "Manual name".into(),
+        };
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert!(matches!(
+                request.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::SuggestConversationTitle { .. }
+                }
+            ));
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Title basis changed",
+                    false,
+                )),
+            );
+            let read: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+            publisher_reply(
+                peer,
+                proof,
+                read.request_id + 1,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: WorkspaceModel::default(),
+                    },
+                },
+            );
+            let later: Option<ClientEnvelope> = read_frame(peer).unwrap();
+            assert!(
+                later.is_none(),
+                "a desynchronized connection must not carry another edit"
+            );
+        });
+        let (updates, _received) = async_channel::unbounded();
+        let (queued, requests) = async_channel::unbounded();
+        queued.send_blocking(title).unwrap();
+        queued.send_blocking(next.clone()).unwrap();
+        drop(queued);
+        let mut pending = None;
+        let error =
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err();
+        drop(client);
+        server.join().unwrap();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(
+            pending.is_none(),
+            "the definitive title refusal must not be replayed"
+        );
+        assert_eq!(requests.try_recv().unwrap(), next);
+    }
+
+    #[test]
+    fn transport_error_after_refusal_retries_only_the_pending_edit_on_reconnect() {
+        let id = ChannelId::new();
+        let title = ModelEdit::SuggestChannelTitle {
+            id,
+            title: "First prompt".into(),
+            source: crate::model::ChannelTitleSource::Prompt,
+        };
+        let next = ModelEdit::RetitleChannel {
+            id,
+            title: "Manual name".into(),
+        };
+        let expected = next.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: title }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Title basis changed",
+                    false,
+                )),
+            );
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: expected }
+            );
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let (updates, received) = async_channel::unbounded();
+        let (queued, requests) = async_channel::unbounded();
+        queued
+            .send_blocking(ModelEdit::SuggestChannelTitle {
+                id,
+                title: "First prompt".into(),
+                source: crate::model::ChannelTitleSource::Prompt,
+            })
+            .unwrap();
+        queued.send_blocking(next.clone()).unwrap();
+        drop(queued);
+        let mut pending = None;
+        let error =
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(error, ControlError::ConnectionClosed.to_string());
+        assert_eq!(pending, Some(next.clone()));
+        assert!(received.is_empty());
+
+        let expected = next.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: expected }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: WorkspaceModel::default(),
+                    },
+                },
+            );
+        });
+        assert_eq!(
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err(),
+            "the window stopped publishing",
+        );
+        drop(client);
+        server.join().unwrap();
+        assert!(pending.is_none());
+        assert!(received.is_empty());
+    }
 
     #[test]
     fn refused_titles_do_not_disconnect_or_block_later_model_edits() {
