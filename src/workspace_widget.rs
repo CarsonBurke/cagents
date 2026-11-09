@@ -34,7 +34,12 @@ pub struct ViewportSample {
 pub enum WorkspaceViewportEvent {
     Scrolled(ViewportSample),
     Resized(f32),
-    PointerFocused(CardId),
+    /// A button was pressed in this pane; `primary` when it was the left one,
+    /// which is the press that places a caret or picks a control.
+    PointerFocused {
+        card: CardId,
+        primary: bool,
+    },
     /// The pointer moved into this pane and rested there for
     /// [`HOVER_ACTIVATION_DWELL`] without a click or a key press in between.
     PointerRested(CardId),
@@ -703,6 +708,119 @@ pub fn focus_card_if_outside<Message: Send + 'static>(
     })
 }
 
+/// Hover activation hands the keyboard to the pane under the pointer, but
+/// only from somewhere inside `workspace` or from nowhere: a field outside
+/// the strip, such as sidebar search, keeps what is being typed into it.
+/// Nothing happens while `target` is not in the widget tree, because a focus
+/// operation that finds no target blurs every widget instead.
+pub fn focus_unless_held_outside<Message: Send + 'static>(
+    workspace: widget::Id,
+    target: widget::Id,
+) -> Task<Message> {
+    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+    use cosmic::iced::core::id::IdEq;
+
+    struct Probe {
+        workspace: widget::Id,
+        target: widget::Id,
+        current: Option<widget::Id>,
+        inside: bool,
+        held_outside: bool,
+        target_mounted: bool,
+    }
+
+    impl<Message: Send + 'static> Operation<Message> for Probe {
+        fn container(&mut self, id: Option<&widget::Id>, _bounds: Rectangle) {
+            self.current = id.cloned();
+        }
+
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            self.target_mounted |= id.is_some_and(|id| IdEq::eq(&id.0, &self.target.0));
+            self.held_outside |= !self.inside && state.is_focused();
+        }
+
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            let entering = !self.inside
+                && self
+                    .current
+                    .as_ref()
+                    .is_some_and(|id| IdEq::eq(&id.0, &self.workspace.0));
+            self.current = None;
+            self.inside |= entering;
+            operate(self);
+            if entering {
+                self.inside = false;
+            }
+        }
+
+        fn finish(&self) -> Outcome<Message> {
+            if self.target_mounted && !self.held_outside {
+                Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+            } else {
+                Outcome::None
+            }
+        }
+    }
+
+    cosmic::iced::advanced::widget::operate(Probe {
+        workspace,
+        target,
+        current: None,
+        inside: false,
+        held_outside: false,
+        target_mounted: false,
+    })
+}
+
+/// Returns the keyboard to `target` when no widget in the window holds it,
+/// as after the window is activated with nothing focused. A control that
+/// kept focus while the window was away keeps it.
+pub fn focus_if_unheld<Message: Send + 'static>(target: widget::Id) -> Task<Message> {
+    use cosmic::iced::advanced::widget::operation::{self, Outcome, focusable};
+    use cosmic::iced::core::id::IdEq;
+
+    struct Probe {
+        target: widget::Id,
+        held: bool,
+        target_mounted: bool,
+    }
+
+    impl<Message: Send + 'static> Operation<Message> for Probe {
+        fn focusable(
+            &mut self,
+            id: Option<&widget::Id>,
+            _bounds: Rectangle,
+            state: &mut dyn operation::Focusable,
+        ) {
+            self.target_mounted |= id.is_some_and(|id| IdEq::eq(&id.0, &self.target.0));
+            self.held |= state.is_focused();
+        }
+
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation<Message>)) {
+            operate(self);
+        }
+
+        fn finish(&self) -> Outcome<Message> {
+            if self.target_mounted && !self.held {
+                Outcome::Chain(Box::new(focusable::focus(self.target.clone())))
+            } else {
+                Outcome::None
+            }
+        }
+    }
+
+    cosmic::iced::advanced::widget::operate(Probe {
+        target,
+        held: false,
+        target_mounted: false,
+    })
+}
+
 pub fn focus_handoff<Message, F>(
     handoff: FocusHandoff,
     toolbar_focus_id: widget::Id,
@@ -1048,9 +1166,16 @@ where
                         content: CardSurface::new(content)
                             .traced_by(input)
                             .on_screen(on_screen)
-                            .on_pointer_focus(on_viewport(WorkspaceViewportEvent::PointerFocused(
-                                card.id,
-                            )))
+                            .on_pointer_focus(
+                                on_viewport(WorkspaceViewportEvent::PointerFocused {
+                                    card: card.id,
+                                    primary: true,
+                                }),
+                                on_viewport(WorkspaceViewportEvent::PointerFocused {
+                                    card: card.id,
+                                    primary: false,
+                                }),
+                            )
                             // The active pane has nothing to gain from a rest.
                             .on_pointer_rest((focus_follows_mouse && !focused).then(|| {
                                 on_viewport(WorkspaceViewportEvent::PointerRested(card.id))
@@ -1099,7 +1224,8 @@ where
 
 struct CardSurface<'a, Message> {
     content: Element<'a, Message>,
-    on_pointer_focus: Option<Message>,
+    /// Published for a primary press and for any other press.
+    on_pointer_focus: Option<(Message, Message)>,
     on_pointer_rest: Option<Message>,
     input: InputTrace,
     on_screen: bool,
@@ -1132,8 +1258,8 @@ impl<'a, Message> CardSurface<'a, Message> {
         self
     }
 
-    fn on_pointer_focus(mut self, message: Message) -> Self {
-        self.on_pointer_focus = Some(message);
+    fn on_pointer_focus(mut self, primary: Message, other: Message) -> Self {
+        self.on_pointer_focus = Some((primary, other));
         self
     }
 
@@ -1169,7 +1295,9 @@ impl<'a, Message> CardSurface<'a, Message> {
 /// before then cancels it, so a pointer that drifts while the reader types or
 /// runs a shortcut leaves their keystrokes going where they were going. The
 /// pointer must still be over the pane when the dwell ends, which a pane the
-/// strip moved away meanwhile is not.
+/// strip moved away meanwhile is not, and must not be resting on a resize
+/// handle at the pane's edge, nor be composing text with an input method.
+/// Leaving such a handle into the pane starts a dwell of its own.
 #[derive(Default)]
 struct CardPointerState {
     /// When a crossing into the pane began the dwell it is still serving.
@@ -1281,15 +1409,19 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
                 // Where the motion began is replayed through the current
                 // translation, so content scrolled under a still pointer did
                 // not cross anything.
+                // Coming off a resize handle counts as arriving: while the
+                // pointer rested on the divider it was choosing to resize,
+                // not this pane.
                 let crossed_in = hovered
-                    && self
-                        .input
-                        .previous_position()
-                        .zip(cursor_point(cursor))
-                        .zip(clip)
-                        .is_some_and(|((previous, local), clip)| {
-                            !clip.contains(previous + (local - *position))
-                        });
+                    && (crate::input_trace::was_on_resize_handle()
+                        || self
+                            .input
+                            .previous_position()
+                            .zip(cursor_point(cursor))
+                            .zip(clip)
+                            .is_some_and(|((previous, local), clip)| {
+                                !clip.contains(previous + (local - *position))
+                            }));
                 if !hovered {
                     pointer.entered_at = None;
                 } else if crossed_in && self.on_pointer_rest.is_some() {
@@ -1308,6 +1440,8 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
                         let rested = now.saturating_duration_since(due)
                             <= HOVER_ACTIVATION_LATENESS
                             && !self.input.pressed_since(entered)
+                            && !self.input.composing()
+                            && !crate::input_trace::on_resize_handle()
                             && clipped_viewport(layout.bounds(), viewport)
                                 .is_some_and(|clip| cursor.is_over(clip));
                         // Gone when the pane became active in the meantime.
@@ -1332,11 +1466,15 @@ impl<Message: Clone> Widget<Message, Theme, Renderer> for CardSurface<'_, Messag
         // Observe before the child can capture the press, but do not capture it
         // ourselves: text selection, caret placement and controls still get it.
         if !shell.is_event_captured()
-            && matches!(event, Event::Mouse(mouse::Event::ButtonPressed(_)))
+            && let Event::Mouse(mouse::Event::ButtonPressed(button)) = event
             && cursor.is_over(clipped)
-            && let Some(message) = &self.on_pointer_focus
+            && let Some((primary, other)) = &self.on_pointer_focus
         {
-            shell.publish(message.clone());
+            shell.publish(if *button == mouse::Button::Left {
+                primary.clone()
+            } else {
+                other.clone()
+            });
         }
         self.content.as_widget_mut().update(
             &mut tree.children[0],
@@ -2557,7 +2695,7 @@ mod tests {
                         .height(Length::Fill),
                 )
                 .traced_by(&input)
-                .on_pointer_focus("click")
+                .on_pointer_focus("click", "other click")
                 .on_pointer_rest(Some("rest")),
                 &input,
             );
@@ -3080,6 +3218,90 @@ mod tests {
             assert_eq!(header.1, usize::from(placeholder_focused));
             assert_eq!(foreign.1, 0, "do not unfocus an already unfocused control");
             assert_eq!(editor.1, 0, "do not clear the target's selection");
+        }
+    }
+
+    #[test]
+    fn hover_and_activation_focus_keep_a_control_the_person_is_using() {
+        use cosmic::iced::advanced::widget::operation::{Focusable, Outcome};
+        use cosmic::iced::futures::{StreamExt, executor::block_on};
+
+        struct Focus(bool);
+        impl Focusable for Focus {
+            fn is_focused(&self) -> bool {
+                self.0
+            }
+            fn focus(&mut self) {
+                self.0 = true;
+            }
+            fn unfocus(&mut self) {
+                self.0 = false;
+            }
+        }
+
+        let workspace = widget::Id::new("workspace.strip");
+        let sidebar_id = widget::Id::new("sidebar.search");
+        let other_id = widget::Id::new("left-pane.composer");
+        let target = widget::Id::new("right-pane.composer");
+        // (held, mounted, rest focuses, activation focuses)
+        for (held, mounted, after_rest, after_activation) in [
+            (None, true, true, true),
+            (Some(&sidebar_id), true, false, false),
+            (Some(&other_id), true, true, false),
+            (None, false, false, false),
+        ] {
+            for activation in [false, true] {
+                let mut sidebar = Focus(held == Some(&sidebar_id));
+                let mut other = Focus(held == Some(&other_id));
+                let mut editor = Focus(false);
+                let task = if activation {
+                    focus_if_unheld::<()>(target.clone())
+                } else {
+                    focus_unless_held_outside::<()>(workspace.clone(), target.clone())
+                };
+                let mut stream = cosmic::iced::runtime::task::into_stream(task)
+                    .expect("the handoff must issue a widget operation");
+                while let Some(action) = block_on(stream.next()) {
+                    let cosmic::iced::runtime::Action::Widget(mut operation) = action else {
+                        continue;
+                    };
+                    loop {
+                        let bounds = Rectangle::default();
+                        operation.container(Some(&widget::Id::new("sidebar")), bounds);
+                        operation.traverse(&mut |operation| {
+                            operation.focusable(Some(&sidebar_id), bounds, &mut sidebar);
+                        });
+                        operation.container(Some(&workspace), bounds);
+                        operation.traverse(&mut |operation| {
+                            operation.focusable(Some(&other_id), bounds, &mut other);
+                            if mounted {
+                                operation.focusable(Some(&target), bounds, &mut editor);
+                            }
+                        });
+                        match operation.finish() {
+                            Outcome::Chain(next) => operation = next,
+                            _ => break,
+                        }
+                    }
+                }
+                let expected = if activation {
+                    after_activation
+                } else {
+                    after_rest
+                };
+                assert_eq!(
+                    editor.0, expected,
+                    "held={held:?} mounted={mounted} activation={activation}"
+                );
+                assert_eq!(
+                    sidebar.0,
+                    held == Some(&sidebar_id),
+                    "an outside field keeps the keyboard"
+                );
+                if !mounted {
+                    assert_eq!(other.0, held == Some(&other_id), "nothing is blurred");
+                }
+            }
         }
     }
 

@@ -194,6 +194,21 @@ pub fn muted_color(theme: &Theme) -> Color {
     color
 }
 
+/// What a person has typed into a field: the surface's full-strength ink, so
+/// their own words never read as secondary to anything around them.
+pub fn field_text_color(theme: &Theme) -> Color {
+    theme.current_container().on.into()
+}
+
+/// A field's placeholder: halfway to the surface, clearly weaker than
+/// [`field_text_color`] so an empty field never looks filled in. A muted
+/// label is too strong for this; beside a field's own text it read as the
+/// stronger of the two.
+pub fn field_placeholder_color(theme: &Theme) -> Color {
+    let container = theme.current_container();
+    mix(container.base.into(), container.on.into(), 0.5)
+}
+
 /// The ink of a control that cannot be used now: mixed toward its surface
 /// rather than faded, so it stays legible yet reads apart from muted labels.
 pub fn disabled_color(theme: &Theme) -> Color {

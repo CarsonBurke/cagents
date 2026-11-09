@@ -1711,9 +1711,9 @@ impl Cagents {
         if self.chrome_ui.rename.take().is_none() {
             return Task::none();
         }
-        self.workspace.focused().map_or_else(Task::none, |card| {
-            iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
-        })
+        self.workspace
+            .focused()
+            .map_or_else(Task::none, |card| self.focus_pane_keyboard(card))
     }
 
     /// Keep Tab traversal and global shortcuts inside the open popup.

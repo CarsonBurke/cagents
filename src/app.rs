@@ -1889,18 +1889,21 @@ fn update_workspace_viewport(
             (update, synchronize)
         }
         WorkspaceViewportEvent::Resized(width) => (workspace.resize_viewport(width), true),
-        WorkspaceViewportEvent::PointerRested(card) => (
-            workspace
+        // Pointer activation hands the keyboard over itself, through
+        // `focus_pane_keyboard_after_rest` and `_after_press`, which leave a
+        // control the person chose where it is. The workspace's own request
+        // would focus the pane's control regardless.
+        WorkspaceViewportEvent::PointerRested(card) => {
+            let update = workspace
                 .focus_without_scrolling(card)
-                .unwrap_or_else(|_| ViewportUpdate::unchanged()),
-            false,
-        ),
-        WorkspaceViewportEvent::PointerFocused(card) => {
+                .unwrap_or_else(|_| ViewportUpdate::unchanged());
+            workspace.take_widget_focus_request();
+            (update, false)
+        }
+        WorkspaceViewportEvent::PointerFocused { card, .. } => {
             let update = workspace
                 .focus(card)
                 .unwrap_or_else(|_| ViewportUpdate::unchanged());
-            // The clicked child already placed its caret/selection. Activating
-            // its pane must not move keyboard focus back to the pane title.
             workspace.take_widget_focus_request();
             (update, true)
         }
@@ -2889,7 +2892,7 @@ fn workspace_navigation_blocked_during_save(message: &Message) -> bool {
             | Message::TerminalReviewMode { .. }
             | Message::FocusAdjacent(_)
             | Message::Viewport {
-                event: WorkspaceViewportEvent::PointerFocused(_)
+                event: WorkspaceViewportEvent::PointerFocused { .. }
                     | WorkspaceViewportEvent::PointerRested(_),
                 ..
             }
@@ -3184,7 +3187,7 @@ impl SettingsField {
             Self::CheckForUpdates => "Automatic checks",
             Self::EditorSyntaxTheme => "Syntax theme",
             Self::ConfirmTerminalClose => "Active processes",
-            Self::FocusFollowsMouse => "Pane activation",
+            Self::FocusFollowsMouse => "Pane focus",
             Self::LinkOpenGesture => "System browser gesture",
             Self::PullRequestOpenTarget => "Open pull requests in",
             Self::ShortcutNewTerminal => "New terminal",
@@ -5184,6 +5187,10 @@ pub struct Cagents {
     lifecycle_sweep_generation: u64,
     /// A save of the focus alone is scheduled; see [`FOCUS_SAVE_DELAY`].
     focus_save_pending: bool,
+    /// A focused chat pane whose message input was not drawn when the pane
+    /// was focused, which takes the keyboard once it is; see
+    /// [`Cagents::focus_pane_keyboard`].
+    keyboard_owed: Option<CardId>,
     /// See [`REPORTED_TITLE_SAVE_DELAY`].
     reported_title_save: ReportedTitleSave,
     /// Where the camera was heading when the last sweep found cards on screen
@@ -6184,10 +6191,7 @@ impl Cagents {
                 // to its input surface; otherwise that button consumes the
                 // first Enter even though typed characters reach the PTY.
                 if self.card_holds_keyboard(card) {
-                    tasks.push(
-                        iced::widget::operation::focus(self.card_keyboard_focus(card))
-                            .map(cosmic::Action::App),
-                    );
+                    tasks.push(self.focus_pane_keyboard(card));
                 }
             }
             Err(error) => {
@@ -8972,6 +8976,176 @@ impl Cagents {
             })
     }
 
+    /// Whether `card` is a chat pane that owes its message input the keyboard
+    /// once that input is drawn.
+    fn owes_chat_input(&self, card: CardId) -> bool {
+        self.is_chat_card(card) && !self.chat_input_drawn(card)
+    }
+
+    fn is_chat_card(&self, card: CardId) -> bool {
+        matches!(
+            self.card_state(card).map(|state| &state.kind),
+            Some(CardKind::Chat(_))
+        )
+    }
+
+    /// Gives the keyboard to the focused pane's own control: a chat's message
+    /// input, a terminal, an editor. Every path that focuses a pane hands the
+    /// keyboard over through here or through the pointer and window variants
+    /// below, so what happens while the input is not drawn yet is decided in
+    /// one place. Closing a dialog only gives the keyboard back to the pane
+    /// that already had it, and asks [`Self::card_keyboard_focus`] directly.
+    ///
+    /// A chat that is still starting or changing session has no input yet.
+    /// Its title holds the keyboard meanwhile and the debt is recorded;
+    /// [`Self::settle_owed_keyboard`] pays it when the input appears, unless
+    /// the person chose another control in between.
+    fn focus_pane_keyboard(&mut self, card: CardId) -> Task<Message> {
+        self.keyboard_owed = self.owes_chat_input(card).then_some(card);
+        iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
+    }
+
+    /// The keyboard after a press inside the focused pane `card`. A press on
+    /// a control that takes focus - a find field, transcript text being
+    /// selected, a terminal - keeps it; a press anywhere else in a chat,
+    /// terminal or editor puts the keyboard in that pane's own control,
+    /// with the draft and caret as they were.
+    fn focus_pane_keyboard_after_press(&mut self, card: CardId) -> Task<Message> {
+        if !self.card_holds_keyboard(card)
+            || !matches!(
+                self.cards.get(&card),
+                Some(CardRuntime::Chat(_) | CardRuntime::Terminal(_) | CardRuntime::Repository(_))
+            )
+        {
+            return Task::none();
+        }
+        self.keyboard_owed = self.owes_chat_input(card).then_some(card);
+        workspace_widget::focus_card_if_outside(
+            self.card_container_id(card),
+            self.card_keyboard_focus(card),
+        )
+        .map(cosmic::Action::App)
+    }
+
+    /// The keyboard after the pointer rested on `card` and focused it. It
+    /// comes from another pane or from nowhere; a field outside the strip,
+    /// such as sidebar search, keeps what is being typed into it.
+    fn focus_pane_keyboard_after_rest(&mut self, card: CardId) -> Task<Message> {
+        if !self.card_holds_keyboard(card) || !self.workspace_surfaces_visible() {
+            return Task::none();
+        }
+        self.keyboard_owed = self.owes_chat_input(card).then_some(card);
+        workspace_widget::focus_unless_held_outside(
+            self.workspace_scroll_id.clone(),
+            self.card_keyboard_focus(card),
+        )
+        .map(cosmic::Action::App)
+    }
+
+    /// The keyboard after the window is activated: the focused pane's own
+    /// control, unless some control kept focus while the window was away.
+    fn focus_pane_keyboard_on_activation(&mut self) -> Task<Message> {
+        let Some(card) = self.workspace.focused() else {
+            return Task::none();
+        };
+        if !self.card_holds_keyboard(card) || !self.workspace_surfaces_visible() {
+            return Task::none();
+        }
+        self.keyboard_owed = self.owes_chat_input(card).then_some(card);
+        workspace_widget::focus_if_unheld(self.card_keyboard_focus(card)).map(cosmic::Action::App)
+    }
+
+    /// Pays a debt [`Self::focus_pane_keyboard`] recorded once the chat's
+    /// input is drawn. The pane's title held the keyboard in its place, so a
+    /// control the person chose meanwhile keeps it. A debt for a pane that is
+    /// no longer focused lapses.
+    fn settle_owed_keyboard(&mut self) -> Task<Message> {
+        let Some(card) = self.keyboard_owed else {
+            return Task::none();
+        };
+        if self.workspace.focused() != Some(card) || !self.is_chat_card(card) {
+            self.keyboard_owed = None;
+            return Task::none();
+        }
+        if !self.chat_input_drawn(card)
+            || !self.card_holds_keyboard(card)
+            || !self.workspace_surfaces_visible()
+        {
+            return Task::none();
+        }
+        self.keyboard_owed = None;
+        workspace_widget::focus_after_loading(
+            self.card_header_widget_id(card),
+            self.card_keyboard_focus(card),
+        )
+        .map(cosmic::Action::App)
+    }
+
+    /// Text typed while a chat pane is focused but nothing took the key -
+    /// its transcript, a button or nothing at all holding the keyboard -
+    /// goes into its message input at the caret, which then keeps the
+    /// keyboard. Chords stay with whatever they belong to, such as copying a
+    /// transcript selection.
+    fn type_into_chat_input(&mut self, event: &keyboard::Event) -> Task<Message> {
+        let keyboard::Event::KeyPressed {
+            text: Some(text),
+            modifiers,
+            ..
+        } = event
+        else {
+            return Task::none();
+        };
+        if modifiers.control()
+            || modifiers.alt()
+            || modifiers.logo()
+            || text.is_empty()
+            || text.chars().any(char::is_control)
+        {
+            return Task::none();
+        }
+        let Some(card) = self.workspace.focused() else {
+            return Task::none();
+        };
+        if !self.chat_input_drawn(card)
+            || !self.card_holds_keyboard(card)
+            || !self.workspace_surfaces_visible()
+        {
+            return Task::none();
+        }
+        // An open picker's search field stands in for the input, and is
+        // where the keyboard already belongs.
+        let target = match self.cards.get(&card) {
+            Some(CardRuntime::Chat(runtime)) if runtime.focus_control() == "chat-composer" => {
+                runtime.target
+            }
+            _ => return Task::none(),
+        };
+        let mut tasks: Vec<Task<Message>> = text
+            .chars()
+            .map(|character| {
+                self.handle_chat_ui(chat_ui::Action::Composer(
+                    target,
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Insert(character),
+                    ),
+                ))
+            })
+            .collect();
+        self.keyboard_owed = None;
+        tasks.push(
+            iced::widget::operation::focus(card_control_id(card, "chat-composer"))
+                .map(cosmic::Action::App),
+        );
+        Task::batch(tasks)
+    }
+
+    fn card_container_id(&self, card: CardId) -> widget::Id {
+        self.card_chrome.get(&card).map_or_else(
+            || workspace_widget::card_widget_id(card),
+            |chrome| chrome.container_id.clone(),
+        )
+    }
+
     /// Where keyboard focus for `card` lands.
     fn card_keyboard_focus(&self, card: CardId) -> widget::Id {
         match self.cards.get(&card) {
@@ -8980,7 +9154,12 @@ impl Cagents {
                 .get(&card)
                 .map(|chrome| chrome.focus_id.clone())
                 .unwrap_or_else(|| workspace_widget::card_focus_id(card)),
-            Some(CardRuntime::Chat(runtime)) => card_control_id(card, runtime.focus_control()),
+            // Until its input is drawn the pane's title holds the keyboard
+            // in its place: a focus aimed at a control that is not in the
+            // tree blurs every widget instead. See `focus_pane_keyboard`.
+            Some(CardRuntime::Chat(runtime)) if self.chat_input_drawn(card) => {
+                card_control_id(card, runtime.focus_control())
+            }
             Some(CardRuntime::Repository(runtime)) => match runtime.editor_focus_target(card) {
                 Some(_) if runtime.find_is_open() => repository_widget::find_focus_id(card),
                 Some(target) => target,
@@ -9166,10 +9345,7 @@ impl Cagents {
             tasks.push(self.synchronize_workspace_scroll());
         }
         if surfaces_visible && let Some(card) = self.workspace.take_widget_focus_request() {
-            tasks.push(
-                iced::widget::operation::focus(self.card_keyboard_focus(card))
-                    .map(cosmic::Action::App),
-            );
+            tasks.push(self.focus_pane_keyboard(card));
         }
         tasks.push(context_overlay_task);
         tasks.push(self.restore_repository_editor_focus());
@@ -14727,6 +14903,7 @@ impl Application for Cagents {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
@@ -16994,14 +17171,16 @@ impl Application for Cagents {
                 }
                 if matches!(
                     event,
-                    WorkspaceViewportEvent::PointerFocused(_)
+                    WorkspaceViewportEvent::PointerFocused { .. }
                         | WorkspaceViewportEvent::PointerRested(_)
                 ) && self.workspace_inputs_blocked()
                 {
                     return Task::none();
                 }
                 if matches!(event, WorkspaceViewportEvent::PointerRested(_))
-                    && !self.settings.focus_follows_mouse
+                    && (!self.settings.focus_follows_mouse
+                        || self.chat_menu_open()
+                        || self.device_ui.menu_open)
                 {
                     return Task::none();
                 }
@@ -17009,6 +17188,24 @@ impl Application for Cagents {
                 let (update, synchronize_scroll) =
                     update_workspace_viewport(&mut self.workspace, event);
                 let task = self.apply_viewport(update, false, false);
+                let keyboard = match event {
+                    WorkspaceViewportEvent::PointerRested(card)
+                        if self.workspace.focused() == Some(card) =>
+                    {
+                        self.focus_pane_keyboard_after_rest(card)
+                    }
+                    // Another button's press, such as one opening a context
+                    // menu over selected text, leaves the keyboard alone.
+                    WorkspaceViewportEvent::PointerFocused {
+                        card,
+                        primary: true,
+                    } if self.workspace.focused() == Some(card) =>
+                    {
+                        self.focus_pane_keyboard_after_press(card)
+                    }
+                    _ => Task::none(),
+                };
+                let task = Task::batch([task, keyboard]);
                 // Both native Scrolled feedback and Resized can measure the
                 // narrower strip first. Reveal its active tab independently
                 // of focus activation and attention acknowledgement.
@@ -17741,11 +17938,6 @@ impl Application for Cagents {
                 if let Some(task) = self.account_key_event(&event) {
                     return task;
                 }
-                if !self.workspace_inputs_blocked()
-                    && let Some(task) = self.chat_find_key(&event)
-                {
-                    return task;
-                }
                 // A widget that consumed Escape has already answered it - a
                 // focused terminal clearing its selection, for one. Running the
                 // chain anyway would close the inspector behind it in the same
@@ -17978,6 +18170,7 @@ impl Application for Cagents {
                         };
                         self.run_workspace_command(command, modifiers)
                     }
+                    None if !captured => self.type_into_chat_input(&event),
                     None => Task::none(),
                 }
             }
@@ -18004,6 +18197,7 @@ impl Application for Cagents {
                         if previous == self.workspace.focused()
                             && let Some(card) = previous
                         {
+                            self.keyboard_owed = self.owes_chat_input(card).then_some(card);
                             Task::batch([
                                 task,
                                 workspace_widget::focus_card_if_outside(
@@ -18556,7 +18750,8 @@ impl Application for Cagents {
         let activation = self.retry_notification_activation();
         let visibility = self.sync_visible_attention();
         self.sync_notification_presence();
-        Task::batch([task, activation, visibility])
+        let keyboard = self.settle_owed_keyboard();
+        Task::batch([task, activation, visibility, keyboard])
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -30494,6 +30689,7 @@ mod tests {
             lifecycle_sweep_deadline: None,
             lifecycle_sweep_generation: 0,
             focus_save_pending: false,
+            keyboard_owed: None,
             reported_title_save: ReportedTitleSave::default(),
             lifecycle_sweep_destination: None,
             input_trace: crate::input_trace::InputTrace::default(),
@@ -31723,7 +31919,10 @@ mod tests {
         app.workspace.take_widget_focus_request();
         let (update, _) = update_workspace_viewport(
             &mut app.workspace,
-            WorkspaceViewportEvent::PointerFocused(id),
+            WorkspaceViewportEvent::PointerFocused {
+                card: id,
+                primary: true,
+            },
         );
         assert_eq!(app.workspace.focused(), Some(id));
         assert_eq!(app.workspace.take_widget_focus_request(), None);
