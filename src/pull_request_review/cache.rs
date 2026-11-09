@@ -483,6 +483,26 @@ struct Record {
     order: u64,
 }
 
+/// The save lock for the review cache at `path`. The returned lock unlocks
+/// as its scope ends, even if a concurrent fork copied the descriptor
+/// before exec; closing the file alone would not.
+fn save_lock(path: &std::path::Path) -> Result<crate::instance::OwnedLock, String> {
+    use std::{fs::OpenOptions, os::unix::fs::OpenOptionsExt};
+    let lock_path = path.with_extension("json.lock");
+    let lock = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(&lock_path)
+        .map_err(|e| e.to_string())?;
+    crate::secure_file::validate_and_privatize_open_file(&lock_path, &lock)
+        .map_err(|e| e.to_string())?;
+    crate::instance::owned_file_lock(lock, libc::LOCK_EX).map_err(|e| e.to_string())
+}
+
 impl JsonStore {
     pub fn new(path: std::path::PathBuf) -> Self {
         Self { path }
@@ -540,7 +560,7 @@ impl Store for JsonStore {
         use std::{
             fs::{File, OpenOptions},
             io::Write,
-            os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+            os::unix::fs::OpenOptionsExt,
         };
         snapshot.validate()?;
         let parent = self
@@ -548,22 +568,7 @@ impl Store for JsonStore {
             .parent()
             .ok_or("Review cache has no parent directory")?;
         crate::secure_file::prepare_private_directory(parent).map_err(|e| e.to_string())?;
-        let lock_path = self.path.with_extension("json.lock");
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .open(&lock_path)
-            .map_err(|e| e.to_string())?;
-        crate::secure_file::validate_and_privatize_open_file(&lock_path, &lock)
-            .map_err(|e| e.to_string())?;
-        // SAFETY: lock owns this descriptor until the transaction finishes.
-        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            return Err(std::io::Error::last_os_error().to_string());
-        }
+        let _lock = save_lock(&self.path)?;
         let mut document = self.read()?;
         let same_key = |record: &Record| {
             record.snapshot.key.number == snapshot.key.number
@@ -637,6 +642,33 @@ impl Store for JsonStore {
 mod draft_durability_tests {
     use super::*;
     use crate::pull_request_review::cache;
+    #[test]
+    fn save_lock_releases_despite_a_copied_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("review.json");
+        let lock_path = path.with_extension("json.lock");
+        let probe = || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
+        };
+        let lock = save_lock(&path).unwrap();
+        // A fork that has not reached exec yet holds a copy of this
+        // description; closing the owner's file alone would leave the lock
+        // held by that copy until the child execs or exits.
+        let copied = lock.try_clone().unwrap();
+        assert!(probe().is_err(), "the held lock must refuse a probe");
+        drop(lock);
+        assert!(
+            probe().is_ok(),
+            "ending the scope must release the lock despite the copied descriptor"
+        );
+        drop(copied);
+    }
+
     #[test]
     fn json_recovery_text_has_order_conflict_and_eviction_protection() {
         let directory = tempfile::tempdir().unwrap();

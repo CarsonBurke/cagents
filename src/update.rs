@@ -1823,8 +1823,14 @@ fn inherited_lock(state: &Path) -> Result<crate::instance::OwnedLock, UpdateErro
     if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
         return Err(invalid("worker inherited the wrong lock"));
     }
-    let lock = crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
-        .map_err(|_| UpdateError::Busy)?;
+    let lock =
+        crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB).map_err(|error| {
+            if error.kind() == io::ErrorKind::WouldBlock {
+                UpdateError::Busy
+            } else {
+                error.into()
+            }
+        })?;
     if unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
         return Err(io::Error::last_os_error().into());
     }

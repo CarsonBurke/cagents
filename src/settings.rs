@@ -2160,8 +2160,7 @@ pub fn default_path() -> Result<PathBuf, SettingsError> {
     instance::settings_path().ok_or(SettingsError::DirectoryUnavailable)
 }
 
-fn settings_lock(path: &Path) -> Result<File, SettingsError> {
-    use std::os::fd::AsRawFd;
+fn settings_lock(path: &Path) -> Result<crate::instance::OwnedLock, SettingsError> {
     let parent = settings_parent(path)?;
     prepare_private_directory(parent)?;
     let lock_path = path.with_extension("toml.lock");
@@ -2174,11 +2173,9 @@ fn settings_lock(path: &Path) -> Result<File, SettingsError> {
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(&lock_path)?;
     validate_owned_regular_file(&lock_path, &lock.metadata()?)?;
-    // SAFETY: the returned file owns the locked descriptor until dropped.
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return Err(io::Error::last_os_error().into());
-    }
-    Ok(lock)
+    // The returned lock unlocks as its scope ends, even if a concurrent fork
+    // copied the descriptor before exec; closing the file alone would not.
+    Ok(crate::instance::owned_file_lock(lock, libc::LOCK_EX)?)
 }
 
 /// Applies only fields this window changed since its last successful save.
@@ -3419,6 +3416,33 @@ mod tests {
             restored.editor_syntax_theme,
             EditorSyntaxTheme::InspiredGitHub
         );
+    }
+
+    #[test]
+    fn settings_lock_releases_despite_a_copied_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = path_in(&directory);
+        let lock_path = path.with_extension("toml.lock");
+        let probe = || {
+            let file = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            crate::instance::owned_file_lock(file, libc::LOCK_EX | libc::LOCK_NB)
+        };
+        let lock = settings_lock(&path).unwrap();
+        // A fork that has not reached exec yet holds a copy of this
+        // description; closing the owner's file alone would leave the lock
+        // held by that copy until the child execs or exits.
+        let copied = lock.try_clone().unwrap();
+        assert!(probe().is_err(), "the held lock must refuse a probe");
+        drop(lock);
+        assert!(
+            probe().is_ok(),
+            "ending the scope must release the lock despite the copied descriptor"
+        );
+        drop(copied);
     }
 
     #[test]
