@@ -25,11 +25,24 @@ impl Runtime {
                 [design::RADIUS_M; 4],
                 false,
             ));
-        let content = widget::column::with_children(vec![
-            header.into(),
-            design::body("This saved pane has not been reopened. Your unsent text is kept here; you can copy it while the workspace reconnects, or open the conversation from history.").into(),
-            widget::scrollable(draft).height(Length::Fill).into(),
-        ])
+        // Files and images wait with the text; their names say they were kept.
+        let attached = self
+            .unsent_attachments()
+            .iter()
+            .map(Attachment::label)
+            .collect::<Vec<_>>();
+        let content = widget::column::with_children(
+            [
+                header.into(),
+                design::body("This saved pane has not been reopened. Your unsent draft is kept here; you can copy its text while the workspace reconnects, or open the conversation from history.").into(),
+                widget::scrollable(draft).height(Length::Fill).into(),
+            ]
+            .into_iter()
+            .chain((!attached.is_empty()).then(|| {
+                design::caption(format!("Attached: {}", attached.join(", "))).into()
+            }))
+            .collect::<Vec<_>>(),
+        )
         .spacing(space::M)
         .width(Length::Fill);
         widget::container(widget::container(content).max_width(design::READABLE_MEASURE))

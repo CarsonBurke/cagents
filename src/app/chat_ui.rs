@@ -7244,16 +7244,16 @@ impl Cagents {
             .chat_ui
             .draft_attachments
             .iter()
-            .filter(|(card, images)| open_cards.contains(card) && !images.is_empty())
-            .map(|(card, images)| (*card, images.clone()))
+            .filter(|(card, attachments)| open_cards.contains(card) && !attachments.is_empty())
+            .map(|(card, attachments)| (*card, attachments.clone()))
             .collect::<HashMap<_, _>>();
         for (card, runtime) in &self.chat_ui.parked {
             if open_cards.contains(card) {
-                let (draft, images) = runtime.persistent_draft();
-                if images.is_empty() {
+                let (draft, attachments) = runtime.persistent_draft();
+                if attachments.is_empty() {
                     chat_draft_attachments.remove(card);
                 } else {
-                    chat_draft_attachments.insert(*card, images);
+                    chat_draft_attachments.insert(*card, attachments);
                 }
                 if draft.is_empty() {
                     chat_drafts.remove(card);
@@ -7266,11 +7266,11 @@ impl Cagents {
             if let CardRuntime::Chat(runtime) = card_runtime
                 && open_cards.contains(card)
             {
-                let (draft, images) = runtime.persistent_draft();
-                if images.is_empty() {
+                let (draft, attachments) = runtime.persistent_draft();
+                if attachments.is_empty() {
                     chat_draft_attachments.remove(card);
                 } else {
-                    chat_draft_attachments.insert(*card, images);
+                    chat_draft_attachments.insert(*card, attachments);
                 }
                 if draft.is_empty() {
                     chat_drafts.remove(card);
@@ -7555,9 +7555,9 @@ impl Cagents {
         // A stopped terminal cannot be converted in place. If its chat had
         // been parked before a restart, the new conversation owns that text.
         if let Some(source) = draft_from
-            && let Some(images) = self.chat_ui.draft_attachments.remove(&source)
+            && let Some(attachments) = self.chat_ui.draft_attachments.remove(&source)
         {
-            self.chat_ui.draft_attachments.insert(card_id, images);
+            self.chat_ui.draft_attachments.insert(card_id, attachments);
         }
         if let Some(source) = draft_from
             && let Some(draft) = self.chat_ui.drafts.remove(&source)
@@ -7867,8 +7867,10 @@ impl Cagents {
         if !self.can_rekey_shared_terminal_draft(alias, canonical) {
             return false;
         }
-        if let Some(images) = self.chat_ui.draft_attachments.remove(&alias) {
-            self.chat_ui.draft_attachments.insert(canonical, images);
+        if let Some(attachments) = self.chat_ui.draft_attachments.remove(&alias) {
+            self.chat_ui
+                .draft_attachments
+                .insert(canonical, attachments);
         }
         if let Some(draft) = self.chat_ui.drafts.remove(&alias) {
             self.chat_ui.drafts.insert(canonical, draft);
@@ -7910,7 +7912,7 @@ impl Cagents {
         self.observe_agent_activity_for_card(card, None);
     }
 
-    /// Captures the unsent text and images of `card`'s chat runtime, which is
+    /// Captures the unsent text and attachments of `card`'s chat runtime, which is
     /// about to be dropped while the card lives on, so whatever runtime the
     /// card builds next opens with them rather than losing them.
     pub(super) fn stash_unsent_chat(&mut self, card: CardId) {
@@ -18753,6 +18755,21 @@ mod tests {
 
     /// A file the person chose has no managed identity, but it is as much a
     /// part of the draft as its text and images (#2202).
+    /// A draft of only a file is work in this window, which another window
+    /// must not adopt or close over it, now that the file no longer blocks.
+    #[test]
+    fn a_draft_of_only_a_file_is_local_work() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = draft_chat(&mut app);
+        assert!(!app.shared_chat_has_local_work(card));
+        let target = chat_runtime(&app, card).target;
+        app.chat_runtime_mut(target)
+            .unwrap()
+            .replace_attachments(vec![Attachment::file("/project/notes.txt")]);
+        assert!(chat_runtime(&app, card).transition_blocker().is_none());
+        assert!(app.shared_chat_has_local_work(card));
+    }
+
     #[test]
     fn unsent_files_survive_saving_reopening_and_closing_with_the_draft() {
         chat::attachment_assets::with_test_image(|image| {
@@ -23450,10 +23467,17 @@ mod tests {
         let mut app = crate::app::tests::context_inspector_test_app(true);
         let terminal = stopped_agent_terminal(&mut app, &["--resume", KNOWN_THREAD], true);
         let text = "Continue this thought\n  with indentation";
-        Arc::make_mut(&mut app.durable)
-            .chat_drafts
-            .insert(terminal, text.into());
-        app.chat_ui = State::with_drafts(app.durable.chat_drafts.clone());
+        // The file attached to that draft moves with it (#2202).
+        let file = Attachment::file("/project/notes.txt");
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.chat_drafts.insert(terminal, text.into());
+        durable
+            .chat_draft_attachments
+            .insert(terminal, vec![file.clone()]);
+        app.chat_ui = State::with_draft_attachments(
+            app.durable.chat_drafts.clone(),
+            app.durable.chat_draft_attachments.clone(),
+        );
 
         let _ = app.update(Message::ChatUi(Action::Switch(terminal)));
         let chat = app.workspace.focused().unwrap();
@@ -23463,10 +23487,13 @@ mod tests {
             CardKind::Terminal(_)
         ));
         assert_eq!(chat_runtime(&app, chat).composer.text(), text);
+        assert_eq!(chat_runtime(&app, chat).attachments, [file.clone()]);
         assert!(!app.chat_ui.drafts.contains_key(&terminal));
         let snapshot = app.persistent_workspace();
         assert!(!snapshot.chat_drafts.contains_key(&terminal));
+        assert!(!snapshot.chat_draft_attachments.contains_key(&terminal));
         assert_eq!(snapshot.chat_drafts.get(&chat).unwrap(), text);
+        assert_eq!(snapshot.chat_draft_attachments[&chat], [file]);
     }
 
     /// A stopped terminal whose relaunch is still starting may yet run its

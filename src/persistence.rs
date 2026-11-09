@@ -420,7 +420,7 @@ impl RetainedChatCopy {
             .is_some_and(|attachments| attachments != &self.attachments)
         {
             return Err(StoreError::InvalidState(
-                "Retained chat copy images changed before saving".into(),
+                "Retained chat copy attachments changed before saving".into(),
             ));
         }
         state.chat_drafts.insert(self.copy.id, self.draft.clone());
@@ -5458,7 +5458,7 @@ fn load_workspace_manifest_connection(
             connection,
             &format!("workspace:{id}:navigation:chat_draft_attachments"),
         )?
-        .map(|value| from_json("workspace chat image drafts", &value))
+        .map(|value| from_json("workspace chat draft attachments", &value))
         .transpose()?
         .unwrap_or_default(),
         local_only_cards: metadata(
