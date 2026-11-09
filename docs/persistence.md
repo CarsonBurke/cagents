@@ -427,8 +427,7 @@ stores, so an old copy can never feed a later upgrade or seed.
 - New windows use a new store file name per slot, so an older UI that is
   restored by rollback finds its own `sessions.sqlite3` unchanged.
 - Stages 1 and 2 change no wire contract and no daemon schema; they ship as
-  compatible updates. Stage 2 adds indexes only to window stores, which are
-  gated by `user_version` alone, so an older UI still opens them.
+  compatible updates. Neither changes a window-store schema either.
 
 ## How this resolves the reported problems
 
