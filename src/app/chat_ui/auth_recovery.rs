@@ -104,6 +104,12 @@ impl Cagents {
             return Task::none();
         };
         if runtime.disconnected || runtime.snapshot.exited {
+            // Account recovery has its own identity and sign-in checks above.
+            // A refusal of an ordinary retry must not disable that recovery.
+            if let Some(runtime) = self.chat_runtime_mut(target) {
+                runtime.start_retry_blocked = false;
+            }
+            self.chat_ui.blocked_starts.remove(&target.card);
             return self.handle_chat_ui(Action::Reconnect(target));
         }
         let Some(failure) = runtime.auth_error().map(str::to_owned) else {

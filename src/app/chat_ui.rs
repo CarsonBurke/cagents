@@ -29193,6 +29193,9 @@ mod tests {
         assert!(app.chat_ui.attempt(card).is_none());
         app.chat_runtime_mut(target).unwrap().disconnected = true;
         app.chat_runtime_mut(target).unwrap().error = Some("Codex RPC error: Not logged in".into());
+        app.chat_runtime_mut(target).unwrap().start_retry_blocked = true;
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        assert!(app.chat_ui.attempt(card).is_none());
         drop(app.handle_chat_ui(Action::ResumeAfterSignIn(target)));
         assert!(app.chat_ui.attempt(card).is_some());
         assert_eq!(chat_runtime(&app, card).session.launch, launch);
