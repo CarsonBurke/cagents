@@ -964,12 +964,16 @@ impl Cagents {
             return None;
         }
         let mut rows: Vec<Element<'_, Message>> = vec![
-            crate::design::title(if intent.detail.is_some() {
-                "Pane kept"
-            } else if !intent.leave.is_empty() {
-                "Closing pane"
+            crate::design::title(if intent.offers_leaving() {
+                leave_running_title(&intent.unreadable)
+            } else if intent.detail.is_some() {
+                "Pane kept".into()
+            } else if intent.active || intent.leave.is_empty() {
+                // Close anyway can meet a terminal the daemon hosts after all,
+                // which asks about its active processes as any Close does.
+                "Close active processes?".into()
             } else {
-                "Close active processes?"
+                "Closing pane".into()
             })
             .into(),
             // Panes can share a title's first words, and a group close asks
@@ -1053,6 +1057,21 @@ impl Cagents {
     }
 }
 
+/// The question Close anyway answers: "Close pane and leave ssh-agent
+/// running?", or "…leave 3 processes running?".
+fn leave_running_title(processes: &[UnreadableProcess]) -> String {
+    match processes {
+        [process] => format!(
+            "Close pane and leave {} running?",
+            process.name.as_deref().unwrap_or("a process")
+        ),
+        _ => format!(
+            "Close pane and leave {} processes running?",
+            processes.len()
+        ),
+    }
+}
+
 fn close_focus(index: usize) -> Task<Message> {
     iced::widget::operation::focus(widget::Id::new(match index {
         1 => "dialog.terminal-close.confirm",
@@ -1066,6 +1085,20 @@ fn close_focus(index: usize) -> Task<Message> {
 mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId};
+
+    /// The dialog asks the question its destructive button answers.
+    #[test]
+    fn leaving_processes_running_is_asked_by_name() {
+        let agent = UnreadableProcess::fixture(1, 10, "ssh-agent");
+        assert_eq!(
+            leave_running_title(std::slice::from_ref(&agent)),
+            "Close pane and leave ssh-agent running?"
+        );
+        assert_eq!(
+            leave_running_title(&[agent, UnreadableProcess::fixture(2, 10, "sshd-session")]),
+            "Close pane and leave 2 processes running?"
+        );
+    }
 
     fn routing_intent(probe_only: bool, saved: Option<TerminalSession>) -> CloseIntent {
         CloseIntent {

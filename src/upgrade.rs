@@ -218,6 +218,12 @@ impl UnreadableProcess {
         }
     }
 
+    /// Whether it can be told apart from a later process given its PID.
+    #[cfg(feature = "ui")]
+    pub(crate) fn identified(&self) -> bool {
+        self.start.is_some()
+    }
+
     fn same_process(&self, other: &Self) -> bool {
         self.pid == other.pid && self.start.is_some() && self.start == other.start
     }

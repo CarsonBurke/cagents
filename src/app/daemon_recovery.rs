@@ -294,11 +294,7 @@ fn reconcile_with(
         .map_err(|error| {
             tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Retry");
             match error {
-                ScanError::Unreadable(processes) => unreadable_refusal(
-                    &processes,
-                    NOTHING_STARTED,
-                    "use Retry or Close again",
-                ),
+                ScanError::Unreadable(processes) => unreadable_retry_refusal(&processes),
                 ScanError::Incomplete(_) => unfinished_check_refusal(),
             }
         })?
@@ -526,10 +522,15 @@ fn prove_not_hosted_at(
         .map_err(|error| {
             tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Close");
             match error {
-                ScanError::Unreadable(processes) => KeptPane {
-                    reason: unreadable_refusal(&processes, PANE_KEPT, "close the pane again"),
-                    unreadable: processes,
-                },
+                ScanError::Unreadable(processes) => {
+                    // Close anyway passes over a process only while it is the
+                    // same one, which takes knowing when it started.
+                    let can_leave = processes.iter().all(UnreadableProcess::identified);
+                    KeptPane {
+                        reason: unreadable_close_refusal(&processes, can_leave),
+                        unreadable: if can_leave { processes } else { Vec::new() },
+                    }
+                }
                 ScanError::Incomplete(_) => cannot_confirm().into(),
             }
         })?
@@ -555,28 +556,72 @@ fn named_process(name: Option<&str>, pid: u32) -> String {
 
 /// These processes don't exit with a terminal session or a moment's wait, so the
 /// refusal names them and says what changes the answer, instead of "try again".
-fn unreadable_refusal(processes: &[UnreadableProcess], outcome: &str, next: &str) -> String {
-    let listed = unreadable_list(processes);
-    let (it, its) = if processes.len() == 1 {
-        ("it", "its")
-    } else {
-        ("them", "their")
-    };
-    let otherwise = if outcome == PANE_KEPT {
-        format!("Or close the pane anyway: Cagents stops nothing and leaves {listed} running.")
-    } else {
-        format!(
-            "Otherwise, use Retry again once {}.",
-            if processes.len() == 1 {
-                "it exits"
-            } else {
-                "they exit"
-            }
-        )
-    };
+/// Each is named once; later sentences say "it" or "them".
+fn unreadable_retry_refusal(processes: &[UnreadableProcess]) -> String {
+    let words = Pronouns::of(processes);
     format!(
-        "Cagents can't tell whether {listed} came from this terminal, because the system keeps {its} environment private, {outcome}. If you can stop {it}, stop {it}, then {next}. {otherwise}"
+        "Cagents can't check whether {} came from this terminal, {NOTHING_STARTED}. Retry works once {} {}. To stop waiting, use Close: it can close the pane and leave {} running.",
+        unreadable_list(processes),
+        words.subject,
+        words.exits,
+        words.object,
     )
+}
+
+/// What Close says when only `processes` kept the pane. `can_leave` says the
+/// dialog offers Close anyway, so the text explains what that button does.
+fn unreadable_close_refusal(processes: &[UnreadableProcess], can_leave: bool) -> String {
+    let words = Pronouns::of(processes);
+    let checked = format!(
+        "Cagents can't check whether {} came from this terminal, {PANE_KEPT}.",
+        unreadable_list(processes)
+    );
+    if !can_leave {
+        return format!(
+            "{checked} Close the pane again once {} {}.",
+            words.subject, words.exits
+        );
+    }
+    let (
+        Pronouns {
+            subject, object, ..
+        },
+        keeps,
+    ) = (
+        words,
+        if processes.len() == 1 {
+            "keeps"
+        } else {
+            "keep"
+        },
+    );
+    format!(
+        "{checked} Close anyway removes the pane and leaves {object} running: Cagents won't stop or signal {object}. If {subject} did come from this terminal, {subject} {keeps} running with no pane to show {object}. To close the pane without leaving anything, end {object} first, then close it again."
+    )
+}
+
+struct Pronouns {
+    subject: &'static str,
+    object: &'static str,
+    exits: &'static str,
+}
+
+impl Pronouns {
+    fn of(processes: &[UnreadableProcess]) -> Self {
+        if processes.len() == 1 {
+            Self {
+                subject: "it",
+                object: "it",
+                exits: "exits",
+            }
+        } else {
+            Self {
+                subject: "they",
+                object: "them",
+                exits: "exit",
+            }
+        }
+    }
 }
 
 /// "ssh-agent (PID 1), gpg-agent (PID 2) and sshd-session (PID 3)".
@@ -1519,7 +1564,9 @@ mod tests {
         assert!(is_retry_refusal(&error), "{error}");
         assert!(error.contains(&format!("ssh-agent (PID {pid})")), "{error}");
         assert!(!error.contains("in a moment"), "{error}");
-        assert!(!error.contains("close the pane anyway"), "{error}");
+        assert!(error.contains("Retry works once it exits"), "{error}");
+        assert!(error.contains("use Close"), "{error}");
+        assert_eq!(error.matches("ssh-agent").count(), 1, "named once: {error}");
     }
 
     /// Close names what it couldn't read, and closes beside exactly those once
@@ -1560,8 +1607,14 @@ mod tests {
             reason.contains(&format!("ssh-agent (PID {pid})")),
             "{reason}"
         );
-        assert!(reason.contains("close the pane anyway"), "{reason}");
-        assert!(reason.contains("stops nothing"), "{reason}");
+        assert!(reason.contains("Close anyway removes the pane"), "{reason}");
+        assert!(reason.contains("won't stop or signal it"), "{reason}");
+        assert!(reason.contains("no pane to show it"), "{reason}");
+        assert_eq!(
+            reason.matches("ssh-agent").count(),
+            1,
+            "named once: {reason}"
+        );
         assert_eq!(attempt("second.sock", 2, &kept.unreadable), Ok(()));
 
         // A process that is this terminal's own still keeps the pane, and isn't
@@ -1581,6 +1634,22 @@ mod tests {
         let kept = attempt("third.sock", 1, &kept.unreadable).unwrap_err();
         assert!(kept.unreadable.is_empty());
         assert!(kept.reason.contains("PID 4242"), "{}", kept.reason);
+        fs::remove_dir_all(directory.path().join("4242")).unwrap();
+
+        // Without a start time, a PID could name a later process by the time
+        // Close anyway runs, so it isn't offered: the button could never work.
+        fs::write(
+            directory.path().join(pid.to_string()).join("stat"),
+            format!("{pid} (ssh-agent) S 1 {pid} {pid} 0"),
+        )
+        .unwrap();
+        let kept = attempt("fourth.sock", 1, &[]).unwrap_err();
+        assert!(kept.unreadable.is_empty());
+        assert!(
+            kept.reason.contains("Close the pane again once it exits"),
+            "{}",
+            kept.reason
+        );
     }
 
     #[test]
