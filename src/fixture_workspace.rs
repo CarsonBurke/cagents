@@ -602,12 +602,14 @@ mod tests {
             pages.into_iter().rev().flatten().collect()
         }
 
-        /// Harness records the reader shows today as the user's own text,
-        /// although Claude Code wrote them: a local command's empty output,
-        /// and /clear's envelope in the indented form Claude Code writes when
-        /// a conversation is cleared. The generator writes them as noise, so
-        /// they are left out of the count until the reader hides them too.
-        const SHOWN_AS_TEXT: [&str; 2] = ["<local-command-stdout>", "<command-name>/clear"];
+        /// Harness records the reader shows as the user's own text, although
+        /// Claude Code wrote them: a local command's empty output, and the
+        /// /clear command that clearing a conversation records, which the
+        /// reader shows as the command typed. The generator writes them as
+        /// noise, so they are left out of the count.
+        fn shown_as_text(text: &str) -> bool {
+            text.starts_with("<local-command-stdout>") || text == "/clear"
+        }
 
         fn messages(items: &[crate::chat::Item]) -> usize {
             items
@@ -620,7 +622,7 @@ mod tests {
                             thinking: false,
                             ..
                         },
-                    ) => !SHOWN_AS_TEXT.iter().any(|prefix| text.starts_with(prefix)),
+                    ) => !shown_as_text(text),
                     _ => false,
                 })
                 .count()
