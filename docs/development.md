@@ -1171,9 +1171,14 @@ configured target directories/triples. A matching version alone does not prove
 that two dirty source trees match.
 
 Through the gate, which is how a hosted agent runs it, there is no base to
-choose: the build host gives each slot a short, private `TMPDIR` under its
-runtime directory (`$XDG_RUNTIME_DIR/cof`), which meets the limits below and
-which the slot's next command clears. A HOST lane leaves about 12 MB there.
+choose. The build host gives each slot a short, private `TMPDIR` such as
+`/run/user/1000/cof/cagents-0`, which is within the socket budget and outside
+the home and any `.git`, and which the slot's next command clears. It is in
+the runtime directory, which is memory on fw16, unlike the disk-backed base a
+local run uses: the slot holds one command's files at a time. If that
+directory can't be made private, the slot falls back to its own `tmp` under
+`~/.cache`, inside the home, where the bundled-skill tests below refuse to
+install.
 
 ```sh
 (
@@ -1186,15 +1191,16 @@ which the slot's next command clears. A HOST lane leaves about 12 MB there.
 )
 ```
 
-The gate sends the helper to the build host and points the variable at its
-copy there. It refuses any other `CAGENTS_` setting that names a path outside
-the checkout and its target, because the build host doesn't have that path.
+The gate sends the helper, which is in the target, to the build host and points
+the variable at its copy there. It refuses a `CAGENTS_` setting that names a
+path outside the checkout and its target, which the build host doesn't have;
+`CAGENTS_BUILD_*` settings and the gate's own are exempt.
 
 For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
-private **disk-backed** base with a
-short, physical absolute path. Verify its filesystem with `findmnt -T PATH`;
-`/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can be RAM-backed. Neither the base nor
-any ancestor may contain a `.git` file, directory or symlink. The base must also
+private **disk-backed** base with a short, physical absolute path. Verify its
+filesystem with `findmnt -T PATH`; `/tmp`, `/dev/shm` and `XDG_RUNTIME_DIR` can
+be RAM-backed. Neither the base nor any ancestor may contain a `.git` file,
+directory or symlink. The base must also
 be outside the account home reported by `getent passwd "$(id -u)"`, even when
 `HOME` points elsewhere: bundled-skill tests deliberately refuse installation
 beneath the passwd home. A private `~/.cot` therefore does not qualify.
