@@ -5,6 +5,7 @@
 //! pending/failed homes remain intact. Historical namespace enrollment and
 //! complete actor/reader retirement census belong to that separate cut.
 use super::state::SharedHost;
+use crate::chat::protocol::SetupError;
 use crate::{
     account::{
         Account,
@@ -64,12 +65,36 @@ fn pending_operation(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, true)
 }
 
+fn startup_failure(error: SetupError) -> ProtocolError {
+    match error {
+        SetupError::Invalid(message) => refusal(message),
+        SetupError::Unavailable(message) => {
+            ProtocolError::new(ProtocolErrorCode::InvalidRequest, message, true)
+        }
+    }
+}
+
+fn filesystem_failure(message: String, error: &std::io::Error) -> SetupError {
+    if matches!(
+        error.raw_os_error(),
+        Some(libc::EINVAL | libc::ENAMETOOLONG | libc::ENOTDIR)
+    ) {
+        SetupError::Invalid(message)
+    } else {
+        SetupError::Unavailable(message)
+    }
+}
+
 impl Home {
     fn capture(path: PathBuf) -> Result<Self, String> {
+        Self::capture_for_start(path).map_err(|error| error.to_string())
+    }
+
+    fn capture_for_start(path: PathBuf) -> Result<Self, SetupError> {
         if !path.is_absolute() {
             return Err("Account homes must be absolute".into());
         }
-        let canonical = normalize(&path)?;
+        let canonical = normalize_for_start(&path)?;
         let pin = match std::fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC | libc::O_NOFOLLOW)
@@ -77,15 +102,20 @@ impl Home {
         {
             Ok(file) => Some(Arc::new(file)),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(format!("Cannot reserve account home: {error}")),
+            Err(error) => {
+                return Err(filesystem_failure(
+                    format!("Cannot reserve account home: {error}"),
+                    &error,
+                ));
+            }
         };
         let identity = pin
             .as_ref()
             .map(|pin| pin.metadata())
             .transpose()
-            .map_err(|e| e.to_string())?
+            .map_err(|error| filesystem_failure(error.to_string(), &error))?
             .map(|metadata| (metadata.dev(), metadata.ino()));
-        let ancestors = physical_ancestors(&canonical, pin.as_deref())?;
+        let ancestors = physical_ancestors_for_start(&canonical, pin.as_deref())?;
         let home = Self {
             path,
             canonical,
@@ -93,34 +123,51 @@ impl Home {
             identity,
             ancestors,
         };
-        home.verify()?;
+        home.verify_for_start()?;
         Ok(home)
     }
 
     fn verify(&self) -> Result<(), String> {
-        if normalize(&self.path)? != self.canonical {
+        self.verify_for_start().map_err(|error| error.to_string())
+    }
+
+    fn verify_for_start(&self) -> Result<(), SetupError> {
+        if normalize_for_start(&self.path)? != self.canonical {
             return Err("The account home changed while its operation was pending; reload accounts and retry".into());
         }
         match (&self.pin, std::fs::metadata(&self.path)) {
             (Some(pin), Ok(current)) => {
-                let original = pin.metadata().map_err(|error| error.to_string())?;
+                let original = pin.metadata().map_err(|error| filesystem_failure(error.to_string(), &error))?;
                 if current.is_dir() && (current.dev(), current.ino()) == (original.dev(), original.ino()) { Ok(()) }
                 else { Err("The account home was replaced while its operation was pending".into()) }
             }
             (None, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            (_, Err(error)) => Err(filesystem_failure("The account home appeared, disappeared or became inaccessible during its operation".into(), &error)),
             _ => Err("The account home appeared, disappeared or became inaccessible during its operation".into()),
         }
     }
 
     fn refresh_ancestors(&mut self) -> Result<(), String> {
+        self.refresh_ancestors_for_start()
+            .map_err(|error| error.to_string())
+    }
+
+    fn refresh_ancestors_for_start(&mut self) -> Result<(), SetupError> {
         if let Some(pin) = &self.pin {
             // Once cleanup unlinks this exact root, it has no current
             // descendants; retain the original lexical guard until Drop.
-            if pin.metadata().map_err(|error| error.to_string())?.nlink() == 0 {
+            if pin
+                .metadata()
+                .map_err(|error| filesystem_failure(error.to_string(), &error))?
+                .nlink()
+                == 0
+            {
                 return Ok(());
             }
-            self.ancestors
-                .extend(physical_ancestors(&self.canonical, Some(pin.as_ref()))?);
+            self.ancestors.extend(physical_ancestors_for_start(
+                &self.canonical,
+                Some(pin.as_ref()),
+            )?);
         }
         Ok(())
     }
@@ -143,8 +190,16 @@ pub(super) fn physical_ancestors(
     path: &Path,
     pin: Option<&File>,
 ) -> Result<BTreeSet<(u64, u64)>, String> {
+    physical_ancestors_for_start(path, pin).map_err(|error| error.to_string())
+}
+
+fn physical_ancestors_for_start(
+    path: &Path,
+    pin: Option<&File>,
+) -> Result<BTreeSet<(u64, u64)>, SetupError> {
     let mut cursor = if let Some(pin) = pin {
-        pin.try_clone().map_err(|error| error.to_string())?
+        pin.try_clone()
+            .map_err(|error| filesystem_failure(error.to_string(), &error))?
     } else {
         let mut existing = path;
         loop {
@@ -160,14 +215,19 @@ pub(super) fn physical_ancestors(
                         .ok_or("Directory scope has no existing directory ancestor")?;
                 }
                 Err(error) => {
-                    return Err(format!("Cannot capture directory scope ancestry: {error}"));
+                    return Err(filesystem_failure(
+                        format!("Cannot capture directory scope ancestry: {error}"),
+                        &error,
+                    ));
                 }
             }
         }
     };
     let mut identities = BTreeSet::new();
     for _ in 0..256 {
-        let metadata = cursor.metadata().map_err(|error| error.to_string())?;
+        let metadata = cursor
+            .metadata()
+            .map_err(|error| filesystem_failure(error.to_string(), &error))?;
         let identity = (metadata.dev(), metadata.ino());
         if !identities.insert(identity) {
             return Ok(identities);
@@ -182,9 +242,10 @@ pub(super) fn physical_ancestors(
             )
         };
         if parent < 0 {
-            return Err(format!(
-                "Cannot capture directory scope parent: {}",
-                std::io::Error::last_os_error()
+            let error = std::io::Error::last_os_error();
+            return Err(filesystem_failure(
+                format!("Cannot capture directory scope parent: {error}"),
+                &error,
             ));
         }
         cursor = unsafe { File::from_raw_fd(parent) };
@@ -195,6 +256,10 @@ pub(super) fn physical_ancestors(
 /// Resolve aliases even for a not-yet-created descendant without interpreting
 /// `..` through a missing directory. Missing-home cleanup remains possible.
 fn normalize(path: &Path) -> Result<PathBuf, String> {
+    normalize_for_start(path).map_err(|error| error.to_string())
+}
+
+fn normalize_for_start(path: &Path) -> Result<PathBuf, SetupError> {
     if !path.is_absolute()
         || path
             .components()
@@ -223,7 +288,12 @@ fn normalize(path: &Path) -> Result<PathBuf, String> {
                     .parent()
                     .ok_or("Account home has no existing parent")?;
             }
-            Err(error) => return Err(format!("Cannot resolve account home: {error}")),
+            Err(error) => {
+                return Err(filesystem_failure(
+                    format!("Cannot resolve account home: {error}"),
+                    &error,
+                ));
+            }
         }
     }
 }
@@ -965,10 +1035,11 @@ pub(super) fn ensure_paths(
         return Ok(());
     }
     for home in &mut reserved {
-        home.refresh_ancestors().map_err(refusal)?;
+        home.refresh_ancestors_for_start()
+            .map_err(startup_failure)?;
     }
     for path in paths {
-        let home = Home::capture(path).map_err(refusal)?;
+        let home = Home::capture_for_start(path).map_err(startup_failure)?;
         if reserved.iter().any(|other| home.overlaps(other)) {
             return Err(pending_operation(
                 "This account home is being changed. Wait for the account operation to finish before using or editing it.",
@@ -1057,8 +1128,9 @@ pub(super) fn ensure_launch_at_directory(
 ) -> Result<(), ProtocolError> {
     if let Some(directory) = execution_directory {
         let metadata = directory.metadata().map_err(|error| {
-            refusal(format!(
-                "Cannot inspect the pinned terminal directory: {error}"
+            startup_failure(filesystem_failure(
+                format!("Cannot inspect the pinned terminal directory: {error}"),
+                &error,
             ))
         })?;
         if !metadata.is_dir() || metadata.nlink() == 0 {
@@ -1247,6 +1319,117 @@ pub(crate) mod tests {
         host.lock().unwrap().register_client(1);
         host
     }
+    #[test]
+    fn startup_account_home_absence_can_be_repaired_but_replacement_is_invalid() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("original");
+        let parked = root.path().join("parked");
+        std::fs::create_dir(&path).unwrap();
+        let home = Home::capture_for_start(path.clone()).unwrap();
+        std::fs::rename(&path, &parked).unwrap();
+        assert!(matches!(
+            home.verify_for_start(),
+            Err(SetupError::Unavailable(_))
+        ));
+        std::fs::rename(&parked, &path).unwrap();
+        assert!(home.verify_for_start().is_ok());
+        std::fs::rename(&path, &parked).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(matches!(
+            home.verify_for_start(),
+            Err(SetupError::Invalid(_))
+        ));
+        assert!(matches!(
+            Home::capture_for_start(PathBuf::from("relative")),
+            Err(SetupError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn startup_account_path_io_retries_after_descriptor_pressure_is_released() {
+        const WORKER: &str = "CAGENTS_ACCOUNT_STARTUP_FD_WORKER";
+        if std::env::var_os(WORKER).is_none() {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "host::account_lifecycle::tests::startup_account_path_io_retries_after_descriptor_pressure_is_released", "--nocapture"])
+                .env(WORKER, "1")
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            let completed = loop {
+                if child.try_wait().unwrap().is_some() {
+                    break true;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    break false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                completed && output.status.success(),
+                "isolated descriptor-pressure fixture failed or exceeded 30 seconds:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let homes = Homes::at(root.path().join("homes"));
+        let store = Store::at(root.path().join("registry"));
+        let reserved = root.path().join("reserved");
+        let selected = root.path().join("selected");
+        std::fs::create_dir(&reserved).unwrap();
+        std::fs::create_dir(&selected).unwrap();
+        let host = host();
+        let _reservation = Reservation::test_install(
+            &host,
+            &[Account::linked(
+                Provider::Claude,
+                uuid::Uuid::new_v4(),
+                reserved,
+            )],
+            store,
+            &homes,
+        )
+        .unwrap();
+        assert!(ensure_paths(&host, [selected.clone()]).is_ok());
+        // File-descriptor pressure produces a real filesystem resource error
+        // regardless of uid/capabilities. Change the limit only in this exact
+        // test's child, never in the parallel host test harness.
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) },
+            0
+        );
+        limit.rlim_cur = limit.rlim_cur.min(64);
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &limit) }, 0);
+        let mut files = Vec::new();
+        loop {
+            match File::open("/dev/null") {
+                Ok(file) => files.push(file),
+                Err(error) => {
+                    assert_eq!(error.raw_os_error(), Some(libc::EMFILE));
+                    break;
+                }
+            }
+            assert!(files.len() < 128, "descriptor pressure must remain bounded");
+        }
+        let refused = ensure_paths(&host, [selected.clone()]).unwrap_err();
+        assert!(refused.retryable, "{}", refused.message);
+        drop(files);
+        ensure_paths(&host, [selected]).unwrap();
+        assert!(
+            !ensure_paths(&host, [PathBuf::from("relative")])
+                .unwrap_err()
+                .retryable
+        );
+    }
+
     #[test]
     fn original_inode_and_physical_ancestry_block_aliases_after_rename() {
         let root = tempfile::tempdir().unwrap();

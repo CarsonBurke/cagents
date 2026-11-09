@@ -393,24 +393,30 @@ fn retryable_unavailable(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
 }
 
+fn launch_account_error(failure: crate::account::registry::LaunchAccountError) -> ProtocolError {
+    let retryable = matches!(&failure,
+        crate::account::registry::LaunchAccountError::Unreadable(error)
+            if error.kind() != std::io::ErrorKind::InvalidData
+    );
+    ProtocolError::new(
+        if matches!(
+            failure,
+            crate::account::registry::LaunchAccountError::Removed { .. }
+        ) {
+            ProtocolErrorCode::AccountRemoved
+        } else {
+            ProtocolErrorCode::TerminalUnavailable
+        },
+        failure.to_string(),
+        retryable,
+    )
+}
 fn check_launch_account(launch: &chat::Launch) -> Result<(), ProtocolError> {
     crate::account::registry::authorize_spawn(&launch.recipe.environment, Some(launch.provider))
         .map(drop)
-        .map_err(|failure| {
-            ProtocolError::new(
-                if matches!(
-                    failure,
-                    crate::account::registry::LaunchAccountError::Removed { .. }
-                ) {
-                    ProtocolErrorCode::AccountRemoved
-                } else {
-                    ProtocolErrorCode::TerminalUnavailable
-                },
-                failure.to_string(),
-                false,
-            )
-        })
+        .map_err(launch_account_error)
 }
+
 fn attached(state: &HostState, client: ClientId, id: TerminalId) -> Result<&Record, ProtocolError> {
     let record = state.chats.get(&id).ok_or_else(|| {
         unavailable("Exact native chat is not hosted; explicit recovery is required")
@@ -653,7 +659,7 @@ fn current_session_snapshot(
     handle: Handle,
     execution_instance: uuid::Uuid,
 ) -> Result<ServerResponse, ProtocolError> {
-    let response = session_snapshot(&session, &handle).map_err(unavailable)?;
+    let response = session_snapshot(&session, &handle).map_err(retryable_unavailable)?;
     let state = host.lock().unwrap_or_else(|p| p.into_inner());
     if state.shutting_down
         || state.chats.get(&session.id).is_none_or(|current| {
@@ -662,9 +668,16 @@ fn current_session_snapshot(
                 || !current.handle.same_attachment(&handle)
         })
     {
-        return Err(unavailable(
-            "Native attachment changed while its exact snapshot was loading",
-        ));
+        let changed_identity = state.chats.get(&session.id).is_some_and(|current| {
+            current.session.launch.provider != session.launch.provider
+                || current.session.launch.recipe != session.launch.recipe
+                || current.session.launch.session_id != session.launch.session_id
+        });
+        return Err(if changed_identity {
+            unavailable("Native attachment changed while its exact snapshot was loading")
+        } else {
+            retryable_unavailable("Native attachment changed while its exact snapshot was loading")
+        });
     }
     Ok(response)
 }
@@ -693,7 +706,7 @@ fn resolve_source(
 > {
     use crate::model::agent_recovery::{bind_session, recipe_from_hint};
     let process = handle.observe_agent_process().ok_or_else(|| {
-        unavailable(
+        retryable_unavailable(
             "No supported foreground agent is running in this terminal. Focus its CLI and retry.",
         )
     })?;
@@ -702,18 +715,19 @@ fn resolve_source(
             "The foreground provider changed; retry from the current terminal",
         ));
     }
-    let hint = handle.observe_agent().map_err(unavailable)?;
+    let hint = handle.observe_agent().map_err(retryable_unavailable)?;
     let fresh = crate::model::agent_recovery::fresh_omp_session(&process);
     if fresh.is_some()
         && !handle.agent_activity().is_some_and(|activity| {
             activity.provider == provider && activity.state == crate::agent::ActivityState::Idle
         })
     {
-        return Err(unavailable(
+        return Err(retryable_unavailable(
             "Wait for the fresh agent to be idle before switching; an unsaved in-flight exchange will not be discarded.",
         ));
     }
-    let public_id = crate::agent::observe::exact_session(&process).map_err(unavailable)?;
+    let public_id =
+        crate::agent::observe::exact_session(&process).map_err(retryable_unavailable)?;
     let observed_id = public_id.or_else(|| {
         // A shared-server TUI can switch threads without changing argv or PID.
         // Even an original `resume ID` is only a preview suggestion, not current
@@ -740,11 +754,14 @@ fn resolve_source(
         fresh.as_deref().and_then(|path| provider.session_file_id(path))
     }).or_else(|| {
         (provider == Provider::Codex && selection_authorized).then(|| selected.map(str::to_owned)).flatten()
-    }).ok_or_else(|| unavailable(match provider {
+    }).ok_or_else(|| {
+        let message = match provider {
         Provider::Codex => "This terminal is not associated with a managed thread. Open New thread to use native and CLI views of one conversation.",
         Provider::Claude => "Claude has not published an exact live conversation yet. Retry once its live session is available; the terminal has not been stopped.",
         Provider::Omp => "OMP has not published an exact live conversation or fresh-session boundary for this terminal. The terminal has not been stopped; no recent history will be selected.",
-    }))?;
+        };
+        if provider == Provider::Codex { unavailable(message) } else { retryable_unavailable(message) }
+    })?;
     let mut recipe = bind_session(&process.recovery, &id).ok_or_else(|| error(
         "The active launch contains options that cannot be safely preserved. Resume the exact conversation with supported account and permission options, then retry.",
     ))?;
@@ -767,7 +784,7 @@ fn resolve_source(
             explicit_environment,
             transient_environment,
         )
-        .map_err(unavailable)?;
+        .map_err(retryable_unavailable)?;
         recipe.environment = durable;
         Some(execution)
     } else {
@@ -791,7 +808,7 @@ fn stop_source(
     handle: &crate::terminal::TerminalHandle,
     frozen: &mut crate::terminal::UpgradeSnapshot,
 ) -> Result<(), ProtocolError> {
-    frozen.stop().map_err(unavailable)?;
+    frozen.stop().map_err(retryable_unavailable)?;
     if !handle.is_completed()
         && let Err(failure) = handle.shutdown()
         && !handle.is_completed()
@@ -801,7 +818,7 @@ fn stop_source(
     let deadline = Instant::now() + Duration::from_secs(10);
     while !handle.is_completed() {
         if Instant::now() >= deadline {
-            return Err(unavailable(
+            return Err(retryable_unavailable(
                 "CLI shutdown did not complete in ten seconds; source evidence is retained",
             ));
         }
@@ -818,12 +835,12 @@ fn confirm_fresh_session(
 ) -> Result<(), ProtocolError> {
     loop {
         if cancelled() {
-            return Err(unavailable(
+            return Err(retryable_unavailable(
                 "Fresh chat handoff was cancelled; the source terminal is retained",
             ));
         }
         if handle.is_completed() {
-            return Err(unavailable(
+            return Err(retryable_unavailable(
                 "The fresh native provider exited before its identity was confirmed; the source terminal is retained",
             ));
         }
@@ -834,7 +851,7 @@ fn confirm_fresh_session(
             ));
         }
         if Instant::now() >= deadline {
-            return Err(unavailable(
+            return Err(retryable_unavailable(
                 "The fresh provider did not confirm its conversation identity; the source terminal is retained",
             ));
         }
@@ -1338,7 +1355,7 @@ fn start_with_execution(
                 .get(&session.id)
                 .ok_or_else(|| error("The proven source terminal no longer exists"))?;
             if record.handle.is_completed() {
-                return Err(unavailable(
+                return Err(retryable_unavailable(
                     "The source agent has exited; resume its exact conversation in the terminal first",
                 ));
             }
@@ -1366,7 +1383,7 @@ fn start_with_execution(
                 ));
             }
             let (title, cwd) = crate::agent::observe::codex_preview(&process.recovery, &id)
-                .map_err(unavailable)?;
+                .map_err(retryable_unavailable)?;
             if cwd != binding.preview.working_directory || title != binding.preview.title {
                 return Err(error(
                     "Conversation metadata changed; review a fresh preview before attaching",
@@ -1559,8 +1576,8 @@ fn start_with_execution(
     let remote = retained_actor::enabled(session.launch.provider, &spec.transport);
     let execution = if remote && execution.is_none() {
         Some(Arc::new(
-            chat::protocol::ExecutionContext::capture(&spec.working_directory)
-                .map_err(retryable_unavailable)?,
+            chat::protocol::ExecutionContext::capture_for_start(&spec.working_directory)
+                .map_err(setup_error)?,
         ))
     } else {
         execution
@@ -1622,7 +1639,15 @@ fn start_with_execution(
                 ));
             }
             if record.handle.owns_work() {
-                return Err(error(
+                if record.session.launch.provider != session.launch.provider
+                    || record.session.launch.recipe != session.launch.recipe
+                    || record.handle.session_id() != session.launch.session_id
+                {
+                    return Err(error(
+                        "Explicit recovery must retain the exact closed chat identity",
+                    ));
+                }
+                return Err(retryable_unavailable(
                     "Chat already owns work; attach instead of starting another writer",
                 ));
             }
@@ -1805,8 +1830,8 @@ fn start_with_execution(
             && let Some(context) = &spec.execution
         {
             context
-                .verify_directory(&spec.working_directory)
-                .map_err(unavailable)?;
+                .verify_directory_for_start(&spec.working_directory)
+                .map_err(setup_error)?;
         }
         spec.remove_unset_environment();
         let recovery_environment = spec.environment.clone();
@@ -1825,7 +1850,7 @@ fn start_with_execution(
                 .fresh_agent_authority(&crate::agent_execution::HostedSession::Chat(
                     session.clone(),
                 ))
-                .map_err(unavailable)?;
+                .map_err(retryable_unavailable)?;
             if let Some(token) = authority.token() {
                 spec.environment
                     .insert(crate::agent_execution::AUTHORITY_ENV.into(), token.into());
@@ -1870,7 +1895,7 @@ fn start_with_execution(
                 | chat::protocol::TransportSpec::UnixWebSocket { .. }
         ) {
             let _account = crate::account::registry::authorize_spawn(&spec.environment, None)
-                .map_err(|error| unavailable(error.to_string()))?;
+                .map_err(launch_account_error)?;
             crate::agent_execution::bundled::install(
                 Some(session.launch.provider),
                 &spec.environment,
@@ -1976,7 +2001,9 @@ fn start_with_execution(
             }
         }
         if !remote {
-            handle.commit_native_installation().map_err(unavailable)?;
+            handle
+                .commit_native_installation()
+                .map_err(retryable_unavailable)?;
         }
         if remote {
             // A converted Claude source has been positively stopped above; it
@@ -1985,7 +2012,7 @@ fn start_with_execution(
                 session.terminal = None;
                 handle
                     .update_native_source(session.clone(), None, None)
-                    .map_err(unavailable)?;
+                    .map_err(retryable_unavailable)?;
             }
             let mut aliases = vec![
                 crate::agent_execution::HostedSession::Chat(requested_source.clone()),
@@ -1999,7 +2026,7 @@ fn start_with_execution(
                     terminal.clone(),
                 ));
             }
-            session = retained_actor::publish_authenticated_source(
+            session = retained_actor::publish_authenticated_source_for_start(
                 host,
                 &handle,
                 session,
@@ -2008,7 +2035,7 @@ fn start_with_execution(
                 None,
                 retained_actor::Publication::Install,
             )
-            .map_err(unavailable)?;
+            .map_err(setup_error)?;
         }
         let execution_instance = handle
             .actor_identity()
@@ -2064,7 +2091,7 @@ fn start_with_execution(
         let mut response = if expected_saved.is_some() {
             None
         } else {
-            Some(session_snapshot(&record.session, &record.handle).map_err(unavailable)?)
+            Some(session_snapshot(&record.session, &record.handle).map_err(retryable_unavailable)?)
         };
 
         let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -2862,7 +2889,8 @@ fn process_inner(
             // this daemon resumes the same way as one a daemon stop ended:
             // the exited actor is retired as a stop first, so the checks
             // below find its verified retirement rather than a present owner.
-            retained_actor::finish_exited_attachment(host, &source).map_err(unavailable)?;
+            retained_actor::finish_exited_attachment_for_start(host, &source)
+                .map_err(setup_error)?;
             // An unnamed pane resumes the conversation its ended actors
             // confirmed, through the same checks as a named one; when they
             // confirmed none, every actor's end is already proved and the
@@ -2892,7 +2920,8 @@ fn process_inner(
             // A helper whose daemon exited between closing its provider and
             // retiring it finishes that exit here, then classifies as retired.
             let retirement = if !retirement.is_classified()
-                && retained_actor::finish_interrupted_exit_of(host, &ended).map_err(unavailable)?
+                && retained_actor::finish_interrupted_exit_of_for_start(host, &ended)
+                    .map_err(setup_error)?
             {
                 retained_resume::inspect_resume_retirement_for_start(host, &source)
                     .map_err(setup_error)?
@@ -2939,7 +2968,7 @@ fn process_inner(
                 // An owner lost without its receipt was closed all the same,
                 // proved while no start or close can take its allocation.
                 chat::native_holder::closed_source(&source, &proof)
-                    .map_err(unavailable)?
+                    .map_err(retryable_unavailable)?
                     .is_some_and(|(_, paired_closed)| paired_closed)
                     || reserve_quiet_allocation(host, &source, None).is_ok_and(|_fence| {
                         codex_owner_lost(host, &source, &proof).unwrap_or(false)
@@ -2959,7 +2988,7 @@ fn process_inner(
             // The old process is proved ended, as after a daemon stop: its
             // authority and unfinished runs end and its agent stays open, so
             // the successor's start can take the agent over.
-            super::agent_execution::stopped(host, &ended).map_err(unavailable)?;
+            super::agent_execution::stopped(host, &ended).map_err(retryable_unavailable)?;
             let predecessor = source.id;
             let root = source
                 .terminal
@@ -2981,7 +3010,7 @@ fn process_inner(
                             .unwrap_or_else(|p| p.into_inner())
                             .any_other_live(members, predecessor)
                     })
-                    .map_err(unavailable)?;
+                    .map_err(retryable_unavailable)?;
             }
             Ok(ServerResponse::ChatResumePrepared { session })
         }
@@ -3175,7 +3204,7 @@ fn process_inner(
             let mut state = host.lock().unwrap_or_else(|p| p.into_inner());
             validate_proof(session.proof.as_ref(), state.proof())?;
             if state.chat_spawning.contains_key(&session.id) {
-                return Err(unavailable(
+                return Err(retryable_unavailable(
                     "Native chat ownership is changing; retry its normal attach after the transition finishes",
                 ));
             }

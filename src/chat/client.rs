@@ -1043,6 +1043,9 @@ fn append_text_copy_page(
 
 enum HandshakeError {
     Protocol(ipc::ProtocolError),
+    /// No response from a different proof can attach. Only its well-framed
+    /// explicit refusal can describe why an initial hard target was rejected.
+    ProofChanged(Option<ipc::ProtocolError>),
     Transport(String),
 }
 impl From<String> for HandshakeError {
@@ -1063,6 +1066,7 @@ fn receive(
 ) -> Result<ServerResponse, String> {
     receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
         HandshakeError::Protocol(error) => error.message,
+        HandshakeError::ProofChanged(_) => "Daemon proof changed".into(),
         HandshakeError::Transport(message) => message,
     })
 }
@@ -1074,6 +1078,27 @@ fn receive_start(
 ) -> Result<ServerResponse, StartFailure> {
     receive_handshake(stream, codec, request_id, proof).map_err(|error| match error {
         HandshakeError::Protocol(error) => start_failure(error),
+        HandshakeError::ProofChanged(error) => StartFailure::retry(
+            error.map_or_else(|| "Daemon proof changed".into(), |error| error.message),
+        ),
+        HandshakeError::Transport(message) => StartFailure::retry(message),
+    })
+}
+fn receive_connect(
+    stream: &mut UnixStream,
+    codec: &mut FrameCodec,
+    request_id: u64,
+    expected: Option<&HostSessionProof>,
+) -> Result<ServerResponse, StartFailure> {
+    receive_handshake(stream, codec, request_id, expected).map_err(|error| match error {
+        HandshakeError::Protocol(error) | HandshakeError::ProofChanged(Some(error)) => {
+            start_failure(error)
+        }
+        HandshakeError::ProofChanged(None) if expected.is_some() => StartFailure {
+            message: "Daemon proof changed".into(),
+            recovery: super::Recovery::Blocked,
+        },
+        HandshakeError::ProofChanged(None) => StartFailure::retry("Daemon proof changed"),
         HandshakeError::Transport(message) => StartFailure::retry(message),
     })
 }
@@ -1100,11 +1125,17 @@ fn receive_handshake(
         crate::daemon_health::incompatible_stream(stream, envelope.version, health_request);
         return Err("Daemon version mismatch; use matched cagents executables".into());
     }
-    if !envelope.proof.is_complete() || proof.is_some_and(|proof| proof != &envelope.proof) {
-        return Err("Daemon proof changed".into());
+    if !envelope.proof.is_complete() {
+        return Err(HandshakeError::ProofChanged(None));
     }
     if envelope.request_id != Some(request_id) {
         return Err("Unexpected daemon response ordering".into());
+    }
+    if proof.is_some_and(|proof| proof != &envelope.proof) {
+        return Err(HandshakeError::ProofChanged(match envelope.message {
+            ServerMessage::Error(error) => Some(error),
+            _ => None,
+        }));
     }
     match envelope.message {
         ServerMessage::Response { response } => {
@@ -1961,6 +1992,26 @@ impl ClientHandle {
         )
     }
 
+    #[cfg(all(test, feature = "host"))]
+    pub(crate) fn fixture_connect(
+        stream: UnixStream,
+        session: Session,
+        intent: Intent,
+        source: Option<HostSessionProof>,
+    ) -> Result<Self, StartFailure> {
+        Self::connect_on(
+            stream,
+            session,
+            intent,
+            source,
+            false,
+            None,
+            None,
+            None,
+            |_| {},
+        )
+    }
+
     fn connect_on(
         mut stream: UnixStream,
         session: Session,
@@ -2037,7 +2088,7 @@ impl ClientHandle {
                 },
             )
             .map_err(|e| e.to_string())?;
-        let proof = match receive_start(&mut stream, &mut codec, 1, expected.as_ref())? {
+        let proof = match receive_connect(&mut stream, &mut codec, 1, expected.as_ref())? {
             ServerResponse::Connected { proof, .. } => proof,
             _ => return Err("Daemon did not complete native chat handshake".into()),
         };
@@ -4387,6 +4438,91 @@ mod tests {
             false,
         );
         (outcome, worker.join().unwrap(), recovery)
+    }
+
+    #[test]
+    fn a_changed_midstream_proof_retries_a_new_handshake_instead_of_binding() {
+        let expected = host_proof("expected");
+        let foreign = host_proof("foreign");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        FrameCodec::new(ipc::MAX_FRAME_BYTES)
+            .write(
+                &mut server,
+                &ServerEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: Some(2),
+                    proof: foreign,
+                    message: ServerMessage::Error(ipc::ProtocolError::new(
+                        ipc::ProtocolErrorCode::ProofMismatch,
+                        "The former connection changed its daemon proof",
+                        false,
+                    )),
+                },
+            )
+            .unwrap();
+        let failure = receive_start(
+            &mut client,
+            &mut FrameCodec::new(ipc::MAX_FRAME_BYTES),
+            2,
+            Some(&expected),
+        )
+        .unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+        assert!(failure.message.contains("former connection"));
+    }
+
+    #[test]
+    fn initial_hard_target_rejects_a_foreign_proof_response_without_attaching() {
+        let expected = host_proof("expected");
+        let foreign = host_proof("foreign");
+        let (mut client, mut server) = UnixStream::pair().unwrap();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let request: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(request.request, ClientRequest::Connect { .. }));
+            codec
+                .write(
+                    &mut server,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request.request_id),
+                        proof: foreign.clone(),
+                        message: ServerMessage::Response {
+                            response: ServerResponse::Connected {
+                                proof: foreign,
+                                resumed: vec![],
+                            },
+                        },
+                    },
+                )
+                .unwrap();
+            assert!(
+                codec.read::<ClientEnvelope>(&mut server).unwrap().is_none(),
+                "a mismatched response cannot lead to an Attach or Start"
+            );
+        });
+        let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+        codec
+            .write(
+                &mut client,
+                &ClientEnvelope {
+                    version: PROTOCOL_VERSION,
+                    request_id: 1,
+                    proof: None,
+                    request: ClientRequest::Connect {
+                        expected_host: Some(expected.clone()),
+                        resume: vec![],
+                    },
+                },
+            )
+            .unwrap();
+        let failure = receive_connect(&mut client, &mut codec, 1, Some(&expected)).unwrap_err();
+        assert_eq!(failure.recovery, crate::chat::Recovery::Blocked);
+        drop(client);
+        worker.join().unwrap();
     }
 
     #[test]

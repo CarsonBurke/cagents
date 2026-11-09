@@ -901,22 +901,86 @@ mod startup_retryability_tests {
         ));
         assert!(host.lock().unwrap().chats.is_empty());
     }
+
+    #[test]
+    fn retained_publication_rejects_changed_source_before_private_operations() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, mut source, _) = pending(root.path());
+        let handle = Handle::fixture_failed_remote();
+        let identity = handle.actor_identity().unwrap();
+        source.id = identity.record.terminal;
+        source.proof.as_mut().unwrap().boot_id = identity.record.boot.clone();
+        for conflict in 0..3 {
+            let mut changed = source.clone();
+            match conflict {
+                0 => changed.id = TerminalId::new(),
+                1 => changed.proof = None,
+                _ => changed.launch.provider = Provider::Codex,
+            }
+            assert!(matches!(
+                publish_authenticated_source_for_start(
+                    &host,
+                    &handle,
+                    changed,
+                    &[],
+                    None,
+                    None,
+                    Publication::Install,
+                ),
+                Err(SetupError::Invalid(_)),
+            ));
+        }
+        assert!(host.lock().unwrap().chats.is_empty());
+    }
+
+    #[test]
+    fn exited_attachment_keeps_source_conflicts_blocked_and_registry_failure_retryable() {
+        let root = tempfile::tempdir().unwrap();
+        let (host, mut source, _) = pending(root.path());
+        let handle = Handle::fixture_failed_remote();
+        let identity = handle.actor_identity().unwrap();
+        source.id = identity.record.terminal;
+        host.lock().unwrap().chats.insert(
+            source.id,
+            super::super::Record {
+                session: source.clone(),
+                handle: handle.clone(),
+                execution_instance: identity.instance,
+                console_recipe: None,
+                paired_terminal: None,
+                source_process: None,
+                subscribers: Default::default(),
+                observations: Default::default(),
+                completion_observed: false,
+                returning_terminal: false,
+            },
+        );
+        let mut changed = source.clone();
+        changed
+            .launch
+            .recipe
+            .arguments
+            .push("--changed-source".into());
+        assert!(matches!(
+            finish_exited_attachment_for_start(&host, &changed),
+            Err(SetupError::Invalid(_)),
+        ));
+        // This exact owner reaches the operational registry lookup. The
+        // fixture has no registry, so cleanup remains pending and retryable.
+        assert!(matches!(
+            finish_exited_attachment_for_start(&host, &source),
+            Err(SetupError::Unavailable(_)),
+        ));
+        let state = host.lock().unwrap();
+        assert!(state.chats[&source.id].handle.same_attachment(&handle));
+        assert_eq!(state.chats[&source.id].session, source);
+        assert!(state.chat_spawning.is_empty());
+    }
 }
 
 /// Persist cleanup authority while the inspected source and captured scope are
 /// still authenticated, before installation or a new attachment can retire the
 /// previous epoch. Pending is never an input or history-resume grant.
-fn enroll_pending(
-    host: &SharedHost,
-    identity: &chat::runtime::ActorIdentity,
-    issued: &Session,
-    aliases: &[Session],
-    scope: Result<&crate::account::scope::LaunchAccountScope, &str>,
-    installed: bool,
-) -> Result<(), String> {
-    enroll_pending_for_start(host, identity, issued, aliases, scope, installed)
-        .map_err(|failure| failure.to_string())
-}
 
 fn enroll_pending_for_start(
     host: &SharedHost,
@@ -966,30 +1030,62 @@ pub(super) enum Publication {
 pub(super) fn publish_authenticated_source(
     host: &SharedHost,
     handle: &Handle,
-    mut source: Session,
+    source: Session,
     retained: &[crate::agent_execution::HostedSession],
     console: Option<crate::model::LaunchRecipe>,
     pair: Option<crate::terminal::holder::Record>,
     publication: Publication,
 ) -> Result<Session, String> {
-    if handle.actor_identity().is_none() {
-        return Err("Retained publication lost its authenticated actor identity".into());
+    publish_authenticated_source_for_start(
+        host,
+        handle,
+        source,
+        retained,
+        console,
+        pair,
+        publication,
+    )
+    .map_err(|failure| failure.to_string())
+}
+
+pub(super) fn publish_authenticated_source_for_start(
+    host: &SharedHost,
+    handle: &Handle,
+    mut source: Session,
+    retained: &[crate::agent_execution::HostedSession],
+    console: Option<crate::model::LaunchRecipe>,
+    pair: Option<crate::terminal::holder::Record>,
+    publication: Publication,
+) -> Result<Session, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    let identity = handle
+        .actor_identity()
+        .ok_or("Retained publication lost its authenticated actor identity")?;
+    if source.id != identity.record.terminal || source.launch.provider != Provider::Claude {
+        return Err("Pending publication changed its exact authenticated actor".into());
     }
     let install = matches!(publication, Publication::Install);
     if install == handle.is_close_only() {
         return Err("Retained publication mode does not match its authenticated attachment".into());
     }
+    let proof = source
+        .proof
+        .clone()
+        .filter(HostSessionProof::is_complete)
+        .ok_or("Pending publication lacks daemon proof")?;
+    if identity.instance.is_nil()
+        || identity.record.kind != crate::daemon::holder_registry::Kind::Native
+        || identity.record.boot != proof.boot_id
+    {
+        return Err("Pending publication changed its exact authenticated actor".into());
+    }
     if install {
-        let proof = source
-            .proof
-            .clone()
-            .ok_or("Pending publication lacks daemon proof")?;
-        let identity = handle.actor_identity().unwrap();
-        let inspection = Handle::inspect_remote(&identity.record, proof)?;
+        let inspection =
+            Handle::inspect_remote(&identity.record, proof).map_err(SetupError::Unavailable)?;
         if inspection.identity != identity {
             return Err("Pending publication changed its exact authenticated actor".into());
         }
-        enroll_pending(
+        enroll_pending_for_start(
             host,
             &inspection.identity,
             &inspection.source,
@@ -1000,7 +1096,9 @@ pub(super) fn publish_authenticated_source(
                 .map_err(String::as_str),
             inspection.state.installed,
         )?;
-        handle.commit_native_installation()?;
+        handle
+            .commit_native_installation()
+            .map_err(SetupError::Unavailable)?;
     }
     source.launch.session_id = handle.confirmed_session_id().or(source.launch.session_id);
     source.native_continuity = handle.native_continuity();
@@ -1012,20 +1110,24 @@ pub(super) fn publish_authenticated_source(
     {
         return Err("Installed Claude actor did not prove retained ownership".into());
     }
-    handle.update_native_source(source.clone(), console, pair)?;
+    handle
+        .update_native_source(source.clone(), console, pair)
+        .map_err(SetupError::Unavailable)?;
     if install {
-        super::super::agent_execution::registry(host)?
+        super::super::agent_execution::registry(host)
+            .map_err(SetupError::Unavailable)?
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .adopt_authenticated_agent_session(
                 retained,
                 &crate::agent_execution::HostedSession::Chat(source.clone()),
-            )?;
+            )
+            .map_err(SetupError::Unavailable)?;
     }
     if install {
         // Promotion follows the exact helper ACK and Registry transaction and
         // precedes any ordinary HOST input record becoming visible.
-        register_ownership(host, handle, &source)?;
+        register_ownership(host, handle, &source).map_err(SetupError::Unavailable)?;
     }
     Ok(source)
 }
@@ -1068,18 +1170,34 @@ pub(in crate::host) fn finish_interrupted_exit(
     host: &SharedHost,
     owner: &crate::daemon::holder_registry::Record,
 ) -> Result<bool, String> {
+    finish_interrupted_exit_for_start(host, owner, None).map_err(|failure| failure.to_string())
+}
+
+fn finish_interrupted_exit_for_start(
+    host: &SharedHost,
+    owner: &crate::daemon::holder_registry::Record,
+    requested: Option<&Session>,
+) -> Result<bool, chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
     let proof = host
         .lock()
         .unwrap_or_else(|p| p.into_inner())
         .proof()
         .clone();
-    let inspection = Handle::inspect_remote(owner, proof.clone())?;
+    let inspection =
+        Handle::inspect_remote(owner, proof.clone()).map_err(SetupError::Unavailable)?;
     if &inspection.identity.record != owner
-        || inspection.source.launch.provider != Provider::Claude
+        || requested.is_some_and(|requested| {
+            requested != &inspection.source && !inspection.previous_sources.contains(requested)
+        })
+    {
+        return Err("The retained actor does not recognize this exact cleanup descriptor".into());
+    }
+    if inspection.source.launch.provider != Provider::Claude
         || inspection.state.owns_work
         || !inspection.state.close.exited
         || !matches!(
-            Handle::inspect_retained_retirement(owner, &proof)?,
+            Handle::inspect_retained_retirement(owner, &proof).map_err(SetupError::Unavailable)?,
             RetirementInspection::Running
         )
     {
@@ -1096,7 +1214,8 @@ pub(in crate::host) fn finish_interrupted_exit(
         None,
         None,
         Ending::Stopped,
-    )?;
+    )
+    .map_err(SetupError::Unavailable)?;
     Ok(true)
 }
 
@@ -1106,7 +1225,15 @@ pub(in crate::host) fn finish_interrupted_exit_of(
     host: &SharedHost,
     session: &Session,
 ) -> Result<bool, String> {
+    finish_interrupted_exit_of_for_start(host, session).map_err(|failure| failure.to_string())
+}
+
+pub(in crate::host) fn finish_interrupted_exit_of_for_start(
+    host: &SharedHost,
+    session: &Session,
+) -> Result<bool, chat::protocol::SetupError> {
     use crate::daemon::holder_registry::{self as registry, Kind};
+    use chat::protocol::SetupError;
     if session.launch.provider != Provider::Claude
         || host
             .lock()
@@ -1116,9 +1243,13 @@ pub(in crate::host) fn finish_interrupted_exit_of(
     {
         return Ok(false);
     }
-    let directory = registry::directory(Kind::Native)?;
-    match registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)? {
-        Some(owner) if Handle::is_remote_record(&owner) => finish_interrupted_exit(host, &owner),
+    let directory = registry::directory(Kind::Native).map_err(SetupError::Unavailable)?;
+    match registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
+        .map_err(SetupError::Unavailable)?
+    {
+        Some(owner) if Handle::is_remote_record(&owner) => {
+            finish_interrupted_exit_for_start(host, &owner, Some(session))
+        }
         _ => Ok(false),
     }
 }
@@ -1138,6 +1269,13 @@ pub(in crate::host) fn finish_exited_attachment(
     host: &SharedHost,
     source: &Session,
 ) -> Result<bool, String> {
+    finish_exited_attachment_for_start(host, source).map_err(|failure| failure.to_string())
+}
+
+pub(in crate::host) fn finish_exited_attachment_for_start(
+    host: &SharedHost,
+    source: &Session,
+) -> Result<bool, chat::protocol::SetupError> {
     let target = {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let Some(record) = state.chats.get(&source.id) else {
@@ -1152,9 +1290,15 @@ pub(in crate::host) fn finish_exited_attachment(
         {
             return Ok(false);
         }
+        if !recognizes_cleanup_source(&state, record, source) {
+            return Err(
+                "The retained actor does not recognize this exact cleanup descriptor".into(),
+            );
+        }
         super::CloseTarget::from_record(record)
     };
-    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)?;
+    close_with_target(host, source, None, Some(&target), None, Ending::Stopped)
+        .map_err(chat::protocol::SetupError::Unavailable)?;
     Ok(true)
 }
 
@@ -1246,7 +1390,7 @@ pub(super) fn recover_cleanup_attachment_for_start(
             .chats
             .get(&requested.id)
             .ok_or_else(|| SetupError::Unavailable("Cleanup owner disappeared".into()))?;
-        if &record.session != requested
+        if !recognizes_cleanup_source(&state, record, requested)
             || !record.handle.is_close_only()
             || record.session.launch.provider != Provider::Claude
         {
@@ -1515,7 +1659,7 @@ fn restore_actor_for_start(
     sources.push(requested.clone());
     sources.sort_by_key(|source| serde_json::to_vec(source).unwrap_or_default());
     sources.dedup();
-    session = publish_authenticated_source(
+    session = publish_authenticated_source_for_start(
         host,
         &handle,
         session,
@@ -1531,8 +1675,7 @@ fn restore_actor_for_start(
         } else {
             Publication::Close
         },
-    )
-    .map_err(SetupError::Unavailable)?;
+    )?;
     let after_generation = handle.observe_next_update();
     let observation = Observation {
         after_generation,
@@ -1726,6 +1869,23 @@ impl Ending {
     }
 }
 
+/// The same issued, observed or authenticated upgrade alias accepted by cleanup.
+fn recognizes_cleanup_source(
+    state: &HostState,
+    record: &super::Record,
+    requested: &Session,
+) -> bool {
+    let mut observed = record.session.clone();
+    observed.launch.session_id = record.handle.session_id();
+    observed.native_continuity = record.handle.native_continuity();
+    record.session == *requested
+        || observed == *requested
+        || state
+            .upgrade_chats
+            .get(&requested.id)
+            .is_some_and(|aliases| aliases.iter().any(|alias| alias.source == *requested))
+}
+
 fn close_with_target(
     host: &SharedHost,
     requested: &Session,
@@ -1818,16 +1978,7 @@ fn close_with_target(
                 "The discovered retained actor differs from the current exact owner".into(),
             );
         }
-        let mut observed = record.session.clone();
-        observed.launch.session_id = record.handle.session_id();
-        observed.native_continuity = record.handle.native_continuity();
-        if record.session != *requested
-            && observed != *requested
-            && !state
-                .upgrade_chats
-                .get(&requested.id)
-                .is_some_and(|aliases| aliases.iter().any(|alias| alias.source == *requested))
-        {
+        if !recognizes_cleanup_source(&state, record, requested) {
             return Err(
                 "The retained actor does not recognize this exact cleanup descriptor".into(),
             );

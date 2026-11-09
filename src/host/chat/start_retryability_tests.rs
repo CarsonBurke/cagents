@@ -5,7 +5,7 @@ use super::*;
 use crate::{chat::client::ClientHandle, model::LaunchRecipe};
 use std::{
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::{fs::PermissionsExt, process::CommandExt},
     path::{Path, PathBuf},
     process::{Child, Command},
 };
@@ -296,6 +296,318 @@ impl Drop for FixtureServer {
     }
 }
 
+fn start_codex_peer(root: &Path, socket: &Path, home: &Path) -> FixtureServer {
+    let provider = root.join("bin/codex");
+    let address = format!("unix://{}", socket.display());
+    let mut server = FixtureServer(
+        Command::new("/usr/bin/python3")
+            .arg(&provider)
+            .args(["--listen", &address])
+            .env_clear()
+            .env("CAGENTS_ESCAPE_FIXTURE_ROOT", root)
+            .env("CODEX_HOME", home)
+            .env("XDG_RUNTIME_DIR", root.join("r"))
+            .stdout(fs::File::create(root.join("peer.stdout")).unwrap())
+            .stderr(fs::File::create(root.join("peer.stderr")).unwrap())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !socket.exists() {
+        assert!(
+            server.0.try_wait().unwrap().is_none(),
+            "fixture server exited: {}",
+            fs::read_to_string(root.join("peer.stderr")).unwrap()
+        );
+        assert!(
+            Instant::now() < deadline,
+            "fixture server never bound its socket"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    server
+}
+
+/// A real installed census row, with private account capture and exact owned
+/// kernel process identities. These tests exercise preparation, not helper RPC
+/// or provider execution; the earlier helper has already been reaped.
+fn ended_claude_census(
+    host: &SharedHost,
+    source: &Session,
+    root_process: crate::daemon::holder_registry::Process,
+) {
+    use crate::daemon::holder_registry::{BuildIdentity, Kind, Process, Record};
+    let mut helper = FixtureServer(
+        Command::new("/bin/sleep")
+            .arg("120")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let holder = Process::read(helper.0.id() as i32).unwrap();
+    helper.0.kill().unwrap();
+    helper.0.wait().unwrap();
+    assert!(!holder.is_current());
+    let owner = Record {
+        version: 4,
+        build: Some(BuildIdentity {
+            version: "fixture".into(),
+            commit: None,
+            capabilities: vec![crate::daemon::holder_registry::RETAINED_CLAUDE_CAPABILITY.into()],
+        }),
+        kind: Kind::Native,
+        application: crate::instance::APPLICATION_ID.into(),
+        boot: source.proof.as_ref().unwrap().boot_id.clone(),
+        terminal: source.id,
+        holder,
+        root: root_process,
+    };
+    let scope = crate::account::scope::LaunchAccountScope::resolve(
+        Provider::Claude,
+        &source.launch.recipe.working_directory,
+        |name| source.launch.recipe.environment.get(name).map(Into::into),
+    )
+    .unwrap();
+    super::super::agent_execution::registry(host)
+        .unwrap()
+        .lock()
+        .unwrap()
+        .register_native_actor_ownership(uuid::Uuid::new_v4(), &owner, source, Ok(&scope))
+        .unwrap();
+}
+
+fn retained_claude_source(root: &Path, proof: &HostSessionProof) -> Session {
+    let mut source = session(root, Provider::Claude, vec![]);
+    source.proof = Some(proof.clone());
+    source.native_continuity = chat::NativeContinuity::RetainedClaudeActor { protocol: 2 };
+    source.launch.recipe.environment.insert(
+        "CLAUDE_CONFIG_DIR".into(),
+        root.join("home/.claude").to_str().unwrap().into(),
+    );
+    source
+}
+
+fn resume_refused(source: &Session) -> chat::StartFailure {
+    match connect(source, chat::Intent::Resume) {
+        Ok(handle) => {
+            let _ = handle.close();
+            panic!("unsettled retained source unexpectedly resumed")
+        }
+        Err(failure) => failure,
+    }
+}
+
+/// The initial refusal traverses the actual native client. The repair proves
+/// the same source's public preparation boundary succeeds without granting or
+/// exercising a provider launch, which belongs to the separate start tests.
+fn assert_repaired_resume_prepares(host: &SharedHost, source: &Session) {
+    let ServerResponse::ChatResumePrepared { session } = process_inner(
+        host,
+        0,
+        ClientRequest::ChatPrepareResume {
+            source: source.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("the repaired exact source did not prepare its saved conversation")
+    };
+    assert_ne!(session.id, source.id);
+    assert_eq!(session.launch, source.launch);
+    assert_eq!(session.proof, None);
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert!(host.lock().unwrap().native_actor_startups.is_empty());
+}
+
+#[test]
+fn surviving_claude_process_keeps_retry_until_its_owned_process_exits() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated("surviving_claude_process_keeps_retry_until_its_owned_process_exits")
+    else {
+        return;
+    };
+    let (host, proof) = setup(&root, "survivor-repair");
+    let source = retained_claude_source(&root, &proof);
+    let mut provider = FixtureServer(
+        Command::new("/bin/sleep")
+            .arg("120")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let process = crate::daemon::holder_registry::Process::read(provider.0.id() as i32).unwrap();
+    ended_claude_census(&host, &source, process.clone());
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let failure = resume_refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Retry,
+        "{}",
+        failure.message
+    );
+    assert!(failure.message.contains("without verified retirement"));
+    assert!(
+        process.is_current(),
+        "preparation must preserve the earlier process"
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    provider.0.kill().unwrap();
+    provider.0.wait().unwrap();
+    assert!(!process.is_current());
+    assert_repaired_resume_prepares(&host, &source);
+}
+
+#[test]
+fn missing_captured_claude_home_keeps_retry_until_same_inode_is_restored() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) =
+        isolated("missing_captured_claude_home_keeps_retry_until_same_inode_is_restored")
+    else {
+        return;
+    };
+    let (host, proof) = setup(&root, "home-repair");
+    let source = retained_claude_source(&root, &proof);
+    let mut provider = FixtureServer(
+        Command::new("/bin/sleep")
+            .arg("120")
+            .process_group(0)
+            .spawn()
+            .unwrap(),
+    );
+    let process = crate::daemon::holder_registry::Process::read(provider.0.id() as i32).unwrap();
+    ended_claude_census(&host, &source, process);
+    provider.0.kill().unwrap();
+    provider.0.wait().unwrap();
+    let home = root.join("home/.claude");
+    let moved_home = root.join("captured-claude-home");
+    fs::rename(&home, &moved_home).unwrap();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let failure = resume_refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Retry,
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure
+            .message
+            .contains("captured provider home is unavailable"),
+        "the account check's refusal must reach the client: {}",
+        failure.message,
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    fs::rename(&moved_home, &home).unwrap();
+    assert_repaired_resume_prepares(&host, &source);
+}
+
+#[test]
+fn managed_account_registry_io_is_retryable_but_malformed_data_is_blocked() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) =
+        isolated("managed_account_registry_io_is_retryable_but_malformed_data_is_blocked")
+    else {
+        return;
+    };
+    let homes = crate::account::home::Homes::installation().unwrap();
+    let store = crate::account::registry::Store::installation().unwrap();
+    let (_, home) = store
+        .create_pending(&homes, Provider::Codex, 1, || {
+            homes.create(Provider::Codex, None)
+        })
+        .unwrap();
+    let provider = root.join("bin/codex");
+    fs::write(
+        &provider,
+        include_str!("../../../tests/fixtures/terminal-escape-codex.py"),
+    )
+    .unwrap();
+    fs::set_permissions(&provider, fs::Permissions::from_mode(0o700)).unwrap();
+    let socket = root.join("r/peer.sock");
+    let mut source = session(
+        &root,
+        Provider::Codex,
+        vec!["--remote".into(), format!("unix://{}", socket.display())],
+    );
+    source
+        .launch
+        .recipe
+        .environment
+        .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+    check_launch_account(&source.launch).unwrap();
+    let (host, proof) = setup(&root, "registry-repair");
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let registry = crate::instance::project_dirs()
+        .unwrap()
+        .config_dir()
+        .join("accounts.toml");
+    let saved_registry = root.join("accounts-valid.toml");
+    fs::rename(&registry, &saved_registry).unwrap();
+    fs::create_dir(&registry).unwrap();
+    let failure = refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Retry,
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure
+            .message
+            .contains("Cannot verify the selected account")
+    );
+    assert!(!root.join("provider.json").exists());
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+
+    fs::remove_dir(&registry).unwrap();
+    fs::write(&registry, "not valid TOML = [").unwrap();
+    fs::set_permissions(&registry, fs::Permissions::from_mode(0o600)).unwrap();
+    let malformed = fs::read(&registry).unwrap();
+    let failure = refused(&source);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Blocked,
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure
+            .message
+            .contains("Cannot verify the selected account")
+    );
+    assert_eq!(fs::read(&registry).unwrap(), malformed);
+    assert!(!root.join("provider.json").exists());
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+
+    fs::remove_file(&registry).unwrap();
+    fs::rename(&saved_registry, &registry).unwrap();
+    let _server = start_codex_peer(&root, &socket, &home);
+    let client = connect(&source, chat::Intent::RetryStart).unwrap();
+    wait_for_ready(&host, &source, &client);
+    assert_eq!(client.session().id, source.id);
+    assert_eq!(client.session().launch, source.launch);
+    let requests = fs::read_to_string(root.join("rpc-intake.jsonl")).unwrap();
+    assert!(requests.lines().all(|line| {
+        serde_json::from_str::<serde_json::Value>(line).unwrap()["method"] != "turn/start"
+    }));
+    client.close().unwrap();
+    assert!(host.lock().unwrap().chats.is_empty());
+}
+
 #[test]
 fn invalid_resume_continuity_stays_blocked_through_prepare_handshake() {
     if crate::retained_fixture::run_isolated() {
@@ -485,32 +797,7 @@ fn codex_endpoint_repair_retries_the_same_socket_and_thread() {
         !root.join("provider.json").exists(),
         "the failed join must not launch a server"
     );
-    let mut server = FixtureServer(
-        Command::new("/usr/bin/python3")
-            .arg(&provider)
-            .args(["--listen", &address])
-            .env_clear()
-            .env("CAGENTS_ESCAPE_FIXTURE_ROOT", &root)
-            .env("CODEX_HOME", root.join("home/.codex"))
-            .env("XDG_RUNTIME_DIR", root.join("r"))
-            .stdout(fs::File::create(root.join("peer.stdout")).unwrap())
-            .stderr(fs::File::create(root.join("peer.stderr")).unwrap())
-            .spawn()
-            .unwrap(),
-    );
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(
-            server.0.try_wait().unwrap().is_none(),
-            "fixture server exited: {}",
-            fs::read_to_string(root.join("peer.stderr")).unwrap()
-        );
-        assert!(
-            Instant::now() < deadline,
-            "fixture server never bound its socket"
-        );
-        thread::sleep(Duration::from_millis(10));
-    }
+    let _server = start_codex_peer(&root, &socket, &root.join("home/.codex"));
     let client = connect(&source, chat::Intent::RetryStart).unwrap();
     wait_for_ready(&host, &source, &client);
     let requests = fs::read_to_string(root.join("rpc-intake.jsonl")).unwrap();
@@ -531,4 +818,66 @@ fn codex_endpoint_repair_retries_the_same_socket_and_thread() {
     );
     client.close().unwrap();
     assert!(host.lock().unwrap().chats.is_empty());
+}
+
+#[test]
+fn connect_shutdown_can_retry_but_an_exact_other_host_is_blocked() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let Some(root) = isolated("connect_shutdown_can_retry_but_an_exact_other_host_is_blocked")
+    else {
+        return;
+    };
+    let (host, proof) = setup(&root, "connect-startup-policy");
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    let _wire = super::retained_admission_tests::HostClientWire::start_native(&host, &proof);
+    let source = session(&root, Provider::Omp, vec![]);
+    let attempt = |expected| {
+        ClientHandle::fixture_connect(
+            std::os::unix::net::UnixStream::connect(
+                crate::terminal::ipc::daemon_socket_path().unwrap(),
+            )
+            .unwrap(),
+            source.clone(),
+            chat::Intent::Start,
+            expected,
+        )
+        .err()
+        .expect("Connect must refuse before any Start")
+    };
+    host.lock().unwrap().shutting_down = true;
+    let failure = attempt(None);
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Retry,
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure.message.contains("shutdown is committed"),
+        "{}",
+        failure.message
+    );
+    host.lock().unwrap().shutting_down = false;
+    let mut other = proof;
+    other.host_incarnation = "different-exact-daemon".into();
+    let failure = attempt(Some(other));
+    assert_eq!(
+        failure.recovery,
+        chat::Recovery::Blocked,
+        "{}",
+        failure.message
+    );
+    assert!(
+        failure
+            .message
+            .contains("different cagents daemon incarnation"),
+        "{}",
+        failure.message
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert!(host.lock().unwrap().native_actor_startups.is_empty());
 }

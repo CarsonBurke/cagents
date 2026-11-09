@@ -131,6 +131,167 @@ fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
     );
 }
 
+/// Exercise the public Resolve -> Attach handshake, including the native
+/// client's recovery classification. The provider and original terminal
+/// holder stay alive while the successor daemon waits for the terminal's
+/// own recovery to become available.
+#[test]
+fn missing_paired_worker_can_retry_the_same_native_restore_after_recovery() {
+    if isolated("missing_paired_worker_can_retry_the_same_native_restore_after_recovery") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let _wire = super::super::retained_admission_tests::HostClientWire::start_native(
+        &fixture.host,
+        &fixture.proof,
+    );
+    let missing = fixture
+        .host
+        .lock()
+        .unwrap()
+        .terminals
+        .remove(&fixture.source.id)
+        .unwrap();
+    let refusal = crate::host::client::process_request(
+        &fixture.host,
+        CLIENT,
+        crate::terminal_ipc::ClientRequest::ResolveUpgradeChat {
+            source: fixture.source.clone(),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(
+        refusal.message,
+        "The paired terminal could not be recovered; native ownership was preserved"
+    );
+    assert!(
+        refusal.retryable,
+        "the same retained provider can attach after its original terminal recovers"
+    );
+    let failure = refused_native_restore(&fixture);
+    assert_eq!(failure.recovery, crate::chat::Recovery::Retry);
+    assert!(failure.message.contains(&refusal.message));
+    fixture.assert_unpublished_and_preserved();
+
+    // Return precisely the original worker and custody record. A retry must
+    // join the retained server, not launch another provider or replace its
+    // paired terminal with a recipe-equivalent process.
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .terminals
+        .insert(fixture.source.id, missing);
+    let client = connect_native_restore(&fixture).unwrap();
+    let actor = {
+        let state = fixture.host.lock().unwrap();
+        let record = &state.chats[&fixture.source.id];
+        assert!(
+            record
+                .paired_terminal
+                .as_ref()
+                .unwrap()
+                .same_worker(&fixture.worker)
+        );
+        assert_eq!(record.session.launch, fixture.source.launch);
+        record.handle.clone()
+    };
+    wait_durable(&actor);
+    assert_eq!(client.session().id, fixture.source.id);
+    assert_eq!(client.session().launch, fixture.source.launch);
+    assert_eq!(client.snapshot().session_id.as_deref(), Some(THREAD));
+    fixture.assert_one_provider();
+    client.close().unwrap();
+}
+
+#[test]
+fn changed_paired_recipe_or_holder_blocks_native_restore_without_relaunch() {
+    if isolated("changed_paired_recipe_or_holder_blocks_native_restore_without_relaunch") {
+        return;
+    }
+    let mut fixture = Fixture::new();
+    let _wire = super::super::retained_admission_tests::HostClientWire::start_native(
+        &fixture.host,
+        &fixture.proof,
+    );
+    let raw = fixture.raw();
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .terminals
+        .get_mut(&fixture.source.id)
+        .unwrap()
+        .session
+        .launch
+        .arguments
+        .push("different-paired-recipe".into());
+    let failure = refused_native_restore(&fixture);
+    assert_eq!(failure.recovery, crate::chat::Recovery::Blocked);
+    assert!(
+        failure
+            .message
+            .contains("The paired terminal could not be recovered")
+    );
+    fixture.assert_unpublished_and_preserved();
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .terminals
+        .get_mut(&fixture.source.id)
+        .unwrap()
+        .session = raw.clone();
+
+    let (_, replacement) = fixture.extra_terminal();
+    let original = {
+        let mut state = fixture.host.lock().unwrap();
+        std::mem::replace(
+            &mut state.terminals.get_mut(&fixture.source.id).unwrap().handle,
+            replacement.clone(),
+        )
+    };
+    let failure = refused_native_restore(&fixture);
+    assert_eq!(failure.recovery, crate::chat::Recovery::Blocked);
+    assert!(
+        failure
+            .message
+            .contains("The paired terminal could not be recovered")
+    );
+    fixture.assert_unpublished_and_preserved();
+    assert!(original.holder_identity().unwrap().root.is_current());
+    assert!(replacement.holder_identity().unwrap().root.is_current());
+    fixture
+        .host
+        .lock()
+        .unwrap()
+        .terminals
+        .get_mut(&fixture.source.id)
+        .unwrap()
+        .handle = original;
+    assert_eq!(fixture.raw(), raw);
+}
+
+fn connect_native_restore(
+    fixture: &Fixture,
+) -> Result<crate::chat::client::ClientHandle, crate::chat::StartFailure> {
+    let socket = crate::terminal::ipc::daemon_socket_path().unwrap();
+    crate::chat::client::ClientHandle::fixture_restore(
+        std::os::unix::net::UnixStream::connect(socket).unwrap(),
+        fixture.source.clone(),
+    )
+}
+
+fn refused_native_restore(fixture: &Fixture) -> crate::chat::StartFailure {
+    match connect_native_restore(fixture) {
+        Err(failure) => failure,
+        Ok(client) => {
+            let _ = client.close();
+            panic!("a missing or changed exact terminal pair must refuse native attachment")
+        }
+    }
+}
+
 #[test]
 fn retained_pair_checkpoints_and_reattaches_across_multiple_upgrade_hops() {
     if std::env::var(MODE).as_deref() == Ok("provider") {

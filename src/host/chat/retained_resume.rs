@@ -157,9 +157,6 @@ fn current_admission(
 
 /// The successor would select the exact physical account home the old actor
 /// captured, so its provider reads the same on-disk conversation.
-fn same_account_home(source: &Session, captured: &LaunchAccountScope) -> Result<(), String> {
-    same_account_home_for_start(source, captured).map_err(|error| error.to_string())
-}
 
 fn same_account_home_for_start(
     source: &Session,
@@ -173,9 +170,6 @@ fn same_account_home_for_start(
 }
 
 /// The physical Claude account home `source`'s launch would select now.
-fn selected_account_home(source: &Session) -> Result<LaunchAccountScope, String> {
-    selected_account_home_for_start(source).map_err(|error| error.to_string())
-}
 
 fn selected_account_home_for_start(source: &Session) -> Result<LaunchAccountScope, SetupError> {
     let launch = super::prepare_native_process_launch(
@@ -282,11 +276,12 @@ const UNMATCHED: &str = "This conversation's earlier Claude process ended withou
 /// launch under the account home the successor would select. Whatever it had
 /// not acknowledged is lost with it and is never resubmitted; the successor
 /// starts on the saved conversation with no input.
-fn abandoned(
+
+fn abandoned_for_start(
     ownership: &NativeActorOwnership,
     source: &Session,
     proof: &HostSessionProof,
-) -> Result<(), String> {
+) -> Result<(), SetupError> {
     let issued = ownership.source();
     if ownership.is_pending()
         || issued.id != source.id
@@ -303,13 +298,15 @@ fn abandoned(
     {
         return Err(UNMATCHED.into());
     }
-    if !Handle::inspect_abandoned_actor(ownership.owner(), proof)? {
-        return Err(SURVIVOR.into());
+    if !Handle::inspect_abandoned_actor(ownership.owner(), proof)
+        .map_err(SetupError::Unavailable)?
+    {
+        return Err(SetupError::Unavailable(SURVIVOR.into()));
     }
-    let captured = ownership.scope().map_err(|_| {
-        "The ended Claude actor has no captured physical account identity".to_owned()
-    })?;
-    same_account_home(source, captured)
+    let captured = ownership
+        .scope()
+        .map_err(|_| "The ended Claude actor has no captured physical account identity")?;
+    same_account_home_for_start(source, captured)
 }
 
 /// How the pane's same-boot actors ended, as far as one census scan proves.
@@ -419,13 +416,17 @@ pub(super) fn inspect_resume_retirement_for_start(
                 crate::chat::runtime::RetirementInspection::ExitedUnproved => {
                     // Disk resume decides separately whether this exit left
                     // no surviving writer; it is never retirement evidence.
-                    if ownership.is_pending()
-                        || !Handle::inspect_abandoned_actor(ownership.owner(), &proof)
-                            .map_err(SetupError::Unavailable)?
-                    {
+                    if ownership.is_pending() {
                         return Err(
                             "The saved Claude actor exited without verified retirement".into()
                         );
+                    }
+                    if !Handle::inspect_abandoned_actor(ownership.owner(), &proof)
+                        .map_err(SetupError::Unavailable)?
+                    {
+                        return Err(SetupError::Unavailable(
+                            "The saved Claude actor exited without verified retirement".into(),
+                        ));
                     }
                     abandoned = true;
                 }
@@ -655,7 +656,7 @@ pub(super) fn unnamed_conversation_for_start(
                         if !Handle::inspect_abandoned_actor(ownership.owner(), &proof)
                             .map_err(SetupError::Unavailable)?
                         {
-                            return Err(SURVIVOR.into());
+                            return Err(SetupError::Unavailable(SURVIVOR.into()));
                         }
                         recorded?
                     }
@@ -793,7 +794,7 @@ pub(super) fn prepare_resume_verified_for_start(
                 continue;
             }
             let Some(retirement) = retirement else {
-                abandoned(&ownership, source, &proof).map_err(SetupError::Invalid)?;
+                abandoned_for_start(&ownership, source, &proof)?;
                 if matched {
                     return Err("The saved Claude pane matches more than one ended actor".into());
                 }
@@ -839,7 +840,7 @@ pub(super) fn prepare_resume_verified_for_start(
                                 .into(),
                         );
                     }
-                    abandoned(&ownership, source, &proof).map_err(SetupError::Invalid)?;
+                    abandoned_for_start(&ownership, source, &proof)?;
                     if matched {
                         return Err(
                             "The saved Claude pane matches more than one ended actor".into()
@@ -913,7 +914,9 @@ pub(super) fn prepare_resume_verified_for_start(
         .map_err(|e| SetupError::Unavailable(e.to_string()))?
         != std::process::id()
     {
-        return Err("Daemon authority changed during Claude resume preparation".into());
+        return Err(SetupError::Unavailable(
+            "Daemon authority changed during Claude resume preparation".into(),
+        ));
     }
     Ok(matched)
 }

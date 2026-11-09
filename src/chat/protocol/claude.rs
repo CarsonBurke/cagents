@@ -51,10 +51,6 @@ pub(crate) fn create_for_start(
     create_inner(launch, None, false)
 }
 
-pub(super) fn create_history(launch: &Launch) -> Result<(ProcessSpec, Box<dyn Adapter>), String> {
-    create_history_for_start(launch).map_err(|error| error.to_string())
-}
-
 pub(super) fn create_history_for_start(
     launch: &Launch,
 ) -> Result<(ProcessSpec, Box<dyn Adapter>), super::SetupError> {

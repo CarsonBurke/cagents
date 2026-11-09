@@ -1420,40 +1420,141 @@ exit 0
     }
 
     #[test]
-    fn missing_saved_history_refuses_unknown_ownership_and_native_writer_descriptors() {
+    fn saved_history_preparation_retries_pending_transitions_without_changing_identity() {
+        for pending in 0..4 {
+            let host = host();
+            let (directory, source, handle) = history_reader(&host, false);
+            let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+            let server_host = host.clone();
+            let server = thread::spawn(move || {
+                super::super::super::client::serve(server, 81, server_host);
+            });
+            let mut control = crate::control::ControlClient::from_stream(client).unwrap();
+            control.authenticate(Default::default()).unwrap();
+            {
+                let mut state = host.lock().unwrap();
+                match pending {
+                    0 => state.shutting_down = true,
+                    1 => {
+                        state.chat_spawning.insert(source.id, source.clone());
+                    }
+                    2 => {
+                        state.native_actor_startups.insert(
+                            source.id,
+                            retained_actor::Startup {
+                                source: source.clone(),
+                                requested: source.clone(),
+                                failed_close: None,
+                                context: Arc::new(
+                                    chat::protocol::ExecutionContext::capture(directory.path())
+                                        .unwrap(),
+                                ),
+                            },
+                        );
+                    }
+                    3 => state.chats.get_mut(&source.id).unwrap().returning_terminal = true,
+                    _ => unreachable!(),
+                }
+            }
+            let refused = control
+                .fixture_request(ClientRequest::ChatPrepareResume {
+                    source: source.clone(),
+                })
+                .unwrap_err();
+            let mut changed = source.clone();
+            changed
+                .launch
+                .recipe
+                .arguments
+                .push("--different-recipe".into());
+            {
+                let mut state = host.lock().unwrap();
+                state.shutting_down = false;
+                state.chat_spawning.remove(&source.id);
+                state.native_actor_startups.remove(&source.id);
+                state.chats.get_mut(&source.id).unwrap().returning_terminal = false;
+            }
+            // The global shutdown gate may refuse before examining identity.
+            // Once admission reopens, a different recipe remains permanent.
+            let conflict = control
+                .fixture_request(ClientRequest::ChatPrepareResume { source: changed })
+                .unwrap_err();
+            let prepared = control
+                .fixture_request(ClientRequest::ChatPrepareResume {
+                    source: source.clone(),
+                })
+                .unwrap();
+            let same_actor = host.lock().unwrap().chats[&source.id]
+                .handle
+                .same_actor(&handle);
+            drop(control);
+            server.join().unwrap();
+            handle.close().unwrap();
+            assert!(
+                matches!(
+                    refused,
+                    crate::control::ControlError::Remote {
+                        retryable: true,
+                        ..
+                    }
+                ),
+                "pending case {pending}: {refused}"
+            );
+            assert!(
+                matches!(
+                    conflict,
+                    crate::control::ControlError::Remote {
+                        retryable: false,
+                        ..
+                    }
+                ),
+                "descriptor conflict in case {pending}: {conflict}"
+            );
+            assert!(
+                matches!(prepared, ServerResponse::ChatResumePrepared { session } if session == source)
+            );
+            assert!(
+                same_actor,
+                "preparation must keep the original paging actor"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_saved_history_retries_unknown_ownership_but_blocks_managed_and_native_sources() {
         let host = host();
         let (_directory, source, _) = closed_history(&host);
         let proof = inspect(&host, source.id).unwrap().proof;
         release(&host, &proof, false).unwrap();
         let registry = host.lock().unwrap().execution_registry.take().unwrap();
-        assert!(
-            process_inner(
-                &host,
-                51,
-                ClientRequest::ChatAttach {
-                    session: source.clone()
-                }
-            )
-            .is_err()
-        );
+        let (missing, server) = restore_client(&host, source.clone(), 51);
+        let missing = match missing {
+            Err(failure) => failure,
+            Ok(_) => panic!("an unreadable owner registry must not admit history"),
+        };
+        server.join().unwrap();
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
         host.lock().unwrap().execution_registry = Some(registry.clone());
+        let (repaired, server) = restore_client(&host, source.clone(), 52);
+        let repaired = repaired.unwrap();
+        wait_for_client_history(&repaired, true);
+        let same_source = repaired.session() == source;
+        drop(repaired);
+        server.join().unwrap();
+        let proof = inspect(&host, source.id).unwrap().proof;
+        release(&host, &proof, false).unwrap();
         registry
             .lock()
             .unwrap()
             .register_agent_authority(&crate::agent_execution::HostedSession::Chat(source.clone()))
             .unwrap();
-        assert!(
-            process_inner(
-                &host,
-                51,
-                ClientRequest::ChatAttach {
-                    session: source.clone()
-                }
-            )
-            .is_err()
-        );
+        let (managed, server) = restore_client(&host, source.clone(), 53);
+        let managed = match managed {
+            Err(failure) => failure,
+            Ok(_) => panic!("managed history requires its owned-agent route"),
+        };
+        server.join().unwrap();
         registry
             .lock()
             .unwrap()
@@ -1463,21 +1564,35 @@ exit 0
         durable.native_continuity = chat::NativeContinuity::Durable {
             provider_version: "test".into(),
         };
-        assert!(process_inner(&host, 51, ClientRequest::ChatAttach { session: durable }).is_err());
+        let native =
+            process_inner(&host, 51, ClientRequest::ChatAttach { session: durable }).unwrap_err();
         let mut wrong_daemon = source;
         wrong_daemon.proof = None;
-        assert!(
-            process_inner(
-                &host,
-                51,
-                ClientRequest::ChatAttach {
-                    session: wrong_daemon
-                }
-            )
-            .is_err()
-        );
+        let proof = process_inner(
+            &host,
+            51,
+            ClientRequest::ChatAttach {
+                session: wrong_daemon,
+            },
+        )
+        .unwrap_err();
         assert!(host.lock().unwrap().chats.is_empty());
         assert!(host.lock().unwrap().chat_spawning.is_empty());
+        assert_eq!(
+            missing.recovery,
+            chat::Recovery::Retry,
+            "{}",
+            missing.message
+        );
+        assert!(same_source);
+        assert_eq!(
+            managed.recovery,
+            chat::Recovery::Blocked,
+            "{}",
+            managed.message
+        );
+        assert!(!native.retryable);
+        assert!(!proof.retryable);
     }
 
     #[test]
@@ -1893,20 +2008,32 @@ fn load_history_for_start(session: &Session) -> Result<LoadedHistory, chat::prot
 }
 
 fn require_unmanaged(host: &SharedHost, id: TerminalId) -> Result<(), String> {
-    let registry = super::super::agent_execution::registry(host)?;
-    if registry
+    require_unmanaged_for_start(host, id).map_err(|error| error.to_string())
+}
+
+fn require_unmanaged_for_start(
+    host: &SharedHost,
+    id: TerminalId,
+) -> Result<(), chat::protocol::SetupError> {
+    use chat::protocol::SetupError;
+    let registry =
+        super::super::agent_execution::registry(host).map_err(SetupError::Unavailable)?;
+    // The legacy registry lookup exposes operational failures as strings.
+    // Preserve Retry until ownership can be read; an actual managed source is
+    // a distinct, permanent refusal of this read-only reattachment route.
+    let managed = !registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .retained_agent_sources(id)?
-        .is_empty()
-    {
-        Ok(())
-    } else {
-        Err(
+        .retained_agent_sources(id)
+        .map_err(SetupError::Unavailable)?
+        .is_empty();
+    if managed {
+        return Err(
             "The actor belongs to a managed agent; use its supported owned-agent close operation"
                 .into(),
-        )
+        );
     }
+    Ok(())
 }
 
 /// A saved read-only descriptor can outlive its resident paging worker. This
@@ -1943,7 +2070,7 @@ pub(super) fn restore_saved_history(
         }
     }
     super::super::account_lifecycle::ensure_idle(host)?;
-    require_unmanaged(host, session.id).map_err(unavailable)?;
+    require_unmanaged_for_start(host, session.id).map_err(setup_error)?;
     let (mut spec, adapter, mut initial) = load_history_for_start(&session).map_err(setup_error)?;
     spec.messages = host
         .lock()
@@ -2004,7 +2131,7 @@ pub(super) fn restore_saved_history(
             record
                 .handle
                 .commit_native_installation()
-                .map_err(unavailable)?;
+                .map_err(retryable_unavailable)?;
             state.chats.insert(id, record);
             state.inventory_generation += 1;
             Ok(response)
@@ -2059,13 +2186,18 @@ pub(super) fn prepare_saved_history(
     if record.session != *source
         || record.handle.session_id() != source.launch.session_id
         || record.handle.owns_work()
-        || record.returning_terminal
+    {
+        return Err(unavailable(
+            "The exact saved-history reader changed; no provider was started",
+        ));
+    }
+    if record.returning_terminal
         || state.shutting_down
         || state.chat_spawning.contains_key(&source.id)
         || state.native_closing.contains_key(&source.id)
         || state.native_actor_startups.contains_key(&source.id)
     {
-        return Err(unavailable(
+        return Err(retryable_unavailable(
             "The exact saved-history reader changed; no provider was started",
         ));
     }

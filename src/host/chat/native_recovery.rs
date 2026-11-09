@@ -37,6 +37,7 @@ fn before_publication_for_test(
     BeforePublicationHook(std::marker::PhantomData)
 }
 
+#[cfg(test)]
 fn project_paired_terminal(
     state: &HostState,
     terminal: &crate::model::TerminalSession,
@@ -470,8 +471,7 @@ fn restore_authenticated(
         // Keep that exact worker through the native holder's acknowledgment;
         // an equal recipe alone cannot authorize a concurrent replacement.
         let (projected, worker) =
-            project_paired_terminal(&state, terminal, paired_holder.as_ref(), proof)
-                .map_err(SetupError::Invalid)?;
+            project_paired_terminal_for_start(&state, terminal, paired_holder.as_ref(), proof)?;
         *terminal = projected;
         Ok(Some(worker))
     })();
