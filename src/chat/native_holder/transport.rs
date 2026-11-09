@@ -376,19 +376,32 @@ impl Holder {
         } else {
             Request::Release
         };
-        send(control, &request, TIMEOUT)?;
-        match receive(control, TIMEOUT)? {
-            Some(Report::Released) => {
+        let report = send(control, &request, TIMEOUT).and_then(|()| receive(control, TIMEOUT));
+        let unanswered = match report {
+            Ok(Some(Report::Released)) => {
                 if !self.identity.receipt(retain)? {
                     return Err("Native holder released without durable cleanup evidence".into());
                 }
                 self.control.take();
                 self.release_on_drop = false;
-                Ok(())
+                return Ok(());
             }
-            Some(Report::Failed(error)) => Err(error),
-            _ => Err("Native holder did not acknowledge server teardown".into()),
+            Ok(Some(Report::Failed(error))) => return Err(error),
+            Ok(Some(_)) => {
+                return Err("Native holder did not acknowledge server teardown".into());
+            }
+            Ok(None) => "Native holder did not acknowledge server teardown".to_owned(),
+            Err(error) => error,
+        };
+        // A holder that exited with its provider closes its control connection
+        // without answering, and never will. If it wrote its receipt first,
+        // that receipt settles the close as a reply would have.
+        if !self.identity.receipt(retain)? && !self.identity.retire_exited() {
+            return Err(unanswered);
         }
+        self.control.take();
+        self.release_on_drop = false;
+        Ok(())
     }
 }
 
@@ -2817,6 +2830,84 @@ exec /bin/sleep 60
                 .unwrap()
                 .contains("length")
         );
+    }
+
+    /// A holder killed without its receipt, and so never able to answer a
+    /// Release, settles its close once its provider is gone too (#2426).
+    /// While the provider outlives it, the provider may still be running a
+    /// turn, and the close keeps refusing.
+    #[test]
+    fn a_holder_lost_with_its_provider_settles_its_close() {
+        const STAGE: &str = "CAGENTS_NATIVE_HOLDER_LOST_TEST";
+        if std::env::var_os(STAGE).is_none() {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "chat::native_holder::transport::tests::a_holder_lost_with_its_provider_settles_its_close", "--nocapture"])
+                .env(STAGE, "1").env("XDG_RUNTIME_DIR", directory.path())
+                .env("XDG_DATA_HOME", directory.path().join("data"))
+                .output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        let mut source = super::super::tests::recovery().source;
+        let boot = crate::daemon::read_boot_id().unwrap();
+        source.proof.as_mut().unwrap().boot_id = boot.clone();
+        source
+            .owned_codex_listener
+            .as_mut()
+            .unwrap()
+            .allocator
+            .boot_id = boot;
+        let socket = source.owned_codex_listener.as_ref().unwrap().socket.clone();
+        let working = tempfile::tempdir_in("/var/tmp").unwrap();
+        let context = std::sync::Arc::new(crate::chat::protocol::ExecutionContext::new(Some(
+            std::sync::Arc::new(std::fs::File::open(working.path()).unwrap()),
+        )));
+        let spec = ProcessSpec {
+            stdout_noise: None,
+            execution: Some(context.clone()),
+            messages: None,
+            transport: TransportSpec::OwnedUnixWebSocket { socket },
+            program: "/bin/sleep".into(),
+            arguments: vec!["60".into()],
+            working_directory: working.path().to_owned(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        let proof = source.proof.clone().unwrap();
+        let _lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+        let mut holder = spawn(spec, source.clone()).unwrap();
+        context.installed();
+        let record = holder.identity.record.clone();
+        let kill = |process: &Process| {
+            unsafe { libc::kill(process.pid, libc::SIGKILL) };
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while process.is_current() {
+                assert!(Instant::now() < deadline, "the killed process never exited");
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        };
+        let evidence = || {
+            registry::evidence(
+                &registry::socket(&registry::directory(Kind::Native).unwrap(), source.id),
+                Kind::Native,
+            )
+            .unwrap()
+        };
+        kill(&record.holder);
+        assert!(record.root.is_current(), "the provider outlived its holder");
+        holder.close_inner(false, DetachedWork::Stop).unwrap_err();
+        assert_eq!(evidence(), Some(record.clone()));
+        kill(&record.root);
+        holder.close_inner(false, DetachedWork::Stop).unwrap();
+        assert_eq!(evidence(), None, "its record is retired as discovery would");
+        // Nothing is left to release when the Holder is dropped.
+        drop(holder);
     }
 
     #[test]

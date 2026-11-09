@@ -157,19 +157,34 @@ fn destination_socket_name(destination: &crate::notifications::Destination) -> S
 /// A lock ends with its owning scope, even if a concurrent fork inherited the
 /// file description and has not reached exec yet. Closing a File alone does
 /// not release flock until every inherited descriptor has also closed.
-pub(crate) struct OwnedLock(File);
+#[derive(Debug)]
+pub(crate) struct OwnedLock(Option<File>);
 
 impl std::ops::Deref for OwnedLock {
     type Target = File;
 
     fn deref(&self) -> &File {
-        &self.0
+        self.0.as_ref().expect("owned lock file")
+    }
+}
+
+impl OwnedLock {
+    fn file_mut(&mut self) -> &mut File {
+        self.0.as_mut().expect("owned lock file")
+    }
+
+    /// Hand this description to a process that already inherited its own copy.
+    /// Closing the returned file preserves that recipient's lock ownership.
+    pub(crate) fn into_file(mut self) -> File {
+        self.0.take().expect("owned lock file")
     }
 }
 
 impl Drop for OwnedLock {
     fn drop(&mut self) {
-        let _ = self.0.unlock();
+        if let Some(file) = &self.0 {
+            let _ = file.unlock();
+        }
     }
 }
 
@@ -200,7 +215,7 @@ pub(crate) fn owned_file_lock(lock: File, operation: i32) -> io::Result<OwnedLoc
     if unsafe { libc::flock(lock.as_raw_fd(), operation) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok(OwnedLock(lock))
+    Ok(OwnedLock(Some(lock)))
 }
 
 /// Expected contention with the installation coordinator, distinct from a
@@ -313,11 +328,11 @@ impl WindowLease {
             &runtime_directory()?.join(format!("{ACTIVATION_SOCKET_FILE}.{slot}.device")),
             libc::LOCK_EX,
         )?;
-        identity.0.set_len(0)?;
+        identity.set_len(0)?;
         if let Some(device) = crate::device::selected() {
-            identity.0.write_all(device.name.as_bytes())?;
+            identity.file_mut().write_all(device.name.as_bytes())?;
         }
-        identity.0.sync_all()?;
+        identity.sync_all()?;
         WINDOW_SLOT
             .set(slot)
             .map_err(|_| io::Error::other("window slot already initialized"))?;
@@ -371,7 +386,7 @@ impl WindowLease {
                 libc::LOCK_EX | libc::LOCK_NB,
             ) {
                 Ok(mut lock) => {
-                    daemon_admission::publish_capability(&mut lock.0)?;
+                    daemon_admission::publish_capability(lock.file_mut())?;
                     return Ok((
                         Self {
                             _legacy_fence: legacy,
@@ -527,6 +542,55 @@ pub fn install_panic_hook_with_version(product: &'static str, version: &'static 
 
 pub fn report_startup_failure() {
     crate::diagnostics::record(crate::diagnostics::Event::StartupFailed);
+}
+
+/// A file a development daemon appends its standard error, and so its tracing
+/// and panic output, to. Daemons are spawned with standard error on
+/// `/dev/null`; `scripts/run-development --daemon-log PATH` sets this so a
+/// development run can read what its daemon did.
+pub const DEVELOPMENT_DAEMON_LOG_ENV: &str = "CAGENTS_DEVELOPMENT_DAEMON_LOG";
+
+/// Points standard error at [`DEVELOPMENT_DAEMON_LOG_ENV`]'s file when a
+/// development build names one, and removes the variable so the daemon's
+/// terminals and agents do not inherit it; children that inherit standard
+/// error, such as helpers, write to the same file. Production builds ignore
+/// the variable. A file that cannot be opened is reported on the original
+/// standard error, which a spawned daemon has on `/dev/null`.
+///
+/// # Safety
+/// Call from the single-threaded entry point: this changes the environment.
+pub unsafe fn redirect_development_daemon_log() {
+    let Some(path) = env::var_os(DEVELOPMENT_DAEMON_LOG_ENV) else {
+        return;
+    };
+    // SAFETY: the caller guarantees that no other thread accesses environment.
+    unsafe { env::remove_var(DEVELOPMENT_DAEMON_LOG_ENV) };
+    if !IS_DEVELOPMENT {
+        return;
+    }
+    let file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "cagentsd: cannot open daemon log {}: {error}",
+                Path::new(&path).display()
+            );
+            return;
+        }
+    };
+    // SAFETY: both descriptors are open; dup2 replaces descriptor 2 atomically.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        eprintln!(
+            "cagentsd: cannot write daemon log: {}",
+            io::Error::last_os_error()
+        );
+    }
 }
 
 pub fn install_tracing(_product: &'static str, default_filter: &str) {
@@ -1399,7 +1463,7 @@ pub(crate) fn window_matches_selected_device(slot: &str) -> io::Result<bool> {
                 Err(error) => return Err(error),
             };
             let mut name = String::new();
-            (&mut identity.0).take(64).read_to_string(&mut name)?;
+            identity.file_mut().take(64).read_to_string(&mut name)?;
             Ok(name == selected.name)
         }
     }
@@ -1418,7 +1482,7 @@ fn window_device_identity(
         libc::LOCK_SH,
     )?;
     let mut name = String::new();
-    (&mut identity.0).take(64).read_to_string(&mut name)?;
+    identity.file_mut().take(64).read_to_string(&mut name)?;
     if !devices.iter().any(|device| device.name == name) {
         return Err(io::Error::other(format!(
             "device profile for window {slot} is unavailable"
@@ -2399,6 +2463,81 @@ mod tests {
         assert!(matches!(busy.raw_os_error(), Some(libc::EWOULDBLOCK)));
         drop(held);
         assert!(owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    fn copied_description(file: &File) -> File {
+        // dup and fork share the same open-file description. Keeping this copy
+        // alive models a child paused between fork and its CLOEXEC boundary.
+        file.try_clone().unwrap()
+    }
+
+    #[test]
+    fn close_alone_retains_flock_in_a_copied_description() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let owner = File::open(path.path()).unwrap();
+        assert_eq!(unsafe { libc::flock(owner.as_raw_fd(), libc::LOCK_EX) }, 0);
+        let copied = copied_description(&owner);
+        drop(owner);
+        let error = owned_file_lock(
+            File::open(path.path()).unwrap(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        // Clean up explicitly so unrelated test forks cannot retain this proof.
+        assert_eq!(unsafe { libc::flock(copied.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+
+    #[test]
+    fn scope_exit_releases_shared_and_exclusive_locks_despite_copied_descriptions() {
+        for operation in [libc::LOCK_SH, libc::LOCK_EX] {
+            let path = tempfile::NamedTempFile::new().unwrap();
+            let owner = owned_file_lock(File::open(path.path()).unwrap(), operation).unwrap();
+            let copied = copied_description(&owner);
+            drop(owner);
+            let next = owned_file_lock(
+                File::open(path.path()).unwrap(),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .unwrap();
+            drop(copied);
+            assert_eq!(
+                owned_file_lock(
+                    File::open(path.path()).unwrap(),
+                    libc::LOCK_EX | libc::LOCK_NB
+                )
+                .unwrap_err()
+                .kind(),
+                io::ErrorKind::WouldBlock
+            );
+            drop(next);
+        }
+    }
+
+    #[test]
+    fn explicit_transfer_preserves_recipient_custody_until_its_scope_ends() {
+        let path = tempfile::NamedTempFile::new().unwrap();
+        let parent = owned_file_lock(File::open(path.path()).unwrap(), libc::LOCK_EX).unwrap();
+        let recipient = owned_file_lock(copied_description(&parent), libc::LOCK_EX).unwrap();
+        let unrelated = copied_description(&parent);
+        drop(parent.into_file());
+        assert_eq!(
+            owned_file_lock(
+                File::open(path.path()).unwrap(),
+                libc::LOCK_EX | libc::LOCK_NB
+            )
+            .unwrap_err()
+            .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(recipient);
+        let next = owned_file_lock(
+            File::open(path.path()).unwrap(),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        drop(unrelated);
+        drop(next);
     }
 
     #[test]

@@ -10,6 +10,7 @@ debug=false
 fresh_daemon=false
 hot=false
 log_file=
+daemon_log=
 instance=
 stop_instance=false
 list_instances=false
@@ -79,6 +80,19 @@ while [ "$#" -gt 0 ]; do
                 *) log_file=$caller_cwd/$log_file ;;
             esac
             ;;
+        --daemon-log)
+            if [ "$#" -lt 2 ] || [ -z "$2" ]; then
+                printf '%s\n' "--daemon-log requires a path" >&2
+                exit 2
+            fi
+            shift
+            daemon_log=$1
+            case $daemon_log in
+                /*) ;;
+                *) daemon_log=$caller_cwd/$daemon_log ;;
+            esac
+            debug=true
+            ;;
         --help)
             cat <<'USAGE'
 Usage: scripts/run-development [OPTIONS] [-- UI_ARGUMENTS...]
@@ -90,6 +104,11 @@ Options:
   --hot            Experimental browserless Linux hot reload (pinned cargo-hot/bwrap)
   --hot-integrated  Explicit embedded-browser hot reload
   --log-file PATH  Write UI tracing output to PATH (relative to caller)
+  --daemon-log PATH
+                   Append the development daemon's tracing output to PATH
+                   (relative to caller); implies --debug. Works with --instance.
+                   Takes effect when the daemon next starts, as with
+                   --fresh-daemon
   --instance NAME  Run an isolated instance, with its own storage and daemon, in
                    a headless niri-harness session named cagents-NAME. Returns
                    once its window maps; --fresh-daemon replaces a running one
@@ -729,6 +748,13 @@ if [ "$hot" = true ]; then
     "$root/scripts/hot-development" --check
 fi
 
+# The flags choose the daemon's log, never an inherited environment.
+if [ -n "$daemon_log" ]; then
+    export CAGENTS_DEVELOPMENT_DAEMON_LOG="$daemon_log"
+else
+    unset CAGENTS_DEVELOPMENT_DAEMON_LOG
+fi
+
 if [ "$debug" = true ]; then
     export CAGENTS_LOCAL_DEBUG=1
     export RUST_BACKTRACE=${RUST_BACKTRACE:-1}
@@ -1167,9 +1193,12 @@ stop_instance_session() {
         # Through the session's own environment, never the caller's desktop.
         # niri-harness exec refuses a session that is no longer live; the
         # sweep below then ends its daemon with the session's other processes.
+        # The session's environment does not name the instance, and without
+        # it the CLI addresses the session's default development daemon.
         if niri-harness exec --session "$harness_session" -- true 2>/dev/null; then
             cli=$(instance_cli_path)
             if ! output=$(niri-harness exec --session "$harness_session" -- \
+                env CAGENTS_DEVELOPMENT_INSTANCE="$instance" \
                 "$cli" daemon stop-for-rebuild --including-subagents 2>&1); then
                 printf '%s\n' "$output" >&2
                 exit 1

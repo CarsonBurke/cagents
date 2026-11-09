@@ -3249,7 +3249,7 @@ impl Cagents {
             };
             children.push(tooltip(indicator, label));
         }
-        if let Some(indicator) = sidebar::attention_indicator(attention, false) {
+        if let Some(indicator) = sidebar::attention_indicator(attention) {
             children.push(indicator);
         }
         if focused && self.chat_switch_available(id) {

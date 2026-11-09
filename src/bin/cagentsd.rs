@@ -95,6 +95,10 @@ fn main() -> std::process::ExitCode {
             }
         };
     }
+    // SAFETY: entry is still single-threaded. After the maintenance flags,
+    // whose answers and refusals belong on the caller's stderr, and before
+    // admission, so a refused start is in the development log too.
+    unsafe { cagents::instance::redirect_development_daemon_log() };
     // SAFETY: entry is still single-threaded; helper-only mode returned above.
     let admission = match unsafe { cagents::host::prepare_daemon_admission() } {
         Ok(admission) => admission,

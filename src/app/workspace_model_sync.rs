@@ -1362,7 +1362,7 @@ impl Cagents {
         let task = self
             .workspace
             .add_card(item, self.workspace.cards().len(), false)
-            .map(|update| self.apply_viewport(update, true, false))
+            .map(|update| self.apply_viewport(update, true, DurableChange::None))
             .unwrap_or_else(|error| {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -3966,6 +3966,7 @@ mod tests {
                     false,
                     navigation,
                     &shortcuts,
+                    false,
                 ),
                 Size::new(280.0, 900.0),
                 cache,

@@ -515,12 +515,16 @@ fn native_origin(registry: &mut Registry, home: Home) -> TrustedResolvedOrigin {
 #[test]
 fn proved_native_session_needs_no_fabricated_managed_agent_or_run() {
     let (mut registry, _directory, home) = fixture();
+    let emptied = views::EmptiedView::plant(&mut registry);
     let origin = native_origin(&mut registry, home);
     let request = claim(home, 1, 0);
     let proof = origin.proof.as_ref().unwrap();
-    let resolved = registry
-        .resolve_channel_work_source(&proof.authority, &proof.source)
-        .unwrap();
+    // Resolving the actor's pane searches occupied views only.
+    let resolved = emptied.unreadable_during(&mut registry, |registry| {
+        registry
+            .resolve_channel_work_source(&proof.authority, &proof.source)
+            .unwrap()
+    });
     assert_eq!(resolved.origin, origin.origin);
     assert_eq!(resolved.proof.as_ref().unwrap().card, proof.card);
     let result = registry.apply_channel_work(&origin, &request).unwrap();

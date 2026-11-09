@@ -36,6 +36,9 @@ pub(crate) use retained_actor::transport::{
     ActorIdentity, RetirementInspection, VerifiedRetirement,
 };
 mod retained_actor;
+/// Synthetic retained-actor receipts for the daemon's collection tests.
+#[cfg(test)]
+pub(crate) use retained_actor::receipt_fixture as retained_receipt_fixture;
 mod store;
 mod websocket;
 pub(crate) use store::Store;

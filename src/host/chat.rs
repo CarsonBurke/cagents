@@ -6,6 +6,8 @@ mod account_recovery_target_tests;
 pub(super) mod capacity;
 #[cfg(test)]
 mod lost_agent_close_tests;
+#[cfg(test)]
+mod lost_codex_owner_close_tests;
 mod native_cleanup;
 mod native_recovery;
 mod owned_listener;
@@ -30,6 +32,8 @@ mod retained_pending_cleanup_tests;
 mod retained_pending_installation_tests;
 #[cfg(test)]
 mod retained_publication_tests;
+#[cfg(test)]
+mod retained_receipt_collection_tests;
 #[cfg(test)]
 mod retained_resolution_tests;
 mod retained_resume;
@@ -1031,6 +1035,92 @@ pub(super) fn close_retained_from_pane(host: &SharedHost, session: &Session) -> 
         return Ok(());
     }
     close_retained_native(host, session)
+}
+
+/// Settles the Close of a Codex conversation whose native owner is gone for
+/// good, as exact cleanup's answer when it finds no pending close, receipt or
+/// live holder record, or when its pending close settled without a receipt.
+/// The caller holds the conversation's close claim, and removes a finished
+/// resident once this succeeds.
+///
+/// A holder that dies - killed, crashed, or taken down with its provider -
+/// writes no close receipt, and discovery deletes its record once the holder
+/// process has gone. Exact cleanup then has nothing to adopt, retire or
+/// confirm, and refused every Close of the pane again, so the pane could
+/// never be closed.
+fn close_lost_codex_owner(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<(), String> {
+    if !codex_owner_lost(host, session, proof)? {
+        return Err("No exact native holder or confirmed close receipt is available".into());
+    }
+    // Proving the loss retired any stale endpoint; give back the allocation.
+    if let Some(parent) = session
+        .owned_codex_listener
+        .as_ref()
+        .and_then(|listener| listener.socket.parent())
+    {
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(())
+}
+
+/// Whether a Codex conversation's native owner ended without its close
+/// receipt and nothing of it can run again, so its Close settles and a
+/// reopened conversation may take over without one.
+///
+/// The owner is lost only when no start, handoff, paired terminal or agent
+/// claims the conversation, no receipt names its terminal, and nothing of it
+/// can still run by the evidence an upgrade requires before replacing its
+/// service: no holder record, no process naming the conversation's listener,
+/// and nothing bound where it listens. Anything else, including an
+/// unavailable agent registry, is not proof of the loss.
+fn codex_owner_lost(
+    host: &SharedHost,
+    session: &Session,
+    proof: &HostSessionProof,
+) -> Result<bool, String> {
+    let Some(listener) = session
+        .owned_codex_listener
+        .as_ref()
+        .filter(|_| session.owns_codex_listener() && session.terminal.is_none())
+    else {
+        return Ok(false);
+    };
+    // A receipt is exact cleanup's, including when it closed a conversation
+    // other than the one asked for.
+    if chat::native_holder::has_receipt(session.id)? {
+        return Ok(false);
+    }
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if state.chat_handoffs.contains_key(&session.id)
+            || state.native_actor_startups.values().any(|startup| {
+                startup.source.id == session.id || startup.requested.id == session.id
+            })
+        {
+            return Ok(false);
+        }
+    }
+    if has_native_owner(session).map_err(|error| error.message)? {
+        return Ok(false);
+    }
+    {
+        let registry = super::agent_execution::registry(host)?;
+        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+        if registry.agent_for_session(session.id)?.is_some()
+            || registry.has_agent_launch_for_session(session.id)?
+            || !registry.retained_agent_sources(session.id)?.is_empty()
+        {
+            return Ok(false);
+        }
+    }
+    Ok(
+        super::upgrade_inspect::codex_execution_ended(session, &proof.boot_id)
+            && !owned_listener::served(&listener.socket).map_err(|error| error.to_string())?,
+    )
 }
 
 pub(super) fn require_unreserved_terminals(
@@ -2820,9 +2910,14 @@ fn process_inner(
                 retained_resume::prepare_resume_verified(host, &source, retirement.verified())
                     .map_err(unavailable)?
             } else {
+                // An owner lost without its receipt was closed all the same,
+                // proved while no start or close can take its allocation.
                 chat::native_holder::closed_source(&source, &proof)
                     .map_err(unavailable)?
                     .is_some_and(|(_, paired_closed)| paired_closed)
+                    || reserve_quiet_allocation(host, &source, None).is_ok_and(|_fence| {
+                        codex_owner_lost(host, &source, &proof).unwrap_or(false)
+                    })
             };
             if !closed {
                 return Err(unavailable(
