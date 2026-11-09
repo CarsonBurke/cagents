@@ -4,8 +4,9 @@ Base: crates.io cosmic-text0.19.0 archive, SHA256
 be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73.
 The retained original manifest, README and MIT/Apache-2.0 licenses identify
 the upstream package. Local library changes combine two independently
-reviewed feature lines; neither standalone provenance statement replaces
-the other's contract.
+reviewed feature lines, neither of whose standalone provenance statements
+replaces the other's contract, and add font matching that reads no font
+file.
 
 - PR1316 source9fb2ae2c0da9c1991440efbdc05f3747d401bd2c adds immutable
   consuming full-context LayoutSnapshot/projection APIs. Its buffer.rs,
@@ -22,6 +23,12 @@ the other's contract.
   cache qualifier adds only the matching cosmic source-hook name, preserving
   PR1316's historical unanchored-producer/package-bootstrap and unrelated
   artifact-retention proofs.
+- cagents#2166 removes FontMatchKey's variable_weight_match.
+  FontSystem::matches_weight reads a face's wght axis when fallback first
+  considers it and caches the range by face ID, cleared with the database;
+  font/fallback/mod.rs asks it after the family test. Selection order and
+  results are unchanged: src/font/system/fallback_choice_tests.rs compares
+  every choice over the repository fonts with upstream's.
 
 The union retains PR1316's complete eight upstream integration-test targets,
 two benchmarks, development dependencies, test profile, source/fonts and
