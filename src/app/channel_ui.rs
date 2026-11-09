@@ -2681,6 +2681,7 @@ mod tests {
         drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
 
         let saved = persists();
+        let mut armed = None;
         for channel in [second, first, second] {
             drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
                 channel_id: channel,
@@ -2689,6 +2690,10 @@ mod tests {
             assert_eq!(app.workspace.order().collect::<Vec<_>>().len(), 1);
             assert_eq!(persists(), saved, "a click alone waits for the burst");
             assert!(app.navigation_save_pending);
+            // The burst's first click arms the one timer; later clicks don't
+            // push it back, so a long burst is still saved within the delay.
+            let generation = *armed.get_or_insert(app.navigation_save_generation);
+            assert_eq!(app.navigation_save_generation, generation);
         }
         let burst = app.navigation_save_generation;
         drop(app.update(Message::NavigationSaveDue(burst)));

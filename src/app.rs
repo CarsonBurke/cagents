@@ -9415,6 +9415,20 @@ impl Cagents {
         })
     }
 
+    /// Whether the navigation save timer armed for `generation` still has a
+    /// burst to save: another save may have carried it already, or a later
+    /// burst armed its own timer.
+    fn navigation_save_due(&self, generation: u64) -> bool {
+        self.navigation_save_pending && generation == self.navigation_save_generation
+    }
+
+    /// A navigation save timer with nothing left to save changes nothing a
+    /// projection reads, so it skips the sidebar and chrome rebuild.
+    fn navigation_save_is_stale(&self, message: &Message) -> bool {
+        matches!(message, Message::NavigationSaveDue(generation)
+            if !self.navigation_save_due(*generation))
+    }
+
     /// Saves runtime-reported titles within [`REPORTED_TITLE_SAVE_DELAY`],
     /// together with whatever else changes by then.
     fn save_reported_titles_soon(&mut self, card: CardId) -> Task<Message> {
@@ -15220,7 +15234,7 @@ impl Application for Cagents {
                 | Message::FocusAdjacent(_)
                 | Message::WindowResized(..)
         );
-        let mut projection = if repaint_tick(&message) {
+        let mut projection = if repaint_tick(&message) || self.navigation_save_is_stale(&message) {
             Projection::Unchanged
         } else {
             Projection::Full
@@ -17303,7 +17317,7 @@ impl Application for Cagents {
                 self.reveal_workspace_selection()
             }
             Message::NavigationSaveDue(generation) => {
-                if self.navigation_save_pending && generation == self.navigation_save_generation {
+                if self.navigation_save_due(generation) {
                     self.persist();
                 }
                 Task::none()
