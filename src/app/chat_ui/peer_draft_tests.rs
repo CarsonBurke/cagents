@@ -1130,3 +1130,118 @@ fn escape_on_the_question_lets_the_next_close_ask() {
         assert!(!app.chat_close_owned(asked), "captured={captured}");
     }
 }
+
+#[test]
+fn a_refused_first_start_catches_up_after_the_winner_is_proven() {
+    chat::attachment_assets::with_test_image(|image| {
+        let mut peer = peer();
+        let (writer, _) = crate::session::SessionRuntime::open(
+            peer._directory.path().join("loser.sqlite3"),
+            crate::model::BootId::new("losing-first-start"),
+        )
+        .unwrap();
+        peer.app.session = Some(writer);
+        write(&mut peer.app, peer.card, "my own first message");
+        if let Some(CardRuntime::Chat(runtime)) = peer.app.cards.get_mut(&peer.card) {
+            runtime.attachments.push(image.clone());
+        }
+        peer.app.persist();
+        peer.app
+            .session
+            .as_ref()
+            .unwrap()
+            .flush(std::time::Duration::from_secs(5))
+            .unwrap();
+        let target = draft_runtime(&peer.app, peer.card).target;
+        let save = peer
+            .app
+            .handle_chat_ui(Action::Submit(target, PromptMode::Send));
+        let (target, attempt, result) = super::first_start_checkpoint_tests::checkpoint(save);
+        assert!(result.is_ok(), "{result:?}");
+        drop(
+            peer.app
+                .handle_chat_ui(Action::DraftStartCheckpointed(target, attempt, result)),
+        );
+        let rejected_target = attempt_target(&peer);
+        let rejected = peer.app.chat_ui.attempt(peer.card).unwrap().session.clone();
+        assert_ne!(rejected.id, peer.draft.id);
+        assert!(draft_runtime(&peer.app, peer.card).queued.is_some());
+
+        let (operation, scope, change) = peer
+            .app
+            .shared_views
+            .pending
+            .iter()
+            .find(|(_, _, change)| {
+                matches!(change, Change::Update { pane, .. }
+                if pane.id == peer.card && pane.kind == CardKind::Chat(rejected.clone()))
+            })
+            .cloned()
+            .expect("checkpoint publishes its candidate");
+        let mut winner = peer.draft.clone();
+        winner.id = TerminalId::new();
+        let mut model = peer.app.workspace_model.clone();
+        model.sequence += 1;
+        let view = model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap();
+        view.revision += 1;
+        view.panes
+            .iter_mut()
+            .find(|pane| pane.id == peer.card)
+            .unwrap()
+            .kind = CardKind::Chat(winner.clone());
+        drop(peer.app.refuse_conflicting_view_update(
+            scope,
+            operation,
+            change,
+            model,
+            "The workspace view changed".into(),
+        ));
+        assert!(
+            !peer
+                .app
+                .shared_views
+                .pending
+                .iter()
+                .any(|(id, _, _)| *id == operation)
+        );
+        assert_eq!(draft_runtime(&peer.app, peer.card).session, winner);
+        assert_eq!(attempt_target(&peer), rejected_target);
+
+        let accepted = started(&winner);
+        drop(project(
+            &mut peer.app,
+            peer.channel,
+            peer.card,
+            CardKind::Chat(accepted.clone()),
+        ));
+        assert!(peer.app.chat_is_draft(peer.card));
+        assert_eq!(draft_runtime(&peer.app, peer.card).session.id, winner.id);
+        assert_eq!(attempt_target(&peer), rejected_target);
+        assert!(matches!(&peer.app.card_state(peer.card).unwrap().kind,
+            CardKind::Chat(session) if session == &accepted));
+        drop(peer.app.handle_chat_ui(Action::Ready(
+            rejected_target,
+            Ready(Arc::new(Mutex::new(Some(Err(chat::StartFailure::retry(
+                "The workspace view changed",
+            )))))),
+        )));
+        assert!(peer.app.chat_start_matches(peer.card, &accepted));
+        assert!(matches!(
+            peer.app.cards.get(&peer.card),
+            Some(CardRuntime::Loading)
+        ));
+        assert_eq!(
+            peer.app.chat_ui.drafts.get(&peer.card).map(String::as_str),
+            Some("my own first message")
+        );
+        assert_eq!(
+            peer.app.chat_ui.draft_attachments.get(&peer.card),
+            Some(&vec![image])
+        );
+        assert!(peer.app.chat_ui.retiring.is_empty());
+    });
+}

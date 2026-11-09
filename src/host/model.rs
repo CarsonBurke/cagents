@@ -42,8 +42,10 @@ mod lineage;
 mod mailbox;
 mod native_actor;
 mod native_actor_retirement;
+mod pane_chat_starts;
 pub(super) use native_actor::NativeActorEvent;
 pub(super) use native_actor_retirement::{NativeActorOwnership, NativeActorRetirement};
+pub(super) use pane_chat_starts::Binding as PaneChatBinding;
 mod navigation;
 mod schema;
 mod terminal_owners;
@@ -52,7 +54,7 @@ mod views;
 #[cfg(test)]
 mod workspace_snapshot_tests;
 
-const SCHEMA_VERSION: u32 = 22;
+const SCHEMA_VERSION: u32 = 23;
 
 /// A writer that loses a race waits rather than failing. Only the daemon writes
 /// this store, so contention is between its own client threads and is measured
@@ -709,6 +711,10 @@ fn migrate_through(
     if version < 22 && target >= 22 {
         automations::migrate_history(tx)?;
         schema::migration_checkpoint(22)?;
+    }
+    if version < 23 && target >= 23 {
+        pane_chat_starts::migrate(tx)?;
+        schema::migration_checkpoint(23)?;
     }
     Ok(())
 }

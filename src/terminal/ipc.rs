@@ -211,7 +211,9 @@ use crate::{
 /// parallel branches and are not adopted.
 /// Version 156 appends the exact skipped-occurrence count and range to Firing.
 /// An older client is refused the replies holding one.
-pub const PROTOCOL_VERSION: u16 = 156;
+/// Version 157 appends pane-scoped first-send admission. A candidate's fresh
+/// conversation ID cannot bypass another window's ownership of the same pane.
+pub const PROTOCOL_VERSION: u16 = 157;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -589,6 +591,23 @@ pub enum ClientRequest {
     WatchConversationPullRequests {
         conversation: TerminalId,
     },
+    /// First-send admission is serialized by stable pane identity, before
+    /// provider initialization. Later attachments retain the ordinary path.
+    ChatStartInPane {
+        pane: PaneChatStart,
+        session: crate::chat::Session,
+        execution_environment: ChatExecutionEnvironment,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneChatStart {
+    pub registry: uuid::Uuid,
+    pub card: crate::model::CardId,
+    pub source: crate::chat::Session,
+    /// A deliberately local pane need not wait for a shared descriptor. An
+    /// existing canonical pane still takes precedence over this client hint.
+    pub allow_local: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

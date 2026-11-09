@@ -252,10 +252,28 @@ impl Registry {
         successor: TerminalId,
         predecessor: TerminalId,
         root: Option<TerminalId>,
-        live: impl FnOnce(&[TerminalId]) -> bool,
+        mut live: impl FnMut(&[TerminalId]) -> bool,
     ) -> Result<Lineage, String> {
         if let Some(lineage) = self.session_lineage(successor)? {
+            let tx = self
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .map_err(|error| error.to_string())?;
+            super::pane_chat_starts::advance(&tx, predecessor, successor)?;
+            tx.commit().map_err(|error| error.to_string())?;
             return Ok(lineage);
+        }
+        // A failed prepared successor leaves its caller holding the original
+        // source. A fresh retry may replace that preparation only while the
+        // pane's actual current allocation is quiescent. An already-recorded
+        // successor above is a replay and never gets this authority.
+        let pane_current = self.pane_chat_allocation(predecessor)?;
+        let pane_predecessor = pane_current.unwrap_or(predecessor);
+        if pane_predecessor != predecessor
+            && (live(&[pane_predecessor])
+                || super::pane_chat_starts::retained_owner(pane_predecessor)?)
+        {
+            return Err("This pane's newer conversation still owns work".into());
         }
         let claimed = match (self.session_lineage(predecessor)?, root) {
             (Some(lineage), _) => lineage,
@@ -279,12 +297,29 @@ impl Registry {
         } else {
             claimed
         };
-        self.db
-            .execute(
-                "INSERT OR IGNORE INTO session_lineages(session_id, lineage) VALUES (?1, ?2)",
-                params![successor.to_string(), lineage.to_string()],
-            )
+        let tx = self
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
+        if super::pane_chat_starts::allocation_in(&tx, predecessor)? != pane_current {
+            return Err("This pane changed while its successor was being prepared".into());
+        }
+        if pane_predecessor != predecessor
+            && (live(&[pane_predecessor])
+                || super::pane_chat_starts::retained_owner(pane_predecessor)?)
+        {
+            return Err("This pane's newer conversation still owns work".into());
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO session_lineages(session_id, lineage) VALUES (?1, ?2)",
+            params![successor.to_string(), lineage.to_string()],
+        )
+        .map_err(|error| error.to_string())?;
+        let advanced = super::pane_chat_starts::advance(&tx, pane_predecessor, successor)?;
+        if pane_current.is_some() && advanced == 0 {
+            return Err("This pane changed while its successor was being prepared".into());
+        }
+        tx.commit().map_err(|error| error.to_string())?;
         Ok(lineage)
     }
 

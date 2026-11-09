@@ -278,6 +278,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -290,6 +291,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         20 => &TWENTY,
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
+        23 => &TWENTY_THREE,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -781,6 +783,8 @@ mod tests {
             (16, "DROP TABLE automation_lifecycle;"),
             (16, "DROP INDEX automation_lifecycle_scoped;"),
             (22, "DROP TABLE automation_precheck_history_cleanup;"),
+            (23, "DROP TABLE pane_chat_starts;"),
+            (23, "DROP TABLE pane_chat_allocations;"),
             (22, "DROP TABLE automation_retired_manual_requests;"),
             (22, "DROP INDEX automation_removed_history;"),
             (22, "DROP INDEX automation_firing_successors;"),
@@ -1057,7 +1061,8 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20, run-attention21 and history22.
+            // This current opener also applies retention20, run-attention21, history22
+            // and private pane ownership23.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1069,6 +1074,8 @@ mod tests {
                 "automation_retired_manual_requests",
                 "automation_removed_history",
                 "automation_firing_successors",
+                "pane_chat_starts",
+                "pane_chat_allocations",
             ];
             for name in retention_names {
                 let index = inventory
@@ -1083,6 +1090,8 @@ mod tests {
                 "automation_run_attention",
                 "automation_precheck_history_cleanup",
                 "automation_retired_manual_requests",
+                "pane_chat_starts",
+                "pane_chat_allocations",
             ] {
                 assert_eq!(
                     registry
@@ -1109,7 +1118,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
+                "only lifecycle/run outboxes, retention and pane ownership objects, and the exact history column may be added"
             );
             assert!(
                 registry
@@ -1437,7 +1446,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
