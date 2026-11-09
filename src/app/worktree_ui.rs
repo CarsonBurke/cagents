@@ -193,6 +193,7 @@ fn scope_descriptor(
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
+        chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),

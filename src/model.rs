@@ -1226,6 +1226,11 @@ pub struct WorkspaceState {
     pub chat_drafts: HashMap<CardId, String>,
     #[serde(default)]
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    /// The messages each chat's provider held in its queue when this was
+    /// saved. A provider that does not come back takes its queue with it, so
+    /// a reopened conversation returns these to its composer, unsent.
+    #[serde(default)]
+    pub chat_waiting_messages: HashMap<CardId, Vec<crate::chat::QueuedMessage>>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1273,6 +1278,7 @@ impl Default for WorkspaceState {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
