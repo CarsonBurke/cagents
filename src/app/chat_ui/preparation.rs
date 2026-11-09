@@ -1624,9 +1624,12 @@ impl Pool {
             arriving: Mutex::default(),
         }
     }
-    /// Parsing is CPU-bound and each parser owns its input and output, so
-    /// parallelism follows the cores, leaving room for the event loop and the
-    /// compositor. The byte and item admission bounds what is in flight.
+    /// Two parsers. Ranking, not parallelism, is what shows the reader's rows
+    /// sooner: more parsers only finish off-screen history sooner, while each
+    /// holds its message's working set and installs more outputs before one
+    /// frame (`frame_cost::a_cold_open_parses_what_is_read_first`).
+    const PARSERS: usize = 2;
+
     fn sized() -> Self {
         #[cfg(test)]
         if let Some((capacity, ranked)) = POLICY.get() {
@@ -1635,12 +1638,7 @@ impl Pool {
                 ..Self::new(capacity)
             };
         }
-        Self::new(Self::capacity_for(
-            std::thread::available_parallelism().map_or(2, usize::from),
-        ))
-    }
-    fn capacity_for(cores: usize) -> usize {
-        (cores / 2).clamp(2, 8)
+        Self::new(Self::PARSERS)
     }
     fn lock(&self) -> std::sync::MutexGuard<'_, Queue> {
         self.queue.lock().unwrap_or_else(|e| e.into_inner())
@@ -2485,17 +2483,6 @@ mod tests {
             .unwrap();
             stuck.abort();
         });
-    }
-
-    #[test]
-    fn parsers_are_half_the_cores_but_at_least_two_and_at_most_eight() {
-        let capacity: Vec<_> = [1, 2, 4, 5, 8, 12, 16, 32]
-            .into_iter()
-            .map(Pool::capacity_for)
-            .collect();
-        assert_eq!(capacity, [2, 2, 2, 2, 4, 6, 8, 8]);
-        let pool = Pool::sized();
-        assert_eq!(pool.permits.available_permits(), pool.capacity);
     }
 
     fn permit() -> tokio::sync::OwnedSemaphorePermit {
