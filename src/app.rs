@@ -8981,8 +8981,9 @@ impl Cagents {
     /// Gives the keyboard to the focused pane's own control: a chat's message
     /// input, a terminal, an editor. Every path that focuses a pane hands the
     /// keyboard over through here or through the pointer and window variants
-    /// below, so what a focused pane's keyboard target is, and what happens
-    /// while it is not drawn yet, is decided in one place.
+    /// below, so what happens while the input is not drawn yet is decided in
+    /// one place. Closing a dialog only gives the keyboard back to the pane
+    /// that already had it, and asks [`Self::card_keyboard_focus`] directly.
     ///
     /// A chat that is still starting or changing session has no input yet.
     /// Its title holds the keyboard meanwhile and the debt is recorded;
@@ -17191,7 +17192,9 @@ impl Application for Cagents {
                     return Task::none();
                 }
                 if matches!(event, WorkspaceViewportEvent::PointerRested(_))
-                    && !self.settings.focus_follows_mouse
+                    && (!self.settings.focus_follows_mouse
+                        || self.chat_menu_open()
+                        || self.device_ui.menu_open)
                 {
                     return Task::none();
                 }

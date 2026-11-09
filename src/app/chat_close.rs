@@ -117,7 +117,7 @@ impl Cagents {
             .filter(|card| self.workspace.order().any(|id| id == *card))
             .unwrap_or(intent.card);
         let _ = self.workspace.focus(card);
-        iced::widget::operation::focus(self.card_keyboard_focus(card)).map(cosmic::Action::App)
+        self.focus_pane_keyboard(card)
     }
 
     pub(super) fn confirm_chat_close(&mut self) -> Task<Message> {

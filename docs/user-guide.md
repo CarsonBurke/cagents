@@ -145,9 +145,9 @@ determine which models and permission modes are available.
 - **Focus follows mouse** is on by default: resting the pointer on a pane for
   300 ms focuses it, without scrolling, and puts the keyboard in its message
   input, terminal or editor. Typing, clicking or dragging during the dwell
-  cancels it, and an open menu, dialog or palette suppresses it. Turn it off in
-  **Settings > Workspace > Pane focus** to focus panes only by clicking them or
-  with pane navigation.
+  cancels it, and an open chat menu or picker, dialog or palette suppresses it.
+  Turn it off in **Settings > General > Workspace** to focus panes only by
+  clicking them or with pane navigation.
 - Focusing a chat pane in any way, by clicking it, navigating to it, switching
   channel or opening a new or resumed chat, puts the keyboard in its message
   input with the draft and caret where you left them. Typing while a chat pane

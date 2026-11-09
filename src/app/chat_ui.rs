@@ -5269,15 +5269,31 @@ impl Runtime {
         }
     }
 
-    /// The named control that should receive the keyboard for this card.
+    /// The named control that should receive the keyboard for this card:
+    /// an open picker's search, then an open find bar, then the composer.
     pub(super) fn focus_control(&self) -> &'static str {
         if self.child_picker.is_some() {
             "chat-subagent-search"
         } else if self.model_picker.is_some() {
             "chat-model-search"
+        } else if self.find.is_some() {
+            "chat-find"
         } else {
             "chat-composer"
         }
+    }
+
+    /// Whether a menu or picker of this card is open over the workspace.
+    /// Resting the pointer on another pane then leaves focus where it is,
+    /// rather than moving the keyboard away from the menu still showing.
+    pub(super) fn has_open_menu(&self) -> bool {
+        self.child_picker.is_some()
+            || self.model_picker.is_some()
+            || self.reasoning_picker
+            || self.permission_picker
+            || self.account_picker
+            || self.composer_actions
+            || self.branch_picker
     }
 
     /// Whether this card should offer to start a new conversation beside the
@@ -5992,6 +6008,13 @@ const QUEUED_BLOCKER: &str = "Wait for the first message to be sent before leavi
 const MODEL_PATIENCE: Duration = Duration::from_secs(10);
 
 impl Cagents {
+    /// Whether a chat's menu or picker is open; see [`Runtime::has_open_menu`].
+    pub(super) fn chat_menu_open(&self) -> bool {
+        self.cards
+            .values()
+            .any(|runtime| matches!(runtime, CardRuntime::Chat(runtime) if runtime.has_open_menu()))
+    }
+
     /// Whether `card` is a chat whose message input, or the picker search
     /// standing in for it, is in the widget tree: it has a runtime that is
     /// neither starting, changing session nor waiting for admission.
@@ -21064,6 +21087,65 @@ mod tests {
             task_focuses(task, &card_control_id(card, "chat-composer")),
             (false, true)
         );
+    }
+
+    /// With the find bar open, the pane's keyboard belongs to the find
+    /// field: pressing its Previous or Next button hands the keyboard back
+    /// there, not to the composer, where the next Enter would send the draft.
+    #[test]
+    fn an_open_find_bar_keeps_the_pane_keyboard() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, Some("find-keyboard"));
+        let target = chat_runtime(&app, card).target;
+        assert_eq!(
+            app.card_keyboard_focus(card),
+            card_control_id(card, "chat-composer")
+        );
+        drop(find_navigation::find_for_test(
+            &mut app,
+            target,
+            "needle".into(),
+        ));
+        assert_eq!(
+            app.card_keyboard_focus(card),
+            card_control_id(card, "chat-find")
+        );
+        drop(app.handle_chat_ui(Action::CloseFind(target)));
+        assert_eq!(
+            app.card_keyboard_focus(card),
+            card_control_id(card, "chat-composer")
+        );
+    }
+
+    /// Resting the pointer on another pane leaves the keyboard with a chat
+    /// menu that is still open, and follows the pointer again once it closes.
+    #[test]
+    fn an_open_chat_menu_holds_focus_against_the_resting_pointer() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.settings.focus_follows_mouse = true;
+        let first = live_chat(&mut app, Some("menu-first"));
+        let second = live_chat(&mut app, Some("menu-second"));
+        let update = app.workspace.resize_viewport(3_000.0);
+        let _ = app.apply_viewport(update, false, true);
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(second),
+        });
+        assert_eq!(app.workspace.focused(), Some(second));
+        let target = chat_runtime(&app, second).target;
+        app.chat_runtime_mut(target).unwrap().composer_actions = true;
+        assert!(app.chat_menu_open());
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(first),
+        });
+        assert_eq!(app.workspace.focused(), Some(second));
+        app.chat_runtime_mut(target).unwrap().composer_actions = false;
+        let _ = app.update(Message::Viewport {
+            generation: app.workspace_view_generation,
+            event: WorkspaceViewportEvent::PointerRested(first),
+        });
+        assert_eq!(app.workspace.focused(), Some(first));
     }
 
     fn account_commit_reply(task: Task<Message>) -> Message {
