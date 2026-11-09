@@ -2489,6 +2489,8 @@ impl Server {
         let published = changed.clone();
         let watcher = Arc::new(push::Watcher::default());
         let published_watcher = watcher.clone();
+        let metadata_changed = changed.clone();
+        let metadata_watcher = watcher.clone();
         let prompt_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let available = prompt_revision.clone();
         let outcomes = journal.clone();
@@ -2523,6 +2525,10 @@ impl Server {
                 }
                 published.fetch_add(1, Ordering::Release);
                 published_watcher.notify();
+            },
+            move || {
+                metadata_changed.fetch_add(1, Ordering::Release);
+                metadata_watcher.notify();
             },
         )?;
         let provider = actor

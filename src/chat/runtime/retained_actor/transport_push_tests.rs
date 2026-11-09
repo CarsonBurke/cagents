@@ -443,3 +443,115 @@ fn input_recovery_waits_only_for_work_with_a_retry_deadline() {
     );
     assert_eq!(actor.retry_after(true), Some(Duration::from_millis(50)));
 }
+
+#[test]
+fn semantic_metadata_wakes_after_confirmation_without_hidden_body_ticks() {
+    use crate::chat::protocol::{Adapter, Step};
+    struct MetadataEcho(usize);
+    impl Adapter for MetadataEcho {
+        fn initialize(&mut self) -> Result<Step, String> {
+            Ok(Step::default())
+        }
+        fn command(&mut self, command: Command) -> Result<Step, String> {
+            Ok(Step {
+                writes: vec![json!({"body": matches!(command, Command::SetModel { .. })})],
+                ..Default::default()
+            })
+        }
+        fn receive(&mut self, frame: Value) -> Result<Step, String> {
+            let events = if frame["body"] == true {
+                vec![
+                    chat::Event::TextDelta {
+                        id: "body".into(),
+                        role: chat::Role::Assistant,
+                        thinking: false,
+                        delta: "hidden text".into(),
+                    },
+                    chat::Event::SubagentTextDelta {
+                        id: "child".into(),
+                        item_id: "child-body".into(),
+                        role: chat::Role::Assistant,
+                        thinking: false,
+                        delta: "hidden child text".into(),
+                    },
+                ]
+            } else {
+                self.0 += 1;
+                vec![
+                    chat::Event::Session {
+                        id: format!("identity-{}", self.0),
+                        title: None,
+                    },
+                    chat::Event::Subagent {
+                        id: "child".into(),
+                        kind: "worker".into(),
+                        description: "known child".into(),
+                        status: None,
+                        background: Some(false),
+                        model: None,
+                        waiting: None,
+                        detail: None,
+                    },
+                ]
+            };
+            Ok(Step {
+                events,
+                ..Default::default()
+            })
+        }
+    }
+    let root = tempfile::tempdir_in("/var/tmp").unwrap();
+    let recipe = crate::model::LaunchRecipe {
+        program: "/bin/cat".into(),
+        arguments: vec![],
+        working_directory: root.path().into(),
+        environment: BTreeMap::new(),
+        unset_environment: Default::default(),
+    };
+    let spec = ProcessSpec::from(&recipe);
+    let mut adapter: Box<dyn Adapter> = Box::new(MetadataEcho(0));
+    let mut initial = adapter.initialize().unwrap();
+    let store = crate::chat::runtime::preflight(&spec, &mut initial).unwrap();
+    let watched = Arc::new(std::sync::OnceLock::<
+        std::sync::Weak<crate::chat::runtime::Inner>,
+    >::new());
+    let target = watched.clone();
+    let (sent, received) = crossbeam_channel::unbounded();
+    let handle = LocalHandle::start_with_scope(
+        spec,
+        adapter,
+        initial,
+        store,
+        None,
+        None,
+        None,
+        Some(Arc::new(move || {
+            if let Some(inner) = target.get().and_then(std::sync::Weak::upgrade) {
+                let id = inner.confirmed_session.lock().unwrap().clone();
+                sent.send(id).unwrap();
+            }
+        })),
+        |_| {},
+    )
+    .unwrap();
+    watched.set(Arc::downgrade(&handle.0)).unwrap();
+    handle.command(Command::Refresh).unwrap();
+    assert_eq!(
+        received.recv_timeout(TIMEOUT).unwrap().as_deref(),
+        Some("identity-1")
+    );
+    handle
+        .command(Command::SetModel {
+            model: "body".into(),
+            reasoning: None,
+        })
+        .unwrap();
+    handle.command(Command::Refresh).unwrap();
+    assert_eq!(
+        received.recv_timeout(TIMEOUT).unwrap().as_deref(),
+        Some("identity-2"),
+        "hidden text must not publish semantic metadata, and identity must already be confirmed"
+    );
+    assert!(received.try_recv().is_err());
+    handle.close().unwrap();
+}
