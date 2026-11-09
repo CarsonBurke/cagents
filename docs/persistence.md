@@ -434,8 +434,9 @@ stores, so an old copy can never feed a later upgrade or seed.
 - #2429 (closes that do not stick, unreachable panes): there is one membership
   record. A close is one daemon transaction; no window copy can keep or revive
   the pane. Migration rule 4 makes the unreachable pane reachable.
-- #2440 (50 s startup with thousands of views): startup no longer loads 1700
-  tombstoned cards and the model is read in one query (stage 2); empty views
+- #2440 (50 s startup with thousands of views): view listings are one query and
+  pane searches skip empty views (stage 2); startup stops loading 1700
+  tombstoned cards once closed history moves to the daemon (stage 5); empty views
   are collected once no window can seed (stage 5). Projection work scales with
   open panes.
 - #1064 (tmpfs transcript caches): orphaned caches are swept continuously with
