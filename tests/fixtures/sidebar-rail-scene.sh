@@ -7,6 +7,7 @@
 # scripts/native-evidence task (see "Native evidence" in docs/development.md):
 #
 #   tests/fixtures/sidebar-rail-scene.sh seed       # once, then save-seed
+#   tests/fixtures/sidebar-rail-scene.sh unreachable # once, after save-seed
 #   tests/fixtures/sidebar-rail-scene.sh theme dark # or light; edits the seed
 #   scripts/native-evidence start before --width 1100
 #   tests/fixtures/sidebar-rail-scene.sh live       # each session
@@ -24,8 +25,12 @@
 #   failed    an error result ends the turn
 #   waiting   a tool permission request, held open
 #
-# It also locks one worktree, so deleting it from the sidebar fails, and moves
-# one project's folder away, so the project is unreachable.
+# `unreachable` moves one project's folder away in the seed, so every later
+# session finds that project missing as it loads the sidebar.
+#
+# No step here produces a failed worktree deletion: the delete dialog checks
+# for a lock both as it opens and as it is confirmed, and Git still forgets a
+# worktree it could only partly remove, so the row goes either way.
 #
 # The result frames carry no session_id: the app refuses a result from any
 # conversation but the agent's own, and the fixture names that one itself.
@@ -212,12 +217,13 @@ cmd_live() {
     spawn unread edge-proxy "TLS renewals"
     spawn working edge-proxy "TLS renewals"
     rm -f -- "$frames"
-    # A locked worktree refuses removal, so deleting it from the sidebar
-    # leaves its row with a failed deletion to show.
-    evidence env git -C "$projects/billing-service" worktree lock \
-        --reason "fixture: refuses deletion" "$projects/billing-service-fix-proration"
-    # A project whose folder has gone is unreachable.
-    evidence env mv "$projects/harbor" "$projects/harbor.away"
+}
+
+cmd_unreachable() {
+    # A folder moved while a session runs is noticed only at the next load,
+    # so this edits the seed every session starts from.
+    [ -d "$seed" ] || { echo "save the seed first" >&2; return 1; }
+    [ ! -d "$seed/projects/harbor" ] || mv "$seed/projects/harbor" "$seed/projects/harbor.away"
 }
 
 cmd_theme() {
@@ -239,6 +245,7 @@ cmd_theme() {
 case ${1:-} in
     seed) cmd_seed ;;
     live) cmd_live ;;
+    unreachable) cmd_unreachable ;;
     theme) cmd_theme "${2:?dark or light}" ;;
-    *) sed -n '2,30p' "$0" >&2; exit 2 ;;
+    *) sed -n '2,37p' "$0" >&2; exit 2 ;;
 esac
