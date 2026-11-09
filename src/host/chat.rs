@@ -4530,8 +4530,13 @@ fn restore_selection(
 /// Whether this daemon's allocated listener at `socket` is still served,
 /// retiring an endpoint its stopped server left behind.
 fn served_owned_listener(socket: &std::path::Path) -> Result<bool, ProtocolError> {
-    owned_listener::served(socket)
-        .map_err(|failure| unavailable(format!("Cannot retire stopped provider socket: {failure}")))
+    owned_listener::served(socket).map_err(|failure| {
+        ProtocolError::new(
+            ProtocolErrorCode::TerminalUnavailable,
+            format!("Cannot retire stopped provider socket: {failure}"),
+            true,
+        )
+    })
 }
 
 /// The environment a conversation started without a proven source runs with:
