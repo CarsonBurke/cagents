@@ -1504,31 +1504,6 @@ fn start_with_execution(
             source_execution.as_ref()
         },
     )?;
-    // A begun thread's bare remote joins the account's shared daemon, which
-    // owns the thread while it runs. With nothing serving that daemon, the
-    // thread is reopened from its history on a listener of its own instead of
-    // failing to join a daemon that is absent.
-    let owned_socket = match owned_socket {
-        None if !owned
-            && source.is_none()
-            && restart_launch.is_none()
-            && !saved_history_only
-            && process_launch.provider == Provider::Codex
-            && chat::protocol::codex::shared_daemon_socket(&process_launch)
-                .is_some_and(|shared| owned_listener::stopped(&shared))
-            && listeners.claim_for_unserved_thread(&mut session, &allocator) =>
-        {
-            process_launch.recipe.arguments = session.launch.recipe.arguments.clone();
-            let socket = session
-                .owned_codex_listener
-                .as_ref()
-                .unwrap()
-                .socket
-                .clone();
-            (!served_owned_listener(&socket)?).then_some(socket)
-        }
-        owned_socket => owned_socket,
-    };
     // A server launched on an existing thread would be a second writer beside
     // any process still writing it: a Codex CLI, the desktop app, or a server
     // an earlier daemon left running. A checkpointed restart replaces the
