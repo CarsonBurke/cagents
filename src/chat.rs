@@ -1056,15 +1056,19 @@ impl Session {
         self.native_continuity = NativeContinuity::ReconnectOnly;
     }
 
-    /// Whether `started` is this new Codex thread as the daemon started it.
+    /// Whether `started` is this Codex thread as the daemon started it.
     ///
     /// A new thread asks for a listener of its own with a bare `unix://`
-    /// remote, which the daemon resolves to its reported owned endpoint
+    /// remote. A reopened thread carries the same bare remote, and the daemon
+    /// gives it a listener of its own when no shared daemon serves it. Either
+    /// way the daemon resolves the remote to its reported owned endpoint
     /// before it launches anything; that resolution is the one change the
     /// launch undergoes, and the rest of the recipe is exactly as asked.
     pub fn resolved_to_owned_codex_listener(&self, started: &Self) -> bool {
-        if self.launch.session_id.is_some()
-            || self.terminal.is_some()
+        if self.terminal.is_some()
+            // A new thread learns its identity as it starts; a reopened one keeps it.
+            || (self.launch.session_id.is_some()
+                && started.launch.session_id != self.launch.session_id)
             || started.id != self.id
             || !started.owns_codex_listener()
             || !started
@@ -1106,6 +1110,32 @@ impl Session {
         root: &std::path::Path,
         allocator: &crate::model::HostSessionProof,
     ) -> bool {
+        let new_thread = self.launch.session_id.is_none();
+        self.claim_codex_listener(root, allocator, new_thread)
+    }
+
+    /// Point this existing Codex thread's bare `unix://` at its own listener.
+    ///
+    /// A begun thread's bare remote names the account's shared daemon, which
+    /// owns the thread whenever it is running. Only the daemon calls this,
+    /// after proving nothing serves that daemon's endpoint: the thread then
+    /// has no live owner to join, so reopening it needs a server of its own.
+    pub fn claim_owned_codex_listener_for_unserved_thread(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+    ) -> bool {
+        self.launch.session_id.is_some()
+            && self.terminal.is_none()
+            && self.claim_codex_listener(root, allocator, true)
+    }
+
+    fn claim_codex_listener(
+        &mut self,
+        root: &std::path::Path,
+        allocator: &crate::model::HostSessionProof,
+        allocate: bool,
+    ) -> bool {
         if self.launch.provider != Provider::Codex {
             return false;
         }
@@ -1119,13 +1149,12 @@ impl Session {
             .join(format!("cagents-codex-{}", self.id))
             .join("control.sock");
         let owned = format!("unix://{}", socket.display());
-        let new_thread = self.launch.session_id.is_none();
         let arguments = &mut self.launch.recipe.arguments;
         let Some(index) = arguments.iter().position(|argument| argument == "--remote") else {
             return false;
         };
         match arguments.get_mut(index + 1) {
-            Some(remote) if *remote == owned || (new_thread && remote == "unix://") => {
+            Some(remote) if *remote == owned || (allocate && remote == "unix://") => {
                 *remote = owned;
                 self.owned_codex_listener = Some(OwnedCodexListener {
                     socket,
@@ -3407,6 +3436,12 @@ mod tests {
         asked.proof = Some(allocator.clone());
         assert!(asked.owns_codex_listener());
         assert!(unstarted.resolved_to_owned_codex_listener(&asked));
+        let mut learned = asked.clone();
+        learned.launch.session_id = Some("learned".into());
+        assert!(
+            unstarted.resolved_to_owned_codex_listener(&learned),
+            "a new thread learns its identity as it starts"
+        );
         let claimed = asked.clone();
         assert!(
             asked.claim_owned_codex_listener(
@@ -3429,6 +3464,32 @@ mod tests {
             let before = other.clone();
             assert!(
                 !other.claim_owned_codex_listener(root, &allocator),
+                "{arguments:?}"
+            );
+            assert_eq!(other, before);
+        }
+
+        // Reopened from history, a thread nothing serves takes a listener of
+        // its own only when the daemon asks on its behalf, and only in place
+        // of the shared daemon its bare remote names.
+        let mut reopened = session(&["resume", "begun", "--remote", "unix://"], Some("begun"));
+        let saved = reopened.clone();
+        assert!(reopened.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
+        reopened.proof = Some(allocator.clone());
+        assert!(reopened.owns_codex_listener());
+        assert!(saved.resolved_to_owned_codex_listener(&reopened));
+        let mut renamed = reopened.clone();
+        renamed.launch.session_id = Some("other".into());
+        assert!(!saved.resolved_to_owned_codex_listener(&renamed));
+        for (arguments, session_id) in [
+            (&["--remote", "unix://"][..], None),
+            (&["--remote", "unix:///shared/elsewhere"][..], Some("begun")),
+            (&["--search"][..], Some("begun")),
+        ] {
+            let mut other = session(arguments, session_id);
+            let before = other.clone();
+            assert!(
+                !other.claim_owned_codex_listener_for_unserved_thread(root, &allocator),
                 "{arguments:?}"
             );
             assert_eq!(other, before);
