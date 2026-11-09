@@ -60,21 +60,6 @@ if [ "$probe" = false ] && [ -n "$resumed" ] && [ -e "$config/fixture-fail-resum
     printf '%s\n' 'fixture: the resumed provider could not start' >&2
     exit 1
 fi
-# Optional slow start: while fixture-start-delay exists, the next start of a
-# new conversation waits the seconds it holds before answering anything, as a
-# provider slower than the start timeout would. The file is removed first, so
-# the start after it answers at once.
-if [ "$probe" = false ] && [ -z "$resumed" ] && [ -f "$config/fixture-start-delay" ]; then
-    delay=$(cat "$config/fixture-start-delay")
-    rm -f "$config/fixture-start-delay"
-    case "$delay" in
-        '' | *[!0-9]*)
-            printf '%s\n' 'Invalid fixture-start-delay' >&2
-            exit 2
-            ;;
-    esac
-    sleep "$delay"
-fi
 project=$(pwd -P | jq -Rr 'gsub("[^a-zA-Z0-9]"; "-")')
 history=$config/projects/$project/$session.jsonl
 mkdir -p "$(dirname "$history")"
