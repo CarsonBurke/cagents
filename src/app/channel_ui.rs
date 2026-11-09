@@ -326,7 +326,19 @@ pub struct State {
     /// to reconnect never does.
     names: HashMap<ChannelId, (String, crate::model::ChannelTitleSource)>,
     reopening: HashMap<ChannelId, PendingReopen>,
+    /// Emptied channels waiting for their view publication to settle, by the
+    /// incarnation the close saw. The registry checks that incarnation and
+    /// the settled view revision before it retires one.
+    pub(super) retire_candidates: HashSet<crate::channel_work::Home>,
+    /// Retirements sent to the registry, with the view revision each expects
+    /// and when it was sent. The registry applies edits in order, so a pane
+    /// published into one of these channels before the answer arrives would
+    /// land after it retired.
+    pub(super) retiring: HashMap<ChannelId, (u64, std::time::Instant)>,
 }
+
+/// Bound a deferred reopen's wait without assuming the retirement was refused.
+const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
 
 #[derive(Debug)]
 struct PendingReopen {
@@ -477,8 +489,10 @@ impl Cagents {
         })
     }
 
+    /// Opens channel `id` as navigation alone; a caller that also changed the
+    /// workspace saves it.
     fn open_channel_with_default(&mut self, id: ChannelId) -> Task<Message> {
-        let scope = self.select_channel(id);
+        let scope = self.navigate_to_channel(id);
         if self.durable.active_channel != Some(id) {
             return scope;
         }
@@ -817,7 +831,7 @@ impl Cagents {
     /// A timed out answer does not cancel the edit already in the publisher.
     /// Keep its identity fenced until the registry answers definitively.
     fn channel_retiring(&self, id: ChannelId) -> bool {
-        self.channel_work.retiring.contains_key(&id)
+        self.channel_ui.retiring.contains_key(&id)
     }
 
     pub(super) fn defer_channel_reopen(
@@ -866,7 +880,7 @@ impl Cagents {
         pending.intents.push(intent);
         let sent = pending.sent;
         Some(cosmic::task::future(async move {
-            tokio::time::sleep(super::channel_work::RETIREMENT_ANSWERED).await;
+            tokio::time::sleep(RETIREMENT_ANSWERED).await;
             Message::ChannelUi(Action::ReopenTimedOut(id, sent))
         }))
     }
@@ -921,7 +935,7 @@ impl Cagents {
     pub(super) fn forget_channel_revival(&mut self, id: ChannelId) {
         self.channel_ui.emptied.retain(|emptied| emptied.id != id);
         self.channel_ui.revived.remove(&id);
-        self.channel_work.retiring.remove(&id);
+        self.channel_ui.retiring.remove(&id);
     }
 
     /// Enters the channel a closed card returns to, recreating it if it
@@ -930,7 +944,7 @@ impl Cagents {
     pub(super) fn enter_closed_card_home(&mut self, home: ClosedCardHome) -> Option<Task<Message>> {
         let (id, reveal) = match home {
             ClosedCardHome::Channel(id) => {
-                self.channel_work
+                self.channel_ui
                     .retire_candidates
                     .retain(|candidate| candidate.channel != id);
                 // No longer empty, so no longer a channel to revive, but one
@@ -1142,8 +1156,60 @@ impl Cagents {
             };
             home.validate().ok().map(|_| home)
         });
-        self.channel_work.retire_candidates.extend(captured);
+        self.channel_ui.retire_candidates.extend(captured);
         Task::none()
+    }
+
+    /// View publication supplies the settled revision. The registry checks
+    /// that exact revision and the channel's incarnation before retiring it.
+    /// Until the daemon's channel work store is retired, it also keeps a
+    /// channel whose incarnation has channel work entries or operations.
+    pub(super) fn retire_settled_empty_channels(&mut self) {
+        let candidates = self
+            .channel_ui
+            .retire_candidates
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        for captured in candidates {
+            let channel = captured.channel;
+            let Some(metadata) = self.workspace_model.channel(channel) else {
+                self.channel_ui.retire_candidates.remove(&captured);
+                continue;
+            };
+            if self.workspace_model.identity != captured.registry
+                || metadata.ordinal != captured.creation_ordinal
+            {
+                self.channel_ui.retire_candidates.remove(&captured);
+                continue;
+            }
+            let Some(view) =
+                self.workspace_model.views.iter().find(|view| {
+                    view.scope == crate::workspace_model::views::Scope::Channel(channel)
+                })
+            else {
+                continue;
+            };
+            if !view.panes.is_empty() {
+                continue;
+            }
+            // An empty view can precede a live pane's first publication. Closing
+            // that pane later captures the channel again.
+            if self.channel_holds_unpublished_work(channel) {
+                self.channel_ui.retire_candidates.remove(&captured);
+                continue;
+            }
+            let edit = ModelEdit::RetireEmptyChannel {
+                home: captured,
+                expected_view_revision: view.revision,
+            };
+            if self.workspace_model_tx.try_send(edit).is_ok() {
+                self.channel_ui.retire_candidates.remove(&captured);
+                self.channel_ui
+                    .retiring
+                    .insert(channel, (view.revision, std::time::Instant::now()));
+            }
+        }
     }
 
     /// The channels `retired` would leave without an open card.
@@ -1512,7 +1578,7 @@ impl Cagents {
         self.channel_ui.deleted.insert(id);
         // Only this window's own retirement of an emptied channel is undone by
         // reopening one of its cards; a deletion anywhere is final.
-        let own_retirement = self.channel_work.retiring.remove(&id).is_some();
+        let own_retirement = self.channel_ui.retiring.remove(&id).is_some();
         if !own_retirement {
             self.channel_ui.emptied.retain(|emptied| emptied.id != id);
         }
@@ -1958,6 +2024,131 @@ fn default_channel_title(project: Option<&SidebarProject>) -> Cow<'static, str> 
 mod tests {
     use super::*;
     use crate::sidebar::RowDeletion;
+
+    fn captured_home() -> crate::channel_work::Home {
+        crate::channel_work::Home {
+            registry: uuid::Uuid::new_v4(),
+            channel: ChannelId::new(),
+            creation_ordinal: 4,
+        }
+    }
+
+    fn model_with_empty_channel(
+        home: crate::channel_work::Home,
+    ) -> crate::workspace_model::WorkspaceModel {
+        use crate::workspace_model::views::{Scope, View};
+        crate::workspace_model::WorkspaceModel {
+            identity: home.registry,
+            channels: vec![crate::workspace_model::ModelChannel {
+                id: home.channel,
+                repository: "/project".into(),
+                title: "Work".into(),
+                title_source: Default::default(),
+                ordinal: home.creation_ordinal,
+            }],
+            views: vec![View {
+                scope: Scope::Channel(home.channel),
+                revision: 7,
+                panes: vec![],
+                retired: vec![],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_channel_work_invalidation_never_skips_a_delayed_canonical_channel_edit() {
+        use super::super::workspace_model_sync::ModelUpdate;
+        let home = captured_home();
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        app.workspace_model = model_with_empty_channel(home);
+        app.workspace_model.sequence = 8;
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 10,
+            edit: ModelEdit::ChannelWorkChanged { home },
+        }));
+        assert_eq!(
+            app.workspace_model.sequence, 8,
+            "an invalidation cannot acknowledge an unseen canonical edit"
+        );
+        drop(app.apply_workspace_model_update(ModelUpdate::Edited {
+            sequence: 9,
+            edit: ModelEdit::DeleteChannel { id: home.channel },
+        }));
+        assert!(app.workspace_model.channel(home.channel).is_none());
+        assert_eq!(app.workspace_model.sequence, 9);
+    }
+
+    #[test]
+    fn deferred_empty_retirement_never_rebinds_to_replacement_registry_or_channel_incarnation() {
+        let original = captured_home();
+        for current in [
+            crate::channel_work::Home {
+                registry: uuid::Uuid::new_v4(),
+                ..original
+            },
+            crate::channel_work::Home {
+                creation_ordinal: original.creation_ordinal + 1,
+                ..original
+            },
+            original,
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(false);
+            let (send, received) = async_channel::unbounded();
+            app.workspace_model_tx = send;
+            app.workspace_model = model_with_empty_channel(current);
+            app.channel_ui.retire_candidates.insert(original);
+            app.retire_settled_empty_channels();
+            if current == original {
+                assert_eq!(
+                    received.try_recv().unwrap(),
+                    ModelEdit::RetireEmptyChannel {
+                        home: original,
+                        expected_view_revision: 7
+                    }
+                );
+            } else {
+                assert!(
+                    received.try_recv().is_err(),
+                    "a delayed old close must not act on a replacement home"
+                );
+            }
+            assert!(app.channel_ui.retire_candidates.is_empty());
+        }
+    }
+
+    #[test]
+    fn close_intent_captures_only_a_confirmed_original_home() {
+        let original = captured_home();
+        for ordinal in [
+            original.creation_ordinal,
+            crate::workspace_model::PENDING_ORDINAL,
+        ] {
+            let mut app = super::super::tests::context_inspector_test_app(true);
+            let card = app.durable.cards[0].id;
+            app.workspace_model = model_with_empty_channel(crate::channel_work::Home {
+                creation_ordinal: ordinal,
+                ..original
+            });
+            Arc::make_mut(&mut app.durable)
+                .channels
+                .push(crate::model::ProjectChannel {
+                    id: original.channel,
+                    project_id: ProjectId::new(),
+                    title: "Work".into(),
+                    title_source: Default::default(),
+                    ordinal,
+                    shared: true,
+                    cards: vec![card],
+                    focused: Some(card),
+                });
+            drop(app.close_emptied_channels(&[card]));
+            assert_eq!(
+                app.channel_ui.retire_candidates.contains(&original),
+                ordinal != crate::workspace_model::PENDING_ORDINAL
+            );
+        }
+    }
 
     #[test]
     fn deletion_opens_on_cancel_and_enter_or_escape_keeps_the_channel_and_cards() {
@@ -2652,6 +2843,69 @@ mod tests {
         ));
         app.refresh_sidebar_channels();
         (app, doomed, survivor, conversation)
+    }
+
+    /// Clicking down the channel list changes where this window is and
+    /// nothing else, so the clicks are saved once, after the burst, instead of
+    /// each one projecting and copying the whole workspace on the UI thread.
+    /// Showing a channel on the way back from a change is still saved at once.
+    #[test]
+    fn opening_channels_from_the_sidebar_saves_once_after_the_burst() {
+        use super::super::terminal_output_tests::persists;
+        let (mut app, first, second, _) = channel_with_a_conversation();
+        let durable = Arc::make_mut(&mut app.durable);
+        let mut other = durable.cards[0].clone();
+        other.id = CardId::new();
+        other.kind = crate::model::CardKind::Chat(chat_session());
+        durable.cards.push(other.clone());
+        durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == second)
+            .unwrap()
+            .cards
+            .push(other.id);
+        app.refresh_sidebar_channels();
+        drop(app.select_channel(first));
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+
+        let saved = persists();
+        let mut armed = None;
+        for channel in [second, first, second] {
+            drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+                channel_id: channel,
+            })));
+            assert_eq!(app.durable.active_channel, Some(channel));
+            assert_eq!(app.workspace.order().collect::<Vec<_>>().len(), 1);
+            assert_eq!(persists(), saved, "a click alone waits for the burst");
+            assert!(app.navigation_save_pending);
+            // The burst's first click arms the one timer; later clicks don't
+            // push it back, so a long burst is still saved within the delay.
+            let generation = *armed.get_or_insert(app.navigation_save_generation);
+            assert_eq!(app.navigation_save_generation, generation);
+        }
+        let burst = app.navigation_save_generation;
+        drop(app.update(Message::NavigationSaveDue(burst)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+        assert!(!app.navigation_save_pending);
+
+        // A timer armed for a burst some other save already wrote does not
+        // cut the next burst short.
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        drop(app.select_channel(second));
+        assert_eq!(persists(), saved + 2, "a programmatic switch saves at once");
+        drop(app.update(Message::Sidebar(SidebarAction::OpenChannel {
+            channel_id: first,
+        })));
+        let stale = app.navigation_save_generation - 1;
+        drop(app.update(Message::NavigationSaveDue(stale)));
+        assert_eq!(persists(), saved + 2, "the earlier burst's timer is spent");
+        assert!(app.navigation_save_pending);
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 3);
+        assert_eq!(app.durable.active_channel, Some(first));
     }
 
     /// A channel's conversations are reachable nowhere else, so deleting one

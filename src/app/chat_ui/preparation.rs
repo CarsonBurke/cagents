@@ -241,7 +241,12 @@ impl Drop for MetadataRetirement {
     }
 }
 
-struct Shared(Option<Box<SharedData>>);
+struct Shared {
+    data: Option<Box<SharedData>>,
+    // Capture admission on the UI thread where the application owns the job.
+    // Its future may be polled on another executor thread.
+    workers: Arc<tokio::sync::Semaphore>,
+}
 struct SharedData {
     latest: Mutex<Request>,
     canonical: Mutex<Option<Canonical>>,
@@ -252,12 +257,12 @@ struct SharedData {
 impl std::ops::Deref for Shared {
     type Target = SharedData;
     fn deref(&self) -> &Self::Target {
-        self.0.as_deref().expect("live preparation owner")
+        self.data.as_deref().expect("live preparation owner")
     }
 }
 impl Drop for Shared {
     fn drop(&mut self) {
-        if let Some(data) = self.0.take() {
+        if let Some(data) = self.data.take() {
             if RECLAIMING_FLOW.with(std::cell::Cell::get) {
                 drop(data);
             } else {
@@ -268,7 +273,10 @@ impl Drop for Shared {
 }
 impl Shared {
     fn new(data: SharedData) -> Self {
-        Self(Some(Box::new(data)))
+        Self {
+            data: Some(Box::new(data)),
+            workers: workers(),
+        }
     }
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Relaxed);
@@ -1150,7 +1158,7 @@ impl Prepared {
 }
 
 /// A single background reclaimer drops only Send data. Installed output
-/// retirement retains one of the two global parser/output permits; detached
+/// retirement retains one of its application's two parser/output permits; detached
 /// canonical owners retain their existing source/item admission until dropped.
 /// Reader Rc state and renderer trees never leave the event thread.
 struct Retired {
@@ -1485,9 +1493,8 @@ impl std::hash::Hash for Job {
         self.run.hash(state);
     }
 }
-fn workers() -> &'static Arc<tokio::sync::Semaphore> {
-    static WORKERS: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
-    WORKERS.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2)))
+fn workers() -> Arc<tokio::sync::Semaphore> {
+    application_capacity!(2)
 }
 fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send>> {
     let job = job.clone();
@@ -1500,7 +1507,8 @@ fn stream(job: &Job) -> Pin<Box<dyn iced::futures::Stream<Item = Message> + Send
     }))
 }
 async fn run(shared: Arc<Shared>) -> Result<Prepared, String> {
-    let permit = workers()
+    let permit = shared
+        .workers
         .clone()
         .acquire_owned()
         .await
@@ -1791,6 +1799,69 @@ mod tests {
     }
     fn ready(prepared: Result<Prepared, String>) -> Ready {
         Ready::new(prepared)
+    }
+
+    #[test]
+    fn parser_jobs_keep_the_originating_application_admission_across_executor_threads() {
+        use iced::futures::FutureExt;
+        let source = item("A real parser job from the originating application.");
+        let mut state = configured(target(), &source);
+        state.set_provider(Provider::Claude);
+        state.stage(
+            &source,
+            false,
+            crate::settings::EditorSyntaxTheme::Auto,
+            |_, _| false,
+        );
+        let (_, shared) = job(&state);
+        let originating_workers: Arc<tokio::sync::Semaphore> = workers();
+        let observed_workers = originating_workers.clone();
+        let held = hold_retirement();
+        let (report, observed) = std::sync::mpsc::channel();
+        let (proceed, resumed) = tokio::sync::oneshot::channel();
+        let executor_thread = std::thread::spawn(move || {
+            // A fresh thread is a different test application with its own
+            // pool. Exhausting that pool must not touch the constructing UI's.
+            let _foreign_application = workers().try_acquire_many_owned(2).unwrap();
+            let executor = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            executor.block_on(async {
+                let mut output = Box::pin(run(shared));
+                // The real worker cannot pass its reclamation barrier yet.
+                assert!(output.as_mut().now_or_never().is_none());
+                report.send(observed_workers.available_permits()).unwrap();
+                if resumed.await.unwrap() {
+                    Some(output.await)
+                } else {
+                    // A broken ownership implementation must fail without
+                    // leaving a job waiting on its own foreign permit guard.
+                    None
+                }
+            })
+        });
+        let available = observed.recv().unwrap();
+        drop(held);
+        proceed.send(available == 1).unwrap();
+        let output = executor_thread.join().unwrap();
+        assert_eq!(
+            available, 1,
+            "the dispatched job must own a slot from its constructing application"
+        );
+        let output = output.expect("admitted real parser job").unwrap();
+        assert!(Arc::ptr_eq(output.item(), &source));
+        assert_eq!(originating_workers.available_permits(), 1);
+        // Discarded outputs retain their originating slot through queued
+        // storage retirement, even while the reclaimer is held.
+        let held = hold_retirement();
+        output.discard();
+        assert_eq!(originating_workers.available_permits(), 1);
+        drop(held);
+        retirement_barrier();
+        assert_eq!(originating_workers.available_permits(), 2);
+        drop(state);
+        retirement_barrier();
     }
 
     fn literal_runtime(content: ItemContent) -> (Runtime, Arc<ClientHandle>) {

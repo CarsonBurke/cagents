@@ -680,7 +680,7 @@ impl Cagents {
                 },
             };
         }
-        let closed = self.apply_viewport(update, true, true);
+        let closed = self.apply_viewport(update, true, DurableChange::Content);
         // A chat returned to a terminal is replaced only now that it
         // is closed, so no state ever holds both.
         let replacement = replacement
@@ -1251,7 +1251,7 @@ mod tests {
                 .is_empty(),
             "persist prunes closed membership after the original Home was captured"
         );
-        assert!(app.channel_work.retire_candidates.contains(&home));
+        assert!(app.channel_ui.retire_candidates.contains(&home));
         let (send, received) = async_channel::unbounded();
         app.workspace_model_tx = send;
         app.retire_settled_empty_channels();

@@ -309,8 +309,10 @@ impl Cagents {
                     .workspace
                     .add_card(card, index + 1, false)
                     .expect("saved draft has a fresh card identity");
-                presentation =
-                    Task::batch([presentation, self.apply_viewport(update, false, false)]);
+                presentation = Task::batch([
+                    presentation,
+                    self.apply_viewport(update, false, DurableChange::None),
+                ]);
             }
         } else if same_source {
             // Keep the Content object (including cursor/selection) through the

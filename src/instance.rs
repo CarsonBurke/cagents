@@ -544,6 +544,55 @@ pub fn report_startup_failure() {
     crate::diagnostics::record(crate::diagnostics::Event::StartupFailed);
 }
 
+/// A file a development daemon appends its standard error, and so its tracing
+/// and panic output, to. Daemons are spawned with standard error on
+/// `/dev/null`; `scripts/run-development --daemon-log PATH` sets this so a
+/// development run can read what its daemon did.
+pub const DEVELOPMENT_DAEMON_LOG_ENV: &str = "CAGENTS_DEVELOPMENT_DAEMON_LOG";
+
+/// Points standard error at [`DEVELOPMENT_DAEMON_LOG_ENV`]'s file when a
+/// development build names one, and removes the variable so the daemon's
+/// terminals and agents do not inherit it; children that inherit standard
+/// error, such as helpers, write to the same file. Production builds ignore
+/// the variable. A file that cannot be opened is reported on the original
+/// standard error, which a spawned daemon has on `/dev/null`.
+///
+/// # Safety
+/// Call from the single-threaded entry point: this changes the environment.
+pub unsafe fn redirect_development_daemon_log() {
+    let Some(path) = env::var_os(DEVELOPMENT_DAEMON_LOG_ENV) else {
+        return;
+    };
+    // SAFETY: the caller guarantees that no other thread accesses environment.
+    unsafe { env::remove_var(DEVELOPMENT_DAEMON_LOG_ENV) };
+    if !IS_DEVELOPMENT {
+        return;
+    }
+    let file = match OpenOptions::new()
+        .create(true)
+        .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            eprintln!(
+                "cagentsd: cannot open daemon log {}: {error}",
+                Path::new(&path).display()
+            );
+            return;
+        }
+    };
+    // SAFETY: both descriptors are open; dup2 replaces descriptor 2 atomically.
+    if unsafe { libc::dup2(file.as_raw_fd(), libc::STDERR_FILENO) } < 0 {
+        eprintln!(
+            "cagentsd: cannot write daemon log: {}",
+            io::Error::last_os_error()
+        );
+    }
+}
+
 pub fn install_tracing(_product: &'static str, default_filter: &str) {
     static INSTALLED: AtomicBool = AtomicBool::new(false);
     if INSTALLED.swap(true, Ordering::AcqRel) {
