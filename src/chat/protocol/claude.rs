@@ -6004,7 +6004,12 @@ impl History {
                 value["message"]["content"]
                     .as_str()
                     .and_then(slash_command_prompt)
-                    .is_some_and(|command| command == "/compact")
+                    .is_some_and(|command| {
+                        command
+                            .split_once(' ')
+                            .map_or(command.as_str(), |(name, _)| name)
+                            == "/compact"
+                    })
                     .then_some(CompactRecord::Command)
             };
             let message_id = value["message"]["id"].as_str().unwrap_or(uuid);
@@ -14912,36 +14917,44 @@ mod tests {
         // After its summary the transcript records /compact as a command
         // run in the terminal, and output that repeats the summary. An
         // automatic compaction has no command, so its summary stays put.
-        let mut history = correlation_history(vec![
-            json!({"type":"user","uuid":"summary","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"Summary"}}),
-            json!({"type":"user","uuid":"caveat","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}),
-            json!({"type":"user","uuid":"command","message":{"role":"user","content":"<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args></command-args>"}}),
-            json!({"type":"user","uuid":"output","repeatsCompactSummary":true,"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}),
-            json!({"type":"user","uuid":"next","message":{"role":"user","content":"Next"}}),
-        ]);
-        let mut step = Step::default();
-        let mut adapter = Claude::default();
-        for record in history.page().unwrap() {
-            adapter.history_message(&record, &mut step).unwrap();
+        for (args, typed) in [
+            ("", "/compact"),
+            ("keep the API notes", "/compact keep the API notes"),
+        ] {
+            let command = format!(
+                "<command-name>/compact</command-name>\n            <command-message>compact</command-message>\n            <command-args>{args}</command-args>"
+            );
+            let mut history = correlation_history(vec![
+                json!({"type":"user","uuid":"summary","isCompactSummary":true,"isVisibleInTranscriptOnly":true,"message":{"role":"user","content":"Summary"}}),
+                json!({"type":"user","uuid":"caveat","isMeta":true,"message":{"role":"user","content":"<local-command-caveat>Caveat</local-command-caveat>"}}),
+                json!({"type":"user","uuid":"command","message":{"role":"user","content":command}}),
+                json!({"type":"user","uuid":"output","repeatsCompactSummary":true,"message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"}}),
+                json!({"type":"user","uuid":"next","message":{"role":"user","content":"Next"}}),
+            ]);
+            let mut step = Step::default();
+            let mut adapter = Claude::default();
+            for record in history.page().unwrap() {
+                adapter.history_message(&record, &mut step).unwrap();
+            }
+            // The command comes first, as the user saw it live.
+            let delivered = deliveries(&step);
+            assert_eq!(delivered.len(), 3, "{delivered:#?}");
+            assert!(
+                matches!(&delivered[0], (Role::User, ItemContent::Text { text, .. }) if text == typed),
+                "{delivered:#?}"
+            );
+            assert_eq!(
+                delivered[1],
+                (
+                    Role::System,
+                    compaction_item("summary:0".into(), "Summary".into()).content
+                )
+            );
+            assert!(
+                matches!(&delivered[2], (Role::User, ItemContent::Text { text, .. }) if text == "Next"),
+                "{delivered:#?}"
+            );
         }
-        // The command comes first, as the user saw it live.
-        let delivered = deliveries(&step);
-        assert_eq!(delivered.len(), 3, "{delivered:#?}");
-        assert!(
-            matches!(&delivered[0], (Role::User, ItemContent::Text { text, .. }) if text == "/compact"),
-            "{delivered:#?}"
-        );
-        assert_eq!(
-            delivered[1],
-            (
-                Role::System,
-                compaction_item("summary:0".into(), "Summary".into()).content
-            )
-        );
-        assert!(
-            matches!(&delivered[2], (Role::User, ItemContent::Text { text, .. }) if text == "Next"),
-            "{delivered:#?}"
-        );
     }
 
     #[test]
