@@ -1743,6 +1743,25 @@ impl Cagents {
             {
                 continue;
             }
+            let active = match &scope {
+                Scope::Channel(id) => self.durable.active_channel == Some(*id),
+                Scope::Worktree { path, .. } => {
+                    self.durable.active_channel.is_none()
+                        && self.active_workspace.as_ref() == Some(path)
+                }
+            };
+            // Matching saved descriptors do not establish that an active
+            // strip already shows this scope. Preserve its current focus until
+            // ordinary migration settles a still-transitioning presentation.
+            if active
+                && !panes.is_empty()
+                && !self
+                    .workspace
+                    .focused()
+                    .is_some_and(|id| members.contains(&id))
+            {
+                continue;
+            }
             self.shared_views.attached.extend(
                 panes
                     .iter()
@@ -4602,6 +4621,7 @@ mod tests {
     #[test]
     fn populated_admission_checks_the_current_strip_order_before_equality() {
         let (mut app, source, _, pane) = channel_move_fixture();
+        app.active_workspace = Some("/repo".into());
         let mut next = pane.clone();
         next.id = CardId::new();
         if let CardKind::Browser(browser) = &mut next.kind {
@@ -4644,6 +4664,7 @@ mod tests {
         browser.current_url = "https://example.test/changed".parse().unwrap();
         app.admit_existing_views_without_migration();
         assert!(!app.shared_views.initialized.contains(&scope));
+        app.card_state_mut(pane.id).unwrap().kind = pane.kind.clone();
         app.shared_views.retained.insert(pane.id);
         app.admit_existing_views_without_migration();
         assert!(!app.shared_views.initialized.contains(&scope));

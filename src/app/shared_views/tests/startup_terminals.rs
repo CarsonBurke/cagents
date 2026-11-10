@@ -924,6 +924,15 @@ fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
     let (publisher, requests) = async_channel::unbounded();
     window.app.workspace_model_tx = publisher;
     let mut model = observed_window_model(&window);
+    // This saved row differs from authority, so it still needs its own
+    // migration barrier; an exact unchanged row can use the snapshot directly.
+    model
+        .views
+        .iter_mut()
+        .flat_map(|view| &mut view.panes)
+        .find(|pane| pane.id == window.cached.id)
+        .unwrap()
+        .title = "Peer updated title".into();
     let focused = window.app.workspace.focused();
     let order = window.app.workspace.order().collect::<Vec<_>>();
     drop(
