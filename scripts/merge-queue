@@ -99,6 +99,7 @@ class Queue:
                 delay = state.get("retry_at", 0) - time.time()
             if delay > 0:
                 time.sleep(delay)
+                continue
             if before_attempt:
                 before_attempt()
             result = command(["gh", "api", "--include", *arguments], self.root, check=False)
@@ -484,8 +485,9 @@ class Queue:
                         state["alert"] = alert
                         for record in state["requests"]:
                             if record["id"] in state["batch"]["ids"] or not record.get("outcome"):
-                                self.results[record["id"]] = {
-                                    "outcome": "tree-mismatch", "detail": alert, "phase": "finished"}
+                                result = {"outcome": "tree-mismatch", "detail": alert, "phase": "finished"}
+                                record.update(result)
+                                self.results[record["id"]] = result
                     self.log(alert)
                     return
                 self.finish(request, "merged", f"verified main {actual}; batch tested tree {tree}")
