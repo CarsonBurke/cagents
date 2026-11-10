@@ -15143,6 +15143,56 @@ mod tests {
         );
     }
 
+    /// The order and the call a notice names don't change what history reads:
+    /// a recorded report of waiting after a stop leaves the agent stopped, and
+    /// one naming the `SendMessage` call that resumed an agent is that agent's.
+    #[test]
+    fn history_keeps_a_stop_over_a_later_waiting_notice_and_reads_one_through_a_resume() {
+        let session = uuid::Uuid::new_v4().to_string();
+        let notice = |tool: &str, task: &str| {
+            let mut value = real_notification(
+                tool,
+                task,
+                "completed",
+                "Agent is waiting on its own background work",
+                INTERIM_NOTE_TEXT,
+                "Report",
+            );
+            value["sessionId"] = json!(session);
+            value
+        };
+        let call = |tool: &str, name: &str, result: Value| {
+            vec![
+                json!({"type":"assistant","uuid":format!("{tool}-a"),"sessionId":session,"message":{"id":format!("{tool}-m"),"role":"assistant","content":[{"type":"tool_use","id":tool,"name":name,"input":{"run_in_background":true}}]}}),
+                json!({"type":"user","uuid":format!("{tool}-r"),"sessionId":session,"toolUseResult":result,"message":{"role":"user","content":[{"type":"tool_result","tool_use_id":tool,"content":"Launched"}]}}),
+            ]
+        };
+        let launched = |task: &str| json!({"status":"async_launched","agentId":task});
+        let mut frames = call("tool-stopped", "Agent", launched("taskstopped"));
+        frames.push(json!({"type":"system","subtype":"task_updated","uuid":"stop","sessionId":session,"task_id":"taskstopped","tool_use_id":"tool-stopped","patch":{"status":"killed"}}));
+        frames.push(notice("tool-stopped", "taskstopped"));
+        frames.extend(call("tool-agent", "Agent", launched("taskagent")));
+        frames.extend(call("tool-send", "SendMessage", json!({"success":true})));
+        frames.push(notice("tool-send", "taskagent"));
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(format!("{session}.jsonl"));
+        let lines = frames
+            .iter()
+            .map(|value| format!("{value}\n"))
+            .collect::<String>();
+        std::fs::write(&file, lines).unwrap();
+        let history = History::index(std::fs::File::open(&file).unwrap(), &session).unwrap();
+        assert_eq!(
+            history.agent_status.get("tool-stopped"),
+            Some(&ToolStatus::Stopped)
+        );
+        assert_eq!(
+            history.agent_status.get("tool-agent"),
+            Some(&ToolStatus::Waiting)
+        );
+        assert_eq!(history.agent_status.get("tool-send"), None);
+    }
+
     /// The transcript Claude Code 2.1.296 wrote for a background agent that
     /// waited on its own `sleep`, then ended once it finished. Its first text
     /// notice says `completed` and "finished", and only its note says the
