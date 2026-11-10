@@ -271,10 +271,18 @@ class BuildDiskGuard(unittest.TestCase):
         # Every command the guard could find but timeout.
         tools = self.root / "tools"
         tools.mkdir()
-        for directory in os.environ["PATH"].split(os.pathsep):
+        path_bin = self.root / "path-bin"
+        path_bin.mkdir()
+        (path_bin / "dangling-command").symlink_to(self.root / "missing-command")
+        # A repeated PATH directory must not recreate an already copied,
+        # dangling symlink. Keep this reproducible with any caller's PATH.
+        for directory in [str(path_bin), str(path_bin), *os.environ["PATH"].split(os.pathsep)]:
             for entry in os.scandir(directory) if os.path.isdir(directory) else ():
-                if entry.name != "timeout" and not (tools / entry.name).exists():
-                    (tools / entry.name).symlink_to(entry.path)
+                target = tools / entry.name
+                if entry.name != "timeout" and not (target.exists() or target.is_symlink()):
+                    target.symlink_to(entry.path)
+        self.assertTrue((tools / "dangling-command").is_symlink())
+        self.assertFalse((tools / "dangling-command").exists())
         started = time.monotonic()
         result = subprocess.run(
             [str(guard), str(self.root / "absent/build/target")],
