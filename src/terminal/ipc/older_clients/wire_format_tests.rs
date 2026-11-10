@@ -205,16 +205,21 @@ impl Comparison<'_> {
         path: &str,
         container: &str,
     ) {
-        let new: Vec<_> = new
-            .iter()
-            .filter(|(field, _)| {
-                !self
-                    .omitted
-                    .iter()
-                    .any(|omitted| *omitted == (container, field.as_str()))
-            })
-            .cloned()
-            .collect();
+        // Compared the other way round, a field the daemon leaves out for
+        // the older side is one that side never sends.
+        let sent = |fields: &[(String, Shape)]| -> Vec<(String, Shape)> {
+            fields
+                .iter()
+                .filter(|(field, _)| {
+                    !self
+                        .omitted
+                        .iter()
+                        .any(|omitted| *omitted == (container, field.as_str()))
+                })
+                .cloned()
+                .collect()
+        };
+        let (old, new) = (sent(old), sent(new));
         if old.len() != new.len() {
             return self.differ(path, format!("{} fields, now {}", old.len(), new.len()));
         }
@@ -415,12 +420,14 @@ fn every_older_client_is_proven_against_its_recorded_format() {
 /// Compare lifecycle and inspection in both directions: unlike general older
 /// clients, nested enums may neither add nor remove variants. Both envelope
 /// headers are included, so proof fields and request correlation stay frozen.
-/// A variant in `restated` is sent to that older side as one it knows, so it
-/// is neither an addition it can't decode nor a removal.
+/// A variant in `restated` is sent to that older side as one it knows, and a
+/// field in `omitted` is left out for it, so neither is an addition it can't
+/// decode nor a removal.
 fn lifecycle_differences(
     older: &Shapes,
     current: &Shapes,
     restated: &[(&'static str, &'static str)],
+    omitted: &[(&'static str, &'static str)],
 ) -> Vec<String> {
     let mut changed = Vec::new();
     for (older, current) in [(older, current), (current, older)] {
@@ -431,7 +438,7 @@ fn lifecycle_differences(
             refused: Vec::new(),
             restated: restated.to_vec(),
             selected: crate::update::source::LIFECYCLE_VARIANTS,
-            omitted: Vec::new(),
+            omitted: omitted.to_vec(),
             visited: BTreeSet::new(),
             differences: Vec::new(),
         };
@@ -459,10 +466,11 @@ fn every_current_client_update_source_preserves_the_frozen_lifecycle_and_inspect
     for protocol in crate::update::source::current_client_protocols() {
         let older = recorded(protocol);
         let restated = since(RESTATED_VARIANTS, protocol);
-        let mut changed = lifecycle_differences(&older, &current_recording, &restated);
+        let omitted = since(OMITTED_FIELDS, protocol);
+        let mut changed = lifecycle_differences(&older, &current_recording, &restated, &omitted);
         // Also compare actual Rust types: regenerating the current fixture
         // cannot bless an incompatible change to an admitted source's subset.
-        changed.extend(lifecycle_differences(&older, &current, &restated));
+        changed.extend(lifecycle_differences(&older, &current, &restated, &omitted));
         assert!(
             changed.is_empty(),
             "update source protocol {protocol} no longer has this build's frozen lifecycle and inspector wire format:\n{}",
@@ -508,7 +516,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
                     .unwrap();
                 variants.swap(index, index - 1);
                 assert!(
-                    !lifecycle_differences(&baseline, &changed, &[]).is_empty(),
+                    !lifecycle_differences(&baseline, &changed, &[], &[]).is_empty(),
                     "protocol {protocol}: inspector variant {name} must be frozen"
                 );
             }
@@ -523,7 +531,7 @@ fn inspector_proof_detects_each_request_response_and_reachable_history_change() 
             panic!()
         };
         fields.push(("future_history_field".into(), Shape::Bool));
-        assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+        assert!(!lifecycle_differences(&baseline, &changed, &[], &[]).is_empty());
     }
 }
 
@@ -544,7 +552,7 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.swap(0, 1);
-    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[]).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Struct(fields) = changed.containers.get_mut(&key("DaemonImpact")).unwrap()
@@ -552,14 +560,14 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     fields.push(("future_field".into(), Shape::Bool));
-    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[]).is_empty());
 
     let mut changed = baseline.clone();
     let Container::Enum(variants) = changed.containers.get_mut(&key("Disposition")).unwrap() else {
         panic!()
     };
     variants.push(("future_variant".into(), Some(Fields::Unit)));
-    assert!(!lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(!lifecycle_differences(&baseline, &changed, &[], &[]).is_empty());
 
     // The newer daemon can evolve unrelated agent operations independently.
     let mut changed = baseline.clone();
@@ -567,5 +575,5 @@ fn lifecycle_proof_detects_variant_positions_and_reachable_payload_changes() {
         panic!()
     };
     variants.push(("unrelated_variant".into(), Some(Fields::Unit)));
-    assert!(lifecycle_differences(&baseline, &changed, &[]).is_empty());
+    assert!(lifecycle_differences(&baseline, &changed, &[], &[]).is_empty());
 }
