@@ -3539,6 +3539,23 @@ fn only_an_agents_owner_reads_its_requests_and_controls_it() {
 }
 
 /// Polls until the agent's latest run waits on a request, and returns them.
+fn awaiting_answer(host: &SharedHost, run: RunId) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let run = registry(host)
+            .unwrap()
+            .lock()
+            .unwrap()
+            .agent_run(run)
+            .unwrap();
+        if run.state == State::Waiting {
+            return;
+        }
+        assert!(Instant::now() < deadline, "run never waited: {run:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -3884,6 +3901,8 @@ fn an_owner_answers_and_interrupts_only_its_own_active_run() {
     let [asked] = asked.as_slice() else {
         panic!("{asked:?}")
     };
+    // The request is listed before the run's own state records the wait.
+    awaiting_answer(&host, accepted.run.id);
     assert_eq!(
         status(&host, &owner, agent).unwrap().1.state,
         State::Waiting
