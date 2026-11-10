@@ -4854,10 +4854,14 @@ impl Runtime {
         let mut rows: Vec<Element<'_, Message>> =
             vec![design::caption(format!("Running in the background · {}", commands.len())).into()];
         for command in commands {
+            let name = match command.description.trim() {
+                "" => "Command",
+                description => description,
+            };
             rows.push(
                 widget::row::with_children(vec![
                     crate::ui_controls::passive_icon(Icon::Terminal, design::COMPACT_ICON_SIZE),
-                    design::heading(command.description.as_str())
+                    design::heading(name)
                         .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                         .width(Length::Fill)
                         .ellipsize(iced::widget::text::Ellipsize::End(
@@ -4870,10 +4874,7 @@ impl Runtime {
                         "Stop"
                     })
                     .icon(Icon::Stop)
-                    .name(format!(
-                        "Stop the background command {}",
-                        command.description
-                    ))
+                    .name(format!("Stop the background command {name}"))
                     .on_press_maybe((available && !command.stopping).then(|| {
                         action(Action::Command(
                             target,

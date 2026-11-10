@@ -1026,7 +1026,19 @@ impl Claude {
             .filter(|task| task.background)
             .map(|task| chat::BackgroundCommand {
                 id: task.id.clone(),
-                description: task.description.clone(),
+                // Claude Code names a command without a description by the
+                // command itself; a task that names it by nothing still has
+                // its call's command to go by.
+                description: if task.description.trim().is_empty() {
+                    task.call
+                        .as_deref()
+                        .and_then(|call| self.tool_inputs.get(&ScopedId::new(None, call)))
+                        .and_then(|input| serde_json::from_str::<Value>(input).ok())
+                        .and_then(|input| input["command"].as_str().map(str::to_owned))
+                        .unwrap_or_default()
+                } else {
+                    task.description.clone()
+                },
                 stopping: task.stopping,
             })
             .collect()
@@ -5650,9 +5662,7 @@ fn apply_result(
         | ItemContent::Delivery { .. } => {}
     }
 }
-/// Whether a failed result is the call being refused or cut short rather
-/// than failing: the person declined it, or it was interrupted before it
-/// finished. Claude Code reports both as errors, in fixed wording.
+
 /// Whether a main-turn result is how Claude ends a turn something cut short,
 /// and says nothing else of itself. Claude names that ending; any other one
 /// is the turn's own, and a failure with its own account is that failure.
@@ -5676,6 +5686,9 @@ fn cut_short(frame: &Value) -> bool {
     }
 }
 
+/// Whether a failed result is the call being refused or cut short rather
+/// than failing: the person declined it, or it was interrupted before it
+/// finished. Claude Code reports both as errors, in fixed wording.
 fn refusal(text: &str, structured: &Value) -> Option<ToolStatus> {
     let text = text.trim_start();
     if text.starts_with("The user doesn't want to proceed with this tool use") {
@@ -21105,6 +21118,28 @@ mod tests {
                     },
                     ..
                 })
+            )));
+        }
+
+        #[test]
+        fn a_background_command_without_a_description_is_named_by_its_command() {
+            let mut adapter = working();
+            adapter
+                .receive(
+                    json!({"type":"assistant","uuid":"a1","message":{"id":"m1","content":[
+                    {"type":"tool_use","id":"t1","name":"Bash",
+                     "input":{"command":"sleep 99","run_in_background":true}}]}}),
+                )
+                .unwrap();
+            let step = adapter
+                .receive(json!({"type":"system","subtype":"task_started","uuid":"s1",
+                    "task_id":"b1","tool_use_id":"t1","task_type":"local_bash",
+                    "description":""}))
+                .unwrap();
+            assert!(step.events.iter().any(|event| matches!(
+                event,
+                Event::BackgroundCommands(commands)
+                    if commands.iter().any(|c| c.id == "b1" && c.description == "sleep 99")
             )));
         }
 
