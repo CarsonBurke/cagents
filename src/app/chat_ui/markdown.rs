@@ -2728,3 +2728,6 @@ fn completed_source_discards_parser_scratch_without_discarding_rendered_content(
 
 #[cfg(test)]
 mod heap_cost;
+
+#[cfg(test)]
+mod storage_cost;
