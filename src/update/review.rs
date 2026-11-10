@@ -105,7 +105,7 @@ fn items(preview: &Preview) -> Vec<Item> {
                 )
                 && let Some(live) = live
             {
-                detail = format!("{}; {detail}", clause(&live.reason));
+                detail = format!("{}; {detail}", live_fact(live));
             }
 
             if let Some(stopped) = stopped {
@@ -121,14 +121,13 @@ fn items(preview: &Preview) -> Vec<Item> {
                 );
                 if outcome == Outcome::Interrupted {
                     outcome = Outcome::Paused;
+                    let interruption = live.map(|session| live_fact(session)).unwrap_or_default();
                     detail = format!(
-                        "its current turn is interrupted; after the update: {}",
+                        "{interruption}; after the update: {}",
                         recovery_detail(&stopped.reason, &stopped.recovery, false)
                     );
                 } else if matches!(outcome, Outcome::Working | Outcome::Attention) {
-                    let reason = live
-                        .map(|session| clause(&session.reason))
-                        .unwrap_or_default();
+                    let reason = live.map(|session| live_fact(session)).unwrap_or_default();
                     detail = format!("{reason}; after the update: {recovery}");
                 } else {
                     outcome = Outcome::Paused;
@@ -142,7 +141,7 @@ fn items(preview: &Preview) -> Vec<Item> {
                         outcome,
                         Outcome::Attention | Outcome::Working | Outcome::Interrupted
                     ) {
-                        detail = clause(&live.reason);
+                        detail = live_fact(live);
                     }
                 }
             }
@@ -267,6 +266,26 @@ pub fn render_review(preview: &Preview) -> String {
         writeln!(output, "  {notice}").unwrap();
     }
     output
+}
+
+/// A source reason can combine live activity with its old destination plan.
+/// When merging outcomes, carry only activity; this review owns the destination.
+fn live_fact(session: &super::impact::SessionImpact) -> String {
+    match session.disposition {
+        Disposition::WaitsForIdle => "finishing its turn".into(),
+        Disposition::Interrupted => {
+            let tasks = session.interrupted_subagents.len();
+            if tasks == 0 {
+                "its current turn is interrupted".into()
+            } else {
+                let noun = if tasks == 1 { "task" } else { "tasks" };
+                format!(
+                    "its current turn and {tasks} background {noun} stop; background work will not resume automatically"
+                )
+            }
+        }
+        _ => clause(&session.reason),
+    }
 }
 
 fn clause(reason: &str) -> String {
@@ -630,11 +649,50 @@ mod tests {
 
     #[test]
     fn a_known_paused_interruption_never_promises_automatic_resume() {
+        for tasks in [0, 2] {
+            let mut preview = preview();
+            let warning = if tasks == 0 {
+                "The active turn will be interrupted; the saved conversation will resume."
+            } else {
+                "The active turn and 2 running background subagents will stop; background work will not resume automatically."
+            };
+            let mut live = session("interrupted · alpha", Disposition::Interrupted, warning);
+            live.interrupted_subagents = (0..tasks)
+                .map(|index| format!("background-task-{index}"))
+                .collect();
+            preview.stopped.push(StoppedPane {
+                pane: live.id,
+                kind: StoppedKind::Chat,
+                label: live.title.clone(),
+                reason: "its conversation could not be confirmed".into(),
+                recovery: CHAT_RECOVERY.into(),
+            });
+            preview.daemon.as_mut().unwrap().sessions.push(live);
+            let review = render_review(&preview);
+            assert!(review.contains("Come back paused (1)"), "{review}");
+            if tasks > 0 {
+                assert!(review.contains("its current turn and 2 background tasks stop; background work will not resume automatically; after the update:"), "{review}");
+            } else {
+                assert!(
+                    review.contains("its current turn is interrupted; after the update:"),
+                    "{review}"
+                );
+            }
+            assert!(
+                !review.contains("the saved conversation will resume"),
+                "{review}"
+            );
+            assert!(!review.contains("Interrupted and resumed"), "{review}");
+        }
+    }
+
+    #[test]
+    fn working_panes_with_manual_recovery_do_not_repeat_the_sources_resume_promise() {
         let mut preview = preview();
         let live = session(
-            "interrupted · alpha",
-            Disposition::Interrupted,
-            "The active turn will be interrupted",
+            "working · alpha",
+            Disposition::WaitsForIdle,
+            "The update will wait for this conversation to become idle, then resume it.",
         );
         preview.stopped.push(StoppedPane {
             pane: live.id,
@@ -645,12 +703,14 @@ mod tests {
         });
         preview.daemon.as_mut().unwrap().sessions.push(live);
         let review = render_review(&preview);
-        assert!(review.contains("Come back paused (1)"), "{review}");
-        assert!(
-            review.contains("its current turn is interrupted; after the update:"),
+        assert!(review.contains("Working now (1)"), "{review}");
+        assert!(review.contains("working · alpha: finishing its turn; after the update: its conversation could not be confirmed"), "{review}");
+        assert!(!review.contains("then resume it"), "{review}");
+        assert_eq!(
+            review.matches("    working · alpha:").count(),
+            1,
             "{review}"
         );
-        assert!(!review.contains("Interrupted and resumed"), "{review}");
     }
 
     #[test]
