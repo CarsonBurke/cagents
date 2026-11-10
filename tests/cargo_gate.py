@@ -2634,6 +2634,8 @@ class CpuPressureAdmission(TwoSlots):
         sed.chmod(0o700)
         temporary = self.root / "start-tmp"
         temporary.mkdir(exist_ok=True)
+        registry = self.root / "start-registry"
+        registry.mkdir(exist_ok=True)
         command = self.root / "start-command"
         command.unlink(missing_ok=True)
         self.report("0.00")
@@ -2647,7 +2649,7 @@ class CpuPressureAdmission(TwoSlots):
             "CAGENTS_BUILD_MEMORY_PRESSURE": "0",
             "CAGENTS_BUILD_CPU_SETTLE_SECS": "60",
             "CAGENTS_BUILD_CPU_PRESSURE_FILE": str(self.pressure),
-            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_ADMISSION_TIMEOUT_SECONDS": "1",
+            "CAGENTS_BUILD_COST_GIB": "7", "CAGENTS_BUILD_REGISTRY": str(registry),
             "CAGENTS_BUILD_REMOTE": "local", "CAGENTS_BUILD_INSTALLED_GATE": "",
         }
         now = self.uptime()
@@ -2669,6 +2671,24 @@ class CpuPressureAdmission(TwoSlots):
                 start_new_session=True,
             )
             try:
+                # Observe the decision, not whether startup fits a one-second
+                # budget. Dedicated AdmissionTimeout cases cover expiry.
+                def refusals():
+                    return [path for path in registry.glob("wait-gate-*")
+                            if not path.name.endswith(".new")]
+
+                deadline = time.monotonic() + 10
+                while process.poll() is None and not refusals():
+                    self.assertLess(time.monotonic(), deadline, "no admission decision")
+                    time.sleep(0.01)
+                refused = refusals()
+                if waits:
+                    self.assertTrue(refused, "fresh holder did not refuse admission")
+                    self.assertEqual(int(refused[0].read_text().split()[0]), process.pid)
+                    self.assertFalse(command.exists())
+                    process.send_signal(signal.SIGTERM)
+                else:
+                    self.assertFalse(refused, "fixture with room refused admission")
                 _stdout, stderr = process.communicate(timeout=5)
             finally:
                 if process.poll() is None:
@@ -2683,9 +2703,8 @@ class CpuPressureAdmission(TwoSlots):
                 with (self.root / name).open("a") as probe:
                     fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
             self.assertFalse((self.root / "slot.lock.cost").exists())
-            self.assertEqual((process.returncode, command.exists()), (124, False) if waits else (0, True), stderr)
-            if waits:
-                self.assertIn("admission", stderr.lower())
+            self.assertEqual((process.returncode, command.exists()), (143, False) if waits else (0, True), stderr)
+            self.assertFalse(list(registry.glob("wait-gate-*")), "refusal record leaked")
         finally:
             for holder in holders:
                 holder.close()
