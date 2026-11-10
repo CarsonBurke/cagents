@@ -122,8 +122,27 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
 const UNCHECKED: &str = "could not be checked before the update";
 const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
 const TERMINAL_RECOVERY: &str = "Press Reconnect in the pane to check the saved terminal";
-const CONSOLE_REASON: &str = "keeps running in its terminal; its chat panel disconnects";
-const CONSOLE_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu afterwards";
+const CONSOLE_REFUSAL: &str = "This update cannot keep a running agent console connected. Finish or close the console, then retry.";
+
+/// An unsupported live console is an update refusal, not uncertain pane
+/// evidence that can be represented as a stopped pane or an informational note.
+#[derive(Debug, PartialEq, Eq)]
+enum LiveInspectionError {
+    Unchecked(String),
+    UnresumableConsole,
+}
+
+impl From<String> for LiveInspectionError {
+    fn from(reason: String) -> Self {
+        Self::Unchecked(reason)
+    }
+}
+
+impl From<&'static str> for LiveInspectionError {
+    fn from(reason: &'static str) -> Self {
+        Self::Unchecked(reason.into())
+    }
+}
 
 fn stop_unchecked(
     inspection: &mut SourceInspection,
@@ -274,7 +293,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         }
     };
     let mut checked_saved = HashSet::new();
-    let inspect_live = (|| -> Result<(), String> {
+    let inspect_live = (|| -> Result<(), LiveInspectionError> {
         let initial_inventory = reader.list()?;
         let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
         let mut cold_history = Vec::new();
@@ -332,6 +351,10 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             .proof
             .as_ref()
             .ok_or("Source service is unavailable")?;
+        let matched_cli = crate::companion::Product::Cli
+            .beside_current()
+            .map_err(|_| "Cannot inspect the destination console companion")?;
+        qualify_live_consoles(&terminals, proof, request.require_resumable, &matched_cli)?;
         record_live_panes(
             &mut inspection,
             &inventory,
@@ -339,9 +362,6 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             proof,
             request.require_resumable,
         );
-        let matched_cli = crate::companion::Product::Cli
-            .beside_current()
-            .map_err(|_| "Cannot inspect the destination console companion")?;
         let mut ids = HashSet::new();
         for session in &inventory {
             check_deadline(deadline)?;
@@ -354,38 +374,12 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
                 );
                 continue;
             }
-            if request.require_resumable
-                && session.terminal.as_ref().is_some_and(|terminal| {
-                    terminal.continuity.can_resume_live(proof)
-                        && qualify_terminal(terminal, &terminals, proof).is_ok()
-                        && qualify_console_migration(terminal, &matched_cli).is_err()
-                })
-            {
-                console_keeps_running(
-                    &mut inspection,
-                    session.id,
-                    crate::update::impact::SessionKind::NativeChat,
-                );
-            } else if validate_live_chat(session, request.require_resumable).is_err() {
+            if validate_live_chat(session, request.require_resumable).is_err() {
                 inspection.stop(
                     session.id,
                     StoppedKind::Chat,
                     "its conversation could not be confirmed",
                     CHAT_RECOVERY,
-                );
-            }
-        }
-        for terminal in &terminals {
-            check_deadline(deadline)?;
-            if request.require_resumable
-                && !inventory.iter().any(|chat| chat.id == terminal.session.id)
-                && terminal.session.continuity.can_resume_live(proof)
-                && qualify_console_migration(&terminal.session, &matched_cli).is_err()
-            {
-                console_keeps_running(
-                    &mut inspection,
-                    terminal.session.id,
-                    crate::update::impact::SessionKind::Terminal,
                 );
             }
         }
@@ -467,9 +461,29 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         }
         Ok(())
     })();
-    if let Err(reason) = inspect_live {
-        inspection_failure(&mut inspection, &reason);
-        stop_unchecked(&mut inspection, &saved, &checked_saved, &current_boot);
+    finish_live_inspection(
+        inspection,
+        inspect_live,
+        &saved,
+        &checked_saved,
+        &current_boot,
+    )
+}
+
+fn finish_live_inspection(
+    mut inspection: SourceInspection,
+    result: Result<(), LiveInspectionError>,
+    saved: &[(crate::model::CardId, CardKind)],
+    checked_saved: &HashSet<crate::model::TerminalId>,
+    current_boot: &crate::model::BootId,
+) -> Result<SourceInspection, String> {
+    match result {
+        Err(LiveInspectionError::UnresumableConsole) => return Err(CONSOLE_REFUSAL.into()),
+        Err(LiveInspectionError::Unchecked(reason)) => {
+            inspection_failure(&mut inspection, &reason);
+            stop_unchecked(&mut inspection, saved, checked_saved, current_boot);
+        }
+        Ok(()) => {}
     }
     Ok(inspection)
 }
@@ -558,21 +572,6 @@ fn record_live_panes(
             replaces_service,
         );
     }
-}
-
-fn console_keeps_running(
-    inspection: &mut SourceInspection,
-    id: crate::model::TerminalId,
-    kind: crate::update::impact::SessionKind,
-) {
-    inspection.details.panes.insert(
-        id,
-        InspectedPane {
-            kind,
-            outcome: SavedOutcome::KeepsRunning,
-            detail: format!("{CONSOLE_REASON}. {CONSOLE_RECOVERY}."),
-        },
-    );
 }
 
 fn inspection_failure(inspection: &mut SourceInspection, reason: &str) {
@@ -1839,9 +1838,29 @@ fn check_deadline(deadline: Instant) -> Result<(), String> {
     Ok(())
 }
 
+/// The authenticated terminal roster includes both standalone terminal panes
+/// and terminals attached to chat panels. Inspect every live accepted console:
+/// its provider surviving does not preserve the console's daemon connection.
+fn qualify_live_consoles(
+    terminals: &[v77::Terminal],
+    proof: &HostSessionProof,
+    require_resumable: bool,
+    matched_cli: &Path,
+) -> Result<(), LiveInspectionError> {
+    if require_resumable
+        && terminals.iter().any(|terminal| {
+            terminal.session.continuity.can_resume_live(proof)
+                && qualify_console_migration(&terminal.session, matched_cli).is_err()
+        })
+    {
+        return Err(LiveInspectionError::UnresumableConsole);
+    }
+    Ok(())
+}
+
 /// A console's issued recipe is not permission to replay a different installed
 /// CLI. Even an unchanged path cannot prove that its existing ControlClient
-/// survives the source daemon stopping. Defer until an exact, typed migration
+/// survives the source daemon stopping. Refuse until an exact, typed migration
 /// route qualifies both the accepted console and its retained provider.
 fn qualify_console_migration(
     terminal: &crate::model::TerminalSession,
@@ -2073,8 +2092,16 @@ mod tests {
 
     #[test]
     fn live_inspection_failure_keeps_one_readable_reason() {
-        let mut inspection = SourceInspection::default();
-        inspection_failure(&mut inspection, "Cannot connect to the source service");
+        let inspection = finish_live_inspection(
+            SourceInspection::default(),
+            Err(LiveInspectionError::Unchecked(
+                "Cannot connect to the source service".into(),
+            )),
+            &[],
+            &HashSet::new(),
+            &current_boot(),
+        )
+        .unwrap();
         assert_eq!(
             inspection.details.notices,
             [
@@ -2105,54 +2132,132 @@ mod tests {
     }
 
     #[test]
-    fn accepted_console_migration_defers_even_when_the_cli_path_is_unchanged() {
+    fn unsupported_live_console_refuses_update_instead_of_claiming_it_keeps_running() {
         let matched = Path::new("/installed/new/bin/cagents");
-        let recipe = crate::model::LaunchRecipe {
-            program: matched.to_string_lossy().into_owned(),
-            arguments: vec![
-                "agent".into(),
-                "console".into(),
-                crate::model::AgentId::new().to_string(),
-            ],
-            working_directory: "/private-directory".into(),
-            environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
-            unset_environment: Default::default(),
+        let proof = session().proof.unwrap();
+        let mut console = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            LaunchRecipe {
+                program: matched.to_string_lossy().into_owned(),
+                arguments: vec![
+                    "agent".into(),
+                    "console".into(),
+                    crate::model::AgentId::new().to_string(),
+                ],
+                working_directory: "/private-directory".into(),
+                environment: [("PRIVATE_ACCOUNT".into(), "never-print-this".into())].into(),
+                unset_environment: Default::default(),
+            },
+            None,
+        );
+        console.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
         };
-        let mut terminal =
-            crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None)
-                .session;
-        let same_path = qualify_console_migration(&terminal, matched).unwrap_err();
-        assert!(same_path.contains("no qualified reconnection"));
-        terminal.launch.program = "/installed/old/bin/cagents".into();
-        let older = qualify_console_migration(&terminal, matched).unwrap_err();
-        assert!(older.contains("different matched CLI installation"));
-        for error in [same_path, older] {
-            let mut inspection = SourceInspection::default();
-            console_keeps_running(
-                &mut inspection,
-                terminal.id,
-                crate::update::impact::SessionKind::Terminal,
-            );
-            assert!(inspection.stopped.is_empty());
-            let pane = &inspection.details.panes[&terminal.id];
-            assert_eq!(pane.outcome, SavedOutcome::KeepsRunning);
-            assert_eq!(
-                pane.detail,
-                "keeps running in its terminal; its chat panel disconnects. Choose Resume conversation in the new tab (+) menu afterwards."
-            );
-            assert!(!error.contains("private-directory"));
-            assert!(!error.contains("never-print-this"));
-            assert!(!error.contains("/installed"));
+        for program in [matched.to_str().unwrap(), "/installed/old/bin/cagents"] {
+            console.session.launch.program = program.into();
+            let roster = vec![v77::Terminal::from(console.clone())];
+            let result = qualify_live_consoles(&roster, &proof, true, matched);
+            assert_eq!(result, Err(LiveInspectionError::UnresumableConsole));
+            let refused = finish_live_inspection(
+                SourceInspection::default(),
+                result,
+                &[],
+                &HashSet::new(),
+                &proof.boot_id,
+            )
+            .unwrap_err();
+            assert_eq!(refused, CONSOLE_REFUSAL);
+            assert!(!refused.contains("private-directory"));
+            assert!(!refused.contains("never-print-this"));
+            assert!(!refused.contains("/installed"));
+            // Keeping the source daemon does not require console migration.
+            assert!(qualify_live_consoles(&roster, &proof, false, matched).is_ok());
         }
-        terminal.launch.arguments = vec!["--login".into()];
-        assert!(qualify_console_migration(&terminal, matched).is_ok());
-        terminal.launch.arguments = vec![
-            "--remote".into(),
-            "unix://owned-listener".into(),
-            "resume".into(),
-            "exact-thread".into(),
+        // The same console can back a chat panel; it remains a live terminal
+        // in the authoritative roster and cannot be downgraded to a chat note.
+        let mut chat = session();
+        chat.id = console.session.id;
+        chat.terminal = Some(console.session.clone());
+        let mut inspection = SourceInspection::default();
+        record_live_panes(
+            &mut inspection,
+            &[chat],
+            &[console.clone().into()],
+            &proof,
+            true,
+        );
+        assert!(
+            finish_live_inspection(
+                inspection,
+                qualify_live_consoles(&[console.into()], &proof, true, matched),
+                &[],
+                &HashSet::new(),
+                &proof.boot_id,
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn console_refusal_does_not_affect_shells_inactive_terminals_or_other_owners() {
+        let matched = Path::new("/installed/new/bin/cagents");
+        let proof = session().proof.unwrap();
+        let mut descriptor = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+            TerminalId::new(),
+            session().launch.recipe,
+            None,
+        );
+        // A saved launch with no accepted live terminal does not block updates.
+        descriptor.session.launch.program = matched.to_string_lossy().into_owned();
+        descriptor.session.launch.arguments = vec![
+            "agent".into(),
+            "console".into(),
+            crate::model::AgentId::new().to_string(),
         ];
-        assert!(qualify_console_migration(&terminal, matched).is_ok());
+        assert!(qualify_live_consoles(&[descriptor.clone().into()], &proof, true, matched).is_ok());
+        descriptor.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: crate::model::HostIncarnation::new("different-owner"),
+        };
+        assert!(qualify_live_consoles(&[descriptor.clone().into()], &proof, true, matched).is_ok());
+        descriptor.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        for (program, arguments) in [
+            ("bash", vec!["--login"]),
+            (matched.to_str().unwrap(), vec!["--login"]),
+            (
+                "codex",
+                vec![
+                    "--remote",
+                    "unix://owned-listener",
+                    "resume",
+                    "exact-thread",
+                ],
+            ),
+        ] {
+            descriptor.session.launch.program = program.into();
+            descriptor.session.launch.arguments =
+                arguments.into_iter().map(str::to_owned).collect();
+            let roster = vec![v77::Terminal::from(descriptor.clone())];
+            let result = qualify_live_consoles(&roster, &proof, true, matched);
+            assert!(result.is_ok());
+            let mut inspection = SourceInspection::default();
+            record_live_panes(&mut inspection, &[], &roster, &proof, true);
+            let inspected =
+                finish_live_inspection(inspection, result, &[], &HashSet::new(), &proof.boot_id)
+                    .unwrap();
+            assert!(inspected.stopped.is_empty());
+            assert_eq!(
+                inspected.details.panes[&descriptor.session.id].outcome,
+                SavedOutcome::KeepsRunning
+            );
+        }
     }
 
     pub(super) fn session() -> Session {
