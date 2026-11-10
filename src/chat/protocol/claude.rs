@@ -332,20 +332,9 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
         ) && inline.is_none()
         {
             // Replaced below; never replay the positional prompt from the TUI recipe.
-        } else if matches!(
-            flag,
-            "--model"
-                | "--agent"
-                | "--permission-mode"
-                | "--settings"
-                | "--setting-sources"
-                | "--effort"
-                | "--system-prompt"
-                | "--append-system-prompt"
-                | "--max-turns"
-                | "--max-budget-usd"
-                | "--fallback-model"
-        ) {
+        } else if crate::chat::fresh::claude_arity(flag)
+            == Some(crate::chat::fresh::ArgumentArity::Value)
+        {
             let value = inline
                 .or_else(|| args.next().map(String::as_str))
                 .ok_or_else(|| format!("Missing value for Claude {flag}"))?;
@@ -359,17 +348,9 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                 return Err(format!("Unknown Claude launch permission mode {value}"));
             }
             result.extend([flag.into(), value.into()]);
-        } else if matches!(
-            flag,
-            "--add-dir"
-                | "--mcp-config"
-                | "--plugin-dir"
-                | "--allowedTools"
-                | "--allowed-tools"
-                | "--disallowedTools"
-                | "--disallowed-tools"
-                | "--tools"
-        ) {
+        } else if crate::chat::fresh::claude_arity(flag)
+            == Some(crate::chat::fresh::ArgumentArity::Values)
+        {
             result.push(flag.into());
             if let Some(value) = inline {
                 result.push(value.into());
@@ -382,17 +363,9 @@ fn arguments(launch: &Launch) -> Result<Vec<String>, String> {
                     return Err(format!("Missing value for Claude {flag}"));
                 }
             }
-        } else if matches!(
-            flag,
-            "--bare"
-                | "--safe-mode"
-                | "--no-chrome"
-                | "--chrome"
-                | "--strict-mcp-config"
-                | "--disable-slash-commands"
-                | "--dangerously-skip-permissions"
-                | "--allow-dangerously-skip-permissions"
-        ) && inline.is_none()
+        } else if crate::chat::fresh::claude_arity(flag)
+            == Some(crate::chat::fresh::ArgumentArity::Switch)
+            && inline.is_none()
         {
             result.push(arg.clone());
         } else if !flag.starts_with('-') {
@@ -17800,5 +17773,172 @@ mod startup_history_retryability_tests {
             ..Claude::default()
         };
         assert!(adapter.initialize_for_start().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod fresh_recipe_constructor_tests {
+    use super::*;
+
+    const SAVED: &str = "00000000-0000-4000-8000-000000000001";
+    const FOREIGN: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn source(root: &Path, arguments: Vec<String>) -> chat::Session {
+        let home = root.join("home");
+        let cwd = root.join("project");
+        let config = home.join(".claude");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: Provider::Claude,
+                session_id: Some(SAVED.into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: root.join("claude").to_string_lossy().into_owned(),
+                    arguments,
+                    working_directory: cwd,
+                    environment: std::collections::BTreeMap::from([
+                        ("HOME".into(), home.to_string_lossy().into_owned()),
+                        (
+                            "CLAUDE_CONFIG_DIR".into(),
+                            config.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                    unset_environment: ["ANTHROPIC_API_KEY".into()].into(),
+                },
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "old-host".into(),
+                boot_id: "old-boot".into(),
+                host_incarnation: "old-incarnation".into(),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
+        }
+    }
+
+    #[test]
+    fn fresh_recipe_constructor_admits_claude_selectors_without_reusing_identity_or_payload_flags()
+    {
+        let root = tempfile::tempdir().unwrap();
+        for (model, system, tool) in [
+            ("--resume", "resume", "--resume"),
+            ("resume", "--resume", "resume"),
+        ] {
+            let payload = vec![
+                "--model".to_owned(),
+                model.to_owned(),
+                "--system-prompt".to_owned(),
+                system.to_owned(),
+                format!("--tools={tool}"),
+            ];
+            let selectors = [
+                vec!["--resume".into(), SAVED.into()],
+                vec![format!("--resume={SAVED}")],
+                vec!["-r".into(), SAVED.into()],
+                vec![format!("-r={SAVED}")],
+                vec!["--session-id".into(), SAVED.into()],
+                vec![format!("--session-id={SAVED}")],
+                vec![
+                    "--resume".into(),
+                    SAVED.into(),
+                    format!("-r={SAVED}"),
+                    "--session-id".into(),
+                    SAVED.into(),
+                ],
+            ];
+            for selector in selectors {
+                let saved = source(root.path(), [payload.clone(), selector.clone()].concat());
+                let original = saved.clone();
+                let fresh = saved
+                    .fresh_start()
+                    .expect("an exact selector can be removed for Fresh");
+                assert_eq!(saved, original, "Fresh must leave the saved card untouched");
+                assert_eq!(
+                    fresh.id, saved.id,
+                    "Fresh replaces the same pane's conversation"
+                );
+                assert!(fresh.launch.session_id.is_none());
+                assert!(fresh.proof.is_none());
+                assert!(fresh.terminal.is_none());
+                assert!(fresh.owned_codex_listener.is_none());
+                assert_eq!(
+                    fresh.native_continuity,
+                    chat::NativeContinuity::ReconnectOnly
+                );
+                assert_eq!(fresh.launch.recipe.arguments, payload, "{selector:?}");
+                assert_eq!(
+                    fresh.launch.recipe.environment,
+                    saved.launch.recipe.environment
+                );
+                assert_eq!(
+                    fresh.launch.recipe.unset_environment,
+                    saved.launch.recipe.unset_environment
+                );
+                assert_eq!(
+                    fresh.launch.recipe.working_directory,
+                    saved.launch.recipe.working_directory
+                );
+                let (spec, mut adapter) = create_for_start(&fresh.launch).unwrap();
+                assert!(
+                    spec.arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--model", model])
+                );
+                assert!(
+                    spec.arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--system-prompt", system])
+                );
+                assert!(
+                    spec.arguments
+                        .windows(2)
+                        .any(|pair| pair == ["--tools", tool])
+                );
+                let generated: Vec<_> = spec
+                    .arguments
+                    .iter()
+                    .filter_map(|arg| arg.strip_prefix("--session-id="))
+                    .collect();
+                assert_eq!(generated.len(), 1);
+                assert_ne!(generated[0], SAVED);
+                assert!(uuid::Uuid::parse_str(generated[0]).is_ok());
+                assert!(!spec.arguments.iter().any(|arg| arg == SAVED));
+                let initial = adapter.initialize_for_start().unwrap();
+                assert!(
+                    !serde_json::to_string(&initial.writes)
+                        .unwrap()
+                        .contains(SAVED)
+                );
+                assert_eq!(saved, original);
+                assert!(
+                    !root.path().join("claude").exists(),
+                    "constructors must not execute a provider"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_recipe_constructor_rejects_foreign_or_malformed_claude_selectors_without_mutating_source()
+     {
+        let root = tempfile::tempdir().unwrap();
+        for arguments in [
+            vec!["--resume".into()],
+            vec!["--resume=".into()],
+            vec!["-r=".into()],
+            vec!["--session-id".into()],
+            vec!["--resume".into(), FOREIGN.into()],
+            vec![format!("--session-id={FOREIGN}")],
+            vec!["--resume".into(), "latest".into()],
+            vec!["--resume".into(), SAVED.into(), format!("-r={FOREIGN}")],
+        ] {
+            let saved = source(root.path(), arguments.clone());
+            let original = saved.clone();
+            assert!(saved.fresh_start().is_none(), "{arguments:?}");
+            assert_eq!(saved, original);
+        }
     }
 }

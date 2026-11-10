@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "ui")]
 pub mod coordination;
 pub mod failure;
+mod fresh;
 pub mod notification;
 pub mod presentation;
 pub mod pricing;

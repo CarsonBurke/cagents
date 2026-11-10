@@ -9840,3 +9840,150 @@ diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1,2
         assert!(late.events.is_empty());
     }
 }
+
+#[cfg(test)]
+mod fresh_recipe_constructor_tests {
+    use super::*;
+
+    const SAVED: &str = "00000000-0000-4000-8000-000000000001";
+    const FOREIGN: &str = "00000000-0000-4000-8000-000000000002";
+
+    fn source(root: &std::path::Path, arguments: Vec<String>) -> chat::Session {
+        let home = root.join("home");
+        let config = home.join(".codex");
+        let cwd = root.join("project");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::create_dir_all(&cwd).unwrap();
+        chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: Launch {
+                provider: crate::agent::Provider::Codex,
+                session_id: Some(SAVED.into()),
+                recipe: crate::model::LaunchRecipe {
+                    program: root.join("codex").to_string_lossy().into_owned(),
+                    arguments,
+                    working_directory: cwd,
+                    environment: BTreeMap::from([
+                        ("HOME".into(), home.to_string_lossy().into_owned()),
+                        ("CODEX_HOME".into(), config.to_string_lossy().into_owned()),
+                    ]),
+                    unset_environment: ["OPENAI_API_KEY".into()].into(),
+                },
+            },
+            proof: Some(crate::model::HostSessionProof {
+                host_session_id: "old-host".into(),
+                boot_id: "old-boot".into(),
+                host_incarnation: "old-incarnation".into(),
+            }),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: chat::NativeContinuity::Durable {
+                provider_version: "0.167.0".into(),
+            },
+        }
+    }
+
+    #[test]
+    fn fresh_recipe_constructor_admits_codex_resume_selectors_as_a_new_thread_without_reusing_authority()
+     {
+        let root = tempfile::tempdir().unwrap();
+        for model in ["resume", "--resume"] {
+            for selector in [
+                vec!["resume".into(), SAVED.into()],
+                vec!["resume".into(), SAVED.into(), "resume".into(), SAVED.into()],
+            ] {
+                let payload = vec!["--model".to_owned(), model.to_owned()];
+                let saved = source(root.path(), [payload.clone(), selector.clone()].concat());
+                let original = saved.clone();
+                let fresh = saved
+                    .fresh_start()
+                    .expect("an exact thread selector can be removed for Fresh");
+                assert_eq!(saved, original);
+                assert_eq!(
+                    fresh.id, saved.id,
+                    "Fresh replaces the same pane's conversation"
+                );
+                assert!(fresh.launch.session_id.is_none());
+                assert!(fresh.proof.is_none());
+                assert!(fresh.terminal.is_none());
+                assert!(fresh.owned_codex_listener.is_none());
+                assert_eq!(
+                    fresh.native_continuity,
+                    chat::NativeContinuity::ReconnectOnly
+                );
+                assert_eq!(fresh.launch.recipe.arguments, payload, "{selector:?}");
+                assert_eq!(
+                    fresh.launch.recipe.environment,
+                    saved.launch.recipe.environment
+                );
+                assert_eq!(
+                    fresh.launch.recipe.unset_environment,
+                    saved.launch.recipe.unset_environment
+                );
+                assert_eq!(
+                    fresh.launch.recipe.working_directory,
+                    saved.launch.recipe.working_directory
+                );
+                let socket = root.path().join("fresh.sock");
+                let (spec, mut adapter) =
+                    create_with_listener_for_start(&fresh.launch, socket.clone()).unwrap();
+                assert!(
+                    matches!(spec.transport, TransportSpec::OwnedUnixWebSocket { socket: ref actual } if actual == &socket)
+                );
+                let initialize = adapter.initialize_for_start().unwrap();
+                let start = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":root.path().join("home/.codex")}})).unwrap();
+                let thread = start
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "thread/start")
+                    .expect("Fresh must issue thread/start, never resume the saved thread");
+                assert_eq!(thread["params"]["model"], model);
+                assert!(
+                    !start
+                        .writes
+                        .iter()
+                        .any(|frame| frame["method"] == "thread/resume")
+                );
+                assert!(
+                    !serde_json::to_string(&start.writes)
+                        .unwrap()
+                        .contains(SAVED)
+                );
+                assert_eq!(saved, original);
+                assert!(
+                    !root.path().join("codex").exists(),
+                    "constructors must not execute a provider"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fresh_recipe_constructor_rejects_foreign_or_malformed_codex_selectors_without_mutating_source()
+     {
+        let root = tempfile::tempdir().unwrap();
+        for arguments in [
+            vec!["resume".into()],
+            vec!["resume".into(), "".into()],
+            vec!["resume".into(), "latest".into()],
+            vec!["resume".into(), FOREIGN.into()],
+            vec![
+                "resume".into(),
+                SAVED.into(),
+                "resume".into(),
+                FOREIGN.into(),
+            ],
+            vec![
+                "--model".into(),
+                "resume".into(),
+                "resume".into(),
+                FOREIGN.into(),
+            ],
+        ] {
+            let saved = source(root.path(), arguments.clone());
+            let original = saved.clone();
+            assert!(saved.fresh_start().is_none(), "{arguments:?}");
+            assert_eq!(saved, original);
+        }
+    }
+}

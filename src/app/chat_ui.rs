@@ -5364,6 +5364,7 @@ impl Runtime {
         self.session.launch.session_id.is_some()
             && self.snapshot.exited
             && self.snapshot.session_id != self.session.launch.session_id
+            && self.session.fresh_start().is_some()
     }
     /// Whether this card's provider stopped while the daemon that ran it still
     /// holds its ended actor, so a new provider can resume the same
@@ -8121,7 +8122,12 @@ impl Cagents {
         }
         match self.cards.get(&card) {
             Some(CardRuntime::Chat(runtime)) => runtime.offers_fresh_conversation(),
-            _ => self.chat_ui.fresh_offers.contains(&card),
+            _ => {
+                self.chat_ui.fresh_offers.contains(&card)
+                    && self.card_state(card).is_some_and(|state| {
+                        matches!(&state.kind, CardKind::Chat(session) if session.fresh_start().is_some())
+                    })
+            }
         }
     }
     pub(super) fn chat_fork_target(&self, card: CardId) -> Option<Target> {
@@ -11317,11 +11323,9 @@ impl Cagents {
                 // Keep the launch settings, but give up the ended actor's
                 // ownership and terminal pair. A fresh Codex thread asks for
                 // its own listener rather than reusing the old thread's socket.
-                let mut session = session.clone();
-                session.reset_owned_codex_listener();
-                session.launch.session_id = None;
-                session.proof = None;
-                session.terminal = None;
+                let Some(session) = session.fresh_start() else {
+                    return Task::none();
+                };
                 self.chat_ui.fresh_offers.remove(&card);
                 // A chat runtime whose provider has exited still holds the
                 // daemon's record for the conversation that failed. Closing it
@@ -27563,6 +27567,25 @@ mod tests {
                 .recipe
                 .environment
                 .insert(account_home.into(), "/fixture/selected-account".into());
+            let mut expected_arguments = source.launch.recipe.arguments.clone();
+            if provider == Provider::Codex {
+                let remote = expected_arguments
+                    .iter()
+                    .position(|argument| argument == "--remote")
+                    .unwrap();
+                expected_arguments[remote + 1] = "unix://".into();
+                source
+                    .launch
+                    .recipe
+                    .arguments
+                    .splice(0..0, ["resume".into(), conversation.into()]);
+            } else {
+                source.launch.recipe.arguments.extend([
+                    "--resume".into(),
+                    conversation.into(),
+                    format!("--session-id={conversation}"),
+                ]);
+            }
             source.native_continuity = match provider {
                 Provider::Claude => chat::NativeContinuity::RetainedClaudeActor { protocol: 2 },
                 Provider::Codex => chat::NativeContinuity::Durable {
@@ -27574,7 +27597,7 @@ mod tests {
                 let proof = source.proof.clone().unwrap();
                 source.terminal = Some(TerminalSession {
                     id: source.id,
-                    launch: source.launch.terminal_recipe().unwrap(),
+                    launch: source.launch.recipe.clone(),
                     continuity: TerminalContinuity::Live {
                         host_session_id: proof.host_session_id,
                         boot_id: proof.boot_id,
@@ -27631,14 +27654,6 @@ mod tests {
                 fresh.launch.recipe.unset_environment,
                 source.launch.recipe.unset_environment
             );
-            let mut expected_arguments = source.launch.recipe.arguments.clone();
-            if provider == Provider::Codex {
-                let remote = expected_arguments
-                    .iter()
-                    .position(|argument| argument == "--remote")
-                    .unwrap();
-                expected_arguments[remote + 1] = "unix://".into();
-            }
             assert_eq!(fresh.launch.recipe.arguments, expected_arguments);
             let fresh = fresh.clone();
             assert_eq!(chat_runtime(&app, card).session, source);
@@ -27647,6 +27662,21 @@ mod tests {
                 "keep the chosen draft"
             );
 
+            drop(app.handle_chat_ui(Action::CloseFinished(
+                target,
+                Err("fixture: close not proved".into()),
+            )));
+            assert!(app.chat_ui.attempt(card).is_none());
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert_eq!(
+                chat_runtime(&app, card).composer.text(),
+                "keep the chosen draft"
+            );
+            // A late success from that failed close cannot adopt a new start.
+            drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
+            assert!(app.chat_ui.attempt(card).is_none());
+            assert_eq!(chat_runtime(&app, card).session, source);
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
             drop(app.handle_chat_ui(Action::CloseFinished(target, Ok(()))));
             let attempt = app
                 .chat_ui
@@ -27658,6 +27688,41 @@ mod tests {
             assert_eq!(
                 app.chat_ui.drafts.get(&card).map(String::as_str),
                 Some("keep the chosen draft")
+            );
+        }
+    }
+
+    #[test]
+    fn unsafe_fresh_recipe_keeps_the_source_and_draft_without_a_close() {
+        for arguments in [
+            vec!["--resume".into(), "a-different-conversation".into()],
+            vec!["an already consumed prompt".into()],
+            vec!["--model".into()],
+        ] {
+            let mut app = crate::app::tests::context_inspector_test_app(false);
+            let (card, target) = unresumable_chat(&mut app);
+            let mut source = chat_runtime(&app, card).session.clone();
+            source.launch.recipe.arguments = arguments;
+            app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
+            let runtime = app.chat_runtime_mut(target).unwrap();
+            runtime.session = source.clone();
+            runtime.start_retry_blocked = true;
+            runtime.replace_draft(text_editor::Content::with_text("keep the draft"));
+            assert!(!app.chat_offers_fresh_conversation(card));
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            assert!(!app.chat_start_pending(card));
+            assert_eq!(chat_runtime(&app, card).session, source);
+            assert_eq!(chat_runtime(&app, card).composer.text(), "keep the draft");
+            app.chat_forget(card);
+            app.cards.remove(&card);
+            app.chat_ui.fresh_offers.insert(card);
+            assert!(!app.chat_offers_fresh_conversation(card));
+            drop(app.handle_chat_ui(Action::StartFresh(card)));
+            assert!(!app.chat_start_pending(card));
+            assert_eq!(app.card_state(card).unwrap().kind, CardKind::Chat(source));
+            assert_eq!(
+                app.chat_ui.drafts.get(&card).map(String::as_str),
+                Some("keep the draft")
             );
         }
     }
