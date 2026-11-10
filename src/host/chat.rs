@@ -4,6 +4,7 @@ mod account_isolation_tests;
 #[cfg(test)]
 mod account_recovery_target_tests;
 pub(super) mod capacity;
+pub(super) mod floor_history;
 #[cfg(test)]
 mod lost_agent_close_tests;
 #[cfg(test)]
@@ -1180,6 +1181,14 @@ fn start_with_execution(
     execution: Option<Arc<chat::protocol::ExecutionContext>>,
     restart_launch: Option<&chat::Launch>,
 ) -> Result<ServerResponse, ProtocolError> {
+    if crate::upgrade::floor::load()
+        .map_err(unavailable)?
+        .blocks_id(session.id)
+    {
+        return Err(unavailable(
+            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or Start fresh if none was recorded.",
+        ));
+    }
     // A helper may have committed installation before host publication failed.
     // Recover its durable outbox through authenticated adoption before asking
     // an unexposed startup guard to retire it without a semantic consumer.
@@ -2821,6 +2830,11 @@ fn process_inner(
             dry_run,
         }),
         ClientRequest::ChatPrepareResume { source } => {
+            if let Some(session) =
+                floor_history::prepare_resume(host, &source).map_err(unavailable)?
+            {
+                return Ok(ServerResponse::ChatResumePrepared { session });
+            }
             let proof = host
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -3819,7 +3833,9 @@ pub(super) fn resolve_upgrade(
                 "The exact upgraded provider is unavailable. Its recovery evidence was retained; reopen this conversation from the provider's saved sessions."
             )))?;
         if !record.handle.owns_work()
-            && !(source.is_saved_claude_history() && record.handle.is_read_only_history())
+            && !((source.is_saved_claude_history()
+                || crate::upgrade::floor::cached().is_ok_and(|ledger| ledger.blocks_chat(source)))
+                && record.handle.is_read_only_history())
         {
             return Err(unavailable(
                 "Restored native provider has closed; no writer was restarted",
@@ -4034,7 +4050,7 @@ pub(super) fn validate_upgrade_environment(
     )?;
     if !handle.recovery_environment_matches(&restored) {
         return Err(
-            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this conversation before upgrading; no source was stopped."
+            "Native execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this conversation stopped after confirmation; no source was stopped."
                 .into(),
         );
     }

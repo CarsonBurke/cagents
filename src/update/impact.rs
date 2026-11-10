@@ -20,10 +20,8 @@ pub enum SessionKind {
     NativeChat,
 }
 
-/// A source refuses to carry a conversation whose provider stopped without
-/// confirming its work settled, and asks for it to be closed. Every source
-/// line since the candidate line (128) reports it in exactly these words, so
-/// the updater can recognize the one blocker that closing resolves.
+/// Historical source wording retained only to identify the stopped-provider
+/// state from older daemons. The candidate never emits this instruction.
 pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -271,6 +269,7 @@ mod tests {
     fn stopped_outcomes_require_the_same_panes_windows_and_reasons() {
         use super::super::source_inspection::{StoppedKind, StoppedPane, StoppedWindow};
         let preview = Preview {
+            editors: Vec::new(),
             candidate: Candidate {
                 version: "2".into(),
                 protocol: 160,

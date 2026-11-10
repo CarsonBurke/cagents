@@ -2136,13 +2136,12 @@ fn upgrade_blockers_message(blockers: &[String], relaunch_agents: bool) -> Strin
     // session's process cannot be resumed after the daemon restarts, only
     // started again, and the upgrade will not make that choice for the user.
     let mut message = String::from(
-        "These active terminals cannot be resumed automatically. Finish or close their jobs before upgrading.",
+        "These active terminals cannot be checkpointed automatically. The updater can stop the terminal service after listing the affected work for confirmation.",
     );
-    // With relaunching accepted, whatever still blocks is no identified agent.
     message.push_str(if relaunch_agents {
-        " Each runs a job that is not an agent cagents can relaunch:"
+        " These jobs require the stopped-pane fallback:"
     } else {
-        " Identified agents can instead be relaunched into their resume picker: turn on Relaunch agents on upgrade in Settings, or pass --relaunch-agents. Unrelated shell jobs still block the upgrade:"
+        " These sessions require the stopped-pane fallback:"
     });
     for blocker in blockers {
         message.push_str("\n  ");
@@ -2201,7 +2200,7 @@ fn validate_terminal_upgrade_environment(
     recipe.remove_unset_environment(&mut restored);
     if execution.0 != restored {
         return Err(upgrade_error(
-            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. Align the daemon configuration or finish and close this terminal before upgrading; no source was stopped",
+            "Terminal execution environment cannot survive daemon upgrade without losing selected credentials or account settings. The updater can restore this terminal stopped after confirmation; no source was stopped",
         ));
     }
     Ok(())
@@ -2282,7 +2281,7 @@ fn prepare_upgrade_with_carry_policy(
             .any(|receipt| !receipt.unacknowledgeable(now))
         {
             return Err(upgrade_error(
-                "A native-to-terminal handoff is not durably acknowledged; save its replacement before upgrading",
+                "A native-to-terminal handoff is not durably acknowledged and cannot be checkpointed",
             ));
         }
         for (chat, receipt) in &state.chat_handoffs {
@@ -2294,7 +2293,7 @@ fn prepare_upgrade_with_carry_policy(
         }
         if state.chats.values().any(|record| record.returning_terminal) {
             return Err(upgrade_error(
-                "A native-to-terminal replacement is still pending; retry or explicitly close it before upgrading",
+                "A native-to-terminal replacement is still pending and cannot be checkpointed",
             ));
         }
         // A durable native holder also keeps its paired terminal alive. Its
@@ -2354,7 +2353,7 @@ fn prepare_upgrade_with_carry_policy(
             }
             if record.handle.is_completed() {
                 return Err(upgrade_error(
-                    "A native provider stopped but may still hold unconfirmed work; close its conversation before upgrading",
+                    "A native provider stopped but may still hold unconfirmed work and cannot be checkpointed",
                 ));
             }
             let mut source = record.session.clone();
@@ -3090,7 +3089,11 @@ pub(super) fn restore_orphaned_holders(host: &SharedHost) -> Result<(), String> 
         &proof.boot_id,
         crate::daemon::holder_registry::Kind::Terminal,
     )?;
+    let stopped = crate::upgrade::floor::load()?;
     for record in records {
+        if stopped.blocks_terminal(record.terminal) {
+            continue;
+        }
         if crate::daemon::termination_requested() {
             break;
         }

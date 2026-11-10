@@ -1248,10 +1248,18 @@ impl UiUpdateGuard {
         timeout: Duration,
         preflight: impl FnOnce(&Self) -> io::Result<()>,
     ) -> io::Result<Vec<String>> {
+        let slots = self.prepare_windows(timeout)?;
+        preflight(self)?;
+        self.close_prepared_windows(&slots, timeout)?;
+        Ok(slots)
+    }
+
+    /// Flush and freeze windows while a candidate asks for destructive consent.
+    /// Dropping the guard cancels preparation without closing a window.
+    pub(crate) fn prepare_windows(&mut self, timeout: Duration) -> io::Result<Vec<String>> {
         let deadline = std::time::Instant::now() + timeout;
         let slots = running_window_slots(&self.runtime)?;
         for slot in &slots {
-            // Include a possibly timed-out participant in cancellation.
             self.prepared.push(slot.clone());
             update_window(
                 &self.runtime,
@@ -1260,14 +1268,17 @@ impl UiUpdateGuard {
                 deadline.saturating_duration_since(std::time::Instant::now()),
             )?;
         }
-        preflight(self)?;
-        if std::time::Instant::now() >= deadline {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                "Source inspection exceeded the window preparation allowance; source windows remain usable",
-            ));
-        }
-        for slot in &slots {
+        Ok(slots)
+    }
+
+    /// Human review has no window-RPC deadline. Closing gets its own budget.
+    pub(crate) fn close_prepared_windows(
+        &mut self,
+        slots: &[String],
+        timeout: Duration,
+    ) -> io::Result<()> {
+        let deadline = std::time::Instant::now() + timeout;
+        for slot in slots {
             // A lost ACK cannot prove that the UI did not accept an irreversible close.
             self.closed.push(slot.clone());
             update_window(
@@ -1287,7 +1298,7 @@ impl UiUpdateGuard {
             std::thread::sleep(Duration::from_millis(25));
         }
         self.prepared.clear();
-        Ok(slots)
+        Ok(())
     }
 
     pub fn relaunch_windows(mut self, slots: &[String], executable: &Path) -> io::Result<()> {

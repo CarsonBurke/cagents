@@ -1,4 +1,5 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
+pub(crate) mod floor;
 #[cfg(any(feature = "host", test))]
 use crate::model::HostSessionProof;
 #[cfg(any(feature = "host", feature = "ui", test))]
@@ -90,7 +91,7 @@ pub(crate) fn recovery_plan(
     if recoverable_shell(&session.launch) {
         return Ok((session.launch.clone(), RecoveryKind::Shell));
     }
-    Err("This command has no agent identity and cannot safely be replayed; finish or close it before upgrading".into())
+    Err("This command has no agent identity and cannot safely be replayed; the updater can restore it stopped after confirmation".into())
 }
 
 /// A shell cagents made can carry the selected provider homes. Other
@@ -1817,6 +1818,19 @@ pub(crate) mod handoff {
             self.write_named(UNATTACHED_FILE, &bytes)
         }
 
+        /// The confirmed stop floor must never replay an earlier checkpoint.
+        /// Preserve it under a unique name after the updater owns the lease.
+        pub(crate) fn archive_floor(&self) -> Result<Option<PathBuf>, String> {
+            if self.read_bytes()?.is_none() {
+                return Ok(None);
+            }
+            self.archive_as(&format!(
+                "daemon-upgrade.stopped.{}.json",
+                uuid::Uuid::new_v4()
+            ))
+            .map(Some)
+        }
+
         pub fn archive(&self) -> Result<PathBuf, String> {
             self.archive_as("daemon-upgrade.abandoned.json")
         }
@@ -3374,6 +3388,44 @@ mod tests {
         assert_eq!(
             store.load().unwrap().unwrap().terminals[0].source.id,
             second.terminals[0].source.id
+        );
+    }
+}
+
+#[cfg(test)]
+mod floor_archive_tests {
+    use super::handoff::Store;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn floor_archives_stale_bytes_without_replaying_or_replacing_prior_evidence() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Store::open(directory.path()).unwrap();
+        assert!(store.archive_floor().unwrap().is_none());
+        let write_checkpoint = |bytes: &[u8]| {
+            std::fs::write(&store.path, bytes).unwrap();
+            std::fs::set_permissions(&store.path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        };
+        // Even an unreadable historical payload must be kept as evidence,
+        // rather than deserialized by the destination's boot path.
+        write_checkpoint(b"historical checkpoint bytes");
+        let first = store.archive_floor().unwrap().unwrap();
+        assert!(!store.path.exists());
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            b"historical checkpoint bytes"
+        );
+        write_checkpoint(b"another refused checkpoint");
+        let second = store.archive_floor().unwrap().unwrap();
+        assert_ne!(first, second);
+        assert!(!store.path.exists());
+        assert_eq!(
+            std::fs::read(first).unwrap(),
+            b"historical checkpoint bytes"
+        );
+        assert_eq!(
+            std::fs::read(second).unwrap(),
+            b"another refused checkpoint"
         );
     }
 }

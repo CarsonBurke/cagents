@@ -72,6 +72,8 @@ pub(super) fn perform(
     job: &mut UpdateJob,
     root: &Path,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    survivors: &mut floor::Survivors,
+    terminal: bool,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
@@ -119,7 +121,7 @@ pub(super) fn perform(
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let confirmed = confirmation::wait(state, job, terminal, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
     })?;
     set_phase(
@@ -129,48 +131,47 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        let inspected = crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
-        let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
-            .map_err(io::Error::other)?.with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
-            return Err(io::Error::other("The installed build or session ownership changed during pane inspection; existing windows were kept open"));
-        }
-        Ok(())
-    })?;
-    let mut startup_attempted = false;
-    let mut startup_owned = false;
-    let result = (|| {
-        let current = observe(
+    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    {
+        let inspected = crate::install_guard::preflight_source_panes(
+            &guard,
+            confirmed
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone()),
+            confirmed.replaces_daemon,
+        )?;
+        let latest = observe(
             confirmed
                 .daemon
                 .as_ref()
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )?
-        .with_inspection(&confirmed.inspection());
-        if !confirmed.preserves_consent(&current) || digest(root)? != staged.identity.digest {
+        )
+        .map_err(io::Error::other)?
+        .with_inspection(&inspected);
+        if !confirmed.preserves_consent(&latest)
+            || digest(root).map_err(io::Error::other)? != staged.identity.digest
+        {
             return Err(invalid(
-                "the installed build or session ownership changed; review the update again",
+                "The installed build or session ownership changed during pane inspection; existing windows were kept open",
             ));
         }
-        // Prepare the capture while the source daemon still runs: failing to
-        // create it must not leave the runtime without a daemon.
-        let output = StartupOutput::create(state)?;
-        if let Some(daemon) = current.daemon {
-            let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client =
-                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-            let paths = crate::daemon::RuntimePaths::discover()
-                .map_err(|error| invalid(error.to_string()))?;
-            let source =
-                crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
-                    .map_err(|error| invalid(error.to_string()))?;
-            client
-                .prepare_confirmed_upgrade(daemon, false)
-                .map_err(|error| invalid(error.to_string()))?;
-            *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
-        }
+    }
+    let output = StartupOutput::create(state)?;
+    floor::quiesce(
+        state,
+        job,
+        &confirmed,
+        terminal,
+        |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
+        handoff,
+        survivors,
+        &guard,
+    )?;
+    guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+    let mut startup_attempted = false;
+    let mut startup_owned = false;
+    let result = (|| {
         set_phase(
             state,
             job,

@@ -37,6 +37,7 @@ pub(super) mod channel_work;
 mod channel_work_integration_tests;
 pub(super) use automations::Claimed;
 mod execution;
+pub(super) mod floor;
 pub(super) use execution::ResidentRelease;
 mod lineage;
 mod mailbox;

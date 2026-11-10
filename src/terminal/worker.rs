@@ -3908,7 +3908,7 @@ impl Worker {
                             .and_then(crate::model::agent_recovery::recipe_from_hint).is_some()
                             && !self.agent_process.as_ref().is_some_and(|process| family.only_agent_tree(process.pid))
                         {
-                            return Err("Terminal also owns unrelated background jobs; finish or close them before upgrading".into());
+                            return Err("Terminal also owns unrelated background jobs that cannot be checkpointed".into());
                         }
                         Ok(UpgradeSnapshot {
                             hint: self.resume_hint.clone(),
@@ -4794,7 +4794,9 @@ impl Worker {
             || !self.commands.is_empty()
             || !self.retained_commands.is_empty()
         {
-            return Err("Terminal input or control is still pending; let it finish or cancel input before upgrading".into());
+            return Err(
+                "Terminal input or control is still pending and cannot be checkpointed".into(),
+            );
         }
         Ok(())
     }

@@ -186,7 +186,7 @@ impl HostState {
             } else {
                 (
                     Disposition::Blocked,
-                    "This terminal cannot preserve its live process through this update; finish it or close it before updating.",
+                    "This terminal cannot preserve its live process through this update; it can reopen stopped after confirmation.",
                 )
             };
             impact.sessions.push(SessionImpact {
@@ -254,7 +254,7 @@ impl HostState {
             } else if record.handle.is_completed() {
                 (
                     Disposition::Blocked,
-                    crate::update::impact::STOPPED_WITH_UNSETTLED_WORK,
+                    "Its provider stopped but may still hold unfinished work and cannot be checkpointed.",
                 )
             } else if let Err(reason) = &migration {
                 (Disposition::Blocked, reason.as_str())
@@ -263,7 +263,7 @@ impl HostState {
             } else if !ready {
                 (
                     Disposition::Blocked,
-                    "Its provider is not ready yet. This clears on its own once it finishes starting; close the conversation if it does not.",
+                    "Its provider is still starting and cannot be checkpointed yet.",
                 )
             } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
                 (

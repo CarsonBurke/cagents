@@ -1056,6 +1056,48 @@ impl ControlClient {
         }
     }
 
+    /// Read the source's current state without starting or interrupting work.
+    /// ChatAttach is authenticated against the exact listed descriptor.
+    pub(crate) fn inspect_chat_state(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<&'static str, ControlError> {
+        let id = session.id;
+        self.attached_chats.insert(id);
+        let result = match self.request_strict(ClientRequest::ChatAttach {
+            session: session.clone(),
+        }) {
+            Ok(ServerResponse::ChatAttached {
+                session: attached,
+                snapshot,
+            }) if attached == session => Ok(if snapshot.exited {
+                "stopped"
+            } else if !snapshot.ready {
+                "starting"
+            } else {
+                match snapshot.activity() {
+                    crate::agent::ActivityState::Working => "working",
+                    crate::agent::ActivityState::Waiting => "waiting for input",
+                    crate::agent::ActivityState::Idle => "idle",
+                    crate::agent::ActivityState::Unknown => "state unavailable",
+                }
+            }),
+            Ok(response) => Err(unexpected_response("the reviewed chat's state", &response)),
+            Err(error) => Err(error),
+        };
+        // A failed or stale read grants no close authority. Finish its read-only
+        // subscription before the source client is reused for another pane.
+        let detached = self.request_strict(ClientRequest::ChatDetach { chat_id: id });
+        if matches!(detached, Ok(ServerResponse::Detached)) {
+            self.attached_chats.remove(&id);
+        }
+        match detached {
+            Ok(ServerResponse::Detached) => result,
+            Ok(response) => Err(unexpected_response("chat state detachment", &response)),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Closes a native chat this client did not open.
     ///
     /// The daemon honours a close only from an attached client, so this
@@ -1069,6 +1111,15 @@ impl ControlClient {
     /// close removes it - the interrupt the close delivers is itself reported
     /// as activity - so they are expected between the requests' responses.
     pub fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), ControlError> {
+        self.close_chat_with_snapshot(session).map(|_| ())
+    }
+
+    /// The updater keeps the source's final transcript page after its own
+    /// confirmed teardown, including output produced during interruption.
+    pub(crate) fn close_chat_with_snapshot(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
         let chat_id = session.id;
         // The daemon subscribes this connection before it answers the
         // attachment, so the chat's notifications can arrive ahead of that
@@ -1081,7 +1132,7 @@ impl ControlClient {
                     Instant::now() + CHAT_CLOSE_TIMEOUT,
                 )
                 .and_then(|response| match response {
-                    ServerResponse::ChatClosed { .. } => Ok(()),
+                    ServerResponse::ChatClosed { snapshot, .. } => Ok(snapshot),
                     response => Err(unexpected_response("a native chat close", &response)),
                 }),
             Ok(response) => Err(unexpected_response("a native chat attachment", &response)),
@@ -1095,7 +1146,7 @@ impl ControlClient {
         let detached = match &closed {
             // The daemon removed the chat, and every notification about it,
             // before answering.
-            Ok(()) => true,
+            Ok(_) => true,
             // The daemon answered, so the connection is still in step and can
             // stop the notifications of a chat it did not close.
             Err(ControlError::Remote { .. } | ControlError::UnexpectedResponse { .. }) => matches!(
@@ -6771,6 +6822,107 @@ mod tests {
             drop(client);
             server.join().unwrap();
         }
+    }
+
+    #[test]
+    fn update_chat_state_reads_and_detaches_without_starting_or_closing_work() {
+        let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
+        let pinned = proof("session", "boot", "incarnation");
+        let session = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: LaunchRecipe {
+                    program: "codex".into(),
+                    arguments: vec![],
+                    working_directory: "/work".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: Some("recorded".into()),
+            },
+            proof: Some(pinned.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let peer_session = session.clone();
+        let server = thread::spawn(move || {
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &connected_envelope(1, pinned.clone(), pinned.clone()),
+            )
+            .unwrap();
+            let respond = |stream: &mut UnixStream, request_id, response| {
+                write_frame(
+                    stream,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: pinned.clone(),
+                        message: ServerMessage::Response { response },
+                    },
+                )
+                .unwrap();
+            };
+            for (ready, busy, waiting, exited) in [
+                (true, true, false, false),
+                (true, false, true, false),
+                (true, false, false, false),
+                (false, false, false, false),
+                (true, false, false, true),
+            ] {
+                let attach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    attach.request,
+                    ClientRequest::ChatAttach {
+                        session: peer_session.clone()
+                    }
+                );
+                respond(
+                    &mut server_stream,
+                    attach.request_id,
+                    ServerResponse::ChatAttached {
+                        session: peer_session.clone(),
+                        snapshot: crate::chat::Snapshot {
+                            ready,
+                            busy,
+                            waiting,
+                            exited,
+                            ..Default::default()
+                        },
+                    },
+                );
+                let detach: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+                assert_eq!(
+                    detach.request,
+                    ClientRequest::ChatDetach {
+                        chat_id: peer_session.id
+                    }
+                );
+                respond(
+                    &mut server_stream,
+                    detach.request_id,
+                    ServerResponse::Detached,
+                );
+            }
+        });
+        let mut client = ControlClient::from_stream(client_stream).unwrap();
+        for expected in [
+            "working",
+            "waiting for input",
+            "idle",
+            "starting",
+            "stopped",
+        ] {
+            assert_eq!(
+                client.inspect_chat_state(session.clone()).unwrap(),
+                expected
+            );
+            assert!(!client.attached_chats.contains(&session.id));
+        }
+        server.join().unwrap();
     }
 
     /// Closing a chat attaches this connection to it, and the interrupt the

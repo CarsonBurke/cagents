@@ -155,6 +155,15 @@ impl Client {
         }
     }
 
+    /// The authenticated local socket peer, for a read-only shutdown survivor
+    /// census. This is a daemon PID, never a terminal-child PID from List.
+    pub(crate) fn peer_pid(&self) -> Option<u32> {
+        match self {
+            Self::Current { peer, .. } => Some(peer.pid),
+            Self::Legacy(_) => None,
+        }
+    }
+
     pub(crate) fn protocol(&self) -> u16 {
         match self {
             Self::Current { client, .. } => client.protocol(),
@@ -208,6 +217,58 @@ impl Client {
 }
 
 impl Client {
+    pub(crate) fn list(
+        &mut self,
+    ) -> Result<Vec<crate::terminal_ipc::TerminalDescriptor>, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client.list().map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot list terminals for a confirmed stop",
+            )),
+        }
+    }
+
+    pub(crate) fn shutdown_preflight(
+        &mut self,
+    ) -> Result<crate::terminal_ipc::ShutdownCapability, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .shutdown_preflight()
+                    .map(|preflight| preflight.capability)
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot confirm a terminal service stop",
+            )),
+        }
+    }
+
+    pub(crate) fn confirm_shutdown(
+        &mut self,
+        capability: crate::terminal_ipc::ShutdownCapability,
+    ) -> Result<(), UpdateError> {
+        if &capability.proof != self.proof() {
+            return Err(invalid("The source changed before its confirmed stop"));
+        }
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .confirm_shutdown(capability)
+                    .map(|_| ())
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "This source cannot confirm a terminal service stop",
+            )),
+        }
+    }
+
     /// The conversations the source lists, as it issued them.
     pub(crate) fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, UpdateError> {
         match self {
@@ -223,15 +284,35 @@ impl Client {
         }
     }
 
-    /// Ends one listed conversation through the source's own authenticated
-    /// close: attached, as any client the source did not open must be, and
-    /// answered only once the source confirms its provider's teardown.
-    pub(crate) fn close_chat(&mut self, session: crate::chat::Session) -> Result<(), UpdateError> {
+    pub(crate) fn chat_state(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<&'static str, UpdateError> {
         match self {
             Self::Current { client, peer } => {
                 peer.verify(client.proof())?;
                 client
-                    .close_chat(session)
+                    .inspect_chat_state(session)
+                    .map_err(|error| invalid(error.to_string()))
+            }
+            Self::Legacy(_) => Err(invalid(
+                "The source cannot report this conversation's state",
+            )),
+        }
+    }
+
+    /// Ends one listed conversation through the source's own authenticated
+    /// close: attached, as any client the source did not open must be, and
+    /// answered only once the source confirms its provider's teardown.
+    pub(crate) fn close_chat(
+        &mut self,
+        session: crate::chat::Session,
+    ) -> Result<crate::chat::Snapshot, UpdateError> {
+        match self {
+            Self::Current { client, peer } => {
+                peer.verify(client.proof())?;
+                client
+                    .close_chat_with_snapshot(session)
                     .map_err(|error| invalid(error.to_string()))
             }
             Self::Legacy(_) => Err(invalid(
@@ -316,6 +397,8 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "List",
             "ChatList",
             "ChatAttach",
+            "ChatVisibility",
+            "ChatRead",
             "ChatClose",
             "ChatDetach",
             "Shutdown",
@@ -333,6 +416,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "listed",
             "chat_listed",
             "chat_attached",
+            "chat_snapshot",
             "chat_closed",
             "detached",
             "shutdown_accepted",

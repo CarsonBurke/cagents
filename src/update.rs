@@ -2,6 +2,8 @@
 //! never writes installation state. The detached worker alone may run an installer.
 mod candidate;
 mod confirmation;
+mod floor;
+mod floor_display;
 mod installed;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -400,6 +402,7 @@ fn applicable_release(release: GitHubRelease) -> Result<Release, UpdateError> {
 enum UpdateRequest {
     Release(Release),
     Installed { root: PathBuf },
+    InstalledFromTerminal { root: PathBuf },
 }
 
 pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
@@ -417,6 +420,10 @@ pub fn apply(release: &Release) -> Result<UpdateJob, UpdateError> {
 }
 
 pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
+    apply_installed_from(executable, false)
+}
+
+fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
     let served = served_version_root(&layout)?;
@@ -436,7 +443,11 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
     start_job(
         &installation,
         &version,
-        &UpdateRequest::Installed { root: served },
+        &if terminal {
+            UpdateRequest::InstalledFromTerminal { root: served }
+        } else {
+            UpdateRequest::Installed { root: served }
+        },
     )
 }
 
@@ -503,14 +514,9 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     use std::io::IsTerminal;
-    if !yes && !io::stdin().is_terminal() {
-        return Err(invalid(
-            "Review the update in the app, or pass --yes to approve its displayed impact; --interrupt additionally permits active native turns and their background subagents to stop.",
-        ));
-    }
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
-    let initial = apply_installed(&candidate)?;
+    let initial = apply_installed_from(&candidate, true)?;
     let mut policy = if interrupt {
         impact::Policy::Interrupt
     } else {
@@ -544,27 +550,41 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                     policy_requested = Some(confirmation.nonce.clone());
                 }
             } else if submitted.as_ref() != Some(&confirmation.nonce) {
-                // A changed preview is a new review, including after approval.
-                eprint!("{}", render_review(&confirmation.preview));
-                if submitted.is_some() {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                    return Err(invalid(
-                        "Update impact changed after approval; review and retry the update.",
-                    ));
+                if let Some(list) = &confirmation.stop {
+                    eprint!("{}", list.render());
+                    let choice = match floor_display::read_stop_choice(
+                        &mut io::stdin().lock(),
+                        io::stdin().is_terminal(),
+                        yes,
+                        list,
+                    ) {
+                        Ok(choice) => choice,
+                        Err(error) => {
+                            cancel_current_review(&job.id);
+                            return Err(error.into());
+                        }
+                    };
+                    if !submit_current_choice(&job.id, &confirmation.nonce, choice.clone())? {
+                        // Live work changed while the person was reading or
+                        // typing. Reload and display its new list in this CLI.
+                        continue;
+                    }
+                    if matches!(choice, UpdateChoice::Cancel) {
+                        return Err(UpdateError::Cancelled);
+                    }
+                    submitted = Some(confirmation.nonce.clone());
+                    continue;
                 }
-                if confirmation
+                eprint!("{}", render_review(&confirmation.preview));
+                let needs_floor = confirmation
                     .preview
                     .daemon
                     .as_ref()
-                    .is_some_and(impact::DaemonImpact::blocked)
-                {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                    return Err(invalid(
-                        "Resolve the items that need attention, then run the update again.",
-                    ));
-                }
-                let choice = if yes {
+                    .is_some_and(impact::DaemonImpact::blocked);
+                let choice = if yes || (!io::stdin().is_terminal() && needs_floor) {
                     UpdateChoice::Confirm
+                } else if !io::stdin().is_terminal() {
+                    UpdateChoice::Cancel
                 } else {
                     match prompt_review(&confirmation.preview) {
                         Ok(choice) => choice,
@@ -585,9 +605,11 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                         policy_requested = Some(confirmation.nonce.clone());
                         submitted = None;
                     }
+                    UpdateChoice::StopListed { .. } => unreachable!("stop has its own prompt"),
                     UpdateChoice::Confirm => {
-                        decide(&job.id, &confirmation.nonce, choice)?;
-                        submitted = Some(confirmation.nonce.clone());
+                        if submit_current_choice(&job.id, &confirmation.nonce, choice)? {
+                            submitted = Some(confirmation.nonce.clone());
+                        }
                     }
                 }
             }
@@ -598,6 +620,38 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
             ));
         }
         thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// A stale nonce means re-display, while a real failure must release prepared
+/// windows through cancellation of the current review.
+fn submit_current_choice(
+    job: &str,
+    nonce: &str,
+    choice: UpdateChoice,
+) -> Result<bool, UpdateError> {
+    match decide(job, nonce, choice) {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            if status()?
+                .filter(|current| current.id == job)
+                .and_then(|current| current.active_confirmation().cloned())
+                .is_some_and(|confirmation| confirmation.nonce != nonce)
+            {
+                return Ok(false);
+            }
+            cancel_current_review(job);
+            Err(error)
+        }
+    }
+}
+
+fn cancel_current_review(id: &str) {
+    if let Ok(Some(job)) = status()
+        && job.id == id
+        && let Some(confirmation) = job.active_confirmation()
+    {
+        let _ = decide(id, &confirmation.nonce, UpdateChoice::Cancel);
     }
 }
 
@@ -649,33 +703,36 @@ fn read_review_choice(
 
 /// End only the exact source descriptors selected by a later destructive
 /// confirmation. Kept separate from the non-destructive update review.
-#[allow(dead_code)]
 fn end_source_chats(
     daemon: &impact::DaemonImpact,
     ending: Vec<crate::chat::Session>,
-) -> Result<(), UpdateError> {
+) -> Result<Vec<crate::model::TerminalId>, UpdateError> {
     let mut client = source_client_for(daemon)?;
+    let listed = client.list_chats()?;
+    if ending.iter().any(|session| !listed.contains(session)) {
+        return Err(invalid(
+            "The source conversations changed before they could be ended",
+        ));
+    }
     // One the source cannot end does not keep the rest: each was approved
     // on its own, and ending it releases what it held either way.
-    let mut failed = Vec::new();
+    let mut ended = Vec::new();
     for session in ending {
         let title = session.launch.provider.label().to_owned();
-        match client.close_chat(session) {
-            Ok(()) => eprintln!("  Ended {title}"),
+        let id = session.id;
+        match client.close_chat(session.clone()) {
+            Ok(snapshot) => {
+                crate::upgrade::floor::retain_final_snapshot(&session, snapshot)
+                    .map_err(invalid)?;
+                eprintln!("  Ended {title}");
+                ended.push(id);
+            }
             Err(error) => {
                 eprintln!("  Could not end {title}: {error}");
-                failed.push(title);
             }
         }
     }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "The update still cannot carry {}; it was not started.",
-            failed.join(", ")
-        )))
-    }
+    Ok(ended)
 }
 
 /// The reviewed source, authenticated again: a preview never authorizes
@@ -1039,7 +1096,14 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     // Keep the shared lease through the durable final outcome, including a
     // startup failure. Dropping a worker copy must never unlock the successor.
     let mut handoff = None;
-    let result = perform_update(&installation, &state, &mut job, &mut handoff);
+    let mut survivors = floor::Survivors::default();
+    let result = perform_update(
+        &installation,
+        &state,
+        &mut job,
+        &mut handoff,
+        &mut survivors,
+    );
     job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
         UpdatePhase::Cancelled
     } else if result.is_ok() {
@@ -1052,6 +1116,16 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(error) => error.to_string(),
     };
+    let (remaining, unchecked) = survivors.report();
+    if !remaining.is_empty() {
+        job.message.push_str("\nStill running, not attached:\n");
+        job.message.push_str(&remaining.join("\n"));
+    }
+    if !unchecked.is_empty() {
+        job.message
+            .push_str("\nStill running; attachment could not be checked:\n");
+        job.message.push_str(&unchecked.join("\n"));
+    }
     write_job(&state, &job)?;
     result
 }
@@ -1061,6 +1135,7 @@ fn perform_update(
     state: &Path,
     job: &mut UpdateJob,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    survivors: &mut floor::Survivors,
 ) -> Result<(), UpdateError> {
     let request: UpdateRequest = serde_json::from_slice(&read_private(
         &state.join(format!("{}.request", job.id)),
@@ -1072,7 +1147,10 @@ fn perform_update(
             release
         }
         UpdateRequest::Installed { root } => {
-            return installed::perform(installation, state, job, &root, handoff);
+            return installed::perform(installation, state, job, &root, handoff, survivors, false);
+        }
+        UpdateRequest::InstalledFromTerminal { root } => {
+            return installed::perform(installation, state, job, &root, handoff, survivors, true);
         }
     };
     let cancellation = CancellationToken::new();
@@ -1116,7 +1194,7 @@ fn perform_update(
     }
     let inspection = reconcile_saved_sources(staged.identity.protocol)?;
     let context = ReviewContext::capture(installation)?;
-    let confirmed = confirmation::wait(state, job, |policy| {
+    let confirmed = confirmation::wait(state, job, false, |policy| {
         Installation::detect()?;
         Ok(context.apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
     })?;
@@ -1127,45 +1205,48 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
-    let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
-        let inspected = crate::install_guard::preflight_source_panes(guard,
-            confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
-        let latest = observe_impact(&staged.identity, confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
-            .map_err(io::Error::other)?.with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) {
-            return Err(io::Error::other("Session ownership changed during pane inspection; existing windows were kept open"));
-        }
-        Ok(())
-    })?;
-    let install_result = (|| {
-        Installation::detect()?;
-        let current = observe_impact(
+    let windows = guard.prepare_windows(Duration::from_secs(45))?;
+    {
+        let inspected = crate::install_guard::preflight_source_panes(
+            &guard,
+            confirmed
+                .daemon
+                .as_ref()
+                .map(|daemon| daemon.capability.proof.clone()),
+            confirmed.replaces_daemon,
+        )?;
+        let latest = observe_impact(
             &staged.identity,
             confirmed
                 .daemon
                 .as_ref()
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
-        )?
-        .with_inspection(&confirmed.inspection());
-        if !confirmed.preserves_consent(&current) {
+        )
+        .map_err(io::Error::other)?
+        .with_inspection(&inspected);
+        if !confirmed.preserves_consent(&latest) {
             return Err(invalid(
-                "Session ownership changed while saving windows; reopen and review the update again",
+                "Session ownership changed during pane inspection; existing windows were kept open",
             ));
         }
-        if let Some(daemon) = current.daemon {
-            let socket = crate::terminal_ipc::daemon_socket_path()?;
-            let mut client =
-                source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-            let paths = crate::daemon::RuntimePaths::discover()
-                .map_err(|error| invalid(error.to_string()))?;
-            let source =
-                crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
-                    .map_err(|error| invalid(error.to_string()))?;
-            client
-                .prepare_confirmed_upgrade(daemon, false)
-                .map_err(|error| invalid(error.to_string()))?;
-            *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
-        }
+    }
+    floor::quiesce(
+        state,
+        job,
+        &confirmed,
+        false,
+        |policy| {
+            Installation::detect()?;
+            Ok(context
+                .apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
+        },
+        handoff,
+        survivors,
+        &guard,
+    )?;
+    guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
+    let install_result = (|| {
+        Installation::detect()?;
         set_phase(
             state,
             job,
@@ -1178,7 +1259,7 @@ fn perform_update(
             &installer,
             &archive,
             &checksums,
-            current.replaces_daemon,
+            confirmed.replaces_daemon,
             &guard,
             handoff.as_ref(),
         )

@@ -166,6 +166,7 @@ fn private_status_projection_never_exposes_capability_error_or_path_content() {
     ] {
         let mut job = job(phase);
         job.confirmation = Some(super::super::confirmation::Confirmation {
+            stop: None,
             nonce: "CONFIRMATION_NONCE_SENTINEL".into(),
             preview: super::super::impact::Preview {
                 from_version: String::new(),

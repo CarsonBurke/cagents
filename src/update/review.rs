@@ -181,6 +181,7 @@ mod tests {
 
     fn preview() -> Preview {
         Preview {
+            editors: Vec::new(),
             candidate: Candidate {
                 version: "0.1.3+local.d2509365".into(),
                 protocol: 160,

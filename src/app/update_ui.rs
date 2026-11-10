@@ -1247,6 +1247,7 @@ mod tests {
     fn transient_status_failure_keeps_observing_and_revokes_stale_confirmation() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let confirmation = crate::update::UpdateConfirmation {
+            stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
                 from_version: String::new(),
@@ -1371,6 +1372,7 @@ mod tests {
     fn live_session_confirmation_is_modal_and_cancel_never_starts_an_update() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
+            stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
                 from_version: String::new(),
@@ -1421,6 +1423,7 @@ mod tests {
     ) -> crate::update::UpdateConfirmation {
         use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
         crate::update::UpdateConfirmation {
+            stop: None,
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
                 from_version: String::new(),

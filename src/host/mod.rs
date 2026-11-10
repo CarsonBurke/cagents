@@ -382,6 +382,7 @@ pub fn run(mut admission: DaemonAdmission) -> Result<(), HostError> {
             chat::restore_orphaned_native(&host, &unattached).map_err(io::Error::other)?;
             chat::retained_actor::reconcile_retired_actors(&host).map_err(io::Error::other)?;
             chat::retained_actor::reconcile_startup_losses(&host).map_err(io::Error::other)?;
+            model::floor::restore_presentations().map_err(io::Error::other)?;
             let retained_runs = chat::retained_actor::retained_runs(&host);
             // A committed acceptance is not proof of provider delivery. Until a
             // restored actor supplies exact run evidence, never authorize a resend.

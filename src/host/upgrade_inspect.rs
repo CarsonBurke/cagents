@@ -24,6 +24,9 @@ use std::{
 pub(super) const ARGUMENT: &str = "--inspect-upgrade-source";
 
 pub(super) fn entry() -> Option<Result<(), String>> {
+    if let Some(result) = retain_floor_entry() {
+        return Some(result);
+    }
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     if arguments
         .first()
@@ -2904,5 +2907,131 @@ fn validate_live_chat(session: &Session, require_resumable: bool) -> Result<(), 
         handoff::validate_chat_source(session, &session.launch)
     } else {
         Ok(())
+    }
+}
+
+/// The updater passes private source recipes through an inherited sealed fd,
+/// never through process arguments. Capture precedes any old-daemon close.
+fn retain_floor_entry() -> Option<Result<(), String>> {
+    let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
+    if arguments
+        .first()
+        .is_none_or(|argument| argument != "--retain-update-floor")
+    {
+        return None;
+    }
+    Some((|| {
+        crate::instance::validate_stage_guard().map_err(
+            |_| "Retaining stopped panes requires the active authenticated update fence",
+        )?;
+        if arguments.len() != 2 {
+            return Err("Invalid stopped update pane arguments".into());
+        }
+        let file = std::fs::File::open(&arguments[1]).map_err(|e| e.to_string())?;
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        file.take(8 * 1024 * 1024 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        if bytes.len() > 8 * 1024 * 1024 {
+            return Err("Stopped update panes exceed their limit".into());
+        }
+        let mut record: crate::upgrade::floor::Record =
+            serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+        if !record.presentations.is_empty() {
+            return Err(
+                "Stopped pane capture cannot import a caller's managed presentation".into(),
+            );
+        }
+        if !record.snapshots.is_empty() || !record.aliases.is_empty() {
+            return Err("Stopped pane capture cannot import caller transcript evidence".into());
+        }
+        let mut budget = crate::persistence::MigrationInspectionBudget::new(
+            Instant::now() + Duration::from_secs(30),
+        );
+        for path in crate::instance::window_database_paths().map_err(|error| error.to_string())? {
+            if let Ok(panes) =
+                crate::persistence::read_labeled_migration_sessions_with_budget(&path, &mut budget)
+            {
+                for pane in panes {
+                    if let CardKind::Chat(saved) = pane.kind {
+                        if record.service_stopped
+                            && saved.proof.as_ref() == Some(&record.source)
+                            && !record.chats.iter().any(|source| source.id == saved.id)
+                        {
+                            record.chats.push(saved.clone());
+                        }
+                        if record
+                            .chats
+                            .iter()
+                            .any(|source| crate::upgrade::floor::same_allocation(source, &saved))
+                            && !record.aliases.contains(&saved)
+                        {
+                            record.aliases.push(saved);
+                        }
+                    }
+                }
+            }
+        }
+        if !record.chats.is_empty() {
+            let socket = crate::terminal_ipc::daemon_socket_path().map_err(|e| e.to_string())?;
+            let mut client = current::Client::connect(
+                &socket,
+                &record.source,
+                Instant::now() + Duration::from_secs(30),
+                record.protocol,
+            )
+            .ok();
+            for source in &record.chats {
+                let captured = client
+                    .as_mut()
+                    .ok_or_else(|| {
+                        "The old service could not provide its transcript preview".to_owned()
+                    })
+                    .and_then(|client| client.snapshot(source));
+                record.snapshots.push(stopped_snapshot(source, captured));
+            }
+        }
+        super::model::Registry::open()?.capture_update_floor(&mut record)?;
+        record.save()
+    })())
+}
+
+fn stopped_snapshot(
+    source: &Session,
+    captured: Result<crate::chat::Snapshot, String>,
+) -> crate::upgrade::floor::StoppedSnapshot {
+    match captured {
+        Ok(snapshot) => crate::upgrade::floor::StoppedSnapshot {source:source.clone(),snapshot,limitation:None},
+        Err(_) => crate::upgrade::floor::StoppedSnapshot {source:source.clone(),snapshot:crate::chat::Snapshot {session_id:source.launch.session_id.clone(),exited:true,..Default::default()},limitation:Some("The old service could not provide a transcript preview. The saved conversation is kept; Resume loads its full history.".into())},
+    }
+}
+
+#[cfg(test)]
+mod floor_capture_tests {
+    #[test]
+    fn an_unattachable_source_still_gets_a_stopped_snapshot() {
+        let source = crate::chat::Session {
+            id: crate::model::TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: crate::model::LaunchRecipe {
+                    program: "claude".into(),
+                    arguments: vec![],
+                    working_directory: "/work".into(),
+                    environment: Default::default(),
+                    unset_environment: Default::default(),
+                },
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let saved = super::stopped_snapshot(&source, Err("attachment refused".into()));
+        assert_eq!(saved.source, source);
+        assert!(saved.snapshot.exited);
+        assert!(saved.limitation.is_some());
     }
 }
