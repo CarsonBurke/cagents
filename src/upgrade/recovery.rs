@@ -1007,12 +1007,24 @@ pub(crate) fn initialize_inherited() -> io::Result<()> {
     inherited().map(|_| ())
 }
 
-pub(crate) fn forward_inherited(command: &mut Command) -> io::Result<()> {
+pub(crate) fn has_inherited_receipt() -> io::Result<bool> {
+    Ok(inherited()?
+        .lock()
+        .map_err(|_| io::Error::other("Update recovery descriptors are unavailable"))?
+        .is_some())
+}
+
+/// A receipt grants no authority to a schema helper, scope launcher or other
+/// intermediate executable. Bind forwarding to the selected daemon's path and
+/// verified bytes before installing its recovery descriptor remapping hook. The daemon
+/// still validates the receipt and all continuous ownership after exec.
+pub(crate) fn forward_target_daemon(command: &mut Command) -> io::Result<()> {
     if let Some(receipt) = inherited()?
         .lock()
         .map_err(|_| io::Error::other("Update recovery descriptors are unavailable"))?
         .as_ref()
     {
+        validate_forward_target(command, &receipt.receipt)?;
         forward(
             command,
             [
@@ -1023,6 +1035,33 @@ pub(crate) fn forward_inherited(command: &mut Command) -> io::Result<()> {
                 &receipt.legacy,
             ],
         )?;
+    }
+    Ok(())
+}
+
+fn validate_forward_target(command: &Command, receipt: &File) -> io::Result<()> {
+    validate_sealed_descriptor(receipt.as_raw_fd())?;
+    let mut bytes = vec![0; receipt.metadata()?.len() as usize];
+    // F_DUPFD shares an open-file description with the selected CLI and daemon.
+    // Read by offset so forwarding never consumes another receiver's receipt.
+    std::os::unix::fs::FileExt::read_exact_at(receipt, &mut bytes, 0)?;
+    let authority: Authority = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    let selected = Path::new(command.get_program());
+    if authority.version != 1
+        || !selected.is_absolute()
+        || !authority.target.is_absolute()
+        || fs::canonicalize(selected)? != fs::canonicalize(&authority.target)?
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "Update recovery may only be forwarded to its verified daemon executable",
+        ));
+    }
+    if executable_hash(selected).map_err(io::Error::other)? != authority.target_hash {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "The recovery daemon executable changed after verification",
+        ));
     }
     Ok(())
 }
@@ -1899,5 +1938,182 @@ mod tests {
             record.validate_census().is_ok(),
             "paired console adoption is part of the original chat's census"
         );
+    }
+    mod forwarding_tests {
+        use super::*;
+        use std::process::Stdio;
+
+        const TEST: &str = "upgrade::recovery::tests::forwarding_tests::bash_cli_forwards_recovery_only_to_the_verified_daemon";
+        const MODE: &str = "CAGENTS_TEST_RECOVERY_FORWARD_MODE";
+        const ROOT: &str = "CAGENTS_TEST_RECOVERY_FORWARD_ROOT";
+
+        #[test]
+        fn bash_cli_forwards_recovery_only_to_the_verified_daemon() {
+            if let Some(mode) = std::env::var_os(MODE) {
+                let root = PathBuf::from(std::env::var_os(ROOT).unwrap());
+                crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
+                assert!(has_inherited_receipt().unwrap());
+                assert!(crate::daemon::lease_handoff::has_inherited_lease().unwrap());
+                for fd in [LEGACY_FD, RECEIPT_FD, WORKER_FD, FENCE_FD, DAEMON_FD] {
+                    let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+                    assert_ne!(flags, -1, "Bash lost recovery descriptor {fd}");
+                    assert_ne!(flags & libc::FD_CLOEXEC, 0);
+                }
+
+                // Model the store/schema maintenance launch: sanitize, seal,
+                // then forward the ordinary reservation, never the receipt.
+                let maintenance_marker = root.join("maintenance-executed");
+                // Maintenance uses the very same daemon executable, so a
+                // path/hash match alone must not turn the normal lease hook
+                // into recovery forwarding.
+                let mut maintenance = Command::new(root.join("bin/cagentsd"));
+                maintenance
+                    .args([
+                        "-c",
+                        r#"
+                    test "$CAGENTS_DAEMON_LEASE_FD" = 199 || exit 10
+                    test -e /proc/self/fd/199 || exit 11
+                    test -z "${CAGENTS_UPDATE_RECOVERY_FD+x}" || exit 12
+                    for fd in 189 193 194 195 196; do
+                        test ! -e "/proc/self/fd/$fd" || exit 13
+                    done
+                    printf maintenance > "$1"
+                "#,
+                        "maintenance-fixture",
+                    ])
+                    .arg(&maintenance_marker);
+                crate::install_guard::sanitize_child_environment(&mut maintenance);
+                unsafe { maintenance.pre_exec(crate::daemon::seal_inherited_descriptors) };
+                crate::daemon::lease_handoff::inherit_daemon_lease(&mut maintenance).unwrap();
+                assert!(maintenance.status().unwrap().success());
+                assert_eq!(fs::read(&maintenance_marker).unwrap(), b"maintenance");
+
+                let wrong_marker = root.join("wrong-target-executed");
+                let mut wrong = Command::new(root.join("other/cagentsd"));
+                wrong
+                    .args(["-c", "printf wrong > \"$1\"", "wrong-target-fixture"])
+                    .arg(&wrong_marker);
+                crate::install_guard::sanitize_child_environment(&mut wrong);
+                unsafe { wrong.pre_exec(crate::daemon::seal_inherited_descriptors) };
+                let rejected =
+                    crate::daemon::lease_handoff::inherit_target_daemon_lease(&mut wrong)
+                        .and_then(|()| wrong.status());
+                assert!(
+                    rejected.is_err(),
+                    "identical bytes and basename are not the selected path"
+                );
+                assert!(!wrong_marker.exists());
+
+                let target_marker = root.join("target-executed");
+                let mut target = Command::new(root.join("bin/cagentsd"));
+                target
+                    .args([
+                        "-c",
+                        r#"
+                    test "$CAGENTS_UPDATE_RECOVERY_FD" = 193 || exit 20
+                    test "$CAGENTS_DAEMON_LEASE_FD" = 199 || exit 21
+                    test -f /proc/self/fd/193 || exit 22
+                    test /proc/self/fd/194 -ef "$1/worker.lock" || exit 23
+                    test /proc/self/fd/195 -ef "$1/fence.lock" || exit 24
+                    test /proc/self/fd/189 -ef "$1/legacy.lock" || exit 25
+                    test /proc/self/fd/196 -ef "$2" || exit 26
+                    test /proc/self/fd/199 -ef "$2" || exit 27
+                    printf daemon > "$3"
+                "#,
+                        "target-daemon-fixture",
+                    ])
+                    .arg(&root)
+                    .arg(crate::daemon::RuntimePaths::discover().unwrap().lock)
+                    .arg(&target_marker);
+                crate::install_guard::sanitize_child_environment(&mut target);
+                unsafe { target.pre_exec(crate::daemon::seal_inherited_descriptors) };
+                let result = crate::daemon::lease_handoff::inherit_target_daemon_lease(&mut target)
+                    .and_then(|()| target.status());
+                if mode == "bad-hash" {
+                    assert!(
+                        result.is_err(),
+                        "changed verified bytes must fail before exec"
+                    );
+                    assert!(!target_marker.exists());
+                } else {
+                    assert_eq!(mode, "valid");
+                    assert!(result.unwrap().success());
+                    assert_eq!(fs::read(&target_marker).unwrap(), b"daemon");
+                }
+                return;
+            }
+
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            for mode in ["valid", "bad-hash"] {
+                let case = root.path().join(mode);
+                fs::create_dir(&case).unwrap();
+                fs::set_permissions(&case, fs::Permissions::from_mode(0o700)).unwrap();
+                for child in ["bin", "other", "runtime"] {
+                    fs::create_dir(case.join(child)).unwrap();
+                    fs::set_permissions(case.join(child), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                // Small ELF fixtures expose inherited descriptors without ever
+                // starting a provider or the installed daemon. The negative
+                // target deliberately has identical bytes and basename.
+                for executable in ["bin/cagentsd", "other/cagentsd"] {
+                    fs::copy("/bin/sh", case.join(executable)).unwrap();
+                    fs::set_permissions(case.join(executable), fs::Permissions::from_mode(0o700))
+                        .unwrap();
+                }
+                let runtime = case.join("runtime");
+                let daemon_directory = runtime.join(crate::instance::runtime_subdirectory());
+                fs::create_dir(&daemon_directory).unwrap();
+                fs::set_permissions(&daemon_directory, fs::Permissions::from_mode(0o700)).unwrap();
+                let preparation = preparation(&case);
+                save(
+                    &preparation.authority.checkpoint_path,
+                    &checkpoint(&preparation, "Prepared"),
+                );
+                let lease = handoff(&daemon_directory);
+                let mut receipt = preparation
+                    .acknowledged()
+                    .unwrap()
+                    .receipt(&case.join("bin/cagentsd"), &lease)
+                    .unwrap()
+                    .unwrap();
+                if mode == "bad-hash" {
+                    receipt.authority.target_hash = "0".repeat(64);
+                    receipt.receipt = sealed_receipt(&receipt.authority).unwrap();
+                }
+                let mut command = Command::new("/bin/bash");
+                command
+                    .args([
+                        "--noprofile",
+                        "--norc",
+                        "-p",
+                        "-c",
+                        "exec \"$@\"",
+                        "receipt-bash-fixture",
+                    ])
+                    .arg(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(MODE, mode)
+                    .env(ROOT, &case)
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .env_remove("BASH_ENV")
+                    .env_remove("ENV")
+                    .stdin(Stdio::null());
+                crate::install_guard::sanitize_child_environment(&mut command);
+                unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+                // The updater explicitly grants the verified shell/selected CLI
+                // its bundle. Later generic lease forwarding must not repeat it.
+                lease.inherit(&mut command).unwrap();
+                receipt.inherit(&mut command).unwrap();
+                let output = command.output().unwrap();
+                assert!(
+                    output.status.success(),
+                    "{mode}:\n{}\n{}",
+                    String::from_utf8_lossy(&output.stdout),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+            }
+        }
     }
 }
