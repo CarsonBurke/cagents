@@ -10,10 +10,23 @@ import signal
 import sys
 import time
 
+# The updater's prompts: an ordinary confirmation, the choice offered while
+# agents are mid-turn, and the typed destructive confirmation. Each ends where
+# the updater starts reading its answer.
+PROMPTS = re.compile(
+    rb'(?P<confirm>[^\r\n]*(?:\[y/N\]|\[Y/n\])[ \t]*)'
+    rb'|(?P<working>[^\r\n]*i: interrupt them now[^\r\n]*n: cancel[ \t]*\r?\n)'
+    rb'|(?P<stop>[^\r\n]*Anything else cancels\.[ \t]*\r?\n)')
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--answer', default='')
+    parser.add_argument('--answer', default='',
+                        help='typed at each [Y/n] or [y/N] confirmation')
+    parser.add_argument('--working', default='',
+                        help='typed at the working-agents choice; empty waits for them')
+    parser.add_argument('--stop', default='',
+                        help='typed at the destructive stop list; empty cancels')
     parser.add_argument('--timeout', type=float, default=240)
     parser.add_argument('command', nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -48,9 +61,11 @@ def main():
             pending += data
             # These are the updater's confirmation markers, including prompts
             # arriving across separate PTY reads. Do not queue answers early.
-            while match := re.search(rb'[^\r\n]*(?:\[y/N\]|\[Y/n\])\s*', pending):
-                print(f'\n[rehearsal prompt={match.group().decode(errors="replace")!r} answer={args.answer!r}]', flush=True)
-                os.write(fd, args.answer.encode()+b'\n')
+            while match := PROMPTS.search(pending):
+                answer = (args.answer if match.group('confirm') else
+                          args.working if match.group('working') else args.stop)
+                print(f'\n[rehearsal prompt={match.group().decode(errors="replace").strip()!r} answer={answer!r}]', flush=True)
+                os.write(fd, answer.encode()+b'\n')
                 pending = pending[match.end():]
             pending = pending[-8192:]
     finally:

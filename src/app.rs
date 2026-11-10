@@ -299,6 +299,8 @@ enum NoticeKey {
     GitCommit(ActiveWorktreeKey),
     /// Saving this chat's return to a terminal.
     ChatReturn(CardId),
+    /// Closing this chat, which the daemon refused.
+    ChatClose(CardId),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9415,6 +9417,7 @@ impl Cagents {
                 VisibilityClass::Visible | VisibilityClass::Overscan => reconcile_now = true,
             }
         }
+        self.trim_warm_chats();
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
@@ -12770,10 +12773,13 @@ impl Cagents {
             .entries
             .iter()
             .filter_map(|entry| match entry.notice.key.as_ref() {
-                Some(key @ (NoticeKey::ChatAttach(card) | NoticeKey::ChatReturn(card)))
-                    if self
-                        .card_state(*card)
-                        .is_none_or(|state| !state.existence.is_open()) =>
+                Some(
+                    key @ (NoticeKey::ChatAttach(card)
+                    | NoticeKey::ChatReturn(card)
+                    | NoticeKey::ChatClose(card)),
+                ) if self
+                    .card_state(*card)
+                    .is_none_or(|state| !state.existence.is_open()) =>
                 {
                     Some(key.clone())
                 }
@@ -12809,6 +12815,15 @@ impl Cagents {
     }
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+        self.apply_workspace_surface_visibility(workspace_visible);
+        self.trim_warm_chats();
+    }
+
+    /// [`Self::set_workspace_surfaces_visible`] without applying the warm
+    /// chat budget, for a caller that shows the next panes before the budget
+    /// is applied: hiding everything first must not cool the chats about to
+    /// be shown again.
+    fn apply_workspace_surface_visibility(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .presence
             .iter()
@@ -14509,6 +14524,7 @@ impl Cagents {
                     _ => {}
                 }
             }
+            self.chat_ui.set_parked_syntax_theme(syntax_theme);
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {
@@ -14765,6 +14781,7 @@ impl Application for Cagents {
         let workspace = Self::rebuild_workspace(&durable);
         let chat_drafts = durable.chat_drafts.clone();
         let chat_draft_attachments = durable.chat_draft_attachments.clone();
+        let chat_waiting_messages = durable.chat_waiting_messages.clone();
         let (terminal_wake_tx, terminal_wake_rx) = async_channel::unbounded();
         // The daemon owns the terminal inventory; this window observes it for
         // the whole of its life, so the observer starts with the window rather
@@ -14884,7 +14901,8 @@ impl Application for Cagents {
             worktree_protections: Default::default(),
             channel_ui: channel_ui::State::default(),
             sidebar_selection_ui: sidebar_selection_ui::State::default(),
-            chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments),
+            chat_ui: chat_ui::State::with_draft_attachments(chat_drafts, chat_draft_attachments)
+                .with_waiting_messages(chat_waiting_messages),
             resume_ui: resume_ui::State::default(),
             update_ui: update_ui::State::new(),
             branch_ui: branch_ui::State::default(),
@@ -19993,37 +20011,15 @@ fn load_repository_github(
             return Err(GitHubAvailability::Unauthenticated);
         }
         let mut pull_requests = github
-            .list(
-                &ListPullRequestsRequest {
-                    repository: key.clone(),
-                    state: PullRequestStateFilter::Open,
-                    limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-                },
-                &cancellation,
-            )
+            .sidebar_open(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
             .map_err(GitHubAvailability::from_error)?;
         // Closed history must not consume the open-PR page. Its failure also
         // must not discard successfully refreshed open conversation authority.
-        if let Ok(history) = github.list(
-            &ListPullRequestsRequest {
-                repository: key.clone(),
-                state: PullRequestStateFilter::All,
-                limit: sidebar::PULL_REQUEST_LIST_LIMIT,
-            },
-            &cancellation,
-        ) {
-            for entry in history {
-                if let Some(current) = pull_requests
-                    .iter_mut()
-                    .find(|current| current.number == entry.number)
-                {
-                    *current = entry;
-                } else {
-                    pull_requests.push(entry);
-                }
-            }
+        if let Ok(history) =
+            github.recent_history(&key, sidebar::PULL_REQUEST_LIST_LIMIT, &cancellation)
+        {
+            crate::github::append_recent_history(&mut pull_requests, history);
         }
-        crate::github::polling::succeeded(&key.host);
         Ok(GitHubAvailability::Ready {
             repository_key: key,
             pull_requests: pull_requests

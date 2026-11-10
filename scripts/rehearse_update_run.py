@@ -59,6 +59,10 @@ class Rehearsal:
             slot = 'ceditor' if 'ceditor' in (window.get('app_id') or '').lower() else 'main'
             if '--window' in argv:
                 slot = argv[argv.index('--window')+1]
+            # Relaunched windows name the main window explicitly
+            # (instance::PRIMARY_WINDOW); it is the same window and store.
+            if slot == 'primary':
+                slot = 'main'
             if slot in slots:
                 raise RuntimeError(f'more than one mapped window for {slot}')
             slots[slot] = window
@@ -275,7 +279,7 @@ class Rehearsal:
         try:
             self.call('init')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
-            self.call('desktop','start','--limit','900', timeout=1900)
+            self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
             self.call('launch','second')
             self.wait_windows(['main','second'])
@@ -290,6 +294,7 @@ class Rehearsal:
                 self.errors.append('before record has evidence gaps')
             self.observe(self.root/'records/before/windows.json',shots='before')
             update_args = ['--yes'] if args.yes else ['--answer',args.answer]
+            update_args += ['--working',args.working,'--stop',args.stop]
             for flag in args.upgrade_arg:
                 update_args.append(flag)
             code, _ = self.call('update',args.new_dir,args.new_version,args.new_installer,*update_args,timeout=300,check=False)
@@ -383,6 +388,8 @@ def main():
     run.add_argument('--ceditor',metavar='BIN_DIR')
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
+    run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
+    run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--reopen-timeout',type=float,default=45)
     seed_options(run)

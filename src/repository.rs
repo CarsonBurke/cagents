@@ -2054,6 +2054,21 @@ fn parse_ahead_behind(value: &[u8], index: usize) -> Result<(u64, u64), GitParse
     Ok((ahead.unwrap(), behind.unwrap()))
 }
 
+/// Parses `git rev-list --left-right --count HEAD...UPSTREAM` output: two
+/// counts, how far the left-hand commit is ahead, then behind.
+pub fn parse_ahead_behind_counts(output: &[u8]) -> Result<(u64, u64), GitParseError> {
+    let value = utf8(output, "git rev-list", 0, "left-right count")?;
+    let mut parts = value.split_ascii_whitespace();
+    let counts = (parts.next(), parts.next(), parts.next());
+    match counts {
+        (Some(ahead), Some(behind), None) => match (ahead.parse(), behind.parse()) {
+            (Ok(ahead), Ok(behind)) => Ok((ahead, behind)),
+            _ => Err(malformed("git rev-list", 0, "invalid left-right count")),
+        },
+        _ => Err(malformed("git rev-list", 0, "invalid left-right count")),
+    }
+}
+
 fn fixed_fields(field: &[u8], index: usize, count: usize) -> Result<Vec<&[u8]>, GitParseError> {
     let fields: Vec<_> = field.splitn(count, |byte| *byte == b' ').collect();
     if fields.len() != count || fields.iter().any(|field| field.is_empty()) {
@@ -3615,17 +3630,77 @@ impl<E: ProcessExecutor> RepositoryService<E> {
     }
 
     pub fn refs_command(&self, worktree: &Path) -> CommandSpec {
-        self.git_read(
+        self.refs_command_over(worktree, &["refs/heads", "refs/remotes"])
+    }
+
+    fn refs_command_over(&self, worktree: &Path, patterns: &[&str]) -> CommandSpec {
+        let mut arguments = vec![
+            "for-each-ref",
+            // `%00` separates the fields; a ref name can contain neither a
+            // NUL nor a newline, so record framing stays unambiguous.
+            "--format=%(refname)%00%(objectname)%00%(symref)%00%(upstream)%00%(HEAD)",
+        ];
+        arguments.extend(patterns);
+        self.git_read(worktree, arguments)
+    }
+
+    /// Every local and remote-tracking ref in one read, for a caller
+    /// deciding which worktrees a shared-ref change can have moved.
+    pub fn ref_listing(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<RefListing, RepositoryError> {
+        let output = self.run_checked(&self.refs_command(worktree), cancellation)?;
+        let parsed = parse_refs(&output.stdout);
+        invalid_output(parsed, output)
+    }
+
+    /// The listing a shared-ref change is judged against, or `None` when
+    /// replace refs rewrite the graph that listing would be judged from:
+    /// status and rev-list both honor them, the listing cannot, so no
+    /// recorded count can be trusted against it.
+    pub fn change_ref_listing(
+        &self,
+        worktree: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<RefListing>, RepositoryError> {
+        let command =
+            self.refs_command_over(worktree, &["refs/heads", "refs/remotes", "refs/replace"]);
+        let output = self.run_checked(&command, cancellation)?;
+        let replaced = output
+            .stdout
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .any(|line| {
+                line.split(|byte| *byte == 0)
+                    .next()
+                    .is_some_and(|name| name.starts_with(b"refs/replace/"))
+            });
+        if replaced {
+            return Ok(None);
+        }
+        let parsed = parse_refs(&output.stdout);
+        invalid_output(parsed, output).map(Some)
+    }
+
+    /// How far `head` is ahead of and behind `upstream`, counted once for
+    /// that pair rather than as part of a whole status read.
+    pub fn ahead_behind(
+        &self,
+        worktree: &Path,
+        head: &Oid,
+        upstream: &Oid,
+        cancellation: &CancellationToken,
+    ) -> Result<(u64, u64), RepositoryError> {
+        let range = format!("{head}...{upstream}");
+        let command = self.git_read(
             worktree,
-            [
-                "for-each-ref",
-                // `%00` separates the fields; a ref name can contain neither a
-                // NUL nor a newline, so record framing stays unambiguous.
-                "--format=%(refname)%00%(objectname)%00%(symref)%00%(upstream)%00%(HEAD)",
-                "refs/heads",
-                "refs/remotes",
-            ],
-        )
+            ["rev-list", "--left-right", "--count", range.as_str()],
+        );
+        let output = self.run_checked(&command, cancellation)?;
+        let parsed = parse_ahead_behind_counts(&output.stdout);
+        invalid_output(parsed, output)
     }
 
     /// Line counts for one uncommitted area. The staged form compares HEAD to
@@ -9090,6 +9165,16 @@ mod tests {
         // The framing itself is still a hard requirement: a record with the
         // wrong field count means the output cannot be walked at all.
         assert!(parse_refs(b"refs/heads/main\0\0\n").is_err());
+    }
+
+    #[test]
+    fn ahead_behind_counts_read_left_then_right() {
+        assert_eq!(parse_ahead_behind_counts(b"3\t2\n").unwrap(), (3, 2));
+        assert_eq!(parse_ahead_behind_counts(b"0\t0\n").unwrap(), (0, 0));
+        assert!(parse_ahead_behind_counts(b"3\n").is_err());
+        assert!(parse_ahead_behind_counts(b"3\t2\t1\n").is_err());
+        assert!(parse_ahead_behind_counts(b"ahead\t2\n").is_err());
+        assert!(parse_ahead_behind_counts(b"").is_err());
     }
 
     /// `git remote add te/am` is legal, so `refs/remotes/te/am/main` is `main`

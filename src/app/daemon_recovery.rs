@@ -4,7 +4,7 @@ use crate::{
     control::ControlClient,
     model::{HostSessionProof, TerminalSession},
     terminal::ensure_daemon_ready,
-    upgrade::{ensure_no_surviving_process, exact_conversation},
+    upgrade::{ScanError, UnreadableProcess, ensure_no_surviving_process, exact_conversation},
 };
 
 pub(super) struct RecoveredTerminal {
@@ -290,10 +290,13 @@ fn reconcile_with(
             }
         }
     }
-    if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root)
+    if let Some(survivor) = crate::upgrade::surviving_process(&session, owner, proc_root, &[])
         .map_err(|error| {
             tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Retry");
-            unfinished_check_refusal()
+            match error {
+                ScanError::Unreadable(processes) => unreadable_retry_refusal(&processes),
+                ScanError::Incomplete(_) => unfinished_check_refusal(),
+            }
         })?
     {
         return Err(survivor_refusal(
@@ -339,10 +342,44 @@ fn reconcile_with(
     })
 }
 
+/// Why Close kept a pane, for the person who asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeptPane {
+    pub(crate) reason: String,
+    /// When these are all that's in the way, the person may close the pane and
+    /// leave them running. Empty otherwise.
+    pub(crate) unreadable: Vec<UnreadableProcess>,
+}
+
+impl From<String> for KeptPane {
+    fn from(reason: String) -> Self {
+        Self {
+            reason,
+            unreadable: Vec::new(),
+        }
+    }
+}
+
+impl From<&str> for KeptPane {
+    fn from(reason: &str) -> Self {
+        reason.to_owned().into()
+    }
+}
+
 /// Decides whether Close may retire a saved pane whose terminal is gone, without
-/// starting, attaching to or stopping anything. `Err` is the reason to show the
-/// person, and always means the pane stays: unknown is not dead.
-pub(super) fn prove_not_hosted(session: &TerminalSession) -> Result<(), String> {
+/// starting or attaching to anything. `Err` is the reason to show the person,
+/// and always means the pane stays: unknown is not dead. `leave` names the
+/// unreadable processes the person chose to close the pane beside; they are
+/// passed over, never signaled, and anything else still keeps the pane.
+///
+/// It stops nothing either, with one exception: a pane that is an open agent's
+/// own conversation, which the daemon no longer hosts, is closed with that
+/// agent as the conversation's own Close would, and only once every check has
+/// let the pane go.
+pub(super) fn prove_not_hosted(
+    session: &TerminalSession,
+    leave: &[UnreadableProcess],
+) -> Result<(), KeptPane> {
     // A remote or agent-scoped window sees neither this daemon's lease nor the
     // processes behind it, so nothing it can read here would prove an absence.
     if crate::device::is_remote()
@@ -356,7 +393,13 @@ pub(super) fn prove_not_hosted(session: &TerminalSession) -> Result<(), String> 
         );
     }
     let socket = crate::terminal::ipc::daemon_socket_path().map_err(|_| UNREACHABLE)?;
-    prove_not_hosted_at(session, &socket, Path::new("/proc"), registered_holder)
+    prove_not_hosted_at(
+        session,
+        &socket,
+        Path::new("/proc"),
+        registered_holder,
+        leave,
+    )
 }
 
 const UNREACHABLE: &str = "Cagents can't reach its daemon, so this terminal may still be running. The pane was kept. Close it again once the daemon is back.";
@@ -401,7 +444,8 @@ fn prove_not_hosted_at(
     socket: &Path,
     proc_root: &Path,
     holder: impl FnOnce(crate::model::TerminalId) -> Result<Option<i32>, String>,
-) -> Result<(), String> {
+    leave: &[UnreadableProcess],
+) -> Result<(), KeptPane> {
     session
         .continuity
         .live_proof()
@@ -456,12 +500,20 @@ fn prove_not_hosted_at(
     }) {
         return Err("A conversation still uses this terminal, so the pane was kept. Close that conversation, then close this pane.".into());
     }
-    // Removing the pane would leave an open agent with no way to show it.
+    // Removing the pane would leave an open agent with no way to show it,
+    // unless the pane is that agent's own conversation, whose provider is gone
+    // from the daemon: closing it is then a person closing that conversation,
+    // which ends its agent. It is closed last, once nothing below has kept the
+    // pane, so a refusal never leaves the agent closed with its pane still open.
+    let mut agent_conversation = None;
     if let Some(agent) = agents
         .iter()
         .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
     {
-        return Err(open_agent_refusal(agent, &chats, &current.boot_id));
+        let Some(conversation) = lost_conversation_of_pane(agent, session.id, &chats) else {
+            return Err(open_agent_refusal(agent, &chats, &current.boot_id).into());
+        };
+        agent_conversation = Some(conversation.clone());
     }
     // Authenticate the answer: reaching a socket that reports another identity
     // is not evidence that the daemon holding the runtime's lease answered.
@@ -473,30 +525,142 @@ fn prove_not_hosted_at(
         tracing::warn!(%error, terminal = %session.id, "could not read the holder record for Close");
         cannot_confirm()
     })? {
-        return Err(unadopted_refusal(pid));
+        return Err(unadopted_refusal(pid).into());
     }
     // Check even when the saved boot is over. No process outlives its boot, but
     // a replacement started on this one carries the saved terminal's lineage
     // and stays unlisted if its daemon failed to adopt it.
-    if let Some(survivor) = crate::upgrade::surviving_process(session, owner, proc_root)
+    if let Some(survivor) = crate::upgrade::surviving_process(session, owner, proc_root, leave)
         .map_err(|error| {
             tracing::warn!(%error, terminal = %session.id, "could not finish the process check for Close");
-            cannot_confirm()
+            match error {
+                ScanError::Unreadable(processes) => {
+                    // Close anyway passes over a process only while it is the
+                    // same one, which takes knowing when it started.
+                    let can_leave = processes.iter().all(UnreadableProcess::identified);
+                    KeptPane {
+                        reason: unreadable_close_refusal(&processes, can_leave),
+                        unreadable: if can_leave { processes } else { Vec::new() },
+                    }
+                }
+                ScanError::Incomplete(_) => cannot_confirm().into(),
+            }
         })?
     {
-        return Err(survivor_refusal(
-            &survivor,
-            "so the pane was kept",
-            "close the pane again",
-        ));
+        return Err(survivor_refusal(&survivor, PANE_KEPT, "close the pane again").into());
     }
     if crate::daemon::replacement_owner(socket, &current).map_err(|_| UNREACHABLE)? != owner {
         return Err(UNREACHABLE.into());
+    }
+    if let Some(conversation) = agent_conversation {
+        // The daemon settles it only once nothing of it can still run.
+        client
+            .close_retained_chat(conversation)
+            .map_err(|error| KeptPane::from(lost_agent_refusal(&error.reason())))?;
+        let (_, agents) = client.read_workspace_agents().map_err(|_| UNREACHABLE)?;
+        if let Some(agent) = agents
+            .iter()
+            .find(|agent| !agent.closed && agent_uses_terminal(agent, session.id))
+        {
+            return Err(open_agent_refusal(agent, &chats, &current.boot_id).into());
+        }
     }
     Ok(())
 }
 
 const NOTHING_STARTED: &str = "so nothing was started";
+const PANE_KEPT: &str = "so the pane was kept";
+
+/// "ssh-agent (PID 4242)", or "A process (PID 4242)" once it has gone.
+fn named_process(name: Option<&str>, pid: u32) -> String {
+    match name {
+        Some(name) => format!("{name} (PID {pid})"),
+        None => format!("A process (PID {pid})"),
+    }
+}
+
+/// These processes don't exit with a terminal session or a moment's wait, so the
+/// refusal names them and says what changes the answer, instead of "try again".
+/// Each is named once; later sentences say "it" or "them".
+fn unreadable_retry_refusal(processes: &[UnreadableProcess]) -> String {
+    let words = Pronouns::of(processes);
+    format!(
+        "Cagents can't check whether {} came from this terminal, {NOTHING_STARTED}. Retry works once {} {}. To stop waiting, use Close: it can close the pane and leave {} running.",
+        unreadable_list(processes),
+        words.subject,
+        words.exits,
+        words.object,
+    )
+}
+
+/// What Close says when only `processes` kept the pane. `can_leave` says the
+/// dialog offers Close anyway, so the text explains what that button does.
+fn unreadable_close_refusal(processes: &[UnreadableProcess], can_leave: bool) -> String {
+    let words = Pronouns::of(processes);
+    let checked = format!(
+        "Cagents can't check whether {} came from this terminal, {PANE_KEPT}.",
+        unreadable_list(processes)
+    );
+    if !can_leave {
+        return format!(
+            "{checked} Close the pane again once {} {}.",
+            words.subject, words.exits
+        );
+    }
+    let (
+        Pronouns {
+            subject, object, ..
+        },
+        keeps,
+    ) = (
+        words,
+        if processes.len() == 1 {
+            "keeps"
+        } else {
+            "keep"
+        },
+    );
+    format!(
+        "{checked} Close anyway removes the pane and leaves {object} running: Cagents won't stop or signal {object}. If {subject} did come from this terminal, {subject} {keeps} running with no pane to show {object}. To close the pane without leaving anything, end {object} first, then close it again."
+    )
+}
+
+struct Pronouns {
+    subject: &'static str,
+    object: &'static str,
+    exits: &'static str,
+}
+
+impl Pronouns {
+    fn of(processes: &[UnreadableProcess]) -> Self {
+        if processes.len() == 1 {
+            Self {
+                subject: "it",
+                object: "it",
+                exits: "exits",
+            }
+        } else {
+            Self {
+                subject: "they",
+                object: "them",
+                exits: "exit",
+            }
+        }
+    }
+}
+
+/// "ssh-agent (PID 1), gpg-agent (PID 2) and sshd-session (PID 3)".
+fn unreadable_list(processes: &[UnreadableProcess]) -> String {
+    let names: Vec<_> = processes
+        .iter()
+        .map(|process| named_process(process.name.as_deref(), process.pid))
+        .collect();
+    match names.as_slice() {
+        [] => "a process".into(),
+        [one] => one.clone(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
 
 fn unfinished_check_refusal() -> String {
     format!(
@@ -516,10 +680,7 @@ fn survivor_refusal(
     next: &str,
 ) -> String {
     use crate::upgrade::SurvivorLink;
-    let process = match &survivor.name {
-        Some(name) => format!("{name} (PID {})", survivor.pid),
-        None => format!("A process (PID {})", survivor.pid),
-    };
+    let process = named_process(survivor.name.as_deref(), survivor.pid);
     match &survivor.link {
         SurvivorLink::Lineage => format!(
             "{process}, started by this terminal, is still running, {outcome}. Stop it, then {next}."
@@ -531,6 +692,34 @@ fn survivor_refusal(
             "{process} is running in {unit}, the systemd unit this terminal was launched in, {outcome}. If it came from this terminal, stop it, then {next}. Otherwise the pane stays until that process exits."
         ),
     }
+}
+
+/// The conversation of an open agent that this pane is, when the daemon no
+/// longer hosts it: what the pane's Close closes, as the conversation's own
+/// Close would. A scheduled agent is its automation's to end.
+fn lost_conversation_of_pane<'a>(
+    agent: &'a crate::agent_execution::Agent,
+    terminal: crate::model::TerminalId,
+    hosted: &[crate::chat::Session],
+) -> Option<&'a crate::chat::Session> {
+    use crate::agent_execution::{HostedSession, Origin};
+    match &agent.session {
+        Some(HostedSession::Chat(chat))
+            if chat.id == terminal
+                && !matches!(agent.origin, Origin::Automation { .. })
+                && !hosted.iter().any(|hosted| hosted.id == chat.id) =>
+        {
+            Some(chat)
+        }
+        _ => None,
+    }
+}
+
+/// Why closing the agent conversation this pane is was refused, in the
+/// daemon's words.
+fn lost_agent_refusal(reason: &str) -> String {
+    let reason = reason.trim_end_matches('.');
+    format!("This pane is an open agent's conversation, which Cagents couldn't close. {reason}.")
 }
 
 /// Never names a route the daemon is certain to refuse.
@@ -570,6 +759,12 @@ fn agent_close_can_release(
         Some(HostedSession::Terminal(_)) => false,
         Some(HostedSession::Chat(session)) => {
             session.closes_without_hosted_actor()
+                // The daemon closes a retained actor that died without its
+                // retirement once nothing of it can still run.
+                || matches!(
+                    session.native_continuity,
+                    crate::chat::NativeContinuity::RetainedClaudeActor { .. }
+                )
                 || hosted.iter().any(|chat| chat.id == session.id)
                 // A scheduled agent is its automation's to end, so the daemon
                 // doesn't take this route for one.
@@ -1384,6 +1579,138 @@ mod tests {
         assert!(!error.contains("42"), "{error}");
     }
 
+    /// A process whose environment the kernel won't show, as for ssh-agent.
+    /// Its PID is beyond any real one, so the user-manager check can't match it.
+    fn unreadable_process(proc_root: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        let pid = u32::MAX - 1;
+        let process = proc_root.join(pid.to_string());
+        fs::create_dir(&process).unwrap();
+        let mut fields = vec!["0"; 20];
+        fields[0] = "S";
+        fields[1] = "1";
+        fields[19] = "100";
+        let session = pid.to_string();
+        fields[3] = &session;
+        fs::write(
+            process.join("stat"),
+            format!("{pid} (ssh-agent) {}", fields.join(" ")),
+        )
+        .unwrap();
+        fs::write(process.join("comm"), b"ssh-agent\n").unwrap();
+        fs::write(process.join("cmdline"), b"ssh-agent\0").unwrap();
+        fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        assert!(fs::read(process.join("environ")).is_err());
+        pid
+    }
+
+    /// #2365: a process Cagents can't read lasts as long as the login, so the
+    /// refusal names it and says what changes the answer, not "in a moment".
+    #[test]
+    fn retry_names_the_process_it_cannot_read() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("daemon.sock");
+        let original = session(directory.path(), &proof("old"));
+        let pid = unreadable_process(directory.path());
+        let replacement_proof = proof("replacement");
+        let _lease = lease(directory.path(), &replacement_proof);
+        let server = discovery(&socket, replacement_proof, Vec::new(), 1);
+        let error = reconcile_at(original, true, &socket, directory.path())
+            .err()
+            .unwrap();
+        server.join().unwrap();
+        assert!(is_retry_refusal(&error), "{error}");
+        assert!(error.contains(&format!("ssh-agent (PID {pid})")), "{error}");
+        assert!(!error.contains("in a moment"), "{error}");
+        assert!(error.contains("Retry works once it exits"), "{error}");
+        assert!(error.contains("use Close"), "{error}");
+        assert_eq!(error.matches("ssh-agent").count(), 1, "named once: {error}");
+    }
+
+    /// Close names what it couldn't read, and closes beside exactly those once
+    /// the person chooses to leave them running. Nothing is signaled either way.
+    #[test]
+    fn close_can_leave_running_only_the_processes_it_named() {
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("before-restart"));
+        let pid = unreadable_process(directory.path());
+        let attempt = |name: &str, owner_probes, leave: &[UnreadableProcess]| {
+            let socket = directory.path().join(name);
+            let current = proof("after-restart");
+            // Each attempt is answered by a daemon of its own.
+            match fs::remove_file(directory.path().join("cagentsd.lock")) {
+                Err(error) if error.kind() != std::io::ErrorKind::NotFound => panic!("{error}"),
+                _ => {}
+            }
+            let _lease = lease(directory.path(), &current);
+            let served = Inventory {
+                owner_probes,
+                ..Default::default()
+            };
+            let server = inventory(&socket, current, served);
+            let result = prove_not_hosted_at(&saved, &socket, directory.path(), no_holder, leave);
+            server.join().unwrap();
+            result
+        };
+        let kept = attempt("first.sock", 1, &[]).unwrap_err();
+        assert_eq!(
+            kept.unreadable
+                .iter()
+                .map(|process| process.pid)
+                .collect::<Vec<_>>(),
+            [pid]
+        );
+        let reason = &kept.reason;
+        assert!(
+            reason.contains(&format!("ssh-agent (PID {pid})")),
+            "{reason}"
+        );
+        assert!(reason.contains("Close anyway removes the pane"), "{reason}");
+        assert!(reason.contains("won't stop or signal it"), "{reason}");
+        assert!(reason.contains("no pane to show it"), "{reason}");
+        assert_eq!(
+            reason.matches("ssh-agent").count(),
+            1,
+            "named once: {reason}"
+        );
+        assert_eq!(attempt("second.sock", 2, &kept.unreadable), Ok(()));
+
+        // A process that is this terminal's own still keeps the pane, and isn't
+        // something Close may leave running.
+        fs::create_dir(directory.path().join("4242")).unwrap();
+        fs::write(
+            directory.path().join("4242/stat"),
+            "4242 (sh) S 1 4242 4242 0",
+        )
+        .unwrap();
+        fs::write(directory.path().join("4242/cmdline"), "sh\0").unwrap();
+        fs::write(
+            directory.path().join("4242/environ"),
+            format!("CAGENTS_TERMINAL_ID={}\0", saved.id),
+        )
+        .unwrap();
+        let kept = attempt("third.sock", 1, &kept.unreadable).unwrap_err();
+        assert!(kept.unreadable.is_empty());
+        assert!(kept.reason.contains("PID 4242"), "{}", kept.reason);
+        fs::remove_dir_all(directory.path().join("4242")).unwrap();
+
+        // Without a start time, a PID could name a later process by the time
+        // Close anyway runs, so it isn't offered: the button could never work.
+        fs::write(
+            directory.path().join(pid.to_string()).join("stat"),
+            format!("{pid} (ssh-agent) S 1 {pid} {pid} 0"),
+        )
+        .unwrap();
+        let kept = attempt("fourth.sock", 1, &[]).unwrap_err();
+        assert!(kept.unreadable.is_empty());
+        assert!(
+            kept.reason.contains("Close the pane again once it exits"),
+            "{}",
+            kept.reason
+        );
+    }
+
     #[test]
     fn explicit_retry_does_not_override_missing_daemon_ownership() {
         let directory = tempfile::tempdir().unwrap();
@@ -1626,12 +1953,15 @@ mod tests {
         recovery_only: bool,
         /// Owner authentication connects once before and once after the scan.
         owner_probes: usize,
+        /// How a pane's Close of a conversation it hosts no longer is
+        /// answered: accepted, which closes its agents, or refused with this.
+        retained_close: Option<Result<(), String>>,
     }
 
     fn inventory(
         socket: &Path,
         proof: HostSessionProof,
-        inventory: Inventory,
+        mut inventory: Inventory,
     ) -> thread::JoinHandle<()> {
         let listener = UnixListener::bind(socket).unwrap();
         thread::spawn(move || {
@@ -1647,6 +1977,29 @@ mod tests {
                             "Startup recovery retained original ownership",
                             false,
                         ))
+                    }
+                    ClientRequest::ChatCloseRetained { .. } => {
+                        match inventory
+                            .retained_close
+                            .take()
+                            .expect("a Close proof closed a conversation")
+                        {
+                            Ok(()) => {
+                                for agent in &mut inventory.agents {
+                                    agent.closed = true;
+                                }
+                                ServerMessage::Response {
+                                    response: ServerResponse::Accepted,
+                                }
+                            }
+                            Err(refusal) => {
+                                ServerMessage::Error(crate::terminal::ipc::ProtocolError::new(
+                                    crate::terminal::ipc::ProtocolErrorCode::TerminalUnavailable,
+                                    refusal,
+                                    true,
+                                ))
+                            }
+                        }
                     }
                     other => ServerMessage::Response {
                         response: match other {
@@ -1752,7 +2105,8 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         let _lease = lease(directory.path(), &current);
         let server = inventory(&socket, current, served);
-        let result = prove_not_hosted_at(saved, &socket, proc_root, no_holder);
+        let result = prove_not_hosted_at(saved, &socket, proc_root, no_holder, &[])
+            .map_err(|kept| kept.reason);
         server.join().unwrap();
         result
     }
@@ -1945,11 +2299,18 @@ mod tests {
             ..Default::default()
         };
         let server = inventory(&socket, current, served);
-        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |terminal| {
-            assert_eq!(terminal, id);
-            Ok(Some(4242))
-        })
-        .unwrap_err();
+        let refusal = prove_not_hosted_at(
+            &saved,
+            &socket,
+            directory.path(),
+            |terminal| {
+                assert_eq!(terminal, id);
+                Ok(Some(4242))
+            },
+            &[],
+        )
+        .unwrap_err()
+        .reason;
         server.join().unwrap();
         assert_eq!(refusal, unadopted_refusal(4242));
 
@@ -1960,10 +2321,15 @@ mod tests {
             ..Default::default()
         };
         let server = inventory(&socket, proof("after-restart"), served);
-        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), |_| {
-            Err("unreadable".into())
-        })
-        .unwrap_err();
+        let refusal = prove_not_hosted_at(
+            &saved,
+            &socket,
+            directory.path(),
+            |_| Err("unreadable".into()),
+            &[],
+        )
+        .unwrap_err()
+        .reason;
         server.join().unwrap();
         assert!(refusal.contains("can't confirm"), "{refusal}");
     }
@@ -2141,10 +2507,17 @@ mod tests {
         ] {
             let served = Inventory {
                 agents: vec![open],
+                // Only the pane that is the agent's conversation asks.
+                retained_close: Some(Err(
+                    "Cagents couldn't confirm this conversation stopped".into()
+                )),
                 ..Default::default()
             };
             let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
-            assert!(refusal.contains("was kept"), "{refusal}");
+            assert!(
+                refusal.contains("was kept") || refusal.contains("which Cagents couldn't close"),
+                "{refusal}"
+            );
         }
         let served = Inventory {
             agents: vec![agent(
@@ -2159,6 +2532,97 @@ mod tests {
             prove(&saved, proof("current"), served, directory.path()),
             Ok(())
         );
+    }
+
+    /// #2102: the pane is an open agent's conversation whose provider the
+    /// daemon no longer hosts. Its Close closes that conversation, and its
+    /// agent with it, as the conversation's own Close does; the daemon keeps
+    /// both when it can't prove nothing of it still runs, and says why.
+    #[test]
+    fn closing_a_lost_agents_own_pane_closes_its_conversation() {
+        use crate::agent_execution::{
+            Agent, HostedSession, Origin, Placement, Spec, Surface, Target,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let saved = session(directory.path(), &proof("old"));
+        let agent = |origin| Agent {
+            name: None,
+            id: crate::model::AgentId::new(),
+            origin,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository: "/execution/.git".into(),
+                    directory: "/execution/cwd".into(),
+                    placement: None,
+                },
+                surface: Surface::Chat,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Placement::Channel(crate::model::ChannelId::new()),
+            session: Some(HostedSession::Chat(crate::chat::Session {
+                native_continuity: crate::chat::NativeContinuity::RetainedClaudeActor {
+                    protocol: 2,
+                },
+                ..chat(saved.id, &saved.launch, None)
+            })),
+            console: Some(saved.clone()),
+            created_ms: 1,
+            closed: false,
+        };
+        let served = Inventory {
+            agents: vec![agent(Origin::User)],
+            retained_close: Some(Ok(())),
+            owner_probes: 2,
+            ..Default::default()
+        };
+        assert_eq!(
+            prove(&saved, proof("current"), served, directory.path()),
+            Ok(())
+        );
+
+        let reason =
+            "Cagents couldn't confirm this conversation stopped. Its Cagents helper is gone";
+        let served = Inventory {
+            agents: vec![agent(Origin::User)],
+            retained_close: Some(Err(reason.into())),
+            owner_probes: 2,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(
+            refusal.contains("which Cagents couldn't close"),
+            "{refusal}"
+        );
+        assert!(refusal.contains(reason), "{refusal}");
+
+        // A scheduled agent is its automation's to end: nothing is asked.
+        let served = Inventory {
+            agents: vec![agent(Origin::Automation {
+                id: uuid::Uuid::new_v4(),
+            })],
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("Only what started it"), "{refusal}");
+
+        // A pane kept for another reason keeps its agent too: nothing is
+        // closed until every check has let the pane go. The inventory panics
+        // on any conversation Close.
+        process_with(
+            directory.path(),
+            format!("CAGENTS_TERMINAL_ID={}", saved.id),
+        );
+        let served = Inventory {
+            agents: vec![agent(Origin::User)],
+            owner_probes: 1,
+            ..Default::default()
+        };
+        let refusal = prove(&saved, proof("current"), served, directory.path()).unwrap_err();
+        assert!(refusal.contains("4242"), "{refusal}");
     }
 
     #[test]
@@ -2196,7 +2660,17 @@ mod tests {
             closed: false,
         };
         let boot = proof("current").boot_id;
-        let lost = chat_with(NativeContinuity::RetainedClaudeActor { protocol: 2 });
+        // A retained actor that died in this boot closes once the daemon
+        // proves nothing of it runs; a conversation with no owner to prove
+        // that by has no route.
+        assert!(agent_close_can_release(
+            &agent(Some(HostedSession::Chat(chat_with(
+                NativeContinuity::RetainedClaudeActor { protocol: 2 }
+            )))),
+            &[],
+            &boot
+        ));
+        let lost = chat_with(NativeContinuity::ReconnectOnly);
         assert!(!agent_close_can_release(
             &agent(Some(HostedSession::Chat(lost.clone()))),
             &[],
@@ -2305,6 +2779,7 @@ mod tests {
                 &directory.path().join("daemon.sock"),
                 directory.path(),
                 no_holder,
+                &[],
             ),
             Err(UNREACHABLE.into())
         );
@@ -2318,7 +2793,7 @@ mod tests {
         // Nothing holds cagentsd.lock, whatever this listener claims to be.
         let server = inventory(&socket, proof("impostor"), Inventory::default());
         assert_eq!(
-            prove_not_hosted_at(&saved, &socket, directory.path(), no_holder),
+            prove_not_hosted_at(&saved, &socket, directory.path(), no_holder, &[]),
             Err(UNREACHABLE.into())
         );
         server.join().unwrap();
@@ -2330,8 +2805,9 @@ mod tests {
         let socket = directory.path().join("daemon.sock");
         let saved = session(directory.path(), &other_boot("old"));
         let _recovering = crate::daemon::RecoveryLease::acquire(&socket, Duration::ZERO).unwrap();
-        let refusal =
-            prove_not_hosted_at(&saved, &socket, directory.path(), no_holder).unwrap_err();
+        let refusal = prove_not_hosted_at(&saved, &socket, directory.path(), no_holder, &[])
+            .unwrap_err()
+            .reason;
         assert!(refusal.contains("being recovered"), "{refusal}");
     }
 
@@ -2346,8 +2822,10 @@ mod tests {
             &directory.path().join("daemon.sock"),
             directory.path(),
             no_holder,
+            &[],
         )
-        .unwrap_err();
+        .unwrap_err()
+        .reason;
         assert!(refusal.contains("incomplete"), "{refusal}");
     }
 }

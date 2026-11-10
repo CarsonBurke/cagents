@@ -18,6 +18,7 @@ struct GatedAdapter {
     entered: Sender<()>,
     release: Receiver<()>,
     observed: Arc<Observed>,
+    fail_after_input: bool,
 }
 
 impl Adapter for GatedAdapter {
@@ -87,6 +88,14 @@ impl Adapter for GatedAdapter {
                 self.observed.prompts.lock().unwrap().push(text.clone());
                 return Ok(Step {
                     writes: vec![json!({"courier_fixture_prompt": text})],
+                    events: if self.fail_after_input {
+                        vec![Event::Error {
+                            message: "fixture failure after queuing input".into(),
+                            fatal: true,
+                        }]
+                    } else {
+                        Vec::new()
+                    },
                     ..Step::default()
                 });
             }
@@ -121,6 +130,10 @@ pub(crate) struct RequestRaceFixture {
 
 impl RequestRaceFixture {
     pub(crate) fn new() -> Self {
+        Self::with_input_failure(false)
+    }
+
+    pub(crate) fn with_input_failure(fail_after_input: bool) -> Self {
         let directory = tempfile::tempdir_in("/var/tmp").unwrap();
         let home = directory.path().join("home");
         let cache = directory.path().join("cache");
@@ -150,6 +163,7 @@ impl RequestRaceFixture {
             entered: entered_tx,
             release: release_rx,
             observed: observed.clone(),
+            fail_after_input,
         };
         let mut initial = adapter.initialize().unwrap();
         // Follow real preflight. Its cfg(test) Store owns a unique private
@@ -375,4 +389,16 @@ fn courier_prompt_refuses_busy_unready_waiting_and_exited_actors() {
     assert!(fixture.handle.is_completed());
     refused(fixture.handle.try_idle_prompt("courier delivery".into()));
     assert_eq!(fixture.prompt_count(), 0);
+}
+
+#[test]
+fn courier_prompt_step_failure_after_queuing_input_is_uncertain() {
+    let mut fixture = RequestRaceFixture::with_input_failure(true);
+    let result = fixture.handle.try_idle_prompt("courier delivery".into());
+    assert!(
+        matches!(&result, Err(Rejection::Unacknowledged(error)) if error.contains("fixture failure after queuing input")),
+        "queued input must never authorize replay: {result:?}"
+    );
+    assert_eq!(fixture.prompt_count(), 1);
+    fixture.close();
 }

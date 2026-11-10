@@ -124,6 +124,14 @@ struct Wire {
     stream: UnixStream,
     codec: FrameCodec,
     body_requested: Arc<AtomicBool>,
+    /// Whether the last visibility this connection sent was visible. The
+    /// daemon refuses reads from a hidden subscriber, and visibility is sent
+    /// from its own worker, so a read goes out only behind a visible frame.
+    announced: bool,
+    /// How many hidden frames this connection has sent. A read refused
+    /// because a hide overtook it on the daemon is told apart by this count
+    /// having moved since the read was sent.
+    hidings: u64,
 }
 struct PendingCommand {
     prompt: bool,
@@ -467,7 +475,7 @@ impl Publications {
 
     fn replace(
         &self,
-        snapshot: Snapshot,
+        mut snapshot: Snapshot,
         body: &AtomicBool,
         sample_clock: bool,
         final_body: bool,
@@ -477,12 +485,14 @@ impl Publications {
         if sample_clock {
             SourceClock::observe(&mut clock, snapshot.sampled_at, Instant::now());
         }
-        let full = Publication::resident(
-            snapshot,
-            clock,
-            append::Lineage::default(),
-            base.source_thread.clone(),
-        );
+        // A full snapshot over a body this client kept shares every item that
+        // did not change, so the interface keeps what it prepared from them.
+        let mut lineage = append::Lineage::default();
+        if base.resident {
+            lineage = base.lineage.clone();
+            lineage.adopt(&base.snapshot, &mut snapshot);
+        }
+        let full = Publication::resident(snapshot, clock, lineage, base.source_thread.clone());
         let metadata = full
             .hidden
             .as_ref()
@@ -911,16 +921,66 @@ fn transmit(
     id: u64,
     request: ClientRequest,
 ) -> Result<(), String> {
-    let hidden = matches!(
-        &request,
-        ClientRequest::ChatVisibility { visible: false, .. }
-    );
     let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
+    write_request(&mut wire, proof, id, request)
+}
+/// Send a presentation read if the daemon was last told the chat is
+/// visible; otherwise the visible frame still to come makes the daemon
+/// announce a change, which reads then. A sent read is returned as its
+/// [`SentRead`].
+fn transmit_read(
+    wire: &Mutex<Wire>,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<Option<SentRead>, String> {
+    let mut wire = wire.lock().unwrap_or_else(|p| p.into_inner());
+    if !wire.announced {
+        return Ok(None);
+    }
+    let hidings = wire.hidings;
+    write_request(&mut wire, proof, id, request).map(|()| Some(SentRead { id, hidings }))
+}
+/// A presentation read on the wire: its request id, and how many hidden
+/// frames had been sent before it.
+#[derive(Clone, Copy)]
+struct SentRead {
+    id: u64,
+    hidings: u64,
+}
+impl SentRead {
+    /// Whether `error`, answering `request`, is the daemon refusing this read
+    /// because a hide sent after it arrived first. Showing the chat again
+    /// makes the daemon announce a change, so the read is simply made again.
+    fn overtaken(
+        self,
+        request: Option<u64>,
+        error: &ipc::ProtocolError,
+        wire: &Mutex<Wire>,
+    ) -> bool {
+        request == Some(self.id)
+            && error.code == ipc::ProtocolErrorCode::InvalidRequest
+            && wire.lock().unwrap_or_else(|p| p.into_inner()).hidings != self.hidings
+    }
+}
+fn write_request(
+    wire: &mut Wire,
+    proof: &HostSessionProof,
+    id: u64,
+    request: ClientRequest,
+) -> Result<(), String> {
+    let visibility = match &request {
+        ClientRequest::ChatVisibility { visible, .. } => Some(*visible),
+        _ => None,
+    };
+    let hidden = visibility == Some(false);
     let Wire {
         stream,
         codec,
         body_requested,
-    } = &mut *wire;
+        announced,
+        hidings,
+    } = wire;
     codec
         .write(
             stream,
@@ -932,6 +992,12 @@ fn transmit(
             },
         )
         .map_err(|e| e.to_string())?;
+    if let Some(visible) = visibility {
+        *announced = visible;
+    }
+    if hidden {
+        *hidings += 1;
+    }
     if hidden || !body_requested.load(Ordering::Acquire) {
         codec.release_spare();
     }
@@ -1434,6 +1500,8 @@ impl ClientHandle {
                         stream,
                         codec: FrameCodec::new(ipc::MAX_FRAME_BYTES),
                         body_requested: body_requested.clone(),
+                        announced: false,
+                        hidings: 0,
                     })),
                     cancel,
                     publication: Arc::new(Publications::new(snapshot)),
@@ -1658,6 +1726,15 @@ impl ClientHandle {
     #[cfg(test)]
     pub(crate) fn disconnect_for_test(&self) {
         self.inner.alive.store(false, Ordering::Release);
+    }
+
+    /// Deliver a full snapshot the way the reader thread takes a daemon's
+    /// `ChatSnapshot` reply, sharing unchanged items with a kept body.
+    #[cfg(test)]
+    pub(crate) fn deliver_snapshot_for_test(&self, snapshot: Snapshot) {
+        self.inner
+            .publication
+            .replace(snapshot, &self.inner.body_requested, false, false);
     }
 
     #[cfg(test)]
@@ -2202,6 +2279,8 @@ impl ClientHandle {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
             body_requested: body_requested.clone(),
+            announced: false,
+            hidings: 0,
         }));
         let mut activity = ActivityObservation {
             generation: initial.generation,
@@ -2313,6 +2392,7 @@ impl ClientHandle {
             trace_worker_stack("chat_reader");
             publication.bind_source_thread();
             let mut read_pending = false;
+            let mut sent_read = SentRead { id: 0, hidings: 0 };
             let mut read_again = false;
             let mut resync = false;
             let failure = loop {
@@ -2337,10 +2417,13 @@ impl ClientHandle {
                         let resident = publication.replace(final_snapshot, &body_requested, false, false);
                         if resident != Some(true) && body_requested.load(Ordering::Acquire) {
                             resync = true;
+                            read_again = true;
                             if visible.load(Ordering::Acquire) && !read_pending {
-                                if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: None }) { break error; }
-                                read_pending = true;
-                            } else { read_again = true; }
+                                match transmit_read(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation: None }) {
+                                    Ok(sent) => { read_pending = sent.is_some(); read_again = sent.is_none(); sent_read = sent.unwrap_or(sent_read); }
+                                    Err(error) => break error,
+                                }
+                            }
                         }
                         if let Some(reply) = envelope.request_id.and_then(|id| pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&id)) {
                             let _ = reply.reply.try_send(Ok(terminal));
@@ -2487,6 +2570,16 @@ impl ClientHandle {
                         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "chat_client", chat_id = %id,
                             resident_bytes = state.snapshot.transcript_bytes());
                     },
+                    ServerMessage::Error(error)
+                        if read_pending && sent_read.overtaken(envelope.request_id, &error, &wire) =>
+                    {
+                        // The daemon refused a read that a hide overtook, so
+                        // a kept body is not marked with an error it no
+                        // longer has. If the chat is visible again by now,
+                        // read again; otherwise showing it will.
+                        read_pending = false;
+                        read_again = true;
+                    },
                     ServerMessage::Error(error) => {
                         read_pending = false;
                         loop {
@@ -2515,13 +2608,14 @@ impl ClientHandle {
                     _ => break "Unexpected native chat protocol frame".into(),
                 }
                 if read_again && !read_pending && visible.load(Ordering::Acquire) {
-                    read_again = false;
                     let after_generation = {
                         let state = publication.current.load();
                         (!resync && (state.resident || !body_requested.load(Ordering::Acquire))).then_some(state.snapshot.generation)
                     };
-                    if let Err(error) = transmit(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) { break error; }
-                    read_pending = true;
+                    match transmit_read(&wire, &proof, next.fetch_add(1, Ordering::Relaxed), ClientRequest::ChatRead { chat_id: id, after_generation }) {
+                        Ok(sent) => { read_pending = sent.is_some(); read_again = sent.is_none(); sent_read = sent.unwrap_or(sent_read); }
+                        Err(error) => break error,
+                    }
                 }
             };
             alive.store(false, Ordering::Release);
@@ -5163,6 +5257,429 @@ mod tests {
     }
 
     #[test]
+    fn a_read_refused_because_the_chat_just_hid_leaves_its_kept_body_unmarked() {
+        use super::super::{Item, ItemContent, Role};
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let answer = Arc::new(Item {
+            id: "answer".into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: "The kept answer.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let body = answer.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("hide-race");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let accepted = || ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            ready: true,
+                            items: vec![body],
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            // Something changed; the client reads, and hides before the
+            // daemon answers, so the daemon refuses the read.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let raced: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(raced.request, ClientRequest::ChatRead { .. }));
+            stage_tx.send(()).unwrap();
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(&mut codec, &mut server, Some(hidden.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                Some(raced.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Hidden chat has no presentation stream; make it visible before reading",
+                    false,
+                )),
+            );
+            // An ordered edge: the client has consumed the refusal.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatActivity {
+                    chat_id,
+                    state: ActivityState::Working,
+                    generation: 2,
+                },
+            );
+            // Shown again, it reads after the body it kept.
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    read.request,
+                    ClientRequest::ChatRead {
+                        after_generation: Some(2),
+                        ..
+                    }
+                ),
+                "the kept body stays the base to read after"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: None,
+                    },
+                },
+            );
+            stage_tx.send(()).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        handle.set_interest(true, true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (shown, _) = handle.resident_snapshot_with_clock().unwrap();
+        assert_eq!(shown.items[0].content, answer.content);
+        // Hidden but keeping its body, as a warm chat does.
+        handle.set_interest(false, true).unwrap();
+        while !matches!(
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+            Wake::Activity
+        ) {}
+        let (kept, _) = handle.resident_snapshot_with_clock().expect("a kept body");
+        assert_eq!(
+            kept.error, None,
+            "a refused stale read is not the chat's error"
+        );
+        assert!(
+            Arc::ptr_eq(&kept.items[0], &shown.items[0]),
+            "the body is the one kept, not one read again"
+        );
+        handle.set_interest(true, true).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        assert_eq!(handle.snapshot().error, None);
+    }
+
+    #[test]
+    fn a_read_refused_after_a_hide_the_chat_has_undone_is_made_again() {
+        use super::super::{Item, ItemContent, Role};
+        use crate::terminal_ipc::{ProtocolError, ProtocolErrorCode};
+        let answer = Arc::new(Item {
+            id: "answer".into(),
+            role: Role::Assistant,
+            content: ItemContent::Text {
+                text: "The kept answer.".into(),
+                thinking: false,
+                phase: Default::default(),
+            },
+            started_at: None,
+            at: None,
+        });
+        let body = answer.clone();
+        let (client, mut server) = UnixStream::pair().unwrap();
+        let (stage_tx, stage_rx) = std::sync::mpsc::channel();
+        let worker = thread::spawn(move || {
+            server
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            server
+                .set_write_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let proof = host_proof("hide-show-race");
+            let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+            let respond = |codec: &mut FrameCodec, server: &mut UnixStream, request_id, message| {
+                codec
+                    .write(
+                        server,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id,
+                            proof: proof.clone(),
+                            message,
+                        },
+                    )
+                    .unwrap();
+            };
+            let accepted = || ServerMessage::Response {
+                response: ServerResponse::Accepted,
+            };
+            let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            respond(
+                &mut codec,
+                &mut server,
+                Some(connect.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            let ClientRequest::ChatStart { session, .. } = start.request else {
+                panic!("chat start expected");
+            };
+            let chat_id = session.id;
+            respond(
+                &mut codec,
+                &mut server,
+                Some(start.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatAttached {
+                        session,
+                        snapshot: Snapshot {
+                            generation: 1,
+                            ..Default::default()
+                        },
+                    },
+                },
+            );
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(read.request, ClientRequest::ChatRead { .. }));
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: Some(Snapshot {
+                            generation: 2,
+                            ready: true,
+                            items: vec![body],
+                            ..Default::default()
+                        }),
+                    },
+                },
+            );
+            // Something changed; the client reads, and hides before the
+            // daemon answers, so the daemon refuses the read.
+            respond(
+                &mut codec,
+                &mut server,
+                None,
+                ServerMessage::ChatChanged { chat_id },
+            );
+            let raced: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(raced.request, ClientRequest::ChatRead { .. }));
+            stage_tx.send(()).unwrap();
+            let hidden: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                hidden.request,
+                ClientRequest::ChatVisibility { visible: false, .. }
+            ));
+            respond(&mut codec, &mut server, Some(hidden.request_id), accepted());
+            stage_tx.send(()).unwrap();
+            // The reader shows the chat again before the refusal arrives.
+            let shown: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(matches!(
+                shown.request,
+                ClientRequest::ChatVisibility { visible: true, .. }
+            ));
+            respond(&mut codec, &mut server, Some(shown.request_id), accepted());
+            respond(
+                &mut codec,
+                &mut server,
+                Some(raced.request_id),
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Hidden chat has no presentation stream; make it visible before reading",
+                    false,
+                )),
+            );
+            // The refused read is made again, after the body kept.
+            let read: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+            assert!(
+                matches!(
+                    read.request,
+                    ClientRequest::ChatRead {
+                        after_generation: Some(2),
+                        ..
+                    }
+                ),
+                "the refused read is made again after the kept body"
+            );
+            respond(
+                &mut codec,
+                &mut server,
+                Some(read.request_id),
+                ServerMessage::Response {
+                    response: ServerResponse::ChatSnapshot {
+                        chat_id,
+                        snapshot: None,
+                    },
+                },
+            );
+            stage_tx.send(()).unwrap();
+        });
+        let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+        let handle = ClientHandle::connect_on(
+            client,
+            omp_card(None, None),
+            Intent::Start,
+            None,
+            false,
+            None,
+            None,
+            None,
+            move |wake| {
+                let _ = wake_tx.send(wake);
+            },
+        )
+        .unwrap();
+        handle.set_interest(true, true).unwrap();
+        while handle.resident_snapshot_with_clock().is_none() {
+            wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        }
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (shown, _) = handle.resident_snapshot_with_clock().unwrap();
+        assert_eq!(shown.items[0].content, answer.content);
+        // Hidden, keeping its body as a warm chat does, and shown again
+        // before the daemon's refusal of the raced read arrives.
+        handle.set_interest(false, true).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        handle.set_interest(true, true).unwrap();
+        stage_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.join().unwrap();
+        let (kept, _) = handle.resident_snapshot_with_clock().expect("a kept body");
+        assert_eq!(
+            kept.error, None,
+            "a refused raced read is not the chat's error"
+        );
+        assert!(Arc::ptr_eq(&kept.items[0], &shown.items[0]));
+    }
+
+    #[test]
     fn hidden_control_subscribers_advance_metadata_without_rehydration_loops() {
         use super::super::{
             Item, ItemContent, Role,
@@ -6513,6 +7030,8 @@ mod tests {
             stream,
             codec: FrameCodec::new(ipc::MAX_CLIENT_FRAME_BYTES),
             body_requested: Arc::new(AtomicBool::new(true)),
+            announced: false,
+            hidings: 0,
         });
         let _held = wire.lock().unwrap();
         let error = transmit_text_copy(

@@ -72,6 +72,18 @@ class Comparison(unittest.TestCase):
         after["sessions"]["lineage"]["state"] = "Stopped"
         self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
 
+    def test_titles_that_follow_content_are_changes_and_blank_titles_are_losses(self):
+        before, after = snapshot(), snapshot()
+        after["windows"]["main"]["title"] = "~/s/alpha (2) \u2014 cagents"
+        after["channels"]["channel"]["title"] = "Offline tool rows"
+        after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][0]["title"] = "bash \u00b7 alpha"
+        changes = records.compare(before, after)
+        self.assertEqual(len(changes), 3)
+        self.assertFalse(any(row["regression"] for row in changes))
+        after["channels"]["channel"]["title"] = ""
+        self.assertTrue(any(row["regression"] and row["kind"] == "channels"
+                            for row in records.compare(before, after)))
+
     def test_evidence_failure_is_not_an_empty_successful_inventory(self):
         before, after = snapshot(), snapshot()
         after["errors"].append("terminals.json: command refused")
@@ -203,6 +215,28 @@ class Pty(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         self.assertEqual(result.stdout.count("[rehearsal prompt="), 2)
         self.assertIn("both confirmations received", result.stdout)
+
+    def test_answers_the_working_choice_and_the_stop_list_separately(self):
+        result = self.run_peer(
+            "import sys; "
+            "tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Update now? [Y/n] '); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'yes'; "
+            "sys.stdout.write('Enter: update when they finish   i: interrupt them now   n: cancel\\n'); sys.stdout.flush(); "
+            "assert tty.readline() == '\\n'; "
+            "sys.stdout.write('Type \"stop\" to stop these and update. Anything else cancels.\\n'); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'stop'; "
+            "print('all three answered')", "--answer", "yes", "--stop", "stop")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("[rehearsal prompt="), 3)
+        self.assertIn("all three answered", result.stdout)
+
+    def test_stop_list_is_cancelled_unless_asked(self):
+        result = self.run_peer(
+            "import sys; tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Type \"stop\" to stop these and update. Anything else cancels.\\n'); sys.stdout.flush(); "
+            "raise SystemExit(0 if tty.readline() == '\\n' else 3)", "--answer", "yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_child_exit_status_is_preserved(self):
         result = self.run_peer("raise SystemExit(7)")

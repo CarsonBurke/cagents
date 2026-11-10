@@ -65,6 +65,7 @@ ui = [
     "dep:jiff",
     "dep:libcosmic",
     "dep:lsp-types",
+    "dep:memchr",
     "dep:mermaid-rs-renderer",
     "dep:unicase",
     "dep:notify",
@@ -246,6 +247,9 @@ imara-diff = "0.2.0"
 ksni = { version = "0.3.6", optional = true }
 libc = "0.2.189"
 libghostty-vt = { version = "0.2.1", default-features = false, features = ["tracing"], optional = true }
+# Finds records worth parsing in large provider transcripts for the resume
+# picker; already in the resolved graph through regex.
+memchr = { version = "2.7", optional = true }
 # Pinned to the version `async-lsp` 0.2.4 depends on so protocol types unify.
 lsp-types = { version = "0.95", optional = true }
 notify = { version = "8.2", optional = true }

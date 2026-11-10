@@ -123,11 +123,11 @@ impl Drop for CheckedCloseReply {
     }
 }
 
-type RequestHandler =
-    fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome, ProtocolError>;
+type RequestHandler<R> =
+    fn(&SharedHost, ClientId, ClientRequest) -> Result<RequestOutcome<R>, ProtocolError>;
 
 pub(crate) fn serve(stream: UnixStream, client_id: ClientId, host: SharedHost) {
-    serve_with(stream, client_id, host, process_request);
+    serve_with(stream, client_id, host, process_wire_request);
 }
 
 fn peer_pid(stream: &UnixStream) -> Option<u32> {
@@ -198,7 +198,12 @@ fn peer_runs_cli(pid: u32) -> bool {
     is_cli_peer(&executable, &command_line)
 }
 
-fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle: RequestHandler) {
+fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
+    stream: UnixStream,
+    client_id: ClientId,
+    host: SharedHost,
+    handle: RequestHandler<R>,
+) {
     let registration = Registration::new(Arc::clone(&host), client_id);
     let peer = peer_pid(&stream);
     if let Some(pid) = peer {
@@ -372,6 +377,9 @@ fn serve_with(stream: UnixStream, client_id: ClientId, host: SharedHost, handle:
                     operation: crate::agent_execution::Operation::Close(_),
                     ..
                 }
+        ) || matches!(
+            &request,
+            ClientRequest::ChatLostProcesses { end, .. } if !end.is_empty()
         ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
@@ -552,7 +560,7 @@ fn disconnect_client(host: &SharedHost, client_id: ClientId) {
     }
 }
 
-type RequestOutcome = (ServerResponse, Vec<ServerMessage>, bool);
+type RequestOutcome<R = ServerResponse> = (R, Vec<ServerMessage>, bool);
 
 /// Recovery is deliberately a subset of existing authority-checked operations.
 /// No visibility operation retries adoption, and no new command may race a
@@ -579,6 +587,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
             | ClientRequest::ChatCloseRetained { .. }
+            | ClientRequest::ChatLostProcesses { .. }
     );
     let shutdown = matches!(
         request,
@@ -998,11 +1007,27 @@ fn close_retirement_is_current(
         && !super::chat::terminal_claim_pending(state, close.terminal)
 }
 
+#[cfg(test)]
 pub(super) fn process_request(
     host: &SharedHost,
     client_id: ClientId,
     request: ClientRequest,
 ) -> Result<RequestOutcome, ProtocolError> {
+    let (response, extras, shutdown) = process_wire_request(host, client_id, request)?;
+    Ok((
+        response
+            .decode()
+            .map_err(|message| ProtocolError::new(ProtocolErrorCode::Internal, message, false))?,
+        extras,
+        shutdown,
+    ))
+}
+
+fn process_wire_request(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: ClientRequest,
+) -> Result<RequestOutcome<crate::terminal_ipc::PreparedResponse>, ProtocolError> {
     ensure_request_open(host, &request)?;
     ensure_startup_recovery_request(host, &request)?;
     let gate = control_gate(host);
@@ -1039,7 +1064,8 @@ pub(super) fn process_request(
         return Ok((
             ServerResponse::DeviceOperation {
                 reply: crate::device_service::Reply::MergedWorktreeRemoved(removed),
-            },
+            }
+            .into(),
             Vec::new(),
             false,
         ));
@@ -1068,7 +1094,8 @@ pub(super) fn process_request(
         return Ok((
             ServerResponse::DeviceOperation {
                 reply: crate::device_service::Reply::AccountLifecycle(value),
-            },
+            }
+            .into(),
             Vec::new(),
             false,
         ));
@@ -1134,6 +1161,24 @@ pub(super) fn process_request(
             ));
         }
     }
+    if let ClientRequest::ChatRead {
+        chat_id,
+        after_generation,
+    } = request
+    {
+        return super::chat::read_presentation(host, client_id, chat_id, after_generation)
+            .map(|response| (response, Vec::new(), false));
+    }
+    let (response, extras, shutdown) = process_admitted_request(host, client_id, request, _shared)?;
+    Ok((response.into(), extras, shutdown))
+}
+
+fn process_admitted_request(
+    host: &SharedHost,
+    client_id: ClientId,
+    request: ClientRequest,
+    _shared: Option<std::sync::RwLockReadGuard<'_, ()>>,
+) -> Result<RequestOutcome, ProtocolError> {
     let notification_watch = matches!(&request, ClientRequest::WatchNotifications { .. });
     match request {
         ClientRequest::DeviceOperation { operation } => {
@@ -1549,6 +1594,17 @@ pub(super) fn process_request(
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ChatLostProcesses { session, end } => {
+            let processes =
+                super::chat::lost_processes(host, &session, &end).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+                })?;
+            Ok((
+                ServerResponse::ChatLostProcesses { processes },
+                Vec::new(),
+                false,
+            ))
         }
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatPrepareResume { .. }
@@ -2299,15 +2355,14 @@ fn push_response(
     delivery: &Arc<DeliveryQueue>,
     proof: &HostSessionProof,
     request_id: u64,
-    response: ServerResponse,
+    response: impl Into<crate::terminal_ipc::PreparedResponse>,
 ) -> Result<(), ()> {
     delivery
-        .push(ServerEnvelope {
-            version: PROTOCOL_VERSION,
-            request_id: Some(request_id),
-            proof: proof.clone(),
-            message: ServerMessage::Response { response },
-        })
+        .push(super::delivery::Outbound::response(
+            proof,
+            request_id,
+            response.into(),
+        ))
         .map_err(|_| ())
 }
 
@@ -2330,7 +2385,7 @@ fn push_error(
 fn writer_loop(mut stream: UnixStream, delivery: Arc<DeliveryQueue>) {
     let mut codec = FrameCodec::new(MAX_FRAME_BYTES);
     while let Some(message) = delivery.pop() {
-        if let Err(error) = codec.write(&mut stream, &message.wire()) {
+        if let Err(error) = message.write(&mut codec, &mut stream) {
             // Queued frames cannot be delivered, so there is nothing to drain
             // and the peer only sees the EOF below; `abort` records why.
             delivery.abort(write_failure(&error));

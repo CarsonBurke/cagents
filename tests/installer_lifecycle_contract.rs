@@ -298,6 +298,8 @@ case "$*" in
     ;;
   'daemon store-schema --help'|'daemon downgrade-store --help')
     [ "$#" -eq 3 ] || exit 98
+    # This legacy CLI predates store conversion. The installer may discover
+    # that with read-only help probes; unknown operations still fail below.
     exit 64
     ;;
   'daemon --help')
@@ -792,7 +794,12 @@ exec sh "$@""#,
             "versions/9.9.9"
         } else {
             "versions/old"
-        })
+        }),
+        "coordinator={coordinator} stage={stage_only} restart={restart:?} \
+         failure={publish_failure:?} download={download:?}\nstdout:\n{}\nstderr:\n{}\nactions:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&actions).unwrap_or_else(|error| format!("unavailable: {error}"))
     );
     let actions = fs::read_to_string(actions).unwrap_or_default();
     if coordinator == "starting" {

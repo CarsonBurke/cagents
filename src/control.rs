@@ -32,7 +32,9 @@ mod chat;
 mod project_channel_authority_tests;
 pub use chat::ChatCommand;
 mod format;
+mod gh;
 pub use agents::AgentCommand;
+pub use gh::GhCommand;
 mod automations;
 mod completions;
 pub use automations::AutomationCommand;
@@ -94,6 +96,9 @@ const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
     .saturating_add(crate::chat::TERMINATE_GRACE)
     .saturating_add(Duration::from_secs(8));
 // Retained-owner cleanup can retire both the native holder and its paired PTY.
+/// Ending a lost conversation's processes gives each a grace period to stop,
+/// then waits for them to be collected, for at most ten seconds in all.
+const LOST_PROCESSES_TIMEOUT: Duration = Duration::from_secs(20);
 const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -140,6 +145,11 @@ pub enum TopCommand {
     Diagnostics,
     /// Read and update Linear tickets, or link a ticket to this Git worktree.
     Linear(LinearCommand),
+    /// Read GitHub status through a shared local cache.
+    Gh {
+        #[command(subcommand)]
+        command: GhCommand,
+    },
     /// Show this session, its parent and agents, and peers in its channel or checkout.
     Whoami,
     /// Inspect account plan allowances and the calling session’s context.
@@ -1244,6 +1254,26 @@ impl ControlClient {
         }
     }
 
+    /// What still runs for a conversation whose Cagents helper died, after
+    /// ending those of `end` proved to be the conversation's; see
+    /// [`ClientRequest::ChatLostProcesses`].
+    pub fn lost_chat_processes(
+        &mut self,
+        session: crate::chat::Session,
+        end: Vec<crate::terminal::ipc::ProcessStart>,
+    ) -> Result<Vec<crate::terminal::ipc::LostProcess>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatLostProcesses { session, end },
+            Instant::now() + LOST_PROCESSES_TIMEOUT,
+        )? {
+            ServerResponse::ChatLostProcesses { processes } => Ok(processes),
+            response => Err(unexpected_response(
+                "a lost conversation's processes",
+                &response,
+            )),
+        }
+    }
+
     pub fn prepare_chat_resume(
         &mut self,
         source: crate::chat::Session,
@@ -2297,6 +2327,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatCapacity { .. } => "chat_capacity",
         ServerResponse::ChatReleaseInspected { .. } => "chat_release_inspected",
+        ServerResponse::ChatLostProcesses { .. } => "chat_lost_processes",
         ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",
@@ -2703,6 +2734,32 @@ where
         };
     }
 
+    // This cache belongs to gh's local credential context, not the daemon.
+    // Reading it must not prepare a remote backend or recover a staged owner.
+    if let TopCommand::Gh { command } = cli.command {
+        if cli.device.as_deref().is_some_and(|name| name != "local") || crate::device::is_remote() {
+            emit_error(
+                cli.json,
+                &AppError::new(
+                    "github_status_local_only",
+                    "Run GitHub status on the device containing the gh credentials; --device is not supported",
+                ),
+            );
+            return ExitCode::FAILURE;
+        }
+        return match gh::execute(command) {
+            Ok(output) => {
+                let code = output.exit_code();
+                emit_success(cli.json, output);
+                code
+            }
+            Err(error) => {
+                emit_error(cli.json, &error);
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let _device_cleanup = crate::device::Cleanup;
     if let Err(error) = crate::device::select(cli.device.as_deref()) {
         emit_error(cli.json, &AppError::new("device", error));
@@ -2860,6 +2917,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
         command,
         TopCommand::Completions { .. }
             | TopCommand::Diagnostics
+            | TopCommand::Gh { .. }
             | TopCommand::CoordinateInstall { .. }
             | TopCommand::VerifyInstallGuard { .. }
             | TopCommand::RecordDeferredInstall { .. }
@@ -2913,6 +2971,7 @@ fn execute_with_model_context(
             })
         }
         TopCommand::Linear(command) => linear::execute(command),
+        TopCommand::Gh { command } => gh::execute(command),
         TopCommand::Automation { command } => match service_context {
             Some(context) => automations::execute_with_context(command, &context),
             None => automations::execute(command),

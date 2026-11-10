@@ -38,6 +38,7 @@ pub(crate) struct Outbound {
     request_id: Option<u64>,
     proof: Arc<HostSessionProof>,
     pub(crate) message: ServerMessage,
+    encoded_response: Option<Vec<u8>>,
 }
 
 impl Outbound {
@@ -48,6 +49,7 @@ impl Outbound {
             request_id: None,
             proof: Arc::clone(proof),
             message,
+            encoded_response: None,
         }
     }
 
@@ -55,6 +57,14 @@ impl Outbound {
     /// reply it cannot decode replaced by a refusal. A notification it cannot
     /// decode is withheld.
     fn for_older(mut self, client: OlderClient) -> Option<Self> {
+        // Older peers must be checked against the actual response variant.
+        // Only this upgrade compatibility path needs to decode a relay payload.
+        if let Some(bytes) = self.encoded_response.take() {
+            self.message = match postcard::from_bytes(&bytes) {
+                Ok(response) => ServerMessage::Response { response },
+                Err(_) => ServerMessage::Error(client.refusal()),
+            };
+        }
         if !client.admits_message(&self.message) {
             self.request_id?;
             tracing::debug!(
@@ -62,11 +72,51 @@ impl Outbound {
                 "refusing a reply an older protocol client cannot decode"
             );
             self.message = ServerMessage::Error(client.refusal());
+            self.encoded_response = None;
         }
         self.version = client.protocol;
         Some(self)
     }
 
+    pub(crate) fn response(
+        proof: &HostSessionProof,
+        request_id: u64,
+        response: crate::terminal_ipc::PreparedResponse,
+    ) -> Self {
+        let (response, encoded_response) = match response {
+            crate::terminal_ipc::PreparedResponse::Decoded(response) => (response, None),
+            crate::terminal_ipc::PreparedResponse::EncodedChat { chat_id, bytes } => (
+                ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: None,
+                },
+                Some(bytes),
+            ),
+        };
+        Self {
+            version: PROTOCOL_VERSION,
+            request_id: Some(request_id),
+            proof: Arc::new(proof.clone()),
+            message: ServerMessage::Response { response },
+            encoded_response,
+        }
+    }
+    pub(crate) fn write(
+        &self,
+        codec: &mut crate::terminal_ipc::FrameCodec,
+        writer: &mut impl std::io::Write,
+    ) -> Result<(), crate::terminal_ipc::FrameError> {
+        match &self.encoded_response {
+            Some(response) => codec.write_encoded_response(
+                writer,
+                self.version,
+                self.request_id,
+                &self.proof,
+                response,
+            ),
+            None => codec.write(writer, &self.wire()),
+        }
+    }
     pub(crate) fn wire(&self) -> ServerEnvelopeRef<'_> {
         ServerEnvelopeRef {
             version: self.version,
@@ -84,6 +134,7 @@ impl From<ServerEnvelope> for Outbound {
             request_id: value.request_id,
             proof: Arc::new(value.proof),
             message: value.message,
+            encoded_response: None,
         }
     }
 }
@@ -344,6 +395,7 @@ impl DeliveryQueue {
             );
             state.discard();
             state.enqueue(Outbound {
+                encoded_response: None,
                 version: PROTOCOL_VERSION,
                 request_id: None,
                 proof: Arc::clone(&message.proof),
@@ -431,6 +483,101 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn encoded_transcripts_keep_wire_bytes_and_bulk_page_credits() {
+        use crate::terminal_ipc::{FrameCodec, PreparedResponse, ServerResponse, read_frame};
+        let id = TerminalId::new();
+        let proof = redraw(id, 0).proof;
+        let snapshot = crate::chat::Snapshot {
+            generation: 2,
+            title: Some("answer λ".into()),
+            ..Default::default()
+        };
+        let responses = [
+            ServerResponse::ChatSnapshot {
+                chat_id: id,
+                snapshot: Some(snapshot.clone()),
+            },
+            ServerResponse::ChatUpdate {
+                chat_id: id,
+                update: crate::chat::presentation::Presentation {
+                    base_generation: 1,
+                    file_changes_unchanged: true,
+                    metadata: snapshot,
+                    order: vec![],
+                    changes: vec![],
+                    children: vec![],
+                },
+            },
+            ServerResponse::ChatSnapshot {
+                chat_id: id,
+                snapshot: None,
+            },
+        ];
+        for response in responses {
+            let encoded = postcard::to_stdvec(&response).unwrap();
+            let outgoing = Outbound::response(
+                &proof,
+                42,
+                PreparedResponse::EncodedChat {
+                    chat_id: id,
+                    bytes: encoded,
+                },
+            );
+            let mut bytes = Vec::new();
+            outgoing
+                .write(
+                    &mut FrameCodec::new(crate::terminal_ipc::MAX_FRAME_BYTES),
+                    &mut bytes,
+                )
+                .unwrap();
+            let expected = ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(42),
+                proof: proof.clone(),
+                message: ServerMessage::Response { response },
+            };
+            let mut ordinary = Vec::new();
+            crate::terminal_ipc::write_frame(&mut ordinary, &expected).unwrap();
+            assert_eq!(bytes, ordinary);
+            let mut refused = Vec::new();
+            assert!(
+                outgoing
+                    .write(&mut FrameCodec::new(ordinary.len() - 5), &mut refused)
+                    .is_err()
+            );
+            assert!(refused.is_empty(), "oversized relay wrote a partial frame");
+            assert_eq!(
+                read_frame::<ServerEnvelope>(&mut std::io::Cursor::new(bytes)).unwrap(),
+                Some(expected)
+            );
+        }
+        let queue = DeliveryQueue::new(1, 20);
+        for request in 0..MAX_QUEUED_BULK_PAGES {
+            queue
+                .push(Outbound::response(
+                    &proof,
+                    request as u64,
+                    PreparedResponse::EncodedChat {
+                        chat_id: id,
+                        bytes: vec![1],
+                    },
+                ))
+                .unwrap();
+        }
+        assert_eq!(
+            queue.push(Outbound::response(
+                &proof,
+                99,
+                PreparedResponse::EncodedChat {
+                    chat_id: id,
+                    bytes: vec![1]
+                }
+            )),
+            Err(DeliveryError::Full)
+        );
+    }
 
     fn redraw(terminal_id: TerminalId, generation: u64) -> ServerEnvelope {
         ServerEnvelope {
