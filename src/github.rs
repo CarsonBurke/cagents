@@ -26,12 +26,15 @@ use crate::repository::{
 pub mod avatar;
 pub mod checkout;
 pub mod polling;
+pub use crate::github_status as pr_status;
 pub mod review_actions;
 mod review_batches;
 mod review_refresh;
 pub mod review_requests;
+mod sidebar;
 pub use review_batches::VIEWED_BATCH_SIZE;
 pub use review_refresh::ReviewRefresh;
+pub use sidebar::append_recent_history;
 
 const PR_LIST_FIELDS: &str = "id,number,title,state,isDraft,headRefName,headRefOid,headRepository,headRepositoryOwner,baseRefName,baseRefOid,author,updatedAt,url,mergeable,mergeStateStatus,reviewDecision,labels,statusCheckRollup";
 /// The Work board's view of the user's own pull requests: identity and state
@@ -1333,7 +1336,7 @@ impl GitHubError {
         match self {
             Self::RateLimited { limit } => Some(limit.clone()),
             Self::InvalidResponse { source, process } => source.rate_limit().or_else(|| {
-                polling::RateLimit::classify(
+                polling::classify(
                     &format!(
                         "{}\n{}",
                         String::from_utf8_lossy(&process.stdout),
@@ -1342,7 +1345,7 @@ impl GitHubError {
                     polling::now(),
                 )
             }),
-            Self::Process(failure) => polling::RateLimit::classify(
+            Self::Process(failure) => polling::classify(
                 &format!(
                     "{}\n{}\n{}",
                     failure.message,
@@ -1351,7 +1354,7 @@ impl GitHubError {
                 ),
                 polling::now(),
             ),
-            _ => polling::RateLimit::classify(&self.to_string(), polling::now()),
+            _ => polling::classify(&self.to_string(), polling::now()),
         }
     }
 }
@@ -1498,6 +1501,25 @@ pub fn remote_for_repository(
 }
 
 impl<E: ProcessExecutor> GitHubService<E> {
+    fn with_host_scope<T>(&self, host: &str, read: impl FnOnce() -> T) -> T {
+        if polling::current_scope().is_some() {
+            return read();
+        }
+        // Service reads run on workers. The UI's ready() only consults the
+        // binding installed here, never credential files or keyring services.
+        match crate::github_status::credential_fingerprint() {
+            Ok(scope) => {
+                polling::bind_scope(host, &scope);
+                polling::with_scope(&scope, read)
+            }
+            Err(_) => read(),
+        }
+    }
+
+    fn with_transport_scope<T>(&self, host: &str, resource: &str, read: impl FnOnce() -> T) -> T {
+        self.with_host_scope(host, || polling::with_resource(resource, read))
+    }
+
     /// Public GitHub or an enterprise host already known to gh. Arbitrary HTTPS
     /// remotes are not evidence that a repository belongs to GitHub.
     pub fn has_associated_remote(
@@ -1510,57 +1532,92 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .filter_map(|remote| remote.fetch_url.as_deref())
             .filter_map(remote_repository_key)
             .collect();
-        Self::check_remote_rate_limits(remotes)?;
-        if keys.iter().any(|key| key.host == "github.com") {
-            return Ok(true);
-        }
-        if keys.is_empty() {
+        let Some(host) = keys.first().map(|key| key.authority()) else {
             return Ok(false);
-        }
-        let output = self.execute(
-            &self.gh_command(["auth", "status", "--json", "hosts"]),
-            cancellation,
-        )?;
-        if !output.success
-            && let Some(limit) = polling::RateLimit::classify(
-                &format!(
-                    "{}\n{}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr)
-                ),
-                polling::now(),
-            )
-        {
-            let error = GitHubError::RateLimited { limit };
-            for key in &keys {
-                polling::failed(&key.host, &error);
+        };
+        self.with_transport_scope(&host, "core", || {
+            if keys.iter().any(|key| key.host == "github.com") {
+                return Ok(true);
             }
-            return Err(error);
-        }
-        require_auth_status_json(&output, &self.gh)?;
-        // gh can return a failing auth exit status while still reporting known
-        // accounts as JSON; those hosts remain associated but cannot authorize.
-        let envelope: GhAuthEnvelope = parse_json(&output.stdout)?;
-        Ok(keys
-            .iter()
-            .any(|key| envelope.hosts.contains_key(&key.authority())))
+            if keys.is_empty() {
+                return Ok(false);
+            }
+            Self::check_remote_rate_limits(remotes)?;
+            let authority = unambiguous_remote_authority(remotes);
+            let mut command = self.gh_command(["auth", "status", "--json", "hosts"]);
+            if let Some(authority) = &authority {
+                command
+                    .arguments
+                    .extend(["--hostname".into(), authority.into()]);
+            }
+            let output = self.execute(&command, cancellation)?;
+            if !output.success
+                && let Some(limit) = polling::classify(
+                    &format!(
+                        "{}\n{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    ),
+                    polling::now(),
+                )
+            {
+                let error = GitHubError::RateLimited { limit };
+                if let Some(authority) = &authority {
+                    polling::failed(authority, &error);
+                }
+                return Err(error);
+            }
+            require_auth_status_json(&output, &self.gh)?;
+            // gh can return a failing auth exit status while still reporting known
+            // accounts as JSON; those hosts remain associated but cannot authorize.
+            let envelope: GhAuthEnvelope = parse_json(&output.stdout)?;
+            Ok(keys
+                .iter()
+                .any(|key| envelope.hosts.contains_key(&key.authority())))
+        })
     }
 
-    // Discovery has not selected a repository yet. Conservatively pause it if
-    // any candidate fetch host is limited, before gh can choose that host.
+    // gh selects the repository during discovery. A quota observed for one
+    // candidate cannot refuse a different authority before that selection.
     fn check_remote_rate_limits(
         remotes: &[crate::repository::RemoteRecord],
     ) -> Result<(), GitHubError> {
-        if let Some(limit) = remotes
-            .iter()
-            .filter_map(|remote| remote.fetch_url.as_deref())
-            .filter_map(remote_repository_key)
-            .filter_map(|key| polling::rate_limit(&key.host))
-            .max_by_key(|limit| limit.retry_at)
+        if let Some(limit) = unambiguous_remote_authority(remotes)
+            .and_then(|authority| polling::rate_limit(&authority))
         {
             return Err(GitHubError::RateLimited { limit });
         }
         Ok(())
+    }
+}
+
+fn unambiguous_remote_authority(remotes: &[crate::repository::RemoteRecord]) -> Option<String> {
+    let mut authorities = remotes
+        .iter()
+        .filter_map(|remote| remote.fetch_url.as_deref())
+        .filter_map(remote_repository_key)
+        .map(|key| key.authority());
+    let first = authorities.next()?;
+    authorities
+        .all(|authority| authority == first)
+        .then_some(first)
+}
+
+fn command_resource(command: &CommandSpec) -> &'static str {
+    let args = &command.arguments;
+    match args.first().and_then(|arg| arg.to_str()) {
+        Some("auth") => "core",
+        Some("api") if args.iter().any(|arg| arg == "graphql") => "graphql",
+        Some("api")
+            if args
+                .iter()
+                .filter_map(|arg| arg.to_str())
+                .any(|arg| arg.starts_with("search/") || arg.starts_with("/search/")) =>
+        {
+            "search"
+        }
+        Some("api") => "core",
+        _ => "graphql",
     }
 }
 
@@ -1730,18 +1787,21 @@ impl<E: ProcessExecutor> GitHubService<E> {
         remotes: &[crate::repository::RemoteRecord],
         cancellation: &CancellationToken,
     ) -> Result<GitHubRepoKey, GitHubError> {
-        Self::check_remote_rate_limits(remotes)?;
-        let result = self.resolve_repository_inner(repository, cancellation);
-        if let Err(error) = &result {
-            for key in remotes
-                .iter()
-                .filter_map(|remote| remote.fetch_url.as_deref())
-                .filter_map(remote_repository_key)
+        let host = remotes
+            .iter()
+            .filter_map(|remote| remote.fetch_url.as_deref())
+            .find_map(remote_repository_key)
+            .map_or_else(|| "github.com".into(), |key| key.authority());
+        self.with_transport_scope(&host, "graphql", || {
+            Self::check_remote_rate_limits(remotes)?;
+            let result = self.resolve_repository_inner(repository, cancellation);
+            if let Err(error) = &result
+                && let Some(authority) = unambiguous_remote_authority(remotes)
             {
-                polling::failed(&key.host, error);
+                polling::failed(&authority, error);
             }
-        }
-        result
+            result
+        })
     }
 
     fn resolve_repository_inner(
@@ -1781,24 +1841,26 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
         cancellation: &CancellationToken,
     ) -> Result<GhAuthStatus, GitHubError> {
-        let command = self.auth_status_command(repository);
-        repository.validate()?;
-        if let Some(limit) = polling::rate_limit(&repository.host) {
-            return Err(GitHubError::RateLimited { limit });
-        }
-        let result = (|| {
-            let output = self.execute(&command, cancellation)?;
-            require_auth_status_json(&output, &self.gh)?;
-            let output = self.checked_output(output, repository)?;
-            attach_process(
-                parse_auth_status(&output.stdout, &repository.authority()),
-                &output,
-            )
-        })();
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+        self.with_transport_scope(&repository.authority(), "core", || {
+            let command = self.auth_status_command(repository);
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
+                return Err(GitHubError::RateLimited { limit });
+            }
+            let result = (|| {
+                let output = self.execute(&command, cancellation)?;
+                require_auth_status_json(&output, &self.gh)?;
+                let output = self.checked_output(output, repository)?;
+                attach_process(
+                    parse_auth_status(&output.stdout, &repository.authority()),
+                    &output,
+                )
+            })();
+            if let Err(error) = &result {
+                polling::failed(&repository.authority(), error);
+            }
+            result
+        })
     }
 
     pub fn list(
@@ -2021,13 +2083,15 @@ impl<E: ProcessExecutor> GitHubService<E> {
         variables: Vec<(&str, GraphQlValue)>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
-        let command = self.graphql_command(repository, query, variables);
-        let output = self.run_checked(&command, repository, cancellation)?;
-        let result = attach_process(parse_graphql(&output.stdout), &output);
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+        self.with_transport_scope(&repository.authority(), "graphql", || {
+            let command = self.graphql_command(repository, query, variables);
+            let output = self.run_checked(&command, repository, cancellation)?;
+            let result = attach_process(parse_graphql(&output.stdout), &output);
+            if let Err(error) = &result {
+                polling::failed(&repository.authority(), error);
+            }
+            result
+        })
     }
 
     /// Like [`Self::graphql`], but a response whose only errors are
@@ -2039,39 +2103,42 @@ impl<E: ProcessExecutor> GitHubService<E> {
         variables: Vec<(&str, GraphQlValue)>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
-        repository.validate()?;
-        if let Some(limit) = polling::rate_limit(&repository.host) {
-            return Err(GitHubError::RateLimited { limit });
-        }
-        let command = self.graphql_command(repository, query, variables);
-        let output = self
-            .execute(&command, cancellation)
-            .map_err(GitHubError::from);
-        if let Ok(output) = &output
-            && !output.success
-            && let Some(data) = not_found_data(graphql_body(&output.stdout))
-        {
-            // The answer is complete, but its headers can still exhaust the
-            // host's quota, exactly as for a successful request.
-            let headers =
-                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
-            match polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now()) {
-                Some(limit) => {
-                    polling::failed(&repository.host, &GitHubError::RateLimited { limit })
-                }
-                None => polling::succeeded(&repository.host),
+        self.with_transport_scope(&repository.authority(), "graphql", || {
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
+                return Err(GitHubError::RateLimited { limit });
             }
-            return Ok(data);
-        }
-        let output = charge_host(
-            repository,
-            output.and_then(|output| self.checked_output(output, repository)),
-        )?;
-        let result = attach_process(parse_graphql(&output.stdout), &output);
-        if let Err(error) = &result {
-            polling::failed(&repository.host, error);
-        }
-        result
+            let command = self.graphql_command(repository, query, variables);
+            let output = self
+                .execute(&command, cancellation)
+                .map_err(GitHubError::from);
+            if let Ok(output) = &output
+                && !output.success
+                && let Some(data) = not_found_data(graphql_body(&output.stdout))
+            {
+                // The answer is complete, but its headers can still exhaust the
+                // host's quota, exactly as for a successful request.
+                let headers =
+                    &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+                match polling::classify(&String::from_utf8_lossy(headers), polling::now()) {
+                    Some(limit) => polling::failed(
+                        &repository.authority(),
+                        &GitHubError::RateLimited { limit },
+                    ),
+                    None => polling::succeeded(&repository.authority()),
+                }
+                return Ok(data);
+            }
+            let output = charge_host(
+                repository,
+                output.and_then(|output| self.checked_output(output, repository)),
+            )?;
+            let result = attach_process(parse_graphql(&output.stdout), &output);
+            if let Err(error) = &result {
+                polling::failed(&repository.authority(), error);
+            }
+            result
+        })
     }
 
     fn pull_request_variables(key: &PullRequestKey) -> Vec<(&'static str, GraphQlValue)> {
@@ -2172,39 +2239,52 @@ impl<E: ProcessExecutor> GitHubService<E> {
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequestCheck>, GitHubError> {
-        key.validate()?;
-        let command = self.checks_command(key);
-        let output = self.execute(&command, cancellation)?;
-        match output.exit_code {
-            Some(8) => {
-                let checks = attach_process(parse_json(&output.stdout), &output)?;
-                Err(GitHubError::ChecksPending {
-                    checks,
-                    process: output,
-                })
+        self.with_transport_scope(&key.repository.authority(), "graphql", || {
+            if let Some(limit) = polling::rate_limit(&key.repository.authority()) {
+                return Err(GitHubError::RateLimited { limit });
             }
-            _ if output.success => attach_process(parse_json(&output.stdout), &output),
-            // gh uses exit 1 both for failed checks and operational errors.
-            // Only a structured checks array is evidence of the former.
-            Some(1) if !output.stdout.is_empty() => {
-                attach_process(parse_json(&output.stdout), &output)
+            let result = (|| {
+                key.validate()?;
+                let command = self.checks_command(key);
+                let output = self.execute(&command, cancellation)?;
+                match output.exit_code {
+                    Some(8) => {
+                        let checks = attach_process(parse_json(&output.stdout), &output)?;
+                        Err(GitHubError::ChecksPending {
+                            checks,
+                            process: output,
+                        })
+                    }
+                    _ if output.success => attach_process(parse_json(&output.stdout), &output),
+                    // gh uses exit 1 both for failed checks and operational errors.
+                    // Only a structured checks array is evidence of the former.
+                    Some(1) if !output.stdout.is_empty() => {
+                        attach_process(parse_json(&output.stdout), &output)
+                    }
+                    Some(1)
+                        if std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
+                            let message = stderr.trim();
+                            message.starts_with("no checks reported on the '")
+                                && message.ends_with("' branch")
+                                && !message.contains('\n')
+                        }) =>
+                    {
+                        Ok(Vec::new())
+                    }
+                    Some(4) => Err(GitHubError::AuthenticationRequired {
+                        host: key.repository.host.clone(),
+                        failure: Box::new(output.require_success(&self.gh).unwrap_err()),
+                    }),
+                    _ => Err(output.require_success(&self.gh).unwrap_err().into()),
+                }
+            })();
+            match &result {
+                Err(GitHubError::ChecksPending { .. }) => {}
+                Err(error) => polling::failed(&key.repository.authority(), error),
+                Ok(_) => polling::succeeded(&key.repository.authority()),
             }
-            Some(1)
-                if std::str::from_utf8(&output.stderr).is_ok_and(|stderr| {
-                    let message = stderr.trim();
-                    message.starts_with("no checks reported on the '")
-                        && message.ends_with("' branch")
-                        && !message.contains('\n')
-                }) =>
-            {
-                Ok(Vec::new())
-            }
-            Some(4) => Err(GitHubError::AuthenticationRequired {
-                host: key.repository.host.clone(),
-                failure: Box::new(output.require_success(&self.gh).unwrap_err()),
-            }),
-            _ => Err(output.require_success(&self.gh).unwrap_err().into()),
-        }
+            result
+        })
     }
 
     /// Inspector refreshes share a versioned cache and a per-key in-flight lock.
@@ -2274,72 +2354,77 @@ impl<E: ProcessExecutor> GitHubService<E> {
         request: &CreatePullRequestRequest,
         cancellation: &CancellationToken,
     ) -> Result<PullRequestCreationOutcome, GitHubError> {
-        let command = self.create_command(request)?;
-        let output = match self.execute(&command, cancellation) {
-            Ok(output) => output,
-            Err(failure) if failure.started => {
-                return Ok(PullRequestCreationOutcome::OutcomeUnknown { failure });
+        self.with_transport_scope(&request.repository.authority(), "graphql", || {
+            if let Some(limit) = polling::rate_limit(&request.repository.authority()) {
+                return Err(GitHubError::RateLimited { limit });
             }
-            Err(failure) => {
-                return Ok(PullRequestCreationOutcome::NotCreated { failure });
-            }
-        };
-        if !output.success {
-            let failure = output.require_success(&self.gh).unwrap_err();
-            return Ok(if failure.exit_code == Some(4) {
-                PullRequestCreationOutcome::NotCreated { failure }
-            } else {
-                PullRequestCreationOutcome::OutcomeUnknown { failure }
-            });
-        }
-
-        let url = match parse_created_url(&output.stdout, &request.repository) {
-            Ok(url) => url,
-            Err(error) => {
-                return Ok(PullRequestCreationOutcome::OutcomeUnknown {
-                    failure: parse_warning(&self.gh, output, error.to_string()),
+            let command = self.create_command(request)?;
+            let output = match self.execute(&command, cancellation) {
+                Ok(output) => output,
+                Err(failure) if failure.started => {
+                    return Ok(PullRequestCreationOutcome::OutcomeUnknown { failure });
+                }
+                Err(failure) => {
+                    return Ok(PullRequestCreationOutcome::NotCreated { failure });
+                }
+            };
+            if !output.success {
+                let failure = output.require_success(&self.gh).unwrap_err();
+                return Ok(if failure.exit_code == Some(4) {
+                    PullRequestCreationOutcome::NotCreated { failure }
+                } else {
+                    PullRequestCreationOutcome::OutcomeUnknown { failure }
                 });
             }
-        };
-        let number = pull_request_number(&url, &request.repository)?;
-        let key = PullRequestKey::new(request.repository.clone(), number)?;
-        // A successful URL is authoritative. Normalization is best-effort and uses
-        // a fresh token so cancellation after the external mutation cannot erase a
-        // known successful result.
-        let normalization_token = CancellationToken::new();
-        let view = self.view_command(&key);
-        let (pull_request, normalization_warning) = match self.execute(&view, &normalization_token)
-        {
-            Ok(output) if output.success => {
-                match parse_pull_request(&output.stdout, &request.repository) {
-                    Ok(pull_request) if pull_request.number == key.number => {
-                        (Some(pull_request), None)
-                    }
-                    Ok(pull_request) => (
-                        None,
-                        Some(parse_warning(
-                            &self.gh,
-                            output,
-                            format!(
-                                "gh normalized pull request {}, expected {}",
-                                pull_request.number, key.number
-                            ),
-                        )),
-                    ),
-                    Err(error) => (
-                        None,
-                        Some(parse_warning(&self.gh, output, error.to_string())),
-                    ),
+
+            let url = match parse_created_url(&output.stdout, &request.repository) {
+                Ok(url) => url,
+                Err(error) => {
+                    return Ok(PullRequestCreationOutcome::OutcomeUnknown {
+                        failure: parse_warning(&self.gh, output, error.to_string()),
+                    });
                 }
-            }
-            Ok(output) => (None, Some(output.require_success(&self.gh).unwrap_err())),
-            Err(failure) => (None, Some(failure)),
-        };
-        Ok(PullRequestCreationOutcome::Created {
-            key,
-            url,
-            pull_request: pull_request.map(Box::new),
-            normalization_warning: normalization_warning.map(Box::new),
+            };
+            let number = pull_request_number(&url, &request.repository)?;
+            let key = PullRequestKey::new(request.repository.clone(), number)?;
+            // A successful URL is authoritative. Normalization is best-effort and uses
+            // a fresh token so cancellation after the external mutation cannot erase a
+            // known successful result.
+            let normalization_token = CancellationToken::new();
+            let view = self.view_command(&key);
+            let (pull_request, normalization_warning) =
+                match self.execute(&view, &normalization_token) {
+                    Ok(output) if output.success => {
+                        match parse_pull_request(&output.stdout, &request.repository) {
+                            Ok(pull_request) if pull_request.number == key.number => {
+                                (Some(pull_request), None)
+                            }
+                            Ok(pull_request) => (
+                                None,
+                                Some(parse_warning(
+                                    &self.gh,
+                                    output,
+                                    format!(
+                                        "gh normalized pull request {}, expected {}",
+                                        pull_request.number, key.number
+                                    ),
+                                )),
+                            ),
+                            Err(error) => (
+                                None,
+                                Some(parse_warning(&self.gh, output, error.to_string())),
+                            ),
+                        }
+                    }
+                    Ok(output) => (None, Some(output.require_success(&self.gh).unwrap_err())),
+                    Err(failure) => (None, Some(failure)),
+                };
+            Ok(PullRequestCreationOutcome::Created {
+                key,
+                url,
+                pull_request: pull_request.map(Box::new),
+                normalization_warning: normalization_warning.map(Box::new),
+            })
         })
     }
 
@@ -2363,7 +2448,23 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 message: "operation was cancelled before launch".into(),
                 started: false,
             })?;
-        self.executor.execute(command, cancellation)
+        let output = self.executor.execute(command, cancellation)?;
+        // The installed coordinator can refuse before it execs the real gh.
+        // This reserved exit/protocol is proof a mutation was not submitted;
+        // a timeout or an ordinary gh error retains its existing ambiguity.
+        if output.exit_code == Some(75) && output.stderr.starts_with(b"cagents-gh: deferred ") {
+            let mut failure = output.require_success(&self.gh).unwrap_err();
+            failure.started = false;
+            failure.message = String::from_utf8_lossy(&failure.stderr)
+                .lines()
+                .next()
+                .and_then(|line| line.strip_prefix("cagents-gh: deferred "))
+                .filter(|reason| !reason.is_empty())
+                .unwrap_or("GitHub requests are waiting for local admission")
+                .to_owned();
+            return Err(failure);
+        }
+        Ok(output)
     }
 
     fn run_checked(
@@ -2372,15 +2473,17 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
-        repository.validate()?;
-        if let Some(limit) = polling::rate_limit(&repository.host) {
-            return Err(GitHubError::RateLimited { limit });
-        }
-        let result = self
-            .execute(command, cancellation)
-            .map_err(GitHubError::from)
-            .and_then(|output| self.checked_output(output, repository));
-        charge_host(repository, result)
+        self.with_transport_scope(&repository.authority(), command_resource(command), || {
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
+                return Err(GitHubError::RateLimited { limit });
+            }
+            let result = self
+                .execute(command, cancellation)
+                .map_err(GitHubError::from)
+                .and_then(|output| self.checked_output(output, repository));
+            charge_host(repository, result)
+        })
     }
 
     fn checked_output(
@@ -2389,7 +2492,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
     ) -> Result<ProcessOutput, GitHubError> {
         if !output.success
-            && let Some(limit) = polling::RateLimit::classify(
+            && let Some(limit) = polling::classify(
                 &format!(
                     "{}\n{}",
                     String::from_utf8_lossy(&output.stdout),
@@ -2404,9 +2507,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
             let headers =
                 &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
             if let Some(limit) =
-                polling::RateLimit::classify(&String::from_utf8_lossy(headers), polling::now())
+                polling::classify(&String::from_utf8_lossy(headers), polling::now())
             {
-                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+                polling::failed(&repository.authority(), &GitHubError::RateLimited { limit });
             }
             Ok(output)
         } else if output.exit_code == Some(4) {
@@ -2430,6 +2533,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .env("GH_PAGER", "cat")
             .env("NO_COLOR", "1")
             .env("GH_SPINNER_DISABLED", "1")
+            .env("CAGENTS_GH_NONBLOCKING", "1")
             .env_remove("GH_FORCE_TTY")
             .env_remove("GH_REPO")
             .env_remove("GH_HOST")
@@ -2484,98 +2588,104 @@ impl<E: ProcessExecutor> GitHubService<E> {
         payload: &str,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<serde_json::Value>, GitHubError> {
-        repository.validate()?;
-        let command = self.graphql_command(repository, mutation, variables);
-        let output = match self.execute(&command, cancellation) {
-            Ok(output) => output,
-            Err(failure) if failure.started => {
-                return Ok(ReviewMutationOutcome::OutcomeUnknown { failure });
+        self.with_transport_scope(&repository.authority(), "graphql", || {
+            repository.validate()?;
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
+                return Err(GitHubError::RateLimited { limit });
             }
-            Err(failure) => return Ok(ReviewMutationOutcome::NotApplied { failure }),
-        };
-        if output.exit_code == Some(4) {
-            return Err(GitHubError::AuthenticationRequired {
-                host: repository.host.clone(),
-                failure: Box::new(output.require_success(&self.gh).unwrap_err()),
-            });
-        }
-        let body: Option<serde_json::Value> =
-            serde_json::from_slice(graphql_body(&output.stdout)).ok();
-        let headers = &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
-        let error_text = body
-            .as_ref()
-            .and_then(|body| body.get("errors"))
-            .map(ToString::to_string)
-            .unwrap_or_default();
-        if let Some(limit) = polling::RateLimit::classify(
-            &format!(
-                "{}\n{}\n{}",
-                String::from_utf8_lossy(headers),
-                error_text,
-                String::from_utf8_lossy(&output.stderr)
-            ),
-            polling::now(),
-        ) {
-            polling::failed(&repository.host, &GitHubError::RateLimited { limit });
-        }
-        let applied = body
-            .as_ref()
-            .and_then(|body| body.pointer(&format!("/data{payload}")))
-            .filter(|value| !value.is_null())
-            .cloned();
-        if let Some(value) = applied {
-            return Ok(ReviewMutationOutcome::Applied(value));
-        }
-        let errors: Vec<&serde_json::Value> = body
-            .as_ref()
-            .and_then(|body| body.get("errors"))
-            .and_then(serde_json::Value::as_array)
-            .map(|errors| errors.iter().collect())
-            .unwrap_or_default();
-        if errors.is_empty() {
-            return Ok(if output.success {
+            let command = self.graphql_command(repository, mutation, variables);
+            let output = match self.execute(&command, cancellation) {
+                Ok(output) => output,
+                Err(failure) if failure.started => {
+                    return Ok(ReviewMutationOutcome::OutcomeUnknown { failure });
+                }
+                Err(failure) => return Ok(ReviewMutationOutcome::NotApplied { failure }),
+            };
+            if output.exit_code == Some(4) {
+                return Err(GitHubError::AuthenticationRequired {
+                    host: repository.host.clone(),
+                    failure: Box::new(output.require_success(&self.gh).unwrap_err()),
+                });
+            }
+            let body: Option<serde_json::Value> =
+                serde_json::from_slice(graphql_body(&output.stdout)).ok();
+            let headers =
+                &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
+            let error_text = body
+                .as_ref()
+                .and_then(|body| body.get("errors"))
+                .map(ToString::to_string)
+                .unwrap_or_default();
+            if let Some(limit) = polling::classify(
+                &format!(
+                    "{}\n{}\n{}",
+                    String::from_utf8_lossy(headers),
+                    error_text,
+                    String::from_utf8_lossy(&output.stderr)
+                ),
+                polling::now(),
+            ) {
+                polling::failed(&repository.authority(), &GitHubError::RateLimited { limit });
+            }
+            let applied = body
+                .as_ref()
+                .and_then(|body| body.pointer(&format!("/data{payload}")))
+                .filter(|value| !value.is_null())
+                .cloned();
+            if let Some(value) = applied {
+                return Ok(ReviewMutationOutcome::Applied(value));
+            }
+            let errors: Vec<&serde_json::Value> = body
+                .as_ref()
+                .and_then(|body| body.get("errors"))
+                .and_then(serde_json::Value::as_array)
+                .map(|errors| errors.iter().collect())
+                .unwrap_or_default();
+            if errors.is_empty() {
+                return Ok(if output.success {
+                    ReviewMutationOutcome::OutcomeUnknown {
+                        failure: parse_warning(
+                            &self.gh,
+                            output,
+                            "GitHub returned no mutation payload".into(),
+                        ),
+                    }
+                } else {
+                    ReviewMutationOutcome::OutcomeUnknown {
+                        failure: output.require_success(&self.gh).unwrap_err(),
+                    }
+                });
+            }
+            let message = errors
+                .iter()
+                .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
+                .collect::<Vec<_>>()
+                .join("; ");
+            // Only evidence proves the write did not happen: a response with no
+            // `data` member never reached execution, and a typed refusal names a
+            // check the forge runs before writing. An untyped error beside a null
+            // payload is how GitHub reports a timeout or an internal failure, and
+            // those can land after the write — retrying them would post twice.
+            let refused = body.as_ref().is_some_and(|body| body.get("data").is_none())
+                || errors.iter().all(|error| {
+                    error
+                        .get("type")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(mutation_refusal_type)
+                });
+            Ok(if refused {
+                ReviewMutationOutcome::NotApplied {
+                    failure: parse_warning(&self.gh, output, format!("GitHub refused: {message}")),
+                }
+            } else {
                 ReviewMutationOutcome::OutcomeUnknown {
                     failure: parse_warning(
                         &self.gh,
                         output,
-                        "GitHub returned no mutation payload".into(),
+                        format!("GitHub did not confirm the change: {message}"),
                     ),
                 }
-            } else {
-                ReviewMutationOutcome::OutcomeUnknown {
-                    failure: output.require_success(&self.gh).unwrap_err(),
-                }
-            });
-        }
-        let message = errors
-            .iter()
-            .filter_map(|error| error.get("message").and_then(serde_json::Value::as_str))
-            .collect::<Vec<_>>()
-            .join("; ");
-        // Only evidence proves the write did not happen: a response with no
-        // `data` member never reached execution, and a typed refusal names a
-        // check the forge runs before writing. An untyped error beside a null
-        // payload is how GitHub reports a timeout or an internal failure, and
-        // those can land after the write — retrying them would post twice.
-        let refused = body.as_ref().is_some_and(|body| body.get("data").is_none())
-            || errors.iter().all(|error| {
-                error
-                    .get("type")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(mutation_refusal_type)
-            });
-        Ok(if refused {
-            ReviewMutationOutcome::NotApplied {
-                failure: parse_warning(&self.gh, output, format!("GitHub refused: {message}")),
-            }
-        } else {
-            ReviewMutationOutcome::OutcomeUnknown {
-                failure: parse_warning(
-                    &self.gh,
-                    output,
-                    format!("GitHub did not confirm the change: {message}"),
-                ),
-            }
+            })
         })
     }
 
@@ -3378,8 +3488,8 @@ fn charge_host<T>(
     result: Result<T, GitHubError>,
 ) -> Result<T, GitHubError> {
     match &result {
-        Ok(_) => polling::succeeded(&repository.host),
-        Err(error) => polling::failed(&repository.host, error),
+        Ok(_) => polling::succeeded(&repository.authority()),
+        Err(error) => polling::failed(&repository.authority(), error),
     }
     result
 }
@@ -3421,7 +3531,7 @@ fn parse_graphql(output: &[u8]) -> Result<serde_json::Value, GitHubError> {
         .get("errors")
         .and_then(serde_json::Value::as_array)
         .is_some_and(|errors| !errors.is_empty())
-        && let Some(limit) = polling::RateLimit::classify(
+        && let Some(limit) = polling::classify(
             &format!(
                 "{}\n{}",
                 String::from_utf8_lossy(&output[..output.len() - graphql_body(output).len()]),
@@ -3555,7 +3665,7 @@ mod tests {
             "a paused read never launches gh"
         );
         let availability = GitHubAvailability::from_error(GitHubError::RateLimited {
-            limit: polling::RateLimit { retry_at: reset },
+            limit: polling::RateLimit::secondary(reset),
         });
         assert!(availability.guidance().contains("Retrying at"));
         assert!(!availability.guidance().contains("Could not connect"));
@@ -3572,9 +3682,7 @@ mod tests {
         polling::failed(
             host,
             &GitHubError::RateLimited {
-                limit: polling::RateLimit {
-                    retry_at: polling::now() + 120,
-                },
+                limit: polling::RateLimit::secondary(polling::now() + 120),
             },
         );
         assert!(matches!(
@@ -3805,6 +3913,95 @@ mod tests {
             fetch_url: Some(fetch_url.into()),
             push_url: None,
         }
+    }
+
+    #[test]
+    fn discovery_rate_limits_are_published_only_for_an_unambiguous_authority() {
+        for association in [false, true] {
+            for mixed in [false, true] {
+                let host = format!("discovery-{association}-{mixed}.invalid");
+                let first = GitHubRepoKey::new(&host, Some(8443), "o", "r").unwrap();
+                let second = GitHubRepoKey::new(&host, Some(9443), "o", "r").unwrap();
+                let remotes = [
+                    remote("origin", &format!("https://{}:{}/o/r", host, 8443)),
+                    remote(
+                        "upstream",
+                        &format!("https://{}:{}/o/r", host, if mixed { 9443 } else { 8443 }),
+                    ),
+                ];
+                let executor = Arc::new(FakeExecutor::with_outputs(vec![Ok(ProcessOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    signal: None,
+                    stdout: vec![],
+                    stderr: b"secondary rate limit\nRetry-After: 120".to_vec(),
+                })]));
+                let service = GitHubService::new("gh", executor.clone());
+                polling::with_scope("discovery-account", || {
+                    if association {
+                        assert!(
+                            service
+                                .has_associated_remote(&remotes, &CancellationToken::new())
+                                .is_err()
+                        );
+                    } else {
+                        assert!(
+                            service
+                                .resolve_repository(
+                                    Path::new("/fixture/repo"),
+                                    &remotes,
+                                    &CancellationToken::new()
+                                )
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(polling::rate_limit(&first.authority()).is_some(), !mixed);
+                    assert!(polling::rate_limit(&second.authority()).is_none());
+                });
+                assert_eq!(executor.commands.lock().unwrap().len(), 1);
+                if association && !mixed {
+                    assert!(
+                        executor.commands.lock().unwrap()[0]
+                            .arguments
+                            .iter()
+                            .any(|arg| arg == first.authority().as_str())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_can_select_an_unlimited_port_when_another_candidate_is_paused() {
+        let host = "discovery-mixed-admission.invalid";
+        let first = GitHubRepoKey::new(host, Some(8443), "o", "r").unwrap();
+        let second = GitHubRepoKey::new(host, Some(9443), "o", "r").unwrap();
+        let remotes = [
+            remote("origin", &format!("https://{host}:8443/o/r")),
+            remote("upstream", &format!("https://{host}:9443/o/r")),
+        ];
+        let body = format!(r#"{{"nameWithOwner":"o/r","url":"https://{host}:9443/o/r"}}"#);
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(body.as_bytes())]));
+        let service = GitHubService::new("gh", executor.clone());
+        polling::with_scope("mixed-admission-account", || {
+            polling::failed(
+                &first.authority(),
+                &GitHubError::RateLimited {
+                    limit: polling::RateLimit::secondary(polling::now() + 120),
+                },
+            );
+            let selected = service
+                .resolve_repository(
+                    Path::new("/fixture/repo"),
+                    &remotes,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(selected, second);
+            assert!(polling::rate_limit(&first.authority()).is_some());
+            assert!(polling::rate_limit(&second.authority()).is_none());
+        });
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
     }
 
     #[test]

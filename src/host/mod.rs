@@ -325,7 +325,13 @@ pub fn run(admission: DaemonAdmission) -> Result<(), HostError> {
         host_incarnation: HostIncarnation::new(Uuid::new_v4().to_string()),
     };
     let paths = RuntimePaths::discover()?;
+    // The lock outlives every daemon but not the runtime directory, which a
+    // reboot removes: without it no daemon of this instance ran this boot.
+    let first_this_boot = fs::symlink_metadata(&paths.lock)
+        .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
     let _lease = HostLease::acquire(&paths, &proof)?;
+    // Before anything is launched, so the epoch precedes every launch.
+    crate::lineage_birth::open_instance_epoch(&proof.boot_id, first_this_boot);
     // Before anything is launched or adopted: sessions launched through this
     // entry by an earlier daemon now run the CLI that speaks this protocol.
     if let Err(error) = crate::agent_execution::bundled::publish_serving_cli(&paths.directory) {
