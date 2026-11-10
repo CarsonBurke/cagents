@@ -1,11 +1,14 @@
 #!/usr/bin/python3
-"""Optional, per-host coordination for gh invocations on one Unix account.
+"""Explicit content-only gh admission; never install this as a PATH wrapper.
 
-This is an invocation guard, not an HTTP proxy: gh can make several requests
-inside one invocation. It adds no retries or requests of its own.
+Usage: gh-coordinate.py --real /usr/bin/gh [--wait 0..30] -- pr comment N -R OWNER/REPO ...
+Only pr/issue create/comment and pr review are coordinated. Reads, local commands,
+API requests (including mutations), aliases and other commands exec unchanged.
+Coordination is local to this Git common directory and the explicit target repo;
+it is not an account-wide GitHub rate limiter. No request is retried or timed out.
+CAGENTS_GH_NONBLOCKING=1 overrides --wait with zero for pre-exec admission.
 """
-import contextlib
-import email.utils
+import argparse
 import fcntl
 import hashlib
 import json
@@ -13,307 +16,258 @@ import math
 import os
 from pathlib import Path
 import re
-import tempfile
+import stat
+import subprocess
+import sys
 import time
-from urllib.parse import urlsplit
+from urllib.parse import unquote, urlsplit
 
 WRITE_INTERVAL = 8.0
-VALUE_FLAGS = {"--hostname", "-R", "--repo", "-X", "--method", "-f", "-F", "--field", "--raw-field", "--input", "-H", "--header", "--jq", "-q", "--template", "-t", "--cache", "--body", "-b", "--body-file", "--title", "--head", "--base", "--reviewer", "--assignee", "--label", "--project", "--milestone", "--search", "--author", "--state", "--limit"}
-
-
-def normalize_authority(value):
-    """Canonical API budget authority, retaining nondefault service ports."""
-    url = urlsplit(value if "://" in value else "//" + value)
-    host = (url.hostname or "").lower()
-    if host == "api.github.com":
-        host = "github.com"
-    try:
-        port = url.port
-    except ValueError:
-        port = None
-    defaults = {80, 443} if url.scheme == "http" else {443}
-    if ":" in host:
-        host = "[" + host + "]"
-    return host + (f":{port}" if port is not None and port not in defaults else "")
-
-
-def enabled(root):
-    setting = os.environ.get("CAGENTS_GH_COORDINATE")
-    return setting == "1" or (setting != "0" and (root / "coordination.enabled").exists())
-
-
-def repository_host(value):
-    if value.startswith(("http://", "https://")):
-        return normalize_authority(value)
-    parts = value.split("/")
-    return parts[0] if len(parts) >= 3 else None
-
-
-def host_for(args):
-    host = os.environ.get("GH_HOST", "github.com")
-    host = repository_host(os.environ.get("GH_REPO", "")) or host
-    index = 0
-    while index < len(args):
-        arg = args[index]
-        if arg in {"--hostname", "-R", "--repo"} and index + 1 < len(args):
-            value = args[index + 1]
-            host = value if arg == "--hostname" else repository_host(value) or host
-            index += 2
-            continue
-        if arg.startswith("--hostname="):
-            host = arg.split("=", 1)[1]
-        elif arg.startswith("--repo="):
-            host = repository_host(arg.split("=", 1)[1]) or host
-        elif arg.startswith("-R") and len(arg) > 2:
-            host = repository_host(arg[2:]) or host
-        index += 2 if arg in VALUE_FLAGS else 1
-    # A URL is a target only in the command's endpoint / selector position.
-    # Comment text and other option values must never select a budget.
-    words = positionals(args)
-    target = words[1] if len(words) > 1 and words[0] == "api" else words[2] if len(words) > 2 and words[0] in {"pr", "issue", "repo"} else ""
-    if target.startswith(("http://", "https://")):
-        host = normalize_authority(target) or host
-    return normalize_authority(host)
-
-
-def query_from(args):
-    for index, arg in enumerate(args):
-        if arg.startswith(("-fquery=", "-Fquery=")):
-            return arg[8:]
-        if arg.startswith(("--field=query=", "--raw-field=query=")):
-            return arg.split("=", 1)[1][6:]
-        if arg.startswith("query=") and index and args[index - 1] in {"-f", "-F", "--field", "--raw-field"}:
-            return arg[6:]
-    return None
-
-
-def positionals(args):
-    result = []
-    skip = False
-
-    for arg in args:
-        if skip:
-            skip = False
-        elif arg in VALUE_FLAGS:
-            skip = True
-        elif arg.startswith("-"):
-            continue
-        else:
-            result.append(arg)
-    return result
+ALLOWED = {("pr", "create"), ("pr", "comment"), ("pr", "review"),
+           ("issue", "create"), ("issue", "comment")}
+VALUE_FLAGS = {
+    "-R", "--repo", "-b", "--body", "-F", "--body-file", "-t", "--title",
+    "-B", "--base", "-H", "--head", "-r", "--reviewer", "-a", "--assignee",
+    "-l", "--label", "-m", "--milestone", "-p", "--project", "-T", "--template",
+    "--recover", "--type",
+}
+BOOL_FLAGS = {
+    "--help", "-h", "--editor", "-e", "--web", "-w", "--draft", "-d",
+    "--fill", "--fill-first", "--fill-verbose", "--no-maintainer-edit",
+    "--edit-last", "--create-if-none", "--delete-last", "--yes",
+    "--approve", "-A", "--comment", "-c", "--request-changes", "-r",
+}
 
 
 class Deferred(Exception):
-    def __init__(self, reason, retry_after=None):
-        super().__init__(reason)
-        self.reason = reason
-        self.retry_after = retry_after
-
-    def stderr(self):
-        message = "cagents-gh: deferred " + self.reason + "\n"
-        if self.retry_after is not None:
-            message += f"Retry-After: {self.retry_after}\n"
-        return message.encode()
+    pass
 
 
-def local_command(args):
-    # Option values such as --body "--help" are content, not local options.
-    skip = False
-    for arg in args:
-        if skip:
-            skip = False
-        elif arg in VALUE_FLAGS:
-            skip = True
-        elif arg in {"--help", "-h", "--version"}:
-            return True
-    words = positionals(args)
-    return bool(words and (words[0] in {"help", "version", "completion", "config", "alias"} or (len(words) > 1 and words[0] == "auth" and words[1] in {"token", "git-credential", "setup-git", "switch", "logout"})))
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        raise Deferred(message)
 
 
-def is_write(args):
-    words = positionals(args)
-    if not words or local_command(args):
-        return False
-    command = words[0]
-    if command == "api":
-        endpoint = words[1] if len(words) > 1 else ""
-        if endpoint == "graphql" or urlsplit(endpoint).path in {"/graphql", "/api/graphql"}:
-            query = query_from(args)
-            # A body supplied through --input may contain a mutation. Do not
-            # read stdin, which belongs exclusively to the real command.
-            return query is None or bool(re.match(r"\s*(?:#[^\n]*\n\s*)*mutation\b", query))
-        method = None
-        for index, arg in enumerate(args):
-            if arg in {"-X", "--method"} and index + 1 < len(args):
-                method = args[index + 1].upper()
-            elif arg.startswith("--method="):
-                method = arg.split("=", 1)[1].upper()
-            elif arg.startswith("-X") and len(arg) > 2:
-                method = arg[2:].upper()
-        if method is not None:
-            return method not in {"GET", "HEAD", "OPTIONS"}
-        return any(arg in {"-f", "-F", "--field", "--raw-field", "--input"} or arg.startswith(("-f", "-F", "--field=", "--raw-field=", "--input=")) for arg in args)
-    if len(words) < 2:
-        return False
-    return words[1] in {
-        "create", "comment", "edit", "delete", "close", "reopen", "merge",
-        "review", "ready", "lock", "unlock", "transfer", "pin", "unpin",
-        "upload", "dispatch", "rerun", "cancel", "enable", "disable",
-        "add", "remove", "rename", "set", "sync", "archive", "unarchive",
-    }
+def option(args, index, review=False):
+    """Consume only known content options; their values are never selectors."""
+    word = args[index]
+    if word == "-r" and review:
+        return word, None, index + 1
+    if word in VALUE_FLAGS:
+        if index + 1 == len(args):
+            raise Deferred(f"missing value for {word}")
+        return word, args[index + 1], index + 2
+    if word.startswith("--") and "=" in word:
+        name, value = word.split("=", 1)
+        if name in VALUE_FLAGS:
+            return name, value, index + 1
+    if word.startswith("-") and not word.startswith("--") and len(word) > 2:
+        if word[:2] in VALUE_FLAGS:
+            return word[:2], word[2:], index + 1
+    if word in BOOL_FLAGS:
+        return word, None, index + 1
+    raise Deferred(f"unsupported content option {word!r}; invoke gh directly after reviewing it")
 
 
-def process_start(pid):
+def authority(value):
+    parsed = urlsplit("//" + value)
     try:
-        stat = (Path("/proc") / str(pid) / "stat").read_text()
-        return stat[stat.rfind(")") + 2:].split()[19]
-    except (OSError, IndexError):
+        port = parsed.port
+    except ValueError as error:
+        raise Deferred("invalid target hostname") from error
+    host = parsed.hostname
+    if not host or parsed.username or parsed.password or parsed.path or parsed.query or parsed.fragment:
+        raise Deferred("use a hostname without a URL, path or credentials")
+    if not re.fullmatch(r"[A-Za-z0-9.-]+", host):
+        raise Deferred("invalid target hostname")
+    return host.lower() + (f":{port}" if port is not None and port != 443 else "")
+
+
+def repository(value):
+    parts = value.split("/")
+    if len(parts) == 2:
+        host = authority(os.environ.get("GH_HOST") or "github.com")
+    elif len(parts) == 3:
+        host = authority(parts.pop(0))
+    else:
+        raise Deferred("content commands require -R OWNER/REPO or -R HOST/OWNER/REPO")
+    owner, name = parts
+    name = name.removesuffix(".git")
+    if any(part in {"", ".", ".."} or not re.fullmatch(r"[A-Za-z0-9_.-]+", part)
+           for part in (owner, name)):
+        raise Deferred("invalid target repository")
+    return host, owner.lower(), name.lower()
+
+
+def content_target(args):
+    if not args or args[0] not in {"pr", "issue"}:
         return None
-
-
-def paths(root, host):
-    directory = root / "coordination"
-    directory.mkdir(parents=True, exist_ok=True, mode=0o700)
-    key = hashlib.sha256(host.encode()).hexdigest()[:32]
-    return directory, key
-
-
-@contextlib.contextmanager
-def locked(root, host):
-    directory, key = paths(root, host)
-    fd = os.open(directory / (key + ".lock"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-    try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        path = directory / (key + ".json")
+    # gh accepts the group's persistent repository option before its verb.
+    index = 1
+    while index < len(args) and (args[index] in {"-R", "--repo"}
+                                 or args[index].startswith("--repo=")
+                                 or args[index].startswith("-R") and len(args[index]) > 2):
         try:
-            data = json.loads(path.read_text())
-        except (OSError, ValueError):
-            data = {}
-        yield data
-        with tempfile.NamedTemporaryFile(dir=directory, prefix=".update-", mode="w", delete=False) as stream:
-            json.dump(data, stream)
-            temporary = Path(stream.name)
-        temporary.replace(path)
-    finally:
-        os.close(fd)
-
-
-def retry_deadline(row, now, failures):
-    headers = row.get("headers", {})
-    empty = headers.get("x-ratelimit-remaining") == "0"
-    limited = row.get("rate_limited") or row.get("status") == 429 or empty or (row.get("status") == 403 and "retry-after" in headers)
-    if not limited:
+            _, _, index = option(args, index)
+        except Deferred:
+            return None
+    if index == len(args) or (args[0], args[index]) not in ALLOWED:
         return None
-    fallback = min(3600, 60 * 2 ** min(failures, 6))
-    retry = headers.get("retry-after")
-    deadline = None
-    if retry:
-        try:
-            deadline = now + max(0, float(retry))
-        except ValueError:
-            try:
-                deadline = email.utils.parsedate_to_datetime(retry).timestamp()
-            except (TypeError, ValueError, OverflowError):
-                pass
-    if empty:
-        try:
-            deadline = max(deadline or 0, float(headers["x-ratelimit-reset"]))
-        except (KeyError, ValueError):
-            pass
-    return deadline if deadline is not None and deadline > now else now + fallback
+    family, verb = args[0], args[index]
+    remaining = args[1:index] + args[index + 1:]
+    selectors, targets = [], []
+    index = 0
+    while index < len(remaining):
+        word = remaining[index]
+        if word == "--":
+            selectors.extend(remaining[index + 1:])
+            break
+        if word.startswith("-"):
+            flag, value, index = option(remaining, index, review=(family, verb) == ("pr", "review"))
+            if flag in {"--help", "-h"}:
+                return None
+            if flag in {"-R", "--repo"}:
+                targets.append(repository(value))
+        else:
+            selectors.append(word)
+            index += 1
+    if not targets or len(set(targets)) != 1:
+        raise Deferred("choose one explicit target with -R OWNER/REPO")
+    if len(selectors) > (0 if verb == "create" else 1):
+        raise Deferred("unexpected content command selectors")
+    target = targets[0]
+    if selectors and "://" in selectors[0]:
+        url = urlsplit(selectors[0])
+        expected = "pull" if family == "pr" else "issues"
+        parts = [unquote(part) for part in url.path.strip("/").split("/")]
+        if (url.scheme != "https" or url.username or url.password or url.query or url.fragment
+                or len(parts) != 4 or parts[2] != expected
+                or not parts[3].isascii() or not parts[3].isdigit() or int(parts[3]) == 0
+                or repository(f"{url.netloc}/{parts[0]}/{parts[1]}") != target):
+            raise Deferred("the selector URL must match the explicit target repository")
+    return target
 
 
-def observed(root, row, now=None):
-    if not enabled(root) or row.get("cached_response"):
-        return
-    host = normalize_authority(row.get("host") or "github.com")
-    now = time.time() if now is None else now
+def git_common_dir():
+    result = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=2, check=True)
+    path = Path(os.fsdecode(result.stdout.rstrip(b"\n"))).resolve(strict=True)
+    if not path.is_dir():
+        raise Deferred("the Git common directory is unavailable")
+    return path
+
+
+def waiting_notice(wait):
+    """Best effort only: a full stderr pipe must not become another queue."""
+    message = f"cagents-gh: waiting for content admission (at most {wait:g}s total).\n".encode()
+    fd = None
     try:
-        with locked(root, host) as state:
-            failures = int(state.get("failures", 0))
-            deadline = retry_deadline(row, now, failures)
-            if deadline is not None:
-                state["cooldown_until"] = max(state.get("cooldown_until", 0), deadline)
-                state["failures"] = failures + 1
-            elif state.get("cooldown_until", 0) <= now and 200 <= row.get("status", 0) < 400 and not row.get("graphql_errors"):
-                state["failures"] = 0
+        # Reopening gives pipes/terminals independent NONBLOCK flags. dup()
+        # would change the caller's shared open description if its flags changed.
+        fd = os.open("/proc/self/fd/2", os.O_WRONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        if stat.S_ISREG(os.fstat(fd).st_mode):
+            # Keep the inherited regular file's offset aligned with real gh.
+            os.write(2, message)
+        else:
+            os.write(fd, message)
     except OSError:
-        # Instrumentation must not replace the command's result with an error.
         pass
-
-
-def before(root, args, on_wait=None):
-    """Wait before a new invocation; return an exec-inheritable content lock.
-
-    The caller must close this fd in the telemetry child so only real gh owns
-    the reservation. FIFO tickets prevent a busy writer from overtaking those
-    already waiting, and dead process identities cannot strand the queue.
-    """
-    if not enabled(root) or local_command(args):
-        return None
-    nonblocking = os.environ.get("CAGENTS_GH_NONBLOCKING") == "1"
-    host = host_for(args)
-    write = is_write(args)
-    directory, key = paths(root, host)
-    ticket = None
-    content_fd = None
-    announced = False
-    try:
-        if write:
-            ticket = directory / f"{key}.{time.time_ns()}.{os.getpid()}.ticket"
-            with locked(root, host):
-                ticket.write_text(json.dumps({"pid": os.getpid(), "start": process_start(os.getpid())}))
-            content_fd = os.open(directory / (key + ".content"), os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-        while True:
-            delay = 0.1
-            with locked(root, host) as state:
-                now = time.time()
-                until = state.get("cooldown_until", 0)
-                waiting = {"reason": "rate_limit", "retry_at": until} if until > now else {"reason": "content"}
-                if nonblocking and until > now:
-                    raise Deferred("GitHub requests are paused by the shared rate limit.", math.ceil(until - now))
-                if write:
-                    candidates = []
-                    for path in directory.glob(key + ".*.ticket"):
-                        try:
-                            owner = json.loads(path.read_text())
-                            if owner.get("start") is None or process_start(owner["pid"]) != owner["start"]:
-                                path.unlink(missing_ok=True)
-                            else:
-                                candidates.append(path)
-                        except (OSError, ValueError, KeyError):
-                            path.unlink(missing_ok=True)
-                    first = min(candidates, key=lambda path: int(path.name.split(".")[1])) if candidates else None
-                    until = max(until, state.get("next_write", 0))
-                    if first == ticket and until <= now:
-                        try:
-                            fcntl.flock(content_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                        except BlockingIOError:
-                            pass
-                        else:
-                            state["next_write"] = now + WRITE_INTERVAL
-                            ticket.unlink(missing_ok=True)
-                            ticket = None
-                            os.set_inheritable(content_fd, True)
-                            result = content_fd
-                            content_fd = None
-                            return result
-                elif until <= now:
-                    return None
-                if nonblocking:
-                    raise Deferred("Another GitHub content change is waiting or in progress.")
-                if until > now:
-                    delay = min(1.0, max(0.1, until - now))
-            if not announced and on_wait is not None:
-                # Emit outside the admission lock: stderr may be a slow pipe.
-                announced = True
-                try:
-                    on_wait(waiting)
-                except OSError:
-                    pass
-            time.sleep(delay)
     finally:
-        if ticket is not None:
-            ticket.unlink(missing_ok=True)
-        if content_fd is not None:
-            os.close(content_fd)
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+def admit(target, wait):
+    deadline = time.monotonic() + wait
+    announced = False
+
+    def announce():
+        nonlocal announced
+        if not announced:
+            announced = True
+            waiting_notice(wait)
+
+    directory = git_common_dir() / "cagents-gh-content"
+    directory.mkdir(mode=0o700, exist_ok=True)
+    metadata = directory.lstat()
+    if not stat.S_ISDIR(metadata.st_mode) or metadata.st_uid != os.geteuid() or metadata.st_mode & 0o077:
+        raise Deferred("content coordination directory must be private and owned by this user")
+    key = hashlib.sha256("/".join(target).encode()).hexdigest()
+    fd = os.open(directory / (key + ".lock"),
+                 os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+    try:
+        metadata = os.fstat(fd)
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.geteuid():
+            raise Deferred("content coordination lock is not an owned regular file")
+        while True:
+            if wait and time.monotonic() > deadline:
+                raise Deferred("content admission deadline expired; nothing was executed")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise Deferred("another content command is still running; nothing was executed")
+                announce()
+                time.sleep(min(0.025, remaining))
+        boot = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
+        previous = os.pread(fd, 1024, 0)
+        state = json.loads(previous) if previous else {}
+        now = time.monotonic()
+        last = state.get("started") if state.get("boot") == boot else None
+        if last is not None and (not isinstance(last, (int, float)) or not math.isfinite(last) or not 0 <= last <= now):
+            raise Deferred("content spacing record is invalid; nothing was executed")
+        delay = max(0, last + WRITE_INTERVAL - now) if last is not None else 0
+        if delay > 0:
+            if delay > deadline - now:
+                raise Deferred("content spacing exceeds the wait budget; nothing was executed")
+            announce()
+            time.sleep(delay)
+        if wait and time.monotonic() > deadline:
+            raise Deferred("content admission deadline expired; nothing was executed")
+        started = json.dumps({"boot": boot, "started": time.monotonic()}).encode()
+        if os.pwrite(fd, started, 0) != len(started):
+            raise Deferred("could not record content spacing; nothing was executed")
+        os.ftruncate(fd, len(started))
+        os.set_inheritable(fd, True)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def main():
+    parser = Parser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--real", required=True, type=Path, help="absolute executable for the real gh")
+    parser.add_argument("--wait", default=30.0, type=float, help="maximum pre-exec wait, 0 through 30 seconds")
+    parser.add_argument("arguments", nargs=argparse.REMAINDER, help="-- followed by unchanged gh arguments")
+    lease = None
+    try:
+        options = parser.parse_args()
+        if not options.real.is_absolute() or not options.real.is_file() or not os.access(options.real, os.X_OK):
+            raise Deferred("--real must name an absolute executable")
+        if options.real.resolve() == Path(__file__).resolve():
+            raise Deferred("--real cannot name this coordinator")
+        if not math.isfinite(options.wait) or not 0 <= options.wait <= 30:
+            raise Deferred("--wait must be between 0 and 30 seconds")
+        args = options.arguments
+        if args[:1] == ["--"]:
+            args = args[1:]
+        target = content_target(args)
+        if target is not None:
+            wait = 0 if os.environ.get("CAGENTS_GH_NONBLOCKING") == "1" else options.wait
+            lease = admit(target, wait)
+        os.execv(str(options.real), [str(options.real), *args])
+    except (Deferred, OSError, ValueError, subprocess.SubprocessError) as error:
+        if lease is not None:
+            os.close(lease)
+        print(f"cagents-gh: deferred {error}", file=sys.stderr)
+        return 75
+
+
+if __name__ == "__main__":
+    sys.exit(main())
