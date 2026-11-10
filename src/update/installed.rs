@@ -252,7 +252,12 @@ fn candidate_serving(root: &Path) -> Result<(), UpdateError> {
         return Err(invalid("The terminal service changed during startup"));
     }
     client.list_chats()?;
-    identity.verify_owner(Some(&root.join("bin/cagentsd")))
+    // Restoration may make a read take longer than the initial observation's
+    // short admission TTL. Authenticate a fresh observation without extending
+    // the original peer's authority across a replacement.
+    let after = source::inspect_installed_identity()?;
+    after.verify_owner(Some(&root.join("bin/cagentsd")))?;
+    identity.verify_same_owner(&after)
 }
 
 fn settle_startup(
