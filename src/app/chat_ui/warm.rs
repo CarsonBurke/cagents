@@ -10,7 +10,7 @@
 //! what changed since, or nothing.
 //!
 //! Warmth is bounded. A chat whose transcript is too large to keep goes cold as
-//! it hides, and [`Budget`] keeps at most [`CHATS`] warm chats within
+//! it hides, and [`over_budget`] keeps at most [`CHATS`] warm chats within
 //! [`BYTES`], releasing the least recently hidden first. The estimate is of
 //! the heap a warm chat holds: its transcript, what its prepared items count
 //! of themselves, and its parsed documents by their text and node count,
