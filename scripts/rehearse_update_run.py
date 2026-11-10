@@ -275,7 +275,7 @@ class Rehearsal:
         try:
             self.call('init')
             self.call('install', args.old_dir, args.old_version, args.old_installer, timeout=180)
-            self.call('desktop','start','--limit','900', timeout=1900)
+            self.call('desktop','start','--limit','900', timeout=None)
             self.call('launch','main')
             self.call('launch','second')
             self.wait_windows(['main','second'])
