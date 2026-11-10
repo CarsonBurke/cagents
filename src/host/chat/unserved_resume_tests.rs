@@ -109,9 +109,21 @@ fn install_codex(root: &Path) {
 /// Serve the saved thread to the native adapter, reporting each method it
 /// calls. Connections that only probe whether anything listens are passed over.
 fn serve(listener: UnixListener, home: PathBuf, methods: mpsc::Sender<Value>) {
+    serve_until(listener, home, methods, || false);
+}
+
+fn serve_until(
+    listener: UnixListener,
+    home: PathBuf,
+    methods: mpsc::Sender<Value>,
+    cancelled: impl Fn() -> bool,
+) {
     listener.set_nonblocking(true).unwrap();
     let deadline = Instant::now() + Duration::from_secs(10);
     let mut websocket = loop {
+        if cancelled() {
+            return;
+        }
         match listener.accept() {
             Ok((stream, _)) => {
                 stream.set_nonblocking(false).unwrap();
@@ -907,10 +919,34 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     let private = tempfile::tempdir_in("/tmp").unwrap();
     let socket = private.path().join("private.sock");
     let ready = private.path().join("ready");
-    let mut server = std::process::Command::new("/usr/bin/python3")
-        .args([
-            "-c",
-            "import fcntl, pathlib, socket, sys, time\n\
+    // Reap the fixture's writer even if an unexpected constructor or server
+    // failure interrupts the assertions below.
+    struct PrivateWriter(Option<std::process::Child>);
+    impl PrivateWriter {
+        fn id(&self) -> u32 {
+            self.0.as_ref().unwrap().id()
+        }
+
+        fn stop(mut self) {
+            let child = self.0.as_mut().unwrap();
+            child.kill().unwrap();
+            child.wait().unwrap();
+            self.0 = None;
+        }
+    }
+    impl Drop for PrivateWriter {
+        fn drop(&mut self) {
+            if let Some(mut child) = self.0.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+    let server = PrivateWriter(Some(
+        std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                "import fcntl, pathlib, socket, sys, time\n\
              lock = open(sys.argv[1], 'w')\n\
              fcntl.flock(lock, fcntl.LOCK_EX)\n\
              listener = socket.socket(socket.AF_UNIX)\n\
@@ -918,12 +954,13 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
              listener.listen()\n\
              pathlib.Path(sys.argv[3]).touch()\n\
              time.sleep(30)",
-        ])
-        .arg(locks.join(format!("{}.lock", thread_id())))
-        .arg(&socket)
-        .arg(&ready)
-        .spawn()
-        .unwrap();
+            ])
+            .arg(locks.join(format!("{}.lock", thread_id())))
+            .arg(&socket)
+            .arg(&ready)
+            .spawn()
+            .unwrap(),
+    ));
     let deadline = Instant::now() + Duration::from_secs(5);
     while !ready.exists() {
         assert!(
@@ -969,7 +1006,12 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
                 }
                 if record.exists() {
                     let (methods, _received) = mpsc::channel();
-                    serve(UnixListener::bind(socket).unwrap(), home, methods);
+                    serve_until(UnixListener::bind(socket).unwrap(), home, methods, || {
+                        matches!(
+                            fallback_cancelled.try_recv(),
+                            Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+                        )
+                    });
                     break;
                 }
             }
@@ -992,8 +1034,7 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     }
     let _ = cancel_fallback.send(());
     unexpected_server.join().unwrap();
-    server.kill().unwrap();
-    server.wait().unwrap();
+    server.stop();
     assert!(
         !root.join("codex-arguments").exists(),
         "no second private server was launched"
