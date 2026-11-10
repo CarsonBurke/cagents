@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import stat
 import subprocess
@@ -85,7 +86,7 @@ STUBS = {
         if [ -n "${cmd:-}" ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
-            sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
+            NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
             # Nor does it report ready until the app is up, unless told not to wait.
@@ -631,6 +632,20 @@ class Evidence(unittest.TestCase):
         self.assertTrue(live_lock_held(self.native_lock))
         self.run_tool("stop")
 
+    def test_named_instances_are_shared_by_the_runner_and_cli_and_stay_pinned(self) -> None:
+        self.built()
+        self.run_tool("start", "after", "--instance", "native-review")
+        self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
+        instance = self.run_tool("env", "sh", "-c", 'printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"')
+        self.assertEqual(instance.stdout, "native-review")
+        self.run_tool("stop")
+        changed = self.run_tool("start", "after", "--instance", "other-review", check=False)
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn("already selected another instance", changed.stderr)
+        self.run_tool("start", "after")
+        self.assertIn("--instance native-review --in-session", (self.logs / "runner").read_text())
+        self.run_tool("stop")
+
     def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
@@ -641,7 +656,7 @@ class Evidence(unittest.TestCase):
         self.run_tool("build", "after", str(checkout))
         built = (self.logs / "cargo").read_text()
         metadata = (self.logs / "cargo-metadata").read_text()
-        started = self.run_tool("start", "after", check=False)
+        started = self.run_tool("start", "after", "--instance", "native-review", check=False)
         self.assertEqual(started.returncode, 0, (self.logs / "app-output").read_text())
         for _ in range(100):
             if (self.logs / "ui-ran").exists():
@@ -1020,6 +1035,23 @@ class Evidence(unittest.TestCase):
         self.assertIn("unknown portal backend: xdg; use gtk, kde, gnome or cosmic", result.stderr)
         self.assertTrue(self.lock_is_free(self.native_lock))
 
+    def test_zero_wait_takes_a_free_lock_without_waiter_scheduling(self) -> None:
+        self.built()
+        real_flock = shutil.which("flock", path=self.env["PATH"])
+        self.assertIsNotNone(real_flock)
+        # Starting a helper is not instantaneous. A zero-wait request must
+        # still try the idle lock before deciding its budget expired.
+        write_executable(self.bin / "flock", f"""
+            #!/bin/sh
+            sleep 0.05
+            exec {shlex.quote(real_flock)} "$@"
+        """)
+        self.run_tool("start", "after", "--wait-lock", "0")
+        self.assertFalse(self.lock_is_free(self.native_lock))
+        self.assertNotIn(str(self.native_lock), (self.logs / "kwin-fds").read_text())
+        self.run_tool("stop")
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
     def test_start_reports_a_busy_lock_without_starting(self) -> None:
         self.built()
         with open(self.native_lock, "a") as lock:
@@ -1278,6 +1310,21 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after")
         self.assertFalse((fixture / "bin/codex").exists())
         self.assertFalse((fixture / "libexec/codex").exists())
+
+    def test_real_codex_and_a_named_instance_keep_the_same_private_environment(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        self.run_tool("start", "after", "--instance", "real-codex-review",
+                      "--codex-executable", str(source))
+        self.assertIn("--instance real-codex-review --in-session", (self.logs / "runner").read_text())
+        instance = self.fixture_shell('printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"')
+        self.assertEqual(instance.stdout, "real-codex-review")
+        installed = self.task / "fixture/libexec/codex/codex"
+        self.assertEqual(installed.read_bytes(), source.read_bytes())
+        receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
+        self.assertEqual(receipt["installed_sha256"], hashlib.sha256(source.read_bytes()).hexdigest())
+        self.assertEqual((self.task / "fixture/bin/codex").resolve(), installed)
+        self.run_tool("stop")
 
     def test_invalid_real_codex_is_refused_before_waiting_or_spawning(self) -> None:
         self.built()
@@ -1568,7 +1615,7 @@ exec(compile(code, "native-evidence copy helper", "exec"))
 
     def test_the_forge_seeds_owner_avatars_into_the_apps_cache(self) -> None:
         self.built()
-        self.run_tool("start", "after")
+        self.run_tool("start", "after", "--instance", "avatar-evidence")
         fixture = self.switch_forge_on()
         seed = fixture / "avatars" / "Octo-Org.image"
         seed.write_bytes(b"\x89PNG\r\n\x1a\nseeded")
@@ -1578,7 +1625,9 @@ exec(compile(code, "native-evidence copy helper", "exec"))
         self.fixture_shell("gh repo view --json nameWithOwner,url")
 
         # The path avatar.rs reads under the development storage name, owner lower-cased.
-        cached = fixture / "cache" / "cagents-development" / "github-avatars" / "github.com-octo-org.image"
+        instance = self.fixture_shell('printf %s "$CAGENTS_DEVELOPMENT_INSTANCE"').stdout
+        self.assertTrue(instance)
+        cached = fixture / "cache" / f"cagents-development-{instance}" / "github-avatars" / "github.com-octo-org.image"
         self.assertEqual(cached.read_bytes(), seed.read_bytes())
         # Under its seven-day freshness, so the app does not try to download it.
         self.assertLess(time.time() - cached.stat().st_mtime, 60)
@@ -1888,10 +1937,11 @@ class RemoteEvidence(unittest.TestCase):
         executable = f"/a path/codex '$(touch {marker})"
         self.run_tool("pair", "--before", str(before), "--after", str(after),
                       "--steps", str(steps), "--width", "900", "--height", "750",
-                      "--codex-executable", executable)
+                      "--codex-executable", executable, "--instance", "real-codex-review")
         calls = self.tool_calls()
         for side in ("before", "after"):
-            self.assertIn(f"start {side} --width 900 --height 750 --codex-executable {executable}", calls)
+            self.assertIn(f"start {side} --width 900 --height 750 --codex-executable {executable}"
+                          " --instance real-codex-review", calls)
         self.assertFalse(marker.exists())
 
     def test_steps_name_the_fixture_on_the_host(self) -> None:
