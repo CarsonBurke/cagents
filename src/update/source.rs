@@ -425,6 +425,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "chat_listed",
             "chat_attached",
             "chat_snapshot",
+            "chat_update",
             "chat_closed",
             "chat_snapshot",
             "detached",

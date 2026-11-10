@@ -1100,6 +1100,18 @@ impl ControlClient {
                 chat_id: actual,
                 snapshot,
             } if actual == chat_id => Ok(snapshot),
+            ServerResponse::ChatUpdate {
+                chat_id: actual,
+                update,
+            } if actual == chat_id
+                && update.base_generation == generation
+                && update.metadata.generation > generation =>
+            {
+                // A presentation delta carries complete current metadata for
+                // the parent and children. The update wait needs no transcript
+                // reconstruction, but must still enforce the delta's base.
+                Ok(Some(update.metadata))
+            }
             response => Err(unexpected_response(
                 "the observed chat's publication",
                 &response,

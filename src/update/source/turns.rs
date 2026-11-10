@@ -373,13 +373,52 @@ mod tests {
                 visible.request_id,
                 ServerResponse::Accepted,
             );
-            for changed in [false, true] {
+            let metadata = |generation, busy| Snapshot {
+                generation,
+                ready: true,
+                busy,
+                subagents: vec![child(ToolStatus::Running)],
+                ..Default::default()
+            };
+            let delta = |base_generation, generation| ServerResponse::ChatUpdate {
+                chat_id: source.id,
+                update: crate::chat::presentation::Presentation {
+                    base_generation,
+                    file_changes_unchanged: true,
+                    metadata: metadata(generation, false),
+                    order: Vec::new(),
+                    changes: Vec::new(),
+                    children: Vec::new(),
+                },
+            };
+            // A matching base receives a delta; missed publications receive a
+            // full resync. Neither an unrelated delta nor a nonadvancing one
+            // can establish that this observed parent finished its turn.
+            for (generation, publication) in [
+                (
+                    7,
+                    ServerResponse::ChatSnapshot {
+                        chat_id: source.id,
+                        snapshot: None,
+                    },
+                ),
+                (7, delta(7, 8)),
+                (
+                    8,
+                    ServerResponse::ChatSnapshot {
+                        chat_id: source.id,
+                        snapshot: Some(metadata(9, true)),
+                    },
+                ),
+                (9, delta(7, 10)),
+                (9, delta(9, 9)),
+            ] {
                 let read: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
                 assert_eq!(
                     read.request,
                     ClientRequest::ChatRead {
                         chat_id: source.id,
-                        after_generation: Some(7)
+                        after_generation: Some(generation)
                     }
                 );
                 // Real sources interleave subscribed notifications with replies.
@@ -393,20 +432,7 @@ mod tests {
                     },
                 )
                 .unwrap();
-                response(
-                    &mut server_stream,
-                    read.request_id,
-                    ServerResponse::ChatSnapshot {
-                        chat_id: source.id,
-                        snapshot: changed.then(|| Snapshot {
-                            generation: 8,
-                            ready: true,
-                            busy: false,
-                            subagents: vec![child(ToolStatus::Running)],
-                            ..Default::default()
-                        }),
-                    },
-                );
+                response(&mut server_stream, read.request_id, publication);
             }
         });
         let mut client = ControlClient::from_stream_at_source_protocol(
@@ -429,6 +455,20 @@ mod tests {
         observed.activity.review(&mut ended);
         assert_eq!(ended.disposition, impact::Disposition::Blocked);
         assert_eq!(ended.interrupted_subagents, ["background-child"]);
+        observed.refresh(&mut client, session.id).unwrap();
+        assert_eq!(observed.activity.generation, 9);
+        assert!(
+            !observed.activity.parent_finished,
+            "full resync observes a new active turn"
+        );
+        for _ in 0..2 {
+            assert!(observed.refresh(&mut client, session.id).is_err());
+            assert_eq!(observed.activity.generation, 9);
+            assert!(
+                !observed.activity.parent_finished,
+                "invalid deltas cannot waive the idle wait"
+            );
+        }
         drop(client);
         server.join().unwrap();
     }
