@@ -1632,6 +1632,23 @@ packages using the generated maintainer-script contract, checks
 mixed-generation interruption, and preserves unrelated files and fixture user
 data. It does not signal the host daemon or install anything on the host.
 
+To qualify channel-work retirement with actual historical writers, run this
+from a plain SSH shell on fw16 after building matched development binaries
+through the gate:
+
+```sh
+python3 tests/channel_work_rollback.py --schema22-bin SCHEMA22_BIN \
+  --schema23-bin SCHEMA23_BIN --current-bin CURRENT_BIN \
+  --evidence-dir NEW_PRIVATE_DIRECTORY
+```
+
+The fixture upgrades a populated schema 23 store, induces an installer startup
+failure, and checks conversion back to 23 without losing the replacement's
+write. It then requires real schema 23 and 22 daemons to move an existing pane.
+The installer coordinator uses fixture processes; store admission, conversion
+and pane edits use the supplied real binaries. The evidence directory must be
+new and remains available for inspection.
+
 ## Installing your checkout
 
 `scripts/install-local` replaces your installed cagents with the committed
