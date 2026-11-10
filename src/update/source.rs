@@ -126,8 +126,8 @@ impl Client {
         deadline: Instant,
         protocol: u16,
     ) -> Result<Self, ControlError> {
-        match protocol {
-            protocol if current_client_supports(protocol) => {
+        match client_family(protocol) {
+            Some(ClientFamily::Current) => {
                 let stream = crate::control::connect_control_socket(
                     socket,
                     deadline.saturating_duration_since(Instant::now()),
@@ -136,7 +136,7 @@ impl Client {
                 let peer = Peer::observe(&stream, socket).map_err(|error| {
                     ControlError::Configure(io::Error::other(error.to_string()))
                 })?;
-                // The lifecycle subset is wire-proven for each admitted source.
+                // The lifecycle and inspector subset is wire-proven for each source.
                 let client =
                     ControlClient::from_stream_at_source_protocol(stream, deadline, protocol)?;
                 peer.verify(client.proof()).map_err(|error| {
@@ -144,13 +144,13 @@ impl Client {
                 })?;
                 Ok(Self::Current { client, peer })
             }
-            protocol if LEGACY_PROTOCOLS.contains(&protocol) => {
+            Some(ClientFamily::V68 | ClientFamily::V77) => {
                 v77::Client::connect_at_protocol(socket, deadline, protocol)
                     .map(Self::Legacy)
                     .map_err(|error| ControlError::Configure(io::Error::other(error.to_string())))
             }
-            actual => Err(ControlError::Configure(io::Error::other(
-                unsupported_source(actual),
+            None => Err(ControlError::Configure(io::Error::other(
+                unsupported_source(protocol),
             ))),
         }
     }
@@ -300,8 +300,8 @@ impl InstalledIdentity {
     }
 }
 
-/// Frozen lifecycle contract, using the wire variant names. Only these outer
-/// variants are compared; every type reachable from their payloads (including
+/// Frozen lifecycle and inspector contract, using the wire variant names.
+/// Only these outer variants are compared; every reachable payload type (including
 /// errors and historical unsolicited chat traffic) must match in full.
 /// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
 /// include status reads. Current-only ChatLimit cannot arrive from historical
@@ -315,9 +315,13 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "Connect",
             "List",
             "ChatList",
+            "ChatStart",
             "ChatAttach",
             "ChatClose",
             "ChatDetach",
+            "ChatVisibility",
+            "ChatRead",
+            "ResolveUpgradeChat",
             "Shutdown",
             "ShutdownV1",
             "PrepareUpgrade",
@@ -334,7 +338,10 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "chat_listed",
             "chat_attached",
             "chat_closed",
+            "chat_snapshot",
             "detached",
+            "accepted",
+            "upgrade_chat_resolved",
             "shutdown_accepted",
             "shutdown_preflight",
             "shutdown_outcome",
@@ -357,21 +364,48 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
     ),
 ];
 
-/// Protocols whose lifecycle subset uses the current wire types. Every entry
-/// is proven against its recorded format, including after a protocol bump.
-pub(crate) const CURRENT_CLIENT_PROTOCOLS: &[u16] =
-    &[128, 156, crate::terminal_ipc::PROTOCOL_VERSION];
-
-/// Older sources served by the frozen bespoke lifecycle client, not by the
-/// current wire types. Its byte-level compatibility tests live in `v77`.
-pub(super) const LEGACY_PROTOCOLS: &[u16] = &[77, 119];
-
-pub(crate) fn current_client_supports(protocol: u16) -> bool {
-    CURRENT_CLIENT_PROTOCOLS.contains(&protocol)
+/// One source qualification for lifecycle control and migration inspection.
+/// The bespoke families share the frozen lifecycle subset but need separate
+/// inventory decoders. Their byte proofs live beside those clients.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClientFamily {
+    Current,
+    V77,
+    V68,
 }
 
-pub(super) fn is_qualified_source(protocol: u16) -> bool {
-    current_client_supports(protocol) || LEGACY_PROTOCOLS.contains(&protocol)
+/// Current-wire entries must pass the recorded lifecycle/inspector proof.
+/// Unrecorded mainline protocols 99–103 and 119 are deliberately not admitted.
+const SOURCE_CLIENTS: &[(u16, ClientFamily)] = &[
+    (68, ClientFamily::V68),
+    (77, ClientFamily::V77),
+    (128, ClientFamily::Current),
+    (156, ClientFamily::Current),
+    (crate::terminal_ipc::PROTOCOL_VERSION, ClientFamily::Current),
+];
+
+pub(crate) fn client_family(protocol: u16) -> Option<ClientFamily> {
+    SOURCE_CLIENTS
+        .iter()
+        .find_map(|&(version, family)| (version == protocol).then_some(family))
+}
+
+#[cfg(test)]
+pub(crate) fn protocols() -> impl Iterator<Item = u16> {
+    SOURCE_CLIENTS.iter().map(|&(protocol, _)| protocol)
+}
+
+#[cfg(test)]
+pub(crate) fn current_client_protocols() -> impl Iterator<Item = u16> {
+    protocols().filter(|&protocol| current_client_supports(protocol))
+}
+
+pub(crate) fn current_client_supports(protocol: u16) -> bool {
+    client_family(protocol) == Some(ClientFamily::Current)
+}
+
+pub(crate) fn is_qualified_source(protocol: u16) -> bool {
+    client_family(protocol).is_some()
 }
 
 pub(super) fn unsupported_source(protocol: u16) -> UpdateError {
