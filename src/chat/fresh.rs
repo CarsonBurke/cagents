@@ -78,9 +78,6 @@ impl Session {
     /// or ambiguous saved selector leaves the source untouched and unoffered.
     pub(crate) fn fresh_start(&self) -> Option<Self> {
         let provider = self.launch.provider;
-        if Provider::from_program(&self.launch.recipe.program) != Some(provider) {
-            return None;
-        }
         let selected = self.launch.session_id.as_deref();
         if selected.is_some_and(|id| {
             id.is_empty()
@@ -224,6 +221,21 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[test]
+    fn the_explicit_provider_keeps_a_custom_executable_verbatim() {
+        let mut source = session(
+            Provider::Claude,
+            &["--resume", THREAD, "--system-prompt=resume"],
+        );
+        source.launch.recipe.program = "/fixture/bin/custom-native-provider".into();
+        let original = source.clone();
+        let fresh = source.fresh_start().unwrap();
+        assert_eq!(fresh.launch.provider, Provider::Claude);
+        assert_eq!(fresh.launch.recipe.program, source.launch.recipe.program);
+        assert_eq!(fresh.launch.recipe.arguments, ["--system-prompt=resume"]);
+        assert_eq!(source, original);
     }
 
     #[test]
