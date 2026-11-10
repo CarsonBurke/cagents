@@ -62,6 +62,7 @@ def main():
     parser.add_argument('--log', type=Path, action='append', required=True, help='One trace per UI window; repeat to capture both.')
     parser.add_argument('--output', required=True, type=Path, help='New directory outside the fixture.')
     parser.add_argument('--edits', type=int, default=200)
+    parser.add_argument('--wait-for-selection', action='store_true', help='Pause at driver-ready.json until driver-ready.go exists, before timing.')
     parser.add_argument('--drain-timeout', type=float, default=180, help='Seconds for both windows to persist the final pane title.')
     parser.add_argument('--interval-ms', type=int, default=100)
     arguments = parser.parse_args()
@@ -78,8 +79,8 @@ def main():
     if len(arguments.log) != 2 or len(set(path.resolve() for path in arguments.log)) != 2:
         parser.error('give two distinct --log paths, one for each UI window')
     output = arguments.output.resolve()
-    if output == root or root in output.parents:
-        parser.error('--output must be outside the fixture that start restores')
+    if output == root or root in output.parents or task not in output.parents:
+        parser.error('--output must be inside this task and outside the fixture that start restores')
     output.mkdir(parents=True, exist_ok=False)
     processes = fixture_processes(root)
     ui_pids = [pid for pid, name, _ in processes if name == 'cagents-ui']
@@ -113,7 +114,10 @@ def main():
     sampler.start()
     try:
         with (output / 'edits.jsonl').open('w') as records, (output / 'edits.stderr').open('w') as errors:
-            child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True)
+            environment = dict(os.environ)
+            if arguments.wait_for_selection:
+                environment['CAGENTS_WORKSPACE_EDIT_READY'] = str(output / 'driver-ready.json')
+            child = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=errors, text=True, env=environment)
             for line in child.stdout:
                 record = json.loads(line)
                 if record.get('event') == 'begin':
@@ -154,6 +158,10 @@ def main():
     finally:
         stop.set()
         sampler.join()
+    lost = sorted({entry['pid'] for row in samples for entry in row['processes'] if 'error' in entry and entry['pid'] in ui_pids})
+    outcome['lost_ui_processes'] = lost
+    if lost or len(samples) < 2:
+        outcome['status'] = 1
     outcome.update(ended_ns=time.monotonic_ns(), pressure_after=pressure())
     (output / 'proc.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in samples))
     for index, (log, position) in enumerate(positions):

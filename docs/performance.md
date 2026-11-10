@@ -136,8 +136,14 @@ rendering partway through the sample:
 scripts/bounded --ttl 300 --name workspace-edits -- scripts/measure-workspace-edits \
   --root "$fixture" --side after --binary "$products/examples/workspace-edit-workload" \
   --log "$task/logs/ui-after-1.log" --log "$task/logs/ui-after-2.log" \
-  --output "$task/measurement-after" --edits 200 --interval-ms 100
+  --output "$task/measurement-after" --edits 200 --interval-ms 100 --wait-for-selection
 ```
+
+With `--wait-for-selection`, the driver writes `driver-ready.json` in the output
+directory after creating its synthetic channel and pane. Select that channel in
+one window and a busy fixture chat in the other, then create `driver-ready.go`
+beside it. The driver starts its timing origin only after that marker. The
+selection wait is bounded at 120 seconds.
 
 `measure-workspace-edits` refuses an unbounded run, an arbitrary workspace, or a
 fixture without exactly two UI processes. It records per-edit receipt times,

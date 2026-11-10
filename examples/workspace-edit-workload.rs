@@ -120,6 +120,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|view| view.scope == scope)
         .ok_or("inserted scope missing")?
         .revision;
+    // A native observer can select this pane before timed deadlines exist.
+    // The optional marker belongs to this task, outside the restored fixture.
+    if let Some(ready) = std::env::var_os("CAGENTS_WORKSPACE_EDIT_READY") {
+        use std::io::Write as _;
+        let ready = PathBuf::from(ready);
+        let parent = ready
+            .parent()
+            .ok_or("ready marker has no parent")?
+            .canonicalize()?;
+        if !parent.starts_with(task) || parent.starts_with(&root) {
+            return Err("the ready marker must be under this task and outside the fixture".into());
+        }
+        let setup = serde_json::json!({"event":"prepared", "pane":pane.id.to_string(), "channel":channel.to_string()});
+        let mut file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&ready)?;
+        writeln!(file, "{setup}")?;
+        println!("{setup}");
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while !ready.with_extension("go").is_file() {
+            if Instant::now() >= deadline {
+                return Err("the native pane was not selected within 120 seconds".into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
     std::thread::sleep(Duration::from_secs(3));
     let origin = Instant::now();
     println!(
