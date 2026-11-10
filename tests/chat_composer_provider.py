@@ -213,11 +213,27 @@ os.execv("/usr/bin/rm", ["/usr/bin/rm", *args])
         marker = self.root / "cleanup-entered.json"
         live.read_until(lambda: marker.exists() or live.response("settle-interrupt"))
         premature = live.response("settle-interrupt")
+        evidence = {}
         if premature:
+            live.read_until(lambda: any(frame.get("type") == "result" and
+                            frame.get("uuid") == "fixture-result-1" for frame in live.output))
+            evidence = {
+                "ack": next(frame for frame in live.output
+                            if frame.get("response", {}).get("request_id") == "settle-interrupt"),
+                "result": next(frame for frame in live.output if frame.get("type") == "result" and
+                               frame.get("uuid") == "fixture-result-1"),
+                "cleanup_barrier_exists": marker.exists(),
+                "scratch": [path.name for path in self.config.glob(".fixture-stream.*")],
+            }
             # The old fixture must fail only after all its private processes
             # have been cleaned up, not while a deliberately held rm survives.
             live.cleanup()
-        self.assertFalse(premature, "interrupt acknowledged before scratch settlement")
+            with self.assertRaises(ProcessLookupError):
+                os.killpg(live.process.pid, 0)
+            evidence["owned_group_empty_before_assertion"] = True
+            evidence["root_returncode"] = live.process.returncode
+        self.assertFalse(premature, "interrupt acknowledged before scratch settlement: "
+                         + json.dumps(evidence, sort_keys=True))
         self.assertTrue(marker.exists())
         self.assertFalse(any(frame.get("event", {}).get("type") == "content_block_stop"
                              or frame.get("type") == "result" for frame in live.output))
