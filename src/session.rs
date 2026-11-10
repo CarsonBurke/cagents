@@ -334,6 +334,15 @@ pub enum SessionError {
     Worker(std::io::Error),
 }
 
+/// A chat card whose shared view holds conversation `canonical` where this
+/// window last saved conversation `expected`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatIdentityAdoption {
+    pub card: CardId,
+    pub expected: TerminalId,
+    pub canonical: crate::chat::Session,
+}
+
 /// An explicit change of the identity a card's payload is bound to, which
 /// ordinary snapshots are not allowed to make.
 #[derive(Debug, Clone)]
@@ -349,24 +358,30 @@ enum Replacement {
     Terminal(TerminalSession),
     /// A new conversation started in a chat card in place of its own.
     Chat(crate::chat::Session),
+    /// The conversation the card's shared view now holds, which another
+    /// client put in place of the one this window last saved.
+    SharedChat(crate::chat::Session),
 }
 
 impl Replacement {
     fn id(&self) -> TerminalId {
         match self {
             Self::Terminal(session) => session.id,
-            Self::Chat(session) => session.id,
+            Self::Chat(session) | Self::SharedChat(session) => session.id,
         }
     }
 
+    /// Whether both rebind the same kind of payload, so one can continue the
+    /// other's chain. Who authorized each step does not matter: a chain is
+    /// applied under the authority of its newest step.
     fn same_kind(&self, other: &Self) -> bool {
-        std::mem::discriminant(self) == std::mem::discriminant(other)
+        self.kind() == other.kind()
     }
 
     fn kind(&self) -> ReplacedIdentity {
         match self {
             Self::Terminal(_) => ReplacedIdentity::Terminal,
-            Self::Chat(_) => ReplacedIdentity::Chat,
+            Self::Chat(_) | Self::SharedChat(_) => ReplacedIdentity::Chat,
         }
     }
 }
@@ -377,7 +392,9 @@ impl IdentityReplacement {
     fn replaces(&self, kind: &CardKind) -> bool {
         let held = match (&self.replacement, kind) {
             (Replacement::Terminal(_), CardKind::Terminal(session)) => session.id,
-            (Replacement::Chat(_), CardKind::Chat(session)) => session.id,
+            (Replacement::Chat(_) | Replacement::SharedChat(_), CardKind::Chat(session)) => {
+                session.id
+            }
             _ => return false,
         };
         held == self.expected_terminal_id && held != self.replacement.id()
@@ -390,6 +407,9 @@ impl IdentityReplacement {
             }
             Replacement::Chat(session) => {
                 store.replace_chat_identity(self.card_id, self.expected_terminal_id, session)
+            }
+            Replacement::SharedChat(session) => {
+                store.adopt_chat_identity(self.card_id, self.expected_terminal_id, session)
             }
         }
     }
@@ -468,9 +488,57 @@ struct QueueState {
     projects: HashMap<ProjectId, ProjectState>,
     worktrees: HashMap<WorktreeId, WorktreeState>,
     identity_replacements: HashMap<CardId, IdentityReplacement>,
+    /// Conversations shared views re-pointed chat cards to, waiting for the
+    /// write that shows them. The writer never takes them on its own: they
+    /// are queued ahead of that write under its lock, so the writer can pair
+    /// them neither with an older state that still shows the replaced
+    /// conversations nor with a state that shows a change queued after them.
+    staged_adoptions: Vec<IdentityReplacement>,
     retry_requested: bool,
     checkpoints: Vec<std::sync::mpsc::SyncSender<std::result::Result<(), String>>>,
     shutdown: bool,
+}
+
+impl QueueState {
+    /// Queues `replacement` behind everything already offered: after the
+    /// pending snapshot while conversions are kept in order, merged with the
+    /// other pending replacements otherwise.
+    fn queue_identity_replacement(&mut self, replacement: IdentityReplacement) {
+        if self.ordered_identities {
+            if let Some(previous) = self.latest.take() {
+                self.conversions
+                    .push_back(ConversionCheckpoint::Snapshot(previous));
+            }
+            self.conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        } else {
+            merge_identity_replacement(&mut self.identity_replacements, replacement);
+        }
+    }
+
+    /// Switches the lane to keeping writes in order, behind everything
+    /// already offered: the merged replacements, which arrived with the
+    /// pending snapshot that shows them, then that snapshot, then the staged
+    /// adoptions, which only the write being queued shows.
+    fn keep_writes_in_order(&mut self) {
+        self.ordered_identities = true;
+        for replacement in std::mem::take(&mut self.identity_replacements).into_values() {
+            self.conversions
+                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
+        }
+        if let Some(previous) = self.latest.take() {
+            self.conversions
+                .push_back(ConversionCheckpoint::Snapshot(previous));
+        }
+        self.admit_staged_adoptions();
+    }
+
+    /// Queues the staged adoptions ahead of the write being queued.
+    fn admit_staged_adoptions(&mut self) {
+        for adoption in std::mem::take(&mut self.staged_adoptions) {
+            self.queue_identity_replacement(adoption);
+        }
+    }
 }
 
 pub struct SessionRuntime {
@@ -613,6 +681,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
+            queue.admit_staged_adoptions();
             queue.latest = Some(state);
             changed.notify_one();
         }
@@ -626,17 +695,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            queue.ordered_identities = true;
-            for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            }
-            if let Some(previous) = queue.latest.take() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
-            }
+            queue.keep_writes_in_order();
             queue
                 .conversions
                 .push_back(ConversionCheckpoint::Snapshot(state));
@@ -662,17 +721,7 @@ impl SessionRuntime {
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            queue.ordered_identities = true;
-            for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            }
-            if let Some(previous) = queue.latest.take() {
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::Snapshot(previous));
-            }
+            queue.keep_writes_in_order();
             queue
                 .conversions
                 .push_back(ConversionCheckpoint::PaneAdoptions {
@@ -699,17 +748,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
-        queue.ordered_identities = true;
-        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-        }
-        if let Some(previous) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(previous));
-        }
+        queue.keep_writes_in_order();
         queue
             .conversions
             .push_back(ConversionCheckpoint::TerminalOwnershipRecovery {
@@ -786,6 +825,27 @@ impl SessionRuntime {
         );
     }
 
+    /// Records the conversations chat cards' shared views now hold in place
+    /// of the ones this window last saved for them, which other clients
+    /// started or replaced. Snapshots refuse such a change on their own.
+    ///
+    /// They are staged for the next write of the window's state, which must
+    /// follow: it queues them ahead of itself under its own lock.
+    pub fn stage_chat_adoptions(&self, adoptions: impl IntoIterator<Item = ChatIdentityAdoption>) {
+        let (lock, _) = &*self.queue;
+        if let Ok(mut queue) = lock.lock()
+            && !queue.shutdown
+        {
+            queue
+                .staged_adoptions
+                .extend(adoptions.into_iter().map(|adoption| IdentityReplacement {
+                    card_id: adoption.card,
+                    expected_terminal_id: adoption.expected,
+                    replacement: Replacement::SharedChat(adoption.canonical),
+                }));
+        }
+    }
+
     /// Commit an exact account transition once, in order with queued snapshots.
     /// The caller keeps its candidate inactive until this receipt succeeds;
     /// failures are returned without retaining an automatic retry.
@@ -834,17 +894,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
-        queue.ordered_identities = true;
-        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-        }
-        if let Some(snapshot) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(snapshot));
-        }
+        queue.keep_writes_in_order();
         queue
             .conversions
             .push_back(ConversionCheckpoint::RetainedChatCopy {
@@ -888,17 +938,7 @@ impl SessionRuntime {
         if queue.shutdown {
             return Err("Session writer is shutting down".into());
         }
-        queue.ordered_identities = true;
-        for replacement in std::mem::take(&mut queue.identity_replacements).into_values() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-        }
-        if let Some(snapshot) = queue.latest.take() {
-            queue
-                .conversions
-                .push_back(ConversionCheckpoint::Snapshot(snapshot));
-        }
+        queue.keep_writes_in_order();
         queue
             .conversions
             .push_back(ConversionCheckpoint::ChatRecovery(ChatRecoveryWrite {
@@ -918,21 +958,23 @@ impl SessionRuntime {
         replacement: IdentityReplacement,
         state: Option<Arc<WorkspaceState>>,
     ) {
+        self.replace_identities([replacement], state);
+    }
+
+    /// Queues `replacements` in order, then `state` as the newest snapshot
+    /// when given.
+    fn replace_identities(
+        &self,
+        replacements: impl IntoIterator<Item = IdentityReplacement>,
+        state: Option<Arc<WorkspaceState>>,
+    ) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock()
             && !queue.shutdown
         {
-            if queue.ordered_identities {
-                if let Some(previous) = queue.latest.take() {
-                    queue
-                        .conversions
-                        .push_back(ConversionCheckpoint::Snapshot(previous));
-                }
-                queue
-                    .conversions
-                    .push_back(ConversionCheckpoint::IdentityReplacement(replacement));
-            } else {
-                merge_identity_replacement(&mut queue.identity_replacements, replacement);
+            queue.admit_staged_adoptions();
+            for replacement in replacements {
+                queue.queue_identity_replacement(replacement);
             }
             if let Some(state) = state {
                 queue.latest = Some(state);
@@ -1081,6 +1123,9 @@ impl SessionRuntime {
     pub fn shutdown(&mut self) {
         let (lock, changed) = &*self.queue;
         if let Ok(mut queue) = lock.lock() {
+            // Nothing will write them now; what storage holds should still
+            // follow what the shared views showed.
+            queue.admit_staged_adoptions();
             queue.shutdown = true;
             changed.notify_one();
         }
@@ -1614,6 +1659,16 @@ trait SessionStore {
         expected_id: TerminalId,
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError>;
+    fn adopt_chat_identity(
+        &self,
+        _card_id: CardId,
+        _expected_id: TerminalId,
+        _canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Err(invalid_state!(
+            "This store does not support shared chat identities"
+        ))
+    }
     fn save_workspace(
         &self,
         state: &WorkspaceState,
@@ -1726,6 +1781,15 @@ impl SessionStore for StateStore {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         Self::replace_chat_identity(self, card_id, expected_id, replacement)
+    }
+
+    fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        Self::adopt_chat_identity(self, card_id, expected_id, canonical)
     }
 
     fn save_workspace(
@@ -1845,6 +1909,14 @@ impl SessionStore for Arc<StateStore> {
         replacement: &crate::chat::Session,
     ) -> Result<(), StoreError> {
         StateStore::replace_chat_identity(self, card_id, expected_id, replacement)
+    }
+    fn adopt_chat_identity(
+        &self,
+        card_id: CardId,
+        expected_id: TerminalId,
+        canonical: &crate::chat::Session,
+    ) -> Result<(), StoreError> {
+        StateStore::adopt_chat_identity(self, card_id, expected_id, canonical)
     }
     fn save_workspace(
         &self,
@@ -3965,6 +4037,244 @@ mod tests {
         }
     }
 
+    /// A write that records the conversations other windows gave shared chat
+    /// cards and then replaces another card's conversation, both with the
+    /// state that shows them, saves both, whether or not the lane is keeping
+    /// conversions in order.
+    #[test]
+    fn adopted_and_replaced_conversations_save_with_their_one_snapshot() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let path = directory.path().join("adopted-and-replaced.sqlite3");
+            let boot = BootId::new("adopted-and-replaced");
+            let (mut runtime, _) = SessionRuntime::open(&path, boot.clone()).unwrap();
+            let health = runtime.health_receiver();
+            let mut state = workspace();
+            let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+                unreachable!()
+            };
+            let chat = |provider: crate::agent::Provider| crate::chat::Session {
+                native_continuity: Default::default(),
+                owned_codex_listener: None,
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider,
+                    recipe: LaunchRecipe {
+                        program: provider.executable().into(),
+                        arguments: Vec::new(),
+                        ..terminal.launch.clone()
+                    },
+                    session_id: None,
+                },
+                proof: None,
+                terminal: None,
+            };
+            let shared_before = chat(crate::agent::Provider::Codex);
+            let own_before = chat(crate::agent::Provider::Codex);
+            let mut own = state.cards[0].clone();
+            own.id = CardId::new();
+            own.kind = CardKind::Chat(own_before.clone());
+            state.cards[0].kind = CardKind::Chat(shared_before.clone());
+            state.cards.push(own.clone());
+            let shared = state.cards[0].id;
+            runtime.snapshot(Arc::new(state.clone()));
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            if ordered {
+                runtime.snapshot_conversion(Arc::new(state.clone()));
+            }
+
+            let theirs = chat(crate::agent::Provider::Claude);
+            let mine = chat(crate::agent::Provider::Claude);
+            state.cards[0].kind = CardKind::Chat(theirs.clone());
+            state.cards[1].kind = CardKind::Chat(mine.clone());
+            let saved = Arc::new(state.clone());
+            runtime.stage_chat_adoptions([ChatIdentityAdoption {
+                card: shared,
+                expected: shared_before.id,
+                canonical: theirs.clone(),
+            }]);
+            runtime.replace_chat_identity(own.id, own_before.id, mine.clone(), saved);
+            runtime.flush(Duration::from_secs(10)).unwrap();
+            runtime.shutdown();
+            assert_eq!(runtime.last_error(), None, "ordered: {ordered}");
+            while let Ok(event) = health.try_recv() {
+                assert!(event.quarantined.is_empty(), "ordered: {ordered}");
+            }
+
+            let (mut reopened, restored) = SessionRuntime::open(&path, boot).unwrap();
+            let restored = restored.unwrap();
+            assert_eq!(
+                restored
+                    .cards
+                    .iter()
+                    .map(|card| card.kind.clone())
+                    .collect::<Vec<_>>(),
+                [CardKind::Chat(theirs), CardKind::Chat(mine)],
+                "ordered: {ordered}"
+            );
+            reopened.shutdown();
+        }
+    }
+
+    /// A session runtime with no writer thread, whose queue holds `older` as
+    /// the pending snapshot, so a test can read what each call queues.
+    fn queue_only_runtime(
+        directory: &tempfile::TempDir,
+        older: &Arc<WorkspaceState>,
+        ordered: bool,
+    ) -> SessionRuntime {
+        let path = directory.path().join("queue-only.sqlite3");
+        let store = Arc::new(StateStore::open(&path, BootId::new("queue-only")).unwrap());
+        let (health_tx, health) = async_channel::unbounded();
+        drop(health_tx);
+        SessionRuntime {
+            queue: Arc::new((
+                Mutex::new(QueueState {
+                    latest: Some(Arc::clone(older)),
+                    ordered_identities: ordered,
+                    ..QueueState::default()
+                }),
+                Condvar::new(),
+            )),
+            last_error: Arc::new(Mutex::new(None)),
+            health,
+            worker: None,
+            database_path: path,
+            restored_projects: Vec::new(),
+            restored_worktrees: Vec::new(),
+            restore_warnings: Vec::new(),
+            operation_store: store,
+        }
+    }
+
+    fn staged_chat(state: &WorkspaceState) -> crate::chat::Session {
+        let CardKind::Terminal(terminal) = state.cards[0].kind.clone() else {
+            unreachable!()
+        };
+        crate::chat::Session {
+            native_continuity: Default::default(),
+            owned_codex_listener: None,
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: terminal.launch,
+                session_id: None,
+            },
+            proof: None,
+            terminal: None,
+        }
+    }
+
+    /// Adoptions wait, out of the writer's reach, for the write that shows
+    /// them, and are queued ahead of it under the same lock: never behind an
+    /// older state that still shows the replaced conversation on its own,
+    /// nor ahead of a replacement queued with a state that shows both.
+    #[test]
+    fn adoptions_are_queued_with_the_write_that_shows_them() {
+        for ordered in [false, true] {
+            let directory = tempdir().unwrap();
+            let older = Arc::new(workspace());
+            let runtime = queue_only_runtime(&directory, &older, ordered);
+            let chat = staged_chat(&older);
+            let (shared, own) = (CardId::new(), CardId::new());
+            runtime.stage_chat_adoptions([ChatIdentityAdoption {
+                card: shared,
+                expected: TerminalId::new(),
+                canonical: chat.clone(),
+            }]);
+            {
+                let queue = runtime.queue.0.lock().unwrap();
+                assert!(
+                    queue.conversions.is_empty() && queue.identity_replacements.is_empty(),
+                    "the writer cannot take a staged adoption, ordered: {ordered}"
+                );
+            }
+            let saved = Arc::new(workspace());
+            runtime.replace_chat_identity(own, TerminalId::new(), chat, Arc::clone(&saved));
+
+            let queue = runtime.queue.0.lock().unwrap();
+            let name = |card: CardId| {
+                if card == shared {
+                    "adoption"
+                } else {
+                    "replacement"
+                }
+            };
+            let order = queue
+                .conversions
+                .iter()
+                .map(|checkpoint| match checkpoint {
+                    ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
+                        "older state"
+                    }
+                    ConversionCheckpoint::IdentityReplacement(replacement) => {
+                        name(replacement.card_id)
+                    }
+                    _ => "something else",
+                })
+                .collect::<Vec<_>>();
+            if ordered {
+                assert_eq!(order, ["older state", "adoption", "replacement"]);
+            } else {
+                assert!(order.is_empty());
+                let mut merged = queue
+                    .identity_replacements
+                    .keys()
+                    .map(|card| name(*card))
+                    .collect::<Vec<_>>();
+                merged.sort_unstable();
+                assert_eq!(merged, ["adoption", "replacement"]);
+            }
+            assert!(
+                queue
+                    .latest
+                    .as_ref()
+                    .is_some_and(|latest| Arc::ptr_eq(latest, &saved)),
+                "the state that shows both is written after them, ordered: {ordered}"
+            );
+            assert!(queue.staged_adoptions.is_empty());
+        }
+    }
+
+    /// The write that first keeps the lane in order queues staged adoptions
+    /// behind the older pending snapshot, not ahead of it: that snapshot still
+    /// shows the conversations the adoptions replace.
+    #[test]
+    fn adoptions_follow_the_older_state_when_the_lane_turns_ordered() {
+        let directory = tempdir().unwrap();
+        let older = Arc::new(workspace());
+        let runtime = queue_only_runtime(&directory, &older, false);
+        let shared = CardId::new();
+        runtime.stage_chat_adoptions([ChatIdentityAdoption {
+            card: shared,
+            expected: TerminalId::new(),
+            canonical: staged_chat(&older),
+        }]);
+        let saved = Arc::new(workspace());
+        runtime.snapshot_conversion(Arc::clone(&saved));
+
+        let queue = runtime.queue.0.lock().unwrap();
+        let order = queue
+            .conversions
+            .iter()
+            .map(|checkpoint| match checkpoint {
+                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &older) => {
+                    "older state"
+                }
+                ConversionCheckpoint::Snapshot(state) if Arc::ptr_eq(state, &saved) => {
+                    "saved state"
+                }
+                ConversionCheckpoint::IdentityReplacement(replacement)
+                    if replacement.card_id == shared =>
+                {
+                    "adoption"
+                }
+                _ => "something else",
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(order, ["older state", "adoption", "saved state"]);
+    }
+
     #[test]
     fn conversion_checkpoints_preserve_discovered_identity_before_fast_cli_return() {
         let directory = tempdir().unwrap();
@@ -5085,6 +5395,14 @@ mod tests {
             ) -> Result<(), StoreError> {
                 self.store
                     .replace_chat_identity(card, expected, replacement)
+            }
+            fn adopt_chat_identity(
+                &self,
+                card: CardId,
+                expected: TerminalId,
+                canonical: &crate::chat::Session,
+            ) -> Result<(), StoreError> {
+                self.store.adopt_chat_identity(card, expected, canonical)
             }
             fn save_workspace(
                 &self,

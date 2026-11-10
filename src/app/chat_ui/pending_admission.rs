@@ -320,6 +320,12 @@ impl Cagents {
             runtime.connection = Connection::Connecting;
             self.cards.insert(pane.id, CardRuntime::Chat(runtime));
         }
+        if let (Some(CardKind::Chat(saved)), CardKind::Chat(canonical)) = (
+            self.card_state(pane.id).map(|card| card.kind.clone()),
+            &pane.kind,
+        ) {
+            self.adopt_shared_chat_identity(pane.id, &saved, canonical);
+        }
         if let Some(card) = self.card_state_mut(pane.id) {
             card.kind = pane.kind.clone();
         }
