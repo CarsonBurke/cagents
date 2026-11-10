@@ -1532,6 +1532,12 @@ extern "C" fn serve_if_requested() {
     if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } != 0 {
         std::process::exit(2);
     }
+    // Nothing this holder was handed may outlive it in its provider: a
+    // provider holding the daemon's end of this channel open would hide the
+    // holder's death from the daemon, which then waits on it forever.
+    if crate::daemon::seal_inherited_descriptors().is_err() {
+        std::process::exit(2);
+    }
     let control = unsafe { UnixStream::from_raw_fd(fd) };
     let _result = (|| {
         let Some(Request::Spawn {

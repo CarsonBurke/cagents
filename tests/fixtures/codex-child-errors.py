@@ -170,7 +170,7 @@ def main():
     if not address or not address.startswith("unix://"):
         raise SystemExit("fixture requires --listen unix://PATH")
     path = Path(address[len("unix://"):])
-    if not path.parent.resolve(strict=True).is_relative_to(runtime) or path.exists() or path.is_symlink():
+    if not transport.private_listener(path.parent, runtime) or path.exists() or path.is_symlink():
         raise SystemExit("fixture requires a fresh socket beneath its private runtime")
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
