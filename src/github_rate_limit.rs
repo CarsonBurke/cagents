@@ -4,8 +4,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RateLimit {
     pub retry_at: u64,
-    /// Primary quota is independent for graphql, core, search, and other
-    /// GitHub resources. None denotes secondary/server pacing.
+    /// Resource-local pacing, including primary exhaustion and ambiguous rate
+    /// errors. "unknown" must be bound to the request's resource; it does not
+    /// establish a primary diagnosis. None denotes secondary/server pacing.
     pub resource: Option<String>,
     /// A response can exhaust a primary quota and also instruct all requests
     /// to wait briefly. Never extend that secondary pause to the primary reset.
@@ -126,12 +127,17 @@ impl RateLimit {
                 resource: Some(resource),
                 secondary_retry_at: secondary_due,
             })
+        } else if let Some(due) = secondary_due {
+            Some(Self::secondary(due.max(now.saturating_add(1))))
         } else {
-            Some(Self::secondary(
-                secondary_due
-                    .unwrap_or_else(|| now.saturating_add(60))
-                    .max(now.saturating_add(1)),
-            ))
+            // A headerless rate error does not establish a secondary limit.
+            // Briefly pause the failing resource without blocking unrelated
+            // transports; classify_for binds this unknown resource to its call.
+            Some(Self {
+                retry_at: now.saturating_add(60),
+                resource: Some("unknown".into()),
+                secondary_retry_at: None,
+            })
         }
     }
 }
@@ -139,6 +145,40 @@ impl RateLimit {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn ambiguous_headerless_rate_errors_pause_only_the_request_resource() {
+        for text in [
+            "GraphQL: API rate limit already exceeded",
+            "API rate limit exceeded",
+            "GraphQL RATE_LIMITED",
+        ] {
+            let unbound = RateLimit::classify(text, 100).unwrap();
+            assert_eq!(unbound.resource.as_deref(), Some("unknown"));
+            assert_eq!(unbound.secondary_retry_at, None);
+            for resource in ["graphql", "core", "search"] {
+                let limit = RateLimit::classify_for(text, 100, resource).unwrap();
+                assert_eq!(limit.resource.as_deref(), Some(resource));
+                assert_eq!(limit.retry_at, 160);
+                assert_eq!(limit.secondary_retry_at, None);
+                assert!(limit.for_resource_at(resource, 100).is_some());
+                let other = if resource == "graphql" {
+                    "core"
+                } else {
+                    "graphql"
+                };
+                assert!(limit.for_resource_at(other, 100).is_none());
+            }
+        }
+        for text in [
+            "GraphQL: API rate limit already exceeded\nRetry-After: 20",
+            "secondary rate limit",
+            "abuse detection",
+        ] {
+            let limit = RateLimit::classify_for(text, 100, "graphql").unwrap();
+            assert!(limit.resource.is_none(), "{text}");
+            assert!(limit.for_resource_at("core", 100).is_some());
+        }
+    }
     #[test]
     fn primary_reset_and_secondary_retry_after_have_independent_resources_and_deadlines() {
         let limit = RateLimit::classify_for(

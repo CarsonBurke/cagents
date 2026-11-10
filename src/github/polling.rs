@@ -86,6 +86,8 @@ struct Budget {
     failures: u32,
     due: u64,
     rate_limited: bool,
+    // Resource-local pauses include ambiguous rate errors, not only confirmed
+    // primary exhaustion. Only affirmative secondary evidence sets shared due.
     primary: HashMap<String, u64>,
 }
 static BUDGETS: LazyLock<Mutex<HashMap<String, Budget>>> = LazyLock::new(Default::default);
@@ -183,6 +185,91 @@ pub fn succeeded(host: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn headerless_plain_cli_graphql_failure_leaves_rest_reads_and_comments_available() {
+        struct Headerless {
+            commands: Mutex<Vec<CommandSpec>>,
+        }
+        impl ProcessExecutor for Headerless {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.commands.lock().unwrap().push(command.clone());
+                let graphql = command_resource(command) == "graphql";
+                if graphql {
+                    assert_eq!(command.arguments[0], "pr");
+                    assert_eq!(command.arguments[1], "view");
+                    assert!(!command.arguments.iter().any(|arg| arg == "--include"));
+                }
+                Ok(ProcessOutput {
+                    success: !graphql,
+                    exit_code: Some(if graphql { 1 } else { 0 }),
+                    signal: None,
+                    stdout: if graphql {
+                        vec![]
+                    } else {
+                        br#"{"id":1,"ok":true}"#.to_vec()
+                    },
+                    stderr: if graphql {
+                        b"GraphQL: API rate limit already exceeded\n".to_vec()
+                    } else {
+                        vec![]
+                    },
+                })
+            }
+        }
+        let repository =
+            GitHubRepoKey::new("headerless-rate-scope.invalid", None, "owner", "repo").unwrap();
+        let key = PullRequestKey::new(repository.clone(), 1).unwrap();
+        let executor = Arc::new(Headerless {
+            commands: Mutex::new(vec![]),
+        });
+        let service = GitHubService::new("gh", executor.clone());
+        let cancellation = CancellationToken::new();
+        with_scope("headerless-account", || {
+            let error = service.view(&key, &cancellation).unwrap_err();
+            let limit = error.rate_limit().unwrap();
+            assert_eq!(limit.resource.as_deref(), Some("graphql"));
+            assert_eq!(limit.secondary_retry_at, None);
+            assert!(!ready(&repository.authority(), false));
+            assert!(with_resource("core", || ready(
+                &repository.authority(),
+                false
+            )));
+            let rest = service.gh_command(["api", "--include", "repos/owner/repo"]);
+            service
+                .run_checked(&rest, &repository, &cancellation)
+                .unwrap();
+            assert!(matches!(
+                service.post_single_review_comment(
+                    &key,
+                    &"a".repeat(40),
+                    &AddReviewThreadRequest {
+                        review_id: "unused".into(),
+                        path: "file.rs".into(),
+                        subject: ReviewThreadSubject::File,
+                        body: "A comment".into(),
+                    },
+                    &cancellation,
+                ),
+                Ok(ReviewMutationOutcome::Applied(()))
+            ));
+            assert!(service.view(&key, &cancellation).is_err());
+            assert!(
+                service
+                    .graphql(&repository, "query{viewer{login}}", vec![], &cancellation)
+                    .is_err()
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), 3);
+            BUDGETS
+                .lock()
+                .unwrap()
+                .remove(&budget_key(&repository.authority()));
+        });
+    }
 
     #[test]
     fn primary_resources_do_not_block_other_transports_but_secondary_pacing_does() {

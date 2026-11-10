@@ -416,6 +416,8 @@ fn host_paths(root: &Path, credentials: &str, host: &str) -> (PathBuf, PathBuf) 
 /// timestamp, which cannot establish an all-resource secondary pause.
 #[derive(Default, Serialize, Deserialize)]
 struct HostBudget {
+    // Compatibility name: resource-local pauses also include ambiguous rate
+    // errors and do not by themselves diagnose primary quota exhaustion.
     primary: std::collections::BTreeMap<String, u64>,
     secondary: u64,
 }
@@ -751,6 +753,59 @@ mod tests {
         assert_eq!(graphql.resource.as_deref(), Some("graphql"));
         assert_eq!(graphql.retry_at, due);
         assert_eq!(graphql.secondary_retry_at, Some(core.retry_at));
+    }
+
+    #[test]
+    fn headerless_graphql_failure_persists_only_a_resource_local_host_v2_pause() {
+        let root = private_tempdir();
+        let fixture = Fixture::new(vec![ProcessOutput {
+            success: false,
+            exit_code: Some(1),
+            signal: None,
+            stdout: vec![],
+            stderr: b"GraphQL: API rate limit already exceeded\n".to_vec(),
+        }]);
+        let service = StatusService::new("gh", fixture.clone());
+        let cancellation = CancellationToken::new();
+        let before = now();
+        let first = read_fixture(root.path(), "account", &key(), &service, &cancellation);
+        assert_eq!(first.outcome, "failed");
+        assert!(first.stale);
+        let (_, path) = host_paths(root.path(), "account", &key().repository.authority());
+        let budget = load::<HostBudget>(&path).unwrap().unwrap();
+        assert_eq!(budget.secondary, 0);
+        assert_eq!(budget.primary.len(), 1);
+        assert!((before + 60..=now() + 60).contains(&budget.primary["graphql"]));
+        for resource in ["core", "search"] {
+            assert!(
+                shared_cooldown(
+                    root.path(),
+                    "account",
+                    &key().repository.authority(),
+                    resource,
+                    &cancellation
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+        let graphql = shared_cooldown(
+            root.path(),
+            "account",
+            &key().repository.authority(),
+            "graphql",
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(graphql.resource.as_deref(), Some("graphql"));
+        assert_eq!(graphql.secondary_retry_at, None);
+        let mut another = key();
+        another.number = 43;
+        let repeated = read_fixture(root.path(), "account", &another, &service, &cancellation);
+        assert_eq!(repeated.source, "cache");
+        assert_eq!(repeated.outcome, "failed");
+        assert_eq!(fixture.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
