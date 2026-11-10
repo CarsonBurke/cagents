@@ -297,13 +297,6 @@ pub enum DaemonCommand {
         /// Permit active native turns and their background subagents to stop.
         #[arg(long)]
         interrupt: bool,
-        /// Carry saved panes whose ended actor never recorded its
-        /// conversation; they stay in their windows but will not reopen.
-        /// Also end conversations the running daemon cannot carry: a Codex
-        /// chat whose server can no longer be reached, or a provider that
-        /// stopped without confirming its work finished.
-        #[arg(long)]
-        accept_unreopenable: bool,
     },
     /// Request daemon termination (use --confirm for a counted confirmation).
     Stop {
@@ -3335,12 +3328,8 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
             "bridge",
             "stdio bridge must run before command output",
         )),
-        DaemonCommand::Upgrade {
-            yes,
-            interrupt,
-            accept_unreopenable,
-        } => {
-            let job = crate::update::upgrade_installed(yes, interrupt, accept_unreopenable)
+        DaemonCommand::Upgrade { yes, interrupt } => {
+            let job = crate::update::upgrade_installed(yes, interrupt)
                 .map_err(|error| AppError::new("update", error))?;
             Ok(CommandOutput {
                 command: "daemon.upgrade",
@@ -3498,7 +3487,7 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     }
                     let preflight = client.shutdown_preflight().map_err(protocol_error)?;
                     eprint!(
-                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
+                        "Stop daemon and terminate {} hosted terminal/chat sessions and all their background subagents ({} currently running or waiting on their own background work; includes pending spawns and unconfirmed provider work)? Type yes to confirm: ",
                         preflight.capability.live_terminals,
                         preflight.capability.background_subagents
                     );

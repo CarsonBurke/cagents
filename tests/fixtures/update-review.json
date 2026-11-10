@@ -1,0 +1,74 @@
+{
+  "id": "fixture-update-review",
+  "version": "9.8.7",
+  "phase": "AwaitingConfirmation",
+  "message": "Review the update before continuing.",
+  "log_path": "/fixture/update.log",
+  "confirmation": {
+    "nonce": "fixture-review-nonce",
+    "expires_at_unix_ms": 18446744073709551615,
+    "preview": {
+      "candidate": {
+        "version": "9.8.7",
+        "protocol": 32,
+        "digest": "fixture-only"
+      },
+      "replaces_daemon": true,
+      "from_version": "9.8.6",
+      "windows": 1,
+      "labels": {
+        "00000000-0000-4000-8000-000000000001": "Build terminal \u00b7 demo",
+        "00000000-0000-4000-8000-000000000002": "Code review \u00b7 demo",
+        "00000000-0000-4000-8000-000000000003": "Paused terminal \u00b7 demo"
+      },
+      "stopped": [
+        {
+          "pane": "00000000-0000-4000-8000-000000000003",
+          "kind": "terminal",
+          "label": "Paused terminal \u00b7 demo",
+          "reason": "Its shell is stopped.",
+          "recovery": "Open a new terminal from this pane."
+        }
+      ],
+      "daemon": {
+        "capability": {
+          "proof": {
+            "host_session_id": "fixture-host",
+            "boot_id": "fixture-boot",
+            "host_incarnation": "fixture-daemon"
+          },
+          "token": "fixture-only",
+          "inventory_generation": 1,
+          "live_terminals": 2,
+          "background_subagents": 0,
+          "background_identity": "",
+          "expires_at_unix_ms": 9223372036854775807
+        },
+        "policy": "when_idle",
+        "sessions": [
+          {
+            "id": "00000000-0000-4000-8000-000000000001",
+            "kind": "terminal",
+            "title": "Build terminal \u00b7 demo",
+            "identity": "fixture-pane-1",
+            "disposition": "continues",
+            "reason": "Its live process is compatible with the new build.",
+            "interrupted_subagents": []
+          },
+          {
+            "id": "00000000-0000-4000-8000-000000000002",
+            "kind": "native_chat",
+            "title": "Code review \u00b7 demo",
+            "identity": "fixture-pane-2",
+            "disposition": "blocked",
+            "reason": "Cannot join existing Codex daemon at /run/cagents-fixture/codex.socket: connection refused",
+            "interrupted_subagents": []
+          }
+        ],
+        "blockers": [
+          "Cannot join existing Codex daemon at /run/cagents-fixture/codex.socket: connection refused"
+        ]
+      }
+    }
+  }
+}

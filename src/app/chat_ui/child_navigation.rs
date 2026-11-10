@@ -34,7 +34,10 @@ fn child_key(id: &str) -> [u8; 32] {
 /// first; a question or a failure follows them, and finished work goes last.
 fn rank(child: &chat::Subagent) -> u8 {
     match child.status {
+        // A child waiting on its own background work is alive and asks nothing
+        // of anyone, so it stays with the working ones rather than in attention.
         chat::ToolStatus::Running if !child.waiting => 0,
+        chat::ToolStatus::Waiting => 0,
         chat::ToolStatus::Running => 1,
         chat::ToolStatus::Failed | chat::ToolStatus::Denied => 2,
         _ => 3,
@@ -47,6 +50,7 @@ fn needs_attention(child: &chat::Subagent) -> bool {
 
 fn child_icon(child: &chat::Subagent) -> Icon {
     match child.status {
+        chat::ToolStatus::Waiting => Icon::AgentBackground,
         chat::ToolStatus::Running if child.waiting => Icon::AgentWaiting,
         chat::ToolStatus::Running => Icon::AgentWorking,
         chat::ToolStatus::Failed | chat::ToolStatus::Denied => Icon::Warning,
@@ -981,5 +985,17 @@ mod tests {
         assert_eq!(Runtime::native_child_name(&children[0]), "Agent done");
         children[0].kind = " \t".into();
         assert_eq!(Runtime::native_child_name(&children[0]), "Subagent");
+    }
+
+    #[test]
+    fn a_child_waiting_on_background_work_stays_with_the_working_and_out_of_attention() {
+        use chat::ToolStatus::*;
+        let waiting = child("waiting", Waiting, false);
+        assert_eq!(rank(&waiting), rank(&child("working", Running, false)));
+        assert!(!needs_attention(&waiting));
+        // Its own glyph: the one for waiting on the reader would ask for them.
+        assert_eq!(child_icon(&waiting), Icon::AgentBackground);
+        assert!(needs_attention(&child("asking", Running, true)));
+        assert!(needs_attention(&child("failed", Failed, false)));
     }
 }

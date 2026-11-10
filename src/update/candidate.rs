@@ -19,6 +19,11 @@ impl Staged {
                     .is_ok()
                 {
                     Ok(impact::Preview {
+                        from_version: String::new(),
+                        windows: 0,
+                        stopped: Vec::new(),
+                        stopped_windows: Vec::new(),
+                        labels: Default::default(),
                         candidate: self.identity.clone(),
                         replaces_daemon: false,
                         daemon: None,

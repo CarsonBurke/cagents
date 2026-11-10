@@ -1533,20 +1533,57 @@ workloads are described in [Performance](performance.md).
 Use the shared, on-demand status cache instead of a watcher per agent:
 
 ```sh
-cagents gh pr-status 1234 -R CarsonBurke/cagents --json
+scripts/gh-pr-status 1234 -R CarsonBurke/cagents --json
 ```
 
-The command requires an explicit repository, needs no daemon, and reads PR,
-head, CI, review and merge state in one GraphQL request. Local callers with
-the same gh credential context share one refresh per PR every 120 seconds;
+The repository entry point works even when the installed CLI has no `gh`
+subcommand. It pins the local `origin/main` commit without fetching, then one
+background builder uses `scripts/cargo-gate` to build the CLI in a private
+snapshot under `.worktrees/`. The executable and build records live under
+`$(git rev-parse --git-common-dir)/gh-pr-status/`; no installed executable or
+shell PATH changes. GitHub/status, CLI dispatch, process/locking and
+Cargo/toolchain input changes invalidate the executable; unrelated app and documentation commits do
+not. A failed build is retried on demand after ten minutes, rather than once
+per caller. Its `build.log` records failures. `--source-ref HEAD` qualifies a
+candidate deliberately; normal agent reads use the default `origin/main`.
+
+While the build is queued, failed or otherwise unavailable, the command makes
+at most one REST `GET /repos/OWNER/REPO/pulls/NUMBER`. It uses the same private
+credential-scoped cache, per-PR flight and host cooldowns as the built CLI.
+The fallback reports PR/head/merge state; **CI and review decision are unknown**
+(`checks_state=null`, `checks_complete=false`, `reviewDecision=null`), with an
+explicit `limitations` entry. It never adds checks/review requests. Failed
+reads are cached too; actual `Retry-After` and primary reset deadlines prevent
+further reads without delaying unrelated API resources. REST primary deadlines
+remain separate from GraphQL deadlines, including when the cached CLI takes
+over. Budget-lock contention returns promptly with a stale/error result; if a
+response's host-wide cooldown could not be saved, its PR-specific deadline is
+retained and the error reports that limitation. A running CLI's GitHub
+error does not trigger REST fallback. Concurrent callers of an in-progress
+fallback return a stale/error result instead of sending another request.
+
+Once the cached CLI is available, it requires an explicit repository, needs
+no daemon, and reads PR, head, CI, review and merge state in one GraphQL
+request. Local callers with the same gh credential context share one refresh
+per PR every 120 seconds;
 when nobody reads it, it makes no requests. Check `data.stale`, `data.error`,
 `data.retry_at` and `data.snapshot.pull_request.headRefOid` before acting.
 A failed refresh exits nonzero and labels any retained snapshot stale.
 Exit zero confirms a readable snapshot; inspect `checks_state` to decide
 whether CI passed, failed or is pending.
-The aggregate check state covers all contexts; `checks_complete=false` means
-the displayed context list stops at 100. No reported checks means unknown,
+For GraphQL snapshots, the aggregate check state covers all contexts;
+`checks_complete=false` means the displayed context list stops at 100.
+REST bootstrap snapshots have no check aggregate. No reported checks means unknown,
 not passing. Enterprise repositories also accept `--hostname HOST`.
+
+To clear bootstrap artifacts, first ensure no status command or builder is
+running. Remove only inactive `gh-pr-status-*` worktrees with `git worktree
+remove`, then remove the `gh-pr-status/` directory under the Git common dir.
+This leaves the user-state status cache intact. Offline bootstrap/concurrency
+coverage runs with `/usr/bin/python3 -B tests/gh-pr-status.py -v` and builds no
+Rust or live GitHub requests. To include interoperability checks with an
+already gated CLI, set `GH_PR_STATUS_TEST_CLI=/absolute/path/to/cagents` for
+that test command; it still uses isolated state and fake GitHub responses.
 
 The app and Ceditor share a resumable review-request scan per repository and
 credential context. A settled scan waits 60 seconds, and continuation pages
@@ -1648,6 +1685,12 @@ cropped image. This changes the capture viewport, not application layouts.
 app, from a shell where the desktop session or `DISPLAY` is unavailable, such as
 plain SSH. It runs headless: KWin's virtual backend hosts a nested niri session,
 driven by `niri-harness`, running `scripts/run-development --browserless`.
+Add `start SIDE --instance NAME` to opt a new task into a named instance.
+It stays in the existing private compositor through the runner's `--in-session`
+mode; CLI and cleanup use the same name. The task keeps that selection across
+starts and refuses a different name. This needs a source runner supporting
+`--in-session`; default unnamed tasks retain compatibility with older runners
+and saved seeds.
 Each task keeps everything in one directory outside Git ancestry. Avoid `/tmp`,
 `/var/tmp` and `~/.cache`, where Codex sandboxes can leave an empty `.git` that
 fixtures refuse.
