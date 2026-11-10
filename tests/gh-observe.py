@@ -78,6 +78,20 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(observe.safe_endpoint("https://api.internal:8443/graphql")["host"], "api.internal:8443")
         self.assertEqual(observe.safe_endpoint("https://api.github.com/graphql")["host"], "github.com")
 
+    def test_endpoint_without_coordinator_discards_credentials(self):
+        with patch.object(observe, "coordinator", return_value=None):
+            cases = [
+                ("https://user:secret@ghe.example:8443/api/graphql?token=secret", "ghe.example:8443"),
+                ("https://user:secret@api.github.com:443/graphql", "github.com"),
+                ("https://user:secret@[::1]:8443/graphql", "[::1]:8443"),
+            ]
+            for target, authority in cases:
+                with self.subTest(target=target):
+                    endpoint = observe.safe_endpoint(target)
+                    self.assertEqual(endpoint["host"], authority)
+                    self.assertNotIn("secret", json.dumps(endpoint))
+                    self.assertNotIn("user", json.dumps(endpoint))
+
     def test_anonymous_query_groups_argument_values(self):
         first = observe.operation('{repository(owner:"one", name:"two"){pullRequests(first:100){totalCount}}}')
         second = observe.operation('{ repository(owner:"three", name:"four") { pullRequests(first:20) {totalCount} } }')

@@ -113,7 +113,23 @@ def safe_endpoint(target):
     if not re.fullmatch(r"/[A-Za-z0-9_./%~:@+-]*", path):
         path = "<redacted>"
     guard = coordinator()
-    authority = guard.normalize_authority(target) if guard is not None else url.netloc
+    if guard is not None:
+        authority = guard.normalize_authority(target)
+    else:
+        # Observation also works without the optional coordinator. Never retain
+        # URL userinfo in that mode; keep the same service authority grouping.
+        authority = (url.hostname or "").lower()
+        if authority == "api.github.com":
+            authority = "github.com"
+        if ":" in authority:
+            authority = "[" + authority + "]"
+        try:
+            port = url.port
+        except ValueError:
+            port = None
+        defaults = {80, 443} if url.scheme == "http" else {443}
+        if port is not None and port not in defaults:
+            authority += f":{port}"
     return {"host": authority, "path": path[:512]}
 
 
