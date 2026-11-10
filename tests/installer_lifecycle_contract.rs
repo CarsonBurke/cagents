@@ -252,34 +252,10 @@ fn coordinated_release_fixture(
     );
 }
 
-fn coordinated_release_mode(
-    compatible: bool,
-    terminals: usize,
-    publish_failure: Option<&str>,
-    restart: Option<&str>,
-    download: Option<&str>,
-    coordinator: &str,
-    stage_only: bool,
-) {
-    let home = tempfile::tempdir().unwrap();
-    let coordinator_bin = home.path().join("coordinator-bin");
-    fs::create_dir(&coordinator_bin).unwrap();
-    let real_cli = coordinator_bin.join("cagents");
-    fs::copy(env!("CARGO_BIN_EXE_cagents"), &real_cli).unwrap();
-    install_source_inspector_fixture(&coordinator_bin.join("cagentsd"));
-    let data = home.path().join("data with spaces");
-    let prefix = data.join("cagents-install");
-    let old_bin = prefix.join("versions/old/bin");
-    fs::create_dir_all(&old_bin).unwrap();
-    fs::write(
-        prefix.join(".cagents-install-root"),
-        "cagents install root\n",
-    )
-    .unwrap();
-    if coordinator != "initial-independent" {
-        std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
-    }
-    let status = r#"#!/bin/sh
+// This fixture models a release before store conversion support. Unsupported
+// capability help is inert; actual unsupported operations remain unsafe.
+fn lifecycle_status_fixture() -> &'static str {
+    r#"#!/bin/sh
 CLI=old
 case "$*" in
   'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
@@ -319,6 +295,10 @@ case "$*" in
     else
       printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture"}}\n' "$running"
     fi
+    ;;
+  'daemon store-schema --help'|'daemon downgrade-store --help')
+    [ "$#" -eq 3 ] || exit 98
+    exit 64
     ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
@@ -376,7 +356,76 @@ case "$*" in
     ;;
   *) printf '%s\n' UNSAFE >> "$FIXTURE_ACTIONS"; exit 99 ;;
 esac
-"#;
+"#
+}
+
+#[test]
+fn lifecycle_fixture_declines_only_inert_store_capability_probes() {
+    let root = tempfile::tempdir().unwrap();
+    let cli = root.path().join("cagents");
+    let actions = root.path().join("actions");
+    for version in ["old", "new"] {
+        executable(
+            &cli,
+            &lifecycle_status_fixture().replace("CLI=old", &format!("CLI={version}")),
+        );
+        for subcommand in ["store-schema", "downgrade-store"] {
+            let output = Command::new(&cli)
+                .args(["daemon", subcommand, "--help"])
+                .env("FIXTURE_ACTIONS", &actions)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(64), "{output:?}");
+            assert!(output.stdout.is_empty());
+            assert!(output.stderr.is_empty());
+            assert!(!actions.exists());
+        }
+        for args in [
+            vec!["daemon", "store-schema"],
+            vec!["daemon", "downgrade-store", "22"],
+            vec!["daemon", "store-schema", "--help", "unexpected"],
+            vec!["daemon", "unknown", "--help"],
+        ] {
+            let output = Command::new(&cli)
+                .args(&args)
+                .env("FIXTURE_ACTIONS", &actions)
+                .output()
+                .unwrap();
+            assert_eq!(output.status.code(), Some(99), "{args:?}: {output:?}");
+            assert_eq!(fs::read_to_string(&actions).unwrap(), "UNSAFE\n");
+            fs::remove_file(&actions).unwrap();
+        }
+    }
+}
+
+fn coordinated_release_mode(
+    compatible: bool,
+    terminals: usize,
+    publish_failure: Option<&str>,
+    restart: Option<&str>,
+    download: Option<&str>,
+    coordinator: &str,
+    stage_only: bool,
+) {
+    let home = tempfile::tempdir().unwrap();
+    let coordinator_bin = home.path().join("coordinator-bin");
+    fs::create_dir(&coordinator_bin).unwrap();
+    let real_cli = coordinator_bin.join("cagents");
+    fs::copy(env!("CARGO_BIN_EXE_cagents"), &real_cli).unwrap();
+    install_source_inspector_fixture(&coordinator_bin.join("cagentsd"));
+    let data = home.path().join("data with spaces");
+    let prefix = data.join("cagents-install");
+    let old_bin = prefix.join("versions/old/bin");
+    fs::create_dir_all(&old_bin).unwrap();
+    fs::write(
+        prefix.join(".cagents-install-root"),
+        "cagents install root\n",
+    )
+    .unwrap();
+    if coordinator != "initial-independent" {
+        std::os::unix::fs::symlink("versions/old", prefix.join("current")).unwrap();
+    }
+    let status = lifecycle_status_fixture();
     executable(&old_bin.join("cagents"), status);
     let archive_root = home.path().join("archive");
     let candidate = archive_root.join("cagents-9.9.9");
