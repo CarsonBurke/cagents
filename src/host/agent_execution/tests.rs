@@ -2601,7 +2601,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     let program = root.join("bin/codex");
     std::fs::write(
         &program,
-        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
+        "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$@\" > \"$HOME/../codex-arguments\"\nprintf '%s\\n' \"$$\" > \"$HOME/../codex-pid\"\nprintf 'launch\\n' >> \"$HOME/../codex-launches\"\nexec /bin/sleep 60\n",
     )
     .unwrap();
     std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -2733,7 +2733,12 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
             .collect::<Vec<_>>()
             .into_iter()
             .map(|handle| {
-                let process = handle.provider_process().expect("owned Codex server");
+                let pid = std::fs::read_to_string(root.join("codex-pid"))
+                    .unwrap()
+                    .trim()
+                    .parse()
+                    .unwrap();
+                let process = crate::daemon::holder_registry::Process::read(pid).unwrap();
                 assert!(
                     process.is_current(),
                     "the fixture server must still be live"
