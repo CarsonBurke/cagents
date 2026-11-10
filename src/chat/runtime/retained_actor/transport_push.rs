@@ -9,13 +9,24 @@ impl Watcher {
     pub(super) fn subscribe(&self) -> Result<UnixStream, String> {
         let (writer, reader) = UnixStream::pair().map_err(|e| e.to_string())?;
         writer.set_nonblocking(true).map_err(|e| e.to_string())?;
-        *self.0.lock().unwrap_or_else(|p| p.into_inner()) = Some(writer);
+        if let Some(previous) = self
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .replace(writer)
+        {
+            // A concurrent child can inherit the descriptor until exec.
+            // Shutdown retires the socket even while that copy stays open.
+            let _ = previous.shutdown(std::net::Shutdown::Both);
+        }
         // Registration cannot miss a publication between attach and watch.
         self.notify();
         Ok(reader)
     }
     pub(super) fn clear(&self) {
-        self.0.lock().unwrap_or_else(|p| p.into_inner()).take();
+        if let Some(previous) = self.0.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            let _ = previous.shutdown(std::net::Shutdown::Both);
+        }
     }
     pub(super) fn notify(&self) {
         if let Some(writer) = self.0.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
