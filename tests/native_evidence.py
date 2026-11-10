@@ -66,7 +66,7 @@ STUBS = {
                 observe)
                     [ ! -e "$STUB_LOG/observe-error" ] || exit 1
                     if [ -e "$STUB_LOG/observe-malformed" ]; then printf 'invalid'; exit 0; fi
-                    if [ -e "$STUB_LOG/ui-absent" ]; then printf '{"window":null}\\n'; exit 0; fi
+                    if [ -e "$STUB_LOG/ui-absent" ]; then printf 'nested session has no windows\\n' >&2; exit 1; fi
                     if [ -e "$STUB_LOG/cropped" ]; then
                         printf '{"window":{"size":[900,600]},"output":{"logical":{"width":900,"height":561}},"text":"'
                     else
@@ -100,6 +100,28 @@ STUBS = {
         if [ -n "${shot:-}" ]; then
             mkdir -p "$STUB_TASK/niri/shots"
             printf png > "$STUB_TASK/niri/shots/$shot.png"
+        fi
+    """,
+    "niri": """
+        #!/bin/bash
+        printf '%s\\n' "$*" >> "$STUB_LOG/niri"
+        [ "${NESTED_MARKER:-}" = nested ] || exit 91
+        [ "$*" = 'msg --json windows' ] || exit 92
+        [ ! -e "$STUB_LOG/niri-error" ] || exit 1
+        if [ -e "$STUB_LOG/niri-malformed" ]; then printf invalid; exit 0; fi
+        if [ -e "$STUB_LOG/niri-object" ]; then printf '{"window":null}'; exit 0; fi
+        if [ -e "$STUB_LOG/niri-scalar" ]; then printf false; exit 0; fi
+        if [ -e "$STUB_LOG/niri-missing-app" ]; then printf '[{}]'; exit 0; fi
+        if [ -e "$STUB_LOG/niri-scalar-record" ]; then printf '[true]'; exit 0; fi
+        if [ -e "$STUB_LOG/niri-invalid-app" ]; then printf '[{"app_id":17}]'; exit 0; fi
+        if [ -e "$STUB_LOG/ui-absent" ]; then
+            if [ -e "$STUB_LOG/other-window" ]; then
+                printf '[{"id":2,"app_id":"example.Other"}]'
+            else
+                printf '[]'
+            fi
+        else
+            printf '[{"id":1,"app_id":"dev.cagents.Cagents.Development"}]'
         fi
     """,
     "magick": """
