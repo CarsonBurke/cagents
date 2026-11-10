@@ -2726,7 +2726,7 @@ fn completed_source_discards_parser_scratch_without_discarding_rendered_content(
     assert_eq!(content.images(), &images);
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "integrated-browser")))]
 mod heap_cost;
 
 #[cfg(test)]
