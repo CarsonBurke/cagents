@@ -1079,6 +1079,11 @@ impl Cagents {
         }
     }
 
+    #[cfg(test)]
+    pub(super) fn remember_channel_name_for_test(&mut self, id: ChannelId, title: String) {
+        self.remember_channel_name(id, title, crate::model::ChannelTitleSource::Provider);
+    }
+
     /// Gives a channel back the automatic name it had once the registry holds
     /// the pane that returned to it, which is when it forgets the name. Any
     /// name it holds by then, the conversation's own or one typed, wins.

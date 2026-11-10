@@ -899,10 +899,7 @@ impl Cagents {
         match self.presentation_scope_for_update(&update) {
             Ok(scope) => {
                 tracing::trace!(target: "cagents::workspace_projection", selected = true, "Projecting shared presentation");
-                return (
-                    self.apply_presentation_model_update(update, scope),
-                    Projection::Chrome,
-                );
+                return self.apply_presentation_model_update(update, scope);
             }
             Err(reason) => {
                 tracing::trace!(target: "cagents::workspace_projection", selected = false, reason, "Projecting shared model")
@@ -932,6 +929,11 @@ impl Cagents {
         update: &ModelUpdate,
     ) -> Result<crate::workspace_model::views::Scope, &'static str> {
         use crate::workspace_model::views::Change;
+        // The active-strip projector can commit this draft through
+        // apply_viewport before returning to the common projection tail.
+        if self.settings_blur_pending() {
+            return Err("a settings draft is leaving focus");
+        }
         let (edit, effects, changes, pending, identity) = match update {
             ModelUpdate::Committed {
                 receipt,
@@ -1050,7 +1052,7 @@ impl Cagents {
         &mut self,
         update: ModelUpdate,
         scope: crate::workspace_model::views::Scope,
-    ) -> Task<Message> {
+    ) -> (Task<Message>, Projection) {
         let (sequence, edit, changes, operation) = match update {
             ModelUpdate::Committed {
                 receipt,
@@ -1079,8 +1081,15 @@ impl Cagents {
             } => (sequence, edit, changes, None),
             _ => unreachable!("only a proven scoped edge selects presentation projection"),
         };
+        let active_primary = self.durable.active_channel.and_then(|id| {
+            self.durable
+                .channels
+                .iter()
+                .find(|channel| channel.id == id)
+                .map(|channel| (id, self.channel_primary_chat(channel)))
+        });
         let Some(installed) = self.install_changed_edge(sequence, &edit, changes) else {
-            return Task::none();
+            return (Task::none(), Projection::Unchanged);
         };
         if let Some(operation) = operation {
             self.acknowledge_view_edit(scope.clone(), Some(operation));
@@ -1092,10 +1101,30 @@ impl Cagents {
         // inspect canonical open views and must run even for presentation-only
         // changes, just as they do after a complete reconciliation.
         let mut phase = WorkspaceProjectionTiming::new(true);
+        let naming_source = Arc::downgrade(&self.durable);
         self.refresh_channel_title_suggestions();
         self.restore_channel_names();
         phase.mark("selected_naming");
-        Task::batch([installed, projected])
+        let names_unchanged = naming_source.as_ptr() == Arc::as_ptr(&self.durable);
+        // Saving snapshots the active strip, even for an inactive scope.
+        // Its normalized order can change which open chat inherits a manual
+        // channel title. Closed-member pruning cannot change that primary.
+        let active_primary_unchanged = active_primary
+            == self.durable.active_channel.and_then(|id| {
+                self.durable
+                    .channels
+                    .iter()
+                    .find(|channel| channel.id == id)
+                    .map(|channel| (id, self.channel_primary_chat(channel)))
+            });
+        let projection = if names_unchanged && active_primary_unchanged {
+            Projection::ScopedChrome(self.presentation_chrome_cards(&scope))
+        } else {
+            // A retained name can belong to another channel; its cards need
+            // the same chrome refresh as the complete projection.
+            Projection::Chrome
+        };
+        (Task::batch([installed, projected]), projection)
     }
 
     /// Only stale complete snapshots skip projection. Even an equal model can

@@ -1106,13 +1106,15 @@ struct TerminalWakeup {
 /// terminals wake about once per frame each, so a wake that changed nothing a
 /// projection reads must not pay for every card's sidebar, chrome and
 /// protection bookkeeping.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Projection {
     /// Nothing any projection reads changed: grid output, repaint ticks.
     Unchanged,
     /// Only a runtime-reported card title changed. Card chrome and the window
     /// title are the only projections that read it.
     Chrome,
+    /// Stable shared presentation, including retained local scope members.
+    ScopedChrome(Vec<CardId>),
     /// Anything else, including every user action.
     Full,
 }
@@ -8400,64 +8402,13 @@ impl Cagents {
         }
         let mut presentation_updates = Vec::new();
         for card in &self.durable.cards {
-            let type_label = card_kind_labels(Some(&card.kind)).type_label;
-            let (title, file_caption) = self.repository_chrome_with(card, || {
-                self.card_display_title_with_chat_title(card, || {
-                    self.chat_channel_title(card, titled_channels.get(&card.id).copied())
-                })
-            });
-            if matches!(card.kind, CardKind::Browser(_))
-                && self
-                    .workspace
-                    .card(card.id)
-                    .is_some_and(|pane| pane.accessible_name != title)
-            {
-                presentation_updates.push((card.id, title.to_string()));
-            }
-            let caption = match &card.kind {
-                CardKind::Terminal(_)
-                    if self.terminal_working_directories.contains_key(&card.id) =>
-                {
-                    display_path(&self.terminal_working_directories[&card.id])
-                }
-                CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
-                    Cow::Owned(format!(
-                        "Relaunched after upgrade · {}",
-                        card_kind_caption(&card.kind)
-                    ))
-                }
-                _ => file_caption.unwrap_or_else(|| card_kind_caption(&card.kind)),
-            };
-            if self
-                .card_chrome
-                .get(&card.id)
-                .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
-            {
-                let mut chrome = CardChrome::new(card.id, type_label, &title, &caption);
-                if matches!(card.kind, CardKind::Terminal(_))
-                    && !self.chrome_ui.user_titles.contains_key(&card.id)
-                    && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
-                {
-                    let suffix = format!(" ({ordinal})");
-                    let base = title.strip_suffix(&suffix).unwrap_or(&title);
-                    chrome.compact_title = Some(format!("{ordinal} {base}"));
-                    chrome.terminal_ordinal_suffix = Some(suffix);
-                    if let CardKind::Terminal(session) = &card.kind {
-                        let reported = self.card_display_title(card);
-                        let directory = self
-                            .terminal_working_directories
-                            .get(&card.id)
-                            .unwrap_or(&session.launch.working_directory);
-                        chrome.terminal_title_source = Some(TerminalTitleSource {
-                            reported: reported.to_owned(),
-                            directory: directory.clone(),
-                            program: session.launch.program.clone(),
-                            ordinal: *ordinal,
-                            fallback: TerminalTitleSource::fallback(reported),
-                        });
-                    }
-                }
+            let (chrome, title) =
+                self.project_card_chrome(card, titled_channels.get(&card.id).copied());
+            if let Some(chrome) = chrome {
                 self.card_chrome.insert(card.id, chrome);
+            }
+            if let Some(title) = title {
+                presentation_updates.push((card.id, title));
             }
         }
         for (id, title) in presentation_updates {
@@ -8470,6 +8421,128 @@ impl Cagents {
                 .terminal_ordinals
                 .retain(|id, _| self.card_indices.contains_key(id));
         }
+        self.sync_window_title()
+    }
+
+    /// Both projection paths share title precedence, caching, accessibility and
+    /// terminal presentation. Only the set of cards to visit differs.
+    fn project_card_chrome(
+        &self,
+        card: &CardState,
+        channel: Option<&crate::model::ProjectChannel>,
+    ) -> (Option<CardChrome>, Option<String>) {
+        #[cfg(test)]
+        self.shared_views
+            .chrome_cards_visited
+            .set(self.shared_views.chrome_cards_visited.get() + 1);
+        let type_label = card_kind_labels(Some(&card.kind)).type_label;
+        let (title, file_caption) = self.repository_chrome_with(card, || {
+            self.card_display_title_with_chat_title(card, || self.chat_channel_title(card, channel))
+        });
+        let presentation = if matches!(card.kind, CardKind::Browser(_))
+            && self
+                .workspace
+                .card(card.id)
+                .is_some_and(|pane| pane.accessible_name != title)
+        {
+            Some(title.to_string())
+        } else {
+            None
+        };
+        let caption = match &card.kind {
+            CardKind::Terminal(_) if self.terminal_working_directories.contains_key(&card.id) => {
+                display_path(&self.terminal_working_directories[&card.id])
+            }
+            CardKind::Terminal(session) if self.relaunched_terminals.contains(&session.id) => {
+                Cow::Owned(format!(
+                    "Relaunched after upgrade · {}",
+                    card_kind_caption(&card.kind)
+                ))
+            }
+            _ => file_caption.unwrap_or_else(|| card_kind_caption(&card.kind)),
+        };
+        let chrome = if self
+            .card_chrome
+            .get(&card.id)
+            .is_none_or(|chrome| !chrome.describes(type_label, &title, &caption))
+        {
+            let mut chrome = CardChrome::new(card.id, type_label, &title, &caption);
+            if matches!(card.kind, CardKind::Terminal(_))
+                && !self.chrome_ui.user_titles.contains_key(&card.id)
+                && let Some(ordinal) = self.chrome_ui.terminal_ordinals.get(&card.id)
+            {
+                let suffix = format!(" ({ordinal})");
+                let base = title.strip_suffix(&suffix).unwrap_or(&title);
+                chrome.compact_title = Some(format!("{ordinal} {base}"));
+                chrome.terminal_ordinal_suffix = Some(suffix);
+                if let CardKind::Terminal(session) = &card.kind {
+                    let reported = self.card_display_title(card);
+                    let directory = self
+                        .terminal_working_directories
+                        .get(&card.id)
+                        .unwrap_or(&session.launch.working_directory);
+                    chrome.terminal_title_source = Some(TerminalTitleSource {
+                        reported: reported.to_owned(),
+                        directory: directory.clone(),
+                        program: session.launch.program.clone(),
+                        ordinal: *ordinal,
+                        fallback: TerminalTitleSource::fallback(reported),
+                    });
+                }
+            }
+            Some(chrome)
+        } else {
+            None
+        };
+        (chrome, presentation)
+    }
+
+    fn install_card_chrome(
+        &mut self,
+        updates: Vec<(CardId, (Option<CardChrome>, Option<String>))>,
+    ) {
+        for (id, (chrome, title)) in updates {
+            if let Some(chrome) = chrome {
+                self.card_chrome.insert(id, chrome);
+            }
+            if let Some(title) = title {
+                let _ = self.workspace.rename_card(id, title);
+            }
+        }
+    }
+
+    fn sync_scoped_chrome(&mut self, cards: &[CardId]) -> Task<Message> {
+        // Ordinals require a global counter reconciliation; missing chrome can
+        // also mean this is the first projection after restoration.
+        if cards.iter().any(|id| {
+            self.card_state(*id).is_none_or(|card| {
+                !self.card_chrome.contains_key(id)
+                    || (matches!(card.kind, CardKind::Terminal(_))
+                        && !self.chrome_ui.terminal_ordinals.contains_key(id))
+            })
+        }) {
+            return self.sync_chrome();
+        }
+        #[cfg(test)]
+        terminal_output_tests::record_chrome();
+        self.terminal_working_directories
+            .retain(|card, _| self.cards.contains_key(card));
+        self.terminal_find
+            .retain(|card, _| self.cards.contains_key(card));
+        self.index_cards();
+        let updates = cards
+            .iter()
+            .filter_map(|id| {
+                let card = self.card_state(*id)?;
+                let channel = self
+                    .durable
+                    .channels
+                    .iter()
+                    .find(|channel| !channel.title.is_empty() && channel.cards.contains(id));
+                Some((*id, self.project_card_chrome(card, channel)))
+            })
+            .collect::<Vec<_>>();
+        self.install_card_chrome(updates);
         self.sync_window_title()
     }
 
@@ -14320,6 +14393,12 @@ impl Cagents {
         self.apply_setting_input(field, value)
     }
 
+    fn settings_blur_pending(&self) -> bool {
+        self.settings_pane_focused
+            && !self.settings_card_focused()
+            && !self.settings_pending.is_empty()
+    }
+
     /// Commits the pane's drafts when focus leaves it, so an edit is never
     /// left pending behind a pane the user has moved on from.
     fn flush_settings_on_blur(&mut self) -> Task<Message> {
@@ -18748,12 +18827,25 @@ impl Application for Cagents {
         // and it is the one place that can bound the history.
         // Before the notices drain, so one raised by a committed draft is
         // recorded with this update rather than the next.
+        // Scoped proof was established during dispatch. Settings commit and
+        // close processing can invalidate it before chrome is projected.
+        if matches!(projection, Projection::ScopedChrome(_))
+            && (self.settings_blur_pending()
+                || !self.queued_card_closes.is_empty() || self.workspace.pending_close().is_some())
+        {
+            projection = Projection::Full;
+        }
+        let scoped_source = matches!(projection, Projection::ScopedChrome(_))
+            .then(|| Arc::downgrade(&self.durable));
         self.reconcile_terminal_review_owner();
         let task = Task::batch([
             task,
             self.flush_settings_on_blur(),
             self.settle_close_queue(),
         ]);
+        if scoped_source.is_some_and(|source| source.as_ptr() != Arc::as_ptr(&self.durable)) {
+            projection = Projection::Full;
+        }
         if projection == Projection::Full {
             self.sync_worktree_protections();
         }
@@ -18781,12 +18873,15 @@ impl Application for Cagents {
             }
             // A reported title reaches the tabs and window title; nothing in
             // the sidebar, worktree ownership or protections reads it.
-            Projection::Chrome => {
+            Projection::Chrome | Projection::ScopedChrome(_) => {
                 #[cfg(test)]
                 if model_update { self.shared_views.chrome_tail_count += 1; }
                 let notices = self.reconcile_notice_popup();
                 let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
-                let chrome = self.sync_chrome();
+                let chrome = match &projection {
+                    Projection::ScopedChrome(cards) => self.sync_scoped_chrome(cards),
+                    _ => self.sync_chrome(),
+                };
                 phase.mark("selected_chrome");
                 return Task::batch([
                     task,

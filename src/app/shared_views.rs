@@ -166,6 +166,16 @@ pub(super) struct State {
     pub(super) structural_tail_count: usize,
     #[cfg(test)]
     pub(super) chrome_tail_count: usize,
+    #[cfg(test)]
+    pub(super) publisher_index_entries: usize,
+    #[cfg(test)]
+    publisher_scope_comparisons: usize,
+    #[cfg(test)]
+    pub(super) chrome_cards_visited: std::cell::Cell<usize>,
+    #[cfg(test)]
+    order_rewrites: usize,
+    #[cfg(test)]
+    held_descriptor_clones: std::cell::Cell<usize>,
     /// The daemon answered this window without a shared model to give.
     pub(super) registry_unavailable: bool,
     baseline: HashMap<Scope, Vec<Pane>>,
@@ -608,12 +618,15 @@ impl Cagents {
                         && !self.terminal_retry_pending(card.id)
                         && !self.pane_close_owned(card.id) =>
                 {
-                    Some((
-                        card.id,
-                        self.exposure(card.id),
-                        matches!(self.residency(card.id), Residency::Hydrating { .. }),
-                        session.clone(),
-                    ))
+                    let opening = matches!(self.residency(card.id), Residency::Hydrating { .. });
+                    if !opening && self.listed_in_registry(card.id) {
+                        return None;
+                    }
+                    #[cfg(test)]
+                    self.shared_views
+                        .held_descriptor_clones
+                        .set(self.shared_views.held_descriptor_clones.get() + 1);
+                    Some((card.id, self.exposure(card.id), opening, session.clone()))
                 }
                 _ => None,
             })
@@ -1619,10 +1632,14 @@ impl Cagents {
         {
             return;
         }
-        self.publish_projected_view_changes(self.local_views());
+        self.publish_projected_view_changes(self.local_views(), ViewProjection::All);
     }
 
-    fn publish_projected_view_changes(&mut self, projected: LocalViews) {
+    fn publish_projected_view_changes(
+        &mut self,
+        projected: LocalViews,
+        projection: ViewProjection<'_>,
+    ) {
         if self.shared_views.applying
             || self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
         {
@@ -1633,18 +1650,57 @@ impl Cagents {
             cards,
             mut panes,
         } = projected;
-        // Publishing only queues edits, so the model's views stay put: find
-        // each scope's first view by lookup rather than a scan per scope.
-        let mut view_indices = HashMap::new();
-        for (index, view) in self.workspace_model.views.iter().enumerate() {
-            view_indices.entry(view.scope.clone()).or_insert(index);
-        }
+        // Ownership is global even when only one destination is published: a
+        // transfer's source can be outside the projected scopes.
         let previous_owners = self
             .shared_views
             .baseline
             .iter()
             .flat_map(|(scope, panes)| panes.iter().map(|pane| (pane.id, scope.clone())))
             .collect::<HashMap<_, _>>();
+        let needed = match projection {
+            ViewProjection::All => None,
+            ViewProjection::Selected(_) => {
+                let mut needed = scopes.iter().collect::<HashSet<_>>();
+                for pane in panes.values().flatten() {
+                    if let Some(source) = previous_owners.get(&pane.id) {
+                        needed.insert(source);
+                    }
+                }
+                Some(needed)
+            }
+        };
+        // The selected path queries only required scopes. Equality lookup
+        // preserves first-view semantics without hashing historical paths.
+        let mut view_indices = HashMap::new();
+        match needed {
+            None => {
+                for (index, view) in self.workspace_model.views.iter().enumerate() {
+                    #[cfg(test)]
+                    {
+                        self.shared_views.publisher_index_entries += 1;
+                    }
+                    view_indices.entry(view.scope.clone()).or_insert(index);
+                }
+            }
+            Some(needed) => {
+                for scope in needed {
+                    if let Some(index) = self.workspace_model.views.iter().position(|view| {
+                        #[cfg(test)]
+                        {
+                            self.shared_views.publisher_scope_comparisons += 1;
+                        }
+                        &view.scope == scope
+                    }) {
+                        #[cfg(test)]
+                        {
+                            self.shared_views.publisher_index_entries += 1;
+                        }
+                        view_indices.insert(scope.clone(), index);
+                    }
+                }
+            }
+        }
         for (destination, desired) in &panes {
             for (index, pane) in desired.iter().enumerate() {
                 if let Some(source) = previous_owners
@@ -2216,7 +2272,7 @@ impl Cagents {
                     projected.panes.get(&scope).cloned().unwrap_or_default(),
                 );
             }
-            app.publish_projected_view_changes(projected);
+            app.publish_projected_view_changes(projected, projection);
         });
         phase.mark("selected_save");
         if let Some(path) = self.shared_views.deferred_default.take() {
@@ -2560,9 +2616,10 @@ impl Cagents {
             if accepted_default {
                 let automatic = self.shared_views.defaults.remove(&pane.id);
                 self.shared_views.default_requests.remove(&pane.id);
-                let explicit = Arc::make_mut(&mut self.durable)
-                    .pending_terminal_creations
-                    .remove(&pane.id);
+                let explicit = self.durable.pending_terminal_creations.contains(&pane.id)
+                    && Arc::make_mut(&mut self.durable)
+                        .pending_terminal_creations
+                        .remove(&pane.id);
                 if automatic.is_some() || explicit {
                     if let CardKind::Terminal(session) = &pane.kind {
                         self.shared_views.attached.insert(pane.id);
@@ -2690,7 +2747,10 @@ impl Cagents {
                     // A reported title waiting for its save is newer than the
                     // shared one, which it replaces when that save publishes it.
                     let reported = self.reported_title_save.cards.contains(&pane.id);
-                    if let Some(current) = self.card_state_mut(pane.id) {
+                    let changed = (!reported && card.title != pane.title)
+                        || card.width_fraction != pane.width_fraction
+                        || (!resuming && card.kind != kind);
+                    if changed && let Some(current) = self.card_state_mut(pane.id) {
                         if !reported {
                             current.title = pane.title.clone();
                         }
@@ -2749,13 +2809,15 @@ impl Cagents {
                     tasks.push(self.attach_shared_pane(pane));
                 }
             }
-            let durable = Arc::make_mut(&mut self.durable);
-            match &pane.scope {
-                Some(scope) => {
-                    durable.card_scopes.insert(pane.id, scope.clone());
-                }
-                None => {
-                    durable.card_scopes.remove(&pane.id);
+            if self.durable.card_scopes.get(&pane.id) != pane.scope.as_ref() {
+                let durable = Arc::make_mut(&mut self.durable);
+                match &pane.scope {
+                    Some(scope) => {
+                        durable.card_scopes.insert(pane.id, scope.clone());
+                    }
+                    None => {
+                        durable.card_scopes.remove(&pane.id);
+                    }
                 }
             }
         }
@@ -2776,14 +2838,45 @@ impl Cagents {
             .chain(retained)
             .collect::<Vec<_>>();
         if let Some(index) = index {
-            let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
-            channel.cards = visible.clone();
-            if !channel
+            let channel = &self.durable.channels[index];
+            let focused = channel
                 .focused
-                .is_some_and(|id| channel.cards.contains(&id))
-            {
-                channel.focused = channel.cards.first().copied();
+                .filter(|id| visible.contains(id))
+                .or_else(|| visible.first().copied());
+            if channel.cards != visible || channel.focused != focused {
+                let channel = &mut Arc::make_mut(&mut self.durable).channels[index];
+                channel.cards = visible.clone();
+                channel.focused = focused;
             }
+        }
+        self.normalize_projected_card_order(&visible);
+        if active {
+            tasks.push(self.project_shared_strip(&view.panes, &visible));
+        }
+        if !self.shared_views.applying {
+            self.persist();
+        }
+        Task::batch(tasks)
+    }
+
+    /// Normalize the selected subsequence without moving unrelated history.
+    /// Local channel order alone is not proof of durable card order.
+    fn normalize_projected_card_order(&mut self, visible: &[CardId]) {
+        let mut previous = None;
+        let ordered = visible.iter().all(|id| {
+            let Some(index) = self.card_index(*id) else {
+                return true;
+            };
+            let follows = previous.is_none_or(|previous| previous < index);
+            previous = Some(index);
+            follows
+        });
+        if ordered {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.shared_views.order_rewrites += 1;
         }
         let members = visible.iter().copied().collect::<HashSet<_>>();
         let states = self
@@ -2795,19 +2888,16 @@ impl Cagents {
             .collect::<HashMap<_, _>>();
         let mut ordered = visible.iter().filter_map(|id| states.get(id).cloned());
         for card in &mut Arc::make_mut(&mut self.durable).cards {
-            if members.contains(&card.id) {
-                if let Some(next) = ordered.next() {
-                    *card = next;
-                }
+            if members.contains(&card.id)
+                && let Some(next) = ordered.next()
+            {
+                *card = next;
             }
         }
-        if active {
-            tasks.push(self.project_shared_strip(&view.panes, &visible));
-        }
-        if !self.shared_views.applying {
-            self.persist();
-        }
-        Task::batch(tasks)
+    }
+
+    pub(super) fn presentation_chrome_cards(&self, scope: &Scope) -> Vec<CardId> {
+        self.local_view_cards(scope)
     }
 
     /// Attaches draft `card` to the conversation another window started in the
@@ -5159,6 +5249,14 @@ mod tests {
             .iter()
             .map(|card| app.sidebar_state.card_attention(*card))
             .collect::<Vec<_>>();
+        // A settled window has already initialized historical chrome and
+        // terminal ordinals. Only selected members should be visited again.
+        drop(app.sync_chrome());
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.publisher_index_entries = 0;
+        app.shared_views.publisher_scope_comparisons = 0;
+        app.shared_views.order_rewrites = 0;
+        app.shared_views.held_descriptor_clones.set(0);
         app.shared_views.notification_attribution_count.set(0);
         let failure = match app.cards.get(&pane.id) {
             Some(CardRuntime::Failed(error)) => format!("{error:?}"),
@@ -5200,6 +5298,11 @@ mod tests {
         assert_eq!(app.shared_views.selected_projection_count.get(), 1);
         assert_eq!(app.shared_views.structural_tail_count, 0);
         assert_eq!(app.shared_views.chrome_tail_count, 1);
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 1);
+        assert_eq!(app.shared_views.publisher_index_entries, 1);
+        assert_eq!(app.shared_views.publisher_scope_comparisons, 1);
+        assert_eq!(app.shared_views.order_rewrites, 0);
+        assert_eq!(app.shared_views.held_descriptor_clones.get(), 0);
         assert_eq!(app.card_state(pane.id).unwrap().title, "Remote label");
         assert_eq!(app.card_state(pane.id).unwrap().width_fraction, 0.72);
         assert!(
@@ -5223,6 +5326,422 @@ mod tests {
         assert!(app.shared_views.attached.contains(&listed_passive));
         assert!(!app.saved_terminals.entries.contains_key(&listed_passive));
         assert!(!app.terminal_start_in_flight(listed_passive));
+    }
+
+    #[test]
+    fn presentation_selected_publication_finds_an_unprojected_transfer_source() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        let source = Scope::Channel(source);
+        let destination = Scope::Channel(destination);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        // Preserve first canonical-view semantics in the scoped lookup too.
+        let mut duplicate = app.workspace_model.views[0].clone();
+        duplicate.revision = 999;
+        app.workspace_model.views.push(duplicate);
+        for index in 0..100 {
+            app.workspace_model.views.push(View::empty(Scope::Worktree {
+                repository: PathBuf::from("/repo/.git"),
+                path: PathBuf::from(format!("/repo/history-{index}")),
+            }));
+        }
+        let baseline = app.shared_views.baseline.clone();
+        let project = || LocalViews {
+            scopes: vec![destination.clone()],
+            cards: HashMap::from([(destination.clone(), vec![pane.id])]),
+            panes: HashMap::from([(destination.clone(), vec![pane.clone()])]),
+        };
+        app.shared_views.publisher_index_entries = 0;
+        app.publish_projected_view_changes(
+            project(),
+            ViewProjection::Selected(std::slice::from_ref(&destination)),
+        );
+        assert_eq!(app.shared_views.publisher_index_entries, 2);
+        assert_eq!(app.shared_views.publisher_scope_comparisons, 3);
+        let scoped = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(scoped.len(), 1);
+        let ModelEdit::ChangeView {
+            scope,
+            expected_revision,
+            change,
+            ..
+        } = &scoped[0]
+        else {
+            panic!("transfer")
+        };
+        assert_eq!(scope, &source);
+        assert_eq!(*expected_revision, 17);
+        assert!(
+            matches!(change, Change::Transfer { id, destination: to, .. } if *id == pane.id && to == &destination)
+        );
+        let scoped_baseline = app.shared_views.baseline.clone();
+        app.shared_views.baseline = baseline;
+        app.shared_views.pending.clear();
+        app.publish_projected_view_changes(project(), ViewProjection::All);
+        let full = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert_eq!(full.len(), scoped.len());
+        let ModelEdit::ChangeView {
+            scope: full_scope,
+            expected_revision: full_revision,
+            change: full_change,
+            ..
+        } = &full[0]
+        else {
+            panic!("transfer")
+        };
+        assert_eq!(
+            (scope, expected_revision, change),
+            (full_scope, full_revision, full_change)
+        );
+        assert_eq!(app.shared_views.baseline, scoped_baseline);
+    }
+
+    #[test]
+    fn presentation_order_normalization_checks_durable_order_and_keeps_history_in_place() {
+        let (mut app, _, _, pane) = channel_move_fixture();
+        let mut other = app.card_state(pane.id).unwrap().clone();
+        other.id = CardId::new();
+        let mut history = other.clone();
+        history.id = CardId::new();
+        history.existence = super::super::project_ui::removed_existence("history");
+        let first = app.card_state(pane.id).unwrap().clone();
+        Arc::make_mut(&mut app.durable).cards = vec![first.clone(), history.clone(), other.clone()];
+        app.index_cards();
+        // COW leaves the old index cached; each lookup must validate its ID
+        // before using that index as durable ordering evidence.
+        Arc::make_mut(&mut app.durable).cards.swap(0, 2);
+        // Channel order is already right; the durable selected subsequence is
+        // deliberately reversed around an unrelated closed historical card.
+        Arc::make_mut(&mut app.durable).channels[0].cards = vec![first.id, other.id];
+        app.normalize_projected_card_order(&[first.id, other.id]);
+        assert_eq!(app.durable.cards, vec![first, history, other]);
+        assert_eq!(app.shared_views.order_rewrites, 1);
+        let held = app.durable.clone();
+        app.normalize_projected_card_order(&[pane.id, held.cards[2].id]);
+        assert!(
+            Arc::ptr_eq(&held, &app.durable),
+            "settled order never writes or clones history"
+        );
+        assert_eq!(app.shared_views.order_rewrites, 1);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_scoped_chrome_matches_full_and_initializes_missing_caches() {
+        let (mut app, source, _, pane) = presentation_fixture();
+        let mut history = app.card_state(pane.id).unwrap().clone();
+        history.id = CardId::new();
+        history.existence = super::super::project_ui::removed_existence("history");
+        Arc::make_mut(&mut app.durable).cards.push(history.clone());
+        drop(app.sync_chrome());
+        app.card_state_mut(pane.id).unwrap().title = "Canonical updated label".into();
+        app.chrome_ui
+            .user_titles
+            .insert(pane.id, "My explicit label".into());
+        app.shared_views.chrome_cards_visited.set(0);
+        let members = app.presentation_chrome_cards(&Scope::Channel(source));
+        assert_eq!(members, vec![pane.id]);
+        drop(app.sync_scoped_chrome(&members));
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 1);
+        let chrome = &app.card_chrome[&pane.id];
+        let observed = (
+            chrome.title.clone(),
+            chrome.caption.clone(),
+            chrome.tooltip.clone(),
+            chrome.focused_name.clone(),
+            chrome.title_width,
+        );
+        let header = app.core.window.header_title.clone();
+        let accessible = app.workspace.card(pane.id).unwrap().accessible_name.clone();
+        drop(app.sync_chrome());
+        let chrome = &app.card_chrome[&pane.id];
+        assert_eq!(
+            observed,
+            (
+                chrome.title.clone(),
+                chrome.caption.clone(),
+                chrome.tooltip.clone(),
+                chrome.focused_name.clone(),
+                chrome.title_width
+            )
+        );
+        assert_eq!(app.core.window.header_title, header);
+        assert_eq!(
+            app.workspace.card(pane.id).unwrap().accessible_name,
+            accessible
+        );
+        assert_eq!(accessible, "My explicit label");
+        app.card_chrome.remove(&pane.id);
+        app.shared_views.chrome_cards_visited.set(0);
+        drop(app.sync_scoped_chrome(&members));
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            app.durable.cards.len()
+        );
+        assert!(app.card_chrome.contains_key(&pane.id));
+        assert!(app.card_chrome.contains_key(&history.id));
+    }
+
+    #[test]
+    fn presentation_missing_terminal_ordinal_uses_the_global_counter() {
+        let (mut app, _, _, pane) = channel_move_fixture_with_kind(Some(moving_terminal_kind()));
+        let mut history = app.card_state(pane.id).unwrap().clone();
+        history.id = CardId::new();
+        history.existence = super::super::project_ui::removed_existence("history");
+        Arc::make_mut(&mut app.durable).cards.push(history.clone());
+        drop(app.sync_chrome());
+        let existing = app.chrome_ui.terminal_ordinals[&history.id];
+        app.chrome_ui.terminal_ordinals.remove(&pane.id);
+        app.shared_views.chrome_cards_visited.set(0);
+        drop(app.sync_scoped_chrome(&[pane.id]));
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            app.durable.cards.len()
+        );
+        assert!(app.chrome_ui.terminal_ordinals[&pane.id] > existing);
+        assert_eq!(app.chrome_ui.terminal_ordinals[&history.id], existing);
+        let chrome = &app.card_chrome[&pane.id];
+        assert!(chrome.compact_title.is_some());
+        assert!(chrome.terminal_title_source.is_some());
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_noop_projection_does_not_copy_a_writer_held_workspace() {
+        let (mut app, source, destination, _) = presentation_fixture();
+        // Exercise the real shared reducer on an inactive, settled scope,
+        // where an unchanged receipt has no active-strip snapshot to save.
+        Arc::make_mut(&mut app.durable).active_channel = Some(destination);
+        let view = app
+            .workspace_model
+            .views
+            .iter()
+            .find(|view| view.scope == Scope::Channel(source))
+            .unwrap()
+            .clone();
+        let current = app.local_view_cards(&view.scope);
+        let owned = view.panes.iter().map(|pane| pane.id).collect();
+        let writer = app.durable.clone();
+        app.shared_views.applying = true;
+        drop(app.project_shared_view_with_cards(&view, &owned, current));
+        app.shared_views.applying = false;
+        assert!(Arc::ptr_eq(&writer, &app.durable));
+        assert_eq!(app.shared_views.order_rewrites, 0);
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_settings_blur_keeps_the_complete_common_tail() {
+        let (mut app, source, _, _) = presentation_fixture();
+        drop(app.sync_chrome());
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "After blur", 0.61);
+        // Focus has already left Settings, while its debounced draft still
+        // belongs to the common post-dispatch blur processing.
+        drop(app.queue_setting_input(SettingsField::TerminalFontSize, "18".into()));
+        app.settings_pane_focused = true;
+        app.shared_views.structural_tail_count = 0;
+        app.shared_views.selected_projection_count.set(0);
+        app.shared_views.local_projection_count.set(0);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.settings.terminal_font_size, 18.0);
+        assert!(app.settings_pending.is_empty());
+        assert_eq!(app.shared_views.selected_projection_count.get(), 0);
+        assert_eq!(app.shared_views.local_projection_count.get(), 1);
+        assert_eq!(
+            app.shared_views.structural_tail_count, 1,
+            "a committed settings draft invalidates the scoped chrome proof"
+        );
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_scoped_chrome_includes_retained_utility_and_keeps_focus() {
+        let (mut app, source, _, pane) = presentation_fixture();
+        drop(app.update(Message::Sidebar(SidebarAction::OpenSettings)));
+        let utility = app.workspace.focused().unwrap();
+        assert_eq!(app.card_state(utility).unwrap().kind, CardKind::Settings);
+        let utility_state = app.card_state(utility).unwrap().clone();
+        assert!(
+            app.presentation_chrome_cards(&Scope::Channel(source))
+                .contains(&utility)
+        );
+        drop(app.sync_chrome());
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "Beside settings", 0.61);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 2);
+        assert_eq!(app.workspace.focused(), Some(utility));
+        assert_eq!(app.card_state(utility), Some(&utility_state));
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Beside settings");
+        assert_eq!(app.card_chrome[&pane.id].title, browser_host::TITLE);
+        assert_eq!(app.card_chrome[&utility].title, "Settings");
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_name_restoration_in_another_channel_refreshes_all_chrome() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        let mut other = app.card_state(pane.id).unwrap().clone();
+        other.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut other.kind {
+            browser.id = BrowserId::new();
+        }
+        let other_pane = Pane::from_card(&other, None).unwrap();
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.push(other.clone());
+        let channel = durable
+            .channels
+            .iter_mut()
+            .find(|row| row.id == destination)
+            .unwrap();
+        channel.cards.push(other.id);
+        channel.title.clear();
+        app.workspace_model
+            .channels
+            .iter_mut()
+            .find(|row| row.id == destination)
+            .unwrap()
+            .title
+            .clear();
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes
+            .push(other_pane.clone());
+        app.shared_views
+            .initialize(Scope::Channel(destination), vec![other_pane]);
+        app.cards.insert(other.id, CardRuntime::Completed);
+        app.remember_channel_name_for_test(destination, "Retained channel name".into());
+        drop(app.sync_chrome());
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "Independent title", 0.61);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert_eq!(
+            app.durable
+                .channels
+                .iter()
+                .find(|row| row.id == destination)
+                .unwrap()
+                .title,
+            "Retained channel name"
+        );
+        assert_eq!(
+            app.shared_views.chrome_cards_visited.get(),
+            app.durable.cards.len()
+        );
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit| matches!(edit,
+            ModelEdit::SuggestChannelTitle { id, title, .. } if id == destination && title == "Retained channel name")));
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_inactive_scope_refreshes_changed_active_primary_chrome() {
+        let (mut app, source, destination, pane) = presentation_fixture();
+        let make_chat = |title: &str| {
+            let CardKind::Terminal(terminal) = moving_terminal_kind() else {
+                unreachable!()
+            };
+            CardState {
+                id: CardId::new(),
+                generation: 0,
+                title: title.into(),
+                width_fraction: 0.5,
+                existence: Existence::Open,
+                kind: CardKind::Chat(crate::chat::Session {
+                    id: TerminalId::new(),
+                    proof: terminal.continuity.live_proof(),
+                    terminal: None,
+                    owned_codex_listener: None,
+                    native_continuity: crate::chat::NativeContinuity::Durable {
+                        provider_version: "fixture".into(),
+                    },
+                    launch: crate::chat::Launch {
+                        provider: crate::agent::Provider::Claude,
+                        recipe: terminal.launch,
+                        session_id: Some(title.into()),
+                    },
+                }),
+            }
+        };
+        let first = make_chat("First chat");
+        let second = make_chat("Second chat");
+        let chats = vec![
+            Pane::from_card(&first, None).unwrap(),
+            Pane::from_card(&second, None).unwrap(),
+        ];
+        let durable = Arc::make_mut(&mut app.durable);
+        durable.cards.extend([first.clone(), second.clone()]);
+        let active = durable
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap();
+        active.cards = vec![first.id, second.id];
+        active.title = "Manual conversation name".into();
+        active.title_source = crate::model::ChannelTitleSource::Manual;
+        durable.active_channel = Some(destination);
+        durable.focused = Some(second.id);
+        app.active_workspace = Some(PathBuf::from("/repo"));
+        let channel = app
+            .workspace_model
+            .channels
+            .iter_mut()
+            .find(|channel| channel.id == destination)
+            .unwrap();
+        channel.title = "Manual conversation name".into();
+        channel.title_source = crate::model::ChannelTitleSource::Manual;
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(destination))
+            .unwrap()
+            .panes = chats.clone();
+        app.shared_views
+            .initialize(Scope::Channel(destination), chats);
+        app.shared_views.attached.extend([first.id, second.id]);
+        app.cards.insert(first.id, CardRuntime::Completed);
+        app.cards.insert(second.id, CardRuntime::Completed);
+        let mut strip = (*app.durable).clone();
+        strip.cards = vec![second.clone(), first.clone()];
+        app.workspace = Cagents::rebuild_workspace(&strip);
+        drop(app.sync_chrome());
+        assert_eq!(app.card_chrome[&first.id].title, "Manual conversation name");
+        assert_eq!(app.card_chrome[&second.id].title, "Second chat");
+        app.shared_views.chrome_cards_visited.set(0);
+        app.shared_views.selected_projection_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 24, "Inactive browser", 0.61);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+        assert_eq!(app.shared_views.chrome_cards_visited.get(), 3);
+        assert_eq!(app.card_chrome[&first.id].title, "First chat");
+        assert_eq!(
+            app.card_chrome[&second.id].title,
+            "Manual conversation name"
+        );
+        assert_eq!(app.card_state(pane.id).unwrap().title, "Inactive browser");
+        assert_eq!(app.card_chrome[&pane.id].title, browser_host::TITLE);
+        let observed = (
+            app.card_chrome[&first.id].title.clone(),
+            app.card_chrome[&second.id].title.clone(),
+            app.core.window.header_title.clone(),
+        );
+        drop(app.sync_chrome());
+        assert_eq!(
+            observed,
+            (
+                app.card_chrome[&first.id].title.clone(),
+                app.card_chrome[&second.id].title.clone(),
+                app.core.window.header_title.clone()
+            )
+        );
     }
 
     #[test]
@@ -5698,6 +6217,30 @@ mod tests {
         drop(selected.update(Message::WorkspaceModelObserved(update)));
         drop(full.update(Message::WorkspaceModelObserved(reference)));
         assert_eq!(selected.card_state(pane.id), full.card_state(pane.id));
+        let selected_chrome = &selected.card_chrome[&pane.id];
+        let full_chrome = &full.card_chrome[&pane.id];
+        assert_eq!(
+            (
+                selected_chrome.title.as_str(),
+                selected_chrome.caption.as_str(),
+                selected_chrome.focused_name.as_str(),
+                selected_chrome.title_width
+            ),
+            (
+                full_chrome.title.as_str(),
+                full_chrome.caption.as_str(),
+                full_chrome.focused_name.as_str(),
+                full_chrome.title_width
+            )
+        );
+        assert_eq!(
+            selected.core.window.header_title,
+            full.core.window.header_title
+        );
+        assert_eq!(
+            selected.workspace.card(pane.id).unwrap().accessible_name,
+            full.workspace.card(pane.id).unwrap().accessible_name
+        );
         assert_eq!(
             selected.workspace.order().collect::<Vec<_>>(),
             full.workspace.order().collect::<Vec<_>>()
@@ -5826,6 +6369,9 @@ mod tests {
                 .set_card_width(pane.id, CardWidth::Fraction(0.69));
             let (tx, rx) = async_channel::unbounded();
             app.workspace_model_tx = tx;
+            drop(app.sync_chrome());
+            app.shared_views.chrome_cards_visited.set(0);
+            app.shared_views.publisher_index_entries = 0;
             app.shared_views.local_projection_count.set(0);
             app.shared_views.selected_projection_count.set(0);
             app.shared_views.structural_tail_count = 0;
@@ -5855,6 +6401,8 @@ mod tests {
             assert_eq!(app.shared_views.selected_projection_count.get(), 2);
             assert_eq!(app.shared_views.structural_tail_count, 0);
             assert_eq!(app.shared_views.chrome_tail_count, 2);
+            assert_eq!(app.shared_views.chrome_cards_visited.get(), 2);
+            assert_eq!(app.shared_views.publisher_index_entries, 2);
             assert_eq!(app.card_state(pane.id).unwrap().title, "My accepted label");
             assert_eq!(app.card_state(pane.id).unwrap().width_fraction, 0.69);
             assert!(rx.try_recv().is_err());
