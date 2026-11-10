@@ -496,6 +496,18 @@ fn shutdown_refusal(outcome: &ShutdownOutcome) -> &'static str {
     }
 }
 
+fn recovery_not_confirmed(item: &mut super::floor_display::StopItem) {
+    item.recovery = match item.kind {
+        impact::SessionKind::NativeChat => {
+            "could not confirm that the captured transcript was saved; start a new conversation"
+        }
+        impact::SessionKind::Terminal => {
+            "could not confirm that the terminal's update recovery was saved; restart the terminal"
+        }
+    }
+    .into();
+}
+
 fn completed_error(
     error: UpdateError,
     completed: &[super::floor_display::StopItem],
@@ -673,8 +685,21 @@ fn quiesce_inner(
                     // for exit or writing the recovery record subsequently fails.
                     let archived = source.archive();
                     let retained = source.retain(daemon, record);
-                    archived?;
-                    retained?;
+                    if retained.is_err() {
+                        for item in completed.iter_mut() {
+                            recovery_not_confirmed(item);
+                        }
+                        source.ended(completed, true);
+                    }
+                    match (archived, retained) {
+                        (Ok(()), Ok(())) => (),
+                        (Err(error), Ok(())) | (Ok(()), Err(error)) => return Err(error),
+                        (Err(archive), Err(retain)) => {
+                            return Err(invalid(format!(
+                                "{archive}; could not confirm stopped-pane recovery: {retain}"
+                            )));
+                        }
+                    }
                     return source.stopped(state, job, true);
                 }
                 ShutdownOutcome::InventoryChanged { .. } | ShutdownOutcome::Expired => continue,
@@ -724,10 +749,17 @@ fn quiesce_inner(
             ended
                 .presentations
                 .retain(|pane| pane.session.id == chat.id);
-            ended
+            let retained = ended
                 .acknowledge_snapshot(&chat, snapshot)
-                .map_err(invalid)?;
-            source.retain(daemon, ended)?;
+                .map_err(invalid)
+                .and_then(|()| source.retain(daemon, ended));
+            if let Err(error) = retained {
+                for item in completed.iter_mut().filter(|item| item.id == chat.id) {
+                    recovery_not_confirmed(item);
+                }
+                source.ended(completed, false);
+                return Err(error);
+            }
         }
         let current = source.observe()?;
         let daemon = current

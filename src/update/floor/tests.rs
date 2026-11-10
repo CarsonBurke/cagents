@@ -29,6 +29,7 @@ struct FakeSource {
     retain_attempts: usize,
     fail_retain_at: Option<usize>,
     fail_stopped: bool,
+    fail_archive: bool,
     change_after_capture: bool,
 }
 
@@ -225,7 +226,11 @@ impl FloorSource for FakeSource {
     }
     fn archive(&mut self) -> Result<(), UpdateError> {
         self.event("archive checkpoint");
-        Ok(())
+        if self.fail_archive {
+            Err(invalid("fake archive failed"))
+        } else {
+            Ok(())
+        }
     }
     fn stopped(&mut self, _: &Path, _: &mut UpdateJob, service: bool) -> Result<(), UpdateError> {
         self.event(if service {
@@ -320,6 +325,7 @@ fn fixture() -> FakeSource {
         retain_attempts: 0,
         fail_retain_at: None,
         fail_stopped: false,
+        fail_archive: false,
         change_after_capture: false,
     }
 }
@@ -1194,6 +1200,15 @@ fn close_or_retain_failure_mid_loop_never_marks_the_chats_that_are_still_running
             "never retain the failed or unattempted close"
         );
         assert!(ledger.records.iter().all(|record| !record.service_stopped));
+        if failure.ends_with("retain") {
+            assert!(
+                error.contains("could not confirm that the captured transcript was saved"),
+                "{failure}: {error}"
+            );
+            if failure == "first-retain" {
+                assert!(!error.contains("transcript stays visible"), "{error}");
+            }
+        }
         if failure != "first-close" {
             assert!(error.contains("Ended or stopped:"), "{failure}: {error}");
             assert!(
@@ -1238,11 +1253,12 @@ fn late_prepare_failure_reports_ended_chats_without_a_second_confirmation() {
 
 #[test]
 fn accepted_shutdown_archives_checkpoint_even_if_retaining_or_waiting_fails() {
-    for failure in ["retain", "wait"] {
+    for failure in ["retain", "wait", "archive-and-retain"] {
         let directory = tempfile::tempdir().unwrap();
         let (mut source, _) = pending_source();
-        if failure == "retain" {
+        if failure.contains("retain") {
             source.fail_retain_at = Some(1);
+            source.fail_archive = failure == "archive-and-retain";
         } else {
             source.fail_stopped = true;
         }
@@ -1251,11 +1267,35 @@ fn accepted_shutdown_archives_checkpoint_even_if_retaining_or_waiting_fails() {
         confirm_stop(directory.path(), &published);
         let (result, source) = finish(worker);
         let error = result.unwrap_err().to_string();
+        if failure.contains("retain") {
+            assert!(
+                error.contains("could not confirm that the captured transcript was saved"),
+                "{error}"
+            );
+            assert!(
+                error.contains("could not confirm that the terminal's update recovery was saved"),
+                "{error}"
+            );
+            assert!(!error.contains("transcript stays visible"), "{error}");
+            assert!(!error.contains("screen and directory kept"), "{error}");
+        }
         assert!(
             error.contains("The terminal service accepted the stop"),
             "{error}"
         );
-        assert!(error.contains("press Restart"), "{error}");
+        if failure == "wait" {
+            assert!(error.contains("press Restart"), "{error}");
+        } else {
+            assert!(error.contains("restart the terminal"), "{error}");
+        }
+        if failure == "archive-and-retain" {
+            assert!(error.contains("fake archive failed"), "{error}");
+            assert!(error.contains("fake retention failed"), "{error}");
+            assert_eq!(
+                source.retain_attempts, 1,
+                "retention is attempted even when archive fails"
+            );
+        }
         assert!(error.contains("start a new conversation"), "{error}");
         let events = source.events.lock().unwrap();
         let archive = events
