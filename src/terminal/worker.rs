@@ -7675,6 +7675,122 @@ mod tests {
     }
 
     #[test]
+    fn checked_close_reconciles_queued_natural_root_exit() {
+        use super::super::ipc::TerminalCloseResult;
+
+        // Own the actual worker without starting its event loop. The shell
+        // blocks until its original root identity and PTY have been captured.
+        let (worker, events) = capture_worker_for(LaunchRecipe {
+            program: "/bin/sh".into(),
+            arguments: vec![
+                "-c".into(),
+                "read line; printf 'CLOSE_FINAL_OUTPUT\\n'; exit 7".into(),
+            ],
+            working_directory: PathBuf::from("/"),
+            environment: BTreeMap::new(),
+            unset_environment: Default::default(),
+        });
+        struct Cleanup(Option<Worker>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                if let Some(worker) = &self.0 {
+                    // Failure before run() still releases this exact owned
+                    // root through its pidfd. The fixture starts no children.
+                    let _ = worker.child.force_kill();
+                }
+            }
+        }
+        let mut cleanup = Cleanup(Some(worker));
+        let worker = cleanup.0.as_mut().unwrap();
+        assert!(worker.child_identity.is_some());
+        let (commands, receiver) = command_channel(1);
+        worker.commands = receiver;
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events,
+                published: Arc::clone(&worker.published),
+                worker: joins::JoinOwner::empty(Arc::clone(&worker.published)),
+            }),
+        };
+
+        worker.writer.write_all(b"release\n").unwrap();
+        // This is the holder's real report, sent only after it reaped the
+        // original root. Relay the same value rather than inventing an exit.
+        let report = worker
+            .child_exit_rx
+            .recv_deadline(Instant::now() + Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(report.as_ref().unwrap().exit_code(), 7);
+        assert!(!worker.child.unreaped());
+        assert!(!handle.is_completed());
+        let (relay, original_exit) = crossbeam_channel::bounded(1);
+        relay.send(report).unwrap();
+        worker.child_exit_rx = original_exit;
+        let (reply, outcome) = crossbeam_channel::bounded(1);
+        handle
+            .try_command(Command::CloseChecked {
+                allow_active: true,
+                deadline: Instant::now() + Duration::from_secs(5),
+                reply,
+            })
+            .unwrap();
+        assert!(
+            handle
+                .inner
+                .published
+                .priority_close
+                .lock()
+                .unwrap()
+                .is_some()
+        );
+
+        // Production takes priority_close before its pending ChildExit. The
+        // root is already reaped, but its output and completion are not yet
+        // consumed. Checked close must reconcile that real pending exit.
+        cleanup.0.take().unwrap().run();
+        let closed = outcome.recv_deadline(Instant::now() + Duration::from_secs(1));
+        let completed = handle.is_completed();
+        let final_screen = handle.snapshot();
+        let final_events: Vec<_> = handle.events().try_iter().collect();
+        // Drop the completed worker's retained holder before asserting the
+        // old failing result, so a red regression leaves no fixture process.
+        drop(handle);
+        drop(cleanup);
+
+        assert!(
+            completed,
+            "actual exit and PTY drain must complete teardown"
+        );
+        assert!(final_screen.lines.iter().any(|line| {
+            line.cells
+                .iter()
+                .map(|cell| cell.text.as_str())
+                .collect::<String>()
+                .contains("CLOSE_FINAL_OUTPUT")
+        }));
+        assert_eq!(
+            final_events
+                .iter()
+                .filter(|event| matches!(
+                    event,
+                    TerminalEvent::Completed {
+                        exit_code: 7,
+                        signal: None,
+                        intentional: false,
+                    }
+                ))
+                .count(),
+            1,
+            "close must preserve the actual unintentional exit result"
+        );
+        assert!(
+            matches!(closed, Ok(TerminalCloseResult::Closed)),
+            "the original root's queued natural exit must be reconciled: {closed:?}"
+        );
+    }
+
+    #[test]
     fn fresh_omp_activity_does_not_require_a_resumable_session() {
         use crate::agent::{Activity, ActivityState, Provider};
         use std::time::Instant;
