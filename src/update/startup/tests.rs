@@ -26,6 +26,7 @@ fn job(phase: UpdatePhase) -> UpdateJob {
         message: "PRIVATE_ERROR_SENTINEL /private/path CONFIRMATION_SENTINEL".into(),
         log_path: "/private/LOG_SENTINEL".into(),
         confirmation: None,
+        refusal: None,
     }
 }
 fn write(state: &Path, job: &UpdateJob) {
@@ -42,6 +43,7 @@ fn projected(phase: UpdatePhase, helper: LockState, fence: LockState) -> Snapsho
             waiting: 0,
             blocked: 0,
             daemon_timeout: false,
+            refused: false,
         }),
     }
 }
@@ -153,6 +155,10 @@ fn failed_or_terminal_status_does_not_override_real_held_or_unknown_ownership() 
             .explanation()
             .contains("daemon did not finish starting")
     );
+    let mut refused = projected(UpdatePhase::Failed, LockState::Free, LockState::Free);
+    refused.job.as_mut().unwrap().refused = true;
+    assert_eq!(refused.heading(), "The update was not installed");
+    assert!(refused.explanation().contains("nothing was installed"));
 }
 
 #[test]
@@ -280,4 +286,32 @@ fn awaiting_approval_and_idle_blockers_use_counts_without_session_names_or_capab
     snapshot.job.as_mut().unwrap().waiting = 0;
     snapshot.job.as_mut().unwrap().phase = UpdatePhase::AwaitingConfirmation;
     assert!(snapshot.explanation().contains("cannot approve"));
+}
+
+#[test]
+fn a_recorded_refusal_reads_as_not_installed_without_its_private_reasons() {
+    let (_root, executable, state) = installation();
+    let mut job = job(UpdatePhase::Failed);
+    let refusal = super::super::impact::Refusal {
+        sessions: vec![super::super::impact::RefusedSession {
+            title: "PRIVATE_TITLE_SENTINEL".into(),
+            reason: "PRIVATE_REASON_SENTINEL".into(),
+        }],
+        blockers: Vec::new(),
+        expired: false,
+    };
+    job.message = refusal.message();
+    job.refusal = Some(refusal);
+    write(&state, &job);
+    let mut snapshot = observe_installation(&executable, LockState::Free);
+    // The helper that wrote the record has exited.
+    snapshot.helper_lock = LockState::Free;
+    assert_eq!(snapshot.heading(), "The update was not installed");
+    let visible = format!(
+        "{} {} {}",
+        snapshot.heading(),
+        snapshot.explanation(),
+        snapshot.technical_summary()
+    );
+    assert!(!visible.contains("PRIVATE"), "{visible}");
 }

@@ -85,6 +85,23 @@ impl DaemonImpact {
                 .any(|session| session.disposition == Disposition::Blocked)
     }
 
+    /// What holds this preview back, if anything has to be resolved by hand.
+    pub fn refusal(&self) -> Option<Refusal> {
+        self.blocked().then(|| Refusal {
+            sessions: self
+                .sessions
+                .iter()
+                .filter(|session| session.disposition == Disposition::Blocked)
+                .map(|session| RefusedSession {
+                    title: session.title.clone(),
+                    reason: session.reason.clone(),
+                })
+                .collect(),
+            blockers: self.blockers.clone(),
+            expired: false,
+        })
+    }
+
     pub fn ready(&self) -> bool {
         self.blockers.is_empty()
             && self.sessions.iter().all(|session| {
@@ -136,12 +153,82 @@ impl DaemonImpact {
     }
 }
 
+/// Why a reviewed update was not installed: what its preview said had to be
+/// resolved first. The job keeps it, so whoever reads the outcome later sees
+/// the reasons the person reviewed rather than a bare cancellation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Refusal {
+    pub sessions: Vec<RefusedSession>,
+    /// Reasons that belong to no one session: work still settling, such as
+    /// agent launches or accepted provider work.
+    pub blockers: Vec<String>,
+    /// Nobody closed the review; it expired while these still held it back.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub expired: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RefusedSession {
+    pub title: String,
+    pub reason: String,
+}
+
+/// Separates a stopped update's summary from its details, as every reader of
+/// an update's message expects.
+const DETAILS_LABEL: &str = " Details: ";
+
+impl Refusal {
+    /// "1 session needs attention", "2 sessions need attention and other
+    /// work must finish first".
+    pub fn summary(&self) -> String {
+        let sessions = match self.sessions.len() {
+            0 => None,
+            1 => Some("1 session needs attention".to_owned()),
+            count => Some(format!("{count} sessions need attention")),
+        };
+        let work = (!self.blockers.is_empty()).then_some("other work must finish first");
+        let held = match (sessions, work) {
+            (Some(sessions), Some(work)) => format!("{sessions} and {work}"),
+            (Some(sessions), None) => sessions,
+            (None, work) => work.unwrap_or_default().to_owned(),
+        };
+        if self.expired {
+            format!("the review expired while {held}")
+        } else {
+            held
+        }
+    }
+
+    /// Each reason, worded on its own line of a notice's details.
+    pub fn details(&self) -> Vec<String> {
+        self.sessions
+            .iter()
+            .map(|session| format!("{}: {}", session.title, session.reason))
+            .chain(self.blockers.iter().cloned())
+            .collect()
+    }
+
+    /// The job message: a summary, then every reason after the details label.
+    pub fn message(&self) -> String {
+        let details = self
+            .details()
+            .iter()
+            .map(|detail| detail.trim_end_matches('.').to_owned())
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!(
+            "Update not installed: {}.{DETAILS_LABEL}{details}.",
+            self.summary()
+        )
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof};
 
-    fn waiting() -> DaemonImpact {
+    pub(in crate::update) fn waiting() -> DaemonImpact {
         DaemonImpact {
             capability: ShutdownCapability {
                 proof: HostSessionProof {
@@ -237,6 +324,67 @@ mod tests {
         let mut changed = preview.clone();
         changed.candidate.digest = "different-local-build".into();
         assert!(!preview.preserves_consent(&changed));
+    }
+
+    pub(in crate::update) fn blocked() -> DaemonImpact {
+        let mut daemon = waiting();
+        daemon.sessions[0].disposition = Disposition::Blocked;
+        daemon.sessions[0].reason = STOPPED_WITH_UNSETTLED_WORK.into();
+        let mut carried = daemon.sessions[0].clone();
+        carried.id = TerminalId::new();
+        carried.title = "Shell".into();
+        carried.disposition = Disposition::Continues;
+        carried.reason = "Keeps running".into();
+        daemon.sessions.push(carried);
+        daemon
+            .blockers
+            .push("Additional agent launches must settle before updating".into());
+        daemon
+    }
+
+    #[test]
+    fn a_refusal_names_only_what_holds_the_update_back() {
+        assert_eq!(waiting().refusal(), None, "waiting for idle is not refused");
+        let refusal = blocked().refusal().unwrap();
+        assert_eq!(
+            refusal.sessions,
+            vec![RefusedSession {
+                title: "Claude".into(),
+                reason: STOPPED_WITH_UNSETTLED_WORK.into(),
+            }]
+        );
+        assert_eq!(
+            refusal.summary(),
+            "1 session needs attention and other work must finish first"
+        );
+        assert_eq!(
+            refusal.message(),
+            "Update not installed: 1 session needs attention and other work must finish first. \
+             Details: Claude: Its provider stopped but may still hold unfinished work. \
+             Close this conversation to release it; \
+             Additional agent launches must settle before updating."
+        );
+        let mut service = blocked();
+        service.sessions.clear();
+        assert_eq!(
+            service.refusal().unwrap().summary(),
+            "other work must finish first"
+        );
+        let mut sessions = blocked();
+        sessions.blockers.clear();
+        sessions.sessions[1].disposition = Disposition::Blocked;
+        assert_eq!(
+            sessions.refusal().unwrap().summary(),
+            "2 sessions need attention"
+        );
+        let expired = Refusal {
+            expired: true,
+            ..sessions.refusal().unwrap()
+        };
+        assert_eq!(
+            expired.summary(),
+            "the review expired while 2 sessions need attention"
+        );
     }
 }
 

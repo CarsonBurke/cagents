@@ -129,6 +129,7 @@ fn real_narrow_and_roomy_buttons_keep_details_progress_and_close_reachable() {
             waiting: 2,
             blocked: 0,
             daemon_timeout: false,
+            refused: false,
         });
         for action in ["Technical details", "Existing window", "Close"] {
             let (labels, messages) = rendered(&state, width, height, Some(action));
@@ -295,6 +296,7 @@ fn observed_operation(id: &str, complete: bool) -> Snapshot {
             waiting: 0,
             blocked: 0,
             daemon_timeout: false,
+            refused: false,
         }),
     }
 }

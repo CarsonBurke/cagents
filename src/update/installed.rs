@@ -604,6 +604,7 @@ exit 1"#,
                 message: "Starting the installed application".into(),
                 log_path: root.join("update.log"),
                 confirmation: None,
+                refusal: None,
             };
             write_job(&state, &job).unwrap();
             if mode == "write-error" {

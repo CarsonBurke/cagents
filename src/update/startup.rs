@@ -35,6 +35,8 @@ struct Job {
     waiting: usize,
     blocked: usize,
     daemon_timeout: bool,
+    /// The update was not installed because its review was blocked.
+    refused: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -72,6 +74,9 @@ impl Snapshot {
         }
         if self.helper_lock == LockState::Free && self.can_open() {
             return match self.job.as_ref().map(|job| &job.phase) {
+                Some(UpdatePhase::Failed) if self.job.as_ref().is_some_and(|job| job.refused) => {
+                    "The update was not installed"
+                }
                 Some(UpdatePhase::Failed) => "The update did not complete",
                 Some(UpdatePhase::Cancelled) => "The update was cancelled",
                 Some(_) => "Update completion is unconfirmed",
@@ -101,6 +106,8 @@ impl Snapshot {
         }
         if self.helper_lock == LockState::Free && self.can_open() {
             return match self.job.as_ref() {
+                Some(job) if job.phase == UpdatePhase::Failed && job.refused =>
+                    "Something held the update back, so nothing was installed. Open cagents to see what, then update again.".into(),
                 Some(job) if job.phase == UpdatePhase::Failed && job.daemon_timeout =>
                     "The daemon did not finish starting. Open cagents to review recovery, or check diagnostics before trying again.".into(),
                 Some(job) if !job.phase.is_terminal() =>
@@ -275,6 +282,7 @@ fn observe_installation(executable: &Path, installation_lock: LockState) -> Snap
                 }),
                 daemon_timeout: job.message.contains("daemon did not answer within")
                     || job.message.contains("daemon startup timed out"),
+                refused: job.refusal.is_some(),
             });
         }
     }

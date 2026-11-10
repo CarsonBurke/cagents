@@ -63,6 +63,14 @@ pub enum UpdateError {
     Busy,
     #[error("update check or download cancelled")]
     Cancelled,
+    /// The person, or the CLI on their behalf, closed a review that nothing
+    /// blocked. The verified download is discarded; nothing was installed.
+    #[error("Update cancelled; nothing was installed")]
+    Declined,
+    /// The reviewed preview could not be approved. Unlike a cancellation,
+    /// this names what held the update back.
+    #[error("{}", .0.message())]
+    Refused(Box<impact::Refusal>),
     #[error("{0} timed out")]
     Timeout(&'static str),
     #[error("{0}")]
@@ -136,6 +144,11 @@ pub struct UpdateJob {
     pub log_path: PathBuf,
     #[serde(default)]
     pub confirmation: Option<confirmation::Confirmation>,
+    /// What held a refused update back. A refused job ends `Failed` with this
+    /// set and `message` naming the same reasons, so a reader that predates
+    /// this field still shows them rather than a cancellation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<impact::Refusal>,
 }
 
 impl UpdateJob {
@@ -658,7 +671,7 @@ pub fn upgrade_installed(
                 && ended_for.as_ref() != Some(&confirmation.nonce)
             {
                 if submitted.is_some() {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                    close_review(&job.id, &confirmation.nonce, false);
                     return Err(invalid(
                         "Update impact changed after approval; review and retry the update.",
                     ));
@@ -685,15 +698,22 @@ pub fn upgrade_installed(
                         for blocker in &daemon.blockers {
                             eprintln!("  {blocker}");
                         }
+                        let mut ended_any = false;
                         let ended = if accept_unreopenable && ended_for.is_none() {
-                            end_unreachable_source_chats(&job.id, &confirmation.nonce, daemon, yes)
+                            end_unreachable_source_chats(
+                                &job.id,
+                                &confirmation.nonce,
+                                daemon,
+                                yes,
+                                &mut ended_any,
+                            )
                         } else {
                             Ok(false)
                         };
                         match ended {
                             Ok(true) => {}
                             Ok(false) => {
-                                decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
+                                close_review(&job.id, &confirmation.nonce, ended_any);
                                 return Err(invalid(if accept_unreopenable {
                                     "Resolve the displayed update blockers, then retry. --accept-unreopenable ends only conversations whose provider can no longer be carried."
                                 } else {
@@ -703,7 +723,7 @@ pub fn upgrade_installed(
                             Err(error) => {
                                 // Never leave the reviewed preview pending: the
                                 // worker would hold it until it expires.
-                                let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                                close_review(&job.id, &confirmation.nonce, ended_any);
                                 return Err(error);
                             }
                         }
@@ -713,8 +733,8 @@ pub fn upgrade_installed(
                     }
                 }
                 if !yes && !confirm_on_terminal("Proceed with this update? [y/N] ")? {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel)?;
-                    return Err(UpdateError::Cancelled);
+                    close_review(&job.id, &confirmation.nonce, false);
+                    return Err(UpdateError::Declined);
                 }
                 decide(&job.id, &confirmation.nonce, UpdateChoice::Confirm)?;
                 submitted = Some(confirmation.nonce.clone());
@@ -724,6 +744,46 @@ pub fn upgrade_installed(
             return Err(invalid(
                 "The update is still running; inspect its progress in the app.",
             ));
+        }
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+/// Cancel the review this CLI showed, which records why the update was not
+/// installed. The worker may have republished it under a new nonce while the
+/// person read it; that review is closed instead, so it does not stay open
+/// until it expires. Once conversations were ended, the worker republishes the
+/// changed impact within a second; closing that one records what still
+/// blocks rather than what was just ended. A newer review someone already
+/// approved, in a window, is theirs to keep.
+fn close_review(job: &str, reviewed: &str, ended_any: bool) {
+    let deadline = Instant::now() + Duration::from_secs(if ended_any { 5 } else { 0 });
+    // A cancel can lose a race with a republish; the review it missed is
+    // read again and closed in its place.
+    let mut attempts = 3;
+    loop {
+        let Ok(current) = status() else {
+            let _ = decide(job, reviewed, UpdateChoice::Cancel);
+            return;
+        };
+        let Some(current) = current.filter(|current| current.id == job) else {
+            return;
+        };
+        let Some(active) = current.active_confirmation() else {
+            return;
+        };
+        if active.nonce != reviewed {
+            if current.phase == UpdatePhase::AwaitingConfirmation {
+                let _ = decide(job, &active.nonce, UpdateChoice::Cancel);
+            }
+            return;
+        }
+        if Instant::now() >= deadline {
+            attempts -= 1;
+            if decide(job, reviewed, UpdateChoice::Cancel).is_ok() || attempts == 0 {
+                return;
+            }
+            continue;
         }
         thread::sleep(Duration::from_millis(250));
     }
@@ -750,6 +810,7 @@ fn end_unreachable_source_chats(
     nonce: &str,
     daemon: &impact::DaemonImpact,
     yes: bool,
+    ended_any: &mut bool,
 ) -> Result<bool, UpdateError> {
     let Some(ending) = unreachable_source_chats(daemon)? else {
         return Ok(false);
@@ -759,7 +820,7 @@ fn end_unreachable_source_chats(
         eprintln!("  {title}: {loss}");
     }
     if !yes && !confirm_on_terminal("End them and continue? [y/N] ")? {
-        return Err(UpdateError::Cancelled);
+        return Err(UpdateError::Declined);
     }
     let still_reviewed = status()?
         .filter(|current| current.id == job)
@@ -782,7 +843,7 @@ fn end_unreachable_source_chats(
             "The conversations to end changed while you decided; nothing more was ended. Review and retry the update.",
         ));
     }
-    end_source_chats(daemon, ending)?;
+    end_source_chats(daemon, ending, ended_any)?;
     Ok(true)
 }
 
@@ -857,6 +918,7 @@ fn select_unreachable_chats(
 fn end_source_chats(
     daemon: &impact::DaemonImpact,
     ending: Vec<EndedChat>,
+    ended_any: &mut bool,
 ) -> Result<(), UpdateError> {
     let mut client = source_client_for(daemon)?;
     // One the source cannot end does not keep the rest: each was approved
@@ -864,7 +926,10 @@ fn end_source_chats(
     let mut failed = Vec::new();
     for (title, _, session) in ending {
         match client.close_chat(session) {
-            Ok(()) => eprintln!("  Ended {title}"),
+            Ok(()) => {
+                *ended_any = true;
+                eprintln!("  Ended {title}");
+            }
             Err(error) => {
                 eprintln!("  Could not end {title}: {error}");
                 failed.push(title);
@@ -920,6 +985,7 @@ fn start_job(
         message: "Starting verified update".into(),
         log_path: state.join(format!("{id}.log")),
         confirmation: None,
+        refusal: None,
     };
     let log = private_create(&job.log_path)?;
     write_job(&state, &job)?;
@@ -1240,20 +1306,29 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         return Err(invalid("update job is no longer pending"));
     }
     let result = perform_update(&installation, &state, &mut job);
-    job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
-        UpdatePhase::Cancelled
-    } else if result.is_ok() {
-        UpdatePhase::Complete
-    } else {
-        UpdatePhase::Failed
+    finish_job(&mut job, &result);
+    write_job(&state, &job)?;
+    result
+}
+
+/// The terminal record of a worker's outcome. A refusal is not a phase of its
+/// own: windows and CLIs that predate it read this file, and an unknown phase
+/// would hide the job from them entirely. They read `Failed` and the reasons.
+fn finish_job(job: &mut UpdateJob, result: &Result<(), UpdateError>) {
+    job.phase = match result {
+        Ok(()) => UpdatePhase::Complete,
+        Err(UpdateError::Cancelled | UpdateError::Declined) => UpdatePhase::Cancelled,
+        Err(_) => UpdatePhase::Failed,
     };
     job.confirmation = None;
-    job.message = match &result {
+    job.refusal = match result {
+        Err(UpdateError::Refused(refusal)) => Some((**refusal).clone()),
+        _ => None,
+    };
+    job.message = match result {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(error) => error.to_string(),
     };
-    write_job(&state, &job)?;
-    result
 }
 
 fn perform_update(
@@ -3835,6 +3910,74 @@ finally:
         fs::rename(root.join("current-next"), root.join("current")).unwrap();
     }
 
+    /// The terminal record is read by windows and CLIs of other versions. A
+    /// refusal ends in a phase they know, with its reasons in the message,
+    /// and a record that predates refusals still reads as it did.
+    #[test]
+    fn a_refused_update_is_recorded_with_its_reasons_for_every_reader() {
+        let refusal = impact::tests::blocked().refusal().unwrap();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "9.8.7".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: "Verified update is ready for review".into(),
+            log_path: "/nonexistent/update.log".into(),
+            confirmation: None,
+            refusal: None,
+        };
+        finish_job(
+            &mut job,
+            &Err(UpdateError::Refused(Box::new(refusal.clone()))),
+        );
+        assert_eq!(job.phase, UpdatePhase::Failed);
+        assert_eq!(job.refusal.as_ref(), Some(&refusal));
+        assert_eq!(job.message, refusal.message());
+        assert!(
+            job.message
+                .contains(impact::STOPPED_WITH_UNSETTLED_WORK.trim_end_matches('.'))
+        );
+        assert!(
+            job.message
+                .contains("Additional agent launches must settle")
+        );
+
+        // A reader that predates the refusal field still parses the record.
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct EarlierJob {
+            id: String,
+            version: String,
+            phase: UpdatePhase,
+            message: String,
+            log_path: PathBuf,
+            #[serde(default)]
+            confirmation: Option<confirmation::Confirmation>,
+        }
+        let encoded = serde_json::to_vec(&job).unwrap();
+        let earlier: EarlierJob = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(earlier.phase, UpdatePhase::Failed);
+        assert_eq!(earlier.message, refusal.message());
+
+        // A record an earlier worker wrote has no refusal to show.
+        let mut value: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        value.as_object_mut().unwrap().remove("refusal");
+        let earlier_record: UpdateJob = serde_json::from_value(value).unwrap();
+        assert_eq!(earlier_record.refusal, None);
+
+        finish_job(&mut job, &Err(UpdateError::Declined));
+        assert_eq!(job.phase, UpdatePhase::Cancelled);
+        assert_eq!(job.refusal, None);
+        assert_eq!(job.message, "Update cancelled; nothing was installed");
+        let unrefused = serde_json::to_value(&job).unwrap();
+        assert!(
+            unrefused.get("refusal").is_none(),
+            "an unrefused record keeps its earlier shape"
+        );
+        finish_job(&mut job, &Err(UpdateError::Cancelled));
+        assert_eq!(job.phase, UpdatePhase::Cancelled);
+        assert_eq!(job.message, "update check or download cancelled");
+    }
+
     #[test]
     fn a_failed_build_requires_a_later_matched_installation_to_be_superseded() {
         let directory = tempfile::tempdir().unwrap();
@@ -3852,6 +3995,7 @@ finally:
             message: "installed daemon startup failed".into(),
             log_path: root.join(".update/historical-failure.log"),
             confirmation: None,
+            refusal: None,
         };
         let superseded = |job: &UpdateJob, switched| {
             failed_job_is_superseded(job, &window, &served, Some(&owner), switched)
