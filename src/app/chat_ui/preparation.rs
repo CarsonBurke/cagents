@@ -2026,6 +2026,7 @@ mod tests {
         notice.body.full.watch_raw_spans(sent);
         let hold = hold_retirement();
         runtime.show(false);
+        runtime.cool();
         runtime.markdown_prepared(runtime.target, "message", run, ready(Ok(output)));
         assert!(disposed.try_recv().is_err());
         assert!(
@@ -3766,6 +3767,7 @@ mod tests {
             assert_eq!(coordination::preparations(), ui_work);
             runtime.cache.insert("message".into(), rebuilt);
             runtime.show(false);
+            runtime.cool();
             let thread = disposed.recv_timeout(Duration::from_secs(5)).expect("actual coordinated canonical graph destructor");
             assert_eq!(thread, retirement_barrier());
             assert_ne!(thread, std::thread::current().id());

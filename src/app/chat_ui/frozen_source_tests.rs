@@ -1,6 +1,7 @@
 //! A resume may retire the source while its daemon socket remains connected.
 //! Keep one already-presented window, without retaining the old client body,
-//! raw logical-message owners, read subscriptions or hidden render caches.
+//! raw logical-message owners or read subscriptions. Hidden rendering is warm
+//! only within the ordinary cache budget; cooling keeps the frozen source.
 use super::*;
 
 const THREAD: &str = "6f1f6f1e-4a4b-4c4d-8e8f-909192939495";
@@ -65,11 +66,13 @@ fn source(
         app.settings.editor_syntax_theme,
     );
     state.refresh();
+    preparation::drain_fixture(&mut state);
     state.replace_draft(text_editor::Content::with_text(DRAFT));
     assert!(state.resumes_in_place());
     assert!(state.logical_prose.raw().is_some());
     assert_eq!(state.logical_prose.request().is_some(), partial);
     assert_eq!(state.snapshot.items.len(), 1);
+    assert!(state.source_clock.is_some());
     let shown = match &state.snapshot.items[0].content {
         ItemContent::Text { text, .. } => text.clone(),
         _ => panic!("the last readable window is logical prose"),
@@ -84,6 +87,10 @@ fn assert_no_source_read_owners(runtime: &Runtime, handle: &ClientHandle) {
     assert!(
         handle.is_connected(),
         "the retired actor's socket stays open"
+    );
+    assert!(
+        !handle.is_visible_for_test(),
+        "old-source reads are inactive"
     );
     assert_eq!(handle.snapshot().transcript_bytes(), 0);
     assert!(handle.resident_snapshot_with_clock().is_none());
@@ -108,7 +115,7 @@ fn in_place_resume_keeps_one_frozen_projection_without_old_source_owners() {
 
             // Metadata from the old connected handle is not a new source for
             // the frozen window, including its clock and provider diagnosis.
-            handle.publish_snapshot_for_test(Snapshot {
+            handle.deliver_snapshot_for_test(Snapshot {
                 generation: 20,
                 sampled_at: Some(9_000_000),
                 session_id: Some(THREAD.into()),
@@ -135,7 +142,11 @@ fn in_place_resume_keeps_one_frozen_projection_without_old_source_owners() {
                 // already empty; logical-only owners must be released too.
                 for _ in 0..3 {
                     state.set_visible(false).unwrap();
+                    assert!(state.warm_stamp().is_some());
+                    assert_no_source_read_owners(state, &handle);
+                    state.cool();
                     state.refresh();
+                    assert!(state.warm_stamp().is_none());
                     assert!(state.cache.is_empty());
                     assert!(state.child_cache.is_empty());
                     assert!(state.selection_document.borrow().is_none());
@@ -190,6 +201,12 @@ fn a_blocked_restore_uses_normal_interest_and_eviction_without_a_source_pin() {
     assert!(handle.resident_snapshot_with_clock().is_some());
     assert!(state.logical_prose.raw().is_some());
     state.set_visible(false).unwrap();
+    assert!(state.warm_stamp().is_some());
+    assert!(state.snapshot.transcript_bytes() > 0);
+    assert!(handle.resident_snapshot_with_clock().is_some());
+    hide_newer_chats_and_trim(&mut app);
+    let state = runtime(&app, card);
+    assert!(state.warm_stamp().is_none());
     assert_eq!(state.snapshot.transcript_bytes(), 0);
     assert_eq!(handle.snapshot().transcript_bytes(), 0);
     assert!(state.cache.is_empty());
@@ -265,6 +282,272 @@ fn a_frozen_window_preserves_active_recall_until_the_draft_is_restored() {
     assert_eq!(state.composer.text(), DRAFT);
     assert!(state.attachments.is_empty());
     state.set_visible(false).unwrap();
+    assert!(state.warm_stamp().is_some());
+    state.cool();
     assert!(state.history.is_empty());
     assert!(state.history_images.is_empty());
+}
+
+/// Apply the real app budget after each newer hide, as channel switches do.
+/// These are small ordinary chats, so count, rather than bytes, cools the
+/// older target. They do not share its source or its frozen-body exception.
+fn hide_newer_chats_and_trim(app: &mut Cagents) {
+    app.trim_warm_chats();
+    let mut newer = Vec::new();
+    for index in 0..=warm::CHATS {
+        let session = fresh_chat_session(
+            Provider::Claude,
+            TerminalId::new(),
+            "/project".into(),
+            &Account::system(Provider::Claude),
+            false,
+        )
+        .unwrap();
+        let snapshot = Snapshot {
+            generation: 1,
+            ready: true,
+            items: vec![Arc::new(chat::Item {
+                id: format!("newer-{index}"),
+                role: chat::Role::Assistant,
+                content: ItemContent::Text {
+                    text: "A newer ordinary warm conversation.".into(),
+                    thinking: false,
+                    phase: chat::Phase::Final,
+                },
+                at: None,
+                started_at: None,
+            })],
+            ..Snapshot::default()
+        };
+        let handle = Arc::new(ClientHandle::fixture(session.clone(), snapshot));
+        let target = Target {
+            card: CardId::new(),
+            generation: 1,
+        };
+        let mut state = Runtime::new(
+            target,
+            session,
+            Connection::Live(handle),
+            true,
+            app.settings.editor_syntax_theme,
+        );
+        preparation::drain_fixture(&mut state);
+        state.set_visible(false).unwrap();
+        assert!(state.warm_stamp().is_some());
+        assert!(state.warm_bytes() < warm::CHAT_BYTES);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(state)));
+        newer.push(target.card);
+        app.trim_warm_chats();
+    }
+    assert!(runtime(app, newer[0]).warm_stamp().is_none());
+    assert!(
+        newer[1..]
+            .iter()
+            .all(|card| runtime(app, *card).warm_stamp().is_some()),
+        "the eight most recently hidden chats stay warm"
+    );
+}
+
+fn assert_frozen_window(
+    state: &Runtime,
+    frozen: &Arc<Snapshot>,
+    clock: &str,
+    handle: &ClientHandle,
+) {
+    assert!(state.resume_source_pinned);
+    assert!(Arc::ptr_eq(&state.snapshot, frozen));
+    assert_eq!(state.snapshot.items, frozen.items);
+    assert_eq!(state.snapshot.error, frozen.error);
+    assert_eq!(format!("{:?}", state.source_clock), clock);
+    assert_eq!(state.composer.text(), DRAFT);
+    assert_no_source_read_owners(state, handle);
+}
+
+#[test]
+fn the_warm_budget_cools_frozen_resume_rendering_without_losing_the_source() {
+    let _context = text_copy::isolated_context();
+    for partial in [false, true] {
+        for recovery in [chat::Recovery::Retry, chat::Recovery::Blocked] {
+            let (mut app, card, target, old, shown, _) = source(partial);
+            let frozen = runtime(&app, card).snapshot.clone();
+            let clock = format!("{:?}", runtime(&app, card).source_clock);
+            let session = runtime(&app, card).session.clone();
+            drop(app.start_chat(card, session, chat::Intent::Resume, None, false));
+            let attempt = tests::chat_runtime_attempt(&app, card);
+            let state = app.chat_runtime_mut(target).unwrap();
+            state.history = vec!["inactive recall".repeat(4096)];
+            state.history_images = vec![vec![Attachment::file("old-history-image.png")]];
+            app.window_width = 640.0;
+            drop(app.sync_context_overlay_state());
+            assert!(!app.workspace_surfaces_visible());
+            let state = app.chat_runtime_mut(target).unwrap();
+            let stamp = state.warm_stamp().expect("frozen rendering may stay warm");
+            assert!(!state.cache.is_empty());
+            assert_frozen_window(state, &frozen, &clock, &old);
+
+            // A retired actor's connected socket can still publish metadata.
+            // It neither invalidates this frozen warm rendering nor grants
+            // the old client renewed body interest.
+            old.deliver_snapshot_for_test(Snapshot {
+                generation: 90_000,
+                sampled_at: Some(90_000_000),
+                ready: true,
+                exited: true,
+                session_id: Some(THREAD.into()),
+                items: vec![Arc::new(chat::Item {
+                    id: "answer".into(),
+                    role: chat::Role::Assistant,
+                    content: ItemContent::Text {
+                        text: "A late old-source body must not be retained.".into(),
+                        thinking: false,
+                        phase: chat::Phase::Final,
+                    },
+                    at: None,
+                    started_at: None,
+                })],
+                ..Snapshot::default()
+            });
+            state.refresh();
+            assert_eq!(state.warm_stamp(), Some(stamp));
+            assert_frozen_window(state, &frozen, &clock, &old);
+
+            hide_newer_chats_and_trim(&mut app);
+            let state = runtime(&app, card);
+            assert!(
+                state.warm_stamp().is_none(),
+                "the old target was LRU-cooled"
+            );
+            assert!(state.cache.is_empty());
+            assert!(state.child_cache.is_empty());
+            assert!(state.selection_document.borrow().is_none());
+            assert!(state.failure_ui.incidents.is_empty());
+            assert!(state.history.is_empty());
+            assert!(state.history_images.is_empty());
+            assert_frozen_window(state, &frozen, &clock, &old);
+
+            tests::answer_start(
+                &mut app,
+                attempt,
+                Err(chat::StartFailure {
+                    message: REFUSAL.into(),
+                    recovery,
+                }),
+            );
+            for generation in [90_001, 90_002] {
+                old.deliver_snapshot_for_test(Snapshot {
+                    generation,
+                    sampled_at: Some(100_000_000 + generation),
+                    error: Some("Late metadata must not replace the readable source".into()),
+                    ..Snapshot::default()
+                });
+                let state = app.chat_runtime_mut(target).unwrap();
+                state.refresh();
+                assert!(state.warm_stamp().is_none());
+                assert!(state.cache.is_empty());
+                assert_eq!(state.error.as_deref(), Some(REFUSAL));
+                assert_eq!(
+                    state.start_retry_blocked,
+                    recovery == chat::Recovery::Blocked
+                );
+                assert_frozen_window(state, &frozen, &clock, &old);
+            }
+            app.window_width = 1600.0;
+            drop(app.sync_context_overlay_state());
+            assert!(app.workspace_surfaces_visible());
+            let state = app.chat_runtime_mut(target).unwrap();
+            assert!(state.visible.load(Ordering::Relaxed));
+            preparation::drain_fixture(state);
+            assert!(state.warm_stamp().is_none());
+            assert!(state.cache.contains_key("answer"));
+            assert!(!state.cache["answer"].placeholder);
+            assert!(
+                matches!(&state.snapshot.items[0].content, ItemContent::Text { text, .. } if text == &shown),
+                "the exact full or part-joined window is shown without projecting it again"
+            );
+            assert_eq!(state.error.as_deref(), Some(REFUSAL));
+            assert_frozen_window(state, &frozen, &clock, &old);
+        }
+    }
+}
+
+#[test]
+fn a_hidden_successor_clears_the_old_warm_stamp_before_reusing_ids_and_generations() {
+    let _context = text_copy::isolated_context();
+    let (mut app, card, _, old, _, copied) = source(true);
+    let session = runtime(&app, card).session.clone();
+    let frozen = runtime(&app, card).snapshot.clone();
+    drop(app.start_chat(card, session.clone(), chat::Intent::Resume, None, false));
+    let attempt = tests::chat_runtime_attempt(&app, card);
+    app.window_width = 640.0;
+    drop(app.sync_context_overlay_state());
+    assert!(!app.workspace_surfaces_visible());
+    assert!(runtime(&app, card).warm_stamp().is_some());
+    assert_no_source_read_owners(runtime(&app, card), &old);
+
+    let body =
+        "A successor owns this reused message ID.\n".repeat(chat::TRANSCRIPT_PART_BYTES / 24 + 1);
+    let items = logical_prose::parts("answer", &body, 0..usize::MAX);
+    let mut next = Snapshot {
+        generation: 1,
+        sampled_at: Some(20_000),
+        ready: true,
+        session_id: Some(THREAD.into()),
+        native_continuity: session.native_continuity.clone(),
+        items,
+        ..Snapshot::default()
+    };
+    let next_source = chat::TextCopySource {
+        cache: uuid::Uuid::new_v4(),
+        bytes: body.len() as u64,
+        ..copied.clone()
+    };
+    next.text_copy_sources.conversation = vec![Some(next_source); next.items.len()];
+    let successor = Arc::new(ClientHandle::fixture(session, next.clone()));
+    tests::answer_start(&mut app, attempt, Ok(successor.clone()));
+    let state = runtime(&app, card);
+    assert!(!state.visible.load(Ordering::Relaxed));
+    assert!(!state.resume_source_pinned);
+    assert!(
+        state.warm_stamp().is_none(),
+        "warmth belonged to the old attachment"
+    );
+    assert!(!state.retains_source_body());
+    assert!(state.cache.is_empty());
+    assert!(state.snapshot.items.is_empty());
+    assert_eq!(state.snapshot.generation, 1);
+    assert!(state.logical_prose.raw().is_none());
+    let successor_target = state.target;
+
+    // An ordinary hidden successor needs hydration on reveal. Its lower
+    // generation and reused IDs must not be mistaken for the frozen source.
+    app.window_width = 1600.0;
+    drop(app.sync_context_overlay_state());
+    assert!(app.workspace_surfaces_visible());
+    successor.deliver_snapshot_for_test(next);
+    let state = app.chat_runtime_mut(successor_target).unwrap();
+    state.refresh();
+    preparation::drain_fixture(state);
+    assert_eq!(state.snapshot.generation, 1);
+    assert_eq!(state.snapshot.items.len(), 1);
+    assert!(!Arc::ptr_eq(&state.snapshot, &frozen));
+    assert!(
+        matches!(&state.snapshot.items[0].content, ItemContent::Text { text, .. } if text == &body)
+    );
+    assert_eq!(state.composer.text(), DRAFT);
+    assert!(state.logical_prose.raw().is_some());
+    assert!(state.logical_prose.request().is_none());
+    assert_eq!(
+        format!("{:?}", state.source_clock),
+        format!("{:?}", successor.resident_snapshot_with_clock().unwrap().1)
+    );
+    assert_eq!(old.snapshot().transcript_bytes(), 0);
+    drop(app.handle_chat_ui(Action::LogicalProseRead(
+        successor_target,
+        copied,
+        Ok("late old-source prose must not enter the successor".into()),
+    )));
+    assert!(
+        matches!(&runtime(&app, card).snapshot.items[0].content, ItemContent::Text { text, .. } if text == &body)
+    );
 }

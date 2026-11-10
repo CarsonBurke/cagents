@@ -374,6 +374,9 @@ fn serve_with<R: Into<crate::terminal_ipc::PreparedResponse>>(
                     operation: crate::agent_execution::Operation::Close(_),
                     ..
                 }
+        ) || matches!(
+            &request,
+            ClientRequest::ChatLostProcesses { end, .. } if !end.is_empty()
         ) {
             match CheckedCloseReply::new(&host, client_id) {
                 Ok(reply) => Some(reply),
@@ -601,6 +604,7 @@ fn ensure_startup_recovery_request(
             | ClientRequest::Authenticate { .. }
             | ClientRequest::CloseTerminalChecked { .. }
             | ClientRequest::ChatCloseRetained { .. }
+            | ClientRequest::ChatLostProcesses { .. }
     );
     let shutdown = matches!(
         request,
@@ -1607,6 +1611,17 @@ fn process_admitted_request(
                 ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
             })?;
             Ok((ServerResponse::Accepted, Vec::new(), false))
+        }
+        ClientRequest::ChatLostProcesses { session, end } => {
+            let processes =
+                super::chat::lost_processes(host, &session, &end).map_err(|message| {
+                    ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
+                })?;
+            Ok((
+                ServerResponse::ChatLostProcesses { processes },
+                Vec::new(),
+                false,
+            ))
         }
         request @ (ClientRequest::ChatStart { .. }
         | ClientRequest::ChatPrepareResume { .. }
