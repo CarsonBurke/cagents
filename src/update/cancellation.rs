@@ -1,4 +1,4 @@
-//! Ctrl-C belongs to the detached update, not only its observing CLI.
+//! Interrupting or terminating the CLI must also cancel its detached update.
 use super::*;
 
 static REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -7,7 +7,10 @@ extern "C" fn interrupt(_: libc::c_int) {
     REQUESTED.store(true, Ordering::Relaxed);
 }
 
-pub(super) struct Interrupt(libc::sigaction);
+pub(super) struct Interrupt {
+    previous_int: libc::sigaction,
+    previous_term: libc::sigaction,
+}
 
 impl Interrupt {
     pub(super) fn install() -> io::Result<Self> {
@@ -16,21 +19,33 @@ impl Interrupt {
         // lock-free atomic. Omitting SA_RESTART also wakes a blocked poll.
         unsafe {
             let mut action: libc::sigaction = std::mem::zeroed();
-            let mut previous = std::mem::zeroed();
+            let mut previous_int = std::mem::zeroed();
+            let mut previous_term = std::mem::zeroed();
             libc::sigemptyset(&mut action.sa_mask);
             action.sa_sigaction = interrupt as *const () as usize;
-            if libc::sigaction(libc::SIGINT, &action, &mut previous) == -1 {
+            if libc::sigaction(libc::SIGINT, &action, &mut previous_int) == -1 {
                 return Err(io::Error::last_os_error());
             }
-            Ok(Self(previous))
+            if libc::sigaction(libc::SIGTERM, &action, &mut previous_term) == -1 {
+                let error = io::Error::last_os_error();
+                libc::sigaction(libc::SIGINT, &previous_int, std::ptr::null_mut());
+                return Err(error);
+            }
+            Ok(Self {
+                previous_int,
+                previous_term,
+            })
         }
     }
 }
 
 impl Drop for Interrupt {
     fn drop(&mut self) {
-        // SAFETY: restore the exact disposition saved by install.
-        unsafe { libc::sigaction(libc::SIGINT, &self.0, std::ptr::null_mut()) };
+        // SAFETY: restore the exact dispositions saved by install.
+        unsafe {
+            libc::sigaction(libc::SIGTERM, &self.previous_term, std::ptr::null_mut());
+            libc::sigaction(libc::SIGINT, &self.previous_int, std::ptr::null_mut());
+        }
     }
 }
 
@@ -107,10 +122,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn sigint_interrupts_review_without_waiting_for_stdin() {
+    fn interrupt_signals_cancel_review_without_waiting_for_stdin() {
         const CHILD: &str = "CAGENTS_TEST_UPDATE_INTERRUPT";
         if let Some(ready) = std::env::var_os(CHILD) {
-            let _interrupt = Interrupt::install().unwrap();
+            // Different prior actions make restoring the wrong signal's saved
+            // disposition observable, without changing the parent test process.
+            let prior_actions = [libc::SIGINT, libc::SIGTERM].map(|signal| unsafe {
+                let mut action: libc::sigaction = std::mem::zeroed();
+                libc::sigemptyset(&mut action.sa_mask);
+                libc::sigaddset(&mut action.sa_mask, libc::SIGUSR1);
+                action.sa_sigaction = if signal == libc::SIGINT {
+                    libc::SIG_IGN
+                } else {
+                    interrupt as *const () as usize
+                };
+                action.sa_flags = libc::SA_RESTART;
+                assert_eq!(libc::sigaction(signal, &action, std::ptr::null_mut()), 0);
+                // Query the kernel representation, which may add flags.
+                assert_eq!(libc::sigaction(signal, std::ptr::null(), &mut action), 0);
+                (signal, action)
+            });
+            let interrupt = Interrupt::install().unwrap();
             let cancellation = CancellationToken::for_terminal();
             let stdin_flags = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_GETFL) };
             fs::write(ready, b"ready").unwrap();
@@ -123,16 +155,30 @@ mod tests {
             assert!(requested());
             assert!(
                 cancellation.cancelled(),
-                "terminal discovery must honor Ctrl-C too"
+                "terminal discovery must honor cancellation signals too"
             );
             assert!(
                 !CancellationToken::new().cancelled(),
                 "unrelated jobs have their own cancellation"
             );
+            drop(interrupt);
+            for (signal, previous) in prior_actions {
+                let restored = unsafe {
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    assert_eq!(libc::sigaction(signal, std::ptr::null(), &mut action), 0);
+                    action
+                };
+                assert_eq!(restored.sa_sigaction, previous.sa_sigaction);
+                assert_eq!(restored.sa_flags, previous.sa_flags);
+                for masked in [libc::SIGINT, libc::SIGTERM, libc::SIGUSR1] {
+                    assert_eq!(
+                        unsafe { libc::sigismember(&restored.sa_mask, masked) },
+                        unsafe { libc::sigismember(&previous.sa_mask, masked) }
+                    );
+                }
+            }
             return;
         }
-        let directory = tempfile::tempdir().unwrap();
-        let ready = directory.path().join("ready");
         struct Child(std::process::Child);
         impl Drop for Child {
             fn drop(&mut self) {
@@ -140,40 +186,44 @@ mod tests {
                 let _ = self.0.wait();
             }
         }
-        let mut fixture = Child(Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "update::cancellation::tests::sigint_interrupts_review_without_waiting_for_stdin",
-                "--nocapture",
-            ])
-            .env(CHILD, &ready)
-            .stdin(Stdio::piped())
-            .spawn()
-            .unwrap());
-        let child = &mut fixture.0;
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !ready.exists() {
-            assert!(
-                Instant::now() < deadline,
-                "child did not install SIGINT handler"
-            );
-            assert!(child.try_wait().unwrap().is_none());
-            thread::sleep(Duration::from_millis(10));
-        }
-        // Only this private child receives a real Ctrl-C equivalent. Its stdin
-        // remains open and empty throughout the test.
-        assert_eq!(unsafe { libc::kill(child.id() as i32, libc::SIGINT) }, 0);
-        loop {
-            if let Some(status) = child.try_wait().unwrap() {
-                assert!(status.success());
-                break;
+        for signal in [libc::SIGINT, libc::SIGTERM] {
+            let directory = tempfile::tempdir().unwrap();
+            let ready = directory.path().join("ready");
+            let mut fixture = Child(Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "update::cancellation::tests::interrupt_signals_cancel_review_without_waiting_for_stdin",
+                    "--nocapture",
+                ])
+                .env(CHILD, &ready)
+                .stdin(Stdio::piped())
+                .spawn()
+                .unwrap());
+            let child = &mut fixture.0;
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "child did not install cancellation handlers"
+                );
+                assert!(child.try_wait().unwrap().is_none());
+                thread::sleep(Duration::from_millis(10));
             }
-            if Instant::now() >= deadline {
-                child.kill().unwrap();
-                child.wait().unwrap();
-                panic!("Ctrl-C did not interrupt the empty stdin wait");
+            // Only this private child receives the signal. Its stdin remains
+            // open and empty throughout the test.
+            assert_eq!(unsafe { libc::kill(child.id() as i32, signal) }, 0);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success(), "signal {signal}: {status}");
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    child.kill().unwrap();
+                    child.wait().unwrap();
+                    panic!("signal {signal} did not interrupt the empty stdin wait");
+                }
+                thread::sleep(Duration::from_millis(10));
             }
-            thread::sleep(Duration::from_millis(10));
         }
     }
 }
