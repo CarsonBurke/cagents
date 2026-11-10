@@ -1404,7 +1404,7 @@ impl Cagents {
                 if self.shared_views.seeding.insert(scope.clone()) {
                     // Only close IDs belonging to this host view. Other views'
                     // tombstones and utility panes are unrelated client state.
-                    let closed = view_indices
+                    let closed: Vec<CardId> = view_indices
                         .get(&scope)
                         .map(|&index| &self.workspace_model.views[index])
                         .map(|view| {
@@ -4539,6 +4539,64 @@ mod tests {
         assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(
             |edit| matches!(edit, ModelEdit::SeedView { scope: seeded, .. } if seeded == scope)
         ));
+    }
+
+    #[test]
+    fn many_matching_populated_views_publish_only_the_genuine_migration() {
+        let (mut app, source, _, template) = channel_move_fixture();
+        let channel_template = app
+            .durable
+            .channels
+            .iter()
+            .find(|channel| channel.id == source)
+            .unwrap()
+            .clone();
+        let model_template = app.workspace_model.channel(source).unwrap().clone();
+        let mut migration = None;
+        for index in 0..97 {
+            let channel_id = ChannelId::new();
+            let mut pane = template.clone();
+            pane.id = CardId::new();
+            pane.title = format!("matching pane {index}");
+            if let CardKind::Browser(browser) = &mut pane.kind {
+                browser.id = BrowserId::new();
+            }
+            let mut card = app.card_state(template.id).unwrap().clone();
+            card.id = pane.id;
+            card.title.clone_from(&pane.title);
+            card.kind.clone_from(&pane.kind);
+            let mut channel = channel_template.clone();
+            channel.id = channel_id;
+            channel.cards = vec![pane.id];
+            channel.focused = Some(pane.id);
+            let durable = Arc::make_mut(&mut app.durable);
+            durable.cards.push(card);
+            durable.channels.push(channel);
+            app.cards.insert(pane.id, CardRuntime::Completed);
+            let mut shared_channel = model_template.clone();
+            shared_channel.id = channel_id;
+            app.workspace_model.channels.push(shared_channel);
+            let mut view = View::empty(channel_id);
+            if index == 96 {
+                migration = Some(view.scope.clone());
+            } else {
+                view.panes.push(pane);
+            }
+            app.workspace_model.views.push(view);
+        }
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        let seeds = std::iter::from_fn(|| rx.try_recv().ok())
+            .filter_map(|edit| {
+                if let ModelEdit::SeedView { scope, .. } = edit {
+                    Some(scope)
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(seeds, [migration.unwrap()]);
     }
 
     #[test]
