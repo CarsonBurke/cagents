@@ -308,14 +308,6 @@ pub(super) fn served_before_retire(
     }
 }
 
-/// Whether an endpoint is accepting connections, without changing its entry.
-/// Unreadable or non-socket evidence never grants a join-only preparation.
-pub(super) fn listening(endpoint: &Path) -> bool {
-    std::fs::metadata(endpoint).is_ok_and(|bound| {
-        bound.file_type().is_socket() && socket::connect(endpoint, bound.dev(), bound.ino()).is_ok()
-    })
-}
-
 /// Whether nothing can be serving at an endpoint this conversation does not own.
 ///
 /// Such an endpoint, like an account's shared daemon or another conversation's
@@ -709,7 +701,6 @@ mod tests {
         let (_root, allocation, runtime) = directories();
         let socket = allocation.join("app-server-control.sock");
         assert!(stopped(&socket));
-        assert!(!listening(&socket));
 
         drop(UnixListener::bind(&socket).unwrap());
         assert!(stopped(&socket));
@@ -721,11 +712,9 @@ mod tests {
 
         let _listening = UnixListener::bind(&socket).unwrap();
         assert!(!stopped(&socket));
-        assert!(listening(&socket));
 
         let file = runtime.join("not-a-socket");
         std::fs::write(&file, b"").unwrap();
         assert!(!stopped(&file));
-        assert!(!listening(&file));
     }
 }

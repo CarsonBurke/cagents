@@ -1544,7 +1544,11 @@ fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool
     let Some(shared) = chat::protocol::codex::shared_daemon_socket(&process_launch) else {
         return Ok(false);
     };
-    if !owned_listener::listening(&shared) {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Ok(endpoint) = std::fs::metadata(&shared) else {
+        return Ok(false);
+    };
+    if !endpoint.file_type().is_socket() {
         return Ok(false);
     }
     // Preserve Start's recorded-selector, effective account and directory
@@ -1572,15 +1576,32 @@ fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool
         &process_launch.recipe.unset_environment,
         false,
     )?;
-    if let Err(failure) = chat::protocol::codex::create(&process_launch) {
-        // A service disappearing during preparation grants no exemption from
-        // the normal ended-execution and writer proof below.
-        if !owned_listener::listening(&shared) {
-            return Ok(false);
+    let (spec, _adapter) = match chat::protocol::codex::create(&process_launch) {
+        Ok(created) => created,
+        Err(failure) => {
+            // A changed or disappearing endpoint grants no exemption from the
+            // normal ended-execution and writer proof below.
+            if !std::fs::metadata(&shared).is_ok_and(|now| {
+                now.file_type().is_socket()
+                    && now.dev() == endpoint.dev()
+                    && now.ino() == endpoint.ino()
+            }) {
+                return Ok(false);
+            }
+            return Err(error(failure));
         }
-        return Err(error(failure));
-    }
-    Ok(true)
+    };
+    // Use the constructor's verified transport, including its short symlink
+    // alias for a published path longer than sockaddr_un permits. Keep the
+    // adapter alive until the probe finishes: its Drop owns that alias.
+    Ok(match &spec.transport {
+        chat::protocol::TransportSpec::UnixWebSocket {
+            socket,
+            device,
+            inode,
+        } => crate::agent::observe::socket::connect(socket, *device, *inode).is_ok(),
+        _ => false,
+    })
 }
 
 /// Read the same execution evidence for restart and picker preparation, so

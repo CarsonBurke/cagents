@@ -351,6 +351,83 @@ fn a_reopened_codex_thread_joins_the_shared_daemon_serving_it() {
 }
 
 #[test]
+fn a_reopened_codex_thread_joins_a_long_published_shared_endpoint() {
+    const NAME: &str = "host::chat::unserved_resume_tests::a_reopened_codex_thread_joins_a_long_published_shared_endpoint";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    install_codex(&root);
+    let home = root.join("long-account-directory-".repeat(6));
+    let _writer = ThreadWriter::hold(&home);
+    let control = home.join("app-server-control");
+    std::fs::create_dir_all(&control).unwrap();
+    let published = control.join("app-server-control.sock");
+    assert!(published.as_os_str().as_encoded_bytes().len() >= 108);
+    let actual = tempfile::tempdir_in("/tmp").unwrap();
+    let socket = actual.path().join("server.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    std::os::unix::fs::symlink(&socket, &published).unwrap();
+    let before = std::fs::symlink_metadata(&published).unwrap();
+    let before_target = std::fs::metadata(&published).unwrap();
+    let (methods, received) = mpsc::channel();
+    let server = thread::spawn(move || serve(listener, home, methods));
+    host.lock().unwrap().register_client(1);
+    let mut requested = reopened(&root);
+    requested.launch.recipe.environment.insert(
+        "CODEX_HOME".into(),
+        control.parent().unwrap().to_str().unwrap().into(),
+    );
+    let ServerResponse::ChatResumePrepared { session: prepared } = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: requested.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected the exact shared join")
+    };
+    assert_eq!(
+        prepared, requested,
+        "long-path preparation preserves the entire descriptor"
+    );
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    let session = started(
+        process(
+            &host,
+            1,
+            ClientRequest::ChatStart {
+                session: prepared,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap(),
+    );
+    resumed(&received);
+    assert!(!session.owns_codex_listener());
+    assert_eq!(session.launch.recipe, requested.launch.recipe);
+    assert!(
+        !root.join("codex-arguments").exists(),
+        "a long published endpoint is joined without a private server"
+    );
+    let after = std::fs::symlink_metadata(&published).unwrap();
+    let after_target = std::fs::metadata(&published).unwrap();
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+    assert_eq!(
+        (before_target.dev(), before_target.ino()),
+        (after_target.dev(), after_target.ino())
+    );
+    crate::host::finish_chat_shutdown(&host).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
 fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
     const NAME: &str = "host::chat::unserved_resume_tests::a_prepared_codex_resume_rechecks_the_shared_service_before_starting";
     if isolated(NAME).is_some() {
