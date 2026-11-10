@@ -1,0 +1,560 @@
+#!/usr/bin/python3
+"""Batch pinned pull requests through the three isolated Cargo merge checks."""
+
+import argparse
+from contextlib import contextmanager
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+import fcntl
+import json
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+import time
+import uuid
+
+
+CODES = {"merged": 0, "conflict": 2, "lane-failure": 3, "ci-not-green": 4,
+         "head-moved": 5, "pr-closed": 6, "tree-mismatch": 7, "runner-error": 8}
+POLL_SECONDS = 120
+QUERY = """query($owner:String!,$name:String!,$number:Int!) {
+  repository(owner:$owner,name:$name) { pullRequest(number:$number) {
+    state headRefOid baseRefName isDraft
+    commits(last:1) { nodes { commit { oid statusCheckRollup {
+      state contexts(first:100) { pageInfo { hasNextPage } nodes {
+        __typename ... on CheckRun { status conclusion }
+        ... on StatusContext { state }
+      } }
+    } } } }
+  } }
+}"""
+
+
+class QueueError(Exception):
+    pass
+
+
+class MainMoved(Exception):
+    pass
+
+
+def command(args, cwd, *, check=True, env=None):
+    result = subprocess.run(args, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, errors="replace")
+    if check and result.returncode:
+        raise QueueError(f"{args[0]} exited {result.returncode}: {result.stdout[-4000:]}")
+    return result
+
+
+class Queue:
+    def __init__(self):
+        self.root = Path(command(["git", "rev-parse", "--show-toplevel"], Path.cwd()).stdout.strip())
+        self.common = Path(command(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                   self.root).stdout.strip())
+        self.directory = self.common / "merge-queue"
+        self.directory.mkdir(mode=0o700, exist_ok=True)
+        self.path = self.directory / "state.json"
+        self.results = {}
+
+    @contextmanager
+    def state(self):
+        with (self.directory / "state.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            previous = self.path.read_text() if self.path.exists() else None
+            state = json.loads(previous) if previous is not None else {
+                "requests": [], "batch": None, "alert": None, "api": {}}
+            yield state
+            serialized = json.dumps(state, indent=2)
+            if serialized == previous:
+                return
+            temporary = self.path.with_suffix(".new")
+            with temporary.open("w") as file:
+                file.write(serialized)
+                file.flush()
+                os.fsync(file.fileno())
+            temporary.replace(self.path)
+            directory_fd = os.open(self.directory, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+
+    def repository(self):
+        remote = command(["git", "remote", "get-url", "origin"], self.root).stdout.strip()
+        match = re.fullmatch(r"(?:https://github\.com/|git@github\.com:|ssh://git@github\.com/)([^/]+/[^/]+?)(?:\.git)?", remote)
+        if not match:
+            raise QueueError("origin must identify a github.com OWNER/REPO repository")
+        return match[1]
+
+    def log(self, message):
+        print(f"{datetime.now(timezone.utc).isoformat()} {message}", flush=True)
+
+    def api(self, arguments, before_attempt=None):
+        """Keep server-directed cooldowns across restarts, including Retry-After."""
+        while True:
+            with self.state() as state:
+                delay = state.get("retry_at", 0) - time.time()
+            if delay > 0:
+                time.sleep(delay)
+            if before_attempt:
+                before_attempt()
+            result = command(["gh", "api", "--include", *arguments], self.root, check=False)
+            # gh --include emits HTTP headers for success and error responses.
+            raw = result.stdout.replace("\r\n", "\n")
+            headers = {}
+            while raw.startswith("HTTP/"):
+                header, _, raw = raw.partition("\n\n")
+                headers.update({key.lower(): value.strip() for line in header.splitlines()[1:]
+                                if ":" in line for key, value in [line.split(":", 1)]})
+            try:
+                data = json.JSONDecoder().raw_decode(raw.lstrip())[0]
+            except ValueError:
+                data = {}
+            limited = ("retry-after" in headers or headers.get("x-ratelimit-remaining") == "0"
+                       or "rate limit" in raw.lower())
+            if limited and (result.returncode or data.get("errors")):
+                retry = headers.get("retry-after")
+                if retry:
+                    try:
+                        until = time.time() + float(retry)
+                    except ValueError:
+                        until = parsedate_to_datetime(retry).timestamp()
+                elif headers.get("x-ratelimit-reset"):
+                    until = float(headers["x-ratelimit-reset"]) + 1
+                else:
+                    limits = command(["gh", "api", "rate_limit"], self.root)
+                    resource = "graphql" if arguments[0] == "graphql" else "core"
+                    until = json.loads(limits.stdout)["resources"][resource]["reset"] + 1
+                with self.state() as state:
+                    state["retry_at"] = max(time.time() + POLL_SECONDS, until)
+                self.log(f"GitHub rate limited; retry after {until}")
+                continue
+            if result.returncode and "PUT" in arguments and "409" in result.stdout:
+                return {"merged": False, "head_moved": True, "message": raw[-4000:]}
+            if result.returncode or data.get("errors"):
+                raise QueueError(f"GitHub request failed: {raw[-4000:]}")
+            return data
+
+    def pr(self, number):
+        # Enqueue and runner share the same cache and per-PR lock: one aggregate
+        # lookup per two minutes even when many stewards enqueue the same PR.
+        with (self.directory / f"pr-{number}.lock").open("a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with self.state() as state:
+                cached = state["api"].get(str(number))
+            if cached and time.time() - cached["at"] < POLL_SECONDS:
+                return cached["data"]
+            owner, name = self.repository().split("/")
+            data = self.api(["graphql", "-f", f"query={QUERY}", "-f", f"owner={owner}",
+                             "-f", f"name={name}", "-F", f"number={number}"])
+            pr = data["data"]["repository"]["pullRequest"]
+            if pr is None:
+                raise QueueError(f"PR #{number} does not exist")
+            with self.state() as state:
+                state["api"][str(number)] = {"at": time.time(), "data": pr}
+            return pr
+
+    def start(self, state):
+        if state["alert"]:
+            raise QueueError(f"queue halted: {state['alert']}")
+        lock = (self.directory / "runner.lock").open("a")
+        try:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return
+            # Transfer the already held flock to the detached runner. Starting and
+            # relinquishing ownership both happen under state.lock (no lost wakeup).
+            with (self.directory / "runner.log").open("a") as log:
+                subprocess.Popen([sys.executable, str(Path(__file__).resolve()), "_run",
+                                  "--lock-fd", str(lock.fileno())], cwd=self.root,
+                                 stdin=subprocess.DEVNULL, stdout=log, stderr=log,
+                                 start_new_session=True, pass_fds=(lock.fileno(),))
+        finally:
+            lock.close()
+
+    def enqueue(self, number, sha):
+        sha = sha or self.pr(number)["headRefOid"]
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            raise QueueError("--sha must be a full 40-character lowercase commit SHA")
+        with self.state() as state:
+            if state["alert"]:
+                raise QueueError(f"queue halted: {state['alert']}")
+            active = next((r for r in state["requests"] if r["pr"] == number and not r.get("outcome")), None)
+            if active and active["sha"] != sha:
+                raise QueueError(f"PR #{number} already has an active request at {active['sha']}")
+            if not active:
+                active = {"id": uuid.uuid4().hex, "pr": number, "sha": sha,
+                          "queued_at": time.time(), "phase": "pending"}
+                state["requests"].append(active)
+            self.start(state)
+        print(f"queued #{number} {sha} request={active['id']}")
+
+    def finish(self, request, outcome, detail):
+        # Publish together only after verification, so no waiter can report
+        # success (or a rejection) before a later write reveals a tree mismatch.
+        self.results[request["id"]] = {"outcome": outcome, "detail": detail, "phase": "finished"}
+        self.log(f"#{request['pr']} {outcome}: {detail}")
+
+    def eligible(self, request):
+        pr = self.pr(request["pr"])
+        if pr["state"] != "OPEN":
+            return "pr-closed", f"PR state is {pr['state']}"
+        if pr["headRefOid"] != request["sha"]:
+            return "head-moved", f"requested {request['sha']}; current {pr['headRefOid']}"
+        if pr["baseRefName"] != "main" or pr["isDraft"]:
+            return "ci-not-green", "PR must be ready for review and target main"
+        nodes = pr["commits"]["nodes"]
+        if nodes and nodes[-1]["commit"]["oid"] != request["sha"]:
+            return "head-moved", "CI commit differs from the requested PR head"
+        rollup = nodes[-1]["commit"]["statusCheckRollup"] if nodes else None
+        if not rollup or rollup["state"] != "SUCCESS":
+            return "ci-not-green", "CI missing, pending or unsuccessful"
+        contexts = rollup["contexts"]
+        if contexts["pageInfo"]["hasNextPage"] or not contexts["nodes"]:
+            return "ci-not-green", "CI evidence incomplete (empty or more than 100 contexts)"
+        for context in contexts["nodes"]:
+            if context["__typename"] == "CheckRun":
+                green = context["status"] == "COMPLETED" and context["conclusion"] in ("SUCCESS", "NEUTRAL", "SKIPPED")
+            else:
+                green = context["state"] == "SUCCESS"
+            if not green:
+                return "ci-not-green", f"CI not complete and successful: {context}"
+        return None
+
+    def fetch_main(self):
+        command(["git", "fetch", "--quiet", "origin", "+refs/heads/main:refs/remotes/origin/main"], self.root)
+        return command(["git", "rev-parse", "origin/main"], self.root).stdout.strip()
+
+    def run(self, lock_fd):
+        lease = os.fstat(lock_fd)
+        expected = (self.directory / "runner.lock").stat()
+        if (lease.st_dev, lease.st_ino) != (expected.st_dev, expected.st_ino):
+            raise QueueError("runner requires its own inherited lease")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        self.worktree = self.common.parent / ".worktrees" / "merge-queue-batch"
+        self.worktree.parent.mkdir(exist_ok=True)
+        self.worktree_ready = False
+        self.attempt = 0
+        self.lock_fd = lock_fd
+        self.passed_trees = set()
+        scratch = self.directory / "scratch"
+        scratch.mkdir(exist_ok=True)
+        self.env = os.environ | {"TMPDIR": str(scratch), "GIT_MERGE_AUTOEDIT": "no"}
+        try:
+            with self.state() as state:
+                # A killed runner never silently retries a possibly committed PUT.
+                interrupted = state["batch"]
+                if interrupted:
+                    for record in state["requests"]:
+                        if record["id"] in interrupted["ids"] and not record.get("outcome"):
+                            record.update(outcome="runner-error", phase="finished",
+                                          detail="runner interrupted; inspect logs and remote before re-enqueueing")
+                    state["batch"] = None
+            if self.worktree.exists():
+                command(["git", "worktree", "remove", "--force", str(self.worktree)], self.root)
+            while True:
+                with self.state() as state:
+                    pending = [dict(r) for r in state["requests"] if not r.get("outcome")]
+                    if not pending or state["alert"]:
+                        state["batch"] = None
+                        # Cleanup while still owning the runner lock. Otherwise a
+                        # new runner could use a worktree the old runner removes.
+                        if self.worktree_ready:
+                            command(["git", "worktree", "remove", "--force", str(self.worktree)], self.root)
+                            self.worktree_ready = False
+                        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+                        return
+                    batch_id = uuid.uuid4().hex
+                    state["batch"] = {"id": batch_id, "ids": [r["id"] for r in pending],
+                                      "prs": [r["pr"] for r in pending], "phase": "preflight", "pid": os.getpid()}
+                    for r in state["requests"]:
+                        if r["id"] in state["batch"]["ids"]:
+                            r["phase"] = "running"
+                self.results = {}
+                try:
+                    self.batch(pending)
+                except Exception as error:
+                    self.log(f"RUNNER ERROR: {error}")
+                    for record in pending:
+                        if record["id"] not in self.results:
+                            self.finish(record, "runner-error", str(error))
+                with self.state() as state:
+                    for record in state["requests"]:
+                        if record["id"] in self.results:
+                            record.update(self.results[record["id"]])
+                    state["batch"] = None
+        finally:
+            if self.worktree_ready:
+                command(["git", "worktree", "remove", "--force", str(self.worktree)], self.root, check=False)
+            os.close(lock_fd)
+
+    def phase(self, **fields):
+        with self.state() as state:
+            state["batch"].update(fields)
+
+    def assemble(self, base, requests):
+        if not self.worktree_ready:
+            # Recover only our own fixed detached checkout, never a steward's tree.
+            if self.worktree.exists():
+                command(["git", "worktree", "remove", "--force", str(self.worktree)], self.root)
+            command(["git", "worktree", "add", "--quiet", "--detach", str(self.worktree), base], self.root)
+            self.worktree_ready = True
+        command(["git", "reset", "--hard", base], self.worktree)
+        accepted, rejected = [], []
+        self.prefix_trees = {}
+        for request in requests:
+            result = command(["git", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+                              "merge", "--no-ff", "--no-edit", "-m", f"Queue PR #{request['pr']}",
+                              request["sha"]], self.worktree, check=False, env=self.env)
+            if result.returncode:
+                unmerged = command(["git", "ls-files", "--unmerged"], self.worktree).stdout
+                command(["git", "merge", "--abort"], self.worktree, check=False)
+                # Hooks, identity errors and disk failures are not PR conflicts.
+                if not unmerged:
+                    raise QueueError(result.stdout)
+                rejected.append((request, "conflict", result.stdout[:2000]))
+            else:
+                accepted.append(request)
+                self.prefix_trees[request["id"]] = self.git("HEAD^{tree}")
+        return accepted, rejected
+
+    def lanes(self):
+        self.attempt += 1
+        tree = self.git("HEAD^{tree}")
+        for lane, features in (("cli", []), ("host", ["--features", "host"]), ("ui", ["--features", "ui"])):
+            log_path = self.directory / f"lane-{self.batch_id}-{self.attempt}-{lane}.log"
+            self.phase(phase="checking", lane=lane, log=str(log_path),
+                       tested_head=self.git("HEAD"), tested_tree=self.git("HEAD^{tree}"))
+            with log_path.open("w") as log:
+                result = subprocess.run(["scripts/cargo-gate", "check", "--locked", "--no-default-features",
+                                         "--all-targets", *features], cwd=self.worktree, env=self.env,
+                                        stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
+                                        pass_fds=(self.lock_fd,))
+            if result.returncode:
+                errors, first = [], []
+                with log_path.open(errors="replace") as log:
+                    for line in log:
+                        line = line.rstrip()
+                        if len(first) < 12:
+                            first.append(line)
+                        if line.lstrip().startswith("error"):
+                            errors.append(line)
+                            if len(errors) == 12:
+                                break
+                return f"{lane} lane failed ({log_path}):\n" + "\n".join(errors or first)
+        if self.git("HEAD^{tree}") != tree or command(
+                ["git", "status", "--porcelain", "--untracked-files=normal"], self.worktree).stdout.strip():
+            raise QueueError("build changed the tested checkout; refusing an untested tree")
+        self.passed_trees.add(tree)
+        return None
+
+    def git(self, revision):
+        return command(["git", "rev-parse", revision], self.worktree).stdout.strip()
+
+    def isolate(self, base, prefix, candidates, *, tested=False, known_error=None):
+        """Halve failures against a passing prefix; validate the retained union.
+
+        When both halves fail, one bounded complement sweep can preserve PRs
+        that only build together. Attribution is against the retained group;
+        arbitrary nonmonotonic failures have no unique independent culprit.
+        """
+        combined, conflicts = self.assemble(base, prefix + candidates)
+        error = known_error if tested else self.lanes()
+        if not error:
+            return combined, conflicts
+        if len(candidates) == 1:
+            return prefix, conflicts + [(candidates[0], "lane-failure", error)]
+        middle = (len(candidates) + 1) // 2
+        first, second = candidates[:middle], candidates[middle:]
+        self.assemble(base, prefix + first)
+        first_error = self.lanes()
+        if first_error and self.complement_budget and len(candidates) > 2:
+            self.assemble(base, prefix + second)
+            if self.lanes():
+                # A failed half might merely be missing a cooperating PR in
+                # the other half. Try full-group-minus-one before blaming it.
+                # At most one linear sweep per failed batch bounds extra work.
+                self.complement_budget = False
+                for omitted in candidates:
+                    retained, rejected = self.assemble(
+                        base, prefix + [r for r in candidates if r != omitted])
+                    if not self.lanes() and not rejected:
+                        return retained, [(omitted, "lane-failure", error)]
+        left, left_rejected = self.isolate(base, prefix, first, tested=True, known_error=first_error)
+        right, right_rejected = self.isolate(base, left, second)
+        return right, left_rejected + right_rejected
+
+    def batch(self, requests):
+        with self.state() as state:
+            self.batch_id = state["batch"]["id"]
+        while requests:
+            base = self.fetch_main()
+            eligible = []
+            for request in requests:
+                rejection = self.eligible(request)
+                if rejection:
+                    self.finish(request, *rejection)
+                else:
+                    command(["git", "fetch", "--quiet", "origin", request["sha"]], self.root)
+                    eligible.append(request)
+            if not eligible:
+                return
+            self.phase(base=base, phase="assembling")
+            accepted, rejected = self.assemble(base, eligible)
+            if not accepted:
+                for rejection in rejected:
+                    self.finish(*rejection)
+                return
+            failure = self.lanes()
+            if failure:
+                # A broken base or build host isn't evidence against any PR.
+                self.assemble(base, [])
+                baseline = self.lanes()
+                if baseline:
+                    raise QueueError(f"origin/main baseline fails; no PR attribution:\n{baseline}")
+                self.complement_budget = True
+                accepted, isolated = self.isolate(base, [], accepted, tested=True, known_error=failure)
+                rejected += isolated
+            # Reassemble and retest if the base changed during any check. Do not
+            # publish tentative conflict/lane attribution against an obsolete base.
+            if self.fetch_main() != base:
+                self.log("origin/main moved; rebuilding the batch")
+                requests = eligible
+                continue
+            for rejection in rejected:
+                self.finish(*rejection)
+            if not accepted:
+                return
+            # isolate() can leave its final failed singleton checked out.
+            rebuilt, conflicts = self.assemble(base, accepted)
+            if rebuilt != accepted or conflicts:
+                raise QueueError("final assembly differs from the validated group")
+            tree = self.git("HEAD^{tree}")
+            if tree not in self.passed_trees:
+                raise QueueError(f"final tree {tree} has not passed all three lanes")
+            self.phase(phase="merging", tested_tree=tree, prs=[r["pr"] for r in accepted])
+            changed = []
+            for request in accepted:
+                rejection = self.eligible(request)
+                if rejection:
+                    self.finish(request, *rejection)
+                    changed.append(request)
+            if changed:
+                requests = [r for r in accepted if r not in changed]
+                continue
+            # Pin SHA at the write. A PR moving after preflight cannot be merged.
+            expected_main = base
+            prefixes = dict(self.prefix_trees)
+            for index, request in enumerate(accepted):
+                def verify_base():
+                    if self.fetch_main() != expected_main:
+                        raise MainMoved()
+
+                try:
+                    response = self.api([
+                        "-X", "PUT", f"repos/{self.repository()}/pulls/{request['pr']}/merge",
+                        "-f", "merge_method=merge", "-f", f"sha={request['sha']}"],
+                        before_attempt=verify_base)
+                except MainMoved:
+                    requests = accepted[index:]
+                    break
+                if response.get("head_moved"):
+                    self.finish(request, "head-moved", response["message"])
+                    requests = accepted[index + 1:]
+                    break
+                if not response.get("merged"):
+                    raise QueueError(f"merge refused for #{request['pr']}: {response}")
+                with (self.directory / f"pr-{request['pr']}.lock").open("a") as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    with self.state() as state:
+                        cached = state["api"].get(str(request["pr"]))
+                        if cached:
+                            cached["data"]["state"] = "MERGED"
+                actual = self.fetch_main()
+                actual_tree = command(["git", "rev-parse", f"{actual}^{{tree}}"], self.root).stdout.strip()
+                expected_tree = prefixes[request["id"]]
+                if actual_tree != expected_tree:
+                    alert = (f"TREE MISMATCH: batch tested tree {tree}; expected merged prefix {expected_tree}, "
+                             f"main {actual} tree {actual_tree}; stop merging and investigate")
+                    with self.state() as state:
+                        state["alert"] = alert
+                        for record in state["requests"]:
+                            if record["id"] in state["batch"]["ids"] or not record.get("outcome"):
+                                self.results[record["id"]] = {
+                                    "outcome": "tree-mismatch", "detail": alert, "phase": "finished"}
+                    self.log(alert)
+                    return
+                self.finish(request, "merged", f"verified main {actual}; batch tested tree {tree}")
+                expected_main = actual
+                if actual != response["sha"]:
+                    # Even an empty intervening commit changes the base. Build
+                    # the remainder again instead of extending an obsolete head.
+                    requests = accepted[index + 1:]
+                    break
+            else:
+                requests = []
+
+    def wait(self, number):
+        request_id = None
+        while True:
+            with self.state() as state:
+                records = [r for r in state["requests"] if r["pr"] == number]
+                if not records:
+                    raise QueueError(f"no request for PR #{number}")
+                request_id = request_id or records[-1]["id"]
+                record = next(r for r in records if r["id"] == request_id)
+                if record.get("outcome"):
+                    print(f"#{number} {record['sha']} {record['outcome']}: {record['detail']}")
+                    return CODES[record["outcome"]]
+                self.start(state)
+            time.sleep(0.5)
+
+    def status(self):
+        with self.state() as state:
+            print(f"state: {self.directory}")
+            if state["alert"]:
+                print(state["alert"])
+            print("batch: " + json.dumps(state["batch"], sort_keys=True))
+            for record in state["requests"]:
+                print(f"#{record['pr']} {record['sha']} {record.get('outcome', record['phase'])} request={record['id']}")
+                if record.get("detail"):
+                    print(f"  {record['detail']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    internal = sys.argv[1:2] == ["_run"]
+    if internal:
+        parser.add_argument("command", choices=["_run"])
+        parser.add_argument("--lock-fd", type=int, required=True)
+        args = parser.parse_args()
+        Queue().run(args.lock_fd)
+        return 0
+    commands = parser.add_subparsers(dest="command", required=True)
+    enqueue = commands.add_parser("enqueue", help="enqueue and start a detached runner")
+    enqueue.add_argument("pr", type=int)
+    enqueue.add_argument("--sha")
+    wait = commands.add_parser("wait", help="wait for the latest request for a PR")
+    wait.add_argument("pr", type=int)
+    commands.add_parser("status", help="show requests, current batch and persistent alerts")
+    args = parser.parse_args()
+    try:
+        queue = Queue()
+        if args.command == "enqueue":
+            queue.enqueue(args.pr, args.sha)
+        elif args.command == "wait":
+            return queue.wait(args.pr)
+        elif args.command == "status":
+            queue.status()
+    except (QueueError, OSError, ValueError, KeyError) as error:
+        print(f"merge-queue: {error}", file=sys.stderr)
+        return 8
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
