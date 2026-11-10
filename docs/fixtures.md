@@ -136,6 +136,17 @@ shows as connected to GitHub only when its checkout has a github.com remote,
 so add one: `git remote add origin https://github.com/OWNER/NAME`. The fixture
 sets `GIT_ALLOW_PROTOCOL=file`, so Git never fetches from or pushes to it.
 
+The named `SidebarPullRequests` and `SidebarHistory` GraphQL queries use seeded
+rows too. The open query computes the aggregate check state from the seed's
+`statusCheckRollup`; history omits checks. This exercises the native sidebar's
+actual query and decoder without a GitHub account.
+
+For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
+appends epoch time, parent PID and operation label to
+`home/.config/fixture-forge-requests.tsv`. Authored listing labels include their
+author and repository, so daemon Work polling can be counted separately from
+sidebar and branch lookups. No query bodies or variables are recorded.
+
 Whether or not the switch is on, the fixture's `curl` always fails and Git
 reaches only local paths, so a step cannot download a file or clone over https;
 copy what it needs from the host's disk instead.

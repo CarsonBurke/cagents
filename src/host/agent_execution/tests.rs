@@ -2763,6 +2763,14 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         );
         let entry = processes.join(provider.pid.to_string());
         std::os::unix::fs::symlink(format!("/proc/{}", provider.pid), &entry).unwrap();
+        let providers = host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(providers.len(), 1);
         let control_gate = host.lock().unwrap().control_gate.clone();
         let control = control_gate.write().unwrap();
         let capability = host
@@ -2777,6 +2785,9 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         super::super::finish_chat_shutdown(&host).unwrap();
         for terminal in shutdown {
             let _ = terminal.shutdown();
+        }
+        for handle in providers {
+            assert!(handle.is_completed(), "the provider teardown must complete");
         }
         // Removal is justified by this original process's actual retirement,
         // not by assuming that shutdown succeeded or by hiding it from the
@@ -2814,7 +2825,7 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         state.install_model(Registry::at(&path).unwrap());
         let successor = Arc::new(crate::host::state::HostLock::new(state));
         assert!(
-            crate::host::state::restore_upgrade_with_processes_for_test(&successor, &processes)
+            crate::host::state::restore_upgrade_with_process_fixture(&successor, &processes)
                 .unwrap()
                 .is_empty()
         );

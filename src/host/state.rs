@@ -2970,10 +2970,10 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
     )
 }
 
-/// Service fixtures inspect real kernel data for their own processes rather
-/// than unrelated processes running beside them on the test host.
+/// Lifecycle fixtures inspect real kernel data for their owned process roster
+/// and prove provider retirement without unrelated protected host processes.
 #[cfg(test)]
-pub(in crate::host) fn restore_upgrade_with_processes_for_test(
+pub(in crate::host) fn restore_upgrade_with_process_fixture(
     host: &SharedHost,
     processes: &std::path::Path,
 ) -> Result<Vec<TerminalId>, String> {

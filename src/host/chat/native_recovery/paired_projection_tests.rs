@@ -22,6 +22,60 @@ const SELECTOR: &str = "CAGENTS_PAIRED_PROJECTION_SELECTOR";
 const CLIENT: u64 = 7;
 const THREAD: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
+/// A saved descriptor may predate the provider's durable confirmation. Its
+/// live holder must take ChatStart through adoption before any restart proof.
+#[test]
+fn codex_start_restores_this_boot_holder_found_by_has_native_owner() {
+    if isolated("codex_start_restores_this_boot_holder_found_by_has_native_owner") {
+        return;
+    }
+    let fixture = Fixture::new();
+    let source = fixture
+        .original
+        .previous_sources
+        .iter()
+        .find(|source| !source.native_continuity.retains_provider())
+        .expect("the holder retained its preconfirmation descriptor")
+        .clone();
+    assert!(!source.native_continuity.retains_provider());
+    assert_eq!(
+        source.proof.as_ref().unwrap().boot_id,
+        fixture.proof.boot_id
+    );
+    assert!(crate::host::chat::has_native_owner(&source).unwrap());
+    let ServerResponse::ChatAttached { session, snapshot } = crate::host::chat::process(
+        &fixture.host,
+        CLIENT,
+        ClientRequest::ChatStart {
+            session: source,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap() else {
+        panic!("live holder was not restored by ChatStart");
+    };
+    assert_eq!(session.id, fixture.source.id);
+    assert_eq!(session.launch.session_id.as_deref(), Some(THREAD));
+    assert_eq!(snapshot.session_id.as_deref(), Some(THREAD));
+    let actor = fixture.host.lock().unwrap().chats[&session.id]
+        .handle
+        .clone();
+    wait_durable(&actor);
+    fixture.assert_one_provider();
+    // The adopted control stream owns the holder until it is preserved; let
+    // go before opening a separate read-only inspection connection.
+    actor.preserve_for_restart().unwrap();
+    let (recovery, exited) =
+        crate::chat::native_holder::inspect(&fixture.native, &fixture.proof).unwrap();
+    assert!(!exited);
+    assert_eq!(recovery.server_process, fixture.original.server_process);
+    assert_eq!(recovery.server_identity, fixture.original.server_identity);
+    assert!(fixture.native.holder.is_current());
+    assert!(fixture.native.root.is_current());
+}
+
 #[test]
 fn current_projection_rebinds_real_paired_native_owner_without_relaunch() {
     if isolated("current_projection_rebinds_real_paired_native_owner_without_relaunch") {

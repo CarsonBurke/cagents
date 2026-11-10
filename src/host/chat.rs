@@ -909,7 +909,24 @@ pub(super) fn has_native_owner(session: &Session) -> Result<bool, ProtocolError>
     }
     use crate::daemon::holder_registry::{self as registry, Kind};
     let directory = registry::directory(Kind::Native).map_err(retryable_unavailable)?;
-    registry::recovery_candidate(&registry::socket(&directory, session.id), Kind::Native)
+    let socket = registry::socket(&directory, session.id);
+    if session.launch.provider == Provider::Codex {
+        let record = registry::execution_record(&socket).map_err(|failure| {
+            retryable_unavailable(format!("Cannot read holder record: {failure}"))
+        })?;
+        if let Some(record) = record {
+            let boot = crate::daemon::read_boot_id().map_err(|error| {
+                retryable_unavailable(format!("Cannot read kernel boot: {error}"))
+            })?;
+            if !record.boot.as_str().is_empty() && record.boot != boot
+                || chat::runtime::codex_execution_abandoned(&record.holder, &record.root)
+                    .map_err(retryable_unavailable)?
+            {
+                return Ok(false);
+            }
+        }
+    }
+    registry::recovery_candidate(&socket, Kind::Native)
         // Unsupported retained protocols still own this allocation. Discovery
         // fences launch; only authenticated recovery may interpret its version.
         .map(|record| record.is_some())
@@ -982,6 +999,36 @@ fn reserve_quiet_allocation(
     session: &Session,
     console: Option<&crate::model::TerminalSession>,
 ) -> Result<capacity::Reservation, ()> {
+    let fence = reserve_unhosted_allocation(host, session, console)?;
+    let terminals = session
+        .terminal
+        .iter()
+        .chain(console)
+        .map(|terminal| terminal.id)
+        .collect::<Vec<_>>();
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    let terminal_owner = |id: &TerminalId| {
+        registry::directory(Kind::Terminal)
+            .and_then(|directory| {
+                registry::recovery_candidate(&registry::socket(&directory, *id), Kind::Terminal)
+            })
+            // An unreadable record still claims the terminal.
+            .map_or(true, |record| record.is_some())
+    };
+    if has_native_owner(session).unwrap_or(true) || terminals.iter().any(terminal_owner) {
+        return Err(());
+    }
+    Ok(fence)
+}
+
+/// Reserve before execution inspection. In-memory owners, pending transitions
+/// and terminals still fence the allocation; the caller must classify kernel
+/// and registry evidence before treating this reservation as an ended pane.
+fn reserve_unhosted_allocation(
+    host: &SharedHost,
+    session: &Session,
+    console: Option<&crate::model::TerminalSession>,
+) -> Result<capacity::Reservation, ()> {
     let mut terminals: Vec<TerminalId> = session
         .terminal
         .iter()
@@ -1002,18 +1049,6 @@ fn reserve_quiet_allocation(
         }
         capacity::Reservation::closing(host, &mut state, session).map_err(|_| ())?
     };
-    use crate::daemon::holder_registry::{self as registry, Kind};
-    let terminal_owner = |id: &TerminalId| {
-        registry::directory(Kind::Terminal)
-            .and_then(|directory| {
-                registry::recovery_candidate(&registry::socket(&directory, *id), Kind::Terminal)
-            })
-            // An unreadable record still claims the terminal.
-            .map_or(true, |record| record.is_some())
-    };
-    if has_native_owner(session).unwrap_or(true) || terminals.iter().any(terminal_owner) {
-        return Err(());
-    }
     Ok(fence)
 }
 
@@ -1124,7 +1159,8 @@ fn codex_owner_lost(
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chat_handoffs.contains_key(&session.id)
+        if codex_terminal_owner(&state, session).is_some()
+            || state.chat_handoffs.contains_key(&session.id)
             || state.native_actor_startups.values().any(|startup| {
                 startup.source.id == session.id || startup.requested.id == session.id
             })
@@ -1149,6 +1185,146 @@ fn codex_owner_lost(
         super::upgrade_inspect::codex_execution_ended(session, &proof.boot_id)
             && !owned_listener::served(&listener.socket).map_err(|error| error.to_string())?,
     )
+}
+
+/// A recorded terminal conversation is writer evidence even without a pane
+/// marker (for example, a CLI resumed against the shared Codex daemon).
+fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<TerminalId> {
+    let id = session.launch.session_id.as_ref()?;
+    state.terminals.iter().find_map(|(terminal_id, record)| {
+        if record.handle.is_completed() {
+            return None;
+        }
+        let observed = record
+            .session
+            .resume_hint
+            .as_deref()
+            .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+        let recipe = observed.as_ref().unwrap_or(&record.session.launch);
+        ((Provider::from_program(&recipe.program) == Some(Provider::Codex)
+            || Provider::recognize_launch(recipe) == Some(Provider::Codex))
+            && recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id)))
+        .then_some(*terminal_id)
+    })
+}
+
+/// Read the same execution evidence for restart and picker preparation, so
+/// unreadable evidence retains its concrete diagnostic in both paths.
+fn require_ended_codex_execution(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+) -> std::io::Result<()> {
+    use super::upgrade_inspect::{CodexExecution, codex_execution};
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = codex_terminal_owner(&state, session) {
+            return Err(std::io::Error::other(format!(
+                "Codex is still running this conversation in terminal {id}. Close that terminal, then try again."
+            )));
+        }
+        // Holders only publish records when recovery was enabled. Older and
+        // in-process consoles can lack them, so a live paired console remains
+        // unproved even if its CLI has not recorded a conversation ID yet.
+        // Check current state rather than the saved descriptor: once its
+        // terminal is gone, a clean kernel/holder scan can prove it ended.
+        if session.terminal.as_ref().is_some_and(|terminal| {
+            state
+                .terminals
+                .get(&terminal.id)
+                .is_some_and(|record| !record.handle.is_completed())
+        }) {
+            return Err(std::io::Error::other(
+                "The paired Codex console is still live; its conversation could not be checked. Close that terminal, then try again.",
+            ));
+        }
+    }
+    let message = match codex_execution(session, boot) {
+        CodexExecution::Ended => return Ok(()),
+        CodexExecution::Running { pid: Some(pid), .. } => format!(
+            "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
+        ),
+        CodexExecution::Running { pid: None, socket } => format!(
+            "Codex is still serving this conversation at {}. Stop that server, then try again.",
+            socket.display()
+        ),
+        CodexExecution::RetainedProcesses =>
+            "The previous Codex execution still has live processes. Wait for them to finish, then try again.".into(),
+        CodexExecution::Unproved { reason }
+            if reason == super::upgrade_inspect::CODEX_PROCESS_STARTING =>
+        {
+            "A process was still starting; try again in a moment.".into()
+        }
+        CodexExecution::Unproved { reason } => format!(
+            "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
+        ),
+    };
+    Err(std::io::Error::other(message))
+}
+
+/// Admit a replacement writer using the original descriptor, then retire only
+/// ended discovery under the caller's allocation reservation.
+fn prepare_codex_restart(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+) -> std::io::Result<()> {
+    use crate::daemon::holder_registry::{self as registry, Kind};
+    use std::os::unix::fs::MetadataExt;
+    if session.launch.session_id.is_none() {
+        return Ok(());
+    }
+    require_ended_codex_execution(host, session, boot)?;
+    let directory = registry::directory(Kind::Native).map_err(std::io::Error::other)?;
+    let control = registry::socket(&directory, session.id);
+    let record = registry::execution_record(&control)?;
+    if let Some(record) = &record
+        && record.boot == *boot
+        && !chat::runtime::codex_execution_abandoned(&record.holder, &record.root)
+            .map_err(std::io::Error::other)?
+    {
+        return Err(std::io::Error::other(
+            "A Codex holder appeared during restart; try again",
+        ));
+    }
+    // A crashed holder may leave its control socket with or without a
+    // record. Retire the stopped inode before its successor binds it.
+    let entry = match std::fs::symlink_metadata(&control) {
+        Ok(entry) => Some(entry),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(entry) = entry {
+        // Holder paths can exceed sun_path; use the same pinned directory
+        // address as their bind, with a nonblocking, inode-checked probe.
+        let stopped = registry::with_socket_address(&control, |address| {
+            match crate::agent::observe::socket::connect(address, entry.dev(), entry.ino()) {
+                Ok(_) => Ok(false),
+                Err(error) if error.not_listening => Ok(true),
+                Err(error) => Err(std::io::Error::other(format!(
+                    "Cannot inspect holder control socket: {}",
+                    String::from(error)
+                ))),
+            }
+        })?;
+        if !stopped {
+            return Err(std::io::Error::other(
+                "A Codex holder is still serving this pane; try again",
+            ));
+        }
+        if std::fs::symlink_metadata(&control)
+            .is_ok_and(|current| current.dev() == entry.dev() && current.ino() == entry.ino())
+        {
+            std::fs::remove_file(&control)?;
+        }
+    }
+    if let Some(record) = record {
+        record.remove_record(&directory)?;
+    }
+    Ok(())
 }
 
 pub(super) fn require_unreserved_terminals(
@@ -1478,13 +1654,17 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    // A server that stopped without cleaning up leaves its endpoint behind.
-    // A listener still being served is joined; anything else is retired so
-    // this conversation's own server starts again at the same path.
+    // Join a served listener. Before replacing a saved conversation's server,
+    // prove its old execution ended, even if its endpoint vanished. Inspect
+    // the original descriptor: claiming a legacy listener above grants no
+    // evidence about the execution that used to serve it.
     let owned_socket = match owned_socket {
         Some(socket)
-            if !owned_listener::served(&socket).map_err(|failure| {
-                retryable_unavailable(format!("Cannot retire stopped provider socket: {failure}"))
+            if !owned_listener::served_before_retire(&socket, || {
+                prepare_codex_restart(host, &requested_source, &allocator.boot_id)
+            })
+            .map_err(|failure| {
+                retryable_unavailable(format!("Cannot restart Codex: {failure}"))
             })? =>
         {
             Some(socket)
@@ -2845,6 +3025,53 @@ pub(super) fn process(
     })
 }
 
+pub(super) fn read_presentation(
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: crate::model::TerminalId,
+    after_generation: Option<u64>,
+) -> Result<crate::terminal_ipc::PreparedResponse, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
+        receipt.require_attached(client)?;
+        if !receipt.subscribers.get(&client).copied().unwrap_or(false) {
+            return Err(error(
+                "Hidden chat has no presentation stream; make it visible before reading",
+            ));
+        }
+        return Ok(ServerResponse::ChatSnapshot {
+            chat_id,
+            snapshot: (!after_generation
+                .is_some_and(|generation| generation >= receipt.generation))
+            .then(|| receipt.snapshot()),
+        }
+        .into());
+    }
+    let record = attached(&state, client, chat_id)?;
+    if !record.subscribers.get(&client).copied().unwrap_or(false) {
+        return Err(error(
+            "Hidden chat has no presentation stream; make it visible before reading",
+        ));
+    }
+    let handle = record.handle.clone();
+    drop(state);
+    let response = handle
+        .presentation_wire(chat_id, after_generation)
+        .map_err(unavailable)?;
+    // A close, detach, replacement actor, or visibility change during
+    // hydration must not publish data under the old attachment.
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let current = attached(&state, client, chat_id)?;
+    if !current.handle.same_attachment(&handle)
+        || !current.subscribers.get(&client).copied().unwrap_or(false)
+    {
+        return Err(error(
+            "Chat attachment changed while preparing its transcript",
+        ));
+    }
+    Ok(response)
+}
+
 fn process_inner(
     host: &SharedHost,
     client: ClientId,
@@ -2946,9 +3173,10 @@ fn process_inner(
             // A kernel boot change proves every process from the saved boot
             // is gone. Unlike missing runtime files within the same boot, it
             // authorizes an exact disk resume without its ephemeral receipt.
-            let previous_boot = source.proof.as_ref().is_some_and(|previous| {
-                previous.is_complete() && previous.boot_id != proof.boot_id
-            });
+            let previous_boot = source.launch.provider != Provider::Codex
+                && source.proof.as_ref().is_some_and(|previous| {
+                    previous.is_complete() && previous.boot_id != proof.boot_id
+                });
             let unstarted = if previous_boot || unconfirmed {
                 None
             } else {
@@ -2979,9 +3207,14 @@ fn process_inner(
                 chat::native_holder::closed_source(&source, &proof)
                     .map_err(retryable_unavailable)?
                     .is_some_and(|(_, paired_closed)| paired_closed)
-                    || reserve_quiet_allocation(host, &source, None).is_ok_and(|_fence| {
-                        codex_owner_lost(host, &source, &proof).unwrap_or(false)
-                    })
+                    || match reserve_unhosted_allocation(host, &source, None) {
+                        Ok(_fence) => {
+                            require_ended_codex_execution(host, &source, &proof.boot_id)
+                                .map_err(|error| retryable_unavailable(error.to_string()))?;
+                            true
+                        }
+                        Err(()) => false,
+                    }
             };
             if !closed {
                 return Err(retryable_unavailable(
@@ -3337,50 +3570,9 @@ fn process_inner(
         ClientRequest::ChatRead {
             chat_id,
             after_generation,
-        } => {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
-                receipt.require_attached(client)?;
-                if !receipt.subscribers.get(&client).copied().unwrap_or(false) {
-                    return Err(error(
-                        "Hidden chat has no presentation stream; make it visible before reading",
-                    ));
-                }
-                return Ok(ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: (!after_generation
-                        .is_some_and(|generation| generation >= receipt.generation))
-                    .then(|| receipt.snapshot()),
-                });
-            }
-            let record = attached(&state, client, chat_id)?;
-            if !record.subscribers.get(&client).copied().unwrap_or(false) {
-                return Err(error(
-                    "Hidden chat has no presentation stream; make it visible before reading",
-                ));
-            }
-            let handle = record.handle.clone();
-            drop(state);
-            let response = handle
-                .presentation(chat_id, after_generation)
-                .map_err(unavailable)?
-                .unwrap_or(ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: None,
-                });
-            // A close, detach, replacement actor, or visibility change during
-            // hydration must not publish data under the old attachment.
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let current = attached(&state, client, chat_id)?;
-            if !current.handle.same_attachment(&handle)
-                || !current.subscribers.get(&client).copied().unwrap_or(false)
-            {
-                return Err(error(
-                    "Chat attachment changed while preparing its transcript",
-                ));
-            }
-            Ok(response)
-        }
+        } => read_presentation(host, client, chat_id, after_generation)?
+            .decode()
+            .map_err(unavailable),
         ClientRequest::ChatReturnTerminal { chat_id } => {
             super::account_lifecycle::ensure_idle(host)?;
             let (owners, closing) = {

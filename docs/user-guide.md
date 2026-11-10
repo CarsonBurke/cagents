@@ -1059,6 +1059,15 @@ New managed sign-ins cannot duplicate a listed system, managed, or linked login.
 The account picker compares weekly allowances consistently; the status bar still
 highlights the limit currently constraining the selected account.
 
+A Claude account's **Weekly · Fable** row is Fable's own weekly allowance.
+Reaching it stops only Fable: the account's other models keep working, so a
+conversation can switch model rather than account. Some Claude accounts also
+hold Fable resets, which give back what Fable used this week. Claude Code
+offers them only in its own terminal, through `/limit-reset`, and reports how
+many an account holds only there, so cagents does not show that count. After
+you use one, the Fable and Weekly rows show the new figures at the account's
+next usage check, or as soon as a conversation on that account runs Fable.
+
 Proxy, certificate, and generic cloud variables remain available to the agent's
 tools. Provider settings files, credential helpers, and administrator policies
 remain user-controlled. This policy does not rewrite those settings or an

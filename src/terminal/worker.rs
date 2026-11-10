@@ -3017,6 +3017,9 @@ impl Worker {
                 ) {
                     command.env("PATH", path);
                 }
+                // Before the holder forks, so nothing this launch starts
+                // predates its record.
+                crate::lineage_birth::record_instance_launch(&session)?;
                 (
                     holder::spawn_recoverable(
                         command,
