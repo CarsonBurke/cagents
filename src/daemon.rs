@@ -1056,6 +1056,38 @@ pub(crate) fn shut_down_test_listener(listener: std::os::unix::net::UnixListener
     );
 }
 
+/// LeaseHandoff deliberately closes without LOCK_UN because a successor
+/// can share its description. An unrelated test's concurrent fork can
+/// retain even a CLOEXEC copy until exec; create the tested descriptors
+/// only inside a coordinator with no other tests running beside it.
+#[cfg(all(test, feature = "host"))]
+pub(crate) fn isolated_handoff_coordinator() -> bool {
+    use std::os::unix::process::CommandExt;
+    use std::process::Command;
+
+    const COORDINATOR: &str = "CAGENTS_TEST_HANDOFF_COORDINATOR";
+    if env::var_os(COORDINATOR).is_some() {
+        return true;
+    }
+    let test = std::thread::current().name().unwrap().to_owned();
+    let mut command = Command::new(env::current_exe().unwrap());
+    command
+        .args(["--exact", &test, "--nocapture", "--test-threads=1"])
+        .env(COORDINATOR, "1");
+    // SAFETY: only descriptor syscalls after fork. The coordinator creates
+    // its own lease after exec and needs no inherited fixture descriptors.
+    unsafe { command.pre_exec(seal_inherited_descriptors) };
+    let output = command.output().unwrap();
+    assert!(
+        output.status.success(),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed; 0 failed"));
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "host")]
@@ -1937,6 +1969,9 @@ while True: time.sleep(1)
         use std::sync::mpsc;
         use std::time::Duration;
 
+        if !isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempdir().unwrap();
         let paths = paths(root.path().join("runtime"));
         let original = HostLease::acquire(&paths, &proof()).unwrap();
@@ -2042,6 +2077,9 @@ while True: time.sleep(1)
             // On the serving-success path skip destructors, as a daemon crash
             // would: the kernel must release its last copy of the descriptor.
             std::process::exit(exit);
+        }
+        if !isolated_handoff_coordinator() {
+            return;
         }
 
         struct FixtureChild(Child);

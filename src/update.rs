@@ -3619,6 +3619,9 @@ finally:
     #[test]
     fn startup_failure_is_persisted_before_releasing_the_handoff() {
         use crate::daemon::{HostLease, RuntimePaths, lease_handoff::LeaseHandoff};
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("daemon");
         let paths = RuntimePaths {
