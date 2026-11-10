@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 167,
+    proven_at: 168,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -84,6 +84,12 @@ pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
 /// it did. An older client is sent those replies without the new fields, and
 /// an interrupt's pending requests as it was before.
 pub(crate) const PROVIDER_ACTIVITY: u16 = 167;
+
+/// The first protocol whose chat snapshot says how a request to send the
+/// queued messages now stands and which commands run behind the main agent,
+/// and whose capabilities say whether that request is carried. An older client
+/// is sent snapshots without them.
+pub(crate) const SEND_QUEUED_NOW: u16 = 168;
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
@@ -124,6 +130,17 @@ const OMITTED_FIELDS: &[(&str, &str, u16)] = &[
         "waiting_agents",
         PROVIDER_ACTIVITY,
     ),
+    ("cagents::chat::Snapshot", "send_now", SEND_QUEUED_NOW),
+    (
+        "cagents::chat::Snapshot",
+        "background_commands",
+        SEND_QUEUED_NOW,
+    ),
+    (
+        "cagents::chat::Capabilities",
+        "send_queued_now",
+        SEND_QUEUED_NOW,
+    ),
 ];
 
 thread_local! {
@@ -160,6 +177,11 @@ pub(crate) fn encoding_before(protocol: u16) -> bool {
 /// Skips a field [`PROVIDER_ACTIVITY`] added, encoding for a client before it.
 pub(crate) fn new_in_provider_activity<T>(_: &T) -> bool {
     encoding_before(PROVIDER_ACTIVITY)
+}
+
+/// Skips a field [`SEND_QUEUED_NOW`] added, encoding for a client before it.
+pub(crate) fn new_in_send_queued_now<T>(_: &T) -> bool {
+    encoding_before(SEND_QUEUED_NOW)
 }
 
 /// The older protocol a client opened its connection with, when this daemon
@@ -605,6 +627,18 @@ mod tests {
             "cagents::agent_execution::Reply",
             Some("Status"),
             &status,
+        );
+        check(
+            &mut checked,
+            "cagents::chat::Snapshot",
+            None,
+            &invent::<crate::chat::Snapshot>().unwrap(),
+        );
+        check(
+            &mut checked,
+            "cagents::chat::Capabilities",
+            None,
+            &crate::chat::Capabilities::default(),
         );
         let listed: BTreeSet<String> = OMITTED_FIELDS
             .iter()

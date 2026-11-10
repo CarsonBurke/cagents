@@ -453,7 +453,10 @@ fn one_working_child_remains_in_the_footer_while_the_parent_waits_or_is_blocked(
     };
     assert_eq!(
         publish(&mut snapshot),
-        (Some(Icon::AgentWorking), "Subagents working".into())
+        (
+            Some(Icon::AgentWorking),
+            "Turn finished · 1 subagent working".into()
+        )
     );
 
     snapshot.waiting = true;
@@ -632,7 +635,10 @@ fn generic_local_error_does_not_mask_an_active_provider_failure_in_the_footer() 
         runtime.refresh();
         assert_eq!(
             runtime.conversation_status(false),
-            (Some(Icon::AgentWorking), "Subagents working".into())
+            (
+                Some(Icon::AgentWorking),
+                "Turn finished · 1 subagent working".into()
+            )
         );
         runtime.error = None;
         runtime.reconcile_failure_ui();

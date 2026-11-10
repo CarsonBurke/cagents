@@ -1921,6 +1921,9 @@ impl Adapter for Codex {
                 let turn = child.turn.clone().ok_or("This Codex subagent has no active turn to stop")?;
                 self.call(&mut step, "turn/interrupt", json!({"threadId":id,"turnId":turn}), Pending::StopChild)?;
             }
+            Command::SendQueuedNow | Command::StopBackgroundCommand { .. } => {
+                return Err("This operation is not supported by Codex".into());
+            }
             operation @ (Command::RemoveQueued { .. } | Command::StartQueued { .. }) => {
                 if !self.queue_available || !self.direct_input { return Err("Codex queue controls are unavailable".into()); }
                 let (method, id, pending) = match operation {
