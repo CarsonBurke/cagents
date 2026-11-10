@@ -222,6 +222,11 @@ fn inherited() -> io::Result<Option<(File, bool)>> {
         .transpose()
 }
 
+#[cfg(feature = "host")]
+pub(crate) fn clone_inherited_lease() -> io::Result<Option<File>> {
+    inherited().map(|lease| lease.map(|(lock, _)| lock))
+}
+
 pub(crate) fn has_inherited_lease() -> io::Result<bool> {
     Ok(inherited_cache()?
         .lock()

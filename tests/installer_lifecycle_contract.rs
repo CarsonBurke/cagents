@@ -340,6 +340,12 @@ case "$*" in
       printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture","inherited_lease":%s}}\n' "$running" "$FIXTURE_HANDOFF"
     fi
     ;;
+  'daemon store-schema --help'|'daemon downgrade-store --help')
+    [ "$#" -eq 3 ] || exit 98
+    # This legacy CLI predates store conversion. The installer may discover
+    # that with read-only help probes; unknown operations still fail below.
+    exit 64
+    ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:help\n' "$CLI" >> "$FIXTURE_ACTIONS"

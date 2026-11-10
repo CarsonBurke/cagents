@@ -438,6 +438,12 @@ OLD_DAEMON_WAS_RUNNING=0
 DAEMON_STARTED=0
 DAEMON_DEFERRED=0
 DAEMON_START_ATTEMPTED=0
+# The shared-model store's schema before the replacement daemon starts, which
+# is the schema the previous daemon reads; `none` when there is no store yet.
+STORE_SCHEMA_BEFORE=
+# A store the replacement creates is converted back this far, the schema of
+# releases before the converter.
+OLDEST_STORE_SCHEMA=22
 BIN_LINK=$HOME/.local/bin/cagents
 DESKTOP_LINK=$DATA_HOME/applications/dev.cagents.Cagents.desktop
 ICON_LINK=$DATA_HOME/icons/hicolor/scalable/apps/dev.cagents.Cagents.svg
@@ -523,6 +529,26 @@ cleanup() {
             TRANSACTION_COMMITTED=1
             printf '%s: replacement daemon shutdown is not proven; retained the new installation and recovery state; inspect cagents daemon status before retrying\n' \
                 "$PROGRAM" >&2
+        fi
+    fi
+
+    # Any daemon of the new version that started after current switched, the
+    # installer's or one a launcher started, may have converted the
+    # shared-model store past what the restored daemon reads. The replacement
+    # converts it back to the schema recorded before the switch; that does
+    # nothing if the store was not converted, and refuses while a daemon runs.
+    # The previous release is never run to ask, since releases before the
+    # converter take no options and would start a daemon instead. Without the
+    # conversion the restored daemon could not open the store, so the new
+    # installation is retained instead.
+    if [ "$TRANSACTION_COMMITTED" -eq 0 ] && [ "$CURRENT_SWITCHED" -eq 1 ] \
+        && [ -n "$STORE_SCHEMA_BEFORE" ]; then
+        restored_schema=$STORE_SCHEMA_BEFORE
+        [ "$restored_schema" != none ] || restored_schema=$OLDEST_STORE_SCHEMA
+        if ! "$NEW_VERSION_DIR/bin/cagents" daemon downgrade-store "$restored_schema" >/dev/null; then
+            TRANSACTION_COMMITTED=1
+            printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store; inspect cagents daemon status before retrying\n' \
+                "$PROGRAM" "$restored_schema" >&2
         fi
     fi
 
@@ -745,6 +771,13 @@ supports_stage_guard() {
         stage_help=$("$1" "$stage_command" --help 2>/dev/null) || return 1
         printf '%s\n' "$stage_help" | awk '$1 == "--stage-only" { found = 1 } END { exit !found }' || return 1
     done
+}
+# The replacement's own command line reports whether it can read and convert
+# the shared-model store, without starting anything.
+supports_store_conversion() {
+    [ -x "$1" ] \
+        && "$1" daemon store-schema --help >/dev/null 2>&1 \
+        && "$1" daemon downgrade-store --help >/dev/null 2>&1
 }
 supports_selected_guard() {
     if [ "$STAGE_ONLY" -eq 1 ]; then supports_stage_guard "$1"; else supports_install_guard "$1"; fi
@@ -1128,6 +1161,21 @@ else
         ROLLBACK_OK=0
         fail 'current installation appeared while preparing the update; retained the candidate for recovery'
     fi
+fi
+# The previous daemon has stopped, so the store holds the schema it reads.
+# Record it before the replacement can convert the store, so that a rollback
+# can convert it back. Only a replacement whose command line offers the store
+# commands is asked. Its daemon is never run directly: releases before the
+# options ignore arguments and would start serving. A replacement without
+# them predates every conversion, so it has nothing to undo.
+if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRED" -eq 0 ] \
+    && supports_store_conversion "$NEW_VERSION_DIR/bin/cagents"; then
+    STORE_SCHEMA_BEFORE=$("$NEW_VERSION_DIR/bin/cagents" daemon store-schema) \
+        || fail 'cannot read the shared-model store schema; installation was not changed'
+    case $STORE_SCHEMA_BEFORE in
+        '') STORE_SCHEMA_BEFORE=none ;;
+        *[!0-9]*) fail 'the shared-model store schema is unreadable; installation was not changed' ;;
+    esac
 fi
 CURRENT_TEMP=$PREFIX/.current.$$
 rm -f "$CURRENT_TEMP"

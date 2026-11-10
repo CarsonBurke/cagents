@@ -10,15 +10,11 @@ pub(super) fn migrate(tx: &Transaction<'_>) -> Result<(), String> {
         "CREATE TABLE terminal_retention_pins(
             terminal TEXT PRIMARY KEY,
             generation TEXT NOT NULL
-        ) STRICT;
-        CREATE TABLE shared_terminal_retention_pins(
-            pane TEXT PRIMARY KEY REFERENCES shared_view_panes(id) ON DELETE CASCADE,
-            terminal TEXT NOT NULL
-        ) STRICT;
-        CREATE INDEX shared_terminal_retention_by_terminal
-            ON shared_terminal_retention_pins(terminal);",
+        ) STRICT;",
     )
     .map_err(|error| error.to_string())?;
+    tx.execute_batch(super::views::store::V22_RETENTION_PINS)
+        .map_err(|error| error.to_string())?;
     // The only all-view scan is this migration. Stream one saved view at a
     // time; later censuses perform only indexed candidate lookups. A corrupt
     // pane/owner cannot silently lose its conservative retention pin.
@@ -505,29 +501,13 @@ mod tests {
                 "retention migration must preserve the published global allocator"
             );
             assert_eq!(registry.model().unwrap().identity.to_string(), identity);
-            let saved: String = registry
-                .db
-                .query_row(
-                    "SELECT panes FROM shared_views WHERE scope=?1",
-                    [&scope],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                serde_json::from_str::<Vec<Pane>>(&saved).unwrap(),
-                vec![pane.clone()]
-            );
-            assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        "SELECT revision FROM shared_views WHERE scope=?1",
-                        [&scope],
-                        |row| row.get::<_, u64>(0)
-                    )
-                    .unwrap(),
-                7
-            );
+            let saved = super::super::views::read(
+                &registry.db,
+                &serde_json::from_str::<Scope>(&scope).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(saved.panes, vec![pane.clone()]);
+            assert_eq!(saved.revision, 7);
             assert_eq!(
                 registry
                     .db
@@ -707,11 +687,11 @@ mod tests {
         names
             .into_iter()
             .map(|name| {
+                let quoted = name.replace('"', "\"\"");
+                // A WITHOUT ROWID table orders by its primary key instead.
                 let mut statement = db
-                    .prepare(&format!(
-                        "SELECT * FROM \"{}\" ORDER BY rowid",
-                        name.replace('"', "\"\"")
-                    ))
+                    .prepare(&format!("SELECT * FROM \"{quoted}\" ORDER BY rowid"))
+                    .or_else(|_| db.prepare(&format!("SELECT * FROM \"{quoted}\" ORDER BY 1")))
                     .unwrap();
                 let columns = statement.column_count();
                 let rows = statement
@@ -746,7 +726,7 @@ mod tests {
             "SELECT id,lag(id) OVER(PARTITION BY automation ORDER BY rowid) FROM automation_firings ORDER BY rowid"
         ).unwrap().query_map([], |row| Ok((row.get::<_,String>(0)?, row.get::<_,Option<String>>(1)?)))
             .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        let before = table_rows(&db);
+        let mut before = table_rows(&db);
         assert!(!before.contains_key("terminal_retention_pins"));
         assert!(!before.contains_key("shared_terminal_retention_pins"));
         assert_eq!(before["automation_notifications"].len(), 1);
@@ -757,6 +737,12 @@ mod tests {
         let attention = super::super::automation_notifications::pending(&db, 100).unwrap();
         assert_eq!(attention.len(), 1);
         drop(db);
+        // Schema 23 replaces the view tables; their content is compared as views.
+        let edit = before.remove("shared_view_edits").unwrap()[0][0].clone();
+        for table in ["shared_view_scopes", "shared_views", "shared_view_panes"] {
+            before.remove(table).unwrap();
+        }
+        let scope_value: Scope = serde_json::from_str(&scope).unwrap();
         for _ in 0..2 {
             let registry = Registry::at(&path).unwrap();
             let previous = registry
@@ -801,6 +787,18 @@ mod tests {
                 row.pop().unwrap();
             }
             assert!(after.remove("terminal_retention_pins").unwrap().is_empty());
+            let operations = after.remove("view_operations").unwrap();
+            assert_eq!(operations.len(), 1);
+            assert_eq!(
+                operations[0][0], edit,
+                "the applied edit must still be recognized"
+            );
+            assert!(after.remove("retired_panes").unwrap().is_empty());
+            for table in ["view_scopes", "view_revision_clock", "panes"] {
+                after.remove(table).unwrap();
+            }
+            let view = super::super::views::read(&registry.db, &scope_value).unwrap();
+            assert_eq!((view.revision, view.panes), (7, vec![pane.clone()]));
             assert_eq!(
                 after.remove("shared_terminal_retention_pins").unwrap(),
                 vec![vec![
@@ -818,15 +816,8 @@ mod tests {
             );
             assert_eq!(registry.model().unwrap().identity.to_string(), identity);
             assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        "SELECT scope FROM shared_view_panes WHERE id=?1",
-                        [pane.id.to_string()],
-                        |row| row.get::<_, String>(0)
-                    )
-                    .unwrap(),
-                scope
+                super::super::views::store::owner(&registry.db, pane.id).unwrap(),
+                Some(scope_value.clone())
             );
             assert!(
                 registry
@@ -993,15 +984,15 @@ mod tests {
                 closed: vec![],
             })
             .unwrap();
-        // A per-census JSON/table scan would fail on this unrelated view.
+        // A census that read saved panes would fail on these descriptors.
         // Target membership was already established by the migration.
-        registry
-            .db
-            .execute(
-                "UPDATE shared_views SET panes='not-json' WHERE scope=?1",
-                [serde_json::to_string(&unrelated).unwrap()],
-            )
-            .unwrap();
+        assert!(
+            registry
+                .db
+                .execute("UPDATE panes SET descriptor='not-json'", [])
+                .unwrap()
+                > 0
+        );
         let missing = TerminalId::new();
         let candidates = BTreeSet::from([terminal(&pane), history[17], missing]);
         assert_eq!(
@@ -1031,7 +1022,7 @@ mod tests {
                 .iter()
                 .any(|line| line.contains("SCAN terminal_retention_pins")
                     || line.contains("SCAN shared_terminal_retention_pins")
-                    || line.contains("shared_views")),
+                    || line.contains(" panes")),
             "{plan:?}"
         );
     }

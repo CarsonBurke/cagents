@@ -578,6 +578,14 @@ impl HostState {
         self.model = Some(registry);
     }
 
+    /// Another connection to the shared-model store, for work that must not
+    /// hold the host lock while it writes.
+    pub(super) fn independent_model(&self) -> Option<Result<super::model::Registry, String>> {
+        self.model
+            .as_ref()
+            .map(super::model::Registry::execution_connection)
+    }
+
     /// How many hosted agents are working, and how many are waiting on the
     /// user, across running terminals and native conversations.
     pub(super) fn agent_tally(&self) -> crate::tray::AgentTally {
@@ -2958,6 +2966,21 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
         host,
         crate::upgrade::handoff::Store::discover()?,
         std::path::Path::new("/proc"),
+        holder_directory().ok().as_deref(),
+    )
+}
+
+/// Lifecycle fixtures that prove their owned providers stopped can supply a
+/// controlled census without depending on unrelated protected host processes.
+#[cfg(test)]
+pub(in crate::host) fn restore_upgrade_with_process_fixture(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<Vec<TerminalId>, String> {
+    restore_upgrade_from(
+        host,
+        crate::upgrade::handoff::Store::discover()?,
+        processes,
         holder_directory().ok().as_deref(),
     )
 }

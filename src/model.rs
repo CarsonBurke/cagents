@@ -385,6 +385,16 @@ pub struct TerminalExit {
     pub occurred_at_unix_ms: i64,
 }
 
+/// A chat provider's queue as last saved, with the daemon that held it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedQueue {
+    /// The daemon hosting the provider that listed `messages`. Only a
+    /// conversation last connected through that daemon can have lost them
+    /// with it; a queue an older build left behind names an earlier one.
+    pub host: Option<HostSessionProof>,
+    pub messages: Vec<crate::chat::QueuedMessage>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostSessionProof {
     pub host_session_id: HostSessionId,
@@ -1226,6 +1236,11 @@ pub struct WorkspaceState {
     pub chat_drafts: HashMap<CardId, String>,
     #[serde(default)]
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    /// The messages each chat's provider held in its queue when this was
+    /// saved. A provider that does not come back takes its queue with it, so
+    /// a reopened conversation returns these to its composer, unsent.
+    #[serde(default)]
+    pub chat_waiting_messages: HashMap<CardId, SavedQueue>,
     /// Unseen semantic agent updates, including their last known worktree owner.
     #[serde(default)]
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
@@ -1273,6 +1288,7 @@ impl Default for WorkspaceState {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
