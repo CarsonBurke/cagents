@@ -21174,9 +21174,8 @@ mod tests {
     #[test]
     fn presentation_projection_retries_a_deferred_title_with_the_ahead_scope_proof() {
         use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
-        use crate::model::{
-            ChannelId, ChannelTitleSource, ProjectChannel, ProjectId, RepositoryId,
-        };
+        use crate::model::{ChannelId, ChannelTitleSource, ProjectChannel, ProjectId};
+        use crate::repository::RepositoryId;
         use crate::workspace_model::{
             ModelChannel, ModelEdit, ModelProject,
             delta::{EditEffects, ViewChanges, ViewRevision},
