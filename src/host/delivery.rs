@@ -668,6 +668,63 @@ mod tests {
         ));
     }
 
+    /// What the daemon writes to a CLI from before `ToolStatus::Waiting` is
+    /// the same as for a running step, through the path that sends it.
+    #[test]
+    fn an_older_client_reads_a_waiting_step_as_running() {
+        use crate::chat::*;
+        let older = crate::terminal_ipc::older_client(crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL)
+            .unwrap();
+        let chat_id = TerminalId::new();
+        let delivered = |status, client: Option<crate::terminal_ipc::OlderClient>| {
+            let mut envelope = redraw(TerminalId::new(), 0);
+            envelope.request_id = Some(3);
+            envelope.message = ServerMessage::Response {
+                response: ServerResponse::ChatFileChangePatches {
+                    chat_id,
+                    page: FileChangePage {
+                        request_id: 8,
+                        key: FileChangeKey {
+                            source: FileChangeSource::Subagent {
+                                id: "delegate".into(),
+                            },
+                            path: "a.rs".into(),
+                        },
+                        revision: 5,
+                        patches: vec![FileChangePatch {
+                            ownership_unverified: false,
+                            item_id: "edit".into(),
+                            kind: ChangeKind::Updated,
+                            status,
+                            imported: false,
+                            offset: 0,
+                            total_bytes: 3,
+                            diff: "+a\n".into(),
+                        }],
+                        next: None,
+                        error: None,
+                    },
+                },
+            };
+            let mut outbound = Outbound::from(envelope);
+            if let Some(client) = client {
+                outbound = outbound.for_older(client).unwrap();
+            }
+            assert!(matches!(outbound.message, ServerMessage::Response { .. }));
+            let mut bytes = Vec::new();
+            crate::terminal_ipc::write_frame(&mut bytes, &outbound.wire()).unwrap();
+            bytes
+        };
+        assert_eq!(
+            delivered(ToolStatus::Waiting, Some(older)),
+            delivered(ToolStatus::Running, Some(older))
+        );
+        assert_ne!(
+            delivered(ToolStatus::Waiting, None),
+            delivered(ToolStatus::Running, None)
+        );
+    }
+
     #[test]
     fn work_board_bursts_keep_one_latest_payload_and_preserve_semantic_replies() {
         let queue = DeliveryQueue::new(1, 3);

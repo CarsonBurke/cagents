@@ -16,7 +16,7 @@ person.
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
-| A Codex app-server peer that plays scripted items | `tests/fixtures/terminal-escape-codex.py` and the peers built on its transport, such as `codex-tool-rows.py` |
+| A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -37,8 +37,9 @@ directories, so nothing reaches the real desktop, daemon or provider config:
    fixture data, logs and `shots/`.
 2. **Fixture** (`TASK/fixture`): the app's HOME and XDG directories, a
    project repository, and `bin/` with the synthetic `claude`, a `gh` that
-   fails until [switched on](#an-offline-github), and a `curl` that always
-   fails. `save-seed` keeps it as the data every later start restores,
+   fails until [switched on](#an-offline-github), a `curl` that always
+   fails and, for a session started with `--codex`, an
+   [offline `codex`](#an-offline-codex). The fixture is mode 0700. `save-seed` keeps it as the data every later start restores,
    so both sides open the same workspace.
 3. **Compositor**: KWin's virtual backend, with its own HOME, hosting a nested
    niri session that `niri-harness` drives (`drive observe`, `drive click`,
@@ -159,6 +160,36 @@ sleep 12
 evidence shot sidebar-avatar
 ```
 
+## An offline Codex
+
+A session started with `--codex PEER`, or a `pair` given it, has a `codex` on
+the fixture's PATH that runs one of the offline app-server peers in
+`tests/fixtures`. Without it there is no `codex`, and the app lists Codex as
+not installed, as before.
+
+| PEER | Script | Each prompt |
+| --- | --- | --- |
+| `tool-rows` | `codex-tool-rows.py` | plays one turn of MCP, dynamic and function tools, collaboration calls, a hook prompt, image generation, a compaction and a diff, started then completed |
+| `child-errors` | `codex-child-errors.py` | reports subagent diagnostics before a failed turn; the prompts `failed-turn`, `retry`, `disconnect` and `closed-after-finish` pick the neighbouring cases |
+| `terminal-escape` | `terminal-escape-codex.py` | streams terminal escapes; see the script for the file that completes the stream |
+
+`start` copies the three scripts into `TASK/fixture/libexec/codex`, since the
+peers load their transport from beside them, creates `home/.codex`, and
+installs [`tests/fixtures/fixture-codex.sh`](../tests/fixtures/fixture-codex.sh)
+as `bin/codex`. That passes the fixture as the peer's private root and
+`$HOME/.codex` as `CODEX_HOME` unless the app names another, and every peer
+checks that both are private to you. Each start installs the peer afresh, so a
+seed doesn't carry one into a session that didn't ask for it.
+
+```sh
+scripts/native-evidence --remote fw16 --task ~/.local/state/cev/pr1234-rows \
+    pair --before origin/main --after . --steps rows.sh --codex tool-rows
+```
+
+The peers model the app-server protocol only: no provider, account, model or
+network is contacted, and the app's account and usage-limit handling isn't
+exercised.
+
 ## Adding a provider behaviour
 
 The synthetic Claude provider reads switches from files in its config
@@ -256,6 +287,8 @@ Every refusal names its cause and the next command. The common ones:
 | `the SIDE side is running on HOST; stop it before rebuilding` | A side's checkout can't change under its session. Run the `stop` it names, then build. |
 | `task NAME on HOST belongs to OWNER` | Another agent's task has that name on the host. Give your task directory another name, such as your PR's. |
 | `... is not a task this route started` | A task of that name exists on the host without an owner: someone runs it there directly, or an earlier version of the route started it. If it is yours, run the command the message gives on the host; otherwise rename yours. |
+| `codex: the fixture has no Codex peer` | The session started without `--codex`, but something ran `codex`. Start it with `--codex tool-rows`, `child-errors` or `terminal-escape`. |
+| `fixture requires private owned root/runtime directories` | A Codex peer found the fixture or runtime directory readable by others. `start` makes both private; if you changed their modes, start again. |
 | `this task directory is the host's own` | You are on the build host. Run `scripts/native-evidence` without `--remote`. |
 
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
