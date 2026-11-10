@@ -1,10 +1,12 @@
 //! Explicit, self-managed release updates. `gh` owns authentication; discovery
 //! never writes installation state. The detached worker alone may run an installer.
+mod cancellation;
 mod candidate;
 mod confirmation;
 mod floor;
 mod floor_display;
 mod floor_prediction;
+mod handoff;
 mod installed;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -48,16 +50,35 @@ const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const WORKER_LOCK_FD: i32 = 198;
 
 #[derive(Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken {
+    requested: Arc<AtomicBool>,
+    marker: Option<PathBuf>,
+    terminal_interrupts: bool,
+}
 impl CancellationToken {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.requested.store(true, Ordering::Relaxed);
+    }
+    fn for_terminal() -> Self {
+        Self {
+            terminal_interrupts: true,
+            ..Self::default()
+        }
     }
     fn cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        (self.terminal_interrupts && cancellation::requested())
+            || self.requested.load(Ordering::Relaxed)
+            || self.marker.as_ref().is_some_and(|marker| marker.exists())
+    }
+    fn for_job(state: &Path, job: &str) -> Result<Self, UpdateError> {
+        Ok(Self {
+            requested: Arc::default(),
+            marker: confirmation::cancellation_path(state, job)?,
+            terminal_interrupts: false,
+        })
     }
 }
 
@@ -67,7 +88,7 @@ pub enum UpdateError {
     Invalid(String),
     #[error("another update is already running")]
     Busy,
-    #[error("update check or download cancelled")]
+    #[error("Update cancelled")]
     Cancelled,
     #[error("{0} timed out")]
     Timeout(&'static str),
@@ -462,7 +483,7 @@ fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<Strin
         .as_ref()
         .map(|owner| owner.version_root.join("bin/cagentsd"));
     source.verify_owner(executable.as_deref())?;
-    installed_update_worker(
+    installed_candidate_version(
         window,
         served,
         owner.as_ref(),
@@ -471,9 +492,9 @@ fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<Strin
     )
 }
 
-/// The served candidate alone performs an update. Source admission and owner
-/// verification happen before this decision; its worker rechecks both.
-fn installed_update_worker(
+/// Return the served candidate's version after source admission and the no-op
+/// check. The candidate updater rechecks the source and its installed owner.
+fn installed_candidate_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
@@ -515,8 +536,12 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 /// CLI entry point for the same leased worker, exact preview and window fence
 /// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
+    let _interrupt = cancellation::Interrupt::install()?;
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
+    if cancellation::requested() {
+        return Err(UpdateError::Cancelled);
+    }
     let initial = apply_installed_from(&candidate, true)?;
     drive_terminal_review(initial, yes, interrupt)
 }
@@ -526,12 +551,13 @@ pub fn upgrade_release(
     yes: bool,
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
+    let _interrupt = cancellation::Interrupt::install()?;
     let installation = Installation::detect()?;
     let parsed = stable_version(version)?;
     let tag = format!("v{parsed}");
     let selected = applicable_release(serde_json::from_slice(&metadata(
         &format!("repos/{REPOSITORY}/releases/tags/{tag}"),
-        &CancellationToken::new(),
+        &CancellationToken::for_terminal(),
     )?)?)?;
     if stable_version(&selected.version)? != parsed
         || parsed <= installed_version(&installation.version)?
@@ -539,6 +565,9 @@ pub fn upgrade_release(
         return Err(invalid(
             "selected release is not newer than the running installation",
         ));
+    }
+    if cancellation::requested() {
+        return Err(UpdateError::Cancelled);
     }
     let initial = start_job(
         &installation,
@@ -553,66 +582,203 @@ fn drive_terminal_review(
     yes: bool,
     interrupt: bool,
 ) -> Result<UpdateJob, UpdateError> {
-    use std::io::IsTerminal;
+    drive_terminal_review_with(initial, yes, interrupt, &mut NativeTerminalReview)
+}
+
+trait TerminalReview: Write {
+    fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError>;
+    fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError>;
+    fn cancel(&mut self, job: &str) -> Result<bool, UpdateError>;
+    fn read_line(&mut self, answer: &mut String) -> io::Result<usize>;
+    fn is_terminal(&self) -> bool;
+    fn interrupted(&self) -> bool;
+    fn worker_running(&mut self) -> Result<bool, UpdateError> {
+        Ok(false)
+    }
+    fn pause(&mut self) {
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
+struct NativeTerminalReview;
+impl Write for NativeTerminalReview {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        io::stderr().lock().write(bytes)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        io::stderr().lock().flush()
+    }
+}
+impl TerminalReview for NativeTerminalReview {
+    fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+        status()
+    }
+    fn decide(&mut self, job: &str, nonce: &str, choice: UpdateChoice) -> Result<(), UpdateError> {
+        decide(job, nonce, choice)
+    }
+    fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
+        confirmation::cancel(job)
+    }
+    fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+        cancellation::read_line(answer)
+    }
+    fn is_terminal(&self) -> bool {
+        use std::io::IsTerminal;
+        io::stdin().is_terminal()
+    }
+    fn interrupted(&self) -> bool {
+        cancellation::requested()
+    }
+    fn worker_running(&mut self) -> Result<bool, UpdateError> {
+        let state = running_installation()?.state_dir()?;
+        match acquire_lock(&state) {
+            Ok(_lease) => Ok(false),
+            Err(UpdateError::Busy) => Ok(true),
+            Err(error) => Err(error),
+        }
+    }
+}
+
+fn drive_terminal_review_with(
+    initial: UpdateJob,
+    yes: bool,
+    interrupt: bool,
+    terminal: &mut impl TerminalReview,
+) -> Result<UpdateJob, UpdateError> {
     let mut policy = if interrupt {
         impact::Policy::Interrupt
     } else {
         impact::Policy::WhenIdle
     };
-    let mut submitted = None;
+    let mut submitted = std::collections::BTreeSet::new();
+    let mut waiting = None;
     let mut policy_requested = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
+    let mut finishing_message_shown = false;
     loop {
-        let job = status()?
+        if Instant::now() >= deadline {
+            return Err(invalid(
+                "The update is still running; inspect its progress in the app.",
+            ));
+        }
+        let job = terminal
+            .status()?
             .filter(|job| job.id == initial.id)
             .ok_or_else(|| {
                 invalid("The update job changed; inspect the current update in the app.")
             })?;
         if job.phase.is_terminal() {
+            if terminal.worker_running()? {
+                terminal.pause();
+                continue;
+            }
+            // Refresh after proving the worker has settled: the snapshot read
+            // before that lease probe may precede its final recovery report.
+            let job = terminal
+                .status()?
+                .filter(|current| current.id == initial.id)
+                .ok_or_else(|| {
+                    invalid("The update job changed; inspect the current update in the app.")
+                })?;
             return if job.phase == UpdatePhase::Complete {
                 Ok(job)
             } else {
                 Err(invalid(job.message))
             };
         }
-        if let Some(confirmation) = job.active_confirmation() {
-            if confirmation
-                .preview
-                .daemon
-                .as_ref()
-                .is_some_and(|daemon| daemon.policy != policy)
+        if terminal.interrupted() {
+            if terminal.cancel(&job.id)? {
+                return Err(UpdateError::Cancelled);
+            }
+            if !finishing_message_shown {
+                writeln!(
+                    terminal,
+                    "The update is already being applied; finishing it before returning."
+                )?;
+                finishing_message_shown = true;
+            }
+        } else if let Some(confirmation) = job.active_confirmation() {
+            if job.phase == UpdatePhase::WaitingForIdle {
+                let labels: Vec<_> = confirmation
+                    .preview
+                    .daemon
+                    .iter()
+                    .flat_map(|daemon| &daemon.sessions)
+                    .filter(|item| item.disposition == impact::Disposition::WaitsForIdle)
+                    .map(|item| {
+                        confirmation
+                            .preview
+                            .labels
+                            .names
+                            .get(&item.id)
+                            .unwrap_or(&item.title)
+                            .clone()
+                    })
+                    .collect();
+                if !labels.is_empty() && waiting.as_ref() != Some(&labels) {
+                    writeln!(
+                        terminal,
+                        "Waiting for these conversations to finish their turns:\n  {}\nCtrl-C cancels the update; nothing has been ended or stopped.",
+                        labels.join("\n  ")
+                    )?;
+                    waiting = Some(labels);
+                }
+                // Approval belongs to this review, even if a worker republishes
+                // it with a fresh nonce during its cancellable idle wait.
+                submitted.insert(confirmation.nonce.clone());
+            }
+            if confirmation.stop.is_none()
+                && confirmation
+                    .preview
+                    .daemon
+                    .as_ref()
+                    .is_some_and(|daemon| daemon.policy != policy)
             {
                 if policy_requested.as_ref() != Some(&confirmation.nonce) {
-                    decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
+                    terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Policy(policy))?;
                     policy_requested = Some(confirmation.nonce.clone());
                 }
-            } else if submitted.as_ref() != Some(&confirmation.nonce) {
+            } else if !submitted.contains(&confirmation.nonce) {
                 if let Some(list) = &confirmation.stop {
-                    eprint!(
+                    write!(
+                        terminal,
                         "{}",
-                        if io::stdin().is_terminal() {
+                        if terminal.is_terminal() {
                             list.render()
                         } else {
                             list.render_preview()
                         }
-                    );
-                    if !io::stdin().is_terminal() {
-                        eprintln!(
+                    )?;
+                    if !terminal.is_terminal() {
+                        writeln!(
+                            terminal,
                             "Stopping live work needs a terminal. Rerun this command in a terminal."
-                        );
+                        )?;
                     }
-                    let choice = match floor_display::read_stop_choice(
-                        &mut io::stdin().lock(),
-                        io::stdin().is_terminal(),
+                    let is_terminal = terminal.is_terminal();
+                    let choice = match floor_display::read_stop_choice_from(
+                        |answer| terminal.read_line(answer),
+                        is_terminal,
                         list,
                     ) {
                         Ok(choice) => choice,
                         Err(error) => {
-                            cancel_current_review(&job.id);
+                            if terminal.interrupted() {
+                                if terminal.cancel(&job.id)? {
+                                    return Err(UpdateError::Cancelled);
+                                }
+                                continue;
+                            }
+                            let _ = terminal.cancel(&job.id);
                             return Err(error.into());
                         }
                     };
-                    if !submit_current_choice(&job.id, &confirmation.nonce, choice.clone())? {
+                    if !submit_current_choice(
+                        terminal,
+                        &job.id,
+                        &confirmation.nonce,
+                        choice.clone(),
+                    )? {
                         // Live work changed while the person was reading or
                         // typing. Reload and display its new list in this CLI.
                         continue;
@@ -620,92 +786,93 @@ fn drive_terminal_review(
                     if matches!(choice, UpdateChoice::Cancel) {
                         return Err(UpdateError::Cancelled);
                     }
-                    submitted = Some(confirmation.nonce.clone());
+                    submitted.insert(confirmation.nonce.clone());
                     continue;
                 }
-                eprint!("{}", render_review(&confirmation.preview));
-                let choice = if ordinary_approval(yes, io::stdin().is_terminal())
+                write!(terminal, "{}", render_review(&confirmation.preview))?;
+                let choice = if ordinary_approval(yes, terminal.is_terminal())
                     == Some(OrdinaryChoice::Cancel)
                 {
                     let stopped_preview = floor::preview_stop_list(&confirmation.preview);
                     if let Err(error) = &stopped_preview {
-                        eprintln!("Stop preview unavailable: {error}");
+                        writeln!(terminal, "Stop preview unavailable: {error}")?;
                     }
                     if let Some(list) = stopped_preview.ok().flatten() {
-                        eprint!("{}", list.render_preview());
+                        write!(terminal, "{}", list.render_preview())?;
                     }
-                    eprintln!(
+                    writeln!(
+                        terminal,
                         "Rerun this command in a terminal, or with --yes for the ordinary review. Stopping live work always needs a terminal."
-                    );
+                    )?;
                     OrdinaryChoice::Cancel
-                } else if let Some(choice) = ordinary_approval(yes, io::stdin().is_terminal()) {
+                } else if let Some(choice) = ordinary_approval(yes, terminal.is_terminal()) {
                     choice
                 } else {
-                    match prompt_review(&confirmation.preview) {
+                    match prompt_review(terminal, &confirmation.preview) {
                         Ok(choice) => choice,
                         Err(error) => {
-                            let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
+                            if terminal.interrupted() {
+                                if terminal.cancel(&job.id)? {
+                                    return Err(UpdateError::Cancelled);
+                                }
+                                continue;
+                            }
+                            let _ =
+                                terminal.decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
                             return Err(error.into());
                         }
                     }
                 };
                 match choice {
                     OrdinaryChoice::Cancel => {
-                        decide(&job.id, &confirmation.nonce, choice.into())?;
+                        terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
                         return Err(UpdateError::Cancelled);
                     }
                     OrdinaryChoice::Policy(next) => {
                         policy = next;
-                        decide(&job.id, &confirmation.nonce, choice.into())?;
+                        terminal.decide(&job.id, &confirmation.nonce, choice.into())?;
                         policy_requested = Some(confirmation.nonce.clone());
-                        submitted = None;
+                        submitted.insert(confirmation.nonce.clone());
                     }
                     OrdinaryChoice::Confirm => {
-                        if submit_current_choice(&job.id, &confirmation.nonce, choice.into())? {
-                            submitted = Some(confirmation.nonce.clone());
+                        if submit_current_choice(
+                            terminal,
+                            &job.id,
+                            &confirmation.nonce,
+                            choice.into(),
+                        )? {
+                            submitted.insert(confirmation.nonce.clone());
                         }
                     }
                 }
             }
         }
-        if Instant::now() >= deadline {
-            return Err(invalid(
-                "The update is still running; inspect its progress in the app.",
-            ));
-        }
-        thread::sleep(Duration::from_millis(250));
+        terminal.pause();
     }
 }
 
 /// A stale nonce means re-display, while a real failure must release prepared
 /// windows through cancellation of the current review.
 fn submit_current_choice(
+    terminal: &mut impl TerminalReview,
     job: &str,
     nonce: &str,
     choice: UpdateChoice,
 ) -> Result<bool, UpdateError> {
-    match decide(job, nonce, choice) {
+    match terminal.decide(job, nonce, choice) {
         Ok(()) => Ok(true),
         Err(error) => {
-            if status()?
+            if terminal
+                .status()?
                 .filter(|current| current.id == job)
                 .and_then(|current| current.active_confirmation().cloned())
                 .is_some_and(|confirmation| confirmation.nonce != nonce)
             {
                 return Ok(false);
             }
-            cancel_current_review(job);
+            let _ = terminal.cancel(job);
             Err(error)
         }
-    }
-}
-
-fn cancel_current_review(id: &str) {
-    if let Ok(Some(job)) = status()
-        && job.id == id
-        && let Some(confirmation) = job.active_confirmation()
-    {
-        let _ = decide(id, &confirmation.nonce, UpdateChoice::Cancel);
     }
 }
 
@@ -744,7 +911,10 @@ fn review_answer(answer: &str, working: bool) -> Option<OrdinaryChoice> {
     }
 }
 
-fn prompt_review(preview: &impact::Preview) -> io::Result<OrdinaryChoice> {
+fn prompt_review(
+    terminal: &mut impl TerminalReview,
+    preview: &impact::Preview,
+) -> io::Result<OrdinaryChoice> {
     let working = preview.daemon.as_ref().is_some_and(|daemon| {
         daemon.policy == impact::Policy::WhenIdle
             && daemon
@@ -756,37 +926,52 @@ fn prompt_review(preview: &impact::Preview) -> io::Result<OrdinaryChoice> {
         .daemon
         .as_ref()
         .is_some_and(impact::DaemonImpact::blocked);
-    read_review_choice(
-        &mut io::stdin().lock(),
-        &mut io::stderr().lock(),
+    read_review_choice_from(
+        |prompt, answer| {
+            terminal.write_all(prompt.as_bytes())?;
+            terminal.flush()?;
+            terminal.read_line(answer)
+        },
         working,
         stops,
     )
 }
 
+#[cfg(test)]
 fn read_review_choice(
     input: &mut impl io::BufRead,
     output: &mut impl Write,
     working: bool,
     stops: bool,
 ) -> io::Result<OrdinaryChoice> {
+    read_review_choice_from(
+        |prompt, answer| {
+            output.write_all(prompt.as_bytes())?;
+            output.flush()?;
+            input.read_line(answer)
+        },
+        working,
+        stops,
+    )
+}
+
+fn read_review_choice_from(
+    mut read_line: impl FnMut(&str, &mut String) -> io::Result<usize>,
+    working: bool,
+    stops: bool,
+) -> io::Result<OrdinaryChoice> {
     loop {
-        write!(
-            output,
-            "{}",
-            if working && stops {
-                "Enter: review stops when they finish   i: interrupt them now   n: cancel\n"
-            } else if working {
-                "Enter: update when they finish   i: interrupt them now   n: cancel\n"
-            } else if stops {
-                "Enter: review what stops   n: cancel\n"
-            } else {
-                "Update now? [Y/n] "
-            }
-        )?;
-        output.flush()?;
+        let prompt = if working && stops {
+            "Enter: review stops when they finish   i: interrupt them now   n: cancel\n"
+        } else if working {
+            "Enter: update when they finish   i: interrupt them now   n: cancel\n"
+        } else if stops {
+            "Enter: review what stops   n: cancel\n"
+        } else {
+            "Update now? [Y/n] "
+        };
         let mut answer = String::new();
-        if input.read_line(&mut answer)? == 0 {
+        if read_line(prompt, &mut answer)? == 0 {
             return Ok(OrdinaryChoice::Cancel);
         }
         if let Some(choice) = review_answer(&answer, working) {
@@ -836,6 +1021,7 @@ fn start_job(
         confirmation: None,
     };
     let log = private_create(&job.log_path)?;
+    confirmation::initialize(&state, &id)?;
     write_job(&state, &job)?;
     let request_file = private_create(&state.join(format!("{id}.request")))?;
     serde_json::to_writer(&request_file, request)?;
@@ -1153,8 +1339,9 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     if job.id != job_id || job.phase != UpdatePhase::Starting {
         return Err(invalid("update job is no longer pending"));
     }
-    // Keep the shared lease through the durable final outcome, including a
-    // startup failure. Dropping a worker copy must never unlock the successor.
+    // Reserve startup until readiness or a recorded failure. Success closes
+    // our copy before reopening windows; recovery closes it before restarting
+    // the selected version. Neither close may unlock a serving successor.
     let mut handoff = None;
     let mut survivors = floor::Survivors::default();
     let result = perform_update(
@@ -1176,8 +1363,11 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
         Ok(()) => "Update installed; saved windows reopened".into(),
         Err(error) => error.to_string(),
     };
-    if result.is_err() && !job.message.contains("Ended or stopped:") {
+    if !job.message.contains("Ended or stopped:") {
         job.message.push_str(&survivors.recovery_report());
+    }
+    if !job.message.contains("Current turns interrupted:") {
+        job.message.push_str(&survivors.prepared_report());
     }
     let (remaining, unchecked) = survivors.report();
     if !remaining.is_empty() {
@@ -1217,7 +1407,7 @@ fn perform_update(
             return installed::perform(installation, state, job, &root, handoff, survivors, true);
         }
     };
-    let cancellation = CancellationToken::new();
+    let cancellation = CancellationToken::for_job(state, &job.id)?;
     let endpoint = format!("repos/{REPOSITORY}/releases/{}", selected.id);
     let release = applicable_release(serde_json::from_slice(&metadata(
         &endpoint,
@@ -1256,7 +1446,7 @@ fn perform_update(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    let inspection = reconcile_saved_sources(staged.identity.protocol)?;
+    let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
     let context = ReviewContext::capture(installation)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
@@ -1269,6 +1459,7 @@ fn perform_update(
         "Saving and closing all application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    confirmation::check_cancelled(state, job)?;
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
     {
         let inspected = crate::install_guard::preflight_source_panes(
@@ -1294,22 +1485,23 @@ fn perform_update(
             ));
         }
     }
-    floor::quiesce(
-        state,
-        job,
-        &confirmed,
-        terminal,
-        |policy| {
-            Installation::detect()?;
-            Ok(context
-                .apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
-        },
-        handoff,
-        survivors,
-        &guard,
-    )?;
-    guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
     let install_result = (|| {
+        floor::quiesce(
+            state,
+            job,
+            &confirmed,
+            terminal,
+            |policy| {
+                Installation::detect()?;
+                Ok(context
+                    .apply(observe_impact(&staged.identity, policy)?.with_inspection(&inspection)))
+            },
+            handoff,
+            survivors,
+            &guard,
+        )?;
+        confirmation::prepared(state, job)?;
+        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         Installation::detect()?;
         set_phase(
             state,
@@ -1328,13 +1520,19 @@ fn perform_update(
             handoff.as_ref(),
         )
     })();
-    record_handoff_failure(state, job, &install_result, handoff)?;
+    let recovery_result = finish_handoff(
+        installation,
+        state,
+        job,
+        &install_result,
+        handoff,
+        survivors,
+        &guard,
+    );
     let reopen_result = guard
-        .relaunch_windows(
-            &windows,
-            &installation.prefix.join("current/bin/cagents-ui"),
-        )
+        .relaunch_closed_windows(&installation.prefix.join("current/bin/cagents-ui"))
         .map_err(UpdateError::from);
+    recovery_result?;
     install_result?;
     reopen_result
 }
@@ -1346,8 +1544,8 @@ struct ReviewContext {
 
 impl ReviewContext {
     fn capture(installation: &Installation) -> Result<Self, UpdateError> {
-        let _guard = crate::instance::UiUpdateGuard::acquire()?;
-        let windows = crate::instance::verified_running_windows()?;
+        let guard = crate::instance::UiUpdateGuard::acquire()?;
+        let windows = guard.verified_windows()?;
         let layout = locate(&std::env::current_exe()?)?;
         let from_version = installed_daemon_owner(&layout)?
             .map(|owner| owner.version)
@@ -1384,10 +1582,16 @@ pub(crate) fn inspect_source_panes(
 // user will consent to. Never expand consent after windows have prepared.
 fn reconcile_saved_sources(
     destination_protocol: u16,
+    replaces_compatible_daemon: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
     let guard = crate::instance::UiUpdateGuard::acquire()?;
     let (protocol, proof) = source::inspect_identity(None)?;
-    inspect_source_panes_mode(&guard, proof, protocol != destination_protocol, true)
+    inspect_source_panes_mode(
+        &guard,
+        proof,
+        protocol != destination_protocol || replaces_compatible_daemon,
+        true,
+    )
 }
 
 fn inspect_source_panes_mode(
@@ -1618,63 +1822,7 @@ fn observe_impact(
     })
 }
 
-fn wait_daemon_stopped(
-    paths: crate::daemon::RuntimePaths,
-    source: crate::daemon::lease_handoff::HandoffSource,
-    state: &Path,
-    job: &mut UpdateJob,
-) -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {
-    use crate::daemon::lease_handoff::{LeaseHandoff, holder_pid};
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    const WAITING: &str = "Waiting for the terminal service to save its panes";
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let waiting_paths = paths.clone();
-    let pid = source.pid;
-    thread::Builder::new()
-        .name("daemon-lease-handoff".into())
-        .spawn(move || {
-            let _ = sender.send(LeaseHandoff::wait(&waiting_paths, pid));
-        })?;
-    let mut last_progress = Instant::now();
-    let mut source_exited_at = None;
-    loop {
-        match receiver.recv_timeout(Duration::from_secs(1)) {
-            Ok(result) => return result.map_err(|error| invalid(error.to_string())),
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(invalid("Terminal service lease handoff thread exited"));
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-        }
-        // A nonblocking older client can race the kernel's waiter wakeup.
-        // Never start a successor against that unexpected holder, or wait
-        // indefinitely for it under the original daemon's identity.
-        let exited = source.exited()?;
-        if let Some(holder) = holder_pid(&paths)? {
-            if holder != std::process::id() as i32 && (Some(holder) != source.locker_pid || exited)
-            {
-                return Err(invalid(format!(
-                    "Terminal service lease handoff was interrupted by holder process {holder} (expected process {pid}); saved panes were retained. Check cagents daemon status before retrying"
-                )));
-            }
-        }
-        // An inherited flock can outlive its original process, and its
-        // kernel record may no longer be visible in this PID namespace. Never
-        // impose a checkpoint deadline while the pinned source lives; after
-        // exit, allow the waiter to run before diagnosing a leaked description.
-        if exited
-            && source_exited_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(5)
-        {
-            return Err(invalid(format!(
-                "Terminal service process {pid} exited but its lease was not handed over (holder PID unavailable); saved panes were retained. Check cagents daemon status before retrying"
-            )));
-        }
-        if last_progress.elapsed() >= Duration::from_secs(15) {
-            eprintln!("{WAITING}");
-            set_phase(state, job, UpdatePhase::Installing, WAITING)?;
-            last_progress = Instant::now();
-        }
-    }
-}
+use handoff::wait_daemon_stopped;
 
 /// Recovery windows may autostart the old version. Publish failure before
 /// allowing that start, rather than keeping the runtime reserved until reopen.
@@ -1683,14 +1831,69 @@ fn record_handoff_failure(
     job: &mut UpdateJob,
     result: &Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    recovery_report: &str,
+    prepared_report: &str,
 ) -> Result<(), UpdateError> {
     if let Err(error) = result {
         eprintln!("{error}");
-        job.phase = UpdatePhase::Failed;
+        job.phase = if matches!(error, UpdateError::Cancelled) {
+            UpdatePhase::Cancelled
+        } else {
+            UpdatePhase::Failed
+        };
         job.confirmation = None;
         job.message = error.to_string();
+        if !job.message.contains("Ended or stopped:") {
+            job.message.push_str(recovery_report);
+        }
+        if !job.message.contains("Current turns interrupted:") {
+            job.message.push_str(prepared_report);
+        }
         write_job(state, job)?;
         drop(handoff.take());
+    }
+    Ok(())
+}
+
+/// Settle the reservation before reopening clients. The worker, including a
+/// headless update with no windows, owns restarting the selected installation.
+fn finish_handoff(
+    installation: &Installation,
+    state: &Path,
+    job: &mut UpdateJob,
+    result: &Result<(), UpdateError>,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    survivors: &floor::Survivors,
+    guard: &crate::instance::UiUpdateGuard,
+) -> Result<(), UpdateError> {
+    let reserved = handoff.is_some() || survivors.needs_daemon_recovery();
+    record_handoff_failure(
+        state,
+        job,
+        result,
+        handoff,
+        &survivors.recovery_report(),
+        &survivors.prepared_report(),
+    )?;
+    // Success has confirmed serving readiness. Only close our copy: LOCK_UN
+    // would also unlock the successor's shared open-file description.
+    drop(handoff.take());
+    if reserved && result.is_err() {
+        let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
+        command.args(["daemon", "start"]);
+        crate::install_guard::sanitize_child_environment(&mut command);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        guard.inherit_for_install(&mut command)?;
+        let started = crate::install_guard::wait_daemon_start(
+            &mut command,
+            crate::install_guard::daemon_start_timeout()?,
+        );
+        if let Err(failure) = started {
+            eprintln!("Recovery daemon start failed: {}", failure.error);
+            job.message.push_str(" The terminal service could not restart. Run `cagents daemon start` to recover your saved panes.");
+            write_job(state, job)?;
+            return Err(invalid(job.message.clone()));
+        }
     }
     Ok(())
 }
@@ -1705,18 +1908,32 @@ fn run_installer(
     guard: &crate::instance::UiUpdateGuard,
     handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<(), UpdateError> {
-    let files = [
-        installer.as_raw_fd(),
-        archive.as_raw_fd(),
-        checksums.as_raw_fd(),
-    ];
+    // Keep sources above the destinations so remapping cannot overwrite a
+    // still-needed input, even in a worker with many open descriptors.
+    let files: Vec<File> = [installer, archive, checksums]
+        .into_iter()
+        .map(|file| {
+            let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { File::from_raw_fd(fd) })
+        })
+        .collect::<io::Result<_>>()?;
+    let inherited_files = [190, 191, 192];
     let mut command = Command::new("/bin/sh");
     command
-        .arg(format!("/proc/self/fd/{}", files[0]))
+        .arg(format!("/proc/self/fd/{}", inherited_files[0]))
         .args(["--version", &release.version, "--prefix"])
         .arg(&installation.prefix)
-        .env("CAGENTS_ARCHIVE", format!("/proc/self/fd/{}", files[1]))
-        .env("CAGENTS_CHECKSUMS", format!("/proc/self/fd/{}", files[2]))
+        .env(
+            "CAGENTS_ARCHIVE",
+            format!("/proc/self/fd/{}", inherited_files[1]),
+        )
+        .env(
+            "CAGENTS_CHECKSUMS",
+            format!("/proc/self/fd/{}", inherited_files[2]),
+        )
         .env("CAGENTS_REPOSITORY", REPOSITORY)
         .env(
             "CAGENTS_INSTALL_OWNER_CLI",
@@ -1733,13 +1950,16 @@ fn run_installer(
     if restart_daemon {
         command.arg("--restart-daemon");
     }
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
     guard.inherit_for_install(&mut command)?;
     // SAFETY: descriptor flags only; sealed anonymous files cannot be replaced
     // between checksum verification and the installer's own second verification.
     unsafe {
         command.pre_exec(move || {
-            for fd in files {
-                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+            for (fd, target) in files.iter().zip(inherited_files) {
+                if libc::dup2(fd.as_raw_fd(), target) == -1
+                    || libc::fcntl(target, libc::F_SETFD, 0) == -1
+                {
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -1747,7 +1967,7 @@ fn run_installer(
         });
     }
     if let Some(handoff) = handoff {
-        handoff.inherit(&mut command)?;
+        handoff.inherit_for_installer(&mut command)?;
     }
     // Do not kill an installer mid-transaction. Its migration protocol owns
     // bounded shutdown/startup and rollback, and its log survives every UI.
@@ -3183,8 +3403,8 @@ finally:
             .to_string();
         assert!(
             error.contains("127")
-                && error.contains("too old")
-                && error.contains("intermediate build")
+                && error.contains("protocol 156")
+                && error.contains("0.1.3+local.991daa43e")
         );
         fixture.finish();
         // A fully qualified current peer owned by an older build is updated
@@ -3369,14 +3589,11 @@ finally:
             boot_id: "boot".into(),
             host_incarnation: "incarnation".into(),
         };
-        for &protocol in source::CURRENT_CLIENT_PROTOCOLS
-            .iter()
-            .chain(source::LEGACY_PROTOCOLS)
-        {
+        for protocol in source::protocols() {
             for window in [&old, &new] {
                 for owner in [&old, &third] {
                     assert_eq!(
-                        installed_update_worker(
+                        installed_candidate_version(
                             window,
                             &new.version_root,
                             Some(owner),
@@ -3391,7 +3608,7 @@ finally:
         }
         // UI-only replacement and a stopped source also use the candidate.
         assert_eq!(
-            installed_update_worker(
+            installed_candidate_version(
                 &old,
                 &new.version_root,
                 Some(&new),
@@ -3402,7 +3619,7 @@ finally:
             "new"
         );
         assert_eq!(
-            installed_update_worker(
+            installed_candidate_version(
                 &old,
                 &new.version_root,
                 None,
@@ -3415,7 +3632,7 @@ finally:
         // Preserve no-op refusal once both window and daemon are already served.
         for (owner, proof) in [(None, None), (Some(&new), Some(&proof))] {
             assert!(
-                installed_update_worker(
+                installed_candidate_version(
                     &new,
                     &new.version_root,
                     owner,
@@ -3425,13 +3642,14 @@ finally:
                 .is_err()
             );
         }
-        let error = installed_update_worker(&new, &new.version_root, Some(&old), 127, Some(&proof))
-            .unwrap_err()
-            .to_string();
+        let error =
+            installed_candidate_version(&new, &new.version_root, Some(&old), 127, Some(&proof))
+                .unwrap_err()
+                .to_string();
         assert!(
             error.contains("127")
-                && error.contains("too old")
-                && error.contains("intermediate build")
+                && error.contains("protocol 156")
+                && error.contains("0.1.3+local.991daa43e")
         );
     }
     use std::os::unix::fs::PermissionsExt;
@@ -3767,6 +3985,9 @@ finally:
     #[test]
     fn startup_failure_is_persisted_before_releasing_the_handoff() {
         use crate::daemon::{HostLease, RuntimePaths, lease_handoff::LeaseHandoff};
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("daemon");
         let paths = RuntimePaths {
@@ -3796,13 +4017,15 @@ finally:
                 &root.path().join("missing"),
                 &mut job,
                 &result,
-                &mut handoff
+                &mut handoff,
+                "",
+                "",
             )
             .is_err()
         );
         assert!(handoff.is_some());
         assert!(HostLease::is_held(&paths).unwrap());
-        record_handoff_failure(root.path(), &mut job, &result, &mut handoff).unwrap();
+        record_handoff_failure(root.path(), &mut job, &result, &mut handoff, "", "").unwrap();
         let persisted: UpdateJob =
             serde_json::from_slice(&fs::read(root.path().join("status.json")).unwrap()).unwrap();
         assert_eq!(persisted.phase, UpdatePhase::Failed);
@@ -3810,6 +4033,138 @@ finally:
         assert!(handoff.is_none());
         assert!(!HostLease::is_held(&paths).unwrap());
     }
+    #[cfg(feature = "host")]
+    #[test]
+    fn transferred_lease_skips_source_prepare_and_survives_installer_start_failure() {
+        use crate::daemon::{HostLease, RuntimePaths, lease_handoff::LeaseHandoff};
+        const MODE: &str = "CAGENTS_TEST_HEADLESS_RECOVERY";
+        const TEST: &str = "update::tests::transferred_lease_skips_source_prepare_and_survives_installer_start_failure";
+        if std::env::var_os(MODE).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let runtime = isolated.path().join("runtime");
+            fs::create_dir(&runtime).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MODE, "worker")
+                .env(
+                    "CAGENTS_TEST_HEADLESS_EXEC",
+                    std::env::current_exe().unwrap(),
+                )
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("HOME", isolated.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        if std::env::var(MODE).unwrap() == "daemon" {
+            // Exercise the real admission barrier while the worker still owns
+            // the update fence. Recovery has to inherit that exact authority.
+            let _admission = crate::instance::DaemonAdmissionGuard::acquire().unwrap();
+            let root = PathBuf::from(std::env::var_os("CAGENTS_TEST_HEADLESS_ROOT").unwrap());
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join("runtime/cagentsd.lock"))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let socket =
+                std::os::unix::net::UnixListener::bind(root.join("runtime/cagentsd.sock")).unwrap();
+            fs::write(root.join("daemon-ready"), b"serving").unwrap();
+            while !root.join("daemon-exit").exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            crate::daemon::shut_down_test_listener(socket);
+            return;
+        }
+        let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("runtime");
+        let paths = RuntimePaths {
+            socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
+            lock: directory.join("cagentsd.lock"),
+            directory,
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("headless-recovery"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("headless-recovery"),
+        };
+        drop(HostLease::acquire(&paths, &proof).unwrap());
+        let mut lease = Some(LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+        let installation = Installation {
+            prefix: root.path().into(),
+            version: "old".into(),
+        };
+        let bin = root.path().join("versions/old/bin");
+        fs::create_dir_all(&bin).unwrap();
+        // Model the installer's restored pointer after a pre-start failure.
+        // There are no UI windows to start a daemon on the worker's behalf.
+        std::os::unix::fs::symlink("versions/old", root.path().join("current")).unwrap();
+        let script = r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys, time
+root = pathlib.Path(__file__).resolve().parents[3]
+assert sys.argv[1:] == ['daemon','start']  # No second source prepare.
+assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
+assert not pathlib.Path('/proc/self/fd/199').exists()
+assert json.loads((root/'status.json').read_text())['phase'] == 'Failed'
+os.environ['CAGENTS_TEST_HEADLESS_RECOVERY']='daemon'
+os.environ['CAGENTS_TEST_HEADLESS_ROOT']=str(root)
+child = subprocess.Popen([os.environ['CAGENTS_TEST_HEADLESS_EXEC'], '--exact',
+    'update::tests::transferred_lease_skips_source_prepare_and_survives_installer_start_failure',
+    '--nocapture', '--test-threads=1'],
+    pass_fds=(int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD']),),
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=None)
+while not (root/'daemon-ready').exists():
+    if child.poll() is not None: sys.exit(1)
+    time.sleep(.005)
+"#;
+        fs::write(bin.join("cagents"), script).unwrap();
+        fs::set_permissions(bin.join("cagents"), fs::Permissions::from_mode(0o700)).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::write(self.0.join("daemon-exit"), b"exit");
+            }
+        }
+        let _cleanup = Cleanup(root.path().to_owned());
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: root.path().join("worker.log"),
+            confirmation: None,
+        };
+        finish_handoff(
+            &installation,
+            root.path(),
+            &mut job,
+            &Err(invalid("installer failed before replacement startup")),
+            &mut lease,
+            &floor::Survivors::default(),
+            &guard,
+        )
+        .unwrap();
+        assert!(lease.is_none());
+        assert!(root.path().join("daemon-ready").exists());
+        assert!(std::os::unix::net::UnixStream::connect(&paths.socket).is_ok());
+        assert!(
+            HostLease::is_held(&paths).unwrap(),
+            "worker must recover without windows"
+        );
+        fs::write(root.path().join("daemon-exit"), b"exit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while HostLease::is_held(&paths).unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[cfg(feature = "host")]
     #[test]
     fn handoff_reports_an_exited_source_with_a_leaked_lock_description() {
@@ -3848,7 +4203,6 @@ sys.stdin.buffer.read(1)
             .read_line(&mut ready)
             .unwrap();
         let leaked_pid: u32 = ready.trim().parse().unwrap();
-        let source_pid = daemon.id();
         let source = HandoffSource::pin(&paths, &proof).unwrap();
         // Pin the deliberate leak before allowing the original daemon to exit.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, leaked_pid, 0) };
@@ -3892,10 +4246,136 @@ sys.stdin.buffer.read(1)
             .err()
             .expect("a leaked lock is not a completed handoff")
             .to_string();
-        assert!(error.contains(&source_pid.to_string()), "{error}");
+        assert_eq!(error, handoff::SERVICE_NOT_STOPPED);
+    }
+    #[test]
+    fn first_terminal_failure_preserves_the_exact_stop_report() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: directory.path().join("worker.log"),
+            confirmation: None,
+        };
+        let report = concat!(
+            "\nThe terminal service accepted the stop.\n",
+            "Ended or stopped:\n",
+            "  build · alpha: screen and directory kept; press Restart in the pane\n",
+            "  review · beta: press Resume in the pane\n",
+        );
+        let mut handoff = None;
+        record_handoff_failure(
+            directory.path(),
+            &mut job,
+            &Err(invalid("The installer failed")),
+            &mut handoff,
+            report,
+            "",
+        )
+        .unwrap();
+
+        let first_failure: UpdateJob =
+            serde_json::from_slice(&fs::read(directory.path().join("status.json")).unwrap())
+                .unwrap();
+        assert_eq!(first_failure.phase, UpdatePhase::Failed);
+        assert!(first_failure.message.starts_with("The installer failed"));
+        for line in report.lines().filter(|line| !line.is_empty()) {
+            assert_eq!(
+                first_failure.message.matches(line).count(),
+                1,
+                "{}",
+                first_failure.message
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_driver_waits_for_worker_recovery_before_returning_failure() {
+        struct Terminal {
+            job: UpdateJob,
+            recovery_finished: bool,
+            pauses: usize,
+            worker_checks: usize,
+            output: Vec<u8>,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(self.job.clone()))
+            }
+            fn decide(&mut self, _: &str, _: &str, _: UpdateChoice) -> Result<(), UpdateError> {
+                panic!("recovery must not ask for another approval");
+            }
+            fn cancel(&mut self, _: &str) -> Result<bool, UpdateError> {
+                panic!("recovery must not submit a new cancellation");
+            }
+            fn read_line(&mut self, _: &mut String) -> io::Result<usize> {
+                panic!("recovery must not ask another question");
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn worker_running(&mut self) -> Result<bool, UpdateError> {
+                self.worker_checks += 1;
+                Ok(!self.recovery_finished)
+            }
+            fn pause(&mut self) {
+                self.pauses += 1;
+                assert_eq!(self.pauses, 1, "the settled failure must return promptly");
+                self.recovery_finished = true;
+                self.job.message.push_str(
+                    "\nThe terminal service could not restart. Run `cagents daemon start` to recover your saved panes.",
+                );
+            }
+        }
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Failed,
+            message: concat!(
+                "The installer failed\nEnded or stopped:\n",
+                "  build · alpha: screen and directory kept; press Restart in the pane",
+            )
+            .into(),
+            log_path: "/fake/update-worker.log".into(),
+            confirmation: None,
+        };
+        let mut terminal = Terminal {
+            job: job.clone(),
+            recovery_finished: false,
+            pauses: 0,
+            worker_checks: 0,
+            output: Vec::new(),
+        };
+        let error = drive_terminal_review_with(job, false, false, &mut terminal)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(terminal.pauses, 1);
+        assert_eq!(terminal.worker_checks, 2);
         assert!(
-            error.contains("holder process") || error.contains("holder PID unavailable"),
+            error.contains("The terminal service could not restart"),
             "{error}"
+        );
+        assert!(
+            error.contains("build · alpha: screen and directory kept"),
+            "{error}"
+        );
+        assert!(
+            terminal.output.is_empty(),
+            "settled recovery needs no new prompts"
         );
     }
 }

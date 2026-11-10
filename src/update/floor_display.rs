@@ -28,6 +28,10 @@ pub struct StopItem {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StopList {
     pub from_version: String,
+    #[serde(default)]
+    pub background_tasks: u64,
+    #[serde(default)]
+    pub background_identity: String,
     pub items: Vec<StopItem>,
 }
 
@@ -49,8 +53,13 @@ impl StopList {
                 )
             })
             .collect();
-        let encoded = serde_json::to_vec(&(&self.from_version, identities))
-            .expect("stop lists contain only serializable values");
+        let encoded = serde_json::to_vec(&(
+            &self.from_version,
+            self.background_tasks,
+            &self.background_identity,
+            identities,
+        ))
+        .expect("stop lists contain only serializable values");
         format!("{:x}", Sha256::digest(encoded))
     }
 
@@ -66,6 +75,19 @@ impl StopList {
             "The running terminal service ({}) cannot hand these over.\nUpdating stops them:\n\n",
             inline(&self.from_version)
         );
+        if self.background_tasks > 0 {
+            let noun = if self.background_tasks == 1 {
+                "task"
+            } else {
+                "tasks"
+            };
+            writeln!(
+                output,
+                "  {} running background {noun} also stop; they do not resume automatically.\n",
+                self.background_tasks
+            )
+            .unwrap();
+        }
         for item in &self.items {
             writeln!(output, "  {}", inline(&item.label)).unwrap();
             writeln!(output, "      {}", inline(&item.running)).unwrap();
@@ -103,7 +125,7 @@ pub(super) fn chat_item_with_state(
         id: impact.id,
         kind: impact::SessionKind::NativeChat,
         label: label.into(),
-        identity: identity(&(&impact.identity, chat)),
+        identity: identity(&(&impact.identity, &impact.interrupted_subagents, chat)),
         running: format!(
             "{} chat, {state}{}",
             match chat.launch.provider {
@@ -147,8 +169,17 @@ fn identity(value: &impl Serialize) -> String {
 
 /// `--yes` accepts only the ordinary review. A person at a terminal must type
 /// this word, even when every other update choice has already been approved.
+#[cfg(test)]
 pub(super) fn read_stop_choice(
     input: &mut impl io::BufRead,
+    is_terminal: bool,
+    list: &StopList,
+) -> io::Result<UpdateChoice> {
+    read_stop_choice_from(|answer| input.read_line(answer), is_terminal, list)
+}
+
+pub(super) fn read_stop_choice_from(
+    mut read_line: impl FnMut(&mut String) -> io::Result<usize>,
     is_terminal: bool,
     list: &StopList,
 ) -> io::Result<UpdateChoice> {
@@ -156,7 +187,7 @@ pub(super) fn read_stop_choice(
         return Ok(UpdateChoice::Cancel);
     }
     let mut answer = String::new();
-    if input.read_line(&mut answer)? != 0 && answer.trim() == "stop" {
+    if read_line(&mut answer)? != 0 && answer.trim() == "stop" {
         Ok(UpdateChoice::StopListed {
             items_digest: list.digest(),
         })
@@ -402,6 +433,8 @@ mod tests {
 
     fn representative() -> StopList {
         StopList {
+            background_tasks: 0,
+            background_identity: String::new(),
             from_version: "0.1.3+local.991daa43e".into(),
             items: vec![
                 item(
@@ -550,6 +583,8 @@ mod tests {
         let mut idle = recorded.clone();
         idle.running = "Claude chat, idle".into();
         let list = |item| StopList {
+            background_tasks: 0,
+            background_identity: String::new(),
             from_version: "old".into(),
             items: vec![item],
         };
@@ -560,6 +595,8 @@ mod tests {
     fn chat_digest_binds_source_descriptor_and_ignores_work_state() {
         let (mut source, impact) = chat(false);
         let list = |item| StopList {
+            background_tasks: 0,
+            background_identity: String::new(),
             from_version: "old".into(),
             items: vec![item],
         };
@@ -720,6 +757,8 @@ mod tests {
         let before = terminal_item(&terminal, &impact, "build", &observed());
         assert_eq!(before.running, "shell running `cargo test`");
         let list = |item| StopList {
+            background_tasks: 0,
+            background_identity: String::new(),
             from_version: "old".into(),
             items: vec![item],
         };
@@ -851,5 +890,21 @@ mod tests {
             processes.foreground(&terminal).is_none(),
             "a shell that changed after the census is not identified by stale evidence"
         );
+    }
+    #[test]
+    fn background_scope_is_disclosed_and_bound_even_when_the_count_is_unchanged() {
+        let mut list = representative();
+        let original = list.digest();
+        list.background_tasks = 2;
+        list.background_identity = "first task;second task".into();
+        assert_ne!(list.digest(), original);
+        let shown = list.digest();
+        assert!(
+            list.render().contains(
+                "2 running background tasks also stop; they do not resume automatically."
+            )
+        );
+        list.background_identity = "replacement task;second task".into();
+        assert_ne!(list.digest(), shown);
     }
 }

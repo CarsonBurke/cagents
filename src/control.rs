@@ -2445,6 +2445,10 @@ where
     let wants_json = arguments
         .iter()
         .any(|argument| argument.as_os_str() == OsStr::new("--json"));
+    if let Err(error) = crate::daemon::lease_handoff::initialize_inherited_lease() {
+        emit_error(wants_json, &AppError::new("daemon_startup", error));
+        return ExitCode::FAILURE;
+    }
     let cli = match Cli::try_parse_from(arguments.clone()) {
         Ok(cli) => cli,
         Err(error)
@@ -2780,9 +2784,8 @@ fn staged_command_requires_daemon(command: &TopCommand) -> bool {
 }
 
 fn routes_to_staged_owner(command: &TopCommand) -> bool {
-    // `daemon upgrade` selects its own worker: an older owner's updater would
-    // apply that owner's preflight, which cannot qualify panes this release
-    // knows how to carry (`update::installed_update_worker`).
+    // `daemon upgrade` enters the served candidate's updater. An older owner's
+    // preflight cannot qualify the panes this candidate knows how to carry.
     !matches!(
         command,
         TopCommand::Completions { .. }
@@ -3369,13 +3372,10 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    // A reviewed worker can reserve the lease after the
-                    // serving process has exited. Only its validated inherited
-                    // description distinguishes that reservation from startup.
-                    !crate::daemon::lease_handoff::has_inherited_lease()
+                    // Ownership proves startup or shutdown is still in progress,
+                    // including a daemon that adopted the updater's descriptor.
+                    crate::daemon::HostLease::is_held(&paths)
                         .map_err(|error| AppError::new("daemon_status", error))?
-                        && crate::daemon::HostLease::is_held(&paths)
-                            .map_err(|error| AppError::new("daemon_status", error))?
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
@@ -3384,6 +3384,8 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 "running": running,
                 "socket": socket,
                 "daemon_version": daemon_version,
+                "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
+                    .map_err(|error| AppError::new("daemon_status", error))?,
                 "cli_version": crate::version()
             });
             let mut human = if running {
@@ -4654,6 +4656,107 @@ mod tests {
     use super::ControlError;
 
     #[test]
+    fn inherited_daemon_lease_reports_starting_before_listener_is_bound() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        const CHILD: &str = "CAGENTS_TEST_INHERITED_STATUS";
+        if let Ok(descriptor) = std::env::var(CHILD) {
+            use std::os::fd::{AsRawFd, FromRawFd};
+            let descriptor: i32 = descriptor.parse().unwrap();
+            crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
+            let output = super::execute_daemon(super::DaemonCommand::Status).unwrap();
+            assert_eq!(output.data["running"], true);
+            assert_eq!(output.data["inherited_lease"], true);
+            assert!(output.data["daemon_version"].is_null());
+            assert!(output.human.contains("starting running"));
+            assert!(!output.human.contains("stopped"));
+            // Startup seals either transport even without a child sealing hook.
+            assert_ne!(
+                unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            assert!(
+                std::process::Command::new("/bin/sh")
+                    .args([
+                        "-c",
+                        "test ! -e /proc/self/fd/199 && test ! -e /proc/self/fd/3"
+                    ])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            if descriptor == 3 {
+                // The installer's low slot grants no authority to overwrite a
+                // different resource already present in the daemon's slot.
+                assert_eq!(unsafe { libc::fcntl(199, libc::F_GETFD) }, -1);
+                let unrelated = std::fs::File::open("/dev/null").unwrap();
+                assert_eq!(unsafe { libc::dup2(unrelated.as_raw_fd(), 199) }, 199);
+                let reserved = unsafe { std::fs::File::from_raw_fd(199) };
+                let error = crate::daemon::lease_handoff::inherit_daemon_lease(
+                    &mut std::process::Command::new("/bin/true"),
+                )
+                .unwrap_err();
+                assert_eq!(error.raw_os_error(), Some(libc::EBUSY));
+                drop(reserved);
+            }
+            // Repeated queries use the startup result, not fd/path inspection.
+            let paths = crate::daemon::RuntimePaths::discover().unwrap();
+            std::fs::rename(&paths.lock, paths.lock.with_extension("saved")).unwrap();
+            assert!(crate::daemon::lease_handoff::has_inherited_lease().unwrap());
+            return;
+        }
+        for descriptor in [3, 199] {
+            let runtime = tempfile::tempdir().unwrap();
+            let directory = runtime.path().join(crate::instance::runtime_subdirectory());
+            std::fs::create_dir(&directory).unwrap();
+            std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let paths = crate::daemon::RuntimePaths {
+                socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
+                lock: directory.join("cagentsd.lock"),
+                directory,
+            };
+            let mut lock = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&paths.lock)
+                .unwrap();
+            use std::io::Write;
+            write!(lock, "{{\"pid\":{}}}", std::process::id()).unwrap();
+            drop(lock);
+            let handoff =
+                crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, std::process::id())
+                    .unwrap();
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+            .args([
+                "--exact",
+                "control::tests::inherited_daemon_lease_reports_starting_before_listener_is_bound",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, descriptor.to_string())
+            .env("XDG_RUNTIME_DIR", runtime.path())
+            .env("XDG_CONFIG_HOME", runtime.path().join("config"))
+            .env("XDG_STATE_HOME", runtime.path().join("state"))
+            .env("HOME", runtime.path());
+            if descriptor == 3 {
+                handoff.inherit_for_installer(&mut command).unwrap();
+            } else {
+                handoff.inherit(&mut command).unwrap();
+            }
+            let output = command.output().unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+        }
+    }
+
+    #[test]
     fn a_daemon_refusal_reaches_a_person_as_its_own_sentence() {
         let refusal = ControlError::Remote {
             code: crate::terminal_ipc::ProtocolErrorCode::InvalidRequest,
@@ -5449,7 +5552,7 @@ mod tests {
 
     #[test]
     fn update_source_confirm_preserves_every_shutdown_outcome() {
-        for &protocol in crate::update::source::CURRENT_CLIENT_PROTOCOLS {
+        for protocol in crate::update::source::current_client_protocols() {
             let (client_stream, mut server_stream) = UnixStream::pair().unwrap();
             let pinned = proof("source", "boot", "incarnation");
             let capability = ShutdownCapability {
@@ -6427,7 +6530,7 @@ mod tests {
 
     #[test]
     fn update_source_client_speaks_and_requires_the_sources_own_protocol() {
-        for &source in crate::update::source::CURRENT_CLIENT_PROTOCOLS {
+        for source in crate::update::source::current_client_protocols() {
             if source == PROTOCOL_VERSION {
                 continue;
             }

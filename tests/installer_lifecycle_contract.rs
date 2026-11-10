@@ -284,10 +284,19 @@ fn coordinated_release_mode(
 CLI=old
 if [ "$FIXTURE_HANDOFF" = true ]; then
   "$FIXTURE_LEASE_CHECK" || exit 97
+  # Match CLI startup: no ordinary helper may retain update authority.
+  exec 3<&-
+  unset CAGENTS_DAEMON_LEASE_FD
   # The worker already owns window coordination in this fixture. This CLI
   # stands in for its verified inherited fence; real guard/adoption validation
   # is covered by installer_guard_contract and the daemon process tests.
-  case "$*" in 'verify-install-guard'*) exit 0 ;; esac
+  case "$*" in
+    'verify-install-guard'*) exit 0 ;;
+    'coordinate-install --help'|'record-deferred-install --help')
+      printf 'Options:\n  --stage-only  Preserve running windows\n'
+      exit 0
+      ;;
+  esac
 fi
 case "$*" in
   'coordinate-install '*|'verify-install-guard'*|'record-deferred-install'*)
@@ -315,9 +324,9 @@ case "$*" in
     if [ "$CLI" = new ] && [ "$FIXTURE_COMPATIBLE" = false ] &&
        [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" = old ]; then exit 9; fi
     if [ -e "$FIXTURE_RUNNING" ]; then running=true; else running=false; fi
-    # Historical CLIs see the updater's flock as a running daemon, even though
-    # its socket is gone. The candidate recognizes its inherited lease instead.
-    if [ "$FIXTURE_HANDOFF:$CLI" = true:old ]; then running=true; fi
+    # A held lease reports running/starting before a listener exists, including
+    # when only the worker reservation survives a failed startup command.
+    if [ "$FIXTURE_HANDOFF" = true ]; then running=true; fi
     if [ -e "$FIXTURE_PENDING" ]; then
       [ "$CLI" = old ] || exit 98
       printf '%s\n' old:draining >> "$FIXTURE_ACTIONS"
@@ -325,10 +334,10 @@ case "$*" in
     elif [ "$running" = false ] && [ -e "$FIXTURE_CHECKPOINT" ]; then
       printf '%s:stopped\n' "$CLI" >> "$FIXTURE_ACTIONS"
     fi
-    if [ "$FIXTURE_COORDINATOR:$CLI" = starting:new ]; then
-      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":null}}\n' "$running"
+    if [ "$FIXTURE_COORDINATOR:$CLI" = starting:new ] || [ "$FIXTURE_RESTART:$CLI" = handoff-starting:new ]; then
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":null,"inherited_lease":%s}}\n' "$running" "$FIXTURE_HANDOFF"
     else
-      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture"}}\n' "$running"
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture","inherited_lease":%s}}\n' "$running" "$FIXTURE_HANDOFF"
     fi
     ;;
   'daemon --help')
@@ -380,6 +389,7 @@ case "$*" in
     fi
     if [ ! -e "$FIXTURE_RUNNING" ]; then printf '%s\n' "$CLI" > "$FIXTURE_RUNNING"; fi
     if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 4; fi
+    if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = handoff-starting ]; then exit 4; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_RESTART" = start-signal ]; then
       kill -TERM "$PPID"
       exit 4
@@ -541,6 +551,71 @@ case "$url" in
 esac
 "#,
     );
+    let utility_log = home.path().join("utility-descriptors");
+    if handoff {
+        // Every external installer utility is checked at exec, including
+        // utilities reached through pipelines, substitutions and find -exec.
+        for tool in [
+            "awk",
+            "cat",
+            "chmod",
+            "cp",
+            "curl",
+            "find",
+            "getconf",
+            "gh",
+            "gtk-update-icon-cache",
+            "id",
+            "ln",
+            "mkdir",
+            "mktemp",
+            "mv",
+            "readlink",
+            "rm",
+            "rmdir",
+            "sed",
+            "sha256sum",
+            "shasum",
+            "sleep",
+            "tar",
+            "uname",
+            "update-desktop-database",
+        ] {
+            let wrapper = tools.join(tool);
+            let target = if wrapper.exists() {
+                let saved = tools.join(format!("original-{tool}"));
+                fs::rename(&wrapper, &saved).unwrap();
+                saved
+            } else {
+                let system = Path::new("/usr/bin").join(tool);
+                if !system.is_file() {
+                    continue;
+                }
+                system
+            };
+            executable(
+                &wrapper,
+                &format!(
+                    r#"#!/usr/bin/python3
+import errno, os, sys
+assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
+for fd in (3, 199):
+    try:
+        os.fstat(fd)
+    except OSError as error:
+        assert error.errno == errno.EBADF
+    else:
+        raise AssertionError(f'installer utility {{sys.argv[0]}} inherited fd {{fd}}')
+with open(os.environ['FIXTURE_UTILITY_LOG'], 'a') as log:
+    log.write({tool:?} + '\n')
+target = {target:?}
+os.execv(target, [target, *sys.argv[1:]])
+"#,
+                    target = target.to_str().unwrap()
+                ),
+            );
+        }
+    }
     let actions = home.path().join("actions");
     let running = home.path().join("running");
     let checkpoint = home.path().join("checkpoint");
@@ -618,11 +693,11 @@ exec sh "$@""#,
             &lease_check,
             r#"#!/usr/bin/python3
 import fcntl, os
-assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '199'
-held = os.fstat(199)
+assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '3'
+held = os.fstat(3)
 expected = os.stat(os.environ['FIXTURE_LEASE_PATH'])
 assert (held.st_dev, held.st_ino) == (expected.st_dev, expected.st_ino)
-fcntl.flock(199, fcntl.LOCK_EX | fcntl.LOCK_NB)
+fcntl.flock(3, fcntl.LOCK_EX | fcntl.LOCK_NB)
 with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     try:
         fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -633,14 +708,14 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
 "#,
         );
         command
-            .env("CAGENTS_DAEMON_LEASE_FD", "199")
+            .env("CAGENTS_DAEMON_LEASE_FD", "3")
             .env("CAGENTS_UI_UPDATE_GUARD_FD", "198");
         let descriptor = lease.as_raw_fd();
         // SAFETY: the parent guard outlives installation, and only descriptor
         // syscalls run after fork. The fixed descriptor matches the real path.
         unsafe {
             command.pre_exec(move || {
-                if libc::dup2(descriptor, 199) == -1 || libc::fcntl(199, libc::F_SETFD, 0) == -1 {
+                if libc::dup2(descriptor, 3) == -1 || libc::fcntl(3, libc::F_SETFD, 0) == -1 {
                     return Err(std::io::Error::last_os_error());
                 }
                 Ok(())
@@ -657,6 +732,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .env("FIXTURE_HANDOFF", handoff.to_string())
         .env("FIXTURE_LEASE_CHECK", &lease_check)
         .env("FIXTURE_LEASE_PATH", &lease_path)
+        .env("FIXTURE_UTILITY_LOG", &utility_log)
         .env("FIXTURE_REAL_CLI", &real_cli)
         .env(
             "FIXTURE_SOURCE_PROTOCOL",
@@ -738,24 +814,24 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     if handoff {
         use std::os::fd::AsRawFd;
         let success = restart == Some("handoff-success");
+        let starting = restart == Some("handoff-starting");
         assert_eq!(output.status.success(), success, "{output:?}");
         assert_eq!(
             fs::read_link(prefix.join("current")).unwrap(),
-            Path::new(if success {
-                "versions/9.9.9"
-            } else {
-                "versions/old"
-            })
+            Path::new("versions/9.9.9")
         );
         let actions = fs::read_to_string(&actions).unwrap();
-        assert_eq!(
-            actions,
-            if success {
-                "new:stopped\nnew:start\n"
-            } else {
-                "new:stopped\nnew:start\nnew:stopped\n"
-            }
-        );
+        assert_eq!(actions, "new:start\n");
+        let utility_calls = fs::read_to_string(&utility_log).unwrap();
+        for tool in [
+            "id", "uname", "getconf", "awk", "mktemp", "cp", "tar", "find", "chmod", "mkdir",
+            "readlink", "sed", "mv", "rmdir", "ln", "rm",
+        ] {
+            assert!(
+                utility_calls.lines().any(|called| called == tool),
+                "{tool} was not checked: {utility_calls}"
+            );
+        }
         assert!(
             !actions.contains("old:"),
             "the stopped source must not be prepared or restarted: {actions}"
@@ -767,12 +843,25 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         if success {
             assert_eq!(fs::read(&restored).unwrap(), fs::read(&checkpoint).unwrap());
             assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+        } else if starting {
+            assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
+            assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("replacement daemon shutdown is not proven"),
+                "{output:?}"
+            );
         } else {
             assert!(!running.exists());
-            assert!(!prefix.join("versions/9.9.9").exists());
+            assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
             assert!(
                 String::from_utf8_lossy(&output.stderr)
                     .contains("replacement daemon startup failed")
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr)
+                    .contains("replacement daemon shutdown is not proven"),
+                "{output:?}"
             );
         }
         let contender = fs::File::open(&lease_path).unwrap();
@@ -1264,8 +1353,15 @@ fn staging_cannot_borrow_candidate_support_from_an_installed_coordinator() {
 /// Shell transaction coverage with a real inherited flock and mocked companion
 /// replies; native daemon adoption is exercised by the daemon process tests.
 #[test]
-fn transferred_lease_skips_source_prepare_and_survives_installer_start_failure() {
+fn lease_path_installer_transaction() {
     for mode in ["handoff-success", "handoff-start-failure"] {
         upgrade_fixture(false, 7, None, Some(mode));
     }
+}
+
+/// A held daemon lease is startup evidence even before the socket and version
+/// round trip become available. Cleanup must keep its executable tree.
+#[test]
+fn inherited_starting_daemon_keeps_its_new_version_on_installer_failure() {
+    upgrade_fixture(false, 7, None, Some("handoff-starting"));
 }

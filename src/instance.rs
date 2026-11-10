@@ -26,8 +26,7 @@ use std::{
 mod daemon_admission;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence,
-    has_inherited_daemon_fence, inherit_daemon_fence,
+    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -1172,6 +1171,14 @@ pub struct UiUpdateGuard {
 }
 
 impl UiUpdateGuard {
+    /// The authenticated windows while this guard is held. Its shared legacy
+    /// fence already excludes a legacy exclusive UI owner, so absence of
+    /// window leases means no windows; probing legacy exclusivity again would
+    /// conflict with the guard's own fence.
+    pub(crate) fn verified_windows(&self) -> io::Result<Vec<VerifiedWindow>> {
+        verified_window_lease_owners_in(&self.runtime, Path::new("/proc"))
+    }
+
     pub fn set_fallback_executable(&mut self, executable: PathBuf) {
         self.fallback_executable = Some(executable);
     }
@@ -1299,6 +1306,20 @@ impl UiUpdateGuard {
         }
         self.prepared.clear();
         Ok(())
+    }
+
+    /// Finish a staged update without reopening windows that never closed.
+    /// On a partial close, Drop cancels the remaining prepared windows and waits
+    /// for committed windows to exit before reopening only those slots.
+    pub(crate) fn relaunch_closed_windows(mut self, executable: &Path) -> io::Result<()> {
+        if self.prepared.is_empty() {
+            let closed = self.closed.clone();
+            self.relaunch_windows(&closed, executable)
+        } else {
+            self.set_fallback_executable(executable.to_owned());
+            drop(self);
+            Ok(())
+        }
     }
 
     pub fn relaunch_windows(mut self, slots: &[String], executable: &Path) -> io::Result<()> {
@@ -2691,6 +2712,35 @@ mod tests {
     }
 
     #[test]
+    fn update_guard_sees_no_windows_without_mistaking_its_own_fence_for_a_legacy_ui() {
+        let runtime = tempfile::tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy = owned_lock(
+            &runtime.path().join(APPLICATION_LOCK_FILE),
+            libc::LOCK_SH | libc::LOCK_NB,
+        )
+        .unwrap();
+        let guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            fallback_executable: None,
+        };
+        // A daemon-only update has no windows; the generic probe cannot tell
+        // the guard's own shared fence from a legacy UI.
+        assert!(verified_windows_in(runtime.path(), Path::new("/proc")).is_err());
+        assert!(guard.verified_windows().unwrap().is_empty());
+    }
+
+    #[test]
     fn recovery_rejects_unknown_legacy_ownership_and_pending_handoff() {
         let runtime = tempfile::tempdir().unwrap();
         let legacy = owned_lock(
@@ -3034,6 +3084,99 @@ mod tests {
             );
             worker.join().unwrap();
         }
+    }
+
+    #[test]
+    fn relaunch_closed_windows_cancels_open_prepared_windows_and_preserves_their_leases() {
+        let runtime = tempdir().unwrap();
+        let lock = owned_lock(
+            &runtime
+                .path()
+                .join(format!("{APPLICATION_LOCK_FILE}.update")),
+            libc::LOCK_EX | libc::LOCK_NB,
+        )
+        .unwrap();
+        let legacy =
+            owned_lock(&runtime.path().join(APPLICATION_LOCK_FILE), libc::LOCK_SH).unwrap();
+        let mut leases = Vec::new();
+        let mut workers = Vec::new();
+        for slot in [PRIMARY_WINDOW, "window-2"] {
+            leases.push(
+                owned_lock(&runtime.path().join(slot_lock_name(slot)), libc::LOCK_EX).unwrap(),
+            );
+            let listener =
+                std::os::unix::net::UnixListener::bind(runtime.path().join(slot_socket_name(slot)))
+                    .unwrap();
+            listener.set_nonblocking(true).unwrap();
+            workers.push(std::thread::spawn(move || {
+                let mut actions = Vec::new();
+                for _ in 0..2 {
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    let stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(
+                                    std::time::Instant::now() < deadline,
+                                    "prepared window was not cancelled"
+                                );
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("window accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(1)))
+                        .unwrap();
+                    actions.push(read_capped_line(&stream).unwrap());
+                    writeln!(&stream, "ok").unwrap();
+                }
+                actions
+            }));
+        }
+        let mut guard = UiUpdateGuard {
+            lock: Some(lock),
+            runtime: runtime.path().into(),
+            _legacy_fence: legacy,
+            prepared: Vec::new(),
+            closed: Vec::new(),
+            fallback_executable: None,
+        };
+        let slots = guard.prepare_windows(Duration::from_secs(5)).unwrap();
+        assert_eq!(slots.len(), 2);
+        // A cancelled stop prompt and a failure before commit both arrive here:
+        // the original windows are still running and must simply unfreeze.
+        guard
+            .relaunch_closed_windows(&runtime.path().join("must-not-launch"))
+            .unwrap();
+        for worker in workers {
+            assert_eq!(worker.join().unwrap(), ["update-prepare", "update-cancel"]);
+        }
+        assert_eq!(running_window_slots(runtime.path()).unwrap(), slots);
+        for slot in &slots {
+            assert!(
+                owned_lock(
+                    &runtime.path().join(slot_lock_name(slot)),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                )
+                .is_err(),
+                "the original window lost its lease"
+            );
+        }
+        assert!(
+            owned_lock(
+                &runtime
+                    .path()
+                    .join(format!("{APPLICATION_LOCK_FILE}.update")),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .is_ok(),
+            "the cancelled update retained the launch fence"
+        );
+        drop(leases);
     }
 
     #[test]

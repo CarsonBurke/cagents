@@ -69,7 +69,7 @@ fn stop_list(
     let processes = super::floor_display::TerminalProcesses::observe();
     let mut items = Vec::new();
     for item in &daemon.sessions {
-        let label = preview.labels.get(&item.id).unwrap_or(&item.title);
+        let label = preview.labels.names.get(&item.id).unwrap_or(&item.title);
         match item.kind {
             impact::SessionKind::NativeChat
                 if service || item.disposition == impact::Disposition::Blocked =>
@@ -126,7 +126,7 @@ fn stop_list(
                 continue;
             }
             let fallback = format!("{} chat", chat.launch.provider.label());
-            let label = preview.labels.get(&chat.id).unwrap_or(&fallback);
+            let label = preview.labels.names.get(&chat.id).unwrap_or(&fallback);
             let item = descriptor_impact(chat.id, impact::SessionKind::NativeChat, label, chat)?;
             items.push(chat_item_with_state(
                 chat,
@@ -154,6 +154,7 @@ fn stop_list(
             }
             let label = preview
                 .labels
+                .names
                 .get(&id)
                 .map(String::as_str)
                 .or(terminal.title.as_deref())
@@ -164,8 +165,34 @@ fn stop_list(
         }
     }
     items.sort_by_key(|item| (item.kind, item.id));
+    let (background_tasks, background_identity) = if service {
+        (
+            daemon.capability.background_subagents,
+            daemon.capability.background_identity.clone(),
+        )
+    } else {
+        let tasks: BTreeSet<_> = daemon
+            .sessions
+            .iter()
+            .filter(|session| items.iter().any(|item| item.id == session.id))
+            .flat_map(|session| {
+                session
+                    .interrupted_subagents
+                    .iter()
+                    .map(move |task| (session.id, task))
+            })
+            .collect();
+        let identity = if tasks.is_empty() {
+            String::new()
+        } else {
+            format!("{:x}", Sha256::digest(serde_json::to_vec(&tasks)?))
+        };
+        (tasks.len() as u64, identity)
+    };
     Ok(StopList {
         from_version: preview.from_version.clone(),
+        background_tasks,
+        background_identity,
         items,
     })
 }
@@ -238,7 +265,13 @@ trait FloorSource {
     ) -> Result<(), UpdateError> {
         self.capture(list)
     }
-    fn ended(&mut self, _items: &[super::floor_display::StopItem], _service: bool) {}
+    fn ended(
+        &mut self,
+        _items: &[super::floor_display::StopItem],
+        _service: bool,
+        _background_tasks: u64,
+    ) {
+    }
     fn archive(&mut self) -> Result<(), UpdateError> {
         Ok(())
     }
@@ -258,6 +291,7 @@ struct NativeSource<'a, O> {
     pinned: Option<crate::daemon::lease_handoff::HandoffSource>,
     handoff: &'a mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
     survivors: &'a mut Survivors,
+    reviewed: &'a impact::Preview,
     guard: &'a crate::instance::UiUpdateGuard,
 }
 
@@ -309,9 +343,9 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         })
     }
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), UpdateError> {
-        source_client_for(daemon)?
-            .prepare_confirmed_upgrade(daemon.clone(), false)
-            .map(|_| ())
+        source_client_for(daemon)?.prepare_confirmed_upgrade(daemon.clone(), false)?;
+        self.survivors.record_prepared(self.reviewed, daemon);
+        Ok(())
     }
     fn close_chat(
         &mut self,
@@ -410,13 +444,19 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
             .and_then(|pid| crate::daemon::holder_registry::Process::read(pid).ok());
         self.survivors.capture(list, root)
     }
-    fn ended(&mut self, items: &[super::floor_display::StopItem], service: bool) {
+    fn ended(
+        &mut self,
+        items: &[super::floor_display::StopItem],
+        service: bool,
+        background_tasks: u64,
+    ) {
         for item in items {
             self.survivors
                 .ended
                 .insert((item.kind, item.id), item.clone());
         }
         self.survivors.service_stopped |= service;
+        self.survivors.background_tasks = background_tasks;
     }
     fn archive(&mut self) -> Result<(), UpdateError> {
         archive_checkpoint()
@@ -464,6 +504,7 @@ pub(super) fn quiesce(
         pinned: Some(pinned),
         handoff,
         survivors,
+        reviewed: confirmed,
         guard,
     };
     quiesce_source(state, job, confirmed, terminal, &mut source)
@@ -508,18 +549,28 @@ fn recovery_not_confirmed(item: &mut super::floor_display::StopItem) {
     .into();
 }
 
+fn background_recovery(tasks: u64) -> String {
+    match tasks {
+        0 => String::new(),
+        1 => "1 background task stopped; it does not resume automatically.\n".into(),
+        _ => format!("{tasks} background tasks stopped; they do not resume automatically.\n"),
+    }
+}
+
 fn completed_error(
     error: UpdateError,
     completed: &[super::floor_display::StopItem],
     service: bool,
+    background_tasks: u64,
 ) -> UpdateError {
-    if completed.is_empty() && !service {
+    if completed.is_empty() && !service && background_tasks == 0 {
         return error;
     }
     let mut message = format!("{error}\n");
     if service {
         message.push_str("The terminal service accepted the stop.\n");
     }
+    message.push_str(&background_recovery(background_tasks));
     message.push_str("Ended or stopped:\n");
     for item in completed {
         message.push_str(&format!("  {}: {}\n", item.label, item.recovery));
@@ -536,6 +587,7 @@ fn quiesce_source(
 ) -> Result<(), UpdateError> {
     let mut completed = Vec::new();
     let mut service_stopped = false;
+    let mut background_tasks = 0;
     let result = quiesce_inner(
         state,
         job,
@@ -544,8 +596,9 @@ fn quiesce_source(
         source,
         &mut completed,
         &mut service_stopped,
+        &mut background_tasks,
     );
-    result.map_err(|error| completed_error(error, &completed, service_stopped))
+    result.map_err(|error| completed_error(error, &completed, service_stopped, background_tasks))
 }
 
 fn quiesce_inner(
@@ -556,11 +609,14 @@ fn quiesce_inner(
     source: &mut impl FloorSource,
     completed: &mut Vec<super::floor_display::StopItem>,
     service_stopped: &mut bool,
+    background_tasks: &mut u64,
 ) -> Result<(), UpdateError> {
     let Some(initial) = &confirmed.daemon else {
         return Ok(());
     };
+    confirmation::check_cancelled(state, job)?;
     let mut preview = source.observe()?;
+    confirmation::check_cancelled(state, job)?;
     if !confirmed.preserves_consent(&preview) {
         return Err(invalid(
             "Session ownership changed before stopping the source; review the update again",
@@ -585,9 +641,11 @@ fn quiesce_inner(
     // With no known ends, prepare itself determines whether the service can
     // checkpoint. A refusal has not ended anything and precedes the one stop list.
     if !daemon.blocked() {
+        confirmation::prepared(state, job)?;
         match source.prepare(daemon) {
             Ok(()) => return source.stopped(state, job, false),
             Err(error) => {
+                confirmation::resume_cancellation(state, job)?;
                 eprintln!("The source could not checkpoint its work: {error}");
                 service = true;
             }
@@ -676,11 +734,13 @@ fn quiesce_inner(
             if !fresh.preserves_stop_consent(&last) || listed.digest() != last_list.digest() {
                 continue;
             }
+            confirmation::prepared(state, job)?;
             match source.shutdown(last.daemon.as_ref().unwrap(), capability)? {
                 ShutdownOutcome::Accepted { .. } => {
                     *service_stopped = true;
+                    *background_tasks = listed.background_tasks;
                     completed.extend(listed.items.clone());
-                    source.ended(&listed.items, true);
+                    source.ended(&listed.items, true, *background_tasks);
                     // Accepted invalidates the old checkpoint even when waiting
                     // for exit or writing the recovery record subsequently fails.
                     let archived = source.archive();
@@ -689,7 +749,7 @@ fn quiesce_inner(
                         for item in completed.iter_mut() {
                             recovery_not_confirmed(item);
                         }
-                        source.ended(completed, true);
+                        source.ended(completed, true, *background_tasks);
                     }
                     match (archived, retained) {
                         (Ok(()), Ok(())) => (),
@@ -702,7 +762,10 @@ fn quiesce_inner(
                     }
                     return source.stopped(state, job, true);
                 }
-                ShutdownOutcome::InventoryChanged { .. } | ShutdownOutcome::Expired => continue,
+                ShutdownOutcome::InventoryChanged { .. } | ShutdownOutcome::Expired => {
+                    confirmation::resume_cancellation(state, job)?;
+                    continue;
+                }
                 outcome => {
                     return Err(invalid(format!(
                         "The terminal service did not accept the stop: {}. The update ended without requesting termination.",
@@ -712,6 +775,9 @@ fn quiesce_inner(
             }
         }
         for chat in ending {
+            if completed.is_empty() {
+                confirmation::prepared(state, job)?;
+            }
             let snapshot = match source.close_chat(daemon, chat.clone()) {
                 Ok(snapshot) => snapshot,
                 Err(error) if completed.is_empty() => {
@@ -723,6 +789,7 @@ fn quiesce_inner(
                     if !fresh.preserves_stop_consent(&current)
                         || listed.digest() != current_list.digest()
                     {
+                        confirmation::resume_cancellation(state, job)?;
                         continue 'review;
                     }
                     return Err(error);
@@ -742,7 +809,14 @@ fn quiesce_inner(
                 .filter(|item| item.id == chat.id)
                 .cloned()
                 .collect();
-            source.ended(&ended_items, false);
+            *background_tasks += daemon
+                .sessions
+                .iter()
+                .find(|session| {
+                    session.id == chat.id && session.kind == impact::SessionKind::NativeChat
+                })
+                .map_or(0, |session| session.interrupted_subagents.len() as u64);
+            source.ended(&ended_items, false, *background_tasks);
             let mut ended = record.clone();
             ended.chats.retain(|source| source.id == chat.id);
             ended.aliases.retain(|source| source.id == chat.id);
@@ -757,7 +831,7 @@ fn quiesce_inner(
                 for item in completed.iter_mut().filter(|item| item.id == chat.id) {
                     recovery_not_confirmed(item);
                 }
-                source.ended(completed, false);
+                source.ended(completed, false, *background_tasks);
                 return Err(error);
             }
         }
@@ -767,6 +841,9 @@ fn quiesce_inner(
             .as_ref()
             .ok_or_else(|| invalid("The source disappeared after ending conversations"))?;
         // No prompt or new destructive scope is permitted after the first end.
+        if completed.is_empty() {
+            confirmation::prepared(state, job)?;
+        }
         source.prepare(daemon)?;
         return source.stopped(state, job, false);
     }
@@ -831,6 +908,9 @@ fn archive_checkpoint() -> Result<(), UpdateError> {
 pub(super) struct Survivors {
     ended: BTreeMap<(impact::SessionKind, TerminalId), super::floor_display::StopItem>,
     service_stopped: bool,
+    source_prepared: bool,
+    interrupted: BTreeMap<(impact::SessionKind, TerminalId), InterruptedTurn>,
+    background_tasks: u64,
     processes: BTreeMap<(i32, u64), Survivor>,
     labels: BTreeMap<TerminalId, String>,
     origins: BTreeMap<TerminalId, TerminalId>,
@@ -839,13 +919,87 @@ pub(super) struct Survivors {
     markers: BTreeMap<Vec<u8>, (TerminalId, String)>,
 }
 
+struct InterruptedTurn {
+    label: String,
+    recovery: String,
+    background_tasks: BTreeSet<String>,
+}
+
 impl Survivors {
-    pub(super) fn recovery_report(&self) -> String {
-        let items: Vec<_> = self.ended.values().cloned().collect();
-        if items.is_empty() && !self.service_stopped {
+    /// Call only after the source accepts preparation. An interrupted turn is
+    /// different from a whole chat ended by the floor, so retain that scope in
+    /// its report rather than describing the conversation itself as stopped.
+    fn record_prepared(&mut self, reviewed: &impact::Preview, daemon: &impact::DaemonImpact) {
+        self.source_prepared = true;
+        for session in &daemon.sessions {
+            let key = (session.kind, session.id);
+            if session.disposition != impact::Disposition::Interrupted
+                || self.ended.contains_key(&key)
+            {
+                continue;
+            }
+            let label = reviewed
+                .labels
+                .names
+                .get(&session.id)
+                .unwrap_or(&session.title)
+                .clone();
+            let recovery = reviewed
+                .stopped
+                .iter()
+                .find(|pane| pane.pane == session.id)
+                .map_or_else(
+                    || "its saved conversation resumes after the update".to_owned(),
+                    |pane| format!("after the update: {}. {}", pane.reason, pane.recovery),
+                );
+            self.interrupted
+                .entry(key)
+                .or_insert_with(|| InterruptedTurn {
+                    label,
+                    recovery,
+                    background_tasks: session.interrupted_subagents.iter().cloned().collect(),
+                });
+        }
+    }
+
+    pub(super) fn prepared_report(&self) -> String {
+        let turns: Vec<_> = self
+            .interrupted
+            .iter()
+            .filter(|(key, _)| !self.ended.contains_key(*key))
+            .map(|(_, turn)| turn)
+            .collect();
+        if turns.is_empty() {
             return String::new();
         }
-        completed_error(invalid(""), &items, self.service_stopped).to_string()
+        let mut report = String::from("\nCurrent turns interrupted:\n");
+        for turn in &turns {
+            report.push_str(&format!(
+                "  {}: current turn interrupted; {}\n",
+                turn.label, turn.recovery
+            ));
+        }
+        let background_tasks: usize = turns.iter().map(|turn| turn.background_tasks.len()).sum();
+        report.push_str(&background_recovery(background_tasks as u64));
+        report
+    }
+
+    pub(super) fn needs_daemon_recovery(&self) -> bool {
+        self.service_stopped || self.source_prepared
+    }
+
+    pub(super) fn recovery_report(&self) -> String {
+        let items: Vec<_> = self.ended.values().cloned().collect();
+        if items.is_empty() && !self.service_stopped && self.background_tasks == 0 {
+            return String::new();
+        }
+        completed_error(
+            invalid(""),
+            &items,
+            self.service_stopped,
+            self.background_tasks,
+        )
+        .to_string()
     }
 }
 

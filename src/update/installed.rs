@@ -78,7 +78,7 @@ pub(super) fn perform(
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
-    installed_daemon_owner(&layout)?;
+    let source_owner = installed_daemon_owner(&layout)?;
     if served_version_root(&layout)? != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
@@ -105,7 +105,7 @@ pub(super) fn perform(
         return Err(invalid("installed CLI exceeds update size limit"));
     }
     seal_file(&executable)?;
-    let cancellation = CancellationToken::new();
+    let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged =
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
     let observe = |policy| {
@@ -119,7 +119,12 @@ pub(super) fn perform(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    let inspection = reconcile_saved_sources(staged.identity.protocol)?;
+    // A different installed daemon is replaced even at the same protocol.
+    // Inspect with the same intent used by the reviewed impact and preflight.
+    let replaces_compatible_daemon = source_owner
+        .as_ref()
+        .is_some_and(|owner| owner.version_root != root);
+    let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
     let context = ReviewContext::capture(installation)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
@@ -131,6 +136,7 @@ pub(super) fn perform(
         "Saving and closing application windows",
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
+    confirmation::check_cancelled(state, job)?;
     let windows = guard.prepare_windows(Duration::from_secs(45))?;
     {
         let inspected = crate::install_guard::preflight_source_panes(
@@ -157,21 +163,23 @@ pub(super) fn perform(
             ));
         }
     }
+    confirmation::check_cancelled(state, job)?;
     let output = StartupOutput::create(state)?;
-    floor::quiesce(
-        state,
-        job,
-        &confirmed,
-        terminal,
-        |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
-        handoff,
-        survivors,
-        &guard,
-    )?;
-    guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
     let mut startup_attempted = false;
     let mut startup_owned = false;
     let result = (|| {
+        floor::quiesce(
+            state,
+            job,
+            &confirmed,
+            terminal,
+            |policy| Ok(context.apply(observe(policy)?.with_inspection(&inspection))),
+            handoff,
+            survivors,
+            &guard,
+        )?;
+        confirmation::prepared(state, job)?;
+        guard.close_prepared_windows(&windows, Duration::from_secs(45))?;
         set_phase(
             state,
             job,
@@ -230,10 +238,19 @@ pub(super) fn perform(
             .join("versions")
             .join(&installation.version)
     };
-    record_handoff_failure(state, job, &result, handoff)?;
+    let recovery_result = finish_handoff(
+        installation,
+        state,
+        job,
+        &result,
+        handoff,
+        survivors,
+        &guard,
+    );
     let reopened = guard
-        .relaunch_windows(&windows, &reopen.join("bin/cagents-ui"))
+        .relaunch_closed_windows(&reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
+    recovery_result?;
     result?;
     reopened
 }

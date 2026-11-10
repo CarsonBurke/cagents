@@ -1457,11 +1457,9 @@ fn ensure_daemon_ready_at(
         return Err(HostedTerminalStartError::HostBinaryMissing(daemon_binary));
     }
 
-    let scoped = !crate::daemon::lease_handoff::has_inherited_lease()
-        .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?
-        && systemd_user_manager_available()
-        && !crate::instance::has_inherited_daemon_fence()
-            .map_err(|error| HostedTerminalStartError::HostStartup(error.to_string()))?;
+    // User scopes execute the command locally and preserve explicitly
+    // forwarded descriptors, including both update admission and inventory.
+    let scoped = systemd_user_manager_available();
     start_and_verify_daemon_at(socket, timeout, &daemon_binary, scoped, |scoped| {
         spawn_daemon(&daemon_binary, application, scoped)
     })
@@ -3345,6 +3343,49 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(5));
     }
 
+    fn scope_fixture_lease(root: &Path) -> crate::daemon::lease_handoff::LeaseHandoff {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let paths = crate::daemon::RuntimePaths {
+            directory: root.to_owned(),
+            socket: root.join("daemon.sock"),
+            lock: root.join("cagentsd.lock"),
+        };
+        let mut lock = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        write!(lock, "{{\"pid\":{}}}", std::process::id()).unwrap();
+        drop(lock);
+        crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap()
+    }
+
+    #[test]
+    fn scoped_launch_passes_reserved_lease_through_the_scope_launcher() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let launcher = root.path().join("systemd-run");
+        // The scope launcher executes locally and preserves inherited fds.
+        // This fake checks the selected mode and reproduces that exec contract.
+        std::fs::write(&launcher, "#!/bin/sh\n[ \"$1\" = --user ] && [ \"$2\" = --scope ] || exit 7\nwhile [ \"$1\" != -- ]; do shift; done\nshift\nexec \"$@\"\n").unwrap();
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lease = scope_fixture_lease(root.path());
+        let mut command = daemon_launch_command(
+            Path::new("/bin/sh"),
+            crate::notifications::Application::Cagents,
+            true,
+        );
+        command.env("PATH", root.path()).args([
+            "-c",
+            "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199",
+        ]);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
+        assert!(command.status().unwrap().success());
+    }
+
     #[test]
     fn systemd_scope_preserves_environment_arguments_and_isolates_cgroup() {
         use std::io::{Read, Seek};
@@ -3354,6 +3395,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let output = directory.path().join("scope-evidence");
+        let lease = scope_fixture_lease(directory.path());
         // Regular files avoid waiting for the background holder to close a pipe.
         let mut stdout = tempfile::tempfile().unwrap();
         let mut stderr = tempfile::tempfile().unwrap();
@@ -3388,12 +3430,14 @@ mod tests {
         // manager-side variable expansion or replacement by manager state.
         command
             .env("CAGENTS_SCOPE_TEST", "caller-value")
-            .args(["-c", "sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
+            .args(["-c", "test \"$CAGENTS_DAEMON_LEASE_FD\" = 199 && test -e /proc/self/fd/199 || exit 8; sed -n 's/^0:://p' /proc/self/cgroup > \"$1\"; printf '%s\\n%s\\n' \"$2\" \"$CAGENTS_SCOPE_TEST\" >> \"$1\"; sleep 30 & echo $! >> \"$1\"", "fixture"])
             .arg(&output)
             .arg("$HOME");
         command
             .stdout(stdout.try_clone().unwrap())
             .stderr(stderr.try_clone().unwrap());
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        lease.inherit(&mut command).unwrap();
         let status = command.status().unwrap();
         assert!(
             status.success(),

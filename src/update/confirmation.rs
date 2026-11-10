@@ -35,6 +35,60 @@ fn now_ms() -> u64 {
         .unwrap_or(u64::MAX)
 }
 
+/// A stable, private cancellation nonce exists before the worker is spawned,
+/// independently of the previews it will later publish for approval.
+pub(super) fn initialize(state: &Path, job: &str) -> Result<(), UpdateError> {
+    let file = private_create(&state.join(format!("{job}.cancel-nonce")))?;
+    serde_json::to_writer(&file, &uuid::Uuid::new_v4().to_string())?;
+    file.sync_all()?;
+    File::open(state)?.sync_all()?;
+    Ok(())
+}
+
+fn cancellation_nonce(state: &Path, job: &str) -> Result<Option<String>, UpdateError> {
+    let bytes = match read_private(
+        &state.join(format!("{job}.cancel-nonce")),
+        SMALL_ASSET_LIMIT,
+    ) {
+        Ok(bytes) => bytes,
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let nonce: String = serde_json::from_slice(&bytes)?;
+    if uuid::Uuid::parse_str(&nonce)
+        .ok()
+        .is_none_or(|id| id.to_string() != nonce)
+    {
+        return Err(invalid("invalid update cancellation identifier"));
+    }
+    Ok(Some(nonce))
+}
+
+pub(super) fn cancellation_path(state: &Path, job: &str) -> Result<Option<PathBuf>, UpdateError> {
+    Ok(cancellation_nonce(state, job)?.map(|nonce| state.join(format!("{job}.{nonce}.cancel"))))
+}
+
+/// True means cancellation was recorded before the preparation boundary.
+/// False means the worker must finish restoring service instead.
+pub(super) fn cancel(job: &str) -> Result<bool, UpdateError> {
+    let state = running_installation()?.state_dir()?;
+    cancel_at(&state, job)
+}
+
+pub(super) fn cancel_at(state: &Path, job: &str) -> Result<bool, UpdateError> {
+    let _decisions = DecisionLease::acquire(state, job)?;
+    let current: UpdateJob =
+        serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
+    if current.id != job || current.phase.is_terminal() {
+        return Ok(false);
+    }
+    let Some(nonce) = cancellation_nonce(state, job)? else {
+        return Ok(false);
+    };
+    publish_decision(state, job, &nonce, Choice::Cancel)?;
+    Ok(true)
+}
+
 /// A choice only applies to the exact preview still held by the leased worker.
 /// Unique files avoid replacing another window's decision mid-read.
 pub fn decide(job: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError> {
@@ -47,14 +101,28 @@ pub fn decide(job: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError>
         }
     }
     let state = running_installation()?.state_dir()?;
+    decide_at(&state, job, nonce, choice)
+}
+
+pub(super) fn decide_at(
+    state: &Path,
+    job: &str,
+    nonce: &str,
+    choice: Choice,
+) -> Result<(), UpdateError> {
+    let _decisions = DecisionLease::acquire(state, job)?;
     let current: UpdateJob =
         serde_json::from_slice(&read_private(&state.join("status.json"), JOB_STATE_LIMIT)?)?;
-    if !matches!(
+    let accepts_choice = matches!(
         current.phase,
         UpdatePhase::AwaitingConfirmation | UpdatePhase::WaitingForIdle
-    ) || current.id != job
+    ) || matches!(choice, Choice::Cancel)
+        && current.phase == UpdatePhase::ClosingWindows;
+    if !accepts_choice
+        || current.id != job
         || current.confirmation.as_ref().is_none_or(|confirmation| {
-            confirmation.nonce != nonce || now_ms() >= confirmation.expires_at_unix_ms
+            confirmation.nonce != nonce
+                || !matches!(choice, Choice::Cancel) && now_ms() >= confirmation.expires_at_unix_ms
         })
     {
         return Err(invalid(
@@ -64,13 +132,52 @@ pub fn decide(job: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError>
     publish_decision(&state, job, nonce, choice)
 }
 
+/// Serialize cancellation publication with closing its admission. The worker
+/// never promises cancellation after it has begun preparing the source.
+struct DecisionLease(File);
+
+impl DecisionLease {
+    fn acquire(state: &Path, job: &str) -> io::Result<Self> {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(state.join(format!("{job}.decisions.lock")))?;
+        loop {
+            // SAFETY: a live, private file descriptor; the guard owns the lock.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(Self(file));
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
+    }
+}
+
+impl Drop for DecisionLease {
+    fn drop(&mut self) {
+        // SAFETY: the guard retains the locked descriptor for this call.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
+
 fn publish_decision(
     state: &Path,
     job: &str,
     nonce: &str,
     choice: Choice,
 ) -> Result<(), UpdateError> {
-    let path = state.join(format!("{job}.{nonce}.decision"));
+    let suffix = if matches!(choice, Choice::Cancel) {
+        "cancel"
+    } else {
+        "decision"
+    };
+    let path = state.join(format!("{job}.{nonce}.{suffix}"));
     let temporary = state.join(format!("{}.decision-writing", uuid::Uuid::new_v4()));
     let file = private_create(&temporary)?;
     serde_json::to_writer(
@@ -84,8 +191,70 @@ fn publish_decision(
     file.sync_all()?;
     let published = fs::hard_link(&temporary, &path);
     let _ = fs::remove_file(&temporary);
-    published?;
+    match published {
+        Ok(()) => (),
+        Err(error) if suffix == "cancel" && error.kind() == io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
+    }
     File::open(&state)?.sync_all()?;
+    Ok(())
+}
+
+/// Cancellation is independent of approval: an already published Confirm must
+/// never prevent a later Ctrl-C from reaching the detached worker.
+pub(super) fn check_cancelled(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+    if let Some(nonce) = cancellation_nonce(state, &job.id)? {
+        check_cancellation(state, &job.id, &nonce)?;
+    }
+    if let Some(confirmation) = &job.confirmation {
+        check_cancellation(state, &job.id, &confirmation.nonce)?;
+    }
+    Ok(())
+}
+
+fn check_cancellation(state: &Path, job: &str, nonce: &str) -> Result<(), UpdateError> {
+    let path = state.join(format!("{job}.{nonce}.cancel"));
+    match read_private(&path, SMALL_ASSET_LIMIT) {
+        Ok(bytes) => {
+            let decision: Decision = serde_json::from_slice(&bytes)?;
+            if decision.job != job
+                || decision.nonce != nonce
+                || !matches!(decision.choice, Choice::Cancel)
+            {
+                return Err(invalid(
+                    "update cancellation does not match the current review",
+                ));
+            }
+            Err(UpdateError::Cancelled)
+        }
+        Err(UpdateError::Io(error)) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+/// Close cancellation admission immediately before requesting preparation.
+/// Once this boundary is crossed the worker must restore service even if its
+/// observing CLI goes away. A cancellation already acknowledged always wins.
+pub(super) fn prepared(state: &Path, job: &mut UpdateJob) -> Result<(), UpdateError> {
+    let _decisions = DecisionLease::acquire(state, &job.id)?;
+    check_cancelled(state, job)?;
+    job.confirmation = None;
+    write_job(state, job)?;
+    match fs::remove_file(state.join(format!("{}.cancel-nonce", job.id))) {
+        Ok(()) => File::open(state)?.sync_all()?,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// A refused request has not ended anything. Restore cancellation before any
+/// renewed human review, while keeping its publication serialized with Ctrl-C.
+pub(super) fn resume_cancellation(state: &Path, job: &UpdateJob) -> Result<(), UpdateError> {
+    let _decisions = DecisionLease::acquire(state, &job.id)?;
+    if cancellation_nonce(state, &job.id)?.is_none() {
+        initialize(state, &job.id)?;
+    }
     Ok(())
 }
 
@@ -132,26 +301,33 @@ fn wait_with(
                 "Update preview expired without installation; review the update again",
             ));
         }
-        job.confirmation = Some(Confirmation {
-            nonce: nonce.clone(),
-            stop: None,
-            preview: preview.clone(),
-            expires_at_unix_ms: expires,
-        });
-        set_phase(
-            state,
-            job,
-            if approved {
-                UpdatePhase::WaitingForIdle
-            } else {
-                UpdatePhase::AwaitingConfirmation
-            },
-            if approved {
-                "Waiting for the confirmed conversations to become idle"
-            } else {
-                "Verified update is ready for review"
-            },
-        )?;
+        {
+            // A cancellation acknowledged for the previous preview must win
+            // before refreshing its nonce, including while observe was busy.
+            let _decisions = DecisionLease::acquire(state, &job.id)?;
+            check_cancelled(state, job)?;
+            job.confirmation = Some(Confirmation {
+                stop: None,
+                nonce: nonce.clone(),
+                preview: preview.clone(),
+                expires_at_unix_ms: expires,
+            });
+            set_phase(
+                state,
+                job,
+                if approved {
+                    UpdatePhase::WaitingForIdle
+                } else {
+                    UpdatePhase::AwaitingConfirmation
+                },
+                if approved {
+                    "Waiting for the confirmed conversations to become idle"
+                } else {
+                    "Verified update is ready for review"
+                },
+            )?;
+        }
+        check_cancelled(state, job)?;
         let path = state.join(format!("{}.{}.decision", job.id, nonce));
         match read_private(&path, SMALL_ASSET_LIMIT) {
             Ok(bytes) => {
@@ -168,8 +344,9 @@ fn wait_with(
                     Choice::StopListed { .. } => (),
                     Choice::Policy(next) => {
                         policy = next;
-                        approved = false;
-                        preview = observe(policy)?;
+                        let current = observe(policy)?;
+                        approved = policy_choice_approves_service_floor(&preview, &current, next);
+                        preview = current;
                         nonce = uuid::Uuid::new_v4().to_string();
                         continue;
                     }
@@ -192,11 +369,51 @@ fn wait_with(
                     .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
             })
         {
-            job.confirmation = None;
+            // Preserve this exact nonce until the source accepts prepare, so
+            // Ctrl-C still cancels while windows are saving and closing.
+            check_cancelled(state, job)?;
             return Ok(preview);
         }
         thread::sleep(Duration::from_millis(500));
     }
+}
+
+/// Choosing interruption advances a service-wide floor to its exact typed
+/// stop list. That next confirmation covers every affected owner. Other
+/// updates retain the ordinary renewed review of interruption scope.
+fn policy_choice_approves_service_floor(
+    previous: &impact::Preview,
+    current: &impact::Preview,
+    next: impact::Policy,
+) -> bool {
+    let (Some(before), Some(after)) = (&previous.daemon, &current.daemon) else {
+        return false;
+    };
+    if next != impact::Policy::Interrupt
+        || before.policy != impact::Policy::WhenIdle
+        || !floor::needs_service_stop(before)
+        || !floor::needs_service_stop(after)
+    {
+        return false;
+    }
+    let mut approved = previous.clone();
+    let daemon = approved.daemon.as_mut().unwrap();
+    daemon.policy = next;
+    for session in &mut daemon.sessions {
+        if session.disposition == impact::Disposition::WaitsForIdle {
+            let Some(interrupted) = after.sessions.iter().find(|item| {
+                item.kind == session.kind
+                    && item.id == session.id
+                    && item.identity == session.identity
+                    && item.disposition == impact::Disposition::Interrupted
+            }) else {
+                return false;
+            };
+            session.disposition = impact::Disposition::Interrupted;
+            session.interrupted_subagents = interrupted.interrupted_subagents.clone();
+        }
+    }
+    approved.preserves_consent(current)
 }
 
 /// Destructive consent is separate from the ordinary review, and bound to the
@@ -210,7 +427,9 @@ pub(super) fn wait_stop(
 ) -> Result<(impact::Preview, floor_display::StopList), UpdateError> {
     let deadline = Instant::now() + CONFIRMATION_LIFETIME;
     let expires = now_ms().saturating_add(CONFIRMATION_LIFETIME.as_millis() as u64);
+    check_cancelled(state, job)?;
     let (mut preview, mut list) = observe()?;
+    check_cancelled(state, job)?;
     if !terminal {
         return Err(invalid(format!(
             "{} Details: {}",
@@ -225,22 +444,29 @@ pub(super) fn wait_stop(
                 "Stop confirmation expired; nothing further was stopped",
             ));
         }
-        job.confirmation = Some(Confirmation {
-            nonce: nonce.clone(),
-            preview: preview.clone(),
-            stop: Some(list.clone()),
-            expires_at_unix_ms: expires,
-        });
-        set_phase(
-            state,
-            job,
-            UpdatePhase::AwaitingConfirmation,
-            &format!(
-                "{}\n{}",
-                list.render_preview(),
-                floor::terminal_confirmation(state, job)?
-            ),
-        )?;
+        {
+            // A cancellation accepted for the old nonce must win before a
+            // changed inventory can publish its replacement.
+            let _decisions = DecisionLease::acquire(state, &job.id)?;
+            check_cancelled(state, job)?;
+            job.confirmation = Some(Confirmation {
+                nonce: nonce.clone(),
+                preview: preview.clone(),
+                stop: Some(list.clone()),
+                expires_at_unix_ms: expires,
+            });
+            set_phase(
+                state,
+                job,
+                UpdatePhase::AwaitingConfirmation,
+                &format!(
+                    "{}\n{}",
+                    list.render_preview(),
+                    floor::terminal_confirmation(state, job)?
+                ),
+            )?;
+        }
+        check_cancelled(state, job)?;
         let path = state.join(format!("{}.{}.decision", job.id, nonce));
         let decision = match read_private(&path, SMALL_ASSET_LIMIT) {
             Ok(bytes) => {
@@ -258,12 +484,14 @@ pub(super) fn wait_stop(
             return Err(UpdateError::Cancelled);
         }
         let (current, current_list) = observe()?;
+        check_cancelled(state, job)?;
         let unchanged =
             preview.preserves_stop_consent(&current) && list.digest() == current_list.digest();
         if unchanged
             && matches!(decision, Some(Choice::StopListed { items_digest }) if items_digest == current_list.digest())
         {
-            job.confirmation = None;
+            // Keep this nonce cancellable through snapshot capture and the
+            // final inventory checks. Only prepared() closes admission.
             return Ok((current, current_list));
         }
         if !unchanged {
@@ -281,20 +509,23 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn job(directory: &Path) -> UpdateJob {
-        let id = uuid::Uuid::new_v4().to_string();
-        let request = UpdateRequest::InstalledFromTerminal {
-            root: "/fake".into(),
-        };
-        let file = private_create(&directory.join(format!("{id}.request"))).unwrap();
-        serde_json::to_writer(file, &request).unwrap();
-        UpdateJob {
-            id,
+        let job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
             version: "9.8.7".into(),
             phase: UpdatePhase::Verifying,
             message: String::new(),
             log_path: directory.join("worker.log"),
             confirmation: None,
-        }
+        };
+        let request = private_create(&directory.join(format!("{}.request", job.id))).unwrap();
+        serde_json::to_writer(
+            request,
+            &UpdateRequest::InstalledFromTerminal {
+                root: "/fake".into(),
+            },
+        )
+        .unwrap();
+        job
     }
 
     fn preview(changed: bool) -> impact::Preview {
@@ -394,9 +625,194 @@ mod tests {
             Err(UpdateError::Cancelled)
         ));
     }
+    #[test]
+    fn cancellation_overrides_pending_approval_and_remains_available_while_closing_windows() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = job(directory.path());
+        job.confirmation = Some(Confirmation {
+            stop: None,
+            nonce: uuid::Uuid::new_v4().to_string(),
+            preview: preview(false),
+            expires_at_unix_ms: now_ms() + 60_000,
+        });
+        job.phase = UpdatePhase::AwaitingConfirmation;
+        write_job(directory.path(), &job).unwrap();
+        let nonce = job.confirmation.as_ref().unwrap().nonce.clone();
+        decide_at(directory.path(), &job.id, &nonce, Choice::Confirm).unwrap();
+        decide_at(directory.path(), &job.id, &nonce, Choice::Cancel).unwrap();
+        assert!(matches!(
+            check_cancelled(directory.path(), &job),
+            Err(UpdateError::Cancelled)
+        ));
 
+        // Approval and a long idle wait must not expire cancellation.
+        job.phase = UpdatePhase::WaitingForIdle;
+        job.confirmation.as_mut().unwrap().expires_at_unix_ms = 0;
+        write_job(directory.path(), &job).unwrap();
+        decide_at(directory.path(), &job.id, &nonce, Choice::Cancel).unwrap();
+
+        // Saving windows does not revoke the already reviewed nonce.
+        job.phase = UpdatePhase::ClosingWindows;
+        write_job(directory.path(), &job).unwrap();
+        decide_at(directory.path(), &job.id, &nonce, Choice::Cancel).unwrap();
+        assert!(matches!(
+            prepared(directory.path(), &mut job),
+            Err(UpdateError::Cancelled)
+        ));
+        assert!(
+            job.confirmation.is_some(),
+            "a cancelled job cannot reach prepare"
+        );
+    }
+
+    #[test]
+    fn preparation_closes_cancellation_admission_before_source_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = job(directory.path());
+        job.phase = UpdatePhase::ClosingWindows;
+        let nonce = uuid::Uuid::new_v4().to_string();
+        job.confirmation = Some(Confirmation {
+            stop: None,
+            nonce: nonce.clone(),
+            preview: preview(false),
+            expires_at_unix_ms: now_ms() + 60_000,
+        });
+        write_job(directory.path(), &job).unwrap();
+        prepared(directory.path(), &mut job).unwrap();
+        assert!(job.confirmation.is_none());
+        assert!(decide_at(directory.path(), &job.id, &nonce, Choice::Cancel).is_err());
+    }
+
+    #[test]
+    fn approval_keeps_the_nonce_for_cancellation_after_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            wait(&path, &mut job, |_| Ok(preview(false))).unwrap();
+            job
+        });
+        let current = published(directory.path(), None);
+        let nonce = current.confirmation.as_ref().unwrap().nonce.clone();
+        decide_at(directory.path(), &current.id, &nonce, Choice::Confirm).unwrap();
+        let mut approved = worker.join().unwrap();
+        assert_eq!(approved.confirmation.as_ref().unwrap().nonce, nonce);
+        approved.phase = UpdatePhase::ClosingWindows;
+        write_job(directory.path(), &approved).unwrap();
+        decide_at(directory.path(), &approved.id, &nonce, Choice::Cancel).unwrap();
+        assert!(matches!(
+            prepared(directory.path(), &mut approved),
+            Err(UpdateError::Cancelled)
+        ));
+    }
+    #[test]
+    fn cancellation_during_observation_survives_a_changed_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let (observing, entered) = std::sync::mpsc::sync_channel(0);
+        let (release, resume) = std::sync::mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            let mut first = true;
+            wait(&path, &mut job, |_| {
+                if first {
+                    first = false;
+                    Ok(preview(false))
+                } else {
+                    observing.send(()).unwrap();
+                    resume.recv().unwrap();
+                    Ok(preview(true))
+                }
+            })
+        });
+        let current = published(directory.path(), None);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        decide_at(
+            directory.path(),
+            &current.id,
+            &current.confirmation.as_ref().unwrap().nonce,
+            Choice::Cancel,
+        )
+        .unwrap();
+        release.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(UpdateError::Cancelled)
+        ));
+    }
+    #[test]
+    fn cancellation_during_verification_stops_probe_without_waiting_for_review() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = job(directory.path());
+        initialize(directory.path(), &job.id).unwrap();
+        job.phase = UpdatePhase::Verifying;
+        write_job(directory.path(), &job).unwrap();
+        let cancellation = CancellationToken::for_job(directory.path(), &job.id).unwrap();
+        let ready = directory.path().join("probe-started");
+        let probe_ready = ready.clone();
+        let worker = thread::spawn(move || {
+            let mut command = Command::new("/bin/sh");
+            command
+                .args(["-c", "touch \"$1\"; exec sleep 30", "probe"])
+                .arg(probe_ready);
+            bounded_command(
+                &mut command,
+                "fixture verification",
+                100,
+                Duration::from_secs(30),
+                &cancellation,
+            )
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready.exists() {
+            assert!(
+                Instant::now() < deadline,
+                "verification probe did not start"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(job.confirmation.is_none());
+        assert!(cancel_at(directory.path(), &job.id).unwrap());
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(UpdateError::Cancelled)
+        ));
+        assert!(
+            Instant::now() < deadline,
+            "cancellation waited for the probe timeout"
+        );
+        assert!(matches!(
+            check_cancelled(directory.path(), &job),
+            Err(UpdateError::Cancelled)
+        ));
+        assert!(matches!(
+            prepared(directory.path(), &mut job),
+            Err(UpdateError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn preparation_atomically_closes_initial_cancellation_nonce() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut job = job(directory.path());
+        initialize(directory.path(), &job.id).unwrap();
+        job.phase = UpdatePhase::ClosingWindows;
+        write_job(directory.path(), &job).unwrap();
+        let token = CancellationToken::for_job(directory.path(), &job.id).unwrap();
+        prepared(directory.path(), &mut job).unwrap();
+        assert!(!cancel_at(directory.path(), &job.id).unwrap());
+        assert!(!token.cancelled());
+        assert!(
+            !directory
+                .path()
+                .join(format!("{}.cancel-nonce", job.id))
+                .exists()
+        );
+    }
     fn stop_list() -> floor_display::StopList {
         floor_display::StopList {
+            background_tasks: 0,
+            background_identity: String::new(),
             from_version: "0.1.3+local.source".into(),
             items: vec![floor_display::StopItem {
                 id: crate::model::TerminalId::new(),
@@ -488,7 +904,11 @@ mod tests {
         let worker = thread::spawn(move || {
             let mut job = job(&path);
             let result = wait_stop(&path, &mut job, true, || Ok((preview(false), list.clone())));
-            assert!(job.confirmation.is_none());
+            assert!(
+                job.confirmation
+                    .as_ref()
+                    .is_some_and(|confirmation| confirmation.stop.is_some())
+            );
             result
         });
         let current = published(directory.path(), None);
@@ -575,5 +995,162 @@ mod tests {
         let (_, returned) = worker.join().unwrap().unwrap();
         assert_eq!(returned.digest(), current_digest);
         assert_eq!(returned.items[0].identity, "a replacement foreground owner");
+    }
+    #[test]
+    fn typed_stop_keeps_cancellation_available_until_the_first_destructive_request() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            initialize(&path, &job.id).unwrap();
+            let list = stop_list();
+            wait_stop(&path, &mut job, true, || Ok((preview(false), list.clone()))).unwrap();
+            job
+        });
+        let current = published(directory.path(), None);
+        let confirmation = current.confirmation.as_ref().unwrap();
+        decide_at(
+            directory.path(),
+            &current.id,
+            &confirmation.nonce,
+            Choice::StopListed {
+                items_digest: confirmation.stop.as_ref().unwrap().digest(),
+            },
+        )
+        .unwrap();
+        let mut approved = worker.join().unwrap();
+        assert!(approved.confirmation.as_ref().unwrap().stop.is_some());
+        assert!(cancel_at(directory.path(), &approved.id).unwrap());
+        assert!(matches!(
+            prepared(directory.path(), &mut approved),
+            Err(UpdateError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn ctrl_c_during_stop_observation_survives_a_changed_preview() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().to_owned();
+        let (observing, entered) = std::sync::mpsc::sync_channel(0);
+        let (release, resume) = std::sync::mpsc::sync_channel(0);
+        let worker = thread::spawn(move || {
+            let mut job = job(&path);
+            initialize(&path, &job.id).unwrap();
+            let list = stop_list();
+            let mut first = true;
+            wait_stop(&path, &mut job, true, || {
+                if first {
+                    first = false;
+                    Ok((preview(false), list.clone()))
+                } else {
+                    observing.send(()).unwrap();
+                    resume.recv().unwrap();
+                    let mut changed = list.clone();
+                    changed.items[0]
+                        .identity
+                        .push_str(" changed foreground owner");
+                    Ok((preview(true), changed))
+                }
+            })
+        });
+        let current = published(directory.path(), None);
+        entered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(cancel_at(directory.path(), &current.id).unwrap());
+        release.send(()).unwrap();
+        assert!(matches!(
+            worker.join().unwrap(),
+            Err(UpdateError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn interruption_choice_advances_only_the_same_service_floor_owners() {
+        use crate::model::{BootId, HostIncarnation, HostSessionId, HostSessionProof, TerminalId};
+        let mut previous = preview(false);
+        previous.daemon = Some(impact::DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: HostSessionProof {
+                    host_session_id: HostSessionId::new("floor"),
+                    boot_id: BootId::new("floor"),
+                    host_incarnation: HostIncarnation::new("floor"),
+                },
+                token: "floor".into(),
+                inventory_generation: 1,
+                live_terminals: 1,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: i64::MAX,
+            },
+            policy: impact::Policy::WhenIdle,
+            blockers: Vec::new(),
+            sessions: [
+                (impact::SessionKind::Terminal, impact::Disposition::Blocked),
+                (
+                    impact::SessionKind::NativeChat,
+                    impact::Disposition::WaitsForIdle,
+                ),
+            ]
+            .into_iter()
+            .map(|(kind, disposition)| impact::SessionImpact {
+                id: TerminalId::new(),
+                kind,
+                title: "reviewed pane".into(),
+                identity: "reviewed exact owner".into(),
+                disposition,
+                reason: String::new(),
+                interrupted_subagents: Vec::new(),
+            })
+            .collect(),
+        });
+        let mut current = previous.clone();
+        let daemon = current.daemon.as_mut().unwrap();
+        daemon.policy = impact::Policy::Interrupt;
+        daemon.sessions[1].disposition = impact::Disposition::Interrupted;
+        daemon.sessions[1]
+            .interrupted_subagents
+            .push("background task".into());
+        assert!(policy_choice_approves_service_floor(
+            &previous,
+            &current,
+            impact::Policy::Interrupt
+        ));
+        for change in [
+            "candidate",
+            "owner",
+            "extra pane",
+            "new work",
+            "no service floor",
+        ] {
+            let mut changed = current.clone();
+            match change {
+                "candidate" => changed.candidate.digest.push_str(" changed"),
+                "owner" => changed.daemon.as_mut().unwrap().sessions[1]
+                    .identity
+                    .push_str(" changed"),
+                "extra pane" => {
+                    let daemon = changed.daemon.as_mut().unwrap();
+                    let mut extra = daemon.sessions[1].clone();
+                    extra.id = TerminalId::new();
+                    daemon.sessions.push(extra);
+                }
+                "new work" => {
+                    changed.daemon.as_mut().unwrap().sessions[1].disposition =
+                        impact::Disposition::WaitsForIdle
+                }
+                "no service floor" => {
+                    changed.daemon.as_mut().unwrap().sessions[0].disposition =
+                        impact::Disposition::Continues
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !policy_choice_approves_service_floor(
+                    &previous,
+                    &changed,
+                    impact::Policy::Interrupt
+                ),
+                "{change}"
+            );
+        }
     }
 }

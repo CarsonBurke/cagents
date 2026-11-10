@@ -31,6 +31,8 @@ struct FakeSource {
     fail_stopped: bool,
     fail_archive: bool,
     change_after_capture: bool,
+    cancel_on_capture: Option<PathBuf>,
+    cancel_after_close: Option<PathBuf>,
 }
 
 impl FakeSource {
@@ -73,7 +75,16 @@ impl FloorSource for FakeSource {
         Ok(self.preview.clone())
     }
     fn observe_policy(&mut self, policy: impact::Policy) -> Result<impact::Preview, UpdateError> {
-        self.preview.daemon.as_mut().unwrap().policy = policy;
+        let daemon = self.preview.daemon.as_mut().unwrap();
+        daemon.policy = policy;
+        if policy == impact::Policy::Interrupt && needs_service_stop(daemon) {
+            for session in &mut daemon.sessions {
+                if session.disposition == impact::Disposition::WaitsForIdle {
+                    session.disposition = impact::Disposition::Interrupted;
+                    session.interrupted_subagents = vec!["reviewed-background-task".into()];
+                }
+            }
+        }
         self.observe()
     }
     fn inventory(&mut self, _: &impact::DaemonImpact, _: bool) -> Result<Inventory, UpdateError> {
@@ -130,6 +141,11 @@ impl FloorSource for FakeSource {
         let daemon = self.preview.daemon.as_mut().unwrap();
         daemon.sessions.retain(|item| item.id != chat.id);
         daemon.capability.inventory_generation += 1;
+        if let Some(state) = &self.cancel_after_close {
+            let job: UpdateJob = serde_json::from_slice(&fs::read(state.join("status.json"))?)?;
+            assert!(!confirmation::cancel_at(state, &job.id)?);
+            self.event("cancellation refused after close");
+        }
         Ok(crate::chat::Snapshot {
             session_id: chat.launch.session_id,
             exited: true,
@@ -211,6 +227,11 @@ impl FloorSource for FakeSource {
         Ok(())
     }
     fn capture(&mut self, _: &StopList) -> Result<(), UpdateError> {
+        if let Some(state) = &self.cancel_on_capture {
+            let job: UpdateJob = serde_json::from_slice(&fs::read(state.join("status.json"))?)?;
+            assert!(confirmation::cancel_at(state, &job.id)?);
+            self.event("cancelled during capture");
+        }
         if self.change_after_capture {
             self.change_after_capture = false;
             self.inventory.terminals[0]
@@ -327,6 +348,8 @@ fn fixture() -> FakeSource {
         fail_stopped: false,
         fail_archive: false,
         change_after_capture: false,
+        cancel_on_capture: None,
+        cancel_after_close: None,
     }
 }
 
@@ -393,6 +416,7 @@ fn job(directory: &Path) -> UpdateJob {
         },
     )
     .unwrap();
+    confirmation::initialize(directory, &job.id).unwrap();
     write_job(directory, &job).unwrap();
     job
 }
@@ -516,6 +540,8 @@ fn survivor_report_finds_late_reparented_scope_and_origin_members_without_shared
     proc_fixture(root, 101, 1, 10, &format!("{scope}/provider"), b"");
     proc_fixture(root, 102, 1, 20, shared, b"");
     let list = StopList {
+        background_tasks: 0,
+        background_identity: String::new(),
         from_version: "old".into(),
         items: vec![super::super::floor_display::StopItem {
             id,
@@ -748,7 +774,7 @@ fn pending_source() -> (FakeSource, TerminalId) {
     let id = pending.id;
     source.inventory.chats.push(pending);
     source.inventory.chat_states.insert(id, "starting".into());
-    source.preview.labels.insert(
+    source.preview.labels.names.insert(
         id,
         "Untitled conversation in beta, start time unavailable".into(),
     );
@@ -1436,6 +1462,8 @@ fn recovery_report_keeps_completed_floor_actions_for_failures_after_quiescence()
     // Later survivor census and destination work must not erase completed-action
     // evidence before the coordinator formats a failure from a later phase.
     survivors.remember_list(&StopList {
+        background_tasks: 0,
+        background_identity: String::new(),
         from_version: "new".into(),
         items: Vec::new(),
     });
@@ -1544,5 +1572,402 @@ fn changed_attachment_before_the_first_close_requires_fresh_typed_consent() {
             .filter(|event| event.as_str() == "ChatClose acknowledged")
             .count(),
         1
+    );
+}
+
+#[test]
+fn ctrl_c_at_stop_prompt_after_refused_prepare_ends_nothing() {
+    let directory = tempfile::tempdir().unwrap();
+    let source = fixture();
+    let worker = spawn_source(source, directory.path(), true);
+    let current = await_stop(directory.path());
+    assert!(confirmation::cancel_at(directory.path(), &current.id).unwrap());
+    let (result, source) = finish(worker);
+    assert!(matches!(result, Err(UpdateError::Cancelled)));
+    assert_no_destructive_actions(&source);
+    assert!(
+        source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "PrepareConfirmedUpgrade refused")
+    );
+}
+
+#[test]
+fn ctrl_c_during_floor_capture_stops_before_first_destructive_request() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    add_chat(&mut source, impact::Disposition::Blocked, false);
+    source.cancel_on_capture = Some(directory.path().to_owned());
+    let worker = spawn_source(source, directory.path(), true);
+    let current = await_stop(directory.path());
+    confirm_stop(directory.path(), &current);
+    let (result, source) = finish(worker);
+    assert!(matches!(result, Err(UpdateError::Cancelled)), "{result:?}");
+    assert_no_destructive_actions(&source);
+    assert!(
+        source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "cancelled during capture")
+    );
+}
+
+#[test]
+fn ctrl_c_after_first_chat_end_finishes_without_another_prompt() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    source.prepare_refusals = 0;
+    add_chat(&mut source, impact::Disposition::Blocked, false);
+    add_chat(&mut source, impact::Disposition::Blocked, true);
+    source.cancel_after_close = Some(directory.path().to_owned());
+    let worker = spawn_source(source, directory.path(), true);
+    let current = await_stop(directory.path());
+    confirm_stop(directory.path(), &current);
+    let (result, source) = finish(worker);
+    result.unwrap();
+    assert_eq!(source.close_attempts, 2);
+    assert_eq!(source.retain_attempts, 2);
+    assert_eq!(
+        source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|event| event.as_str() == "cancellation refused after close")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn ctrl_c_after_shutdown_expiry_cancels_the_renewed_stop_prompt() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut source = fixture();
+    source.outcomes.push_back(ShutdownOutcome::Expired);
+    let worker = spawn_source(source, directory.path(), true);
+    let first = await_stop(directory.path());
+    confirm_stop(directory.path(), &first);
+    let first_nonce = &first.confirmation.as_ref().unwrap().nonce;
+    let renewed = await_prompt(directory.path(), |confirmation| {
+        confirmation.stop.is_some() && &confirmation.nonce != first_nonce
+    });
+    assert!(confirmation::cancel_at(directory.path(), &renewed.id).unwrap());
+    let (result, source) = finish(worker);
+    assert!(matches!(result, Err(UpdateError::Cancelled)));
+    assert_eq!(source.close_attempts, 0);
+    assert_eq!(source.retain_attempts, 0);
+    assert!(
+        !source
+            .events
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|event| event == "archive checkpoint")
+    );
+    source.assert_running_panes_are_unmarked();
+}
+
+/// Exercise the actual terminal driver against the real worker confirmation
+/// files. Only source operations are fake; approvals, idle waiting, typed
+/// consent, and preparation boundaries are the production implementations.
+#[test]
+fn terminal_update_prompts_once_through_idle_wait_and_typed_stop() {
+    struct Terminal {
+        state: PathBuf,
+        output: Vec<u8>,
+        answers: VecDeque<&'static str>,
+        settled: Arc<AtomicBool>,
+        deadline: Instant,
+    }
+    impl Write for Terminal {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.output.extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+    impl TerminalReview for Terminal {
+        fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+            Ok(Some(serde_json::from_slice(&fs::read(
+                self.state.join("status.json"),
+            )?)?))
+        }
+        fn decide(
+            &mut self,
+            job: &str,
+            nonce: &str,
+            choice: UpdateChoice,
+        ) -> Result<(), UpdateError> {
+            confirmation::decide_at(&self.state, job, nonce, choice)
+        }
+        fn cancel(&mut self, job: &str) -> Result<bool, UpdateError> {
+            confirmation::cancel_at(&self.state, job)
+        }
+        fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+            let next = self
+                .answers
+                .pop_front()
+                .expect("the CLI asked an extra question");
+            answer.push_str(next);
+            Ok(next.len())
+        }
+        fn is_terminal(&self) -> bool {
+            true
+        }
+        fn interrupted(&self) -> bool {
+            false
+        }
+        fn pause(&mut self) {
+            assert!(
+                Instant::now() < self.deadline,
+                "the full terminal update stalled"
+            );
+            if String::from_utf8_lossy(&self.output)
+                .contains("Ctrl-C cancels the update; nothing has been ended or stopped.")
+            {
+                self.settled.store(true, Ordering::Release);
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+    for ordinary_answer in ["\n", "i\n"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut source = fixture();
+        source.preview.from_version = "0.1.3+local.991daa43e".into();
+        source.preview.candidate.version = "0.1.3+local.updated".into();
+        source.preview.windows = 2;
+        source.preview.daemon.as_mut().unwrap().sessions[0].title =
+            "build · Release Details: rollout · alpha".into();
+        source.preview.daemon.as_mut().unwrap().sessions[0].disposition =
+            impact::Disposition::Blocked;
+        let working = add_chat(&mut source, impact::Disposition::WaitsForIdle, false);
+        let idle = add_chat(&mut source, impact::Disposition::Resumes, true);
+        for (id, title) in [
+            (
+                working,
+                "Untitled conversation in beta, started 9 Nov 14:02",
+            ),
+            (idle, "review · General · alpha"),
+        ] {
+            source.preview.labels.names.insert(id, title.into());
+        }
+        let initial = job(directory.path());
+        let mut worker_job = initial.clone();
+        let path = directory.path().to_owned();
+        let settled = source.settled.clone();
+        let worker = thread::spawn(move || {
+            let result = (|| {
+                let reviewed = confirmation::wait(&path, &mut worker_job, |policy| {
+                    source.observe_policy(policy)
+                })?;
+                quiesce_source(&path, &mut worker_job, &reviewed, true, &mut source)
+            })();
+            worker_job.phase = if result.is_ok() {
+                UpdatePhase::Complete
+            } else {
+                UpdatePhase::Failed
+            };
+            worker_job.confirmation = None;
+            worker_job.message = match &result {
+                Ok(()) => "Update installed; saved windows reopened".into(),
+                Err(error) => error.to_string(),
+            };
+            write_job(&path, &worker_job).unwrap();
+            (result, source)
+        });
+        let mut terminal = Terminal {
+            state: directory.path().to_owned(),
+            output: Vec::new(),
+            answers: VecDeque::from([ordinary_answer, "stop\n"]),
+            settled,
+            deadline: Instant::now() + Duration::from_secs(10),
+        };
+        drive_terminal_review_with(initial, false, false, &mut terminal).unwrap();
+        let (result, source) = finish(worker);
+        result.unwrap();
+        let output = String::from_utf8(terminal.output).unwrap();
+        println!("{output}");
+        for prompt in [
+            "Update cagents ",
+            "Enter: review stops when they finish   i: interrupt them now   n: cancel",
+            "Type \"stop\" to stop these and update. Anything else cancels.",
+        ] {
+            assert_eq!(output.matches(prompt).count(), 1, "{output}");
+        }
+        if ordinary_answer == "\n" {
+            for message in [
+                "Waiting for these conversations to finish their turns:",
+                "Ctrl-C cancels the update; nothing has been ended or stopped.",
+            ] {
+                assert_eq!(output.matches(message).count(), 1, "{output}");
+            }
+        }
+        assert!(terminal.answers.is_empty());
+        assert!(output.contains("Stops (2)"), "{output}");
+        assert!(!output.contains("Needs attention"), "{output}");
+        assert!(
+            source
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|event| event == "ShutdownV1 Confirm")
+        );
+    }
+}
+
+#[test]
+fn service_stop_consent_covers_exact_background_tasks_even_when_the_count_stays_the_same() {
+    let mut source = fixture();
+    let daemon = source.preview.daemon.as_mut().unwrap();
+    daemon.capability.background_subagents = 2;
+    daemon.capability.background_identity = "first exact task set".into();
+    let first = stop_list(&source.preview, &source.inventory, true).unwrap();
+    assert_eq!(first.background_tasks, 2);
+    assert_eq!(first.background_identity, "first exact task set");
+    let rendered = first.render();
+    assert!(rendered.contains("2"), "{rendered}");
+    assert!(rendered.contains("background"), "{rendered}");
+    assert!(rendered.contains("not resume automatically"), "{rendered}");
+    source
+        .preview
+        .daemon
+        .as_mut()
+        .unwrap()
+        .capability
+        .background_identity = "replacement exact task set".into();
+    let changed = stop_list(&source.preview, &source.inventory, true).unwrap();
+    assert_eq!(first.background_tasks, changed.background_tasks);
+    assert_ne!(first.digest(), changed.digest());
+}
+
+#[test]
+fn a_chat_only_stop_list_covers_only_its_listed_background_tasks() {
+    let mut source = fixture();
+    let blocked = add_chat(&mut source, impact::Disposition::Blocked, false);
+    let unchanged = add_chat(&mut source, impact::Disposition::Resumes, true);
+    for session in &mut source.preview.daemon.as_mut().unwrap().sessions {
+        if session.id == blocked {
+            session.interrupted_subagents = vec!["stopped background task".into()];
+        } else if session.id == unchanged {
+            session.interrupted_subagents = vec!["unaffected background task".into()];
+        }
+    }
+    let first = stop_list(&source.preview, &source.inventory, false).unwrap();
+    assert_eq!(first.background_tasks, 1);
+    source
+        .preview
+        .daemon
+        .as_mut()
+        .unwrap()
+        .sessions
+        .iter_mut()
+        .find(|session| session.id == blocked)
+        .unwrap()
+        .interrupted_subagents = vec!["replacement background task".into()];
+    let changed = stop_list(&source.preview, &source.inventory, false).unwrap();
+    assert_eq!(first.background_tasks, changed.background_tasks);
+    assert_ne!(first.digest(), changed.digest());
+}
+
+#[test]
+fn completed_service_stop_reports_background_tasks_and_their_recovery() {
+    let report = completed_error(invalid("later startup failed"), &[], true, 2).to_string();
+    assert!(
+        report.contains("2 background tasks stopped; they do not resume automatically."),
+        "{report}"
+    );
+    let survivors = Survivors {
+        service_stopped: true,
+        background_tasks: 2,
+        ..Default::default()
+    };
+    assert!(
+        survivors
+            .recovery_report()
+            .contains("2 background tasks stopped; they do not resume automatically.")
+    );
+}
+
+#[test]
+fn accepted_prepare_reports_only_interrupted_turns_with_their_reviewed_recovery() {
+    let mut source = fixture();
+    let unchanged = add_chat(&mut source, impact::Disposition::Resumes, true);
+    let resumes = add_chat(&mut source, impact::Disposition::Interrupted, true);
+    let paused = add_chat(&mut source, impact::Disposition::Interrupted, true);
+    for (id, label) in [
+        (unchanged, "Unchanged conversation"),
+        (resumes, "Reviewed automatic resume"),
+        (paused, "Reviewed paused conversation"),
+    ] {
+        source.preview.labels.names.insert(id, label.into());
+    }
+    for session in &mut source.preview.daemon.as_mut().unwrap().sessions {
+        if session.id == resumes {
+            session.interrupted_subagents = vec!["task-a".into(), "task-b".into(), "task-b".into()];
+        } else if session.id == paused {
+            session.interrupted_subagents = vec!["task-c".into()];
+        }
+    }
+    source
+        .preview
+        .stopped
+        .push(super::super::source_inspection::StoppedPane {
+            pane: paused,
+            kind: super::super::source_inspection::StoppedKind::Chat,
+            label: "stale saved label".into(),
+            reason: "its conversation could not be confirmed".into(),
+            recovery: "Choose Resume conversation in the new tab (+) menu".into(),
+        });
+    let mut survivors = Survivors::default();
+    assert!(survivors.prepared_report().is_empty());
+    assert!(!survivors.needs_daemon_recovery());
+    let daemon = source.preview.daemon.as_ref().unwrap();
+    survivors.record_prepared(&source.preview, daemon);
+    let report = survivors.prepared_report();
+    assert!(report.contains("Reviewed automatic resume: current turn interrupted; its saved conversation resumes after the update"), "{report}");
+    assert!(report.contains("Reviewed paused conversation: current turn interrupted; after the update: its conversation could not be confirmed. Choose Resume conversation in the new tab (+) menu"), "{report}");
+    assert!(
+        report.contains("3 background tasks stopped; they do not resume automatically."),
+        "{report}"
+    );
+    assert!(!report.contains("Unchanged conversation"), "{report}");
+    assert!(!report.contains("build"), "{report}");
+    assert!(!report.contains("Ended or stopped"), "{report}");
+    assert!(!report.contains("terminal service accepted"), "{report}");
+    assert!(survivors.needs_daemon_recovery());
+    assert!(!survivors.service_stopped);
+    assert!(survivors.recovery_report().is_empty());
+    survivors.record_prepared(&source.preview, daemon);
+    assert_eq!(
+        survivors.prepared_report(),
+        report,
+        "a repeated acknowledgment must not duplicate ended turns or background tasks"
+    );
+
+    let stopped = stop_list(&source.preview, &source.inventory, true).unwrap();
+    let already_ended = stopped
+        .items
+        .iter()
+        .find(|item| item.id == resumes)
+        .unwrap();
+    let mut mixed = Survivors::default();
+    mixed
+        .ended
+        .insert((already_ended.kind, resumes), already_ended.clone());
+    mixed.record_prepared(&source.preview, daemon);
+    let report = mixed.prepared_report();
+    assert!(!report.contains("Reviewed automatic resume"), "{report}");
+    assert!(report.contains("Reviewed paused conversation"), "{report}");
+    assert!(
+        report.contains("1 background task stopped; it does not resume automatically."),
+        "{report}"
     );
 }

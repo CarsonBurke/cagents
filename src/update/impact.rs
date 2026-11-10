@@ -322,7 +322,7 @@ mod tests {
         .unwrap();
         assert!(preview.stopped.is_empty());
         assert!(preview.stopped_windows.is_empty());
-        assert!(preview.labels.is_empty());
+        assert!(preview.labels.names.is_empty());
         assert!(preview.from_version.is_empty());
         assert_eq!(preview.windows, 0);
     }
@@ -352,16 +352,17 @@ pub struct Preview {
     pub stopped: Vec<super::source_inspection::StoppedPane>,
     #[serde(default)]
     pub stopped_windows: Vec<super::source_inspection::StoppedWindow>,
-    #[serde(default)]
-    pub labels: BTreeMap<TerminalId, super::source_inspection::PaneLabel>,
+    #[serde(flatten)]
+    pub labels: super::source_inspection::ReviewInventory,
 }
 
 impl Preview {
     pub(super) fn inspection(&self) -> super::source_inspection::SourceInspection {
         super::source_inspection::SourceInspection {
+            details: self.labels.details.clone(),
             stopped: self.stopped.clone(),
             stopped_windows: self.stopped_windows.clone(),
-            labels: self.labels.clone(),
+            labels: self.labels.names.clone(),
         }
     }
 
@@ -369,9 +370,10 @@ impl Preview {
         mut self,
         inspection: &super::source_inspection::SourceInspection,
     ) -> Self {
+        self.labels.details = inspection.details.clone();
         self.stopped = inspection.stopped.clone();
         self.stopped_windows = inspection.stopped_windows.clone();
-        self.labels = inspection.labels.clone();
+        self.labels.names = inspection.labels.clone();
         self
     }
 

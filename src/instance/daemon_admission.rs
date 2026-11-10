@@ -413,9 +413,6 @@ fn forward_fence(
     Ok(())
 }
 
-pub(crate) fn has_inherited_daemon_fence() -> io::Result<bool> {
-    Ok(inherited_fence()?.is_some())
-}
 pub(crate) fn inherit_daemon_fence(command: &mut process::Command) -> io::Result<()> {
     if let Some((file, descriptor)) = inherited_fence()? {
         forward_fence(command, file, Some(descriptor))?;

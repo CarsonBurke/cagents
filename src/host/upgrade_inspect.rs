@@ -8,10 +8,13 @@ mod v77;
 pub(super) use current::Client as InspectionClient;
 
 use crate::install_guard::SourceInspectionRequest as Request;
-use crate::update::source_inspection::{SourceInspection, StoppedKind, StoppedWindow};
+use crate::update::source_inspection::{
+    InspectedPane, SavedOutcome, SourceInspection, StoppedKind, StoppedWindow,
+};
 use crate::{
     chat::Session,
     model::{CardKind, HostSessionProof},
+    update::source::{self, ClientFamily},
     upgrade::handoff,
 };
 use std::{
@@ -104,15 +107,10 @@ impl Reader {
 }
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
-    if !current::supports_protocol(request.protocol)
-        && request.protocol != 77
-        && request.protocol != 68
-    {
-        return Err(
-            "Source protocol has no qualified migration inspector; source windows remain usable"
-                .into(),
-        );
-    }
+    let family = source::client_family(request.protocol).ok_or_else(|| {
+        "Source protocol has no qualified migration inspector; source windows remain usable"
+            .to_owned()
+    })?;
     let proof = request
         .proof
         .as_ref()
@@ -120,20 +118,21 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
         .ok_or("Saved conversations have no authenticated source service")?;
     let socket = crate::terminal::ipc::daemon_socket_path()
         .map_err(|_| "Source service namespace is unavailable")?;
-    if current::supports_protocol(request.protocol) {
-        current::Client::connect(&socket, proof, deadline, request.protocol).map(Reader::Current)
-    } else if request.protocol == 68 {
-        v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68)
-    } else {
-        v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy)
+    match family {
+        ClientFamily::Current => {
+            current::Client::connect(&socket, proof, deadline, request.protocol)
+                .map(Reader::Current)
+        }
+        ClientFamily::V68 => v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68),
+        ClientFamily::V77 => v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy),
     }
 }
 
 const UNCHECKED: &str = "could not be checked before the update";
-const CHAT_RECOVERY: &str = "Press Resume in the pane to reopen it";
-const TERMINAL_RECOVERY: &str = "Press Restart in the pane";
-const CONSOLE_REASON: &str = "its console reopens without its chat view connected";
-const CONSOLE_RECOVERY: &str = "The console keeps running; reopen the conversation from the pane";
+const CHAT_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu";
+const TERMINAL_RECOVERY: &str = "Press Reconnect in the pane to check the saved terminal";
+const CONSOLE_REASON: &str = "keeps running in its terminal; its chat panel disconnects";
+const CONSOLE_RECOVERY: &str = "Choose Resume conversation in the new tab (+) menu afterwards";
 
 fn stop_unchecked(
     inspection: &mut SourceInspection,
@@ -147,7 +146,13 @@ fn stop_unchecked(
             CardKind::Terminal(source) => source.id,
             _ => continue,
         };
-        if checked.contains(&id) {
+        if checked.contains(&id)
+            || inspection
+                .details
+                .panes
+                .get(&id)
+                .is_some_and(|pane| pane.outcome == SavedOutcome::Unchanged)
+        {
             continue;
         }
         match kind {
@@ -196,6 +201,13 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
                         _ => continue,
                     };
                     inspection.labels.entry(pane).or_insert(label);
+                    record_saved_pane(
+                        &mut inspection,
+                        &kind,
+                        inert,
+                        &current_boot,
+                        request.require_resumable,
+                    );
                     if !inert {
                         saved.push((card, kind));
                     }
@@ -203,13 +215,18 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             }
             Err(_) => inspection.stopped_windows.push(StoppedWindow {
                 window: window + 1,
-                reason: format!("Window {}'s saved panes could not be read", window + 1),
-                recovery: "The saved file is kept unchanged".into(),
+                reason: format!(
+                    "A saved window ({}) could not be read; it may not reopen",
+                    path.file_name().unwrap_or_default().to_string_lossy()
+                ),
+                recovery: "Its saved file stays as it is".into(),
             }),
         }
     }
     let evidence = ExecutionEvidence::load(&current_boot, deadline);
+    record_ended_panes(&mut inspection, &saved, &evidence);
     if check_deadline(deadline).is_err() {
+        inspection_failure(&mut inspection, "Checking saved panes took too long");
         stop_unchecked(&mut inspection, &saved, &HashSet::new(), &current_boot);
         return Ok(inspection);
     }
@@ -219,6 +236,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         let mut checked = HashSet::new();
         for (_, kind) in &saved {
             if check_deadline(deadline).is_err() {
+                inspection_failure(&mut inspection, "Checking saved panes took too long");
                 stop_unchecked(&mut inspection, &saved, &checked, &current_boot);
                 break;
             }
@@ -256,182 +274,357 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         }
         return Ok(inspection);
     }
-    let mut reader = connect(&request, deadline)?;
+    let mut reader = match connect(&request, deadline) {
+        Ok(reader) => reader,
+        Err(reason) => {
+            inspection_failure(&mut inspection, &reason);
+            stop_unchecked(&mut inspection, &saved, &HashSet::new(), &current_boot);
+            return Ok(inspection);
+        }
+    };
     let mut checked_saved = HashSet::new();
-    let inspect_live =
-        (|| -> Result<(), String> {
-            let initial_inventory = reader.list()?;
-            let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
-            let mut cold_history = Vec::new();
-            for (_, kind) in &saved {
-                check_deadline(deadline)?;
-                if let CardKind::Chat(source) = kind {
-                    if !source.is_unstarted()
-                        && (source.proof.as_ref() != request.proof.as_ref()
-                            || !initial_inventory.iter().any(|live| live.id == source.id))
-                        && !resolutions.iter().any(|(issued, _)| issued == source)
-                        && !request.proof.as_ref().is_some_and(|proof| {
-                            relisted_codex_conversation(
-                                source,
-                                &initial_inventory,
-                                proof,
-                                request.require_resumable,
-                            )
-                        })
-                    {
-                        let missing = !initial_inventory.iter().any(|live| live.id == source.id);
-                        if missing
-                            && matches!(
-                                evidence.classify(source),
-                                SavedExecution::Ended | SavedExecution::Unrecorded
-                            )
-                        {
-                            continue;
-                        }
-                        let result = if missing && request.reconcile_retained {
-                            reader
-                                .reconcile_retained(source)
-                                .and_then(|()| reader.resolve(source))
-                        } else if missing {
-                            Err("Saved owner changed after preview".into())
-                        } else {
-                            reader.resolve(source)
-                        };
-                        if missing
-                            && source.is_saved_claude_history()
-                            && !result
-                                .as_ref()
-                                .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
-                            && reader.inspect_saved_history(source).is_ok()
-                        {
-                            cold_history.push(source.clone());
-                        }
-                        resolutions.push((source.clone(), result));
-                    }
-                }
-            }
-            let inventory = reader.list()?;
-            let terminals = reader.terminals()?;
-            if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
-                return Err("Source inventory exceeds its inspection limit".into());
-            }
-            let proof = request
-                .proof
-                .as_ref()
-                .ok_or("Source service is unavailable")?;
-            let matched_cli = crate::companion::Product::Cli
-                .beside_current()
-                .map_err(|_| "Cannot inspect the destination console companion")?;
-            let mut ids = HashSet::new();
-            for session in &inventory {
-                check_deadline(deadline)?;
-                if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
-                    inspection.stop(
-                        session.id,
-                        StoppedKind::Chat,
-                        "its conversation could not be confirmed",
-                        CHAT_RECOVERY,
-                    );
-                    continue;
-                }
-                if session.terminal.as_ref().is_some_and(|terminal| {
-                    qualify_console_migration(terminal, &matched_cli).is_err()
-                }) {
-                    inspection.stop(
-                        session.id,
-                        StoppedKind::Chat,
-                        CONSOLE_REASON,
-                        CONSOLE_RECOVERY,
-                    );
-                } else if validate_live_chat(session, request.require_resumable).is_err() {
-                    inspection.stop(
-                        session.id,
-                        StoppedKind::Chat,
-                        "its conversation could not be confirmed",
-                        CHAT_RECOVERY,
-                    );
-                }
-            }
-            for terminal in &terminals {
-                check_deadline(deadline)?;
-                if !inventory.iter().any(|chat| chat.id == terminal.session.id)
-                    && terminal_requires_migration(&terminal.session, &current_boot)
-                    && qualify_console_migration(&terminal.session, &matched_cli).is_err()
+    let inspect_live = (|| -> Result<(), String> {
+        let initial_inventory = reader.list()?;
+        let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
+        let mut cold_history = Vec::new();
+        for (_, kind) in &saved {
+            check_deadline(deadline)?;
+            if let CardKind::Chat(source) = kind {
+                if !source.is_unstarted()
+                    && (source.proof.as_ref() != request.proof.as_ref()
+                        || !initial_inventory.iter().any(|live| live.id == source.id))
+                    && !resolutions.iter().any(|(issued, _)| issued == source)
+                    && !request.proof.as_ref().is_some_and(|proof| {
+                        relisted_codex_conversation(
+                            source,
+                            &initial_inventory,
+                            proof,
+                            request.require_resumable,
+                        )
+                    })
                 {
-                    inspection.stop(
-                        terminal.session.id,
-                        StoppedKind::Terminal,
-                        CONSOLE_REASON,
-                        CONSOLE_RECOVERY,
-                    );
+                    let missing = !initial_inventory.iter().any(|live| live.id == source.id);
+                    if missing
+                        && matches!(
+                            evidence.classify(source),
+                            SavedExecution::Ended | SavedExecution::Unrecorded
+                        )
+                    {
+                        continue;
+                    }
+                    let result = if missing && request.reconcile_retained {
+                        reader
+                            .reconcile_retained(source)
+                            .and_then(|()| reader.resolve(source))
+                    } else if missing {
+                        Err("Saved owner changed after preview".into())
+                    } else {
+                        reader.resolve(source)
+                    };
+                    if missing
+                        && source.is_saved_claude_history()
+                        && !result
+                            .as_ref()
+                            .is_ok_and(|resolved| resolved.native_continuity.retains_provider())
+                        && reader.inspect_saved_history(source).is_ok()
+                    {
+                        cold_history.push(source.clone());
+                    }
+                    resolutions.push((source.clone(), result));
                 }
             }
-            for (_, kind) in &saved {
-                check_deadline(deadline)?;
-                match kind {
-                    CardKind::Chat(source) => {
-                        checked_saved.insert(source.id);
-                    }
-                    CardKind::Terminal(source) => {
-                        checked_saved.insert(source.id);
-                    }
-                    _ => {}
+        }
+        let inventory = reader.list()?;
+        let terminals = reader.terminals()?;
+        if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
+            return Err("Source inventory exceeds its inspection limit".into());
+        }
+        let proof = request
+            .proof
+            .as_ref()
+            .ok_or("Source service is unavailable")?;
+        record_live_panes(
+            &mut inspection,
+            &inventory,
+            &terminals,
+            proof,
+            request.require_resumable,
+        );
+        let matched_cli = crate::companion::Product::Cli
+            .beside_current()
+            .map_err(|_| "Cannot inspect the destination console companion")?;
+        let mut ids = HashSet::new();
+        for session in &inventory {
+            check_deadline(deadline)?;
+            if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
+                inspection.stop(
+                    session.id,
+                    StoppedKind::Chat,
+                    "its conversation could not be confirmed",
+                    CHAT_RECOVERY,
+                );
+                continue;
+            }
+            if request.require_resumable
+                && session.terminal.as_ref().is_some_and(|terminal| {
+                    terminal.continuity.can_resume_live(proof)
+                        && qualify_terminal(terminal, &terminals, proof).is_ok()
+                        && qualify_console_migration(terminal, &matched_cli).is_err()
+                })
+            {
+                console_keeps_running(
+                    &mut inspection,
+                    session.id,
+                    crate::update::impact::SessionKind::NativeChat,
+                );
+            } else if validate_live_chat(session, request.require_resumable).is_err() {
+                inspection.stop(
+                    session.id,
+                    StoppedKind::Chat,
+                    "its conversation could not be confirmed",
+                    CHAT_RECOVERY,
+                );
+            }
+        }
+        for terminal in &terminals {
+            check_deadline(deadline)?;
+            if request.require_resumable
+                && !inventory.iter().any(|chat| chat.id == terminal.session.id)
+                && terminal.session.continuity.can_resume_live(proof)
+                && qualify_console_migration(&terminal.session, &matched_cli).is_err()
+            {
+                console_keeps_running(
+                    &mut inspection,
+                    terminal.session.id,
+                    crate::update::impact::SessionKind::Terminal,
+                );
+            }
+        }
+        for (_, kind) in &saved {
+            check_deadline(deadline)?;
+            match kind {
+                CardKind::Chat(source) => {
+                    checked_saved.insert(source.id);
                 }
-                match kind {
-                    CardKind::Terminal(source)
-                        if terminal_requires_migration(source, &current_boot) =>
-                    {
-                        if qualify_terminal(source, &terminals, proof).is_err() {
-                            inspection.stop(
-                                source.id,
-                                StoppedKind::Terminal,
-                                "its terminal could not be matched",
-                                TERMINAL_RECOVERY,
-                            );
-                        }
+                CardKind::Terminal(source) => {
+                    checked_saved.insert(source.id);
+                }
+                _ => {}
+            }
+            match kind {
+                CardKind::Terminal(source)
+                    if terminal_requires_migration(source, &current_boot) =>
+                {
+                    if qualify_terminal(source, &terminals, proof).is_err() {
+                        inspection.stop(
+                            source.id,
+                            StoppedKind::Terminal,
+                            "its terminal could not be matched",
+                            TERMINAL_RECOVERY,
+                        );
                     }
-                    CardKind::Chat(source) if !source.is_unstarted() => {
-                        if cold_history.iter().any(|issued| issued == source)
-                            || relisted_codex_conversation(
+                }
+                CardKind::Chat(source) if !source.is_unstarted() => {
+                    if inspection
+                        .details
+                        .panes
+                        .get(&source.id)
+                        .is_some_and(|pane| !pane.detail.is_empty())
+                    {
+                        continue;
+                    }
+                    if cold_history.iter().any(|issued| issued == source)
+                        || relisted_codex_conversation(
+                            source,
+                            &inventory,
+                            proof,
+                            request.require_resumable,
+                        )
+                    {
+                        if cold_history.iter().any(|issued| issued == source) {
+                            inspection
+                                .details
+                                .panes
+                                .get_mut(&source.id)
+                                .unwrap()
+                                .outcome = SavedOutcome::Unchanged;
+                        }
+                        continue;
+                    }
+                    if let Some((reason, recovery)) =
+                        saved_chat_problem(source, &inventory, &evidence, || {
+                            qualify_with_mode(
                                 source,
                                 &inventory,
                                 proof,
                                 request.require_resumable,
+                                |source| {
+                                    resolutions
+                                        .iter()
+                                        .find(|(issued, _)| issued == source)
+                                        .map(|(_, result)| result.clone())
+                                        .unwrap_or_else(|| {
+                                            Err("No authenticated source resolution".into())
+                                        })
+                                },
                             )
-                        {
-                            continue;
-                        }
-                        if let Some((reason, recovery)) =
-                            saved_chat_problem(source, &inventory, &evidence, || {
-                                qualify_with_mode(
-                                    source,
-                                    &inventory,
-                                    proof,
-                                    request.require_resumable,
-                                    |source| {
-                                        resolutions
-                                            .iter()
-                                            .find(|(issued, _)| issued == source)
-                                            .map(|(_, result)| result.clone())
-                                            .unwrap_or_else(|| {
-                                                Err("No authenticated source resolution".into())
-                                            })
-                                    },
-                                )
-                            })
-                        {
-                            inspection.stop(source.id, StoppedKind::Chat, &reason, recovery);
-                        }
+                        })
+                    {
+                        inspection.stop(source.id, StoppedKind::Chat, &reason, recovery);
                     }
-                    _ => {}
                 }
+                _ => {}
             }
-            Ok(())
-        })();
-    if inspect_live.is_err() {
+        }
+        Ok(())
+    })();
+    if let Err(reason) = inspect_live {
+        inspection_failure(&mut inspection, &reason);
         stop_unchecked(&mut inspection, &saved, &checked_saved, &current_boot);
     }
     Ok(inspection)
+}
+
+fn record_saved_pane(
+    inspection: &mut SourceInspection,
+    kind: &CardKind,
+    inert: bool,
+    boot: &crate::model::BootId,
+    replaces_service: bool,
+) {
+    use crate::update::impact::SessionKind;
+    let (id, kind, outcome) = match kind {
+        CardKind::Chat(source) => (
+            source.id,
+            SessionKind::NativeChat,
+            if inert || source.is_unstarted() {
+                SavedOutcome::Unchanged
+            } else if replaces_service && !source.native_continuity.retains_provider() {
+                SavedOutcome::Resumes
+            } else {
+                SavedOutcome::KeepsRunning
+            },
+        ),
+        CardKind::Terminal(source) => (
+            source.id,
+            SessionKind::Terminal,
+            if terminal_requires_migration(source, boot) {
+                SavedOutcome::KeepsRunning
+            } else {
+                SavedOutcome::Unchanged
+            },
+        ),
+        _ => return,
+    };
+    inspection.details.panes.entry(id).or_insert(InspectedPane {
+        kind,
+        outcome,
+        detail: String::new(),
+    });
+}
+
+fn record_ended_panes(
+    inspection: &mut SourceInspection,
+    saved: &[(crate::model::CardId, CardKind)],
+    evidence: &ExecutionEvidence,
+) {
+    for (_, kind) in saved {
+        if let CardKind::Chat(source) = kind
+            && !source.is_unstarted()
+            && evidence.classify(source) == SavedExecution::Ended
+            && let Some(pane) = inspection.details.panes.get_mut(&source.id)
+        {
+            pane.outcome = SavedOutcome::Unchanged;
+        }
+    }
+}
+
+fn record_live_panes(
+    inspection: &mut SourceInspection,
+    chats: &[Session],
+    terminals: &[v77::Terminal],
+    proof: &HostSessionProof,
+    replaces_service: bool,
+) {
+    for session in chats {
+        inspection.details.panes.remove(&session.id);
+        record_saved_pane(
+            inspection,
+            &CardKind::Chat(session.clone()),
+            false,
+            &proof.boot_id,
+            replaces_service,
+        );
+    }
+    for terminal in terminals {
+        if chats.iter().any(|chat| chat.id == terminal.session.id) {
+            continue;
+        }
+        inspection.details.panes.remove(&terminal.session.id);
+        record_saved_pane(
+            inspection,
+            &CardKind::Terminal(terminal.session.clone()),
+            false,
+            &proof.boot_id,
+            replaces_service,
+        );
+    }
+}
+
+fn console_keeps_running(
+    inspection: &mut SourceInspection,
+    id: crate::model::TerminalId,
+    kind: crate::update::impact::SessionKind,
+) {
+    inspection.details.panes.insert(
+        id,
+        InspectedPane {
+            kind,
+            outcome: SavedOutcome::KeepsRunning,
+            detail: format!("{CONSOLE_REASON}. {CONSOLE_RECOVERY}."),
+        },
+    );
+}
+
+fn inspection_failure(inspection: &mut SourceInspection, reason: &str) {
+    let lower = reason.to_ascii_lowercase();
+    let readable = if lower.contains("console companion") {
+        "the console helper installed with this build could not be checked".to_owned()
+    } else if lower.contains("timed out")
+        || lower.contains("budget")
+        || lower.contains("took too long")
+    {
+        "checking panes took too long".to_owned()
+    } else if lower.contains("ownership")
+        || lower.contains("owner")
+        || lower.contains("proof")
+        || lower.contains("authenticate")
+    {
+        "the running terminal service's identity changed or could not be verified".to_owned()
+    } else if lower.contains("connect")
+        || lower.contains("namespace")
+        || lower.contains("unavailable")
+        || lower.contains("send")
+    {
+        "the running terminal service could not be reached".to_owned()
+    } else if lower.contains("limit") || lower.contains("exceeds") || lower.contains("exceeded") {
+        "the running terminal service sent more pane data than could be checked".to_owned()
+    } else if lower.contains("protocol")
+        || lower.contains("response")
+        || lower.contains("contract")
+        || lower.contains("unsupported")
+    {
+        "the running terminal service returned pane data this build could not read".to_owned()
+    } else {
+        reason
+            .replace("Source service", "The running terminal service")
+            .replace("source service", "running terminal service")
+            .replace("Source", "The running terminal service")
+    };
+    inspection
+        .details
+        .notices
+        .push(format!("Live panes could not all be checked: {readable}."));
 }
 
 // Cold terminal presentation is retained unchanged. An actual previous boot
@@ -1202,7 +1395,7 @@ fn saved_chat_problem(
     if execution == Some(SavedExecution::Unrecorded) {
         return Some((
             "ended before it recorded its conversation".into(),
-            "Start a new conversation in the pane; no conversation was recorded to resume",
+            "Choose Resume conversation in the new tab (+) menu to find a saved conversation, or start a new conversation",
         ));
     }
     qualify().err().map(|_| {
@@ -1219,7 +1412,7 @@ fn saved_chat_problem(
                         provider_name(source.launch.provider)
                     ),
                 },
-                "Stop that process, then press Resume in the pane",
+                "Stop that process, then choose Resume conversation in the new tab (+) menu",
             )
         } else if execution == Some(SavedExecution::Unchecked) {
             (UNCHECKED.into(), CHAT_RECOVERY)
@@ -1329,6 +1522,37 @@ mod tests {
     };
 
     #[test]
+    fn inspector_and_lifecycle_admit_exactly_the_same_source_protocols() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for protocol in 0..=u16::MAX {
+            let request = Request {
+                protocol,
+                proof: None,
+                require_resumable: true,
+                reconcile_retained: false,
+            };
+            // Qualified sources reach the ownership check. Unqualified sources
+            // are refused before reading any service namespace or opening a socket.
+            let error = connect(&request, deadline).err().unwrap();
+            assert_eq!(
+                error == "Saved conversations have no authenticated source service",
+                source::is_qualified_source(protocol),
+                "protocol {protocol}: {error}"
+            );
+            assert_eq!(
+                current::supports_protocol(protocol),
+                source::client_family(protocol) == Some(ClientFamily::Current),
+                "protocol {protocol}"
+            );
+        }
+        assert!(current::supports_protocol(156));
+        assert_eq!(
+            source::protocols().collect::<Vec<_>>(),
+            [68, 77, 128, 156, crate::terminal_ipc::PROTOCOL_VERSION]
+        );
+    }
+
+    #[test]
     fn cold_terminal_history_never_requires_replaying_a_launch_or_inventing_an_exit() {
         let mut source = crate::terminal_ipc::TerminalDescriptor::relaunchable(
             TerminalId::new(),
@@ -1366,6 +1590,94 @@ mod tests {
             terminal_requires_migration(&source, &BootId::new("current")),
             "incomplete proof cannot classify obsolete execution"
         );
+    }
+
+    #[test]
+    fn drafts_and_inactive_panes_are_counted_without_starting_them() {
+        let mut draft = session();
+        draft.launch.session_id = None;
+        draft.proof = None;
+        draft.terminal = None;
+        draft.owned_codex_listener = None;
+        draft.native_continuity = NativeContinuity::ReconnectOnly;
+        assert!(draft.is_unstarted());
+        let inactive = session();
+        let mut inspection = SourceInspection::default();
+        for (source, inert) in [(&draft, false), (&inactive, true)] {
+            record_saved_pane(
+                &mut inspection,
+                &CardKind::Chat(source.clone()),
+                inert,
+                &current_boot(),
+                true,
+            );
+            assert_eq!(
+                inspection.details.panes[&source.id].outcome,
+                SavedOutcome::Unchanged
+            );
+        }
+        assert_eq!(inspection.details.panes.len(), 2);
+        assert!(inspection.stopped.is_empty());
+    }
+
+    #[test]
+    fn compatible_updates_count_live_chats_and_terminals_including_relisted_panes() {
+        let source = session();
+        let proof = source.proof.clone().unwrap();
+        let recipe = crate::model::LaunchRecipe {
+            program: "bash".into(),
+            arguments: vec![],
+            working_directory: "/alpha".into(),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        let mut terminal =
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(TerminalId::new(), recipe, None);
+        terminal.session.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: proof.host_session_id.clone(),
+            boot_id: proof.boot_id.clone(),
+            host_incarnation: proof.host_incarnation.clone(),
+        };
+        let mut inspection = SourceInspection::default();
+        record_saved_pane(
+            &mut inspection,
+            &CardKind::Chat(source.clone()),
+            true,
+            &proof.boot_id,
+            false,
+        );
+        assert_eq!(
+            inspection.details.panes[&source.id].outcome,
+            SavedOutcome::Unchanged
+        );
+        record_live_panes(
+            &mut inspection,
+            &[source.clone()],
+            &[terminal.into()],
+            &proof,
+            false,
+        );
+        assert_eq!(inspection.details.panes.len(), 2);
+        assert!(
+            inspection
+                .details
+                .panes
+                .values()
+                .all(|pane| pane.outcome == SavedOutcome::KeepsRunning)
+        );
+    }
+
+    #[test]
+    fn live_inspection_failure_keeps_one_readable_reason() {
+        let mut inspection = SourceInspection::default();
+        inspection_failure(&mut inspection, "Cannot connect to the source service");
+        assert_eq!(
+            inspection.details.notices,
+            [
+                "Live panes could not all be checked: the running terminal service could not be reached."
+            ]
+        );
+        assert!(inspection.stopped.is_empty());
     }
 
     #[test]
@@ -1412,19 +1724,17 @@ mod tests {
         assert!(older.contains("different matched CLI installation"));
         for error in [same_path, older] {
             let mut inspection = SourceInspection::default();
-            inspection.stop(
+            console_keeps_running(
+                &mut inspection,
                 terminal.id,
-                StoppedKind::Terminal,
-                CONSOLE_REASON,
-                CONSOLE_RECOVERY,
+                crate::update::impact::SessionKind::Terminal,
             );
+            assert!(inspection.stopped.is_empty());
+            let pane = &inspection.details.panes[&terminal.id];
+            assert_eq!(pane.outcome, SavedOutcome::KeepsRunning);
             assert_eq!(
-                inspection.stopped[0].reason,
-                "its console reopens without its chat view connected"
-            );
-            assert_eq!(
-                inspection.stopped[0].recovery,
-                "The console keeps running; reopen the conversation from the pane"
+                pane.detail,
+                "keeps running in its terminal; its chat panel disconnects. Choose Resume conversation in the new tab (+) menu afterwards."
             );
             assert!(!error.contains("private-directory"));
             assert!(!error.contains("never-print-this"));
@@ -2300,7 +2610,7 @@ mod tests {
     }
 
     #[test]
-    fn ended_panes_are_omitted_and_live_unlisted_panes_report_recovery() {
+    fn ended_panes_stay_unchanged_and_live_unlisted_panes_report_recovery() {
         let holders = tempfile::tempdir_in("/var/tmp").unwrap();
         let retired = retained_card(current_boot());
         let previous = retained_card(BootId::new("previous-boot"));
@@ -2317,6 +2627,22 @@ mod tests {
         let evidence = evidence(holders.path(), census);
         let inventory = [held.clone()];
         let mut inspection = SourceInspection::default();
+        let saved: Vec<_> = [&retired, &live, &previous, &held]
+            .into_iter()
+            .map(|source| {
+                let kind = CardKind::Chat(source.clone());
+                record_saved_pane(&mut inspection, &kind, false, &current_boot(), true);
+                (crate::model::CardId::new(), kind)
+            })
+            .collect();
+        record_ended_panes(&mut inspection, &saved, &evidence);
+        assert_eq!(inspection.details.panes.len(), 4);
+        for source in [&retired, &previous] {
+            assert_eq!(
+                inspection.details.panes[&source.id].outcome,
+                SavedOutcome::Unchanged
+            );
+        }
         for source in [&retired, &live, &previous, &held] {
             if let Some((reason, recovery)) =
                 saved_chat_problem(source, &inventory, &evidence, || Err("unqualified".into()))
@@ -2339,7 +2665,7 @@ mod tests {
         );
         assert_eq!(
             running.recovery,
-            "Stop that process, then press Resume in the pane"
+            "Stop that process, then choose Resume conversation in the new tab (+) menu"
         );
         let held = inspection
             .stopped
@@ -2381,7 +2707,7 @@ mod tests {
         );
         assert_eq!(
             inspection.stopped[0].recovery,
-            "Start a new conversation in the pane; no conversation was recorded to resume"
+            "Choose Resume conversation in the new tab (+) menu to find a saved conversation, or start a new conversation"
         );
         assert!(
             saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into())).is_some()
