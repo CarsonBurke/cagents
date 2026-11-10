@@ -1249,6 +1249,7 @@ mod tests {
         let confirmation = crate::update::UpdateConfirmation {
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "new".into(),
                     protocol: 32,
@@ -1367,6 +1368,7 @@ mod tests {
         app.update_ui.confirmation = Some(crate::update::UpdateConfirmation {
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,
@@ -1411,6 +1413,7 @@ mod tests {
         crate::update::UpdateConfirmation {
             nonce: uuid::Uuid::new_v4().to_string(),
             preview: crate::update::impact::Preview {
+                editors: Vec::new(),
                 candidate: crate::update::impact::Candidate {
                     version: "9.8.7".into(),
                     protocol: 32,
