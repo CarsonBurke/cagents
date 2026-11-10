@@ -924,6 +924,15 @@ fn restored_observed_row_waits_for_its_own_seed_ack_after_connected() {
     let (publisher, requests) = async_channel::unbounded();
     window.app.workspace_model_tx = publisher;
     let mut model = observed_window_model(&window);
+    // This saved row differs from authority, so it still needs its own
+    // migration barrier; an exact unchanged row can use the snapshot directly.
+    model
+        .views
+        .iter_mut()
+        .flat_map(|view| &mut view.panes)
+        .find(|pane| pane.id == window.cached.id)
+        .unwrap()
+        .title = "Peer updated title".into();
     let focused = window.app.workspace.focused();
     let order = window.app.workspace.order().collect::<Vec<_>>();
     drop(
@@ -1027,7 +1036,8 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
         let target = window.projected();
         assert_eq!(window.app.restored_agent_attaches, [target, other.id]);
         // Both new scopes are introduced by a real model Read. Only the
-        // moved target's scope is acknowledged below; the other stays unready.
+        // moved target's scope is acknowledged below; the other has no
+        // authoritative view yet and must still wait for its seed receipt.
         let project = window.app.durable.channels[0].project_id;
         window
             .app
@@ -1042,7 +1052,8 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
                 vec![],
             ));
         let destination = ChannelId::new();
-        for channel in [destination, ChannelId::new()] {
+        let unready = ChannelId::new();
+        for channel in [destination, unready] {
             model.channels.push(crate::workspace_model::ModelChannel {
                 id: channel,
                 repository: "/fixture-project".into(),
@@ -1050,7 +1061,9 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
                 title_source: Default::default(),
                 ordinal: model.channels.len() as u32,
             });
-            model.views.push(View::empty(channel));
+            if channel == destination {
+                model.views.push(View::empty(channel));
+            }
         }
         let at = model.views[1]
             .panes
@@ -1069,6 +1082,7 @@ fn a_queued_transfer_waits_for_target_ack_without_blocking_an_admitted_row() {
         );
         let mut destination_seeds = emitted_seeds(&requests);
         assert!(destination_seeds.contains_key(&Scope::Channel(destination)));
+        assert!(destination_seeds.contains_key(&Scope::Channel(unready)));
         assert!(!window.app.shared_views_ready_for_startup());
         assert_eq!(window.app.restored_agent_attaches, [target, other.id]);
         let target_model = apply_emitted_seed(
