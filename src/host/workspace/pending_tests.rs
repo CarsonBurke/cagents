@@ -153,7 +153,7 @@ fn failed_pending_save_still_publishes_the_worker_and_retry_reuses_it() {
     rusqlite::Connection::open(&fixture.path)
         .unwrap()
         .execute_batch(
-            "CREATE TRIGGER reject_pending BEFORE UPDATE ON shared_views BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
+            "CREATE TRIGGER reject_pending BEFORE UPDATE ON view_scopes BEGIN SELECT RAISE(ABORT, 'fixture'); END;",
         )
         .unwrap();
     fixture.complete().unwrap();

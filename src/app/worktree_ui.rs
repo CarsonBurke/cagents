@@ -193,6 +193,7 @@ fn scope_descriptor(
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
+        chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
@@ -864,7 +865,9 @@ impl Cagents {
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
-        self.set_workspace_surfaces_visible(false);
+        // The warm chat budget waits for `apply_viewport` below, once the
+        // panes this scope shows are visible again and so not candidates.
+        self.apply_workspace_surface_visibility(false);
         self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
         // Iced inherits old anonymous IDs during diff. A named generation ID

@@ -38,9 +38,10 @@ both use the same fixture data and synthetic provider.
                   target. scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
-  start SIDE [--width PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
+  start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
         [--portal gtk|kde|gnome|cosmic]
-                  Take the native lock and start a headless session. The lock is
+                  Take the native lock and start a headless session at the
+                  requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
@@ -48,10 +49,16 @@ both use the same fixture data and synthetic provider.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
-                  where Cargo and rustup live.
+                  where Cargo and rustup live. Between sessions it runs under
+                  the side the last session ran, with no daemon running.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
   nested CMD...   Run a command in the nested compositor's environment.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
+  relaunch [--chat-stages]
+                  After closing the app window, run the same built UI again in
+                  this session, keeping its daemon and providers alive. Runs in
+                  the foreground; stop still ends the complete session.
+                  --chat-stages records UI stage timings on normal close.
   stop            End the session, its daemon and its processes; release the lock.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
@@ -526,7 +533,7 @@ report_over_limit() {
 }
 
 run_session() {
-    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6
+    local side=$1 width=$2 keep_state=$3 wait_lock=$4 limit=$5 starter=$6 height=${7:-900}
     load_side "$side" "$state/source"
     # Open for the whole session, even while it waits for the native lock, so
     # the pruner leaves the target.
@@ -564,6 +571,25 @@ run_session() {
     fi
     mkdir -m 700 "$runtime"
     mkdir -p -- "$compositor_home"/{home,config,data,cache,state}
+    # KWin owns only this task's nested compositor window. Give its client
+    # framebuffer both requested dimensions before niri fits its logical width;
+    # scaling the old fixed 1280x800 frame also scaled away the vertical space.
+    cat >"$compositor_home/config/kwinrulesrc" <<RULES
+[General]
+count=1
+rules=1
+
+[1]
+Description=Native evidence viewport
+wmclassmatch=0
+types=4294967295
+position=0,0
+positionrule=2
+size=$width,$height
+sizerule=2
+noborder=true
+noborderrule=2
+RULES
     prepare_fixture "$keep_state" 9>&-
 
     # The compositor reads and rewrites its settings on exit, so it gets its own
@@ -579,7 +605,7 @@ run_session() {
         CAGENTS_EVIDENCE_REAL_HOME="$real_home" PATH="$(path_without_shims)" \
         setpriv --pdeathsig TERM dbus-run-session -- setpriv --pdeathsig TERM \
         kwin_wayland --virtual --no-lockscreen --socket "$session_name" \
-        --width 1596 --height 929 --exit-with-session \
+        --width "$width" --height "$height" --exit-with-session \
         "$self --task $task __inner $side $width" \
         >"$logs/kwin-$side.log" 2>&1 8<&- 9>&- &
     compositor=$!
@@ -652,7 +678,7 @@ write_session_cargo() {
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
         printf 'recorded=%q\n' "$(build_arguments)"
         cat <<'CARGO'
-[ ! -e "$state/ready" ] || exec "$real_cargo" "$@"
+[ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {
     local message="refusing to $1 while holding the native lock${2:+; $2}"
     printf '%s\n' "$message" >"$state/failed.$$"
@@ -713,8 +739,9 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0
-    fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+    local status=0 stage_environment=()
+    [ -z "${chat_stage_output:-}" ] || stage_environment+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
+    fixture_env env "${stage_environment[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
         scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
@@ -722,15 +749,88 @@ run_app() {
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
             "$status" "$harness_root/session.log" "$logs/ui-$side.log" >"$state/failed"
     fi
+    return "$status"
+}
+
+# Observe the explicit machine format; display text is not a window contract.
+app_window_is_open() {
+    local observed
+    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 2
+    /usr/bin/python3 -c 'import json,sys
+try:
+    state=json.load(sys.stdin)
+    if not isinstance(state,dict) or "window" not in state:
+        sys.exit(2)
+    window=state["window"]
+    if window is None:
+        sys.exit(1)
+    sys.exit(0 if isinstance(window,dict) and window else 2)
+except (ValueError,AttributeError):
+    sys.exit(2)
+' <<<"$observed"
+}
+
+cmd_relaunch() {
+    local side watcher observed status=0 chat_stage_output=
+    side=$(current_side)
+    case ${1:-} in
+        --chat-stages)
+            [ "$#" -eq 1 ] || die 'relaunch accepts only --chat-stages'
+            mkdir -p -m 700 -- "$logs/chat-stages"
+            chat_stage_output=$logs/chat-stages/$side-$(date +%s)-$$.json
+            printf 'chat stages: %s\n' "$chat_stage_output"
+            ;;
+        '') ;;
+        *) die 'relaunch accepts only --chat-stages' ;;
+    esac
+    [ -f "$harness_root/session.rc" ] || die 'close the app window before relaunching it'
+    exec 7>"$state/relaunch.lock"
+    flock -n 7 || die 'a relaunched app is already running'
+    nested_session_env
+    local session_environment
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    eval "$session_environment"
+    app_window_is_open && observed=0 || observed=$?
+    case $observed in
+        0) die 'close the app window before relaunching it' ;;
+        1) ;;
+        *) die "could not observe whether the app window is closed; see $harness_root/session.log" ;;
+    esac
+    # Product copies need not contain Cargo dependency lists, so the runner's
+    # ordinary warm-build shortcut may decline them. Replay the exact recorded
+    # builds again until the new window appears; never compile under this lock.
+    touch "$state/replaying"
+    (
+        for _ in {1..300}; do
+            live_session || exit 1
+            if app_window_is_open; then
+                rm -f -- "$state/replaying"
+                exit 0
+            fi
+            sleep 0.1
+        done
+        printf 'the relaunched app window did not appear; see %s\n' "$logs/ui-$side.log" >"$state/failed"
+        touch "$state/stop"
+    ) 7>&- &
+    watcher=$!
+    trap 'rm -f -- "$state/replaying"; kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :' EXIT
+    trap 'exit 143' TERM HUP
+    run_app "$side" 7>&- || status=$?
+    if [ -e "$state/replaying" ]; then
+        printf 'the relaunched app exited before its window appeared; see %s\n' "$logs/ui-$side.log" >"$state/failed"
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 keep_state=false wait_lock=1800 limit=2700 portal=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
         case $1 in
             --width) width=${2:?--width needs pixels}; shift 2 ;;
+            --height) height=${2:?--height needs pixels}; shift 2 ;;
             --keep-state) keep_state=true; shift ;;
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
@@ -738,8 +838,8 @@ cmd_start() {
             *) die "unknown start option: $1" 2 ;;
         esac
     done
-    [[ $width =~ ^[0-9]+$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
-        die 'width, lock wait and session limit must be whole numbers' 2
+    [[ $width =~ ^[1-9][0-9]*$ && $height =~ ^[1-9][0-9]*$ && $wait_lock =~ ^[0-9]+$ && $limit =~ ^[1-9][0-9]*$ ]] ||
+        die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
@@ -757,10 +857,11 @@ cmd_start() {
         die "$(not_built "$side" "$checkout")"
     printf '%s\n' "$side" >"$state/side"
     printf '%s\n' "$width" >"$state/width"
+    printf '%s\n' "$height" >"$state/height"
     printf '%s\n' "$portal" >"$state/portal"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
-    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" \
+    setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" \
         >>"$logs/session-$side.log" 2>&1 </dev/null &
     local pid=$!
     printf '%s\n' "$pid" >"$state/pid"
@@ -819,10 +920,20 @@ cmd_shot() {
     (
         nested_session_env
         local observed
-        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" observe --no-text) ||
+        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" --json observe --no-text) ||
             die "could not observe the session; see $harness_root/session.log and $logs/ui-$side.log"
-        grep -q '^window=' <<<"$observed" ||
-            die "the app has no window to capture; see $logs/ui-$side.log"
+        /usr/bin/python3 -c '
+import json, sys
+state = json.load(sys.stdin)
+window = state.get("window")
+if not window:
+    sys.exit("native-evidence: the app has no window to capture")
+viewport = state["output"]["logical"]
+width, height = viewport["width"], viewport["height"]
+w, h = window["size"]
+if w > width + 2 or h > height + 2:
+    sys.exit(f"native-evidence: app window {w}x{h} exceeds viewport {width}x{height}; restart with a larger --width/--height")
+' <<<"$observed"
         timeout -k 5 60 niri-harness --no-heal --session "$session_name" shot "$side-$name" >/dev/null
     )
     local webp="$shots/$side-$name.webp" manifest="$shots/manifest.tsv"
@@ -902,13 +1013,21 @@ select_task "$task_argument"
 case $command in
     build) cmd_build "$@" ;;
     start) cmd_start "$@" ;;
+    relaunch) cmd_relaunch "$@" ;;
     cli)
         side=$(current_side)
         load_side "$side" "$state/source"
         fixture_env "$target/dev-runtime/cagents" "$@"
         ;;
     env)
-        side=$(current_side)
+        # Between sessions the fixture is still there, with no daemon holding
+        # its stores, so setup that needs the daemon stopped runs then, under
+        # the side the last session ran.
+        if live_session || [ ! -f "$state/side" ]; then
+            side=$(current_side)
+        else
+            side=$(cat "$state/side")
+        fi
         load_side "$side" "$state/source"
         fixture_env "$@"
         ;;

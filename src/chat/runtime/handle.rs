@@ -549,6 +549,22 @@ impl Handle {
             }
         }
     }
+    pub(crate) fn presentation_wire(
+        &self,
+        chat_id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<crate::terminal_ipc::PreparedResponse, String> {
+        match &self.0 {
+            Owner::Local(local) => Ok(local
+                .presentation(chat_id, after)
+                .unwrap_or(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                    chat_id,
+                    snapshot: None,
+                })
+                .into()),
+            Owner::Remote(remote) => remote.presentation_wire(chat_id, after),
+        }
+    }
     pub fn session_id(&self) -> Option<String> {
         match &self.0 {
             Owner::Local(local) => local.session_id(),

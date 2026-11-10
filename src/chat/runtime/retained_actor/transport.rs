@@ -297,6 +297,8 @@ struct Remote {
     launch_account_scope: Result<crate::account::scope::LaunchAccountScope, String>,
     recovery_environment: BTreeMap<String, String>,
     desired_visible: Mutex<Option<bool>>,
+    wake: Arc<push::Wake>,
+    binary_codec: std::sync::OnceLock<bool>,
     desired_observe: AtomicBool,
     notified_prompt_revision: std::sync::atomic::AtomicU64,
     input_sequence: Mutex<u64>,
@@ -495,6 +497,8 @@ impl RemoteActor {
             launch_account_scope: Err("fixture has no account scope".into()),
             recovery_environment: Default::default(),
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new().unwrap()),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(1),
@@ -793,9 +797,11 @@ impl RemoteActor {
             .desired_visible
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(visible);
+        self.0.wake.notify();
     }
     pub fn observe_next_update(&self) -> u64 {
         self.0.desired_observe.store(true, Ordering::Release);
+        self.0.wake.notify();
         self.state().generation
     }
     pub fn attachment_snapshot(&self) -> Snapshot {
@@ -1135,6 +1141,8 @@ impl RemoteActor {
             proof,
             socket,
             desired_visible: Mutex::new(None),
+            binary_codec: std::sync::OnceLock::new(),
+            wake: Arc::new(push::Wake::new()?),
             desired_observe: AtomicBool::new(false),
             notified_prompt_revision: std::sync::atomic::AtomicU64::new(0),
             input_sequence: Mutex::new(attached.resident.next_input),
@@ -1158,6 +1166,8 @@ impl RemoteActor {
             worker: Mutex::new(None),
             startup: Mutex::new(startup),
         }));
+        let watch = remote.watch()?;
+        let wake = remote.0.wake.clone();
         let weak = Arc::downgrade(&remote.0);
         let worker = thread::Builder::new()
             .name("cagents-actor-proxy".into())
@@ -1193,6 +1203,7 @@ impl RemoteActor {
                     }
                     let old = actor.state();
                     let response = actor.call::<Option<Resident>>("state", json!([old.changed]));
+                    let mut retry_housekeeping = response.is_err();
                     if actor.0.stop.load(Ordering::Acquire) {
                         break;
                     }
@@ -1207,7 +1218,7 @@ impl RemoteActor {
                             break;
                         }
                     }
-                    let _ = actor.reconcile_acknowledged_inputs();
+                    retry_housekeeping |= actor.reconcile_acknowledged_inputs().is_err();
                     let identities: Vec<_> = actor
                         .0
                         .pending
@@ -1217,21 +1228,99 @@ impl RemoteActor {
                         .filter(|pending| pending.reply.is_some())
                         .map(|pending| pending.identity.clone())
                         .collect();
-                    if !identities.is_empty()
-                        && let Ok(receipts) =
-                            actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
-                    {
-                        actor.apply_receipts(&receipts);
+                    if !identities.is_empty() {
+                        match actor.call::<Vec<InputReceipt>>("input_receipts", json!([identities]))
+                        {
+                            Ok(receipts) => actor.apply_receipts(&receipts),
+                            Err(_) => retry_housekeeping = true,
+                        }
                     }
                     actor.resolve_uncertain_input();
-                    let _ = actor.flush_input_retirements();
+                    retry_housekeeping |= actor.flush_input_retirements().is_err();
+                    let retry = if watch.is_none() {
+                        Some(Duration::from_millis(50))
+                    } else {
+                        actor.retry_after(retry_housekeeping)
+                    };
                     drop(actor);
-                    thread::sleep(Duration::from_millis(50));
+                    if let Err(error) = wake.wait(watch.as_ref(), retry) {
+                        if let Some(inner) = weak.upgrade() {
+                            Self(inner).publish_unavailable(&error);
+                        }
+                        break;
+                    }
                 }
             })
             .map_err(|error| error.to_string())?;
         *remote.0.worker.lock().unwrap_or_else(|p| p.into_inner()) = Some(worker);
         Ok(remote)
+    }
+    fn retry_after(&self, failed: bool) -> Option<Duration> {
+        // Accepted inputs finish through helper publication. Only work that
+        // failed, or has a scheduled retransmission, needs a timer.
+        if failed
+            || self.0.recovering_inputs.load(Ordering::Acquire)
+            || self.state().acknowledged_input_count > 0
+            || self.0.desired_observe.load(Ordering::Acquire)
+            || self
+                .0
+                .desired_visible
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_some()
+            || !self
+                .0
+                .retiring_inputs
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .is_empty()
+        {
+            return Some(Duration::from_millis(50));
+        }
+        self.0
+            .uncertain_input
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .as_ref()
+            .and_then(|input| input.retransmit.as_ref())
+            .map(|retry| retry.next.saturating_duration_since(Instant::now()))
+    }
+    fn watch(&self) -> Result<Option<UnixStream>, String> {
+        let deadline = Instant::now() + TIMEOUT;
+        let control =
+            registry::connect_until(&self.0.socket, deadline).map_err(|e| e.to_string())?;
+        verify_peer(&control, &self.0.identity.record)?;
+        deadline_io::send_until(
+            &control,
+            &Invocation {
+                proof: self.0.proof.clone(),
+                epoch: Some(self.0.epoch),
+                method: "watch".into(),
+                args: Value::Null,
+            },
+            deadline,
+        )?;
+        let (result, mut fds) =
+            crate::descriptor_frame::receive_json_with_fds_until::<Result<(), String>>(
+                &control,
+                deadline,
+                MAX_FRAME,
+                1,
+                crate::descriptor_frame::FrameByteOrder::LittleEndian,
+            )?;
+        verify_peer(&control, &self.0.identity.record)?;
+        match result {
+            Err(error) if error == UNKNOWN_METHOD => Ok(None),
+            Err(error) => Err(error),
+            Ok(()) => {
+                if fds.len() != 1 {
+                    return Err("Retained watcher did not transfer exactly one descriptor".into());
+                }
+                let watch = UnixStream::from(fds.remove(0));
+                watch.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok(Some(watch))
+            }
+        }
     }
     fn publish_resident(&self, resident: Resident) -> bool {
         self.publish_resident_inner(resident, false)
@@ -1324,6 +1413,7 @@ impl RemoteActor {
             .lock()
             .unwrap_or_else(|p| p.into_inner()) = Some(Arc::new(snapshot));
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         let mut state = self.0.state.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(mut resident) = resident {
             // A close response may also have been issued before installation
@@ -1390,6 +1480,7 @@ impl RemoteActor {
         (self.0.notify)(Update::Observed { generation });
         (self.0.notify)(Update::Presentation);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
     }
     pub(in crate::chat::runtime) fn pinned_launch_directory(
         &self,
@@ -1636,6 +1727,7 @@ impl RemoteActor {
             });
             break;
         }
+        self.0.wake.notify();
         // Preserve the exact identity and envelope before crossing the socket.
         // An ambiguous write keeps the receipt pending and fences new input
         // until the metadata pump observes, retransmits or settles it.
@@ -1677,6 +1769,7 @@ impl RemoteActor {
             });
             uncertain.refusal = refusal;
         }
+        self.0.wake.notify();
         Ok(response)
     }
     /// Inputs reach the helper one at a time, so a caller who arrives while
@@ -1946,6 +2039,9 @@ impl RemoteActor {
             .retiring_inputs
             .lock()
             .unwrap_or_else(|p| p.into_inner());
+        if !completed.is_empty() {
+            self.0.wake.notify();
+        }
         for identity in completed {
             if !retiring.contains(&identity) {
                 retiring.push(identity);
@@ -2082,6 +2178,7 @@ impl RemoteActor {
         self.call::<()>("preserve", Value::Null)?;
         self.0.preserved.store(true, Ordering::Release);
         self.0.stop.store(true, Ordering::Release);
+        self.0.wake.notify();
         Ok(())
     }
     pub fn close_method(&self, method: &str, args: Value) -> Result<(), String> {
@@ -2153,6 +2250,7 @@ impl chat::protocol::LaunchCleanup for RemoteActor {
 impl Drop for Remote {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Release);
+        self.wake.notify();
         if let Some(worker) = self
             .worker
             .get_mut()
@@ -2198,10 +2296,13 @@ fn close_only_method(method: &str) -> bool {
     matches!(
         method,
         "state"
+            | "watch"
             | "execution_environment"
             | "recognize_sources"
             | "snapshot"
             | "presentation"
+            | "presentation_codec"
+            | "presentation_binary"
             | "visible"
             | "observe"
             | "readiness"
@@ -2293,10 +2394,15 @@ struct Server {
     installed: bool,
     journal: Arc<Mutex<Journal>>,
     changed: Arc<std::sync::atomic::AtomicU64>,
+    watcher: Arc<push::Watcher>,
+    #[cfg(test)]
+    state_reads: Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    fail_state_reads: Arc<std::sync::atomic::AtomicU64>,
     prompt_revision: Arc<std::sync::atomic::AtomicU64>,
     pending: Vec<(
         InputIdentity,
-        crossbeam_channel::Receiver<Result<(), String>>,
+        crossbeam_channel::Receiver<Result<(), Rejection>>,
         Option<(crate::model::RunId, Arc<std::sync::atomic::AtomicU8>)>,
     )>,
     account_reports: Arc<Mutex<Vec<Update>>>,
@@ -2381,6 +2487,10 @@ impl Server {
         let journal = Arc::new(Mutex::new(Journal::open(store.directory())?));
         let changed = Arc::new(std::sync::atomic::AtomicU64::new(1));
         let published = changed.clone();
+        let watcher = Arc::new(push::Watcher::default());
+        let published_watcher = watcher.clone();
+        let metadata_changed = changed.clone();
+        let metadata_watcher = watcher.clone();
         let prompt_revision = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let available = prompt_revision.clone();
         let outcomes = journal.clone();
@@ -2414,6 +2524,11 @@ impl Server {
                     }
                 }
                 published.fetch_add(1, Ordering::Release);
+                published_watcher.notify();
+            },
+            move || {
+                metadata_changed.fetch_add(1, Ordering::Release);
+                metadata_watcher.notify();
             },
         )?;
         let provider = actor
@@ -2461,6 +2576,11 @@ impl Server {
             installed: false,
             journal,
             changed,
+            watcher,
+            #[cfg(test)]
+            state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            #[cfg(test)]
+            fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             prompt_revision,
             pending: Vec::new(),
             account_reports,
@@ -2477,11 +2597,47 @@ impl Server {
             detached: DetachedWork::Stop,
         })
     }
+    fn presentation_response(
+        &mut self,
+        id: crate::model::TerminalId,
+        after: Option<u64>,
+    ) -> Result<Option<crate::terminal_ipc::ServerResponse>, String> {
+        if id != self.source.id {
+            return Err("Retained presentation names another chat".into());
+        }
+        // Loss is outside the reducer's transcript generation. Refuse
+        // even an unchanged-generation read instead of hiding it as
+        // an empty publication or inventing a transcript revision.
+        if let Some(loss) = self
+            .journal
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .continuity_loss()?
+        {
+            return Err(loss.reason);
+        }
+        let response = self.actor.presentation(id, after);
+        let snapshot = match &response {
+            Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
+                snapshot: Some(snapshot),
+                ..
+            }) => Some(snapshot),
+            Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
+                Some(&update.metadata)
+            }
+            _ => None,
+        };
+        if let Some(snapshot) = snapshot {
+            self.remember_publication(snapshot.session_id.as_deref(), &snapshot.native_continuity)?;
+        }
+        Ok(response)
+    }
     fn notifier(&self) -> impl Fn(Update) + Send + Sync + 'static {
         let outcomes = self.journal.clone();
         let changed = self.changed.clone();
         let available = self.prompt_revision.clone();
         let reports = self.account_reports.clone();
+        let watcher = self.watcher.clone();
         move |update| {
             if matches!(update, Update::PromptAvailable) {
                 available.fetch_add(1, Ordering::Release);
@@ -2501,6 +2657,7 @@ impl Server {
                 }
             }
             changed.fetch_add(1, Ordering::Release);
+            watcher.notify();
         }
     }
     fn revision(&self) -> u64 {
@@ -2717,20 +2874,43 @@ impl Server {
         let journal = self.journal.clone();
         let completed = self.actor.is_completed();
         let changed = self.changed.clone();
-        self.pending.retain(|(identity,response,effects)| {
-            if !completed && effects.as_ref().is_some_and(|(_,state)|state.load(Ordering::Acquire)==0) {return true;}
-            let result=match response.try_recv() {Ok(result)=>Some(InputState::Acknowledged(result)),Err(crossbeam_channel::TryRecvError::Disconnected)=>Some(InputState::Unknown("The retained actor stopped before acknowledging this input; never replay it automatically".into())),Err(crossbeam_channel::TryRecvError::Empty)=>None};
-            if let Some(state)=result {
-                let mut journal=journal.lock().unwrap_or_else(|p|p.into_inner());
-                if matches!(&state,InputState::Acknowledged(Err(_))) && let Some((run,effects))=effects && effects.load(Ordering::Acquire)==1 {
-                    if let Err(error)=journal.refuse_unexecuted_run(*run) {let _=journal.record_loss(&error);}
-                }
-                if let Err(error)=journal.finish(identity,state) {let _=journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));}
-                changed.fetch_add(1,Ordering::Release);
-                false
-            } else {true}
+        let revision = self.revision();
+        self.pending.retain(|(identity, response, effects)| {
+            if !completed
+                && effects
+                    .as_ref()
+                    .is_some_and(|(_, state)| state.load(Ordering::Acquire) == 0)
+            {
+                return true;
+            }
+            let state = match response.try_recv() {
+                Ok(Ok(())) => InputState::Acknowledged(Ok(())),
+                Ok(Err(Rejection::Refused(error))) => InputState::Acknowledged(Err(error)),
+                Ok(Err(Rejection::Unacknowledged(error))) => InputState::Unknown(error),
+                Err(crossbeam_channel::TryRecvError::Disconnected) => InputState::Unknown(
+                    "The retained actor stopped before acknowledging this input; never replay it automatically".into(),
+                ),
+                Err(crossbeam_channel::TryRecvError::Empty) => return true,
+            };
+            let mut journal = journal.lock().unwrap_or_else(|p| p.into_inner());
+            if matches!(&state, InputState::Acknowledged(Err(_)))
+                && let Some((run, effects)) = effects
+                && effects.load(Ordering::Acquire) == 1
+                && let Err(error) = journal.refuse_unexecuted_run(*run)
+            {
+                let _ = journal.record_loss(&error);
+            }
+            if let Err(error) = journal.finish(identity, state) {
+                let _ = journal.record_loss(&format!("Cannot persist retained input outcome: {error}"));
+            }
+            changed.fetch_add(1, Ordering::Release);
+            false
         });
+        if self.revision() != revision {
+            self.watcher.notify();
+        }
     }
+
     fn pinned_launch_directory(
         &self,
         request: &Invocation,
@@ -2795,6 +2975,7 @@ impl Server {
                     "Retained actor source/account identity does not match this chat".into(),
                 );
             }
+            self.watcher.clear();
             self.epoch = uuid::Uuid::new_v4();
             self.close_only = close_only;
             self.attachment_preserved = false;
@@ -2839,6 +3020,11 @@ impl Server {
             return Err("This attachment preserved provider ownership; authenticate a new attachment before changing it".into());
         }
         match request.method.as_str() {
+            "watch" => Ok(Value::Null),
+            "presentation_codec" => {
+                let (version,) = decode!((u16,));
+                value!(version == crate::terminal_ipc::PROTOCOL_VERSION)
+            }
             "account_switch_generation"
             | "completed_account_options"
             | "account_switch_notice"
@@ -2892,6 +3078,17 @@ impl Server {
             }
             "execution_environment" => value!(self.environment.clone()),
             "state" => {
+                #[cfg(test)]
+                {
+                    self.state_reads.fetch_add(1, Ordering::Release);
+                    if self
+                        .fail_state_reads
+                        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+                        .is_ok()
+                    {
+                        return Err("Temporary fixture observation failure".into());
+                    }
+                }
                 let (after,) = decode!((u64,));
                 if after == self.revision() {
                     Ok(Value::Null)
@@ -3125,37 +3322,7 @@ impl Server {
             }
             "presentation" => {
                 let (id, after) = decode!((crate::model::TerminalId, Option<u64>));
-                if id != self.source.id {
-                    return Err("Retained presentation names another chat".into());
-                }
-                // Loss is outside the reducer's transcript generation. Refuse
-                // even an unchanged-generation read instead of hiding it as
-                // an empty publication or inventing a transcript revision.
-                if let Some(loss) = self
-                    .journal
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .continuity_loss()?
-                {
-                    return Err(loss.reason);
-                }
-                let response = self.actor.presentation(id, after);
-                let snapshot = match &response {
-                    Some(crate::terminal_ipc::ServerResponse::ChatSnapshot {
-                        snapshot: Some(snapshot),
-                        ..
-                    }) => Some(snapshot),
-                    Some(crate::terminal_ipc::ServerResponse::ChatUpdate { update, .. }) => {
-                        Some(&update.metadata)
-                    }
-                    _ => None,
-                };
-                if let Some(snapshot) = snapshot {
-                    self.remember_publication(
-                        snapshot.session_id.as_deref(),
-                        &snapshot.native_continuity,
-                    )?;
-                }
+                let response = self.presentation_response(id, after)?;
                 value!(response)
             }
             "text_copy" => {
@@ -3521,7 +3688,23 @@ impl Server {
                 }
                 let (request, reply) = call.into_parts();
                 let close = request.method == "retire";
+                if request.method == "presentation_binary" {
+                    let response = self.binary_presentation(request);
+                    reply.send(connections::Answer::Binary(response));
+                    orphans.run();
+                    continue;
+                }
+                if request.method == "watch" {
+                    let watch = self.invoke(request).and_then(|_| self.watcher.subscribe());
+                    reply.send(connections::Answer::Watch(watch));
+                    orphans.run();
+                    continue;
+                }
+                let revision = self.revision();
                 let response = self.invoke(request);
+                if self.revision() != revision {
+                    self.watcher.notify();
+                }
                 // Only an explicit retirement after durable semantic ACK exits
                 // the helper; a lost provider-close reply retains its journal.
                 let finished = close && response.is_ok();
@@ -4374,6 +4557,10 @@ while IFS= read -r frame; do :; done
                 installed: true,
                 journal: Arc::new(Mutex::new(Journal::open(&journal_directory).unwrap())),
                 changed: Arc::new(std::sync::atomic::AtomicU64::new(1)),
+                watcher: Arc::new(push::Watcher::default()),
+                state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+                #[cfg(test)]
+                fail_state_reads: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 prompt_revision: Arc::new(std::sync::atomic::AtomicU64::new(0)),
                 pending: Vec::new(),
                 account_reports: Arc::new(Mutex::new(Vec::new())),
@@ -5054,6 +5241,80 @@ exec /bin/sleep 60
         }
     }
     #[test]
+    fn courier_input_completion_persists_uncertainty_and_retains_affected_runs() {
+        for uncertain in [false, true] {
+            let mut fixture = resident_fixture();
+            let server = &mut fixture.server;
+            let identity = InputIdentity {
+                sequence: 1,
+                id: uuid::Uuid::new_v4(),
+                hash: [8; 32],
+            };
+            let run = crate::model::RunId::new();
+            server
+                .journal
+                .lock()
+                .unwrap()
+                .admit_with_run(&identity, Some(run))
+                .unwrap();
+            let (reply, response) = crossbeam_channel::bounded(1);
+            let error = "fixture input failure".to_owned();
+            reply
+                .send(Err(if uncertain {
+                    Rejection::Unacknowledged(error.clone())
+                } else {
+                    Rejection::Refused(error.clone())
+                }))
+                .unwrap();
+            server.pending.push((
+                identity.clone(),
+                response,
+                Some((
+                    run,
+                    Arc::new(std::sync::atomic::AtomicU8::new(if uncertain {
+                        2
+                    } else {
+                        1
+                    })),
+                )),
+            ));
+            server.finish_inputs();
+            assert!(server.pending.is_empty());
+            let journal = server.journal.lock().unwrap();
+            let receipt = journal.input(&identity).unwrap().unwrap();
+            assert_eq!(
+                receipt.state,
+                if uncertain {
+                    InputState::Unknown(error)
+                } else {
+                    InputState::Acknowledged(Err(error))
+                }
+            );
+            assert_eq!(
+                journal.retained_runs().unwrap(),
+                if uncertain { vec![run] } else { vec![] }
+            );
+            // Helpers keep their Journal for one lifetime. An independent
+            // read-only database connection checks the committed receipt;
+            // reopening the actor Journal itself is intentionally refused.
+            let persisted = rusqlite::Connection::open_with_flags(
+                fixture._root.path().join("journal/actor-journal.sqlite"),
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            )
+            .unwrap();
+            let bytes: Vec<u8> = persisted
+                .query_row(
+                    "SELECT state FROM inputs WHERE sequence=?1",
+                    [identity.sequence],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            let state: InputState = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(state, receipt.state);
+        }
+    }
+
+    #[test]
     fn input_refusal_and_storage_failure_publish_new_resident_revisions() {
         for storage_failure in [false, true] {
             let mut fixture = resident_fixture();
@@ -5074,7 +5335,9 @@ exec /bin/sleep 60
             let before = server.resident().unwrap();
             assert_eq!(before.retained_runs, vec![run]);
             let (reply, response) = crossbeam_channel::bounded(1);
-            reply.send(Err("fixture refusal".to_owned())).unwrap();
+            reply
+                .send(Err(Rejection::Refused("fixture refusal".to_owned())))
+                .unwrap();
             server.pending.push((
                 identity,
                 response,
@@ -6027,6 +6290,11 @@ exec /bin/sleep 60
         let (processed, poll_processed) = crossbeam_channel::bounded(1);
         let (stop, stopped) = crossbeam_channel::bounded(1);
         let peer = thread::spawn(move || {
+            // This ordering fixture models an older helper without readiness.
+            let (watch, _) = listener.accept().unwrap();
+            let request: Invocation = receive(&watch, TIMEOUT).unwrap();
+            assert_eq!(request.method, "watch");
+            send(&watch, &Err::<Value, _>(UNKNOWN_METHOD.to_owned()), TIMEOUT).unwrap();
             // Hold the observer's response to force refresh_state to publish
             // the new resident before that observer returns an unchanged poll.
             let (observer, _) = listener.accept().unwrap();
@@ -6575,7 +6843,12 @@ exec /bin/sleep 60
                             .lock()
                             .unwrap()
                             .push((request.method.clone(), request.args.clone()));
-                        let response = fixture.server.invoke(request);
+                        // This deliberately models a pre-readiness protocol-2 helper.
+                        let response = if request.method == "watch" {
+                            Err(UNKNOWN_METHOD.into())
+                        } else {
+                            fixture.server.invoke(request)
+                        };
                         let _ = send(&control, &response, TIMEOUT);
                     }
                 })
@@ -6616,6 +6889,7 @@ exec /bin/sleep 60
         fn drop(&mut self) {
             self.actor.0.stop.store(true, Ordering::Release);
             self.stop.store(true, Ordering::Release);
+            self.actor.0.wake.notify();
             if let Some(helper) = self.helper.take() {
                 let _ = helper.join();
             }
@@ -7211,3 +7485,13 @@ mod connections;
 #[cfg(test)]
 #[path = "transport_connection_tests.rs"]
 mod connection_tests;
+
+#[cfg(test)]
+#[path = "transport_push_tests.rs"]
+mod push_tests;
+
+#[path = "transport_push.rs"]
+mod push;
+
+#[path = "transport_binary.rs"]
+mod binary;

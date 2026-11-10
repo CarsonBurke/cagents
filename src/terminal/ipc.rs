@@ -216,7 +216,10 @@ use crate::{
 /// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
 /// which reaches every chat subscriber unasked. 157 to 159 are reserved for
 /// parallel branches and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 160;
+/// Version 165 appends `ChatLostProcesses`, which lists and ends what a dead
+/// Cagents helper left running for a conversation, and its reply. 161 to 164
+/// are reserved for parallel branches and are not adopted here.
+pub const PROTOCOL_VERSION: u16 = 165;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -594,6 +597,15 @@ pub enum ClientRequest {
     WatchConversationPullRequests {
         conversation: TerminalId,
     },
+    /// Lists what still runs for a conversation whose Cagents helper died,
+    /// which is what holds its Close. It first ends each process in `end`
+    /// that is still the one listed and proved to be the conversation's: the
+    /// ones the person was shown and chose to end. Ends nothing while its
+    /// helper runs.
+    ChatLostProcesses {
+        session: crate::chat::Session,
+        end: Vec<ProcessStart>,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -697,6 +709,31 @@ pub struct ServerEnvelope {
     pub request_id: Option<u64>,
     pub proof: HostSessionProof,
     pub message: ServerMessage,
+}
+
+/// A host reply whose transcript may already be encoded by a retained helper.
+#[cfg(feature = "host")]
+#[derive(Debug)]
+pub(crate) enum PreparedResponse {
+    Decoded(ServerResponse),
+    EncodedChat { chat_id: TerminalId, bytes: Vec<u8> },
+}
+#[cfg(feature = "host")]
+impl From<ServerResponse> for PreparedResponse {
+    fn from(response: ServerResponse) -> Self {
+        Self::Decoded(response)
+    }
+}
+#[cfg(feature = "host")]
+impl PreparedResponse {
+    pub(crate) fn decode(self) -> Result<ServerResponse, String> {
+        match self {
+            Self::Decoded(response) => Ok(response),
+            Self::EncodedChat { bytes, .. } => {
+                postcard::from_bytes(&bytes).map_err(|e| e.to_string())
+            }
+        }
+    }
 }
 
 /// A borrowed, serialize-only view of [`ServerEnvelope`].
@@ -945,6 +982,11 @@ pub enum ServerResponse {
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
     StartupState(StartupState),
+    /// What [`ClientRequest::ChatLostProcesses`] found still running, after
+    /// ending what it ended.
+    ChatLostProcesses {
+        processes: Vec<LostProcess>,
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -989,6 +1031,28 @@ pub struct ChatReleaseProof {
     pub session: crate::chat::Session,
     pub execution_instance: uuid::Uuid,
     pub generation: u64,
+}
+
+/// One process, as it was when it was listed: a PID, and the start time
+/// that tells it apart from a later process given the same PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessStart {
+    pub pid: i32,
+    /// Clock ticks after boot, as `/proc/<pid>/stat` gives it.
+    pub start: u64,
+}
+
+/// A process that still runs for a conversation whose Cagents helper died.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostProcess {
+    pub process: ProcessStart,
+    /// The executable's short name, as `ps` shows it.
+    pub name: String,
+    /// Its command line, shortened; empty when it shows none.
+    pub command: String,
+    /// Whether it is proved to be the conversation's, so that Cagents may
+    /// end it. One that isn't is only named, and still holds the Close.
+    pub proved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1950,6 +2014,42 @@ impl FrameCodec {
         recycle_frame_buffer(&mut self.read_buffer, length, &mut self.small_reads);
         tracing::trace!(target: "cagents::memory", process_id = std::process::id(), owner = "ipc", codec = self.memory_id, read_capacity = self.read_buffer.capacity(), write_capacity = self.write_buffer.capacity());
         Ok(Some(value?))
+    }
+
+    /// Append an already encoded response after the ordinary envelope header.
+    #[cfg(feature = "host")]
+    pub(crate) fn write_encoded_response(
+        &mut self,
+        writer: &mut impl Write,
+        version: u16,
+        request_id: Option<u64>,
+        proof: &HostSessionProof,
+        response: &[u8],
+    ) -> Result<(), FrameError> {
+        // Response is the first ServerMessage variant. A unit enum emits only
+        // its discriminant, leaving the response's bytes immediately after it.
+        #[derive(Serialize)]
+        enum MessagePrefix {
+            Response,
+        }
+        encode_frame(
+            &mut self.write_buffer,
+            self.maximum,
+            &(version, request_id, proof, MessagePrefix::Response),
+        )?;
+        let mut sink = CappedSink {
+            buffer: &mut self.write_buffer,
+            maximum: self.maximum,
+            failure: None,
+        };
+        sink.write_all(response).map_err(FrameError::Io)?;
+        let length = self.write_buffer.len() - LENGTH_PREFIX_BYTES;
+        validate_frame_length(length, self.maximum)?;
+        self.write_buffer[..LENGTH_PREFIX_BYTES].copy_from_slice(&(length as u32).to_be_bytes());
+        writer.write_all(&self.write_buffer)?;
+        writer.flush()?;
+        recycle_frame_buffer(&mut self.write_buffer, length, &mut self.small_writes);
+        Ok(())
     }
 
     pub fn write<T: Serialize>(

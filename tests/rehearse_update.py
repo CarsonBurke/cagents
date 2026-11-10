@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""Pure contracts for the update rehearsal; no compositor or installed daemon."""
+from __future__ import annotations
+
+import importlib.util
+import json
+import fcntl
+from contextlib import closing
+import os
+from pathlib import Path
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+import signal
+import unittest
+from unittest.mock import patch
+
+REPOSITORY = Path(__file__).resolve().parent.parent
+SCRIPT = REPOSITORY / "scripts/rehearse-update"
+spec = importlib.util.spec_from_file_location("rehearsal_records", REPOSITORY / "scripts/rehearse_update_records.py")
+records = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(records)
+AUTHORITY = ("CAGENTS_AGENT_AUTHORITY", "CAGENTS_AGENT_TOKEN", "CAGENTS_SESSION_TOKEN")
+
+
+def snapshot() -> dict:
+    return {"schema": 1, "errors": [], "windows": {
+        "main": {"id": 1, "app_id": "cagents", "title": "Main", "size": [1000, 800], "painted": True}},
+        "terminals": {"terminal": {"id": "terminal", "state": "running"}},
+        "sessions": {"lineage": {"id": "chat-old", "lineage": "lineage", "state": "Working"}},
+        "agents": {"agent": {"agent": {"id": "agent", "name": "named"}, "state": "Running"}},
+        "channels": {"channel": {"id": "channel", "title": "Release Details: rollout"}},
+        "projects": {},
+        "stores": {"windows/main/sessions.sqlite3": {"rows": {
+            "cards": [{"card_id": "pane", "workspace_id": "workspace", "ordinal": 0,
+                       "kind_tag": "terminal", "title": "Shell", "existence": "open"}],
+            "terminal_recipes": [{"card_id": "pane", "terminal_id": "terminal"}]}}},
+        "processes": [{"pid": 42, "ppid": 10, "start_ticks": 123,
+                       "terminal_id": "terminal", "argv": ["sleep", "86400"]}]}
+
+
+class Comparison(unittest.TestCase):
+    def test_same_record_does_not_lose_items(self):
+        self.assertEqual(records.compare(snapshot(), snapshot()), [])
+
+    def test_window_compositor_id_and_focus_are_not_persistent_identity(self):
+        before, after = snapshot(), snapshot()
+        after["windows"]["main"].update(id=20, focused=True)
+        self.assertEqual(records.compare(before, after), [])
+
+    def test_reports_losses_state_changes_and_reused_pid(self):
+        before, after = snapshot(), snapshot()
+        del after["windows"]["main"]
+        del after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][0]
+        del after["channels"]["channel"]
+        after["agents"]["agent"]["state"] = "Failed"
+        after["terminals"]["terminal"]["state"] = "exited"
+        after["processes"][0]["start_ticks"] = 124
+        changes = records.compare(before, after)
+        self.assertEqual({row["kind"] for row in changes},
+                         {"windows", "panes", "channels", "agents", "terminals", "terminal-child"})
+        self.assertTrue(all(row["regression"] for row in changes))
+
+    def test_chat_resume_and_healthy_completion_are_reported(self):
+        before, after = snapshot(), snapshot()
+        after["sessions"]["lineage"].update(id="chat-new", state="Idle")
+        changes = records.compare(before, after)
+        self.assertEqual({row["change"] for row in changes}, {"id", "state"})
+        self.assertFalse(any(row["regression"] for row in changes))
+        after["sessions"]["lineage"]["state"] = "Stopped"
+        self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
+
+    def test_titles_that_follow_content_are_changes_and_blank_titles_are_losses(self):
+        before, after = snapshot(), snapshot()
+        after["windows"]["main"]["title"] = "~/s/alpha (2) \u2014 cagents"
+        after["channels"]["channel"]["title"] = "Offline tool rows"
+        after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][0]["title"] = "bash \u00b7 alpha"
+        changes = records.compare(before, after)
+        self.assertEqual(len(changes), 3)
+        self.assertFalse(any(row["regression"] for row in changes))
+        after["channels"]["channel"]["title"] = ""
+        self.assertTrue(any(row["regression"] and row["kind"] == "channels"
+                            for row in records.compare(before, after)))
+
+    def test_evidence_failure_is_not_an_empty_successful_inventory(self):
+        before, after = snapshot(), snapshot()
+        after["errors"].append("terminals.json: command refused")
+        self.assertTrue(records.compare(before, after)[0]["regression"])
+
+    def test_record_reads_old_cli_envelopes_and_main_window_database(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-old-") as temporary:
+            root = Path(temporary)
+            out = root / "records/before"
+            out.mkdir(parents=True)
+            inventories = {
+                "agents": [{"agent": {"id": "a", "name": "codex-alpha", "spec": {"provider": "Codex"}},
+                            "state": "Running", "run": "r"}],
+                "terminals": [{"id": "t", "state": "running", "title": "shell"}],
+                "sessions": [{"id": "s", "lineage": "lineage", "surface": "Chat", "state": "Idle"}],
+                "channels": [{"id": "c", "title": "Release Details: rollout", "repository": "/alpha/.git"}],
+                "projects": [{"repository": "/alpha/.git", "name": "alpha"},
+                             {"repository": "/beta/.git", "name": "beta"}],
+            }
+            for name, rows in inventories.items():
+                (out / f"{name}.json").write_text(records.dump({"ok": True, "data": {name: rows}}))
+            database = root / "home/.local/share/cagents/sessions.sqlite3"
+            database.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(database)) as db, db:
+                db.execute("CREATE TABLE cards(card_id TEXT, title TEXT, existence_json TEXT, kind_tag TEXT)")
+                db.execute("INSERT INTO cards VALUES ('a', 'Codex agent', '\"open\"', 'chat')")
+                db.commit()
+            windows = out / "windows.json"
+            windows.write_text(records.dump({"main": {"window": {"id": 1, "app_id": "cagents", "title": "cagents"},
+                                                    "painted": True}}))
+            captured = records.record(root, out, windows)
+            self.assertEqual(captured["errors"], [])
+            self.assertEqual(set(captured["projects"]), {"/alpha/.git", "/beta/.git"})
+            self.assertEqual(captured["agents"]["a"]["agent"]["name"], "codex-alpha")
+            self.assertIn("sessions.sqlite3:a", records.panes(captured))
+
+    def test_child_pid_file_tracks_identity_without_terminal_environment(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-process-") as temporary:
+            root = Path(temporary)
+            peer = subprocess.Popen(["sleep", "86400"], env={**os.environ, "HOME": str(root / "home")})
+            try:
+                (root / "child.pid").write_text(str(peer.pid))
+                errors = []
+                captured = records.processes(root, errors)
+                self.assertEqual(errors, [])
+                child = next(row for row in captured if row["pid"] == peer.pid)
+                self.assertEqual(child["role"], "long-lived-child")
+                before, after = snapshot(), snapshot()
+                before["processes"] = [child]
+                after["processes"] = []
+                changes = records.compare(before, after)
+                self.assertEqual(changes[0]["kind"], "terminal-child")
+                self.assertTrue(changes[0]["regression"])
+            finally:
+                peer.terminate()
+                peer.wait()
+
+    def test_cli_accepts_record_directories_and_returns_failure(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-record-") as temporary:
+            root = Path(temporary)
+            for name in ("before", "after"):
+                (root / name).mkdir()
+                (root / name / "snapshot.json").write_text(records.dump(snapshot()))
+            command = [str(REPOSITORY / "scripts/rehearse_update_records.py"), "compare",
+                       str(root / "before"), str(root / "after")]
+            self.assertEqual(subprocess.run(command, capture_output=True).returncode, 0)
+            value = snapshot()
+            value["terminals"] = {}
+            (root / "after/snapshot.json").write_text(records.dump(value))
+            result = subprocess.run(command, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 1)
+            self.assertIn("terminals terminal: disappeared", result.stdout)
+
+    def test_database_capture_reads_wal_and_does_not_mutate_database(self):
+        with tempfile.TemporaryDirectory(prefix="rehearse-store-") as temporary:
+            home = Path(temporary)
+            path = home / ".local/share/cagents/windows/main/sessions.sqlite3"
+            path.parent.mkdir(parents=True)
+            with closing(sqlite3.connect(path)) as db, db:
+                db.execute("PRAGMA journal_mode=WAL")
+                db.execute("CREATE TABLE cards(card_id TEXT, title TEXT, existence_json TEXT)")
+                db.execute("INSERT INTO cards VALUES ('one', 'Details: pane', '\"open\"')")
+                db.commit()
+                original = path.read_bytes()
+                errors = []
+                captured = records.stores(home, errors)
+                self.assertEqual(errors, [])
+                self.assertEqual(captured["windows/main/sessions.sqlite3"]["rows"]["cards"][0]["title"],
+                                 "Details: pane")
+                self.assertEqual(path.read_bytes(), original)
+
+
+class ReopenedWindows(unittest.TestCase):
+    def test_success_requires_the_new_ui_image_in_both_named_windows(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        rehearsal = scenario.Rehearsal('/var/tmp/rehearsal-test', str(SCRIPT))
+        windows = {'main': {'pid': 1}, 'second': {'pid': 2}}
+        expected = '/var/tmp/rehearsal-test/home/.local/share/cagents-install/versions/new/bin/cagents-ui'
+        with patch.object(rehearsal, 'mapped', return_value=windows), \
+                patch.object(scenario.os, 'readlink', side_effect=[expected, expected]):
+            self.assertEqual(rehearsal.wait_windows(['main','second'], timeout=1, version='new'), windows)
+        with patch.object(rehearsal, 'mapped', return_value=windows), \
+                patch.object(scenario.os, 'readlink', side_effect=[expected, expected.replace('/new/', '/old/')]), \
+                patch.object(scenario.time, 'monotonic', side_effect=[0, .1, 2]), \
+                patch.object(scenario.time, 'sleep'):
+            with self.assertRaisesRegex(RuntimeError, 'windows did not map on new'):
+                rehearsal.wait_windows(['main','second'], timeout=1, version='new')
+
+
+class Pty(unittest.TestCase):
+    def run_peer(self, body, *options):
+        command = [sys.executable, str(REPOSITORY / "scripts/rehearse_update_pty.py"),
+                   *options, "--", sys.executable, "-c", body]
+        return subprocess.run(command, capture_output=True, text=True, timeout=10)
+
+    def test_waits_for_split_prompt_and_answers_each_prompt_on_controlling_tty(self):
+        result = self.run_peer(
+            "import os,sys,time; "
+            "assert sys.stdin.isatty(); "
+            "tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Proceed with this update? [y/'); sys.stdout.flush(); "
+            "time.sleep(.1); sys.stdout.write('N] '); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'yes'; "
+            "sys.stdout.write('End them and continue? [Y/n] '); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'yes'; "
+            "print('both confirmations received')", "--answer", "yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("[rehearsal prompt="), 2)
+        self.assertIn("both confirmations received", result.stdout)
+
+    def test_answers_the_working_choice_and_the_stop_list_separately(self):
+        result = self.run_peer(
+            "import sys; "
+            "tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Update now? [Y/n] '); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'yes'; "
+            "sys.stdout.write('Enter: update when they finish   i: interrupt them now   n: cancel\\n'); sys.stdout.flush(); "
+            "assert tty.readline() == '\\n'; "
+            "sys.stdout.write('Type \"stop\" to stop these and update. Anything else cancels.\\n'); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'stop'; "
+            "print('all three answered')", "--answer", "yes", "--stop", "stop")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("[rehearsal prompt="), 3)
+        self.assertIn("all three answered", result.stdout)
+
+    def test_stop_list_is_cancelled_unless_asked(self):
+        result = self.run_peer(
+            "import sys; tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Type \"stop\" to stop these and update. Anything else cancels.\\n'); sys.stdout.flush(); "
+            "raise SystemExit(0 if tty.readline() == '\\n' else 3)", "--answer", "yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_child_exit_status_is_preserved(self):
+        result = self.run_peer("raise SystemExit(7)")
+        self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
+
+    def test_timeout_allows_peer_to_finish_sigterm_handler_before_pty_closes(self):
+        with tempfile.TemporaryDirectory(prefix="ru-pty-") as temporary:
+            marker = Path(temporary) / "terminated"
+            result = self.run_peer(
+                "import signal,time,pathlib; "
+                f"signal.signal(signal.SIGTERM, lambda *_: (time.sleep(.1), pathlib.Path({str(marker)!r}).write_text('done'), exit(0))); "
+                "print('ready',flush=True); time.sleep(30)", "--timeout", ".3")
+            self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+            self.assertEqual(marker.read_text(), "done")
+
+    def test_timeout_kills_peer_that_ignores_sigterm(self):
+        result = self.run_peer("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); signal.signal(signal.SIGHUP, signal.SIG_IGN); time.sleep(30)",
+                               "--timeout", ".2")
+        self.assertEqual(result.returncode, 124, result.stdout + result.stderr)
+        self.assertIn("exceeded PTY timeout", result.stdout)
+
+
+class Arguments(unittest.TestCase):
+    def test_inherited_authority_is_refused_before_any_action(self):
+        for name in AUTHORITY:
+            with self.subTest(name=name):
+                result = subprocess.run([str(SCRIPT), "--root", "/var/tmp/should-not-create", "init"],
+                                        env={**os.environ, name: "fixture-authority"},
+                                        capture_output=True, text=True)
+                self.assertEqual(result.returncode, 77)
+                self.assertIn("inherited agent authority was not modified", result.stderr)
+
+    def test_help_is_available_with_inherited_authority(self):
+        for arguments in (["-h"], ["--help"], ["--root", "/var/tmp/unused", "--help"],
+                          ["--root", "/var/tmp/unused", "run", "--help"]):
+            result = subprocess.run([str(SCRIPT), *arguments],
+                                    env={**os.environ, AUTHORITY[0]: "fixture-authority"},
+                                    capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("usage:", result.stdout.lower())
+
+    @unittest.skipIf(any(name in os.environ for name in AUTHORITY),
+                     "stop is tested in a genuine user shell; never strip authority")
+    def test_stop_restores_only_its_private_preservation_fault(self):
+        for fault in ("marker", "interrupted-rename", "unrelated-file", "unrelated-symlink"):
+            with self.subTest(fault=fault), tempfile.TemporaryDirectory(prefix="ru-stop-", dir="/var/tmp") as temporary:
+                root = Path(temporary)
+                (root / ".rehearse-update").write_text(str(root)+"\n")
+                saved = root / "rt/cagents/holders.rehearsal-saved"
+                saved.mkdir(parents=True)
+                (saved / "private.json").write_text("private registry bytes")
+                holders = saved.with_name("holders")
+                if fault == "marker":
+                    holders.write_text("rehearse-update: preservation unavailable\n")
+                elif fault == "unrelated-file":
+                    holders.write_text("unrelated file; preserve me")
+                elif fault == "unrelated-symlink":
+                    (root / "unrelated-target").write_text("unrelated file; preserve me")
+                    holders.symlink_to(root / "unrelated-target")
+                result = subprocess.run([str(SCRIPT), "--root", str(root), "stop"],
+                                        capture_output=True, text=True, timeout=20)
+                self.assertEqual(result.returncode, 1 if fault.startswith("unrelated-") else 0,
+                                 result.stdout + result.stderr)
+                if fault.startswith("unrelated-"):
+                    if fault == "unrelated-symlink":
+                        self.assertTrue(holders.is_symlink())
+                    self.assertEqual(holders.read_text(), "unrelated file; preserve me")
+                    self.assertEqual((saved / "private.json").read_text(), "private registry bytes")
+                else:
+                    self.assertTrue(holders.is_dir(), result.stdout + result.stderr)
+                    self.assertFalse(saved.exists())
+                    self.assertEqual((holders / "private.json").read_text(), "private registry bytes")
+
+    @unittest.skipIf(any(name in os.environ for name in AUTHORITY),
+                     "argument parsing is tested in a genuine user shell; never strip authority")
+    def test_argument_checks(self):
+        for arguments in (["--root", "/" + "x" * 41, "init"],
+                          ["--root", "/var/tmp/bad space", "init"],
+                          ["--root", "/var/tmp/nonexistent-rehearsal", "unknown"],
+                          ["--root", "/home/rehearsal", "init"],
+                          ["--root", "/dev/shm", "init"]):
+            with self.subTest(arguments=arguments):
+                result = subprocess.run([str(SCRIPT), *arguments], capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2)
+
+
+@unittest.skipIf(any(name in os.environ for name in AUTHORITY),
+                 "harness actions require a genuine user shell; never strip authority")
+class PrivateRoot(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory(prefix="ru-contract-", dir="/var/tmp")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def call(self, *args, **kwargs):
+        return subprocess.run([str(SCRIPT), "--root", str(self.root), *args],
+                              capture_output=True, text=True, timeout=20, **kwargs)
+
+    def test_init_records_root_and_cleanup_refuses_mismatched_or_symlink_marker(self):
+        result = self.call("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        marker = self.root / ".rehearse-update"
+        self.assertEqual(marker.read_text(), str(self.root)+"\n")
+        for kind in ("mismatch", "symlink"):
+            with self.subTest(kind=kind):
+                marker.unlink()
+                if kind == "mismatch":
+                    marker.write_text("/var/tmp/somewhere-else\n")
+                else:
+                    target = self.root / "other-marker"
+                    target.write_text(str(self.root)+"\n")
+                    marker.symlink_to(target)
+                result = self.call("cleanup")
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("matching root marker", result.stderr)
+                self.assertTrue(self.root.exists())
+
+    def test_update_refuses_existing_noncurrent_version(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        prefix = self.root / "home/.local/share/cagents-install"
+        for version in ("old", "new"):
+            (prefix / "versions" / version).mkdir(parents=True)
+        (prefix / "current").symlink_to("versions/old")
+        result = self.call("update", "/missing", "new", "/missing/install.sh")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exists but is not current; remove it to reinstall", result.stderr)
+        self.assertEqual((prefix / "current").readlink(), Path("versions/old"))
+        (prefix / "current").unlink()
+        (prefix / "current").symlink_to("versions/new")
+        result = self.call("update", "/missing", "new", "/missing/install.sh")
+        self.assertIn("already current; skipping staging", result.stdout)
+        self.assertNotIn("exists but is not current", result.stderr)
+
+    def test_desktop_waiting_for_lock_exits_on_stop_without_starting_compositor(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        desktop = self.root / "desktop"
+        desktop.mkdir()
+        with (self.root / "native.lock").open("w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            with (self.root / "waiter.log").open("w") as output:
+                peer = subprocess.Popen([str(SCRIPT), "--root", str(self.root), "__desktop", "60"],
+                                        env={**os.environ, "CAGENTS_EVIDENCE_NATIVE_LOCK": str(self.root / "native.lock")},
+                                        stdout=output, stderr=subprocess.STDOUT, start_new_session=True)
+                try:
+                    deadline = time.monotonic()+5
+                    while "waiting for the native lock" not in (self.root / "waiter.log").read_text():
+                        self.assertIsNone(peer.poll())
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(.05)
+                    (desktop / "stop").touch()
+                    self.assertEqual(peer.wait(timeout=5), 0)
+                    self.assertFalse((self.root / "logs/kwin.log").exists())
+                finally:
+                    if peer.poll() is None:
+                        os.killpg(peer.pid, signal.SIGKILL)
+                        peer.wait()
+
+    def test_stop_reports_surviving_attributed_scope_without_stopping_other_members(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        unit = self.root.name+".scope"
+        # The wrapper and second child retain the real environment. Only the
+        # first child's HOME attributes this scope to the private root.
+        body = ('env HOME="$1/home" sleep 60 & echo $! >"$1/private.pid"; '
+                'sleep 60 & echo $! >"$1/unrelated.pid"; wait')
+        peer = subprocess.Popen(["systemd-run", "--user", "--scope", "--unit="+unit,
+                                 "bash", "-c", body, "bash", str(self.root)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                start_new_session=True)
+        try:
+            deadline = time.monotonic()+5
+            while not (self.root / "unrelated.pid").exists():
+                if peer.poll() is not None:
+                    self.fail("scope fixture failed: "+peer.communicate()[1])
+                self.assertLess(time.monotonic(), deadline)
+                time.sleep(.05)
+            unrelated = int((self.root / "unrelated.pid").read_text())
+            result = self.call("stop")
+            self.assertNotEqual(result.returncode, 0, result.stdout+result.stderr)
+            self.assertIn("attributed scopes still running:\n"+unit, result.stderr)
+            os.kill(unrelated, 0)
+        finally:
+            # This test created the whole group, unlike stop's attributed PID
+            # cleanup. End it here even when an assertion failed.
+            try:
+                os.killpg(peer.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            peer.communicate(timeout=5)
+
+    def test_drive_and_display_query_only_receive_allowlisted_environment(self):
+        self.assertEqual(self.call("init").returncode, 0)
+        desktop = self.root / "desktop"
+        (desktop / "home").mkdir(parents=True)
+        (desktop / "pid").write_text(str(os.getpid()))
+        (desktop / "ready").touch()
+        (desktop / "env").write_text("WAYLAND_DISPLAY=fixture-wayland\n"
+                                     "DBUS_SESSION_BUS_ADDRESS=unix:path=/fixture\n"
+                                     f"XDG_RUNTIME_DIR={desktop}/rt\n"
+                                     "PRIVATE_SECRET=must-not-pass\n")
+        tools = self.root / "caller-tools"
+        tools.mkdir()
+        harness = tools / "niri-harness"
+        harness.write_text("#!/usr/bin/python3\nimport json,os,sys,pathlib\n"
+                           "value=json.dumps(dict(os.environ))\n"
+                           "if sys.argv[-2:]==['session','env']:\n"
+                           " pathlib.Path(os.environ['HOME'],'seen.json').write_text(value)\n"
+                           " print(\"export WAYLAND_DISPLAY='fixture-wayland'\")\n"
+                           "else: print(value)\n")
+        harness.chmod(0o755)
+        caller = {**os.environ, "PATH": str(tools)+":"+os.environ["PATH"],
+                  "PRIVATE_SECRET": "caller-secret", "CODEX_HOME": "/real-provider"}
+        result = self.call("drive", "observe", env=caller)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environments = [json.loads(result.stdout)]
+        result = self.call("app", "/usr/bin/true", env=caller)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environments.append(json.loads((desktop / "home/seen.json").read_text()))
+        for environment in environments:
+            self.assertEqual(set(environment) - {"LC_CTYPE"},
+                             {"HOME", "PATH", "LANG", "TERM", "WAYLAND_DISPLAY",
+                              "DBUS_SESSION_BUS_ADDRESS", "XDG_RUNTIME_DIR"})
+            self.assertEqual(environment["HOME"], str(desktop / "home"))
+            self.assertEqual(environment["PATH"], str(desktop / "tools")+":/usr/local/bin:/usr/bin:/bin")
+
+
+class FailedInitialization(unittest.TestCase):
+    def test_partial_init_still_records_failure_and_stops(self):
+        spec = importlib.util.spec_from_file_location("rehearsal_run", REPOSITORY / "scripts/rehearse_update_run.py")
+        scenario = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scenario)
+        with tempfile.TemporaryDirectory(prefix="ru-run-") as temporary:
+            root = Path(temporary) / "fresh"
+            rehearsal = scenario.Rehearsal(root, str(SCRIPT))
+            commands = []
+            def call(command, *args, **kwargs):
+                commands.append(command)
+                if command == "init":
+                    root.mkdir()
+                    raise RuntimeError("partly failed init")
+                return 1, "not initialized"
+            args = type("Args", (), dict(old_version="old", new_version="new", ceditor=None))()
+            with patch.object(rehearsal, "call", side_effect=call):
+                self.assertEqual(rehearsal.run(args), 1)
+            self.assertEqual(commands, ["init", "record", "stop"])
+            self.assertIn("Outcome: FAIL", (root / "report.txt").read_text())
+            self.assertIn("partly failed init", (root / "report.txt").read_text())
+            with patch.object(rehearsal, "call") as call:
+                with self.assertRaisesRegex(RuntimeError, "fresh, absent root"):
+                    rehearsal.run(args)
+                call.assert_not_called()
+
+
+if __name__ == "__main__":
+    unittest.main()

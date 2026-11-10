@@ -308,7 +308,7 @@ impl<E: ProcessExecutor> RepositoryService<E> {
             )
             .env(format!("GIT_CONFIG_VALUE_{count}"), endpoint)
             .env("GIT_NO_REPLACE_OBJECTS", "1");
-        command.inherited_lease = Some(lease.as_raw_fd());
+        command.inherited_lease = Some(inherited_worktree_lease(lease)?);
         let output = self.executor.execute(&command, cancellation);
         match output {
             Ok(output) if output.success => {}
