@@ -5400,13 +5400,24 @@ print(json.dumps({'frames': frames, 'replies': {
             )
             .1
         };
-        let active = snapshot(frames[..pause].to_vec(), fixture["replies"].clone());
-        assert!(active.busy && active.is_working());
+        // There is deliberately no outcome before the pause. Inspect the
+        // parser directly rather than asking a notification-outcome harness
+        // to synthesize a completion for still-running work.
+        let mut active = Fixture {
+            parser: adapter(),
+            replies: fixture["replies"].clone(),
+        };
+        for frame in &frames[..pause] {
+            active.receive(frame.clone()).unwrap();
+        }
+        assert!(active.parser.busy);
         assert!(
-            active.subagents.iter().any(|child| {
-                child.id == "child-exact" && child.background && child.status == ToolStatus::Running
-            }),
+            active.parser.children["child-exact"].busy,
             "the pause must represent actual delegated work"
+        );
+        assert_eq!(
+            active.parser.children["child-exact"].subagent_status,
+            Some(ToolStatus::Running)
         );
         let completed: Vec<_> = frames
             .iter()
