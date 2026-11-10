@@ -9,6 +9,8 @@ reads in the native transcript, running and settled.
 
 Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT=1 to acknowledge interruptions
 without completing either the interrupted turn or its delayed successful script.
+Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE=1 to keep a WebSocket connection open
+after a close frame until its peer disconnects, without changing turn settlement.
 
 Requires a private CAGENTS_TOOL_ROWS_FIXTURE_ROOT and CODEX_HOME beneath it,
 and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
@@ -97,6 +99,7 @@ class Scenario:
         self.child_latest = None
         self.interrupting = set()
         self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
+        self.never_confirm_close = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE") == "1"
 
     def latest_turn(self, thread):
         if thread == self.thread:
@@ -301,7 +304,16 @@ def serve(connection, codex_home, scenario, request_lock):
             connection.sendall(transport.frame(response))
 
     while True:
-        request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
+        try:
+            request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
+        except EOFError:
+            if scenario.never_confirm_close:
+                # receive() reports both WebSocket Close and transport EOF.
+                # Withhold the close handshake while the peer is connected;
+                # a real disconnect ends this worker immediately in both cases.
+                while connection.recv(65536):
+                    pass
+            raise
         with request_lock:
             responses = scenario.request(request, codex_home)
         origin = (responses[0]["result"]["turn"]["id"]

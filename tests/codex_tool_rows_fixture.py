@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Offline app-server lifecycle contracts; no provider or daemon is started."""
+from contextlib import contextmanager
 from pathlib import Path
 import os
 import runpy
+import socket
 import threading
 import unittest
 from unittest import mock
@@ -12,6 +14,44 @@ PEER = runpy.run_path(str(Path(__file__).resolve().parent / "fixtures/codex-tool
 
 
 class CodexToolRowsFixture(unittest.TestCase):
+    @contextmanager
+    def connected_peer(self, never_confirm_close):
+        with mock.patch.dict(os.environ, {
+                "CAGENTS_TOOL_ROWS_NEVER_CONFIRM_CLOSE": "1" if never_confirm_close else "0"}):
+            scenario = PEER["Scenario"]()
+        server, client = socket.socketpair()
+        server.settimeout(2)
+        client.settimeout(2)
+        done, failures = threading.Event(), []
+
+        def serve():
+            try:
+                PEER["serve"](server, "/private/codex", scenario, threading.Lock())
+            except (EOFError, ConnectionError):
+                pass
+            except BaseException as error:
+                failures.append(error)
+            finally:
+                server.close()
+                done.set()
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+        try:
+            client.sendall(b"GET / HTTP/1.1\r\nHost: fixture\r\nUpgrade: websocket\r\n"
+                           b"Connection: Upgrade\r\nSec-WebSocket-Key: dGVzdC1maXh0dXJl\r\n\r\n")
+            handshake = bytearray()
+            while not handshake.endswith(b"\r\n\r\n"):
+                handshake.extend(PEER["transport"].exact(client, 1))
+            self.assertTrue(handshake.startswith(b"HTTP/1.1 101 Switching Protocols\r\n"))
+            yield client, done
+        finally:
+            client.close()
+            worker.join(2)
+            self.assertFalse(worker.is_alive(), "fixture worker survived its peer's disconnect")
+            if failures:
+                raise failures[0]
+
     def paused_turn(self, scenario):
         replies = scenario.request({"id": 1, "method": "turn/start", "params": {
             "threadId": scenario.thread}}, "/private/codex")
@@ -207,6 +247,25 @@ class CodexToolRowsFixture(unittest.TestCase):
             raise failures[0]
         self.assertEqual(len(sent), confirmed, "late scripted frames escaped the interruption fence")
         self.assertEqual(scenario.latest["status"], "interrupted")
+
+    def test_close_confirmation_can_be_withheld_until_peer_disconnect(self):
+        for never_confirm in (False, True):
+            with self.subTest(never_confirm=never_confirm), self.connected_peer(never_confirm) as (client, done):
+                client.sendall(PEER["transport"].frame(b"", opcode=8))
+                if never_confirm:
+                    client.settimeout(0.05)
+                    with self.assertRaises(TimeoutError):
+                        client.recv(1)
+                    self.assertFalse(done.is_set(), "a WebSocket close frame is not a transport disconnect")
+                else:
+                    self.assertTrue(done.wait(2), "the default peer did not close its connection")
+                    self.assertEqual(client.recv(1), b"")
+
+    def test_never_confirm_close_does_not_hold_a_disconnected_peer(self):
+        with self.connected_peer(True) as (client, done):
+            client.shutdown(socket.SHUT_WR)
+            self.assertTrue(done.wait(2), "transport EOF left the fixture worker waiting")
+            self.assertEqual(client.recv(1), b"")
 
 
 if __name__ == "__main__":
