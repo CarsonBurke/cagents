@@ -1202,7 +1202,7 @@ fn saved_chat_problem(
     if execution == Some(SavedExecution::Unrecorded) {
         return Some((
             "ended before it recorded its conversation".into(),
-            "Start fresh in the pane; anything it began can be reopened from Resume",
+            "Start a new conversation in the pane; no conversation was recorded to resume",
         ));
     }
     qualify().err().map(|_| {
@@ -2381,7 +2381,7 @@ mod tests {
         );
         assert_eq!(
             inspection.stopped[0].recovery,
-            "Start fresh in the pane; anything it began can be reopened from Resume"
+            "Start a new conversation in the pane; no conversation was recorded to resume"
         );
         assert!(
             saved_chat_problem(&running, &[], &evidence, || Err("unqualified".into())).is_some()

@@ -269,8 +269,9 @@ mod tests {
             kind: StoppedKind::Chat,
             label: "console-alpha · General · alpha".into(),
             reason: "ended before it recorded its conversation".into(),
-            recovery: "Start fresh in the pane; anything it began can be reopened from Resume"
-                .into(),
+            recovery:
+                "Start a new conversation in the pane; no conversation was recorded to resume"
+                    .into(),
         });
         preview.stopped_windows.push(StoppedWindow {
             window: 3,
@@ -292,7 +293,7 @@ mod tests {
                 "  Interrupted and resumed (1)\n",
                 "    Review · General · beta\n",
                 "  Reopens stopped (3)  nothing is started; each can be reopened from its pane\n",
-                "    console-alpha · General · alpha: ended before it recorded its conversation. Start fresh in the pane; anything it began can be reopened from Resume\n",
+                "    console-alpha · General · alpha: ended before it recorded its conversation. Start a new conversation in the pane; no conversation was recorded to resume\n",
                 "    Window 3's saved panes could not be read. The saved file is kept unchanged\n",
                 "    Notes · General · beta: its conversation needs to be selected. Pick its conversation from Resume in the pane\n",
                 "  Stops (1)            you will confirm these next\n",

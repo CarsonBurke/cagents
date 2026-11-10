@@ -1186,7 +1186,7 @@ fn start_with_execution(
         .blocks_id(session.id)
     {
         return Err(unavailable(
-            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or Start fresh if none was recorded.",
+            "This conversation was stopped for the update. Press Resume in its pane to continue the recorded conversation, or start a new conversation if none was recorded.",
         ));
     }
     // A helper may have committed installation before host publication failed.
