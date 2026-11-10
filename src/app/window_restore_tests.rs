@@ -326,6 +326,8 @@ fn sidebar_disclosures_restore_after_initial_source_control_binding() {
     sidebar["changes_tab"] = serde_json::json!("History");
     app.sidebar_state
         .restore_view(serde_json::from_value(sidebar.clone()).unwrap());
+    // RepoPath accepts legacy strings but writes byte-preserving paths.
+    let sidebar = serde_json::to_value(app.sidebar_state.saved_view()).unwrap();
     app.workspace.native_scroll(137.0, 300.0);
     assert_eq!(app.workspace.camera().offset(), 137.0);
     let restored = restart(app, &directory.path().join("sidebar.sqlite3"), false);
