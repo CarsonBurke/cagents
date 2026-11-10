@@ -44,11 +44,78 @@ pub(crate) fn abandoned(holder: &Process, root: &Process) -> Result<bool, String
 }
 
 fn abandoned_in(proc: &std::path::Path, holder: &Process, root: &Process) -> Result<bool, String> {
-    if !identity_absent(holder)? || !identity_absent(root)? {
-        return Ok(false);
+    abandoned_with_policy(proc, holder, root, false)
+}
+
+/// Codex execution needs a positive survivor tied to the pane. A reused PID
+/// proves its original group/session also ended: Linux cannot reuse the PID
+/// while that numeric group/session still has members.
+pub(crate) fn codex_abandoned(holder: &Process, root: &Process) -> Result<bool, String> {
+    abandoned_with_policy(std::path::Path::new("/proc"), holder, root, true)
+}
+
+fn abandoned_with_policy(
+    proc: &std::path::Path,
+    holder: &Process,
+    root: &Process,
+    exclude_reused: bool,
+) -> Result<bool, String> {
+    let mut groups = Vec::with_capacity(2);
+    for expected in [holder, root] {
+        if expected.pid <= 0 || expected.start == 0 {
+            return Err("Invalid retained process absence identity".into());
+        }
+        match Process::read(expected.pid) {
+            Ok(actual) if actual == *expected => return Ok(false),
+            Ok(_) if exclude_reused => {}
+            Ok(_) => groups.push(expected.pid),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => groups.push(expected.pid),
+            Err(error) => return Err(format!("Cannot establish exact process absence: {error}")),
+        }
     }
-    // Ending a lost conversation's processes ends exactly this census.
-    Ok(crate::daemon::lost_processes::census_in(proc, holder, root)?.is_empty())
+    let entries = std::fs::read_dir(proc)
+        .map_err(|error| format!("Cannot enumerate processes for exact absence: {error}"))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("Cannot enumerate processes: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<i32>().ok())
+        else {
+            continue;
+        };
+        let stat = match std::fs::read(entry.path().join("stat")) {
+            Ok(stat) => stat,
+            // A process that exited during the scan holds no group: its
+            // entry is gone, or was reaped between opening and reading it.
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    || error.raw_os_error() == Some(libc::ESRCH) =>
+            {
+                continue;
+            }
+            Err(error) => {
+                return Err(format!(
+                    "Cannot read process {pid} for exact absence: {error}"
+                ));
+            }
+        };
+        let Some(close) = stat.iter().rposition(|&byte| byte == b')') else {
+            return Err(format!("Process {pid} has an unreadable identity"));
+        };
+        let fields = String::from_utf8_lossy(&stat[close + 1..]);
+        let mut fields = fields.split_ascii_whitespace().skip(2);
+        let (Some(group), Some(session)) = (
+            fields.next().and_then(|field| field.parse::<i32>().ok()),
+            fields.next().and_then(|field| field.parse::<i32>().ok()),
+        ) else {
+            return Err(format!("Process {pid} has an unreadable group identity"));
+        };
+        if [group, session].iter().any(|id| groups.contains(id)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) fn observe(expected: &Process) -> Result<Observation, String> {
@@ -189,6 +256,28 @@ mod abandonment_tests {
             format!("{pid} (odd ) name) S 1 {group} {session} 0 0"),
         )
         .unwrap();
+    }
+
+    #[test]
+    fn codex_absence_excludes_reused_ids_but_keeps_leaderless_groups() {
+        let me = Process::read(std::process::id() as i32).unwrap();
+        let reused = Process {
+            start: me.start + 1,
+            ..me.clone()
+        };
+        let gone = Process {
+            pid: i32::MAX - 1,
+            start: 1,
+        };
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        stat(root.path(), 10, reused.pid, reused.pid);
+        assert!(abandoned_with_policy(root.path(), &reused, &gone, true).unwrap());
+        // Retained Claude keeps its existing conservative policy.
+        assert!(!abandoned_in(root.path(), &reused, &gone).unwrap());
+        assert!(!abandoned_with_policy(root.path(), &me, &gone, true).unwrap());
+        // The old leader is absent, yet a child still holds its numeric group.
+        stat(root.path(), 10, gone.pid, 10);
+        assert!(!abandoned_with_policy(root.path(), &reused, &gone, true).unwrap());
     }
 
     #[test]
