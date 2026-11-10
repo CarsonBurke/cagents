@@ -207,6 +207,20 @@ further notice. `tests/fixtures/waiting-agent-scene.sh` builds a scene on
 this: an agent that reports it is waiting, then is resumed, finishes, fails,
 is resumed elsewhere, or is stopped from its tab.
 
+To check model and usage reporting, copy a recorded `initialize` response to
+`fixture-models.json`, such as `fixtures/accounts/claude-initialize-models.json`,
+the list Claude Code 2.1.296 offered with Fable 5.2. Its `models` replace the
+default list, and from the provider's next start each turn's `init` names the
+full ID the chosen model resolves to, as Claude Code's does: `opus` runs
+`claude-opus-5-5`. The model chosen with `--model` or in the picker is the one
+resolved; without either, the conversation starts on the list's `default`
+entry, as Claude Code's does. To give the account check figures, write a
+`get_usage` control response's inner `response` to `fixture-usage.json`; the
+account check and each conversation read it whenever they ask. A live usage change is a
+`rate_limit_event` frame in `fixture-frames.jsonl`, such as
+`fixtures/accounts/claude-rate-limit-event-fable.json`, which a Fable turn
+reported.
+
 To hold a conversation's provider at start-up, as a cold start does, create
 `home/.claude/fixture-slow-start`. The provider then waits before it reads
 anything: the number of seconds on the file's first line, such as `1.5`, or

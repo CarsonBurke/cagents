@@ -889,13 +889,47 @@ impl OwnedCodexListener {
                 .parent()
                 .and_then(std::path::Path::file_name)
                 .is_some_and(|name| name == format!("cagents-codex-{id}").as_str())
-            && recipe
-                .arguments
-                .iter()
-                .position(|arg| arg == "--remote")
-                .and_then(|index| recipe.arguments.get(index + 1))
-                .is_some_and(|remote| remote == &format!("unix://{}", self.socket.display()))
+            && codex_remote_argument(&recipe.arguments)
+                .is_some_and(|(_, remote)| remote == format!("unix://{}", self.socket.display()))
     }
+}
+
+/// Index and value of the first remote argument, in either CLI spelling.
+fn codex_remote_argument(arguments: &[String]) -> Option<(usize, &str)> {
+    arguments.iter().enumerate().find_map(|(index, argument)| {
+        if argument == "--remote" {
+            arguments
+                .get(index + 1)
+                .map(|value| (index, value.as_str()))
+        } else {
+            argument
+                .strip_prefix("--remote=")
+                .map(|value| (index, value))
+        }
+    })
+}
+
+fn set_codex_remote(arguments: &mut [String], index: usize, address: String) {
+    if arguments[index] == "--remote" {
+        arguments[index + 1] = address;
+    } else {
+        arguments[index] = format!("--remote={address}");
+    }
+}
+
+/// The local endpoint recorded by a Codex launch recipe. This is execution
+/// evidence only; ownership and replacement admission are checked separately.
+pub(crate) fn recorded_codex_socket(recipe: &LaunchRecipe) -> Option<std::path::PathBuf> {
+    let (_, address) = codex_remote_argument(&recipe.arguments)?;
+    let path = address
+        .strip_prefix("unix://")
+        .filter(|path| !path.is_empty())?;
+    let path = std::path::PathBuf::from(path);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        recipe.working_directory.join(path)
+    })
 }
 
 impl Session {
@@ -919,6 +953,15 @@ impl Session {
                 .owned_codex_listener
                 .as_ref()
                 .is_some_and(|owned| owned.matches(self.id, &self.launch.recipe))
+    }
+
+    /// The endpoint in the saved launch, including panes predating allocator
+    /// records. Reading it grants no authority to replace an external server.
+    pub(crate) fn recorded_codex_socket(&self) -> Option<std::path::PathBuf> {
+        if self.launch.provider != Provider::Codex {
+            return None;
+        }
+        recorded_codex_socket(&self.launch.recipe)
     }
 
     /// A typed descriptor shape, never proof of an authenticated live helper.
@@ -1046,28 +1089,34 @@ impl Session {
     /// draft. Its next start receives a fresh identity and asks the daemon for
     /// a new listener rather than reusing the abandoned conversation's socket.
     pub fn reset_owned_codex_listener(&mut self) {
-        if self.owns_codex_listener() {
-            let index = self
-                .launch
-                .recipe
-                .arguments
-                .iter()
-                .position(|argument| argument == "--remote")
-                .expect("owned listener has a remote argument");
-            self.launch.recipe.arguments[index + 1] = "unix://".into();
+        // The picker also reopens legacy panes, whose launch records their
+        // pane-specific endpoint but predates owned listener provenance.
+        let pane_endpoint = self.recorded_codex_socket().is_some_and(|socket| {
+            socket
+                .file_name()
+                .is_some_and(|name| name == "control.sock")
+                && socket
+                    .parent()
+                    .and_then(std::path::Path::file_name)
+                    .is_some_and(|name| name == format!("cagents-codex-{}", self.id).as_str())
+        });
+        if self.owns_codex_listener() || pane_endpoint {
+            let (index, _) = codex_remote_argument(&self.launch.recipe.arguments)
+                .expect("pane listener has a remote argument");
+            set_codex_remote(&mut self.launch.recipe.arguments, index, "unix://".into());
         }
         self.owned_codex_listener = None;
         self.native_continuity = NativeContinuity::ReconnectOnly;
     }
 
-    /// Whether `started` is this new Codex thread as the daemon started it.
+    /// Whether `started` resolved this Codex pane's requested allocation.
     ///
-    /// A new thread asks for a listener of its own with a bare `unix://`
+    /// A new or resumed pane asks for a listener with a bare `unix://`
     /// remote, which the daemon resolves to its reported owned endpoint
     /// before it launches anything; that resolution is the one change the
     /// launch undergoes, and the rest of the recipe is exactly as asked.
     pub fn resolved_to_owned_codex_listener(&self, started: &Self) -> bool {
-        if self.launch.session_id.is_some()
+        if self.launch.session_id.is_some() && self.launch.session_id != started.launch.session_id
             || self.terminal.is_some()
             || started.id != self.id
             || !started.owns_codex_listener()
@@ -1079,16 +1128,13 @@ impl Session {
             return false;
         }
         let mut recipe = self.launch.recipe.clone();
-        let Some(index) = recipe.arguments.iter().position(|arg| arg == "--remote") else {
-            return false;
-        };
-        let Some(remote) = recipe.arguments.get_mut(index + 1) else {
+        let Some((index, remote)) = codex_remote_argument(&recipe.arguments) else {
             return false;
         };
         if self.launch.provider != Provider::Codex || remote != "unix://" {
             return false;
         }
-        *remote = format!(
+        let address = format!(
             "unix://{}",
             started
                 .owned_codex_listener
@@ -1097,10 +1143,12 @@ impl Session {
                 .socket
                 .display()
         );
+        set_codex_remote(&mut recipe.arguments, index, address);
         recipe == started.launch.recipe
     }
 
     /// Point this Codex thread's first `--remote` at its own listener.
+    /// A bare `unix://` requests a new allocation, including for disk resume.
     ///
     /// Only the daemon chooses `root`. Existing evidence must have come from
     /// trusted retained/checkpointed state before invoking this method. Legacy
@@ -1123,22 +1171,19 @@ impl Session {
             .join(format!("cagents-codex-{}", self.id))
             .join("control.sock");
         let owned = format!("unix://{}", socket.display());
-        let new_thread = self.launch.session_id.is_none();
         let arguments = &mut self.launch.recipe.arguments;
-        let Some(index) = arguments.iter().position(|argument| argument == "--remote") else {
+        let Some((index, remote)) = codex_remote_argument(arguments) else {
             return false;
         };
-        match arguments.get_mut(index + 1) {
-            Some(remote) if *remote == owned || (new_thread && remote == "unix://") => {
-                *remote = owned;
-                self.owned_codex_listener = Some(OwnedCodexListener {
-                    socket,
-                    allocator: allocator.clone(),
-                });
-                true
-            }
-            _ => false,
+        if remote != owned && remote != "unix://" {
+            return false;
         }
+        set_codex_remote(arguments, index, owned);
+        self.owned_codex_listener = Some(OwnedCodexListener {
+            socket,
+            allocator: allocator.clone(),
+        });
+        true
     }
 }
 
@@ -3458,7 +3503,7 @@ mod tests {
     /// listens on, so the claim looks only at the first `--remote`, as the
     /// launch itself does, and never re-points an endpoint it did not allocate.
     #[test]
-    fn only_a_new_thread_asking_for_its_own_listener_is_claimed() {
+    fn codex_pane_allocation_preserves_external_endpoints_and_resume_identity() {
         let session = |arguments: &[&str], session_id: Option<&str>| Session {
             native_continuity: Default::default(),
             owned_codex_listener: None,
@@ -3505,7 +3550,6 @@ mod tests {
                 &["--remote", "unix:///elsewhere", "--remote", "unix://"][..],
                 None,
             ),
-            (&["--remote", "unix://"][..], Some("begun")),
             (&["--search"][..], None),
         ] {
             let mut other = session(arguments, session_id);
@@ -3516,6 +3560,22 @@ mod tests {
             );
             assert_eq!(other, before);
         }
+
+        let mut resumed = session(&["--remote", "unix://"], Some("begun"));
+        let requested = resumed.clone();
+        assert!(resumed.claim_owned_codex_listener(root, &allocator));
+        resumed.proof = Some(allocator.clone());
+        assert!(resumed.owns_codex_listener());
+        assert!(requested.resolved_to_owned_codex_listener(&resumed));
+        let mut changed = resumed.clone();
+        changed.launch.session_id = Some("another-conversation".into());
+        assert!(!requested.resolved_to_owned_codex_listener(&changed));
+        let mut resumed = session(&["--remote=unix://"], Some("begun"));
+        let requested = resumed.clone();
+        assert!(resumed.claim_owned_codex_listener(root, &allocator));
+        resumed.proof = Some(allocator.clone());
+        assert!(resumed.owns_codex_listener());
+        assert!(requested.resolved_to_owned_codex_listener(&resumed));
 
         // Proof rotation does not rewrite the allocator or the saved endpoint.
         let mut restored: Session =

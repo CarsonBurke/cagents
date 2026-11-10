@@ -5,9 +5,7 @@ use crate::fs_safety::{self, Root};
 use serde::{Deserialize, Serialize};
 use std::{
     ffi::OsStr,
-    fs::File,
     io::{self, Write},
-    os::fd::AsRawFd,
     os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
     process::Command,
@@ -125,15 +123,7 @@ fn read_stored_link(root: &Root) -> Result<Option<StoredLink>, Error> {
 
 /// A stable lock name serializes every explicit edit with creator recovery.
 /// Never unlink this file: replacing the lock inode would split authority.
-struct LinkGuard(File);
-
-impl Drop for LinkGuard {
-    fn drop(&mut self) {
-        let _ = self.0.unlock();
-    }
-}
-
-fn lock_link(root: &Root) -> Result<LinkGuard, Error> {
+fn lock_link(root: &Root) -> Result<crate::instance::OwnedLock, Error> {
     // Install without replacing an existing lock, resolving every operation
     // relative to the already opened administrative directory.
     let file = match fs_safety::open_beneath(root, Path::new(LINK_LOCK)) {
@@ -156,25 +146,32 @@ fn lock_link(root: &Root) -> Result<LinkGuard, Error> {
     if !metadata.is_file() || metadata.uid() != current_uid {
         return Err(storage("Linear link lock must be an owned regular file"));
     }
+    // The wait serializes a genuinely live edit: the holder unlocks as its
+    // scope ends, even if a fork copied its descriptor, so contention here
+    // never outlives the edit itself.
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
-        // SAFETY: the file descriptor remains owned throughout the call.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            break;
+    let guard = loop {
+        match crate::instance::owned_file_lock(
+            file.try_clone().map_err(storage)?,
+            libc::LOCK_EX | libc::LOCK_NB,
+        ) {
+            Ok(guard) => break guard,
+            Err(error) => {
+                if error.kind() != io::ErrorKind::WouldBlock
+                    && error.kind() != io::ErrorKind::Interrupted
+                {
+                    return Err(storage(error));
+                }
+                if Instant::now() >= deadline {
+                    return Err(Error::new(
+                        "linear_link_busy",
+                        "Another Linear link edit is still active; retry after it finishes",
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::WouldBlock && error.kind() != io::ErrorKind::Interrupted {
-            return Err(storage(error));
-        }
-        if Instant::now() >= deadline {
-            return Err(Error::new(
-                "linear_link_busy",
-                "Another Linear link edit is still active; retry after it finishes",
-            ));
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let guard = LinkGuard(file);
+    };
     let named = fs_safety::metadata_beneath(root, Path::new(LINK_LOCK)).map_err(storage)?;
     if !named.is_file() || (named.dev(), named.ino()) != (metadata.dev(), metadata.ino()) {
         return Err(storage(
@@ -615,6 +612,21 @@ mod tests {
                 assert_eq!(read_stored_link(&root).unwrap().unwrap().issue, later);
             }
         }
+    }
+
+    #[test]
+    fn link_lock_releases_despite_a_copied_descriptor() {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "-q"]);
+        let root = git_directory(directory.path()).unwrap();
+        let guard = lock_link(&root).unwrap();
+        // A fork that has not reached exec yet holds a copy of this
+        // description; closing the owner's file alone would leave the lock
+        // held by that copy until the child execs or exits.
+        let copied = guard.try_clone().unwrap();
+        drop(guard);
+        lock_link(&root).unwrap();
+        drop(copied);
     }
 
     #[test]
