@@ -544,6 +544,7 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         return;
     }
     use cagents::{
+        agent_execution::{Agent, HostedSession, Run},
         chat::{ItemContent, NativeContinuity},
         control::ControlClient,
         terminal::ipc::{
@@ -575,14 +576,61 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
         "close-delayed-stream",
     ]);
     let agent = accepted["agent"]["id"].as_str().unwrap();
+    // Spawn acknowledges durable acceptance before its asynchronous provider
+    // installation. Inventory also includes the uninstalled reservation, so
+    // wait for this exact agent's bound source before choosing its live view.
+    let binding_deadline = Instant::now() + Duration::from_secs(10);
+    let installed_source = loop {
+        let output = fixture.output_until(&["agent", "status", agent], binding_deadline);
+        assert!(output.status.success(), "agent status: {output:?}");
+        let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(status["ok"], true, "{status}");
+        let current: Agent = serde_json::from_value(status["data"]["agent"].clone()).unwrap();
+        let run: Run = serde_json::from_value(status["data"]["run"].clone()).unwrap();
+        assert_eq!(current.id.to_string(), agent);
+        assert_eq!(run.id.to_string(), accepted["run"]["id"].as_str().unwrap());
+        assert_eq!(run.agent, current.id);
+        assert!(
+            !current.closed && !run.state.is_terminal(),
+            "agent ended before the streaming close contract: {status}"
+        );
+        if let Some(source) = current.session {
+            let HostedSession::Chat(source) = source else {
+                panic!("the accepted chat agent bound another surface: {status}");
+            };
+            assert!(source.has_valid_native_continuity(), "{source:?}");
+            assert!(matches!(
+                &source.native_continuity,
+                NativeContinuity::RetainedClaudeActor { .. }
+            ));
+            break source;
+        }
+        assert!(
+            Instant::now() < binding_deadline,
+            "accepted agent never bound its installed chat: {status}"
+        );
+        thread::sleep(Duration::from_millis(10));
+    };
     let status = fixture.cli(&["daemon", "status"]);
     let socket = Path::new(status["socket"].as_str().unwrap());
     let mut inventory = ControlClient::connect(socket).unwrap();
-    let session = inventory.list_chats().unwrap().into_iter().next().unwrap();
-    assert!(matches!(
-        &session.native_continuity,
-        NativeContinuity::RetainedClaudeActor { .. }
-    ));
+    let session = inventory
+        .list_chats()
+        .unwrap()
+        .into_iter()
+        .find(|session| session.id == installed_source.id)
+        .expect("the installed agent's exact chat must remain in inventory");
+    assert_eq!(session.launch.provider, installed_source.launch.provider);
+    assert_eq!(session.launch.recipe, installed_source.launch.recipe);
+    assert_eq!(session.proof, installed_source.proof);
+    assert!(session.has_valid_native_continuity(), "{session:?}");
+    assert!(
+        matches!(
+            &session.native_continuity,
+            NativeContinuity::RetainedClaudeActor { .. }
+        ),
+        "{session:?}"
+    );
     let chat_id = session.id;
     let mut observer = std::os::unix::net::UnixStream::connect(socket).unwrap();
     observer
@@ -653,6 +701,10 @@ fn retained_agent_closes_during_a_delayed_fixture_stream() {
             }
             _ => None,
         }) {
+            assert!(matches!(
+                &snapshot.native_continuity,
+                NativeContinuity::RetainedClaudeActor { .. }
+            ));
             assert!(snapshot.busy, "close must start during the active stream");
             assert!(text.len() < reply.len());
             break;
