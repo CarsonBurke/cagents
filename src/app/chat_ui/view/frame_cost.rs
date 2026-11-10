@@ -1566,6 +1566,7 @@ fn a_reveal_of_a_hidden_full_window() {
 /// Each workload is shown and settled, then hidden while it stays warm; the
 /// heap that cooling it releases is what keeping it warm cost. Run it alone:
 /// the heap count is process-wide.
+#[cfg(not(feature = "integrated-browser"))]
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn what_a_warm_hidden_chat_holds() {
