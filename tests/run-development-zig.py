@@ -89,6 +89,20 @@ exit 83
         self.assertFalse(self.shim_calls.exists(), "mise shim was executed")
         return result, calls
 
+    def test_in_session_rejects_lifecycle_options_and_the_login_desktop(self):
+        for flags in ([], ["--keep"], ["--fresh-daemon"], ["--ttl", "60"],
+                      ["--stop-instance", "review2571"]):
+            with self.subTest(flags=flags):
+                result = subprocess.run(
+                    [str(self.runner), "--in-session", "--instance", "review2571", *flags],
+                    env=(self.env if not flags else self.env | {
+                        "XDG_RUNTIME_DIR": str(self.root / "nh-evidence"),
+                        "DISPLAY": "", "NIRI_SOCKET": "private-niri.sock",
+                    }), capture_output=True, text=True, timeout=3,
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.cargo_calls.exists())
+
     def test_isolated_home_finds_pinned_zig_for_zon_and_json(self):
         for format_name in ("zon", "json"):
             with self.subTest(format=format_name):
@@ -314,6 +328,22 @@ exit 83
             self.assertNotIn(f"lock={self.env['CAGENTS_BUILD_LOCK']} ", line)
             self.assertIn(f"lock={self.target}/dev-runtime/.native-lock-gate ", line)
             self.assertIn("seed=0 remote=local slots=1 held=", line)
+
+    def test_named_instance_runs_in_the_current_session_without_a_compositor(self):
+        self.fake_cargo_reports_its_guard()
+        app_environment = self.root / "app-environment"
+        harness_calls = self.root / "harness-calls"
+        harness = self.root / "bin/niri-harness"
+        harness.write_text(f'#!/bin/sh\nprintf called >> "{harness_calls}"\nexit 99\n')
+        harness.chmod(0o755)
+        log = self.root / "ui.log"
+        self.launch("--browserless", "--instance", "review2571", "--in-session",
+                    "--log-file", str(log),
+                    XDG_RUNTIME_DIR=str(self.root / "nh-evidence"),
+                    DISPLAY="", NIRI_SOCKET="private-niri.sock", APP_ENV=str(app_environment))
+        self.assertIn("CAGENTS_DEVELOPMENT_INSTANCE=review2571", app_environment.read_text())
+        self.assertFalse(harness_calls.exists(), "the runner started another compositor")
+        self.assertTrue(log.exists())
 
     def test_a_launch_below_the_lock_holder_cannot_compile(self):
         guard_calls = self.fake_cargo_reports_its_guard()

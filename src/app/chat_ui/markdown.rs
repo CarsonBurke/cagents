@@ -344,7 +344,7 @@ impl Content {
                         ..
                     },
                 ) if old_language == language => {
-                    *reader_source = super::reader_source::Source::updated(previous, old, code);
+                    **reader_source = super::reader_source::Source::updated(previous, old, code);
                 }
                 _ => {}
             }
@@ -524,7 +524,7 @@ pub enum Item {
         /// The styled lines of text in the code block.
         lines: Vec<Text>,
         /// Stable source digest and bounded append proof for nested reader geometry.
-        reader_source: super::reader_source::Source,
+        reader_source: Box<super::reader_source::Source>,
     },
     /// A list.
     List {
@@ -540,9 +540,9 @@ pub enum Item {
         /// The title of the image.
         title: String,
         /// Literal title text prepared alongside the image, never parsed as Markdown.
-        title_text: Text,
+        title_text: Box<Text>,
         /// The alternative text of the image.
-        alt: Text,
+        alt: Box<Text>,
     },
     /// A quote.
     Quote(Vec<Item>),
@@ -636,9 +636,8 @@ pub(super) fn materialized_bytes() -> usize {
 #[derive(Debug, Clone)]
 pub struct Text {
     spans: Arc<Spans>,
-    starts: Arc<[usize]>,
     plain: std::cell::OnceCell<Arc<str>>,
-    plain_source: std::cell::OnceCell<super::reader_source::Source>,
+    plain_source: std::cell::OnceCell<Box<super::reader_source::Source>>,
     // Most parsed nodes are never styled. Keep the large Style and empty
     // Arc allocation out of every cold Text (and therefore every Item).
     styled_cache: RefCell<Option<Box<StyledCache>>>,
@@ -655,43 +654,138 @@ struct StyledLineage {
     edges: std::collections::VecDeque<(std::sync::Weak<Spans>, std::sync::Weak<Spans>)>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Attributes {
+    strikethrough: bool,
+    strong: bool,
+    emphasis: bool,
+    code: bool,
+}
+#[derive(Debug, Clone)]
+struct Run {
+    end: usize,
+    link: Option<Uri>,
+    attributes: Attributes,
+}
 #[derive(Debug)]
 struct Spans {
-    values: Vec<Span>,
+    // Keep this growable: syntax-free streaming appends to this buffer.
+    text: String,
+    runs: Box<[Run]>,
     #[cfg(test)]
     disposed: Option<std::sync::mpsc::Sender<(std::thread::ThreadId, usize)>>,
 }
 impl Clone for Spans {
     fn clone(&self) -> Self {
         Self {
-            values: self.values.clone(),
+            text: self.text.clone(),
+            runs: self.runs.clone(),
             #[cfg(test)]
             disposed: None,
         }
     }
 }
-impl std::ops::Deref for Spans {
-    type Target = Vec<Span>;
-    fn deref(&self) -> &Self::Target {
-        &self.values
+impl Spans {
+    fn new(spans: Vec<Span>) -> Self {
+        let bytes = spans.iter().map(|span| span.text().len()).sum::<usize>();
+        let mut runs = Vec::with_capacity(spans.len());
+        let mut spans = spans.into_iter();
+        let mut text = String::new();
+        if let Some(Span::Standard {
+            text: first,
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code,
+        }) = spans.next()
+        {
+            text = first;
+            text.reserve_exact(bytes - text.len());
+            runs.push(Run {
+                end: text.len(),
+                link,
+                attributes: Attributes {
+                    strikethrough,
+                    strong,
+                    emphasis,
+                    code,
+                },
+            });
+        }
+        for Span::Standard {
+            text: next,
+            strikethrough,
+            link,
+            strong,
+            emphasis,
+            code,
+        } in spans
+        {
+            text.push_str(&next);
+            runs.push(Run {
+                end: text.len(),
+                link,
+                attributes: Attributes {
+                    strikethrough,
+                    strong,
+                    emphasis,
+                    code,
+                },
+            });
+        }
+        Self {
+            text,
+            runs: runs.into_boxed_slice(),
+            #[cfg(test)]
+            disposed: None,
+        }
     }
-}
-impl std::ops::DerefMut for Spans {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.values
+    fn len(&self) -> usize {
+        self.runs.len()
+    }
+    fn span(&self, index: usize) -> SpanRef<'_> {
+        let start = if index == 0 {
+            0
+        } else {
+            self.runs[index - 1].end
+        };
+        let run = &self.runs[index];
+        SpanRef {
+            text: &self.text[start..run.end],
+            run,
+        }
+    }
+    fn iter(&self) -> impl ExactSizeIterator<Item = SpanRef<'_>> {
+        (0..self.runs.len()).map(|index| self.span(index))
     }
 }
 #[cfg(test)]
 impl Drop for Spans {
     fn drop(&mut self) {
-        let values = std::mem::take(&mut self.values);
-        let bytes = values.iter().map(|span| span.text().len()).sum();
-        // Observe the real raw span Vec and its owned Strings after disposal,
-        // not an unrelated token whose lifetime might end before the source.
-        drop(values);
+        let bytes = self.text.len();
+        // Observe disposal of the actual text and run owners.
+        drop(std::mem::take(&mut self.text));
+        drop(std::mem::take(&mut self.runs));
         if let Some(disposed) = self.disposed.take() {
             let _ = disposed.send((std::thread::current().id(), bytes));
         }
+    }
+}
+struct SpanRef<'a> {
+    text: &'a str,
+    run: &'a Run,
+}
+impl std::fmt::Debug for SpanRef<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Standard")
+            .field("text", &self.text)
+            .field("strikethrough", &self.run.attributes.strikethrough)
+            .field("link", &self.run.link)
+            .field("strong", &self.run.attributes.strong)
+            .field("emphasis", &self.run.attributes.emphasis)
+            .field("code", &self.run.attributes.code)
+            .finish()
     }
 }
 
@@ -699,18 +793,20 @@ impl Drop for Spans {
 /// this boundary. Capture only existing backing, without plain/style work.
 pub(super) struct FlowText {
     spans: Arc<Spans>,
-    starts: Arc<[usize]>,
     plain: std::sync::OnceLock<Arc<str>>,
     // Retain every source/cache owner until raw Flow retirement, including
     // already-primed proof state and a cached style captured from the Text.
-    _plain_source: Option<super::reader_source::Source>,
-    style: Option<Style>,
-    styled: Arc<[text::Span<'static, Uri>]>,
+    captured: Option<Box<FlowCaches>>,
     lineage: Arc<std::sync::Mutex<StyledLineage>>,
 }
+struct FlowCaches {
+    _plain_source: Option<super::reader_source::Source>,
+    styled: Option<StyledCache>,
+}
+
 impl FlowText {
     pub(super) fn len(&self) -> usize {
-        self.starts.last().copied().unwrap_or_default()
+        self.spans.text.len()
     }
     pub(super) fn append_proven(&self, previous: &Self) -> bool {
         append_proven(
@@ -725,13 +821,18 @@ impl FlowText {
             .get_or_init(|| {
                 #[cfg(test)]
                 MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
-                self.spans.iter().map(Span::text).collect::<String>().into()
+                Arc::from(self.spans.text.as_str())
             })
             .clone()
     }
     pub(super) fn spans(&self, style: Style) -> Arc<[text::Span<'static, Uri>]> {
-        if self.style == Some(style) {
-            self.styled.clone()
+        if let Some(cached) = self
+            .captured
+            .as_ref()
+            .and_then(|capture| capture.styled.as_ref())
+            && cached.style == style
+        {
+            cached.spans.clone()
         } else {
             #[cfg(test)]
             MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
@@ -789,21 +890,15 @@ impl Text {
     /// append-proof lineage. Tests retain every raw span attribute and link.
     #[cfg(test)]
     pub(super) fn semantic_spans(&self) -> impl std::fmt::Debug + '_ {
-        &self.spans.values
+        self.spans.iter().collect::<Vec<_>>()
     }
     fn new(spans: Vec<Span>) -> Self {
-        let mut starts = Vec::with_capacity(spans.len() + 1);
-        starts.push(0);
-        for span in &spans {
-            starts.push(starts.last().copied().unwrap() + span.text().len());
-        }
+        Self::from_spans(Spans::new(spans))
+    }
+
+    fn from_spans(spans: Spans) -> Self {
         Self {
-            spans: Arc::new(Spans {
-                values: spans,
-                #[cfg(test)]
-                disposed: None,
-            }),
-            starts: starts.into(),
+            spans: Arc::new(spans),
             plain: std::cell::OnceCell::new(),
             plain_source: std::cell::OnceCell::new(),
             styled_cache: RefCell::default(),
@@ -812,25 +907,21 @@ impl Text {
     }
 
     fn is_plain_source(&self, source: &str) -> bool {
-        matches!(self.spans.as_slice(), [Span::Standard { text, strikethrough: false,
-            link: None, strong: false, emphasis: false, code: false }] if text == source)
+        matches!(self.spans.runs.as_ref(), [Run { link: None,
+            attributes: Attributes { strikethrough: false, strong: false, emphasis: false, code: false }, .. }]
+            if self.spans.text == source)
     }
     fn append_plain(&mut self, suffix: &str) {
         let previous = Arc::downgrade(&self.spans);
         if let Some(source) = self.plain_source.get_mut() {
-            // Primed parser outputs share the old plain backing; update only
-            // the suffix hash state before invalidating that display string.
-            let [Span::Standard { text, .. }] = self.spans.as_slice() else {
-                unreachable!("plain append has one source span")
-            };
-            source.append(text, suffix);
+            source.append(&self.spans.text, suffix);
         }
-        let [Span::Standard { text, .. }] = Arc::make_mut(&mut self.spans).as_mut_slice() else {
+        let spans = Arc::make_mut(&mut self.spans);
+        let [run] = spans.runs.as_mut() else {
             unreachable!("plain append requires one plain span")
         };
-        text.push_str(suffix);
-        let length = self.starts.last().copied().unwrap_or_default() + suffix.len();
-        self.starts = Arc::from([0, length]);
+        spans.text.push_str(suffix);
+        run.end = spans.text.len();
         self.plain.take();
         *self.styled_cache.get_mut() = None;
         self.record_edge(previous);
@@ -857,7 +948,7 @@ impl Text {
             .iter()
             .zip(self.spans.iter())
             .enumerate()
-            .all(|(index, (old, new))| old.prefix_of(new, index + 1 == previous.spans.len()))
+            .all(|(index, (old, new))| old.prefix_of(&new, index + 1 == previous.spans.len()))
         {
             return;
         }
@@ -882,17 +973,21 @@ impl Text {
         if let Some(ready) = self.plain.get() {
             let _ = plain.set(ready.clone());
         }
-        let (style, styled) = match self.styled_cache.borrow().as_ref() {
-            Some(cached) => (Some(cached.style), cached.spans.clone()),
-            None => (None, Arc::from([])),
-        };
+        let source = self
+            .plain_source
+            .get()
+            .map(|source| source.as_ref().clone());
+        let styled = self.styled_cache.borrow().as_deref().cloned();
+        let captured = (source.is_some() || styled.is_some()).then(|| {
+            Box::new(FlowCaches {
+                _plain_source: source,
+                styled,
+            })
+        });
         FlowText {
             spans: self.spans.clone(),
-            starts: self.starts.clone(),
             plain,
-            _plain_source: self.plain_source.get().cloned(),
-            style,
-            styled,
+            captured,
             lineage: self.lineage.clone(),
         }
     }
@@ -916,17 +1011,17 @@ impl Text {
             .get_or_init(|| {
                 #[cfg(test)]
                 MATERIALIZED_BYTES.with(|bytes| bytes.set(bytes.get() + self.len()));
-                self.spans.iter().map(Span::text).collect::<String>().into()
+                Arc::from(self.spans.text.as_str())
             })
             .clone()
     }
     pub fn plain_prefixes(&self) -> Arc<Vec<[u8; 32]>> {
         self.plain_source
-            .get_or_init(|| super::reader_source::Source::new(&self.plain()))
+            .get_or_init(|| Box::new(super::reader_source::Source::new(&self.plain())))
             .prefixes()
     }
     pub fn len(&self) -> usize {
-        self.starts.last().copied().unwrap_or_default()
+        self.spans.text.len()
     }
 
     /// Style just a bounded rendered byte range; hidden chunks never populate
@@ -937,20 +1032,20 @@ impl Text {
         range: Range<usize>,
     ) -> Arc<[text::Span<'static, Uri>]> {
         let first = self
-            .starts
-            .partition_point(|start| *start <= range.start)
-            .saturating_sub(1);
-        self.spans
-            .iter()
-            .enumerate()
-            .skip(first)
-            .take_while(|(index, _)| self.starts[*index] < range.end)
+            .spans
+            .runs
+            .partition_point(|run| run.end <= range.start);
+        (first..self.spans.len())
+            .map(|index| (index, self.spans.span(index)))
+            .take_while(|(index, _)| *index == 0 || self.spans.runs[*index - 1].end < range.end)
             .filter_map(|(index, span)| {
-                let start = range.start.saturating_sub(self.starts[index]);
-                let end = range
-                    .end
-                    .saturating_sub(self.starts[index])
-                    .min(span.text().len());
+                let offset = if index == 0 {
+                    0
+                } else {
+                    self.spans.runs[index - 1].end
+                };
+                let start = range.start.saturating_sub(offset);
+                let end = range.end.saturating_sub(offset).min(span.text.len());
                 (start < end).then(|| span.view_part(&style, start..end))
             })
             .collect()
@@ -992,80 +1087,63 @@ enum Span {
 }
 
 impl Span {
-    fn prefix_of(&self, new: &Self, last: bool) -> bool {
-        let Self::Standard {
-            text: old,
-            strikethrough: a,
-            link: b,
-            strong: c,
-            emphasis: d,
-            code: e,
-        } = self;
-        let Self::Standard {
-            text: new,
-            strikethrough: f,
-            link: g,
-            strong: h,
-            emphasis: i,
-            code: j,
-        } = new;
-        (a, b, c, d, e) == (f, g, h, i, j)
-            && if last {
-                new.starts_with(old)
-            } else {
-                new == old
-            }
-    }
     fn text(&self) -> &str {
-        match self {
-            Self::Standard { text, .. } => text,
-        }
+        let Self::Standard { text, .. } = self;
+        text
+    }
+}
+impl SpanRef<'_> {
+    fn prefix_of(&self, new: &Self, last: bool) -> bool {
+        self.run.attributes == new.run.attributes
+            && self.run.link == new.run.link
+            && if last {
+                new.text.starts_with(self.text)
+            } else {
+                new.text == self.text
+            }
     }
     fn view(&self, style: &Style) -> text::Span<'static, Uri> {
-        self.view_part(style, 0..self.text().len())
+        self.view_part(style, 0..self.text.len())
     }
     fn view_part(&self, style: &Style, range: Range<usize>) -> text::Span<'static, Uri> {
-        match self {
-            Span::Standard {
-                text,
-                strikethrough,
-                link,
-                strong,
-                emphasis,
-                code,
-            } => {
-                let span = span(text[range].to_owned()).strikethrough(*strikethrough);
+        let text = self.text;
+        let Attributes {
+            strikethrough,
+            strong,
+            emphasis,
+            code,
+        } = &self.run.attributes;
+        let link = &self.run.link;
+        let span = span(text[range].to_owned()).strikethrough(*strikethrough);
 
-                let span = if *code {
-                    span.font(style.inline_code_font)
-                        .color(style.inline_code_color)
-                        .background(style.inline_code_highlight.background)
-                        .border(style.inline_code_highlight.border)
-                        .padding(style.inline_code_padding)
-                } else if *strong || *emphasis {
-                    span.font(Font {
-                        weight: if *strong {
-                            font::Weight::Bold
-                        } else {
-                            font::Weight::Normal
-                        },
-                        style: if *emphasis {
-                            font::Style::Italic
-                        } else {
-                            font::Style::Normal
-                        },
-                        ..style.font
-                    })
+        let span = if *code {
+            span.font(style.inline_code_font)
+                .color(style.inline_code_color)
+                .background(style.inline_code_highlight.background)
+                .border(style.inline_code_highlight.border)
+                .padding(style.inline_code_padding)
+        } else if *strong || *emphasis {
+            span.font(Font {
+                weight: if *strong {
+                    font::Weight::Bold
                 } else {
-                    span.font(style.font)
-                };
+                    font::Weight::Normal
+                },
+                style: if *emphasis {
+                    font::Style::Italic
+                } else {
+                    font::Style::Normal
+                },
+                ..style.font
+            })
+        } else {
+            span.font(style.font)
+        };
 
-                if let Some(link) = link.as_ref() {
-                    span.color(style.link_color).link(link.clone())
-                } else {
-                    span
-                }
-            }
+        if let Some(link) = link.as_ref() {
+            span.color(style.link_color).link(link.clone())
+        } else {
+            span
         }
     }
 }
@@ -1143,6 +1221,119 @@ fn collect_images(items: &[Item], images: &mut HashSet<Uri>) {
     }
 }
 
+/// Parser-local text and ranges. Text fragments enter their final backing
+/// directly; publication never builds and then rejoins owned span Strings.
+#[derive(Default)]
+struct SpanBuffer {
+    text: String,
+    runs: Vec<Run>,
+}
+
+impl SpanBuffer {
+    fn is_empty(&self) -> bool {
+        self.runs.is_empty()
+    }
+
+    fn push(
+        &mut self,
+        text: pulldown_cmark::CowStr<'_>,
+        attributes: Attributes,
+        link: Option<Uri>,
+    ) {
+        if self.text.is_empty() {
+            self.text = text.into_string();
+        } else {
+            self.text.push_str(&text);
+        }
+        self.runs.push(Run {
+            end: self.text.len(),
+            link,
+            attributes,
+        });
+    }
+
+    fn finish(&mut self, linkify: bool) -> Text {
+        let text = mem::take(&mut self.text);
+        let mut runs = mem::take(&mut self.runs);
+        if linkify {
+            // Match the existing bare-reference rule: only adjacent unlinked,
+            // non-code fragments in the same style can form one reference.
+            runs.dedup_by(|next, previous| {
+                if next.link.is_none()
+                    && previous.link.is_none()
+                    && !next.attributes.code
+                    && next.attributes == previous.attributes
+                {
+                    previous.end = next.end;
+                    true
+                } else {
+                    false
+                }
+            });
+            let mut start = 0;
+            let first_split = runs.iter_mut().enumerate().find_map(|(index, run)| {
+                let fragment = &text[start..run.end];
+                start = run.end;
+                if run.link.is_none() && run.attributes.code {
+                    run.link = destination(fragment);
+                    None
+                } else if run.link.is_none() && references(fragment).next().is_some() {
+                    Some(index)
+                } else {
+                    None
+                }
+            });
+            if let Some(first_split) = first_split {
+                let mut linked = Vec::with_capacity(runs.len());
+                linked.extend(runs.drain(..first_split));
+                let mut start = linked.last().map_or(0, |run| run.end);
+                for mut run in runs {
+                    let end = run.end;
+                    let fragment = &text[start..end];
+                    if run.link.is_none() && run.attributes.code {
+                        run.link = destination(fragment);
+                        linked.push(run);
+                    } else if run.link.is_none() {
+                        let mut copied = 0;
+                        for (from, to, destination) in references(fragment) {
+                            if copied < from {
+                                linked.push(Run {
+                                    end: start + from,
+                                    link: None,
+                                    attributes: run.attributes,
+                                });
+                            }
+                            linked.push(Run {
+                                end: start + to,
+                                link: Some(destination),
+                                attributes: run.attributes,
+                            });
+                            copied = to;
+                        }
+                        if copied == 0 || copied < fragment.len() {
+                            linked.push(Run {
+                                end,
+                                link: None,
+                                attributes: run.attributes,
+                            });
+                        }
+                    } else {
+                        linked.push(run);
+                    }
+                    start = end;
+                }
+                runs = linked;
+            }
+        }
+        Text::from_spans(Spans {
+            text,
+            runs: runs.into_boxed_slice(),
+            #[cfg(test)]
+            disposed: None,
+        })
+    }
+}
+
 fn parse_with<'a>(
     mut state: impl BorrowMut<State> + 'a,
     markdown: &'a str,
@@ -1166,7 +1357,7 @@ fn parse_with<'a>(
 
     let reference_labels = Rc::new(RefCell::new(HashSet::new()));
 
-    let mut spans = Vec::new();
+    let mut spans = SpanBuffer::default();
     let mut code = String::new();
     let mut code_language = None;
     let mut code_lines = Vec::new();
@@ -1281,8 +1472,6 @@ fn parse_with<'a>(
 
     let parser = parser.into_offset_iter();
 
-    // We want to keep the `spans` capacity
-    #[allow(clippy::drain_collect)]
     parser.filter_map(move |(event, source)| match event {
         pulldown_cmark::Event::Start(tag) => match tag {
             pulldown_cmark::Tag::Heading { level, .. } if !metadata => {
@@ -1326,7 +1515,7 @@ fn parse_with<'a>(
                 ..
             } if !metadata => {
                 if !spans.is_empty() {
-                    let text = Text::new(linked(spans.drain(..)));
+                    let text = spans.finish(true);
                     RefCell::borrow_mut(&inline_items).push(match inline_heading {
                         Some(level) => Item::Heading(level, text),
                         None => Item::Paragraph(text),
@@ -1352,7 +1541,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 };
@@ -1378,7 +1567,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 };
@@ -1399,7 +1588,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1441,7 +1630,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Heading(level, Text::new(linked(spans.drain(..)))),
+                        Item::Heading(level, spans.finish(true)),
                         source,
                     )
                 }
@@ -1469,7 +1658,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1481,7 +1670,7 @@ fn parse_with<'a>(
                     produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source,
                     )
                 }
@@ -1514,7 +1703,7 @@ fn parse_with<'a>(
             }
             pulldown_cmark::TagEnd::Image if !metadata => {
                 let (url, title) = image.take()?;
-                let alt = Text::new(spans.drain(..).collect());
+                let alt = spans.finish(false);
 
                 let state = state.borrow_mut();
                 let _ = state.images.insert(url.clone());
@@ -1530,8 +1719,8 @@ fn parse_with<'a>(
                 RefCell::borrow_mut(&inline_items).push(Item::Image {
                     url,
                     title,
-                    title_text,
-                    alt,
+                    title_text: Box::new(title_text),
+                    alt: Box::new(alt),
                 });
                 None
             }
@@ -1545,7 +1734,7 @@ fn parse_with<'a>(
                     Item::CodeBlock {
                         language: code_language.take(),
                         source: display.clone(),
-                        reader_source: super::reader_source::Source::new(&display),
+                        reader_source: Box::new(super::reader_source::Source::new(&display)),
                         code: display,
                         lines: code_lines.drain(..).collect(),
                     },
@@ -1579,7 +1768,7 @@ fn parse_with<'a>(
                     let _ = produce(
                         state.borrow_mut(),
                         &mut stack,
-                        Item::Paragraph(Text::new(linked(spans.drain(..)))),
+                        Item::Paragraph(spans.finish(true)),
                         source.clone(),
                     );
                 }
@@ -1615,67 +1804,70 @@ fn parse_with<'a>(
         pulldown_cmark::Event::Text(text) if !metadata => {
             if code_block {
                 code.push_str(&text);
-
                 return None;
             }
-
-            let span = Span::Standard {
-                text: text.into_string(),
-                strong,
-                emphasis,
-                strikethrough,
-                link: link.clone(),
-                code: false,
-            };
-
-            spans.push(span);
-
+            spans.push(
+                text,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::Code(code) if !metadata => {
-            let span = Span::Standard {
-                text: code.into_string(),
-                strong,
-                emphasis,
-                strikethrough,
-                link: link.clone(),
-                code: true,
-            };
-
-            spans.push(span);
+            spans.push(
+                code,
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: true,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::SoftBreak if !metadata => {
-            spans.push(Span::Standard {
-                text: String::from(" "),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                " ".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::HardBreak if !metadata => {
-            spans.push(Span::Standard {
-                text: String::from("\n"),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::InlineHtml(h) if !metadata && h.eq_ignore_ascii_case("<br>") => {
-            spans.push(Span::Standard {
-                text: String::from("\n"),
-                strikethrough,
-                strong,
-                emphasis,
-                link: link.clone(),
-                code: false,
-            });
+            spans.push(
+                "\n".into(),
+                Attributes {
+                    strong,
+                    emphasis,
+                    strikethrough,
+                    code: false,
+                },
+                link.clone(),
+            );
             None
         }
         pulldown_cmark::Event::Rule => produce(state.borrow_mut(), &mut stack, Item::Rule, source),
@@ -1708,6 +1900,7 @@ fn parse_with<'a>(
 /// The parser can hand over one run of text as several pieces, so neighbours
 /// set in the same style are joined first: an address cut in two would
 /// otherwise link neither half.
+#[cfg(test)]
 fn linked(spans: impl Iterator<Item = Span>) -> Vec<Span> {
     let mut joined: Vec<Span> = Vec::new();
     for span in spans {
@@ -1994,6 +2187,83 @@ mod tests {
     }
 
     #[test]
+    fn direct_parser_runs_match_owned_span_linking_and_image_text() {
+        let span = |text: &str, strong, code, link: Option<Uri>| Span::Standard {
+            text: text.into(),
+            strikethrough: false,
+            link,
+            strong,
+            emphasis: false,
+            code,
+        };
+        let cases = [
+            vec![
+                span("ordinary prefix ", false, false, None),
+                span("src/first.rs:12", false, true, None),
+                span(" then https://example.test/λ ", false, false, None),
+                span("src/last.rs:8", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span("https://exa", false, false, None),
+                span("mple.test/λ", false, false, None),
+            ],
+            vec![
+                span("", false, false, None),
+                span("λ café ", true, false, None),
+                span("src/lib.rs:12", false, true, None),
+                span("", true, false, None),
+            ],
+            vec![
+                span(
+                    "https://example.test",
+                    false,
+                    false,
+                    Some("app://explicit".into()),
+                ),
+                span(" /tmp/λ.rs:8", false, false, None),
+            ],
+        ];
+        for spans in cases {
+            for linkify in [false, true] {
+                let expected = Text::new(if linkify {
+                    linked(spans.clone().into_iter())
+                } else {
+                    spans.clone()
+                });
+                let mut builder = SpanBuffer::default();
+                for Span::Standard {
+                    text,
+                    strikethrough,
+                    link,
+                    strong,
+                    emphasis,
+                    code,
+                } in spans.clone()
+                {
+                    builder.push(
+                        text.into(),
+                        Attributes {
+                            strikethrough,
+                            strong,
+                            emphasis,
+                            code,
+                        },
+                        link,
+                    );
+                }
+                let actual = builder.finish(linkify);
+                assert_eq!(
+                    format!("{:?}", actual.semantic_spans()),
+                    format!("{:?}", expected.semantic_spans())
+                );
+                assert_eq!(actual.plain(), expected.plain());
+                assert!(builder.is_empty());
+            }
+        }
+    }
+
+    #[test]
     fn cold_parsed_graph_and_document_clone_keep_compact_unstyled_text() {
         let source = "paragraph **λ linked [text](https://example.test)**\n\n![alt](image.png \"title\")\n\n".repeat(1024);
         let content = Content::parse(&source);
@@ -2030,17 +2300,22 @@ mod tests {
                 "cold clone has no styled allocation"
             );
         }
-        // Item's largest variant embeds two Text nodes. Bound the cold graph
-        // representation independently of whether a particular theme is used.
+        // Bound the per-node cold storage, including the raw Flow capture,
+        // independently of theme or whether caches were materialized.
         assert!(
-            std::mem::size_of::<Text>() <= 192,
+            std::mem::size_of::<Text>() <= 96,
             "cold Text bytes: {}",
             std::mem::size_of::<Text>()
         );
         assert!(
-            std::mem::size_of::<Item>() <= 448,
+            std::mem::size_of::<Item>() <= 128,
             "cold Item bytes: {}",
             std::mem::size_of::<Item>()
+        );
+        assert!(
+            std::mem::size_of::<FlowText>() <= 96,
+            "cold Flow text bytes: {}",
+            std::mem::size_of::<FlowText>()
         );
     }
 
@@ -2352,10 +2627,14 @@ mod tests {
         let mut output = Vec::new();
         for item in items {
             match item {
-                Item::Paragraph(text) | Item::Heading(_, text) | Item::Image { alt: text, .. } => {
+                Item::Paragraph(text) | Item::Heading(_, text) => {
                     for span in text.spans.iter() {
-                        let Span::Standard { text, link, .. } = span;
-                        output.extend(text.chars().map(|ch| (ch, link.clone())));
+                        output.extend(span.text.chars().map(|ch| (ch, span.run.link.clone())));
+                    }
+                }
+                Item::Image { alt: text, .. } => {
+                    for span in text.spans.iter() {
+                        output.extend(span.text.chars().map(|ch| (ch, span.run.link.clone())));
                     }
                 }
                 Item::Quote(items) => output.extend(reference_text(items)),
@@ -2642,3 +2921,9 @@ fn completed_source_discards_parser_scratch_without_discarding_rendered_content(
     assert_eq!(format!("{:?}", content.items()), before);
     assert_eq!(content.images(), &images);
 }
+
+#[cfg(all(test, not(feature = "integrated-browser")))]
+mod heap_cost;
+
+#[cfg(test)]
+mod storage_cost;

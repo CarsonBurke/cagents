@@ -705,3 +705,228 @@ fn presentation_replica_capture_trace_smoke_matches_deferred_work_accounting_tag
     assert!(tag(captures[0], "accepted", "true"), "{logged}");
     assert!(captures[0].contains("elapsed_ns="));
 }
+
+#[test]
+fn presentation_replica_capture_repository_load_is_a_structural_barrier() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, source, _, pane) = presentation_fixture();
+    install_writer(&mut app, &directory);
+    let update = presentation_edge(
+        &app,
+        Scope::Channel(source),
+        21,
+        "Before repository load",
+        0.68,
+    );
+    drop(app.update(Message::WorkspaceModelObserved(update)));
+    assert!(app.replica_capture.pending.is_some());
+    let generation = app.replica_capture.generation;
+    let captures = app.replica_capture.captures;
+    let offers = app.replica_capture.offers;
+    let project = ProjectId::new();
+    let repository = PathBuf::from("/loaded/.git");
+    app.workspace_model
+        .projects
+        .push(crate::workspace_model::ModelProject {
+            repository: repository.clone(),
+            name: "loaded".into(),
+            kind: ProjectKind::Git,
+            ordinal: 1,
+        });
+    app.repository_generations.insert(project, 1);
+    let loaded = LoadedRepository {
+        project: ProjectState {
+            kind: ProjectKind::Git,
+            id: project,
+            generation: 0,
+            name: "loaded".into(),
+            repository,
+            existence: Existence::Open,
+        },
+        repository: None,
+        worktrees: vec![],
+        github: GitHubAvailability::NotAssociated,
+        review_repository: None,
+        head_repositories: HashMap::new(),
+    };
+    drop(app.update(Message::RepositoryLoaded {
+        open_cards: false,
+        project_id: project,
+        generation: 1,
+        result: Ok(Box::new(loaded)),
+    }));
+    assert!(app.replica_capture.pending.is_none());
+    assert_eq!(app.replica_capture.captures, captures + 1);
+    assert_eq!(app.replica_capture.offers, offers + 1);
+    assert_eq!(
+        app.card_state(pane.id).unwrap().title,
+        "Before repository load"
+    );
+    assert_eq!(
+        app.shared_views.baseline[&Scope::Channel(source)][0].title,
+        "Before repository load"
+    );
+    drop(app.replica_capture_due(generation, Instant::now() + Duration::from_secs(2)));
+    assert_eq!(app.replica_capture.captures, captures + 1);
+
+    // Structural settlement must not disable the separate stable-presentation
+    // path or make the following replica update take a full local projection.
+    app.shared_views.local_projection_count.set(0);
+    app.shared_views.selected_projection_count.set(0);
+    app.shared_views.scope_discovery_count.set(0);
+    let update = presentation_edge(
+        &app,
+        Scope::Channel(source),
+        22,
+        "After repository load",
+        0.72,
+    );
+    drop(app.update(Message::WorkspaceModelObserved(update)));
+    assert_eq!(app.shared_views.local_projection_count.get(), 0);
+    assert_eq!(app.shared_views.selected_projection_count.get(), 1);
+    assert_eq!(app.shared_views.scope_discovery_count.get(), 0);
+    assert!(app.replica_capture.pending.is_some());
+    assert_eq!(app.replica_capture.captures, captures + 1);
+    assert_eq!(
+        app.card_state(pane.id).unwrap().title,
+        "After repository load"
+    );
+    drop(app);
+}
+
+#[test]
+fn presentation_replica_capture_repository_alias_adoption_keeps_draft_and_ordered_save() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, source, destination, pane) = presentation_fixture();
+    let destination_project = ProjectId::new();
+    let repository = PathBuf::from("/other/.git");
+    Arc::make_mut(&mut app.durable)
+        .channels
+        .iter_mut()
+        .find(|row| row.id == destination)
+        .unwrap()
+        .project_id = destination_project;
+    app.sidebar_model.projects.push(SidebarProject::new(
+        destination_project,
+        RepositoryId::new(),
+        "other".into(),
+        repository.clone(),
+        vec![],
+        vec![],
+    ));
+    app.workspace_model
+        .channels
+        .iter_mut()
+        .find(|row| row.id == destination)
+        .unwrap()
+        .repository = repository.clone();
+    let alias = CardId::new();
+    let state = CardState {
+        id: alias,
+        generation: 0,
+        title: "Local terminal alias".into(),
+        width_fraction: 0.5,
+        existence: Existence::Open,
+        kind: moving_terminal_kind(),
+    };
+    let alias_scope = ChannelId::new();
+    let alias_pane = Pane::from_card(&state, None).unwrap();
+    let mut local = app
+        .durable
+        .channels
+        .iter()
+        .find(|row| row.id == source)
+        .unwrap()
+        .clone();
+    local.id = alias_scope;
+    local.title = "Alias source".into();
+    local.ordinal = 2;
+    local.cards = vec![alias];
+    local.focused = Some(alias);
+    let mut shared = app.workspace_model.channel(source).unwrap().clone();
+    shared.id = alias_scope;
+    shared.title = local.title.clone();
+    shared.ordinal = local.ordinal;
+    Arc::make_mut(&mut app.durable).channels.push(local);
+    Arc::make_mut(&mut app.durable).cards.push(state);
+    app.workspace_model.channels.push(shared);
+    app.workspace_model.views.push(View {
+        scope: Scope::Channel(alias_scope),
+        revision: 17,
+        panes: vec![alias_pane.clone()],
+        retired: vec![],
+    });
+    app.shared_views
+        .initialize(Scope::Channel(alias_scope), vec![alias_pane.clone()]);
+    app.cards.insert(alias, CardRuntime::Completed);
+    app.chat_ui =
+        chat_ui::State::with_drafts(HashMap::from([(alias, "cross-repository draft  ".into())]));
+    install_writer(&mut app, &directory);
+    let update = presentation_edge(&app, Scope::Channel(source), 21, "Pending replica", 0.68);
+    drop(app.update(Message::WorkspaceModelObserved(update)));
+    assert!(app.replica_capture.pending.is_some());
+
+    // The incoming canonical identity moved across repositories while the
+    // other channel still owes its already-published local snapshot.
+    let mut canonical = alias_pane;
+    canonical.id = CardId::new();
+    app.workspace_model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(alias_scope))
+        .unwrap()
+        .panes
+        .clear();
+    app.workspace_model
+        .views
+        .iter_mut()
+        .find(|view| view.scope == Scope::Channel(destination))
+        .unwrap()
+        .panes = vec![canonical.clone()];
+    let captures = app.replica_capture.captures;
+    let offers = app.replica_capture.offers;
+    drop(app.reconcile_shared_views_for_repository(&repository, &HashSet::new()));
+    assert!(app.replica_capture.pending.is_none());
+    assert_eq!(app.replica_capture.captures, captures + 1);
+    assert_eq!(app.replica_capture.offers, offers + 1);
+    assert!(!app.card_state(alias).unwrap().existence.is_open());
+    assert!(app.card_state(canonical.id).unwrap().existence.is_open());
+    assert_eq!(app.card_state(pane.id).unwrap().title, "Pending replica");
+    assert!(
+        app.shared_views.baseline[&Scope::Channel(alias_scope)]
+            .iter()
+            .all(|pane| pane.id != alias)
+    );
+    assert!(
+        app.shared_views.baseline[&Scope::Channel(destination)]
+            .iter()
+            .any(|pane| pane.id == canonical.id)
+    );
+    assert_eq!(
+        app.persistent_workspace()
+            .chat_drafts
+            .get(&canonical.id)
+            .map(String::as_str),
+        Some("cross-repository draft  ")
+    );
+    app.session
+        .as_ref()
+        .unwrap()
+        .flush(Duration::from_secs(5))
+        .unwrap();
+    drop(app);
+    let (mut writer, restored) = crate::session::SessionRuntime::open(
+        directory.path().join("window.sqlite3"),
+        crate::model::BootId::new("replica-capture"),
+    )
+    .unwrap();
+    assert_eq!(
+        restored
+            .unwrap()
+            .chat_drafts
+            .get(&canonical.id)
+            .map(String::as_str),
+        Some("cross-repository draft  ")
+    );
+    writer.shutdown();
+}

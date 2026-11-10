@@ -2666,7 +2666,7 @@ mod tests {
                 language: None,
                 code: Arc::from(content),
                 source: Arc::from(content),
-                reader_source: super::reader_source::Source::new(content),
+                reader_source: Box::new(super::reader_source::Source::new(content)),
                 lines: Vec::new(),
             }];
         });
@@ -2691,7 +2691,7 @@ mod tests {
                     language: None,
                     code: Arc::from(code),
                     source: Arc::from(code),
-                    reader_source: super::reader_source::Source::new(code),
+                    reader_source: Box::new(super::reader_source::Source::new(code)),
                     lines: Vec::new(),
                 })
                 .collect();
