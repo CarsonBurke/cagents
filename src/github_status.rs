@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::{
     fs::{self, OpenOptions},
     io::{self, Read, Write},
-    os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
     sync::Arc,
     thread,
@@ -556,10 +556,18 @@ fn read_with<E: ProcessExecutor>(
         verify_credentials()?;
         return Ok(cached.report(key, "cache", current));
     }
-    let mut command = status_command(&service.gh, key);
-    // A killed owner must not release the single-flight lock while gh still
-    // runs. Normal completion/cancellation waits for the executor to reap it.
-    command.inherited_lease = Some(_flight.as_raw_fd());
+    // An exclusive flight must retain its original open description: an
+    // independently opened shared lease would conflict with this lock. Keep
+    // the scoped owner until publication so normal return unlocks unrelated
+    // fork copies; abrupt owner death leaves gh holding the original EX lock.
+    let lease = Arc::new(
+        _flight
+            .try_clone()
+            .map_err(|error| format!("Cannot inherit the GitHub status flight: {error}"))?,
+    );
+    let command = status_command(&service.gh, key)
+        .inherit_file(lease)
+        .map_err(|error| format!("Cannot inherit the GitHub status flight: {error}"))?;
     let result = service.fetch(&command, key, cancellation);
     if cancellation.is_cancelled() {
         return Err("GitHub status read cancelled".into());
@@ -905,7 +913,6 @@ mod tests {
                     .any(|argument| argument == "--include")
             );
             assert_eq!(command.timeout, Some(Duration::from_secs(30)));
-            assert!(command.inherited_lease.is_some());
             assert_eq!(
                 command
                     .environment
@@ -1351,5 +1358,165 @@ mod tests {
         .unwrap();
         assert_eq!(report.source, "network");
         assert_eq!(report.outcome, "succeeded");
+    }
+
+    #[test]
+    fn completed_flight_unlocks_even_when_a_command_copy_survives() {
+        struct RememberingExecutor(Mutex<Option<CommandSpec>>);
+        impl ProcessExecutor for RememberingExecutor {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                cancellation: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                // A retained command owns a copy of the exported description,
+                // just as an unrelated fork can retain it before reaching exec.
+                *self.0.lock().unwrap() = Some(command.clone());
+                SystemProcessExecutor.execute(command, cancellation)
+            }
+        }
+        let root = private_tempdir();
+        let script = root.path().join("gh");
+        fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\ncat <<'RESPONSE'\n{}\nRESPONSE\n",
+                String::from_utf8(response(data()).stdout).unwrap()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let executor = Arc::new(RememberingExecutor(Mutex::new(None)));
+        let service = StatusService::new(script, Arc::clone(&executor));
+        let report = read_with(
+            root.path(),
+            "account",
+            &key(),
+            &service,
+            &CancellationToken::new(),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(report.outcome, "succeeded", "{report:?}");
+        assert!(executor.0.lock().unwrap().is_some());
+        let path = root
+            .path()
+            .join(format!("{}.lock", target_name("account", &key())));
+        let next = crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB);
+        assert!(
+            next.is_ok(),
+            "scoped flight was retained by a copy: {next:?}"
+        );
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn a_live_query_keeps_the_original_flight_after_its_owner_is_killed() {
+        use std::ffi::CString;
+        const ROOT: &str = "CAGENTS_PR_STATUS_TEST_KILLED_OWNER_ROOT";
+        const TEST: &str = "github_status::tests::a_live_query_keeps_the_original_flight_after_its_owner_is_killed";
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
+        if let Some(root) = std::env::var_os(ROOT) {
+            let root = PathBuf::from(root);
+            let service = StatusService::system(root.join("gh"));
+            read_with(
+                &root,
+                "account",
+                &key(),
+                &service,
+                &CancellationToken::new(),
+                || Ok(()),
+            )
+            .unwrap();
+            panic!("the query owner must remain blocked until killed");
+        }
+        // This exact worker is already beneath the fixture guardian. Make it
+        // the nearer subreaper so it can reap gh after killing its producer;
+        // no shared test harness changes process-wide child ownership.
+        assert_eq!(unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) }, 0);
+        // Retain the small private fixture if any assertion fails; the outer
+        // guardian settles descendants before the evidence can be removed.
+        let root = private_tempdir().keep();
+        eprintln!("GitHub killed-owner fixture: {}", root.display());
+        let fifo = root.join("release");
+        let fifo_name = CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
+        let ready = root.join("started");
+        let quoted = |path: &Path| format!("'{}'", path.to_str().unwrap().replace('\'', "'\\''"));
+        fs::write(
+            root.join("gh"),
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$$\" > {}\nread release < {}\n",
+                quoted(&ready),
+                quoted(&fifo)
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(root.join("gh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let mut producer = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture"])
+            .env(ROOT, &root)
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let pid = loop {
+            if let Some(pid) = fs::read_to_string(&ready)
+                .ok()
+                .and_then(|value| value.trim().parse::<libc::pid_t>().ok())
+            {
+                break pid;
+            }
+            assert!(Instant::now() < deadline, "fixture query did not start");
+            thread::sleep(Duration::from_millis(10));
+        };
+        assert!(pid > 0 && pid as u32 != producer.id());
+        // This owned Child is still blocked in read_with. Kill only the
+        // producer, leaving the actual query and its inherited flight alive.
+        producer.kill().unwrap();
+        assert!(!producer.wait().unwrap().success());
+        let path = root.join(format!("{}.lock", target_name("account", &key())));
+        let busy = crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB)
+            .err()
+            .map(|error| error.kind());
+        let mut release = loop {
+            match OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(file) => break file,
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "fixture did not reach its barrier"
+                    );
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("cannot release fixture: {error}"),
+            }
+        };
+        release.write_all(b"finish\n").unwrap();
+        drop(release);
+        let mut status = 0;
+        loop {
+            // The private producer's gh was adopted by this private subreaper.
+            // waitpid only reaps that exact child; no file-derived PID is signalled.
+            let reaped = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if reaped == pid {
+                break;
+            }
+            assert_eq!(reaped, 0, "fixture query was not an owned child");
+            assert!(Instant::now() < deadline, "fixture query did not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        let next = crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB);
+        assert_eq!(busy, Some(io::ErrorKind::WouldBlock));
+        assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+        assert!(next.is_ok(), "query exit retained its flight: {next:?}");
+        drop(next);
+        fs::remove_dir_all(root).unwrap();
     }
 }
