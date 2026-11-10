@@ -565,9 +565,13 @@ fn candidate_can_upgrade_source(
 /// install candidate line (128) is one: its own worker would apply its older
 /// preflight to the panes this release knows how to qualify.
 fn is_bootstrapped_source(protocol: u16) -> bool {
-    (matches!(protocol, 77 | 119) && crate::terminal_ipc::PROTOCOL_VERSION > 77)
-        || (protocol == crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
-            && crate::terminal_ipc::PROTOCOL_VERSION > crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL)
+    protocol < crate::terminal_ipc::PROTOCOL_VERSION
+        && matches!(
+            protocol,
+            77 | 119
+                | crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
+                | crate::terminal_ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL
+        )
 }
 
 /// The worker for a source the staged candidate cannot upgrade itself.
@@ -3497,93 +3501,97 @@ finally:
         // The install candidate line's daemon is updated by this release's
         // worker, so this release's inspector and preflight decide what the
         // update preserves. Its older worker would apply its own preflight.
-        let candidate_line = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
-        assert!(is_bootstrapped_source(candidate_line));
-        assert!(!is_bootstrapped_source(candidate_line - 1));
-        assert!(!is_bootstrapped_source(
-            crate::terminal_ipc::PROTOCOL_VERSION
-        ));
-        for daemon in [Some(&old), None] {
-            assert!(candidate_can_upgrade_source(
-                &new.version_root,
-                daemon,
-                candidate_line,
-                Some(&proof)
+        for candidate_line in [
+            crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
+            crate::terminal_ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL,
+        ] {
+            assert!(is_bootstrapped_source(candidate_line));
+            assert!(!is_bootstrapped_source(candidate_line - 1));
+            assert!(!is_bootstrapped_source(
+                crate::terminal_ipc::PROTOCOL_VERSION
             ));
-            for window in [&new, &old] {
+            for daemon in [Some(&old), None] {
+                assert!(candidate_can_upgrade_source(
+                    &new.version_root,
+                    daemon,
+                    candidate_line,
+                    Some(&proof)
+                ));
+                for window in [&new, &old] {
+                    assert_eq!(
+                        installed_update_worker(
+                            window,
+                            &new.version_root,
+                            Some(crate::terminal_ipc::PROTOCOL_VERSION),
+                            daemon,
+                            candidate_line,
+                            Some(&proof)
+                        )
+                        .unwrap(),
+                        "new"
+                    );
+                }
+            }
+            assert!(!candidate_can_upgrade_source(
+                &new.version_root,
+                Some(&old),
+                candidate_line,
+                None
+            ));
+            // The staged worker refuses a source without a complete proof, so
+            // such a bootstrapped source stays with this window's worker, even
+            // when the daemon belongs to a third build; an ordinary same-protocol
+            // source stays with its daemon owner's worker.
+            let incomplete = crate::model::HostSessionProof {
+                host_session_id: "partial-source".into(),
+                boot_id: "".into(),
+                host_incarnation: "partial-incarnation".into(),
+            };
+            let elder = layout("elder");
+            for (source_protocol, expected) in [
+                (candidate_line, "old"),
+                (crate::terminal_ipc::PROTOCOL_VERSION, "elder"),
+            ] {
                 assert_eq!(
                     installed_update_worker(
-                        window,
+                        &old,
                         &new.version_root,
                         Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                        daemon,
-                        candidate_line,
-                        Some(&proof)
+                        Some(&elder),
+                        source_protocol,
+                        Some(&incomplete)
                     )
                     .unwrap(),
-                    "new"
+                    expected
                 );
             }
-        }
-        assert!(!candidate_can_upgrade_source(
-            &new.version_root,
-            Some(&old),
-            candidate_line,
-            None
-        ));
-        // The staged worker refuses a source without a complete proof, so
-        // such a bootstrapped source stays with this window's worker, even
-        // when the daemon belongs to a third build; an ordinary same-protocol
-        // source stays with its daemon owner's worker.
-        let incomplete = crate::model::HostSessionProof {
-            host_session_id: "partial-source".into(),
-            boot_id: "".into(),
-            host_incarnation: "partial-incarnation".into(),
-        };
-        let elder = layout("elder");
-        for (source_protocol, expected) in [
-            (candidate_line, "old"),
-            (crate::terminal_ipc::PROTOCOL_VERSION, "elder"),
-        ] {
+            // A bootstrapped source goes to the staged worker only when it shares
+            // this window's protocol, and so the list of sources it bootstraps.
             assert_eq!(
                 installed_update_worker(
                     &old,
                     &new.version_root,
-                    Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                    Some(&elder),
-                    source_protocol,
-                    Some(&incomplete)
+                    Some(crate::terminal_ipc::PROTOCOL_VERSION + 1),
+                    Some(&old),
+                    candidate_line,
+                    Some(&proof)
                 )
                 .unwrap(),
-                expected
+                "old"
+            );
+            assert_eq!(
+                installed_update_worker(
+                    &new,
+                    &new.version_root,
+                    Some(crate::terminal_ipc::PROTOCOL_VERSION),
+                    Some(&old),
+                    candidate_line - 1,
+                    Some(&proof)
+                )
+                .unwrap(),
+                "old"
             );
         }
-        // A bootstrapped source goes to the staged worker only when it shares
-        // this window's protocol, and so the list of sources it bootstraps.
-        assert_eq!(
-            installed_update_worker(
-                &old,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION + 1),
-                Some(&old),
-                candidate_line,
-                Some(&proof)
-            )
-            .unwrap(),
-            "old"
-        );
-        assert_eq!(
-            installed_update_worker(
-                &new,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                Some(&old),
-                candidate_line - 1,
-                Some(&proof)
-            )
-            .unwrap(),
-            "old"
-        );
         // The real entry decision must not mistake an already-served window
         // for a completed daemon migration. No-daemon/current observations keep
         // the old already-running refusal instead of granting a legacy route.

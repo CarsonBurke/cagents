@@ -339,3 +339,124 @@ fn removed_channel_work_tags_are_incompatible_with_published_older_clients() {
         }
     }
 }
+
+#[test]
+fn pre_removal_protocol_preserves_the_restricted_upgrade_and_inspection_subset() {
+    let older = recorded(super::super::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL);
+    let current = traced();
+    let mut comparison = Comparison {
+        older: &older,
+        current: &current,
+        gated: Vec::new(),
+        refused: Vec::new(),
+        visited: BTreeSet::new(),
+        differences: Vec::new(),
+    };
+    // The source client sends its own protocol number, but the envelope's
+    // scalar fields and ownership proof must keep their exact positions.
+    for envelope in ["ClientEnvelope", "ServerEnvelope"] {
+        let name = format!("cagents::terminal::ipc::{envelope}");
+        let Some(Container::Struct(old)) = older.containers.get(&name) else {
+            panic!("missing historical {envelope}");
+        };
+        let Some(Container::Struct(new)) = current.containers.get(&name) else {
+            panic!("missing current {envelope}");
+        };
+        comparison.named(Direction::Reply, &old[..3], &new[..3], envelope);
+        assert_eq!(old[3].0, new[3].0);
+    }
+    // Compare only messages this upgrade path exchanges, preserving each
+    // original enum position and recursively comparing its complete payload.
+    // Comparing all requests would correctly reject the removed channel work;
+    // ordinary client admission remains separate and refuses this protocol.
+    for (name, direction, variants) in [
+        (
+            "ClientRequest",
+            Direction::Request,
+            &[
+                "Connect",
+                "List",
+                "ChatList",
+                "UpgradeImpact",
+                "PrepareConfirmedUpgrade",
+                "ResolveUpgradeChat",
+                "ChatAttach",
+                "ChatDetach",
+                "ChatVisibility",
+                "ChatRead",
+                "ChatClose",
+            ][..],
+        ),
+        (
+            "ServerResponse",
+            Direction::Reply,
+            &[
+                "connected",
+                "listed",
+                "chat_listed",
+                "upgrade_impact",
+                "upgrade_prepared",
+                "upgrade_chat_resolved",
+                "chat_attached",
+                "detached",
+                "accepted",
+                "chat_snapshot",
+                "chat_closed",
+            ][..],
+        ),
+        (
+            "ServerMessage",
+            Direction::Reply,
+            &[
+                "host_shutting_down",
+                "error",
+                "chat_activity",
+                "chat_observed",
+                "chat_changed",
+                "chat_account_usage",
+                "chat_limit",
+            ][..],
+        ),
+    ] {
+        let path = format!("cagents::terminal::ipc::{name}");
+        let Some(Container::Enum(old)) = older.containers.get(&path) else {
+            panic!("missing historical {name}");
+        };
+        let Some(Container::Enum(new)) = current.containers.get(&path) else {
+            panic!("missing current {name}");
+        };
+        for variant in variants {
+            let index = old.iter().position(|(name, _)| name == variant).unwrap();
+            let (new_name, new_fields) = new.get(index).unwrap();
+            assert_eq!(new_name, variant, "{name}::{variant} changed its tag");
+            comparison.fields(
+                direction,
+                old[index].1.as_ref().unwrap(),
+                new_fields.as_ref().unwrap(),
+                &format!("{name}::{variant}"),
+            );
+        }
+    }
+    // Response is the envelope around each explicitly selected reply above.
+    for shapes in [&older, &current] {
+        let Some(Container::Enum(messages)) = shapes
+            .containers
+            .get("cagents::terminal::ipc::ServerMessage")
+        else {
+            unreachable!();
+        };
+        assert_eq!(messages[0].0, "response");
+        assert!(matches!(
+            &messages[0].1,
+            Some(Fields::Struct(fields)) if fields == &vec![(
+                "response".into(),
+                Shape::Container("cagents::terminal::ipc::ServerResponse".into())
+            )]
+        ));
+    }
+    assert!(
+        comparison.differences.is_empty(),
+        "{:?}",
+        comparison.differences
+    );
+}

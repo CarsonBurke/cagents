@@ -224,6 +224,10 @@ pub const PROTOCOL_VERSION: u16 = 161;
 /// inspector. Its CLI cannot speak this release's wire format after the
 /// channel-work variants were removed.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+/// The last protocol before channel-work removal. Its restricted upgrade and
+/// inspection messages keep their encoding, so it remains a qualified source
+/// for an update. Ordinary clients still require the current protocol.
+pub const PRE_CHANNEL_WORK_REMOVAL_PROTOCOL: u16 = 160;
 
 mod older_clients;
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
