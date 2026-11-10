@@ -1581,6 +1581,16 @@ harness, it provides:
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **UI-only restart.** To measure restored chats while their providers keep
+  running, close the app window normally, then run `relaunch` in the same
+  session. It reuses the recorded executables through the development runner
+  and refuses compilation under the native lock. `relaunch` stays in the
+  foreground until that UI exits; run measurements from another shell and
+  finish with `stop`. This preserves the daemon and live providers, whereas
+  `stop` ends them. Add `--chat-stages` to record UI-thread chat stage timings
+  under `logs/` on normal close; these measure synchronous work rather than
+  compositor presentation. Recreate the same workload on each revision when comparing
+  startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
   width and size, so a pair can be compared and named in the PR.
