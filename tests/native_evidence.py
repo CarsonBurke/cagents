@@ -84,7 +84,7 @@ STUBS = {
         if [ -n "${cmd:-}" ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
-            sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
+            NIRI_SOCKET=stub-niri sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
             # Nor does it report ready until the app is up, unless told not to wait.

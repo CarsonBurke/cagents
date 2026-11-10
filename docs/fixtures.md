@@ -238,3 +238,20 @@ Every refusal names its cause and the next command. The common ones:
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
+
+## A read-only native update review
+
+Development UI builds under `native-evidence` read
+`home/.config/fixture-update-review.json` in `CAGENTS_EVIDENCE_FIXTURE`.
+Copy `tests/fixtures/update-review.json` there with mode 0600, then start the
+session (or wait for the active review's next status poll). The example includes
+running work, a blocked conversation, a daemon notice and a paused terminal.
+The file must contain an awaiting-confirmation job named `fixture-update-review`
+with a blocked daemon preview. Apply is disabled; decisions fail before looking
+up an installation. Remove the file to end the fixture review.
+
+This loads data into the actual native dialog and supports scrolling and Copy
+details. It does not run providers, inspect a live update inventory, perform an
+update, or exercise cancellation/recovery. The grouped Paused heading belongs
+to the CLI review. The native dialog currently omits saved stopped panes, so
+the fixture's paused terminal does not appear in that dialog.

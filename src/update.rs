@@ -3,6 +3,8 @@
 mod candidate;
 mod confirmation;
 mod installed;
+#[cfg(all(feature = "ui", feature = "development"))]
+mod review_fixture;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
@@ -780,6 +782,12 @@ pub fn status() -> Result<Option<UpdateJob>, UpdateError> {
 /// installation failure as a warning in every subsequently installed window.
 #[cfg(feature = "ui")]
 pub(crate) fn status_for_ui() -> Result<Option<UpdateJob>, UpdateError> {
+    #[cfg(feature = "development")]
+    if let Some(root) = std::env::var_os("CAGENTS_EVIDENCE_FIXTURE")
+        && let Some(job) = review_fixture::read(Path::new(&root))?
+    {
+        return Ok(Some(job));
+    }
     let Some(job) = status()? else {
         return Ok(None);
     };
