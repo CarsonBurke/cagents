@@ -5676,9 +5676,9 @@ impl Runtime {
     /// hidden, since its provider becoming ready, and the models it lists,
     /// reach the card only through that snapshot.
     ///
-    /// A connection already lost has nothing to tell: the pane reports the
-    /// disconnection itself, and the handle that replaces it is shown with the
-    /// visibility recorded here.
+    /// A frozen source has already taken readability from the connection and
+    /// releases its raw body even if the reader died before its UI wake. Ordinary
+    /// closed cards keep the client's final body as their cold readable fallback.
     ///
     /// A warm hidden chat keeps its body without reading further: what it
     /// missed arrives as one change, or nothing, when it is shown again.
@@ -5690,8 +5690,13 @@ impl Runtime {
                 || self.queued.is_some()
                 || !self.followups.is_empty());
         match self.handle() {
-            Some(handle) if handle.is_connected() => {
-                match handle.set_interest(interested, retain_body) {
+            Some(handle) if frozen || handle.is_connected() => {
+                let result = if frozen {
+                    handle.hand_off_source_body()
+                } else {
+                    handle.set_interest(interested, retain_body)
+                };
+                match result {
                     // The connection can drop between the check and the call, and
                     // is then as lost as one found lost: not this pass's to report.
                     Err(_) if !handle.is_connected() => Ok(()),
@@ -28771,7 +28776,10 @@ mod tests {
             runtime.set_visible(false).unwrap();
             runtime.refresh();
             assert_eq!(runtime.snapshot.items, [item.clone()]);
+            assert!(runtime.warm_stamp().is_some());
+            runtime.cool();
             assert!(runtime.cache.is_empty());
+            assert_eq!(runtime.snapshot.items, [item.clone()]);
             runtime.set_visible(true).unwrap();
             preparation::drain_fixture(runtime);
             assert_eq!(runtime.snapshot.items, [item]);

@@ -443,18 +443,34 @@ impl Publication {
     }
 }
 
+// Local readability ownership, independent of daemon/provider ownership and
+// ordinary offscreen interest. A frozen UI projection replaces the client's
+// final-body fallback only for this exact connection.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum BodyOwner {
+    #[default]
+    Client,
+    FrozenProjection,
+}
+
+#[derive(Default)]
+struct PublicationPolicy {
+    revision: u64,
+    body_owner: BodyOwner,
+}
+
 struct Publications {
     current: ArcSwap<Publication>,
     // Only writers use this gate. All body derivation and destruction happens
     // outside it; UI presentation readers never acquire a producer lock.
-    commit: Mutex<u64>,
+    commit: Mutex<PublicationPolicy>,
 }
 
 impl Publications {
     fn new(snapshot: Snapshot) -> Self {
         Self {
             current: ArcSwap::from(Publication::initial(snapshot)),
-            commit: Mutex::new(0),
+            commit: Mutex::new(PublicationPolicy::default()),
         }
     }
 
@@ -471,7 +487,7 @@ impl Publications {
     /// alone cannot fence a hide/show cycle while that response is built.
     fn capture(&self) -> (Arc<Publication>, u64) {
         let revision = self.commit.lock().unwrap_or_else(|p| p.into_inner());
-        (self.current.load_full(), *revision)
+        (self.current.load_full(), revision.revision)
     }
 
     fn replace(
@@ -523,9 +539,14 @@ impl Publications {
             if !final_body && current.snapshot.generation != base.snapshot.generation {
                 (None, current, None)
             } else {
+                // A final body is the cold kept-card fallback after ordinary
+                // hiding. Only an explicit handoff to an already readable
+                // frozen projection relinquishes that fallback. Final control
+                // and identity metadata remains authoritative in either mode.
                 let resident = full.is_some()
+                    && current_revision.body_owner == BodyOwner::Client
                     && (final_body
-                        || (*current_revision == revision
+                        || (current_revision.revision == revision
                             && Arc::ptr_eq(base, &current)
                             && body.load(Ordering::Acquire)));
                 let next = if resident {
@@ -2695,7 +2716,7 @@ impl ClientHandle {
                             let (old, current) = {
                                 let current_revision = publication.commit.lock().unwrap_or_else(|p| p.into_inner());
                                 let current = publication.current.load_full();
-                                let old = if *current_revision == revision && Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
+                                let old = if current_revision.revision == revision && Arc::ptr_eq(&base, &current) { Some(publication.current.swap(proposed.take().unwrap())) } else { None };
                                 (old, current)
                             };
                             let applied = old.is_some(); drop(old); drop(current);
@@ -3086,7 +3107,29 @@ impl ClientHandle {
     /// Keep control notifications flowing for queued commands without keeping
     /// renderable history resident in an offscreen UI card.
     pub(crate) fn set_interest(&self, interested: bool, retain_body: bool) -> Result<(), String> {
-        if !self.inner.alive.load(Ordering::Acquire) {
+        self.update_interest(
+            interested,
+            retain_body,
+            retain_body.then_some(BodyOwner::Client),
+        )
+    }
+
+    /// The caller now owns an already projected, readable source window. Release
+    /// this client's raw body even if its reader died before the UI saw its wake.
+    /// A late final frame still supplies identity/control state, but cannot take
+    /// body ownership back. A later live body request restores normal ownership.
+    pub(crate) fn hand_off_source_body(&self) -> Result<(), String> {
+        self.update_interest(false, false, Some(BodyOwner::FrozenProjection))
+    }
+
+    fn update_interest(
+        &self,
+        interested: bool,
+        retain_body: bool,
+        body_owner: Option<BodyOwner>,
+    ) -> Result<(), String> {
+        let handoff = body_owner == Some(BodyOwner::FrozenProjection);
+        if !handoff && !self.inner.alive.load(Ordering::Acquire) {
             return Err("Chat is disconnected".into());
         }
         let changed = self.inner.visible.swap(interested, Ordering::AcqRel) != interested;
@@ -3098,16 +3141,23 @@ impl ClientHandle {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner());
             let current = self.inner.publication.current.load_full();
-            if !self.inner.alive.load(Ordering::Acquire) {
+            if !handoff && !self.inner.alive.load(Ordering::Acquire) {
                 (None, current, Err("Chat is disconnected"))
             } else {
+                let owner_changed = body_owner.is_some_and(|owner| {
+                    let changed = revision.body_owner != owner;
+                    revision.body_owner = owner;
+                    changed
+                });
                 let body_changed = self
                     .inner
                     .body_requested
                     .swap(retain_body, Ordering::AcqRel)
-                    != retain_body;
+                    != retain_body
+                    || owner_changed;
                 if body_changed {
-                    *revision = revision
+                    revision.revision = revision
+                        .revision
                         .checked_add(1)
                         .expect("chat body-policy revision exhausted");
                 }
@@ -3124,7 +3174,7 @@ impl ClientHandle {
                     (None, current.resident, current.snapshot.generation)
                 };
                 let observation = (
-                    *revision,
+                    revision.revision,
                     published_resident,
                     published_generation,
                     old.is_some(),
@@ -3148,6 +3198,9 @@ impl ClientHandle {
                 requested_interested = interested, requested_retain_body = retain_body,
                 policy_revision = revision, published_generation, published_resident,
                 metadata_installed);
+        }
+        if !self.inner.alive.load(Ordering::Acquire) {
+            return Err("Chat is disconnected".into());
         }
         if interested && (changed || body_changed) {
             // Controls can use retained metadata immediately. The visibility
@@ -6352,6 +6405,205 @@ mod tests {
         assert_eq!(handle.snapshot().transcript_bytes(), 6 * 64 * 1024);
         advance_tx.send(()).unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn final_wire_body_respects_frozen_handoff_and_keeps_ordinary_cold_fallback() {
+        #[derive(Clone, Copy, Debug)]
+        enum Case {
+            Visible,
+            HiddenBeforeClose,
+            HiddenAfterClose,
+            FrozenBeforeClose,
+            FrozenDuringFinalDerivation,
+            NewLiveBodyConsumer,
+        }
+        for case in [
+            Case::Visible,
+            Case::HiddenBeforeClose,
+            Case::HiddenAfterClose,
+            Case::FrozenBeforeClose,
+            Case::FrozenDuringFinalDerivation,
+            Case::NewLiveBodyConsumer,
+        ] {
+            let item = |body: &str| {
+                Arc::new(super::super::Item {
+                    id: "final-body".into(),
+                    role: super::super::Role::Assistant,
+                    started_at: None,
+                    at: None,
+                    content: super::super::ItemContent::Text {
+                        text: body.into(),
+                        thinking: false,
+                        phase: Default::default(),
+                    },
+                })
+            };
+            let initial = Snapshot {
+                generation: 1,
+                sampled_at: Some(1_000),
+                ready: true,
+                items: vec![item("original readable source")],
+                ..Default::default()
+            };
+            // Final identity/control state remains authoritative even when its
+            // generation is older and body ownership has moved to the UI.
+            let final_snapshot = Snapshot {
+                generation: 0,
+                session_id: Some("final-session".into()),
+                exited: true,
+                error: Some("Final close reason".into()),
+                items: vec![item("final readable source")],
+                ..Default::default()
+            };
+            let (client, mut server) = UnixStream::pair().unwrap();
+            let (send_tx, send_rx) = std::sync::mpsc::channel();
+            let worker = thread::spawn(move || {
+                server
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                server
+                    .set_write_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+                let proof = host_proof("final-body-policy");
+                let mut codec = FrameCodec::new(ipc::MAX_FRAME_BYTES);
+                let respond =
+                    |codec: &mut FrameCodec, server: &mut UnixStream, request_id, response| {
+                        codec
+                            .write(
+                                server,
+                                &ServerEnvelope {
+                                    version: PROTOCOL_VERSION,
+                                    request_id,
+                                    proof: proof.clone(),
+                                    message: ServerMessage::Response { response },
+                                },
+                            )
+                            .unwrap();
+                    };
+                let connect: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(connect.request_id),
+                    ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                );
+                let start: ClientEnvelope = codec.read(&mut server).unwrap().unwrap();
+                let ClientRequest::ChatStart { session, .. } = start.request else {
+                    panic!("expected start")
+                };
+                let chat_id = session.id;
+                respond(
+                    &mut codec,
+                    &mut server,
+                    Some(start.request_id),
+                    ServerResponse::ChatAttached {
+                        session,
+                        snapshot: initial,
+                    },
+                );
+                send_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                respond(
+                    &mut codec,
+                    &mut server,
+                    None,
+                    ServerResponse::ChatClosed {
+                        chat_id,
+                        snapshot: final_snapshot,
+                    },
+                );
+            });
+            let (wake_tx, wake_rx) = std::sync::mpsc::channel();
+            let handle = ClientHandle::connect_on(
+                client,
+                omp_card(None, None),
+                Intent::Start,
+                None,
+                false,
+                None,
+                None,
+                None,
+                move |wake| {
+                    let _ = wake_tx.send(wake);
+                },
+            )
+            .unwrap();
+            match case {
+                Case::HiddenBeforeClose => handle.set_visible(false).unwrap(),
+                Case::FrozenBeforeClose => handle.hand_off_source_body().unwrap(),
+                Case::NewLiveBodyConsumer => {
+                    handle.hand_off_source_body().unwrap();
+                    handle.set_interest(true, true).unwrap();
+                }
+                _ => {}
+            }
+            let gate = if matches!(case, Case::FrozenDuringFinalDerivation) {
+                let (paused_tx, paused_rx) = std::sync::mpsc::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                REPLACEMENT_GATES.lock().unwrap().insert(
+                    Arc::as_ptr(&handle.inner.publication) as usize,
+                    (paused_tx, resume_rx),
+                );
+                Some((paused_rx, resume_tx))
+            } else {
+                None
+            };
+            send_tx.send(()).unwrap();
+            if let Some((paused_rx, resume_tx)) = gate {
+                paused_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(!handle.is_connected());
+                assert!(handle.hand_off_source_body().is_err());
+                assert!(!handle.inner.body_requested.load(Ordering::Acquire));
+                assert!(handle.resident_snapshot_with_clock().is_none());
+                resume_tx.send(()).unwrap();
+            }
+            while handle.snapshot().generation != 0 {
+                wake_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+            worker.join().unwrap();
+            assert!(!handle.is_connected());
+            if matches!(case, Case::HiddenAfterClose) {
+                assert!(handle.set_visible(false).is_err());
+            }
+            let snapshot = handle.snapshot();
+            assert_eq!(
+                snapshot.session_id.as_deref(),
+                Some("final-session"),
+                "{case:?}"
+            );
+            assert!(snapshot.exited && !snapshot.ready, "{case:?}");
+            assert_eq!(
+                snapshot.error.as_deref(),
+                Some("Final close reason"),
+                "{case:?}"
+            );
+            assert_eq!(handle.snapshot_with_clock().1.unwrap().sampled_at, 1_000);
+            let frozen = matches!(
+                case,
+                Case::FrozenBeforeClose | Case::FrozenDuringFinalDerivation
+            );
+            assert_eq!(
+                handle.resident_snapshot_with_clock().is_none(),
+                frozen,
+                "{case:?}"
+            );
+            if frozen {
+                assert_eq!(snapshot.transcript_bytes(), 0, "{case:?}");
+                assert!(handle.inner.publication.current.load().lineage.is_empty());
+            } else {
+                // An ordinary cold kept card reveals from this final body;
+                // its daemon/actor has already closed and cannot hydrate it.
+                let (readable, _) = handle.resident_snapshot_with_clock().unwrap();
+                assert!(
+                    matches!(&readable.items[0].content,
+                    super::super::ItemContent::Text { text, .. } if text == "final readable source"),
+                    "{case:?}"
+                );
+            }
+        }
     }
 
     fn paused_wire_publication(visibility: Option<bool>) {

@@ -551,3 +551,223 @@ fn a_hidden_successor_clears_the_old_warm_stamp_before_reusing_ids_and_generatio
         matches!(&runtime(&app, card).snapshot.items[0].content, ItemContent::Text { text, .. } if text == &body)
     );
 }
+
+#[test]
+fn reconnect_before_the_disconnect_wake_releases_only_the_retired_raw_source() {
+    let _context = text_copy::isolated_context();
+    for (partial, recovery) in [
+        (false, chat::Recovery::Retry),
+        (true, chat::Recovery::Blocked),
+    ] {
+        let (mut app, card, target, old, shown, _) = source(partial);
+        let frozen = runtime(&app, card).snapshot.clone();
+        let clock = format!("{:?}", runtime(&app, card).source_clock);
+        let session = runtime(&app, card).session.clone();
+        let raw_part = {
+            let raw = runtime(&app, card).logical_prose.raw().unwrap();
+            assert!(raw.items.len() > 1, "this fixture joins several raw parts");
+            let part = raw.items.last().unwrap();
+            assert!(
+                frozen.items.iter().all(|shown| !Arc::ptr_eq(shown, part)),
+                "this raw-only item differs from the readable joined projection"
+            );
+            Arc::downgrade(part)
+        };
+        let retired = old.observe_snapshot_retirement_for_test();
+
+        // The reader has exited, but its UI Wake has not run. Ordinary dead
+        // sources retain their readable publication until explicitly released.
+        old.disconnect_for_test();
+        assert!(!old.is_connected());
+        assert!(old.is_visible_for_test());
+        assert!(old.resident_snapshot_with_clock().is_some());
+        assert!(raw_part.upgrade().is_some());
+        assert!(!runtime(&app, card).disconnected);
+        assert!(!runtime(&app, card).resume_source_pinned);
+        assert!(!app.chat_start_pending(card));
+
+        // This is the stopped pane's actual Resume action, ahead of Wake.
+        drop(app.handle_chat_ui(Action::Reconnect(target)));
+        let attempt = app.chat_ui.attempt(card).expect("Resume must be in flight");
+        assert!(matches!(attempt.intent, chat::Intent::Resume));
+        assert_eq!(attempt.session, session);
+        let attempt = attempt.target;
+        let assert_source = |app: &Cagents| {
+            let state = runtime(app, card);
+            assert!(state.resume_source_pinned);
+            assert!(Arc::ptr_eq(&state.snapshot, &frozen));
+            assert_eq!(state.snapshot.items, frozen.items);
+            assert_eq!(state.snapshot.error, frozen.error);
+            assert_eq!(format!("{:?}", state.source_clock), clock);
+            assert_eq!(state.composer.text(), DRAFT);
+            assert!(!old.is_visible_for_test(), "old-source reads are inactive");
+            assert!(old.resident_snapshot_with_clock().is_none());
+            assert_eq!(old.snapshot().transcript_bytes(), 0);
+            assert!(state.logical_prose.raw().is_none());
+            assert!(state.logical_prose.request().is_none());
+            assert!(logical_prose::subscriptions(state).is_none());
+        };
+        assert_source(&app);
+
+        // Policy release is immediate; destruction follows the existing
+        // asynchronous publication reaper. The signal observes this exact
+        // publication, not process RSS or universal duplicated text bytes.
+        retired
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the explicitly released dead-client publication must retire");
+        assert!(
+            raw_part.upgrade().is_none(),
+            "the raw-only part is gone while the joined projection remains readable"
+        );
+        assert_source(&app);
+
+        // A full late frame still obeys the body policy: false retention is
+        // local state even though this dead wire cannot send visibility.
+        old.deliver_snapshot_for_test(Snapshot {
+            generation: 90_000,
+            sampled_at: Some(90_000_000),
+            ready: true,
+            exited: true,
+            session_id: Some(THREAD.into()),
+            items: frozen.items.clone(),
+            ..Snapshot::default()
+        });
+        assert_source(&app);
+        drop(app.handle_chat_ui(Action::Wake(
+            target,
+            Wake::Disconnected("Delayed old-reader disconnect".into()),
+        )));
+        assert_eq!(tests::chat_runtime_attempt(&app, card), attempt);
+        assert_source(&app);
+
+        for failed in [false, true] {
+            if failed {
+                tests::answer_start(
+                    &mut app,
+                    attempt,
+                    Err(chat::StartFailure {
+                        message: REFUSAL.into(),
+                        recovery,
+                    }),
+                );
+            }
+            let state = app.chat_runtime_mut(target).unwrap();
+            state.set_visible(false).unwrap();
+            assert!(state.warm_stamp().is_some());
+            assert!(!state.cache.is_empty());
+            assert_source(&app);
+            let state = app.chat_runtime_mut(target).unwrap();
+            state.cool();
+            state.refresh();
+            assert!(state.warm_stamp().is_none());
+            assert!(state.cache.is_empty());
+            assert!(state.child_cache.is_empty());
+            assert!(state.selection_document.borrow().is_none());
+            assert_source(&app);
+            let state = app.chat_runtime_mut(target).unwrap();
+            state.set_visible(true).unwrap();
+            preparation::drain_fixture(state);
+            assert!(!state.cache["answer"].placeholder);
+            assert!(
+                matches!(&state.snapshot.items[0].content, ItemContent::Text { text, .. } if text == &shown)
+            );
+            if failed {
+                assert_eq!(state.error.as_deref(), Some(REFUSAL));
+                assert_eq!(
+                    state.start_retry_blocked,
+                    recovery == chat::Recovery::Blocked
+                );
+            }
+            assert_source(&app);
+        }
+    }
+}
+
+/// The framed client contract covers retaining ChatClosed's final publication
+/// when close arrives while hidden. This fixture starts at that boundary and
+/// exercises the ordinary Runtime consumer, without a frozen Resume source.
+#[test]
+fn an_ordinary_cold_hidden_chat_reveals_its_dead_clients_final_publication() {
+    let mut session = fresh_chat_session(
+        Provider::Claude,
+        TerminalId::new(),
+        "/project".into(),
+        &Account::system(Provider::Claude),
+        false,
+    )
+    .unwrap();
+    session.launch.session_id = Some(THREAD.into());
+    let item = Arc::new(chat::Item {
+        id: "ordinary-final-answer".into(),
+        role: chat::Role::Assistant,
+        content: ItemContent::Text {
+            text: "The final answer arrived while this ordinary card was hidden.".into(),
+            thinking: false,
+            phase: chat::Phase::Final,
+        },
+        at: None,
+        started_at: None,
+    });
+    let final_item = Arc::downgrade(&item);
+    let handle = Arc::new(ClientHandle::fixture(
+        session.clone(),
+        Snapshot {
+            generation: 29,
+            sampled_at: Some(70_000),
+            ready: true,
+            exited: true,
+            session_id: Some(THREAD.into()),
+            error: Some("The provider stopped after its final answer".into()),
+            items: vec![item],
+            ..Snapshot::default()
+        },
+    ));
+    handle.disconnect_for_test();
+    let clock = format!("{:?}", handle.resident_snapshot_with_clock().unwrap().1);
+    let mut state = Runtime::new(
+        Target {
+            card: CardId::new(),
+            generation: 1,
+        },
+        session,
+        Connection::Live(handle.clone()),
+        false,
+        crate::settings::EditorSyntaxTheme::default(),
+    );
+    state.replace_draft(text_editor::Content::with_text(DRAFT));
+    for _ in 0..3 {
+        state.set_visible(false).unwrap();
+        state.cool();
+        state.refresh();
+        assert!(!state.resume_source_pinned);
+        assert!(!state.retains_source_body());
+        assert!(state.warm_stamp().is_none());
+        assert!(state.snapshot.items.is_empty());
+        assert!(state.cache.is_empty());
+        assert!(state.logical_prose.raw().is_none());
+        assert!(!handle.is_connected());
+        assert!(handle.resident_snapshot_with_clock().is_some());
+        assert!(handle.snapshot().transcript_bytes() > 0);
+        assert!(final_item.upgrade().is_some());
+    }
+
+    state.set_visible(true).unwrap();
+    preparation::drain_fixture(&mut state);
+    assert!(!state.resume_source_pinned);
+    assert_eq!(state.snapshot.generation, 29);
+    assert_eq!(state.snapshot.items.len(), 1);
+    assert!(Arc::ptr_eq(
+        &state.snapshot.items[0],
+        &final_item.upgrade().unwrap()
+    ));
+    assert!(
+        matches!(&state.snapshot.items[0].content, ItemContent::Text { text, .. } if text == "The final answer arrived while this ordinary card was hidden.")
+    );
+    assert!(!state.cache["ordinary-final-answer"].placeholder);
+    assert_eq!(
+        state.snapshot.error.as_deref(),
+        Some("The provider stopped after its final answer")
+    );
+    assert_eq!(format!("{:?}", state.source_clock), clock);
+    assert_eq!(state.composer.text(), DRAFT);
+}
