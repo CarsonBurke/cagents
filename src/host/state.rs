@@ -2970,6 +2970,21 @@ pub(super) fn restore_upgrade(host: &SharedHost) -> Result<Vec<TerminalId>, Stri
     )
 }
 
+/// Service fixtures inspect real kernel data for their own processes rather
+/// than unrelated processes running beside them on the test host.
+#[cfg(test)]
+pub(in crate::host) fn restore_upgrade_with_processes_for_test(
+    host: &SharedHost,
+    processes: &std::path::Path,
+) -> Result<Vec<TerminalId>, String> {
+    restore_upgrade_from(
+        host,
+        crate::upgrade::handoff::Store::discover()?,
+        processes,
+        holder_directory().ok().as_deref(),
+    )
+}
+
 /// A holder's private record is discovery only. The live holder must return
 /// matching process evidence and the previous daemon's issued lineage before
 /// its PTY may be attached; a matching numeric terminal ID alone is insufficient.
