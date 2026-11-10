@@ -1519,6 +1519,70 @@ fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<Terminal
     })
 }
 
+/// A proofless history selection can join the account's live shared daemon
+/// without retiring an old pane. This grants no replacement-writer authority:
+/// Start receives the unchanged bare descriptor and rechecks the endpoint.
+fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool, ProtocolError> {
+    if source.launch.provider != Provider::Codex
+        || source.proof.is_some()
+        || source.terminal.is_some()
+        || source.owned_codex_listener.is_some()
+        || source.native_continuity != chat::NativeContinuity::ReconnectOnly
+        || source.launch.session_id.is_none()
+    {
+        return Ok(false);
+    }
+    let process_launch = prepare_native_process_launch(
+        &source.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Codex,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )?;
+    let Some(shared) = chat::protocol::codex::shared_daemon_socket(&process_launch) else {
+        return Ok(false);
+    };
+    if !owned_listener::listening(&shared) {
+        return Ok(false);
+    }
+    // Preserve Start's recorded-selector, effective account and directory
+    // checks. Constructing the adapter validates the exact thread/recipe;
+    // it neither initializes nor launches a provider.
+    super::account_lifecycle::ensure_launch(
+        host,
+        &source.launch.recipe.working_directory,
+        &source.launch.recipe.environment,
+        &Default::default(),
+        true,
+    )?;
+    super::account_lifecycle::ensure_launch_at_directory(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &process_launch.recipe.unset_environment,
+        false,
+        None,
+    )?;
+    super::account_lifecycle::ensure_launch(
+        host,
+        &process_launch.recipe.working_directory,
+        &process_launch.recipe.environment,
+        &process_launch.recipe.unset_environment,
+        false,
+    )?;
+    if let Err(failure) = chat::protocol::codex::create(&process_launch) {
+        // A service disappearing during preparation grants no exemption from
+        // the normal ended-execution and writer proof below.
+        if !owned_listener::listening(&shared) {
+            return Ok(false);
+        }
+        return Err(error(failure));
+    }
+    Ok(true)
+}
+
 /// Read the same execution evidence for restart and picker preparation, so
 /// unreadable evidence retains its concrete diagnostic in both paths.
 fn require_ended_codex_execution(
@@ -1526,7 +1590,17 @@ fn require_ended_codex_execution(
     session: &Session,
     boot: &crate::model::BootId,
 ) -> std::io::Result<()> {
-    require_ended_codex_execution_for_launch(host, session, boot, &session.launch)
+    let launch = prepare_native_process_launch(
+        &session.launch,
+        Some(crate::model::agent_recovery::fresh_native_environment(
+            Provider::Codex,
+            false,
+        )),
+        &BTreeMap::new(),
+        None,
+    )
+    .map_err(|failure| std::io::Error::other(failure.message))?;
+    require_ended_codex_execution_for_launch(host, session, boot, &launch)
 }
 
 /// The process launch may add the effective account home without changing the
@@ -3507,6 +3581,9 @@ fn process_inner(
             if !retirement.is_classified() && has_native_owner(&ended)? {
                 return Ok(ServerResponse::ChatResumePrepared { session: ended });
             }
+            if prepare_shared_codex_join(host, &source)? {
+                return Ok(ServerResponse::ChatResumePrepared { session: source });
+            }
             // A kernel boot change proves every process from the saved boot
             // is gone. Unlike missing runtime files within the same boot, it
             // authorizes an exact disk resume without its ephemeral receipt.
@@ -3542,8 +3619,15 @@ fn process_inner(
                     .is_some_and(|(_, paired_closed)| paired_closed)
                     || match reserve_unhosted_allocation(host, &source, None) {
                         Ok(_fence) => {
-                            require_ended_codex_execution(host, &source, &proof.boot_id)
-                                .map_err(|error| unavailable(error.to_string()))?;
+                            require_ended_codex_execution(host, &source, &proof.boot_id).map_err(
+                                |failure| {
+                                    ProtocolError::new(
+                                        ProtocolErrorCode::TerminalUnavailable,
+                                        failure.to_string(),
+                                        source.launch.provider == Provider::Codex,
+                                    )
+                                },
+                            )?;
                             true
                         }
                         Err(()) => false,

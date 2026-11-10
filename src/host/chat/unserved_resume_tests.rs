@@ -42,6 +42,44 @@ fn reopened(root: &Path) -> Session {
     }
 }
 
+/// Real kernel writer ownership, without a rollout FD or provider argv that
+/// main's process census could otherwise identify as this thread's execution.
+struct ThreadWriter(std::fs::File);
+
+impl ThreadWriter {
+    fn hold(home: &Path) -> Self {
+        use std::os::fd::AsRawFd;
+        let locks = home.join("thread-writer-locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(locks.join(format!("{}.lock", thread_id())))
+            .unwrap();
+        assert_eq!(unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) }, 0);
+        assert_eq!(
+            codex_owners::writer(
+                Some(&locks.join(format!("{}.lock", thread_id()))),
+                thread_id()
+            )
+            .unwrap()
+            .unwrap()
+            .pid,
+            std::process::id() as libc::pid_t,
+        );
+        Self(file)
+    }
+}
+
+impl Drop for ThreadWriter {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        assert_eq!(unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) }, 0);
+    }
+}
+
 /// A Codex stand-in that records its arguments and stays running.
 fn install_codex(root: &Path) {
     let program = root.join("bin/codex");
@@ -246,32 +284,160 @@ fn a_reopened_codex_thread_joins_the_shared_daemon_serving_it() {
     let (host, _, path) = fixture();
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
-    let home = root.join("home/.codex");
+    let home = root.join("account");
+    let _writer = ThreadWriter::hold(&home);
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
     let listener = UnixListener::bind(control.join("app-server-control.sock")).unwrap();
     let (methods, received) = mpsc::channel();
     let server = thread::spawn(move || serve(listener, home, methods));
     host.lock().unwrap().register_client(1);
-    let requested = reopened(&root);
+    let mut requested = reopened(&root);
+    requested.launch.recipe.environment.insert(
+        "CODEX_HOME".into(),
+        root.join("account").to_str().unwrap().into(),
+    );
+    let ServerResponse::ChatResumePrepared { session: prepared } = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: requested.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected join-only preparation")
+    };
+    assert_eq!(
+        prepared, requested,
+        "preparation must not allocate or rewrite a bare source"
+    );
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert!(host.lock().unwrap().chats.is_empty());
+    assert!(!root.join("codex-arguments").exists());
+    let mut conflicting = requested.clone();
+    conflicting.launch.recipe.arguments[1] = "another-thread".into();
+    let refused = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: conflicting,
+        },
+    )
+    .unwrap_err();
+    assert_eq!(refused.code, ProtocolErrorCode::InvalidRequest);
+    assert!(!refused.retryable, "a changed recipe is structural");
     let session = started(
-        start(
+        process(
             &host,
             1,
-            requested.clone(),
-            None,
-            false,
-            None,
-            Default::default(),
+            ClientRequest::ChatStart {
+                session: prepared,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
         )
         .unwrap(),
     );
     resumed(&received);
+    assert!(
+        !root.join("codex-arguments").exists(),
+        "a live shared daemon must be joined without launching a private server"
+    );
     assert!(!session.owns_codex_listener());
     assert_eq!(session.launch.recipe, requested.launch.recipe);
-    assert!(!root.join("codex-arguments").exists());
     crate::host::finish_chat_shutdown(&host).unwrap();
     server.join().unwrap();
+}
+
+#[test]
+fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
+    const NAME: &str = "host::chat::unserved_resume_tests::a_prepared_codex_resume_rechecks_the_shared_service_before_starting";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    install_codex(&root);
+    let home = root.join("home/.codex");
+    let writer = ThreadWriter::hold(&home);
+    let control = home.join("app-server-control");
+    std::fs::create_dir_all(&control).unwrap();
+    let shared = control.join("app-server-control.sock");
+    let listener = UnixListener::bind(&shared).unwrap();
+    host.lock().unwrap().register_client(1);
+    let requested = reopened(&root);
+    let ServerResponse::ChatResumePrepared { session: prepared } = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: requested.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected join-only preparation")
+    };
+    assert_eq!(prepared, requested);
+    drop(listener);
+    let refusal = process(
+        &host,
+        1,
+        ClientRequest::ChatStart {
+            session: prepared,
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    )
+    .unwrap_err();
+    assert!(refusal.retryable, "{refusal:?}");
+    assert_eq!(
+        refusal.message,
+        format!(
+            "Cannot restart Codex: {}",
+            running_codex_process(std::process::id())
+        )
+    );
+    let refuse_prepare = || {
+        process(
+            &host,
+            1,
+            ClientRequest::ChatPrepareResume {
+                source: requested.clone(),
+            },
+        )
+        .unwrap_err()
+    };
+    let prepare = refuse_prepare();
+    assert_eq!(prepare.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(
+        prepare.retryable,
+        "a live writer can end before Retry: {prepare:?}"
+    );
+    assert_eq!(prepare.message, running_codex_process(std::process::id()));
+    assert_eq!(
+        refuse_prepare(),
+        prepare,
+        "Retry while held repeats the same refusal"
+    );
+    assert!(
+        !root.join("codex-arguments").exists(),
+        "no private replacement was launched"
+    );
+    assert!(host.lock().unwrap().chat_spawning.is_empty());
+    assert!(host.lock().unwrap().chats.is_empty());
+    drop(writer);
+    assert!(
+        matches!(
+            process(
+                &host,
+                1,
+                ClientRequest::ChatPrepareResume { source: requested }
+            ),
+            Ok(ServerResponse::ChatResumePrepared { .. })
+        ),
+        "the same source prepares once its writer exits"
+    );
 }
 
 /// A process outside this daemon with the thread loaded, such as a Codex CLI
@@ -398,6 +564,29 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     let allocated_socket = allocation.join("control.sock");
     drop(UnixListener::bind(&allocated_socket).unwrap());
     let before = std::fs::symlink_metadata(&allocated_socket).unwrap();
+    // A writer-gate counterfactual must reach the explicit no-launch/inode
+    // assertion, rather than time out connecting to its mistaken new server.
+    let (cancel_fallback, fallback_cancelled) = mpsc::channel();
+    let unexpected_server = {
+        let (socket, home, record) = (
+            allocated_socket.clone(),
+            root.join("home/.codex"),
+            root.join("codex-arguments"),
+        );
+        thread::spawn(move || {
+            loop {
+                match fallback_cancelled.recv_timeout(Duration::from_millis(10)) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                }
+                if record.exists() {
+                    let (methods, _received) = mpsc::channel();
+                    serve(UnixListener::bind(socket).unwrap(), home, methods);
+                    break;
+                }
+            }
+        })
+    };
     let result = start(
         &host,
         1,
@@ -410,6 +599,11 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     let repeated = start(&host, 1, requested, None, false, None, Default::default());
     // Clean up the fixture before checking the result, including a mutant
     // that incorrectly tries to launch the installed Codex stand-in.
+    if result.is_ok() {
+        crate::host::finish_chat_shutdown(&host).unwrap();
+    }
+    let _ = cancel_fallback.send(());
+    unexpected_server.join().unwrap();
     server.kill().unwrap();
     server.wait().unwrap();
     assert!(
@@ -458,6 +652,22 @@ fn a_reopened_codex_thread_with_uninspectable_writer_evidence_refuses_retryably(
     // It must not be interpreted as evidence that the thread has no writer.
     std::os::unix::fs::symlink(&lock, &lock).unwrap();
     host.lock().unwrap().register_client(1);
+    let prepared = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: reopened(&root),
+        },
+    )
+    .unwrap_err();
+    assert_eq!(prepared.code, ProtocolErrorCode::TerminalUnavailable);
+    assert!(prepared.retryable, "{prepared:?}");
+    assert!(
+        prepared
+            .message
+            .contains("Cannot inspect Codex thread writer lock"),
+        "{prepared:?}"
+    );
     let refusal = start(
         &host,
         1,
