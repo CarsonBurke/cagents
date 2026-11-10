@@ -111,7 +111,7 @@ impl Fixture {
     fn close_card(&mut self) {
         self.app.workspace.request_close(self.card).unwrap();
         drop(self.app.commit_card_removal(self.card, None).unwrap());
-        assert!(self.app.channel_work.retire_candidates.contains(&self.home));
+        assert!(self.app.channel_ui.retire_candidates.contains(&self.home));
     }
 
     /// The registry's view of the channel settles empty, and the window asks
@@ -159,7 +159,7 @@ impl Fixture {
         drop(self.app.apply_workspace_model_update(
             super::super::workspace_model_sync::ModelUpdate::RetirementAnswered { channel, model },
         ));
-        assert!(!self.app.channel_work.retiring.contains_key(&channel));
+        assert!(!self.app.channel_ui.retiring.contains_key(&channel));
     }
 
     /// The registry retires the channel, and the window learns it.
@@ -239,6 +239,21 @@ impl Fixture {
         };
         assert_eq!(resumed.launch, original.launch);
         state
+    }
+
+    /// The registry incarnation of the channel the window has entered.
+    fn entered_home(&self) -> crate::channel_work::Home {
+        let id = self
+            .app
+            .durable
+            .active_channel
+            .expect("a channel is entered");
+        let channel = self.app.workspace_model.channel(id).unwrap();
+        crate::channel_work::Home {
+            registry: self.app.workspace_model.identity,
+            channel: channel.id,
+            creation_ordinal: channel.ordinal,
+        }
     }
 
     fn active_channel(&self) -> &ProjectChannel {
@@ -608,7 +623,7 @@ fn reopening_before_retirement_keeps_the_channel() {
     assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
     let resumed = fixture.resumed().clone();
     assert_eq!(fixture.active_channel().cards, vec![resumed.id]);
-    assert!(fixture.app.channel_work.retire_candidates.is_empty());
+    assert!(fixture.app.channel_ui.retire_candidates.is_empty());
     fixture.app.workspace_model.views[0].panes.clear();
     fixture.app.workspace_model.views[0].revision = 8;
     fixture.app.retire_settled_empty_channels();
@@ -683,7 +698,7 @@ fn a_refused_in_flight_retirement_reopens_into_the_original_home() {
 
     assert_eq!(fixture.app.durable.channels.len(), 1);
     assert_eq!(fixture.app.durable.active_channel, Some(fixture.channel));
-    assert_eq!(fixture.app.channel_home().unwrap().0, fixture.home);
+    assert_eq!(fixture.entered_home(), fixture.home);
     assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
     assert!(fixture.app.channel_ui.revived.is_empty());
     assert!(
@@ -769,7 +784,7 @@ fn a_definitively_failed_retirement_keeps_reopen_available_for_retry() {
     assert_eq!(fixture.app.recently_closed.len(), 1);
     assert_eq!(fixture.app.durable.channels.len(), 1);
     fixture.reopen_pane();
-    assert_eq!(fixture.app.channel_home().unwrap().0, fixture.home);
+    assert_eq!(fixture.entered_home(), fixture.home);
     assert_eq!(fixture.active_channel().cards, vec![fixture.resumed().id]);
 }
 
@@ -848,7 +863,7 @@ fn an_unanswered_retirement_fails_reopen_without_guessing_its_outcome() {
     assert!(
         fixture
             .app
-            .channel_work
+            .channel_ui
             .retiring
             .contains_key(&fixture.channel)
     );

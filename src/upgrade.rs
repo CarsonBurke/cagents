@@ -1636,9 +1636,14 @@ pub(crate) mod handoff {
         pub aliases: Vec<chat::Session>,
     }
 
+    /// A restoring provider can take its full attachment timeout even when
+    /// there is no upgrade inventory (for example, after a daemon crash).
+    pub(crate) const STARTUP_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Budget sequential provider confirmation without parsing session payloads.
+    /// Estimating readiness must not create durable upgrade storage.
     pub(crate) fn startup_timeout() -> Result<std::time::Duration, String> {
-        Store::discover()?.startup_timeout()
+        Store::existing()?.map_or(Ok(STARTUP_BASE), |store| store.startup_timeout())
     }
 
     #[derive(Deserialize)]
@@ -1745,7 +1750,7 @@ pub(crate) mod handoff {
 
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
             let Some(bytes) = self.read_bytes()? else {
-                return Ok(std::time::Duration::from_secs(5));
+                return Ok(STARTUP_BASE);
             };
             let inventory: Inventory =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -1758,10 +1763,11 @@ pub(crate) mod handoff {
                 return Err("Upgrade checkpoint exceeds session limits".into());
             }
             // Adopting a carried terminal is a local handshake with its holder.
-            Ok(std::time::Duration::from_secs(
-                5 + 30 * (inventory.terminals + inventory.chats) as u64
-                    + 5 * inventory.carried as u64,
-            ))
+            Ok(STARTUP_BASE
+                + std::time::Duration::from_secs(
+                    30 * (inventory.terminals + inventory.chats) as u64
+                        + 5 * inventory.carried as u64,
+                ))
         }
 
         #[cfg(any(feature = "host", test))]
@@ -2186,13 +2192,32 @@ pub(crate) mod handoff {
         }
 
         #[test]
-        fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
+        fn startup_budget_without_inventory_allows_provider_restoration() {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::open(directory.path()).unwrap();
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(5)
+                std::time::Duration::from_secs(30)
             );
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&store.path)
+                .unwrap();
+            file.write_all(br#"{"version":3,"terminals":[],"chats":[]}"#)
+                .unwrap();
+            assert_eq!(
+                store.startup_timeout().unwrap(),
+                std::time::Duration::from_secs(30)
+            );
+        }
+
+        #[test]
+        fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            assert_eq!(store.startup_timeout().unwrap(), STARTUP_BASE);
             let save = |bytes: &[u8]| {
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
@@ -2206,12 +2231,12 @@ pub(crate) mod handoff {
             save(br#"{"version":1,"terminals":[{"nested":["ignored"]},{}],"chats":[{}]}"#);
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(95)
+                std::time::Duration::from_secs(120)
             );
             save(br#"{"version":2,"terminals":[{}],"carried":[{},{}],"chats":[]}"#);
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(45)
+                std::time::Duration::from_secs(70)
             );
             save(br#"{"version":3,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_ok());
@@ -2236,7 +2261,7 @@ pub(crate) mod handoff {
                 );
                 assert_eq!(
                     store.startup_timeout().unwrap(),
-                    std::time::Duration::from_secs(5 + 30 * chats as u64)
+                    STARTUP_BASE + std::time::Duration::from_secs(30 * chats as u64)
                 );
             }
             for (terminals, chats) in [(MAX_TERMINALS + 1, 0), (0, MAX_CHATS + 1)] {

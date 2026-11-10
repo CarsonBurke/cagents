@@ -3172,14 +3172,17 @@ impl Runtime {
         content.push(crate::interaction::composer_popover(
             widget::container(
                 widget::column::with_children(vec![
-                    widget::column::with_children(self.queue_view().into_iter().chain(
-                        (!attachment_chips.is_empty()).then(|| {
-                            widget::column::with_children(attachment_chips)
-                                .spacing(step::GAP_XS)
-                                .padding([0, step::GAP_M as u16])
-                                .into()
-                        }),
-                    ))
+                    widget::column::with_children(
+                        self.queue_view()
+                            .into_iter()
+                            .chain(self.restored_waiting_notice())
+                            .chain((!attachment_chips.is_empty()).then(|| {
+                                widget::column::with_children(attachment_chips)
+                                    .spacing(step::GAP_XS)
+                                    .padding([0, step::GAP_M as u16])
+                                    .into()
+                            })),
+                    )
                     .spacing(step::GAP_XS)
                     .into(),
                     widget::row::with_children(row)
@@ -4676,6 +4679,36 @@ impl Runtime {
         } else {
             description
         }
+    }
+
+    /// Says, where the queue was, that what a provider which did not come
+    /// back was holding is now the reader's draft, and was not sent again.
+    fn restored_waiting_notice(&self) -> Option<Element<'_, Message>> {
+        let restored = self.restored_waiting?;
+        let text = restored.caption();
+        Some(
+            widget::container(
+                widget::row::with_children(vec![
+                    crate::ui_controls::passive_icon(Icon::History, design::COMPACT_ICON_SIZE),
+                    design::caption(text).width(Length::Fill).into(),
+                    small_icon(
+                        Icon::Close,
+                        "Dismiss",
+                        Action::DismissRestoredWaiting(self.target),
+                    ),
+                ])
+                .spacing(step::GAP_S)
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(step::GAP_S)
+            .class(design::surface(
+                Some(design::sunken),
+                [design::RADIUS_M, design::RADIUS_M, 0.0, 0.0],
+                false,
+            ))
+            .into(),
+        )
     }
 
     /// The messages waiting to be sent, docked on the composer.
@@ -7976,6 +8009,62 @@ mod tests {
     fn actual_find_current_target_appends_keep_pending_geometry_through_parser_publications() {
         drive_deep_find(true);
     }
+    #[test]
+    fn actual_find_navigation_keeps_its_thirty_second_expiry() {
+        use iced::futures::{FutureExt, StreamExt};
+        let executor = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let (runtime, _handle) = frame_cost::live_runtime(&[]);
+        let target = runtime.target;
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        app.cards
+            .insert(target.card, CardRuntime::Chat(Box::new(runtime)));
+        let mut stream = iced::runtime::task::into_stream(app.begin_find_navigation(target, None))
+            .expect("navigation owns its production deadline");
+        executor.block_on(async {
+            // Iced tasks yield before polling their futures. Receiving the
+            // actual resume proves both batched timers have started.
+            let started = tokio::time::Instant::now();
+            assert!(matches!(
+                stream.next().await,
+                Some(iced::runtime::Action::Output(cosmic::Action::App(
+                    Message::ChatUi(Action::FindResume(..))
+                )))
+            ));
+            tokio::time::advance(started + Duration::from_secs(29) - tokio::time::Instant::now())
+                .await;
+            assert!(stream.next().now_or_never().is_none());
+            assert!(
+                app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .pending()
+            );
+            tokio::time::advance(Duration::from_secs(1)).await;
+            let Some(iced::runtime::Action::Output(cosmic::Action::App(
+                message @ Message::ChatUi(Action::FindExpired(..)),
+            ))) = stream.next().await
+            else {
+                panic!("the production deadline must expire navigation at thirty seconds");
+            };
+            assert_eq!(
+                tokio::time::Instant::now(),
+                started + Duration::from_secs(30)
+            );
+            drop(app.update(message));
+            assert!(
+                !app.chat_runtime_mut(target)
+                    .unwrap()
+                    .find_navigation
+                    .pending()
+            );
+        });
+        executor.shutdown_background();
+    }
+
     fn drive_deep_find(append_target: bool) {
         use iced::advanced::{
             Layout, Shell, layout, mouse,
@@ -8072,8 +8161,11 @@ mod tests {
             }
         }
         let renderer = crate::app::tests::headless_renderer();
+        // This fixture holds geometry through 24 real parser publications; use
+        // simulated frame time for its functional navigation deadline.
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
+            .start_paused(append_target)
             .build()
             .unwrap();
         let shortcuts = crate::settings::KeyboardShortcuts::default();
@@ -8213,7 +8305,8 @@ mod tests {
             let mut tree = Tree::empty();
             let viewport = iced::Rectangle::with_size(iced::Size::new(600.0, 500.0));
             let limits = layout::Limits::new(iced::Size::ZERO, viewport.size());
-            let deadline = Instant::now() + Duration::from_secs(30);
+            let deadline =
+                executor.block_on(async { tokio::time::Instant::now() }) + Duration::from_secs(30);
             let mut seen = false;
             let mut passes = 0;
             let mut last_geometry = None;
@@ -8222,7 +8315,7 @@ mod tests {
             let mut buffered_reply = None;
             let mut target_publications = 0;
             let mut accepted_publications = 0;
-            while Instant::now() < deadline {
+            while executor.block_on(async { tokio::time::Instant::now() }) < deadline {
                 passes += 1;
                 // Materialize the actual admitted parser subscriptions once per
                 // recipe, including their real spawn_blocking worker/results.
@@ -8476,6 +8569,12 @@ mod tests {
                             );
                         }
                     }
+                }
+                if append_target {
+                    // All UI borrows have ended. Acknowledge retired output
+                    // admission before the next paused-clock tick across this
+                    // handoff to the process-owned std reclaimer.
+                    preparation::retirement_barrier();
                 }
                 if !pending && visible.found && (!append_target || accepted_publications == 24) {
                     seen = true;

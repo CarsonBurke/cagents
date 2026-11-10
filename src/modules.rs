@@ -34,8 +34,6 @@ pub mod browser;
 pub mod capability;
 pub mod channel_work;
 pub mod channel_work_api;
-#[cfg(feature = "ui")]
-pub mod channel_work_ui;
 pub mod chat;
 pub mod companion;
 pub mod control;

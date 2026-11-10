@@ -309,14 +309,22 @@ impl Cagents {
                     .workspace
                     .add_card(card, index + 1, false)
                     .expect("saved draft has a fresh card identity");
-                presentation =
-                    Task::batch([presentation, self.apply_viewport(update, false, false)]);
+                presentation = Task::batch([
+                    presentation,
+                    self.apply_viewport(update, false, DurableChange::None),
+                ]);
             }
         } else if same_source {
             // Keep the Content object (including cursor/selection) through the
             // actual Ready handler, which replaces only the connection.
             runtime.connection = Connection::Connecting;
             self.cards.insert(pane.id, CardRuntime::Chat(runtime));
+        }
+        if let (Some(CardKind::Chat(saved)), CardKind::Chat(canonical)) = (
+            self.card_state(pane.id).map(|card| card.kind.clone()),
+            &pane.kind,
+        ) {
+            self.adopt_shared_chat_identity(pane.id, &saved, canonical);
         }
         if let Some(card) = self.card_state_mut(pane.id) {
             card.kind = pane.kind.clone();

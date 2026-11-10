@@ -21,6 +21,26 @@ use crate::workspace_model::{
 /// cannot miss anything by being late.
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
+/// How long after its first send a pane change may still be resent. The daemon
+/// remembers an applied operation for a week (`OPERATION_RETENTION`) so a
+/// resend whose reply was lost is recognized as done; a change older than this
+/// is never resent, so it can never outlive that memory and apply twice, even
+/// across a week-long suspend or a clock a few days off. The window reconciles
+/// from the daemon's model instead, as for any refused change.
+const REPLAY_LIMIT: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// An edit taken from the window, and when it was first sent.
+type Unsent = (ModelEdit, std::time::SystemTime);
+
+/// Whether `edit`, first sent at `first`, may still be sent `now`. A clock
+/// that moved backwards past the first send proves nothing, so it may not.
+fn may_resend(edit: &ModelEdit, first: std::time::SystemTime, now: std::time::SystemTime) -> bool {
+    !matches!(edit, ModelEdit::ChangeView { .. })
+        || now
+            .duration_since(first)
+            .is_ok_and(|waited| waited <= REPLAY_LIMIT)
+}
+
 /// What the daemon threads hand the window.
 #[derive(Debug, Clone)]
 pub enum ModelUpdate {
@@ -219,24 +239,55 @@ pub(super) fn publish_workspace_model(
 fn publish(
     updates: &async_channel::Sender<ModelUpdate>,
     requests: &async_channel::Receiver<ModelEdit>,
-    pending: &mut Option<ModelEdit>,
+    pending: &mut Option<Unsent>,
 ) -> Result<(), String> {
     // Unlike the observer, the publisher starts a daemon: a channel the user
     // just created has to reach the registry, and there is no registry without
     // a daemon to hold it.
     let socket = crate::terminal::ensure_daemon_ready().map_err(|error| error.to_string())?;
     let mut client = ControlClient::connect(&socket).map_err(|error| error.to_string())?;
+    publish_with_client(updates, requests, pending, &mut client)
+}
+
+fn publish_with_client(
+    updates: &async_channel::Sender<ModelUpdate>,
+    requests: &async_channel::Receiver<ModelEdit>,
+    pending: &mut Option<Unsent>,
+    client: &mut ControlClient,
+) -> Result<(), String> {
     loop {
-        let request = match pending.take() {
-            Some(request) => request,
-            None => requests
-                .recv_blocking()
-                .map_err(|_| "the window stopped publishing".to_owned())?,
+        let (request, first) = match pending.take() {
+            Some((request, first)) => {
+                if !may_resend(&request, first, std::time::SystemTime::now()) {
+                    tracing::warn!(
+                        "a pane change waited too long for the daemon and was not resent"
+                    );
+                    if let ModelEdit::ChangeView {
+                        scope, operation, ..
+                    } = &request
+                    {
+                        let _ = updates.send_blocking(ModelUpdate::ViewRefused {
+                            scope: scope.clone(),
+                            operation: *operation,
+                            error: "The pane change waited too long for the daemon to be resent"
+                                .into(),
+                        });
+                    }
+                    continue;
+                }
+                (request, first)
+            }
+            None => (
+                requests
+                    .recv_blocking()
+                    .map_err(|_| "the window stopped publishing".to_owned())?,
+                std::time::SystemTime::now(),
+            ),
         };
         // Retained until it is sent, so a daemon replaced mid-publish costs a
         // reconnection rather than the edit.
-        *pending = Some(request.clone());
-        match send(&mut client, request.clone(), updates) {
+        *pending = Some((request.clone(), first));
+        match send(client, request.clone(), updates) {
             Ok(()) => *pending = None,
             Err(error) => {
                 // A refusal is final: the registry rejected the edit itself, so
@@ -257,12 +308,16 @@ fn publish(
                         let _ =
                             updates.send_blocking(ModelUpdate::NavigationFailed(error.to_string()));
                     }
-                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. })
-                        && let Ok(model) = client.read_workspace_model()
-                    {
+                    if matches!(&request, ModelEdit::SuggestConversationTitle { .. }) {
                         // A refused suggestion is not replayed against a newer
                         // owner. Restore the authoritative name after optimism.
-                        let _ = updates.send_blocking(ModelUpdate::Read(model));
+                        match client.read_workspace_model() {
+                            Ok(model) => {
+                                let _ = updates.send_blocking(ModelUpdate::Read(model));
+                            }
+                            Err(ControlError::Remote { .. }) => {}
+                            Err(error) => return Err(error.to_string()),
+                        }
                     }
                     if let ModelEdit::ChangeView {
                         scope, operation, ..
@@ -286,6 +341,10 @@ fn publish(
                             error: error.to_string(),
                         });
                     }
+                    // The daemon answered definitively on this connection.
+                    // Keep draining independent edits; only an unknown outcome
+                    // needs reconnection and its backoff.
+                    continue;
                 }
                 return Err(error.to_string());
             }
@@ -590,7 +649,7 @@ impl Cagents {
                     .retain(|shared| shared.id != channel);
                 task = Task::batch([task, self.retire_peer_channel(channel)]);
             }
-            self.channel_work.retiring.remove(&channel);
+            self.channel_ui.retiring.remove(&channel);
             return (
                 Task::batch([task, self.finish_channel_reopen(channel)]),
                 applied || retired,
@@ -612,7 +671,7 @@ impl Cagents {
     fn apply_workspace_model_update_inner(&mut self, update: ModelUpdate) -> Task<Message> {
         match update {
             ModelUpdate::RetirementFailed { channel, error } => {
-                self.channel_work.retiring.remove(&channel);
+                self.channel_ui.retiring.remove(&channel);
                 self.fail_channel_reopen(
                     channel,
                     &format!("Could not reopen the channel: {error}. Try reopening again."),
@@ -734,24 +793,11 @@ impl Cagents {
                 self.apply_closed_project_tombstones()
             }
             ModelUpdate::Edited { sequence, edit } => {
-                // Work commits and metadata announcements can cross between
-                // independent WAL connections. Even an older invalidation
-                // must refresh its exact home; it never replays a model edit.
-                if let ModelEdit::ChannelWorkChanged { home } = &edit {
-                    if home.registry != self.workspace_model.identity {
-                        return Task::none();
-                    }
-                    // This is an independent invalidation, not a folded
-                    // canonical edit. Advancing that watermark could discard
-                    // a delayed, lower-sequence channel/project edit.
-                    return if self.channel_work.view.home() == Some(*home) {
-                        self.channel_work
-                            .view
-                            .refresh()
-                            .map_or_else(Task::none, |effect| self.channel_work_effect(effect))
-                    } else {
-                        Task::none()
-                    };
+                // A channel-work invalidation is not a folded canonical edit,
+                // and nothing in the window shows channel work. Advancing the
+                // watermark could discard a delayed, lower-sequence edit.
+                if matches!(edit, ModelEdit::ChannelWorkChanged { .. }) {
+                    return Task::none();
                 }
 
                 if sequence <= self.workspace_model.sequence {
@@ -1320,7 +1366,7 @@ impl Cagents {
         let task = self
             .workspace
             .add_card(item, self.workspace.cards().len(), false)
-            .map(|update| self.apply_viewport(update, true, false))
+            .map(|update| self.apply_viewport(update, true, DurableChange::None))
             .unwrap_or_else(|error| {
                 self.status = Some(TransientNotice::error(error.to_string()));
                 Task::none()
@@ -1740,6 +1786,371 @@ impl Cagents {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::terminal::ipc::{
+        ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+        ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+    };
+
+    fn publisher_reply(
+        peer: &mut std::os::unix::net::UnixStream,
+        proof: &crate::model::HostSessionProof,
+        request_id: u64,
+        message: ServerMessage,
+    ) {
+        write_frame(
+            peer,
+            &ServerEnvelope {
+                version: PROTOCOL_VERSION,
+                request_id: Some(request_id),
+                proof: proof.clone(),
+                message,
+            },
+        )
+        .unwrap();
+    }
+
+    fn publisher_connection(
+        serve: impl FnOnce(&mut std::os::unix::net::UnixStream, &crate::model::HostSessionProof)
+        + Send
+        + 'static,
+    ) -> (ControlClient, std::thread::JoinHandle<()>) {
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        peer.set_write_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "publisher-refusal".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "owner".into(),
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            publisher_reply(
+                &mut peer,
+                &proof,
+                hello.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            serve(&mut peer, &proof);
+        });
+        (ControlClient::from_stream(stream).unwrap(), server)
+    }
+
+    #[test]
+    fn failed_title_restore_reconnects_before_sending_later_edits() {
+        let id = ChannelId::new();
+        let title = ModelEdit::SuggestConversationTitle {
+            id,
+            card: CardId::new(),
+            expected_revision: 1,
+            title: "First prompt".into(),
+            source: crate::model::ChannelTitleSource::Prompt,
+        };
+        let next = ModelEdit::RetitleChannel {
+            id,
+            title: "Manual name".into(),
+        };
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert!(matches!(
+                request.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: ModelEdit::SuggestConversationTitle { .. }
+                }
+            ));
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Title basis changed",
+                    false,
+                )),
+            );
+            let read: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+            publisher_reply(
+                peer,
+                proof,
+                read.request_id + 1,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: WorkspaceModel::default(),
+                    },
+                },
+            );
+            let later: Option<ClientEnvelope> = read_frame(peer).unwrap();
+            assert!(
+                later.is_none(),
+                "a desynchronized connection must not carry another edit"
+            );
+        });
+        let (updates, _received) = async_channel::unbounded();
+        let (queued, requests) = async_channel::unbounded();
+        queued.send_blocking(title).unwrap();
+        queued.send_blocking(next.clone()).unwrap();
+        drop(queued);
+        let mut pending = None;
+        let error =
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err();
+        drop(client);
+        server.join().unwrap();
+        assert!(error.contains("does not match"), "{error}");
+        assert!(
+            pending.is_none(),
+            "the definitive title refusal must not be replayed"
+        );
+        assert_eq!(requests.try_recv().unwrap(), next);
+    }
+
+    #[test]
+    fn transport_error_after_refusal_retries_only_the_pending_edit_on_reconnect() {
+        let id = ChannelId::new();
+        let title = ModelEdit::SuggestChannelTitle {
+            id,
+            title: "First prompt".into(),
+            source: crate::model::ChannelTitleSource::Prompt,
+        };
+        let next = ModelEdit::RetitleChannel {
+            id,
+            title: "Manual name".into(),
+        };
+        let expected = next.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: title }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Error(ProtocolError::new(
+                    ProtocolErrorCode::InvalidRequest,
+                    "Title basis changed",
+                    false,
+                )),
+            );
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: expected }
+            );
+            peer.shutdown(std::net::Shutdown::Both).unwrap();
+        });
+        let (updates, received) = async_channel::unbounded();
+        let (queued, requests) = async_channel::unbounded();
+        queued
+            .send_blocking(ModelEdit::SuggestChannelTitle {
+                id,
+                title: "First prompt".into(),
+                source: crate::model::ChannelTitleSource::Prompt,
+            })
+            .unwrap();
+        queued.send_blocking(next.clone()).unwrap();
+        drop(queued);
+        let mut pending = None;
+        let error =
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err();
+        drop(client);
+        server.join().unwrap();
+        assert_eq!(error, ControlError::ConnectionClosed.to_string());
+        assert_eq!(pending.as_ref().map(|(edit, _)| edit), Some(&next));
+        assert!(received.is_empty());
+
+        let expected = next.clone();
+        let (mut client, server) = publisher_connection(move |peer, proof| {
+            let request: ClientEnvelope = read_frame(peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel { edit: expected }
+            );
+            publisher_reply(
+                peer,
+                proof,
+                request.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: WorkspaceModel::default(),
+                    },
+                },
+            );
+        });
+        assert_eq!(
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err(),
+            "the window stopped publishing",
+        );
+        drop(client);
+        server.join().unwrap();
+        assert!(pending.is_none());
+        assert!(received.is_empty());
+    }
+
+    #[test]
+    fn refused_titles_do_not_disconnect_or_block_later_model_edits() {
+        use crate::terminal::ipc::{
+            ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
+            ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
+        };
+        let id = ChannelId::new();
+        let titles = [
+            ModelEdit::SuggestConversationTitle {
+                id,
+                card: CardId::new(),
+                expected_revision: 1,
+                title: "First prompt".into(),
+                source: crate::model::ChannelTitleSource::Prompt,
+            },
+            ModelEdit::SuggestChannelTitle {
+                id,
+                title: "First prompt".into(),
+                source: crate::model::ChannelTitleSource::Prompt,
+            },
+        ];
+        let next = ModelEdit::RetitleChannel {
+            id,
+            title: "Manual name".into(),
+        };
+        let expected_next = next.clone();
+        let expected_titles = titles.clone();
+        let (stream, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let server = std::thread::spawn(move || {
+            let proof = crate::model::HostSessionProof {
+                host_session_id: "refused-titles".into(),
+                boot_id: "boot".into(),
+                host_incarnation: "owner".into(),
+            };
+            let respond = |peer: &mut std::os::unix::net::UnixStream, request_id, message| {
+                write_frame(
+                    peer,
+                    &ServerEnvelope {
+                        version: PROTOCOL_VERSION,
+                        request_id: Some(request_id),
+                        proof: proof.clone(),
+                        message,
+                    },
+                )
+                .unwrap();
+            };
+            let hello: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            respond(
+                &mut peer,
+                hello.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::Connected {
+                        proof: proof.clone(),
+                        resumed: vec![],
+                    },
+                },
+            );
+            for title in expected_titles {
+                let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                assert_eq!(
+                    request.request,
+                    ClientRequest::EditWorkspaceModel {
+                        edit: title.clone()
+                    }
+                );
+                respond(
+                    &mut peer,
+                    request.request_id,
+                    ServerMessage::Error(ProtocolError::new(
+                        ProtocolErrorCode::InvalidRequest,
+                        "Title basis changed",
+                        false,
+                    )),
+                );
+                if matches!(title, ModelEdit::SuggestConversationTitle { .. }) {
+                    let read: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+                    assert_eq!(read.request, ClientRequest::ReadWorkspaceModel);
+                    respond(
+                        &mut peer,
+                        read.request_id,
+                        ServerMessage::Response {
+                            response: ServerResponse::WorkspaceModel {
+                                model: WorkspaceModel::default(),
+                            },
+                        },
+                    );
+                }
+            }
+            let request: ClientEnvelope = read_frame(&mut peer).unwrap().unwrap();
+            assert_eq!(
+                request.request,
+                ClientRequest::EditWorkspaceModel {
+                    edit: expected_next
+                }
+            );
+            respond(
+                &mut peer,
+                request.request_id,
+                ServerMessage::Response {
+                    response: ServerResponse::WorkspaceModel {
+                        model: WorkspaceModel::default(),
+                    },
+                },
+            );
+        });
+        let mut client = ControlClient::from_stream(stream).unwrap();
+        let (updates, received) = async_channel::unbounded();
+        let (queued, requests) = async_channel::unbounded();
+        for title in titles {
+            queued.send_blocking(title).unwrap();
+        }
+        queued.send_blocking(next).unwrap();
+        drop(queued);
+        let mut pending = None;
+        let error =
+            publish_with_client(&updates, &requests, &mut pending, &mut client).unwrap_err();
+        assert_eq!(
+            error, "the window stopped publishing",
+            "only draining the queue ends publication"
+        );
+        assert!(pending.is_none());
+        assert!(matches!(received.try_recv().unwrap(), ModelUpdate::Read(_)));
+        drop(client);
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn a_pane_change_is_resent_only_while_the_daemon_still_remembers_it() {
+        use crate::workspace_model::views::{Change, Scope};
+        let first = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let change = ModelEdit::ChangeView {
+            scope: Scope::Channel(ChannelId::new()),
+            expected_revision: 4,
+            operation: uuid::Uuid::new_v4(),
+            change: Change::Remove { id: CardId::new() },
+        };
+        assert!(may_resend(&change, first, first));
+        assert!(may_resend(&change, first, first + REPLAY_LIMIT));
+        assert!(!may_resend(
+            &change,
+            first,
+            first + REPLAY_LIMIT + Duration::from_secs(1)
+        ));
+        // A clock that went back cannot show the change is still young.
+        assert!(!may_resend(&change, first, first - Duration::from_secs(1)));
+        // The limit must leave the daemon days of margin for clock skew.
+        assert!(
+            crate::workspace_model::views::OPERATION_RETENTION >= REPLAY_LIMIT * 6,
+            "the daemon must remember an operation well past its last resend"
+        );
+        // Other edits carry their own idempotency and are never dropped.
+        let delete = ModelEdit::DeleteChannel {
+            id: ChannelId::new(),
+        };
+        assert!(may_resend(&delete, first, first + REPLAY_LIMIT * 30));
+    }
 
     #[test]
     fn absent_channel_candidates_preserve_local_order_duplicates_and_shared_flags() {
