@@ -507,7 +507,9 @@ fn protocol56_bespoke_payloads_match_the_recorded_source_graph() {
     let payloads =
         Shapes::trace::<crate::update::source::v56::Impact, crate::update::source::v56::Terminal>()
             .unwrap();
-    let sessions = Shapes::trace::<crate::chat::Session, crate::chat::Session>().unwrap();
+    let sessions =
+        Shapes::trace::<crate::update::source::v56::Chat, crate::update::source::v56::Chat>()
+            .unwrap();
     for (current, name, shape) in [
         (
             &payloads,

@@ -29,7 +29,7 @@ enum Request<'a> {
     Connect(&'a HostSessionProof),
     ListTerminals,
     ListChats,
-    Resolve(&'a Session),
+    Resolve(&'a Chat),
 }
 impl Serialize for Request<'_> {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -117,10 +117,10 @@ enum Message {
 enum Response {
     Connected(HostSessionProof),
     Terminals(Vec<Terminal>),
-    Listed(Vec<Session>),
-    Resolved(Session),
+    Listed(Vec<Chat>),
+    Resolved(Chat),
 }
-use crate::update::source::v56::Terminal;
+use crate::update::source::v56::{Chat, Terminal};
 #[derive(Deserialize)]
 struct Terminals {
     terminals: Vec<Terminal>,
@@ -132,11 +132,11 @@ struct Connected {
 }
 #[derive(Deserialize)]
 struct Listed {
-    sessions: Vec<Session>,
+    sessions: Vec<Chat>,
 }
 #[derive(Deserialize)]
 struct Resolved {
-    session: Session,
+    session: Chat,
 }
 struct EmptyResume;
 impl<'de> Deserialize<'de> for EmptyResume {
@@ -291,7 +291,7 @@ impl Client {
     pub(super) fn list(&mut self) -> Result<Vec<Session>, String> {
         match self.request(Request::ListChats, Some(self.proof.clone()))? {
             Response::Listed(sessions) if sessions.len() <= crate::upgrade::handoff::MAX_CHATS => {
-                Ok(sessions)
+                Ok(sessions.into_iter().map(Into::into).collect())
             }
             _ => Err("Source chat inventory is unsupported or exceeds the inspection limit".into()),
         }
@@ -311,8 +311,9 @@ impl Client {
     }
 
     pub(super) fn resolve(&mut self, source: &Session) -> Result<Session, String> {
-        match self.request(Request::Resolve(source), Some(self.proof.clone()))? {
-            Response::Resolved(session) => Ok(session),
+        let source = Chat::try_from(source)?;
+        match self.request(Request::Resolve(&source), Some(self.proof.clone()))? {
+            Response::Resolved(session) => Ok(session.into()),
             _ => Err("Source did not authenticate a saved conversation's lineage".into()),
         }
     }
@@ -394,7 +395,8 @@ mod tests {
                     assert_eq!(sessions.len(), 3);
                     assert!(
                         sessions
-                            .iter()
+                            .into_iter()
+                            .map(Session::from)
                             .all(|s| s.proof.as_ref() == Some(&envelope.proof))
                     );
                 }

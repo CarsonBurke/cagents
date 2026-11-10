@@ -193,14 +193,14 @@ impl Client {
     }
     pub(super) fn list_chats(&mut self) -> Result<Vec<crate::chat::Session>, UpdateError> {
         let bytes = self.0.request(29, (), 13, Duration::from_secs(30))?;
-        let chats: Vec<crate::chat::Session> = postcard::from_bytes(&bytes)
+        let chats: Vec<Chat> = postcard::from_bytes(&bytes)
             .map_err(|_| invalid("Malformed protocol56 chat inventory"))?;
         if chats.len() > 128 {
             return Err(invalid(
                 "Source chat inventory exceeds its inspection limit",
             ));
         }
-        Ok(chats)
+        Ok(chats.into_iter().map(Into::into).collect())
     }
     pub(super) fn shutdown_preflight(&mut self) -> Result<ipc::ShutdownCapability, UpdateError> {
         let bytes = self
@@ -369,3 +369,61 @@ impl From<Capability> for ipc::ShutdownCapability {
 
 #[cfg(test)]
 mod tests;
+
+/// Protocol 56 predates retained Claude actors. Keep its closed two-variant
+/// continuity enum on both inspection reads and ResolveUpgradeChat writes.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Chat {
+    id: crate::model::TerminalId,
+    launch: crate::chat::Launch,
+    proof: Option<HostSessionProof>,
+    terminal: Option<crate::model::TerminalSession>,
+    owned_codex_listener: Option<crate::chat::OwnedCodexListener>,
+    native_continuity: NativeContinuity,
+}
+#[derive(Clone, Serialize, Deserialize)]
+enum NativeContinuity {
+    ReconnectOnly,
+    Durable { provider_version: String },
+}
+impl TryFrom<&crate::chat::Session> for Chat {
+    type Error = String;
+    fn try_from(s: &crate::chat::Session) -> Result<Self, Self::Error> {
+        let native_continuity = match &s.native_continuity {
+            crate::chat::NativeContinuity::ReconnectOnly => NativeContinuity::ReconnectOnly,
+            crate::chat::NativeContinuity::Durable { provider_version } => {
+                NativeContinuity::Durable {
+                    provider_version: provider_version.clone(),
+                }
+            }
+            crate::chat::NativeContinuity::RetainedClaudeActor { .. } => {
+                return Err("Protocol 56 cannot authenticate a retained Claude actor".into());
+            }
+        };
+        Ok(Self {
+            id: s.id,
+            launch: s.launch.clone(),
+            proof: s.proof.clone(),
+            terminal: s.terminal.clone(),
+            owned_codex_listener: s.owned_codex_listener.clone(),
+            native_continuity,
+        })
+    }
+}
+impl From<Chat> for crate::chat::Session {
+    fn from(s: Chat) -> Self {
+        Self {
+            id: s.id,
+            launch: s.launch,
+            proof: s.proof,
+            terminal: s.terminal,
+            owned_codex_listener: s.owned_codex_listener,
+            native_continuity: match s.native_continuity {
+                NativeContinuity::ReconnectOnly => crate::chat::NativeContinuity::ReconnectOnly,
+                NativeContinuity::Durable { provider_version } => {
+                    crate::chat::NativeContinuity::Durable { provider_version }
+                }
+            },
+        }
+    }
+}

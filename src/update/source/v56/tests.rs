@@ -41,7 +41,7 @@ fn real_0387aa2_frames_pin_protocol56_payloads_and_requests() {
         owner = Some(actual.clone());
         if frame["operation"] == "resolve-chat" {
             assert_eq!((tag, message), (38, 6)); // Real source has no replacement yet.
-            assert!(postcard::from_bytes::<crate::chat::Session>(payload).is_ok());
+            assert!(postcard::from_bytes::<Chat>(payload).is_ok());
             continue;
         }
         assert_eq!(message, 0);
@@ -71,9 +71,20 @@ fn real_0387aa2_frames_pin_protocol56_payloads_and_requests() {
             "chat-list" => {
                 assert_eq!((tag, response_tag), (29, 13));
                 assert!(payload.is_empty());
-                let chats: Vec<crate::chat::Session> = postcard::from_bytes(body).unwrap();
+                let chats: Vec<Chat> = postcard::from_bytes(body).unwrap();
                 assert_eq!(chats.len(), 3);
                 assert!(chats.iter().all(|s| s.proof.as_ref() == Some(&actual)));
+                for chat in chats {
+                    let old = postcard::to_stdvec(&chat).unwrap();
+                    let mut current = crate::chat::Session::from(chat);
+                    assert_eq!(
+                        postcard::to_stdvec(&Chat::try_from(&current).unwrap()).unwrap(),
+                        old
+                    );
+                    current.native_continuity =
+                        crate::chat::NativeContinuity::RetainedClaudeActor { protocol: 1 };
+                    assert!(Chat::try_from(&current).is_err());
+                }
             }
             "impact" => {
                 assert_eq!((tag, response_tag, payload), (36, 9, &[0][..]));
