@@ -5313,6 +5313,141 @@ mod tests {
     }
 
     #[test]
+    fn tool_rows_fixture_settles_parent_and_child_without_leaving_update_work() {
+        // Use the actual offline peer's frames and RPC responses, including
+        // child hydration. No provider executable, account or socket is used.
+        let export = std::process::Command::new("/usr/bin/python3")
+            .args([
+                "-c",
+                r#"
+import json, runpy, sys
+peer = runpy.run_path(sys.argv[1])
+scenario = peer['Scenario']()
+scenario.thread, scenario.child = 'thread-exact', 'child-exact'
+frames = scenario.request({'id': 1, 'method': 'turn/start', 'params': {
+    'threadId': scenario.thread}}, '/private/codex')[1:]
+resume = scenario.request({'id': 2, 'method': 'thread/resume', 'params': {
+    'threadId': scenario.child}}, '/private/codex')
+turn = frames[0]['params']['turn']['id']
+prediction = scenario.request({'id': 3, 'method': 'thread/prediction/request', 'params': {
+    'threadId': scenario.thread, 'sourceTurnId': turn}}, '/private/codex')
+print(json.dumps({'frames': frames, 'replies': {
+    'thread/resume': resume, 'thread/prediction/request': prediction}}))
+"#,
+            ])
+            .arg(
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/codex-tool-rows.py"),
+            )
+            .output()
+            .unwrap();
+        assert!(
+            export.status.success(),
+            "fixture export failed: {}",
+            String::from_utf8_lossy(&export.stderr)
+        );
+        let fixture: Value = serde_json::from_slice(&export.stdout).unwrap();
+        let frames = fixture["frames"].as_array().unwrap();
+        let pause = frames
+            .iter()
+            .position(|frame| frame.get("_sleep").is_some())
+            .unwrap();
+
+        struct Fixture {
+            parser: Codex,
+            replies: Value,
+        }
+        impl Adapter for Fixture {
+            fn initialize(&mut self) -> Result<Step, String> {
+                Ok(Step::default())
+            }
+            fn command(&mut self, _: Command) -> Result<Step, String> {
+                Err("fixture accepts provider frames only".into())
+            }
+            fn receive(&mut self, frame: Value) -> Result<Step, String> {
+                let mut pending = std::collections::VecDeque::from([frame]);
+                let mut result = Step::default();
+                let mut consumed = 0;
+                while let Some(frame) = pending.pop_front() {
+                    consumed += 1;
+                    assert!(consumed < 32, "fixture RPC responses did not settle");
+                    let step = self.parser.receive(frame)?;
+                    result.events.extend(step.events);
+                    for request in step.writes {
+                        let method = request["method"].as_str().unwrap();
+                        let replies = self.replies[method]
+                            .as_array()
+                            .unwrap_or_else(|| panic!("unexpected fixture RPC: {request}"));
+                        for mut reply in replies.iter().cloned() {
+                            if reply.get("id").is_some() {
+                                reply["id"] = request["id"].clone();
+                            }
+                            pending.push_back(reply);
+                        }
+                    }
+                }
+                Ok(result)
+            }
+        }
+        let snapshot = |frames: Vec<Value>, replies: Value| {
+            crate::chat::runtime::notification_frames_with_snapshot_for_test(
+                Box::new(Fixture {
+                    parser: adapter(),
+                    replies,
+                }),
+                frames,
+                false,
+            )
+            .1
+        };
+        let active = snapshot(frames[..pause].to_vec(), fixture["replies"].clone());
+        assert!(active.busy && active.is_working());
+        assert!(
+            active.subagents.iter().any(|child| {
+                child.id == "child-exact" && child.background && child.status == ToolStatus::Running
+            }),
+            "the pause must represent actual delegated work"
+        );
+        let completed: Vec<_> = frames
+            .iter()
+            .filter(|frame| frame.get("_sleep").is_none())
+            .cloned()
+            .collect();
+        let settled = snapshot(completed.clone(), fixture["replies"].clone());
+        assert!(!settled.busy && !settled.is_working());
+        assert!(settled.requests.is_empty());
+        assert_eq!(settled.subagents.len(), 1);
+        assert_eq!(settled.subagents[0].status, ToolStatus::Succeeded);
+
+        // Recreate the old fixture: hydration says idle, completed collab
+        // items assert Running again, and no child lifecycle ever follows.
+        // A parent's success alone cannot prove its background work ended.
+        let broken: Vec<_> = completed
+            .into_iter()
+            .filter(|frame| frame["params"]["threadId"] != "child-exact")
+            .map(|mut frame| {
+                if frame["method"] == "item/completed"
+                    && frame["params"]["item"]["type"] == "collabAgentToolCall"
+                {
+                    frame["params"]["item"]["agentsStates"]["child-exact"]["status"] =
+                        json!("running");
+                }
+                frame
+            })
+            .collect();
+        let mut replies = fixture["replies"].clone();
+        replies["thread/resume"][0]["result"]["thread"]["status"]["type"] = json!("idle");
+        replies["thread/resume"][0]["result"]["initialTurnsPage"]["data"] = json!([]);
+        let stranded = snapshot(broken, replies);
+        assert!(!stranded.busy, "the parent turn really completed");
+        assert!(
+            stranded.is_working(),
+            "the old update check still sees the orphaned Running child"
+        );
+        assert_eq!(stranded.subagents[0].status, ToolStatus::Running);
+    }
+
+    #[test]
     fn rejected_turn_start_releases_optimistic_activity_for_sign_in_recovery() {
         let mut adapter = adapter();
         let submitted = adapter
