@@ -13390,7 +13390,7 @@ fn finish_worktree_journal(
 #[cfg(all(test, feature = "ui"))]
 mod worktree_journal_tests {
     use super::*;
-    use crate::model::BootId;
+    use crate::{model::BootId, repository::test_fixture::isolated_fixture_case};
 
     struct Fixture {
         directory: tempfile::TempDir,
@@ -13595,6 +13595,12 @@ mod worktree_journal_tests {
     /// worktree can be created again on the branch the deletion kept (#269).
     #[test]
     fn a_deleted_worktree_can_be_created_again_on_its_kept_branch() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::a_deleted_worktree_can_be_created_again_on_its_kept_branch"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         fixture.resolve(fixture.input("foo"));
         let report = fixture.run(&CancellationToken::new());
@@ -13625,6 +13631,12 @@ mod worktree_journal_tests {
     /// deleted path and is still live, while one moved and then deleted is.
     #[test]
     fn a_deletion_releases_only_the_creation_of_the_worktree_it_removed() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::a_deletion_releases_only_the_creation_of_the_worktree_it_removed"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         fixture.resolve(fixture.input("foo"));
         let doomed = fixture.run(&CancellationToken::new());
@@ -13686,6 +13698,12 @@ mod worktree_journal_tests {
     /// is the removed worktree's only at the same path on the same branch.
     #[test]
     fn a_creation_without_its_admin_dir_is_matched_by_path_and_branch() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::a_creation_without_its_admin_dir_is_matched_by_path_and_branch"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         fixture.resolve(fixture.input("foo"));
         let report = fixture.run(&CancellationToken::new());
@@ -13708,6 +13726,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn creation_from_project_common_directory_keeps_project_identity() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::creation_from_project_common_directory_keeps_project_identity"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let root = fixture.request.repository.clone();
         let common = root.join(".git");
@@ -13726,6 +13750,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn managed_directory_can_create_a_sibling_worktree() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::managed_directory_can_create_a_sibling_worktree"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let mut input = fixture.input("feature/sibling");
         input.managed_directory = "../managed trees/".into();
@@ -13770,6 +13800,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn offline_creation_uses_last_fetched_remote_default_and_hides_managed_trees() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::offline_creation_uses_last_fetched_remote_default_and_hides_managed_trees"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["commit", "--allow-empty", "-m", "remote advanced"]);
@@ -13814,6 +13850,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn plain_name_tracks_an_unfetched_remote_branch_and_reports_an_unreachable_remote() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::plain_name_tracks_an_unfetched_remote_branch_and_reports_an_unreachable_remote"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["switch", "-c", "colleague"]);
@@ -13858,6 +13900,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn explicit_remote_creation_follows_force_push_without_overwriting_local_history() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::explicit_remote_creation_follows_force_push_without_overwriting_local_history"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         let base = remote.git(&["rev-parse", "HEAD"]);
@@ -13889,6 +13937,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn uncached_remote_branch_fetch_allows_successful_transfers_longer_than_discovery_timeout() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::uncached_remote_branch_fetch_allows_successful_transfers_longer_than_discovery_timeout"
+        )) {
+            return;
+        }
         use std::os::unix::fs::PermissionsExt;
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
@@ -13925,6 +13979,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn unavailable_remote_branch_refresh_falls_back_to_cached_ref_with_warning() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::unavailable_remote_branch_refresh_falls_back_to_cached_ref_with_warning"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
@@ -13957,6 +14017,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn cached_remote_resolution_preserves_configured_remote_names_containing_slashes() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::cached_remote_resolution_preserves_configured_remote_names_containing_slashes"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
@@ -13987,6 +14053,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn explicit_tag_base_resolves_to_its_commit_without_remote_lookup() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::explicit_tag_base_resolves_to_its_commit_without_remote_lookup"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let original = fixture.git(&["rev-parse", "HEAD"]);
         fixture.git(&["tag", "-a", "v1", "-m", "release"]);
@@ -14004,6 +14076,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn qualified_remote_bases_keep_their_namespace_and_missing_cache_policy() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::qualified_remote_bases_keep_their_namespace_and_missing_cache_policy"
+        )) {
+            return;
+        }
         struct RecordingFetch(Arc<std::sync::atomic::AtomicUsize>);
         impl ProcessExecutor for RecordingFetch {
             fn execute(
@@ -14131,6 +14209,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn qualified_tags_are_exact_and_shorthand_keeps_local_tag_remote_precedence() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::qualified_tags_are_exact_and_shorthand_keeps_local_tag_remote_precedence"
+        )) {
+            return;
+        }
         for annotated in [false, true] {
             let mut fixture = Fixture::new();
             let tagged = fixture.git(&["rev-parse", "HEAD"]);
@@ -14217,6 +14301,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn intelligent_creation_uses_cached_default_branch_and_keeps_source_changes() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::intelligent_creation_uses_cached_default_branch_and_keeps_source_changes"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["commit", "--allow-empty", "-m", "remote default advanced"]);
@@ -14257,6 +14347,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn intelligent_creation_keeps_local_branch_without_refreshing_upstream() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::intelligent_creation_keeps_local_branch_without_refreshing_upstream"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
@@ -14275,6 +14371,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn intelligent_creation_preserves_ahead_branch_and_rejects_divergence() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::intelligent_creation_preserves_ahead_branch_and_rejects_divergence"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let remote = Fixture::new();
         remote.git(&["branch", "topic"]);
@@ -14319,6 +14421,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn intelligent_creation_rejects_checked_out_dirty_branch_without_reset() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::intelligent_creation_rejects_checked_out_dirty_branch_without_reset"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         fixture.git(&["branch", "topic"]);
         fixture.resolve(fixture.input("topic"));
@@ -14347,6 +14455,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn intelligent_creation_disambiguates_remotes_before_fetching() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::intelligent_creation_disambiguates_remotes_before_fetching"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let first = Fixture::new();
         let second = Fixture::new();
@@ -14376,6 +14490,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn intelligent_creation_accepts_linear_and_safe_managed_path_overrides() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::intelligent_creation_accepts_linear_and_safe_managed_path_overrides"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         let mut input =
             fixture.input("https://linear.app/team/issue/APP-42/fix-worktree-paths?view=all");
@@ -14454,6 +14574,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn prepared_interruption_rehydrates_not_created_and_retry_needs_fresh_id() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::prepared_interruption_rehydrates_not_created_and_retry_needs_fresh_id"
+        )) {
+            return;
+        }
         let mut fixture = Fixture::new();
         fixture.prepare();
         assert!(!fixture.request.managed_root.exists());
@@ -14479,6 +14605,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn interrupted_base_resolution_requires_quiescence_and_unchanged_branch_identity() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::interrupted_base_resolution_requires_quiescence_and_unchanged_branch_identity"
+        )) {
+            return;
+        }
         for (existing, moved, expected) in [
             (false, false, WorktreeOperationState::NotCreated),
             (true, false, WorktreeOperationState::NotCreated),
@@ -14559,6 +14691,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn live_lease_and_orphaned_child_prevent_false_not_created() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::live_lease_and_orphaned_child_prevent_false_not_created"
+        )) {
+            return;
+        }
         let fixture = Fixture::new();
         let (mut journal, payload) = fixture.prepare();
         let lease = worktree_lease(&journal.lease_path, true).unwrap();
@@ -14624,6 +14762,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn git_success_before_resolution_is_reconciled_after_restart() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::git_success_before_resolution_is_reconciled_after_restart"
+        )) {
+            return;
+        }
         let fixture = Fixture::new();
         let (mut journal, payload) = fixture.prepare();
         let lease = worktree_lease(&journal.lease_path, true).unwrap();
@@ -14783,6 +14927,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn cancel_at_git_and_after_exit_both_reconcile_instead_of_promising_rollback() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::cancel_at_git_and_after_exit_both_reconcile_instead_of_promising_rollback"
+        )) {
+            return;
+        }
         for (after_exit, expected) in [
             (false, WorktreeOperationState::NotCreated),
             (true, WorktreeOperationState::Created),
@@ -14809,6 +14959,12 @@ mod worktree_journal_tests {
     }
     #[test]
     fn a_partial_branch_is_never_a_retryable_not_created() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::a_partial_branch_is_never_a_retryable_not_created"
+        )) {
+            return;
+        }
         let fixture = Fixture::new();
         fixture.prepare();
         let output = Command::new("git")
@@ -14874,6 +15030,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn cancellation_during_real_git_hook_preserves_reconciled_created_worktree() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::cancellation_during_real_git_hook_preserves_reconciled_created_worktree"
+        )) {
+            return;
+        }
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let fixture = Fixture::new();
         let marker = fixture.directory.path().join("hook-running");
@@ -14962,6 +15124,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn created_followup_failures_remain_durable_visible_warnings() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::created_followup_failures_remain_durable_visible_warnings"
+        )) {
+            return;
+        }
         for unlock in [false, true] {
             let mut fixture = Fixture::new();
             fixture.request.track = true;
@@ -14995,6 +15163,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn incomplete_checkout_and_replaced_destination_never_rehydrate_created() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::incomplete_checkout_and_replaced_destination_never_rehydrate_created"
+        )) {
+            return;
+        }
         for replace_destination in [false, true] {
             let fixture = Fixture::new();
             let (mut journal, payload) = fixture.prepare();
@@ -15060,6 +15234,12 @@ mod worktree_journal_tests {
 
     #[test]
     fn post_executor_settlement_waits_for_unrelated_pre_exec_descriptor_inheritance() {
+        if isolated_fixture_case(concat!(
+            module_path!(),
+            "::post_executor_settlement_waits_for_unrelated_pre_exec_descriptor_inheritance"
+        )) {
+            return;
+        }
         use std::os::unix::{net::UnixStream, process::CommandExt};
         let fixture = Fixture::new();
         let (journal, _) = fixture.prepare();
