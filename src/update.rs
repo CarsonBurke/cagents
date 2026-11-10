@@ -3,7 +3,7 @@
 mod candidate;
 mod confirmation;
 mod installed;
-mod source;
+pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
 pub mod impact;
 #[cfg(feature = "ui")]
@@ -431,10 +431,8 @@ pub fn apply_installed(
             "the installed candidate changed; inspect the installation again",
         ));
     }
-    // A newly opened UI may already be current while an older daemon still
-    // owns the sessions. The worker is that owner's version unless the staged
-    // candidate can upgrade it: an authenticated supported source or a
-    // compatible older build is updated by the candidate's own worker.
+    // The served build owns every update, including an older daemon's
+    // replacement and a remaining window-only replacement.
     installation.version = installed_entry_worker(&layout, &served)?;
     let version = served
         .file_name()
@@ -452,19 +450,6 @@ pub fn apply_installed(
 }
 
 fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<String, UpdateError> {
-    // This window's constants describe its own build, not the staged one.
-    // Ask the staged build which protocol it speaks; one that cannot answer
-    // is never chosen to update a source it may not understand. Probe first,
-    // so the source observation below stays the last one before choosing.
-    let staged_protocol = if served == window.version_root {
-        Some(crate::terminal_ipc::PROTOCOL_VERSION)
-    } else {
-        installed_protocol(&served.join("bin/cagents"))
-            .inspect_err(|error| {
-                tracing::warn!(%error, "the staged build did not report its protocol");
-            })
-            .ok()
-    };
     let source = source::inspect_installed_identity()?;
     let owner = installed_daemon_owner(window)?;
     // A header cannot choose a coordinator. Keep the original socket peer's
@@ -473,117 +458,38 @@ fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<Strin
         .as_ref()
         .map(|owner| owner.version_root.join("bin/cagentsd"));
     source.verify_owner(executable.as_deref())?;
-    if source.requires_matched_owner_worker()
-        && owner
-            .as_ref()
-            .is_none_or(|owner| owner.version_root == served)
-    {
-        // The UI-only fallback uses the old window's CLI. It cannot speak an
-        // unqualified service already owned by the served candidate, so do
-        // not infer that workflow from an unknown version header.
-        return Err(invalid(
-            "The installed source requires its own matched application to finish this update",
-        ));
-    }
-    installed_update_worker(
+    installed_candidate_version(
         window,
         served,
-        staged_protocol,
         owner.as_ref(),
         source.protocol,
         source.proof.as_ref(),
     )
 }
 
-/// This entry decision consumes an authenticated source observation. A failed
-/// ordinary-client decode is neither proof of compatibility nor permission to
-/// route around a source owner. Header discovery alone never reaches here.
-fn installed_update_worker(
+/// Return the served candidate's version after source admission and the no-op
+/// check. The candidate updater rechecks the source and its installed owner.
+fn installed_candidate_version(
     window: &InstallLayout,
     served: &Path,
-    staged_protocol: Option<u16>,
     daemon: Option<&InstallLayout>,
     source_protocol: u16,
     source_proof: Option<&crate::model::HostSessionProof>,
 ) -> Result<String, UpdateError> {
+    if !source::is_qualified_source(source_protocol) {
+        return Err(source::unsupported_source(source_protocol));
+    }
     let replaces_daemon = source_proof.is_some()
         && (source_protocol != crate::terminal_ipc::PROTOCOL_VERSION
             || daemon.is_some_and(|owner| owner.version_root != served));
     if served == window.version_root && !replaces_daemon {
         return Err(invalid("the installed application is already running"));
     }
-    let legacy_source = source_proof.is_some() && is_bootstrapped_source(source_protocol);
-    let complete_proof = source_proof.is_some_and(crate::model::HostSessionProof::is_complete);
-    // A source the staged build can upgrade is updated by the staged build's
-    // own worker, so its inspector and preflight decide what the update
-    // carries. That holds whichever entry asks: the staged CLI, or an older
-    // window's update control (#2431). Delegating an older build of the same
-    // protocol back to that build's updater applied its older preflight.
-    //
-    // Only the staged build's reported protocol says what it can speak. A
-    // bootstrapped source is judged by this window's list, so it goes to the
-    // staged worker only when both builds share a protocol, assuming builds
-    // of one protocol bootstrap the same older ones; otherwise this window's
-    // worker, which knows that source, performs the update. The staged
-    // worker's own guard requires a complete proof, so it gets no other.
-    let staged_speaks = |protocol| staged_protocol == Some(protocol);
-    if complete_proof
-        && ((legacy_source && staged_speaks(crate::terminal_ipc::PROTOCOL_VERSION))
-            || (staged_speaks(source_protocol)
-                && daemon.is_some_and(|owner| owner.version_root != served)))
-    {
-        return served
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(str::to_owned)
-            .ok_or_else(unsupported_install);
-    }
-    if legacy_source {
-        return Ok(window.version.clone());
-    }
-    let worker = installation_worker_version(window, served, daemon);
-    if served == window.prefix.join("versions").join(&worker) {
-        return Err(invalid("the installed application is already running"));
-    }
-    Ok(worker)
-}
-
-fn candidate_can_upgrade_source(
-    served: &Path,
-    daemon: Option<&InstallLayout>,
-    protocol: u16,
-    proof: Option<&crate::model::HostSessionProof>,
-) -> bool {
-    proof.is_some_and(crate::model::HostSessionProof::is_complete)
-        && (is_bootstrapped_source(protocol)
-            || (protocol == crate::terminal_ipc::PROTOCOL_VERSION
-                && daemon.is_some_and(|owner| owner.version_root != served)))
-}
-
-/// Older protocols whose update this release's worker performs itself, so
-/// its own inspector and preflight decide what the update must preserve. The
-/// install candidate line (128) is one: its own worker would apply its older
-/// preflight to the panes this release knows how to qualify.
-fn is_bootstrapped_source(protocol: u16) -> bool {
-    (matches!(protocol, 77 | 119) && crate::terminal_ipc::PROTOCOL_VERSION > 77)
-        || (protocol == crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL
-            && crate::terminal_ipc::PROTOCOL_VERSION > crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL)
-}
-
-/// The worker for a source the staged candidate cannot upgrade itself.
-fn installation_worker_version(
-    window: &InstallLayout,
-    served: &Path,
-    daemon: Option<&InstallLayout>,
-) -> String {
-    // Once the candidate already owns the daemon, the old window's worker
-    // must perform the remaining UI-only replacement. A current worker would
-    // correctly reject replacing its own installation with itself.
-    daemon
-        .filter(|owner| owner.version_root != served)
-        .unwrap_or(window)
-        .version
-        .clone()
+    served
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_owned)
+        .ok_or_else(unsupported_install)
 }
 
 fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout>, UpdateError> {
@@ -603,8 +509,7 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 }
 
 /// CLI entry point for the same leased worker, exact preview and window fence
-/// used by the application. This installed coordinator chooses the worker
-/// (`installed_update_worker`); it is never delegated to an older owner's CLI.
+/// used by the application. The served candidate always supplies the worker.
 pub fn upgrade_installed(
     yes: bool,
     interrupt: bool,
@@ -1499,16 +1404,6 @@ pub(crate) fn companion_protocol(executable: &Path) -> Result<u16, UpdateError> 
         executable,
         CEDITOR_COMPANION,
         "editor companion protocol check",
-    )
-}
-
-/// The daemon protocol an installed version's own CLI reports. It runs only
-/// that owned executable, with no daemon contact or startup.
-fn installed_protocol(executable: &Path) -> Result<u16, UpdateError> {
-    owned_cli_protocol(
-        executable,
-        "The installed build",
-        "installed build protocol check",
     )
 }
 
@@ -3033,7 +2928,7 @@ sys.exit(7)
     }
 
     #[test]
-    fn installed_entry_routes_ordinary_skew_only_through_its_exact_owned_old_cli() {
+    fn installed_entry_admits_supported_sources_and_uses_the_candidate_worker() {
         const CASE: &str = "CAGENTS_TEST_INSTALLED_ENTRY_OWNER";
         let selector = thread::current().name().unwrap().to_owned();
         if std::env::var_os(CASE).is_none() {
@@ -3133,8 +3028,7 @@ sys.exit(7)
             },
         })
         .unwrap();
-        let mut other_reply =
-            postcard::to_stdvec(&(crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL - 1)).unwrap();
+        let mut other_reply = postcard::to_stdvec(&127u16).unwrap();
         // Deliberately not a current, candidate-line or protocol77 envelope. Entry routing
         // must never decode this unknown source's response DTO.
         other_reply.extend_from_slice(b"opaque-unqualified-source-dto");
@@ -3225,39 +3119,26 @@ finally:
             fixture
         };
         let executable = prefix.join("versions/old/bin/cagentsd");
-        // The served window is already new. This exact production entry
-        // decision must nevertheless route the unknown old owner to its CLI.
+        // Unknown source protocols are refused without decoding their DTOs
+        // or asking any older worker to perform the update.
         let mut fixture = start(&executable, false, true, 1, None);
-        assert_eq!(installed_entry_worker(&window, &served).unwrap(), "old");
+        let error = installed_entry_worker(&window, &served)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("127")
+                && error.contains("protocol 156")
+                && error.contains("0.1.3+local.991daa43e")
+        );
         fixture.finish();
         // A fully qualified current peer owned by an older build is updated
         // by the staged build's worker even when the old window asks, as it
-        // is from the staged CLI (#2431); no inventory or preparation request
-        // is sent to choose it. The window learns what the staged build
-        // speaks from that build's own CLI, never from its own constants.
-        let staged_cli = prefix.join("versions/new/bin/cagents");
-        let report = |protocol: u16| {
-            fs::write(
-                &staged_cli,
-                format!(
-                    "#!/bin/sh\nprintf '{{\"ok\":true,\"data\":{{\"protocol_version\":{protocol}}}}}'\n"
-                ),
-            )
-            .unwrap();
-            fs::set_permissions(&staged_cli, fs::Permissions::from_mode(0o700)).unwrap();
-        };
-        report(crate::terminal_ipc::PROTOCOL_VERSION);
+        // is from the staged CLI (#2431); entry sends no impact or
+        // preparation request and never probes an older worker.
         let mut fixture = start(&executable, true, true, 2, None);
         assert_eq!(installed_entry_worker(&old_window, &served).unwrap(), "new");
         fixture.finish();
-        // A staged build on a later protocol cannot speak this source; its
-        // owner's worker still performs the update.
-        report(crate::terminal_ipc::PROTOCOL_VERSION + 1);
-        let mut fixture = start(&executable, true, true, 2, None);
-        assert_eq!(installed_entry_worker(&old_window, &served).unwrap(), "old");
-        fixture.finish();
-        fs::write(&staged_cli, b"binary").unwrap();
-        let mut fixture = start(&executable, false, false, 1, None);
+        let mut fixture = start(&executable, true, false, 2, None);
         assert!(installed_entry_worker(&window, &served).is_err());
         fixture.finish();
         // Unknown service at the served candidate must not fall back to the
@@ -3282,9 +3163,9 @@ finally:
         .unwrap();
         let mut fixture = start(
             &foreign.join("versions/old/bin/cagentsd"),
-            false,
             true,
-            1,
+            true,
+            2,
             None,
         );
         assert!(installed_entry_worker(&window, &served).is_err());
@@ -3292,9 +3173,9 @@ finally:
         fs::remove_file(foreign.join(".cagents-install-root")).unwrap();
         let mut fixture = start(
             &foreign.join("versions/old/bin/cagentsd"),
-            false,
             true,
-            1,
+            true,
+            2,
             None,
         );
         assert!(installed_entry_worker(&window, &served).is_err());
@@ -3394,12 +3275,12 @@ finally:
         fixture.finish();
         // A replacement using the very same executable and proof text is
         // still another process: the held original pidfd/epoch must refuse it.
-        let mut fixture = start(&executable, false, true, 2, None);
+        let mut fixture = start(&executable, true, true, 4, None);
         let original = source::inspect_installed_identity().unwrap();
         let same_owner = source::inspect_installed_identity().unwrap();
         original.verify_same_owner(&same_owner).unwrap();
         fixture.finish();
-        let mut replacement = start(&executable, false, true, 1, None);
+        let mut replacement = start(&executable, true, true, 2, None);
         let replacement_identity = source::inspect_installed_identity().unwrap();
         let owner = installed_daemon_owner(&window).unwrap().unwrap();
         replacement_identity
@@ -3418,7 +3299,7 @@ finally:
     }
 
     #[test]
-    fn staged_update_selects_the_worker_for_both_directions_of_version_skew() {
+    fn staged_update_always_uses_the_candidate_worker() {
         let layout = |version: &str| InstallLayout {
             prefix: "/owned/install".into(),
             version_root: PathBuf::from("/owned/install/versions").join(version),
@@ -3426,237 +3307,73 @@ finally:
         };
         let old = layout("old");
         let new = layout("new");
-        // A newer UI cannot speak the old service's protocol.
-        assert_eq!(
-            installation_worker_version(&new, &new.version_root, Some(&old)),
-            "old"
-        );
-        // Once that service is already new, the old UI still needs replacement:
-        // selecting the new worker would reject its candidate as itself.
-        assert_eq!(
-            installation_worker_version(&old, &new.version_root, Some(&new)),
-            "old"
-        );
-        // Repeated staging must use the actual owner, not the window or current.
-        let staged = layout("third");
-        assert_eq!(
-            installation_worker_version(&old, &staged.version_root, Some(&new)),
-            "new"
-        );
-        // Bootstrap from the staged CLI also works when the installed daemon
-        // has the current wire protocol but an older executable/version root.
-        // Reusing its old updater would preserve the very bug being repaired.
+        let third = layout("third");
         let proof = crate::model::HostSessionProof {
-            host_session_id: "current-source".into(),
-            boot_id: "current-boot".into(),
-            host_incarnation: "current-incarnation".into(),
+            host_session_id: "source".into(),
+            boot_id: "boot".into(),
+            host_incarnation: "incarnation".into(),
         };
-        assert_eq!(
-            installed_update_worker(
-                &new,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                Some(&old),
-                crate::terminal_ipc::PROTOCOL_VERSION,
-                Some(&proof),
-            )
-            .unwrap(),
-            "new"
-        );
-        // The old window's update control reaches the same worker as the
-        // staged CLI (#2431): delegating to the owner's updater applied that
-        // build's preflight, which refuses panes this release carries.
-        assert_eq!(
-            installed_update_worker(
-                &old,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                Some(&old),
-                crate::terminal_ipc::PROTOCOL_VERSION,
-                Some(&proof),
-            )
-            .unwrap(),
-            "new"
-        );
-        // The window's constants describe only its own build. A staged build
-        // on another protocol, or one that did not report its protocol, is
-        // never chosen for a source it may not speak: the owner's worker,
-        // which can upgrade across protocols, performs the update.
-        for staged in [Some(crate::terminal_ipc::PROTOCOL_VERSION + 1), None] {
-            assert_eq!(
-                installed_update_worker(
-                    &old,
-                    &new.version_root,
-                    staged,
-                    Some(&old),
-                    crate::terminal_ipc::PROTOCOL_VERSION,
-                    Some(&proof),
-                )
-                .unwrap(),
-                "old"
-            );
-        }
-        // Once the staged build owns the daemon, the old window's worker
-        // performs the remaining replacement of that window.
-        assert_eq!(
-            installed_update_worker(
-                &old,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                Some(&new),
-                crate::terminal_ipc::PROTOCOL_VERSION,
-                Some(&proof),
-            )
-            .unwrap(),
-            "old"
-        );
-        assert!(candidate_can_upgrade_source(
-            &new.version_root,
-            Some(&old),
-            crate::terminal_ipc::PROTOCOL_VERSION,
-            Some(&proof)
-        ));
-        assert!(!candidate_can_upgrade_source(
-            &new.version_root,
-            Some(&new),
-            crate::terminal_ipc::PROTOCOL_VERSION,
-            Some(&proof)
-        ));
-        assert!(!candidate_can_upgrade_source(
-            &new.version_root,
-            Some(&old),
-            crate::terminal_ipc::PROTOCOL_VERSION,
-            None
-        ));
-        // The install candidate line's daemon is updated by this release's
-        // worker, so this release's inspector and preflight decide what the
-        // update preserves. Its older worker would apply its own preflight.
-        let candidate_line = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
-        assert!(is_bootstrapped_source(candidate_line));
-        assert!(!is_bootstrapped_source(candidate_line - 1));
-        assert!(!is_bootstrapped_source(
-            crate::terminal_ipc::PROTOCOL_VERSION
-        ));
-        for daemon in [Some(&old), None] {
-            assert!(candidate_can_upgrade_source(
-                &new.version_root,
-                daemon,
-                candidate_line,
-                Some(&proof)
-            ));
-            for window in [&new, &old] {
-                assert_eq!(
-                    installed_update_worker(
-                        window,
-                        &new.version_root,
-                        Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                        daemon,
-                        candidate_line,
-                        Some(&proof)
-                    )
-                    .unwrap(),
-                    "new"
-                );
+        for protocol in source::protocols() {
+            for window in [&old, &new] {
+                for owner in [&old, &third] {
+                    assert_eq!(
+                        installed_candidate_version(
+                            window,
+                            &new.version_root,
+                            Some(owner),
+                            protocol,
+                            Some(&proof)
+                        )
+                        .unwrap(),
+                        "new"
+                    );
+                }
             }
         }
-        assert!(!candidate_can_upgrade_source(
-            &new.version_root,
-            Some(&old),
-            candidate_line,
-            None
-        ));
-        // The staged worker refuses a source without a complete proof, so
-        // such a bootstrapped source stays with this window's worker, even
-        // when the daemon belongs to a third build; an ordinary same-protocol
-        // source stays with its daemon owner's worker.
-        let incomplete = crate::model::HostSessionProof {
-            host_session_id: "partial-source".into(),
-            boot_id: "".into(),
-            host_incarnation: "partial-incarnation".into(),
-        };
-        let elder = layout("elder");
-        for (source_protocol, expected) in [
-            (candidate_line, "old"),
-            (crate::terminal_ipc::PROTOCOL_VERSION, "elder"),
-        ] {
-            assert_eq!(
-                installed_update_worker(
-                    &old,
-                    &new.version_root,
-                    Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                    Some(&elder),
-                    source_protocol,
-                    Some(&incomplete)
-                )
-                .unwrap(),
-                expected
-            );
-        }
-        // A bootstrapped source goes to the staged worker only when it shares
-        // this window's protocol, and so the list of sources it bootstraps.
+        // UI-only replacement and a stopped source also use the candidate.
         assert_eq!(
-            installed_update_worker(
+            installed_candidate_version(
                 &old,
                 &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION + 1),
-                Some(&old),
-                candidate_line,
+                Some(&new),
+                crate::terminal_ipc::PROTOCOL_VERSION,
                 Some(&proof)
             )
             .unwrap(),
-            "old"
+            "new"
         );
         assert_eq!(
-            installed_update_worker(
-                &new,
-                &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                Some(&old),
-                candidate_line - 1,
-                Some(&proof)
-            )
-            .unwrap(),
-            "old"
-        );
-        // The real entry decision must not mistake an already-served window
-        // for a completed daemon migration. No-daemon/current observations keep
-        // the old already-running refusal instead of granting a legacy route.
-        for source_proof in [
-            None,
-            Some(crate::model::HostSessionProof {
-                host_session_id: crate::model::HostSessionId::new("current"),
-                boot_id: crate::model::BootId::new("current"),
-                host_incarnation: crate::model::HostIncarnation::new("current"),
-            }),
-        ] {
-            assert!(
-                installed_update_worker(
-                    &new,
-                    &new.version_root,
-                    Some(crate::terminal_ipc::PROTOCOL_VERSION),
-                    Some(&new),
-                    crate::terminal_ipc::PROTOCOL_VERSION,
-                    source_proof.as_ref()
-                )
-                .is_err()
-            );
-        }
-        assert_eq!(
-            installed_update_worker(
+            installed_candidate_version(
                 &old,
                 &new.version_root,
-                Some(crate::terminal_ipc::PROTOCOL_VERSION),
                 None,
                 crate::terminal_ipc::PROTOCOL_VERSION,
                 None
             )
             .unwrap(),
-            "old"
+            "new"
         );
-        // Without a service, the old window's worker can start the candidate.
-        assert_eq!(
-            installation_worker_version(&old, &new.version_root, None),
-            "old"
+        // Preserve no-op refusal once both window and daemon are already served.
+        for (owner, proof) in [(None, None), (Some(&new), Some(&proof))] {
+            assert!(
+                installed_candidate_version(
+                    &new,
+                    &new.version_root,
+                    owner,
+                    crate::terminal_ipc::PROTOCOL_VERSION,
+                    proof
+                )
+                .is_err()
+            );
+        }
+        let error =
+            installed_candidate_version(&new, &new.version_root, Some(&old), 127, Some(&proof))
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("127")
+                && error.contains("protocol 156")
+                && error.contains("0.1.3+local.991daa43e")
         );
     }
     use std::os::unix::fs::PermissionsExt;
