@@ -8,7 +8,6 @@ use crate::{
     terminal::ipc::ProtocolError,
 };
 use std::{
-    cell::Cell,
     fs::{self, File},
     os::unix::{ffi::OsStringExt, fs::PermissionsExt, net::UnixListener},
     thread::JoinHandle,
@@ -324,12 +323,7 @@ fn local(role: &str) {
             if no_start {
                 args.insert(1, "--no-start".into());
             }
-            let staged = Cell::new(0);
-            let result = run_from_with_staged_lookup(args, |_, recover| {
-                staged.set(staged.get() + 1);
-                assert_eq!(recover, !no_start);
-                Ok(None)
-            });
+            let result = run_from(args);
             assert_eq!(
                 result,
                 if scoped && mutation {
@@ -339,18 +333,13 @@ fn local(role: &str) {
                 }
             );
             let (readiness, raw) = peer.finished();
-            routing.push((business, refuse_auth, staged.get(), readiness, raw));
+            routing.push((business, readiness, raw));
         }
     }
-    // Reach every real command and both scoped refusal boundaries first;
-    // only then diagnose the predecessor's startup/staged-owner behavior.
-    for (business, refused_auth, staged, readiness, raw) in routing {
+    // Reach every real command and both scoped refusal boundaries before
+    // checking startup behavior.
+    for (business, readiness, raw) in routing {
         let scoped_mutation = scoped && !matches!(business, Business::List);
-        assert_eq!(
-            staged,
-            usize::from(!scoped_mutation),
-            "{business:?} auth_refused={refused_auth}: scoped mutation bypasses staged owner"
-        );
         assert_eq!(
             readiness,
             usize::from(!scoped_mutation && !no_start),
@@ -397,15 +386,7 @@ fn remote() {
     let before = proxies();
     let mut args = arguments(business, TerminalId::new());
     args.splice(1..1, ["--device".into(), "fixture".into()]);
-    let staged = Cell::new(0);
-    assert_eq!(
-        run_from_with_staged_lookup(args, |_, _| {
-            staged.set(staged.get() + 1);
-            Ok(None)
-        }),
-        ExitCode::FAILURE
-    );
-    assert_eq!(staged.get(), 0);
+    assert_eq!(run_from(args), ExitCode::FAILURE);
     assert!(crate::device::is_remote());
     assert_eq!(crate::device::selected().unwrap().name, "fixture");
     assert_eq!(proxies(), before);
@@ -567,7 +548,7 @@ fn child(selector: &str, role: &str, remote_verb: Option<Business>) {
     }
 }
 #[test]
-fn public_terminal_mutations_preserve_original_scope_before_staged_lookup_and_readiness() {
+fn public_terminal_mutations_preserve_original_scope_before_readiness() {
     if let Some(role) = std::env::var_os(ROLE) {
         if std::env::var(MODE).unwrap() == "remote" {
             remote();

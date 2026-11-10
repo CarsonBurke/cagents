@@ -21,7 +21,7 @@ Usage: scripts/install-local [--build-host HOST] [--stage-only] [--this-commit]
                              [--yes] [--interrupt]
 
 Builds HEAD with the `local` Cargo profile as version <version>+local.<sha>,
-stages it with install.sh --stage-only, and runs `cagents daemon upgrade`.
+stages it without changing current, and runs the staged CLI's daemon upgrade.
 
 The build runs in the repository's .worktrees/.install-local, a detached
 checkout this script owns, so its target directory stays warm between runs
@@ -29,7 +29,7 @@ and edits in other checkouts never reach the binaries.
 
   --build-host HOST  Build on HOST over ssh, then install here. HEAD is pushed
                      to the repository at the same path relative to $HOME.
-  --stage-only       Stop after staging; finish later with: cagents daemon upgrade
+  --stage-only       Stop after staging; print the staged CLI command to finish later
   --this-commit      Build HEAD even when it is detached or its branch is
                      behind its upstream.
   --yes, --interrupt
@@ -151,6 +151,11 @@ VERSION=$MANIFEST_VERSION+local.$SHORT
 # Worktrees share their repository's objects; address the main checkout.
 REPOSITORY=$(dirname -- "$(git rev-parse --path-format=absolute --git-common-dir)")
 PREFIX=${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install
+INITIAL_INSTALL=0
+if [[ ! -L $PREFIX/current ]]; then
+    ((STAGE_ONLY == 0)) || fail '--stage-only requires an existing installation; run scripts/install-local for the first install'
+    INITIAL_INSTALL=1
+fi
 ARCHIVE=cagents-$VERSION-x86_64-unknown-linux-gnu.tar.gz
 OUTPUT=${TMPDIR:-/var/tmp}/cagents-install-local/$VERSION
 BUILD_REF=refs/cagents/install-local
@@ -190,7 +195,8 @@ build_commit() {
 prune_versions() {
     local versions current name exe kept=0
     versions=$(realpath -- "$PREFIX/versions")
-    current=$(basename -- "$(readlink -- "$PREFIX/current")")
+    current=$(readlink -- "$PREFIX/current" 2>/dev/null || :)
+    current=${current##*/}
     local -A in_use=()
     for exe in /proc/[0-9]*/exe; do
         exe=$(readlink -- "$exe" 2>/dev/null) || continue
@@ -199,7 +205,7 @@ prune_versions() {
         in_use[${exe%%/*}]=1
     done
     while IFS= read -r name; do
-        [[ $name == *+local.* && $name != "$current" && -z ${in_use[$name]:-} ]] || continue
+        [[ $name == *+local.* && $name != "$current" && $name != "$VERSION" && -z ${in_use[$name]:-} ]] || continue
         if ((kept < 2)); then
             kept=$((kept + 1))
             continue
@@ -212,7 +218,10 @@ prune_versions() {
 if [[ $PREFIX/current -ef $PREFIX/versions/$VERSION ]]; then
     printf '%s is already current; skipping the build.\n' "$VERSION"
 elif [[ -e $PREFIX/versions/$VERSION ]]; then
-    fail "$PREFIX/versions/$VERSION exists but is not current; remove it to reinstall"
+    for binary in cagents cagentsd cagents-ui; do
+        [[ -x $PREFIX/versions/$VERSION/bin/$binary ]] || fail "$VERSION is incomplete; missing executable $binary"
+    done
+    printf '%s is already staged; skipping the build.\n' "$VERSION"
 else
     if [[ -z $BUILD_HOST ]]; then
         build_commit "$REPOSITORY" "$COMMIT" "$VERSION" "$OUTPUT" "${CARGO_BUILD_JOBS:-}" </dev/null
@@ -250,14 +259,19 @@ EOF
     [[ -n $need ]] || fail 'could not determine the glibc the build requires'
     [[ $(printf '%s\n%s\n' "$need" "$have" | sort -V | tail -n1) == "$have" ]] \
         || fail "the build requires glibc $need; this host has $have"
+    INSTALL_OPTIONS=()
+    ((INITIAL_INSTALL)) || INSTALL_OPTIONS+=(--stage-only)
     CAGENTS_ARCHIVE=$OUTPUT/$ARCHIVE CAGENTS_CHECKSUMS=$OUTPUT/SHA256SUMS \
-        sh "$ROOT_DIR/install.sh" --version "$VERSION" --stage-only
+        sh "$ROOT_DIR/install.sh" --version "$VERSION" "${INSTALL_OPTIONS[@]}"
     rm -rf -- "$OUTPUT"
     prune_versions
 fi
 
-if ((STAGE_ONLY)); then
-    printf 'Staged %s. Finish the update with: cagents daemon upgrade\n' "$VERSION"
+if ((INITIAL_INSTALL)); then
     exit 0
 fi
-exec "$PREFIX/current/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"
+if ((STAGE_ONLY)); then
+    printf 'Staged %s. Finish the update with: %q daemon upgrade\n' "$VERSION" "$PREFIX/versions/$VERSION/bin/cagents"
+    exit 0
+fi
+exec "$PREFIX/versions/$VERSION/bin/cagents" daemon upgrade "${UPGRADE_ARGS[@]}"

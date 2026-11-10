@@ -95,18 +95,15 @@ fn scoped_remote_write_reports_permission_before_device_preparation() {
     fs::create_dir_all(devices.parent().unwrap()).unwrap();
     fs::write(devices, br#"{"devices":[{"name":"fixture-remote","host":"scope-fixture.invalid","executable":"cagents"}]}"#).unwrap();
     let channel = ChannelId::new().to_string();
-    let result = run_from_with_staged_lookup(
-        [
-            "cagents",
-            "--device",
-            "fixture-remote",
-            "--json",
-            "channel",
-            "close",
-            &channel,
-        ],
-        |_, _| panic!("scoped remote write must not consult a staged User owner"),
-    );
+    let result = run_from([
+        "cagents",
+        "--device",
+        "fixture-remote",
+        "--json",
+        "channel",
+        "close",
+        &channel,
+    ]);
     assert_eq!(result, ExitCode::FAILURE);
     assert!(!Path::new(&std::env::var_os(MARKER).unwrap()).exists());
 }

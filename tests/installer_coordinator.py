@@ -184,6 +184,45 @@ class InstallerCoordinator(unittest.TestCase):
         self.assertEqual(list(self.downloads.iterdir()), [], "downloaded coordinator pair was not cleaned")
         return next(e for e in events if e['event'] == 'coordinate')
 
+    def test_staging_preserves_current_and_public_links(self):
+        previous = self.installed_cli(guarded=True)
+        current = self.prefix / "current"
+        before = current.lstat()
+        launcher = self.home / ".local/bin/cagents"
+        launcher.parent.mkdir(parents=True)
+        launcher.symlink_to(current / "bin/cagents")
+        launcher_before = launcher.lstat()
+        result = self.install("--stage-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(os.readlink(current), "versions/old")
+        self.assertEqual(current.lstat().st_ino, before.st_ino)
+        self.assertEqual(current.lstat().st_ctime_ns, before.st_ctime_ns)
+        self.assertEqual(launcher.lstat().st_ino, launcher_before.st_ino)
+        self.assertTrue((self.prefix / f"versions/{VERSION}/bin/cagents").is_file())
+        self.assertFalse((self.prefix / f"versions/{VERSION}/.deferred-owner.json").exists())
+        self.assertFalse((self.home / "data/applications").exists())
+        self.assertEqual([event['event'] for event in self.events()], ['inspect', 'coordinate', 'verify'])
+        self.assertIn(str(self.prefix / f"versions/{VERSION}/bin/cagents"), result.stdout)
+
+    def test_staging_a_fresh_prefix_requires_an_ordinary_first_install(self):
+        result = self.install("--stage-only")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('--stage-only requires an existing installation', result.stderr)
+        self.assertIn('without --stage-only for the first install', result.stderr)
+        self.assertFalse((self.prefix / "current").is_symlink())
+        self.assertFalse((self.home / ".local/bin/cagents").exists())
+        self.assertFalse((self.prefix / f"versions/{VERSION}").exists())
+
+    def test_staging_refuses_a_dangling_current_without_publishing_the_version(self):
+        self.installed_cli(guarded=True)
+        (self.prefix / "current").unlink()
+        (self.prefix / "current").symlink_to("versions/missing")
+        result = self.install("--stage-only")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('--stage-only requires an existing installation', result.stderr)
+        self.assertEqual(os.readlink(self.prefix / "current"), "versions/missing")
+        self.assertFalse((self.prefix / f"versions/{VERSION}").exists())
+
     def test_fresh_prefix_uses_the_verified_candidate_pair(self):
         self.assertFalse(self.prefix.exists())
         coordinator = self.assert_installed(self.install(), 'candidate')

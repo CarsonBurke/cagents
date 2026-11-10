@@ -79,7 +79,9 @@ pub(super) fn perform(
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
     let source_owner = installed_daemon_owner(&layout)?;
-    if served_version_root(&layout)? != root {
+    let previous = served_version_root(&layout)?;
+    let candidate = locate(&root.join("bin/cagents"))?;
+    if candidate.prefix != layout.prefix || candidate.version_root != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
@@ -110,7 +112,7 @@ pub(super) fn perform(
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
     let mut turns = source::TurnReview::default();
     let mut observe = |policy| {
-        if served_version_root(&layout)? != root || stamp(root)? != before {
+        if served_version_root(&layout)? != previous || stamp(root)? != before {
             return Err(invalid(
                 "the installed application changed; review the new build before updating",
             ));
@@ -167,7 +169,6 @@ pub(super) fn perform(
     confirmation::check_cancelled(state, job)?;
     let output = StartupOutput::create(state)?;
     let mut startup_attempted = false;
-    let mut startup_owned = false;
     let result = (|| {
         floor::quiesce(
             state,
@@ -200,44 +201,24 @@ pub(super) fn perform(
         let timeout = crate::install_guard::daemon_start_timeout()?;
         startup_attempted = true;
         let started = wait_for_daemon_start(&mut command, timeout, state, job);
-        startup_owned = started.as_ref().err().is_none_or(|failure| failure.spawned);
         // The worker's stderr is this job's log.
         let reason = output.record(&mut io::stderr().lock());
-        // A post-spawn failure is never converted to success by readiness.
-        // Its exact original command has settled, but its result remains error.
-        if let Err(failure) = started {
-            let successor_runs = crate::daemon::running_executable()
-                .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
-            return Err(startup_failure(
-                &failure.error,
-                reason.as_deref(),
-                successor_runs,
-            ));
-        }
-        if crate::daemon::running_executable().map_err(|error| invalid(error.to_string()))?
-            != Some(root.join("bin/cagentsd"))
-        {
-            return Err(invalid(
-                "The terminal service does not belong to the confirmed installation; its saved panes and recovery state were retained. Check cagents daemon status before retrying",
-            ));
-        }
-        Ok(())
+        // Readiness is independent of the wrapper's exit status: an overdue
+        // start may have succeeded while retaining its original timeout error.
+        // Once handoff happened, keep future launches paired with that daemon.
+        settle_startup(started, reason.as_deref(), candidate_serving(root), || {
+            publish_current(&layout, &previous, root)
+        })
     })();
-    // Before startup, retain the previous matched executable on failure. Once
-    // the successor owns the runtime or an actual startup command was spawned,
-    // reopen that candidate's recovery UI instead of an incompatible old UI.
+    // Reopen the set actually serving after the handoff. A failed launch may
+    // still own the lease; retain its recovery UI without publishing it.
     let successor_owns_runtime = startup_attempted
-        && !startup_owned
-        && result.is_err()
         && crate::daemon::running_executable()
             .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
-    let reopen = if result.is_ok() || successor_owns_runtime || startup_owned {
+    let reopen = if result.is_ok() || successor_owns_runtime {
         root.to_owned()
     } else {
-        installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
+        previous
     };
     let recovery_result = finish_handoff(
         installation,
@@ -254,6 +235,68 @@ pub(super) fn perform(
     recovery_result?;
     result?;
     reopened
+}
+
+fn candidate_serving(root: &Path) -> Result<(), UpdateError> {
+    let identity = source::inspect_installed_identity()?;
+    if identity.protocol != crate::terminal_ipc::PROTOCOL_VERSION || identity.proof.is_none() {
+        return Err(invalid(
+            "The candidate terminal service has not started serving",
+        ));
+    }
+    identity.verify_owner(Some(&root.join("bin/cagentsd")))?;
+    let socket = crate::terminal_ipc::daemon_socket_path()?;
+    let mut client =
+        source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
+    if Some(client.proof()) != identity.proof.as_ref() {
+        return Err(invalid("The terminal service changed during startup"));
+    }
+    client.list_chats()?;
+    identity.verify_owner(Some(&root.join("bin/cagentsd")))
+}
+
+fn settle_startup(
+    started: Result<(), crate::install_guard::DaemonStartError>,
+    reason: Option<&str>,
+    serving: Result<(), UpdateError>,
+    publish: impl FnOnce() -> Result<(), UpdateError>,
+) -> Result<(), UpdateError> {
+    let ready = serving.is_ok();
+    if ready {
+        publish()?;
+    }
+    if let Err(failure) = started {
+        return Err(startup_failure(&failure.error, reason, ready));
+    }
+    serving
+}
+
+/// The serving-success point is the only publisher. No fallible bookkeeping
+/// follows this rename; later window errors retain the serving matched set.
+fn publish_current(
+    layout: &InstallLayout,
+    previous: &Path,
+    root: &Path,
+) -> Result<(), UpdateError> {
+    if served_version_root(layout)? != previous {
+        return Err(invalid("current installation changed during the update"));
+    }
+    if previous == root {
+        return Ok(());
+    }
+    let current = layout.prefix.join("current");
+    let temporary = layout
+        .prefix
+        .join(format!(".current.{}", uuid::Uuid::new_v4()));
+    let target = root
+        .strip_prefix(&layout.prefix)
+        .map_err(|_| unsupported_install())?;
+    std::os::unix::fs::symlink(target, &temporary)?;
+    if let Err(error) = fs::rename(&temporary, &current) {
+        let _ = fs::remove_file(&temporary);
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 /// A compatible protocol is not proof that the daemon already runs the
@@ -485,6 +528,85 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staged_current_is_published_once_only_on_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        super::super::tests::install_tree(prefix, &["old", "new"], "old");
+        let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+        let previous = served_version_root(&layout).unwrap();
+        let root = layout.version_root.clone();
+        let original = fs::symlink_metadata(prefix.join("current")).unwrap().ino();
+        // Dropping a staged candidate or refusing/cancelling its review performs
+        // no publication. Only the serving-success branch calls this helper.
+        assert_eq!(served_version_root(&layout).unwrap(), previous);
+        assert_eq!(
+            fs::symlink_metadata(prefix.join("current")).unwrap().ino(),
+            original
+        );
+        publish_current(&layout, &previous, &root).unwrap();
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/new")
+        );
+        let published = fs::symlink_metadata(prefix.join("current")).unwrap().ino();
+        assert_ne!(published, original);
+        publish_current(&layout, &root, &root).unwrap();
+        assert_eq!(
+            fs::symlink_metadata(prefix.join("current")).unwrap().ino(),
+            published
+        );
+    }
+
+    #[test]
+    fn settled_startup_publishes_only_a_serving_successor_even_after_a_wrapper_error() {
+        for command in ["exit 0", "exit 4"] {
+            for serving in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let prefix = directory.path();
+                super::super::tests::install_tree(prefix, &["old", "new"], "old");
+                let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+                let previous = served_version_root(&layout).unwrap();
+                let (started, _, reason) = run_captured(command);
+                let result = settle_startup(
+                    started,
+                    reason.as_deref(),
+                    if serving {
+                        Ok(())
+                    } else {
+                        Err(invalid("fake successor not serving"))
+                    },
+                    || publish_current(&layout, &previous, &layout.version_root),
+                );
+                assert_eq!(result.is_ok(), serving && command == "exit 0");
+                assert_eq!(
+                    served_version_root(&layout).unwrap(),
+                    if serving {
+                        layout.version_root
+                    } else {
+                        previous
+                    }
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn publication_preserves_an_independent_current_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let prefix = directory.path();
+        super::super::tests::install_tree(prefix, &["old", "new", "other"], "old");
+        let layout = locate(&prefix.join("versions/new/bin/cagents")).unwrap();
+        let previous = served_version_root(&layout).unwrap();
+        super::super::tests::install_tree(prefix, &[], "other");
+        assert!(publish_current(&layout, &previous, &layout.version_root).is_err());
+        assert!(
+            served_version_root(&layout)
+                .unwrap()
+                .ends_with("versions/other")
+        );
+    }
 
     fn run_captured(
         script: &str,

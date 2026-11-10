@@ -285,12 +285,24 @@ or restart its terminal. The update keeps the saved panes and their files.
 If the running service still reports an item that needs attention, resolve it
 before updating. A changed inventory requires another review.
 
-To make a verified build available without saving or closing running windows,
-append `--stage-only` to the installer invocation. It publishes the complete
-candidate while preserving unsaved windows and the running daemon; it does not
-start, stop or checkpoint them. The existing application's update control then
-offers the reviewed apply/reopen flow. Resolve any save blockers before applying:
-staging makes the candidate available but does not complete the application handoff.
+To prepare a verified build without saving or closing running windows,
+append `--stage-only` to the installer invocation for an existing installation.
+Use an ordinary install for the first installation. Staging unpacks the complete
+candidate into `versions/VERSION` and leaves `current`, launchers, windows and
+the daemon unchanged. Apply that exact build from a system terminal outside
+cagents:
+
+```sh
+"${XDG_DATA_HOME:-$HOME/.local/share}/cagents-install/versions/VERSION/bin/cagents" daemon upgrade
+```
+
+Replace `VERSION` with the staged version, or use the command printed by the
+installer. `scripts/install-local` runs this staged CLI automatically unless
+called with `--stage-only`. The candidate reviews the update and asks for
+approval. Cancellation, refusal or a failure before handoff leaves `current`
+unchanged. Once the candidate daemon holds the lease and serves requests, the
+worker atomically switches `current` to that version and reopens saved windows.
+Staging alone does not notify existing windows of an available update.
 This option cannot be combined with restart, relaunch, uninstall or purge options.
 
 For an explicitly authorized direct daemon replacement, append
@@ -303,7 +315,7 @@ session-by-session preview and waiting for native turns.
 
 | Option | Effect |
 | --- | --- |
-| `--stage-only` | Publish a verified candidate without closing windows or changing the daemon |
+| `--stage-only` | Unpack a verified candidate without moving `current` or changing running windows and daemon |
 | `--restart-daemon` | Checkpoint supported sessions and replace the running daemon |
 | `--require-empty-daemon` | With `--restart-daemon`, refuse rather than interrupt live sessions |
 | `--relaunch-agents` | With `--restart-daemon`, relaunch agents that have no exact resume identity into their resume picker (requires an installed CLI that can record this) |

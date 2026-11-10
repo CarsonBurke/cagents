@@ -1,5 +1,5 @@
 //! Actual public parsing and legacy dispatch over a private framed Unix peer.
-//! No Host policy, staged executable, provider or remote transport is simulated
+//! No Host policy, provider or remote transport is simulated
 //! as a successful production integration; these tests pin the caller boundary.
 mod read_routing;
 mod remote_entry;
@@ -947,32 +947,11 @@ fn public_move_refuses_cross_project_before_editing() {
 }
 
 #[test]
-fn public_classification_and_staged_routing_preserve_reads_users_and_channel_work() {
+fn public_classification_separates_legacy_writes_reads_and_channel_work() {
     let fixture = Fixture::new();
-    let scoped = ProjectChannelContext {
-        authority: Authority::session("fixture-staged-scope".into()),
-        remote: false,
-        no_start: false,
-    };
-    let empty = ProjectChannelContext {
-        authority: Authority::session(String::new()),
-        remote: false,
-        no_start: false,
-    };
-    let user = ProjectChannelContext {
-        authority: Authority::default(),
-        remote: false,
-        no_start: false,
-    };
     for verb in ["open", "project-close", "spawn", "channel-close", "move"] {
         let cli = parse(&fixture.argv(verb));
         assert!(legacy_model_command_mutates(&cli.command));
-        assert!(!routes_to_staged_owner_as(&cli.command, Some(&scoped)));
-        assert!(!routes_to_staged_owner_as(&cli.command, Some(&empty)));
-        assert_eq!(
-            routes_to_staged_owner_as(&cli.command, Some(&user)),
-            routes_to_staged_owner(&cli.command)
-        );
     }
     for args in [
         vec!["project".into(), "list".into()],
@@ -994,10 +973,6 @@ fn public_classification_and_staged_routing_preserve_reads_users_and_channel_wor
     ] {
         let cli = parse(&args);
         assert!(!legacy_model_command_mutates(&cli.command));
-        assert_eq!(
-            routes_to_staged_owner_as(&cli.command, Some(&scoped)),
-            routes_to_staged_owner(&cli.command)
-        );
         match cli.command {
             TopCommand::Project { command } => assert!(!project_command_mutates(&command)),
             TopCommand::Channel {
@@ -1021,31 +996,24 @@ fn public_classification_and_staged_routing_preserve_reads_users_and_channel_wor
     }
 }
 
-/// The real public implementation body, including capture BEFORE staged lookup,
+/// The real public implementation body, including authority capture,
 /// is exercised in isolated self-exec children. Their output is captured, so
-/// these six children are not six additional owning libtest parents. The parent
+/// these children are not additional owning libtest parents. The parent
 /// neither reads nor mutates its ambient authority, device, or start policy.
 #[test]
-fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fallback() {
+fn actual_run_from_captures_scoped_writes_without_user_fallback() {
     use std::{
         ffi::OsString,
         fs::{self, File},
         os::unix::{ffi::OsStringExt, fs::PermissionsExt},
     };
-    const ROLE: &str = "CAGENTS_TEST_PROJECT_CHANNEL_STAGED_ROLE";
-    const TOKEN: &str = "fixture-staged-original-capability";
+    const ROLE: &str = "CAGENTS_TEST_PROJECT_CHANNEL_PUBLIC_ROLE";
+    const TOKEN: &str = "fixture-public-original-capability";
     let selector = thread::current().name().unwrap().to_owned();
     let Some(role) = std::env::var_os(ROLE) else {
-        for role in [
-            "scoped",
-            "invalid",
-            "empty",
-            "non-unicode",
-            "user",
-            "user-no-start",
-        ] {
+        for role in ["scoped", "invalid", "empty", "non-unicode"] {
             let private = tempfile::Builder::new()
-                .prefix("pc-stage-")
+                .prefix("pc-public-")
                 .tempdir()
                 .unwrap();
             for leaf in ["home", "runtime", "config", "data", "cache", "state"] {
@@ -1078,7 +1046,7 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
                 "invalid" => {
                     command.env(
                         crate::agent_execution::AUTHORITY_ENV,
-                        "fixture-invalid-stage-token",
+                        "fixture-invalid-public-token",
                     );
                 }
                 "empty" => {
@@ -1101,7 +1069,7 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
                 if Instant::now() >= deadline {
                     child.kill().unwrap();
                     child.wait().unwrap();
-                    panic!("private staged-routing child exceeded its bound: {role}");
+                    panic!("private public-dispatch child exceeded its bound: {role}");
                 }
                 thread::sleep(Duration::from_millis(5));
             };
@@ -1113,8 +1081,8 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
             assert!(stdout.contains("1 passed; 0 failed; 0 ignored;"));
             assert!(!stdout.contains(TOKEN) && !stderr.contains(TOKEN));
             assert!(
-                !stdout.contains("fixture-invalid-stage-token")
-                    && !stderr.contains("fixture-invalid-stage-token")
+                !stdout.contains("fixture-invalid-public-token")
+                    && !stderr.contains("fixture-invalid-public-token")
             );
             let errors = stderr
                 .lines()
@@ -1122,15 +1090,11 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
                 .collect::<Vec<_>>();
             assert_eq!(errors.len(), 1);
             assert_eq!(errors[0]["ok"], false);
-            if role.starts_with("user") {
-                assert_eq!(errors[0]["error"]["kind"], "deferred_install");
-            } else {
-                assert_eq!(
-                    errors[0]["error"]["details"]["code"],
-                    json!(ProtocolErrorCode::PermissionDenied)
-                );
-                assert_eq!(errors[0]["error"]["details"]["retryable"], false);
-            }
+            assert_eq!(
+                errors[0]["error"]["details"]["code"],
+                json!(ProtocolErrorCode::PermissionDenied)
+            );
+            assert_eq!(errors[0]["error"]["details"]["retryable"], false);
         }
         return;
     };
@@ -1142,33 +1106,18 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
         "local".into(),
         "--json".into(),
     ];
-    if role == "user-no-start" {
-        args.push("--no-start".into());
-    }
     args.extend(["channel".into(), "close".into(), channel.to_string()]);
-    if role.starts_with("user") {
-        let lookups = Cell::new(0);
-        let result = run_from_with_staged_lookup(args, |executable, recover| {
-            lookups.set(lookups.get() + 1);
-            assert_eq!(executable, std::env::current_exe().unwrap());
-            assert_eq!(recover, role == "user");
-            Err(io::Error::other("controlled staged-lookup refusal"))
-        });
-        assert_eq!(result, ExitCode::FAILURE);
-        assert_eq!(lookups.get(), 1);
-        return;
-    }
     let expected = if role == "scoped" {
         Authority::session(TOKEN.into())
     } else if role == "invalid" {
-        Authority::session("fixture-invalid-stage-token".into())
+        Authority::session("fixture-invalid-public-token".into())
     } else {
         Authority::session(String::new())
     };
     let socket = daemon_socket_path().unwrap();
     fs::create_dir_all(socket.parent().unwrap()).unwrap();
     let directory = tempfile::Builder::new()
-        .prefix("pc-stage-peer-")
+        .prefix("pc-public-peer-")
         .tempdir()
         .unwrap();
     let scoped = role == "scoped";
@@ -1185,9 +1134,7 @@ fn actual_run_from_captures_scoped_writes_before_staged_lookup_without_user_fall
             reply(peer, &request, denied());
         }
     });
-    let result = run_from_with_staged_lookup(args, |_, _| {
-        panic!("scoped legacy writes must not consult or recover a staged User owner")
-    });
+    let result = run_from(args);
     assert_eq!(result, ExitCode::FAILURE);
     peer.finished();
 }

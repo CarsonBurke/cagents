@@ -449,16 +449,22 @@ pub fn apply_installed(executable: &Path) -> Result<UpdateJob, UpdateError> {
 fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, UpdateError> {
     let mut installation = running_installation()?;
     let layout = locate(&std::env::current_exe()?)?;
-    let served = served_version_root(&layout)?;
-    if executable.canonicalize()? != served.join("bin/cagents-ui").canonicalize()? {
+    let candidate = locate(executable)?;
+    if candidate.prefix != layout.prefix
+        || executable.canonicalize()?
+            != candidate
+                .version_root
+                .join("bin/cagents-ui")
+                .canonicalize()?
+    {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
     }
-    // The served build owns every update, including an older daemon's
-    // replacement and a remaining window-only replacement.
-    installation.version = installed_entry_worker(&layout, &served)?;
-    let version = served
+    // The selected build owns the review and worker before it becomes current.
+    let candidate_root = candidate.version_root;
+    installation.version = installed_entry_worker(&layout, &candidate_root)?;
+    let version = candidate_root
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(unsupported_install)?
@@ -467,9 +473,13 @@ fn apply_installed_from(executable: &Path, terminal: bool) -> Result<UpdateJob, 
         &installation,
         &version,
         &if terminal {
-            UpdateRequest::InstalledFromTerminal { root: served }
+            UpdateRequest::InstalledFromTerminal {
+                root: candidate_root,
+            }
         } else {
-            UpdateRequest::Installed { root: served }
+            UpdateRequest::Installed {
+                root: candidate_root,
+            }
         },
     )
 }
@@ -507,7 +517,7 @@ fn installed_candidate_version(
     let replaces_daemon = source_proof.is_some()
         && (source_protocol != crate::terminal_ipc::PROTOCOL_VERSION
             || daemon.is_some_and(|owner| owner.version_root != served));
-    if served == window.version_root && !replaces_daemon {
+    if served == window.version_root && served_version_root(window)? == served && !replaces_daemon {
         return Err(invalid("the installed application is already running"));
     }
     served
@@ -534,11 +544,12 @@ fn installed_daemon_owner(layout: &InstallLayout) -> Result<Option<InstallLayout
 }
 
 /// CLI entry point for the same leased worker, exact preview and window fence
-/// used by the application. The served candidate always supplies the worker.
+/// used by the application. The explicitly invoked build supplies the worker.
 pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, UpdateError> {
     let _interrupt = cancellation::Interrupt::install()?;
     let layout = locate(&std::env::current_exe()?)?;
-    let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
+    // An explicit versions/V CLI applies V without publishing it first.
+    let candidate = layout.version_root.join("bin/cagents-ui");
     if cancellation::requested() {
         return Err(UpdateError::Cancelled);
     }
@@ -1878,6 +1889,15 @@ fn finish_handoff(
     // would also unlock the successor's shared open-file description.
     drop(handoff.take());
     if reserved && result.is_err() {
+        // A settled start can report an error after the successor acquired
+        // the lease (including before it serves). Never start an old build
+        // against that owner. Its binaries and recovery state remain intact.
+        if crate::daemon::running_executable()
+            .map_err(|error| invalid(error.to_string()))?
+            .is_some()
+        {
+            return Ok(());
+        }
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
@@ -3575,10 +3595,17 @@ finally:
 
     #[test]
     fn staged_update_always_uses_the_candidate_worker() {
-        let layout = |version: &str| InstallLayout {
-            prefix: "/owned/install".into(),
-            version_root: PathBuf::from("/owned/install/versions").join(version),
-            version: version.into(),
+        let directory = tempfile::tempdir().unwrap();
+        install_tree(directory.path(), &["old", "new", "third"], "new");
+        let layout = |version: &str| {
+            locate(
+                &directory
+                    .path()
+                    .join("versions")
+                    .join(version)
+                    .join("bin/cagents"),
+            )
+            .unwrap()
         };
         let old = layout("old");
         let new = layout("new");
@@ -3641,6 +3668,21 @@ finally:
                 .is_err()
             );
         }
+        // Even with no running daemon, invoking a staged build selects it;
+        // the current link remains the old build until the worker succeeds.
+        install_tree(directory.path(), &[], "old");
+        assert_eq!(
+            installed_candidate_version(
+                &new,
+                &new.version_root,
+                None,
+                crate::terminal_ipc::PROTOCOL_VERSION,
+                None
+            )
+            .unwrap(),
+            "new"
+        );
+        assert_eq!(served_version_root(&new).unwrap(), old.version_root);
         let error =
             installed_candidate_version(&new, &new.version_root, Some(&old), 127, Some(&proof))
                 .unwrap_err()
@@ -3810,7 +3852,7 @@ finally:
 
     /// Builds `<root>/{.cagents-install-root,versions/<v>/bin/{cagents,cagents-ui,cagentsd}}`
     /// and points `current` at `served`.
-    fn install_tree(root: &Path, versions: &[&str], served: &str) {
+    pub(super) fn install_tree(root: &Path, versions: &[&str], served: &str) {
         fs::write(root.join(".cagents-install-root"), b"cagents install root").unwrap();
         for version in versions {
             let bin = root.join("versions").join(version).join("bin");

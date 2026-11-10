@@ -311,11 +311,6 @@ case "$*" in
     if [ "$1" = coordinate-install ] && [ "$2" != --help ]; then
       printf '%s\n' "$CLI" >> "$FIXTURE_COORDINATOR_USED"
     fi
-    if [ "$1" = record-deferred-install ] && [ "$2" != --help ] && [ "$FIXTURE_PRE_CAS_CHANGE" = true ]; then
-      "$FIXTURE_REAL_CLI" "$@" || exit "$?"
-      /usr/bin/ln -snf versions/9.9.9 "$FIXTURE_PREFIX/current"
-      exit 0
-    fi
     exec "$FIXTURE_REAL_CLI" "$@"
     ;;
   '--json daemon status')
@@ -450,7 +445,7 @@ esac
     let tools = home.path().join("tools");
     fs::create_dir(&tools).unwrap();
     // Fail after current switches, exercising the real rollback trap.
-    if let Some(failure) = publish_failure.filter(|failure| *failure != "pre-cas-candidate") {
+    if let Some(failure) = publish_failure {
         let fail = if failure == "current-changed" {
             "/usr/bin/ln -snf versions/independent \"$FIXTURE_PREFIX/current\"; exit 8"
         } else if matches!(failure, "outer-signal" | "outer-signal-invalid-target") {
@@ -742,10 +737,6 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .env("FIXTURE_COORDINATOR", coordinator)
         .env("FIXTURE_STAGE_ONLY", stage_only.to_string())
         .env(
-            "FIXTURE_PRE_CAS_CHANGE",
-            (publish_failure == Some("pre-cas-candidate")).to_string(),
-        )
-        .env(
             "FIXTURE_COORDINATOR_USED",
             home.path().join("coordinator-used"),
         )
@@ -923,6 +914,24 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         assert!(fs::read_to_string(actions).unwrap_or_default().is_empty());
         return;
     }
+    if stage_only {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+        assert!(!prefix.join("versions/9.9.9/.deferred-owner.json").exists());
+        assert!(fs::read_to_string(&actions).unwrap_or_default().is_empty());
+        assert!(!checkpoint.exists());
+        assert!(!restored.exists());
+        assert!(!home.path().join(".local/bin/cagents").exists());
+        assert!(
+            String::from_utf8_lossy(&output.stdout)
+                .contains("current, running windows and daemon were preserved")
+        );
+        return;
+    }
     let success = !matches!(download, Some("gh-failure" | "auth-failure"))
         && match restart {
             Some("success" | "relaunch" | "decline" | "decline-legacy") => {
@@ -939,10 +948,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         String::from_utf8_lossy(&output.stderr)
     );
     let retained_candidate = success
-        || matches!(
-            publish_failure,
-            Some("current-changed" | "pre-cas-candidate")
-        )
+        || publish_failure == Some("current-changed")
         || matches!(
             restart,
             Some("start-unknown" | "start-signal" | "empty-start-unknown")
@@ -968,48 +974,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         );
     }
     assert!(!actions.contains("UNSAFE"), "{actions}");
-    if stage_only {
-        assert_eq!(
-            fs::read_to_string(home.path().join("coordinator-used")).unwrap(),
-            "new\n"
-        );
-        assert!(
-            actions.is_empty(),
-            "staging must never call daemon control: {actions}"
-        );
-        assert!(!checkpoint.exists());
-        assert!(!restored.exists());
-        if matches!(
-            publish_failure,
-            Some("current-changed" | "pre-cas-candidate")
-        ) {
-            assert!(prefix.join("versions/old").exists());
-            if publish_failure == Some("current-changed") {
-                assert!(
-                    home.path()
-                        .join(".local/bin/cagents")
-                        .symlink_metadata()
-                        .is_ok(),
-                    "uncertain rollback must retain created shared launchers"
-                );
-            }
-            assert!(prefix.join("versions/9.9.9/.deferred-owner.json").exists());
-            assert!(
-                String::from_utf8_lossy(&output.stderr).contains("retained both version trees")
-            );
-        }
-        if success {
-            let marker: serde_json::Value = serde_json::from_slice(
-                &fs::read(prefix.join("versions/9.9.9/.deferred-owner.json")).unwrap(),
-            )
-            .unwrap();
-            assert_eq!(marker["version"], 1);
-            assert!(
-                String::from_utf8_lossy(&output.stdout)
-                    .contains("running windows and daemon were preserved")
-            );
-        }
-    } else if restart == Some("empty-start-unknown") {
+    if restart == Some("empty-start-unknown") {
         assert_eq!(actions, "require-empty\nnew:start\n");
         assert!(!checkpoint.exists());
         assert!(!restored.exists());
@@ -1279,12 +1244,10 @@ fn private_authentication_failure_preserves_installation_without_anonymous_downl
 }
 
 #[test]
-fn staging_preserves_daemons_and_rolls_back_publication_without_control_calls() {
+fn staging_preserves_current_launchers_and_daemon_without_control_calls() {
     for compatible in [true, false] {
-        for failure in [None, Some("publish"), Some("signal"), Some("outer-signal")] {
-            for coordinator in ["installed", "candidate", "legacy"] {
-                coordinated_release_mode(compatible, 38, failure, None, None, coordinator, true);
-            }
+        for coordinator in ["installed", "candidate", "legacy"] {
+            coordinated_release_mode(compatible, 38, None, None, None, coordinator, true);
         }
     }
 }
@@ -1312,37 +1275,6 @@ fn staging_rejects_destructive_options_before_touching_installation() {
         );
         assert_eq!(fs::read_dir(root.path()).unwrap().count(), 0);
     }
-}
-
-#[test]
-fn staging_keeps_both_trees_when_current_cannot_be_safely_rolled_back() {
-    coordinated_release_mode(
-        false,
-        38,
-        Some("current-changed"),
-        None,
-        None,
-        "initial-independent",
-        true,
-    );
-    coordinated_release_mode(
-        false,
-        38,
-        Some("pre-cas-candidate"),
-        None,
-        None,
-        "legacy",
-        true,
-    );
-    coordinated_release_mode(
-        false,
-        38,
-        Some("current-changed"),
-        None,
-        None,
-        "legacy",
-        true,
-    );
 }
 
 #[test]

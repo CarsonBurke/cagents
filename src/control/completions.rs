@@ -62,16 +62,6 @@ mod tests {
     }
     #[test]
     fn completions_bypass_device_and_service_routing() {
-        let cli = Cli::try_parse_from([
-            "cagents",
-            "--device",
-            "missing-device",
-            "completions",
-            "fish",
-        ])
-        .unwrap();
-        assert!(!staged_command_requires_daemon(&cli.command));
-        assert!(!routes_to_staged_owner(&cli.command));
         assert_eq!(
             run_from([
                 "cagents",

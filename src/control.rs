@@ -243,19 +243,9 @@ pub enum TopCommand {
         #[arg(help = "Stage an installation while retaining running windows.")]
         stage_only: bool,
     },
-    /// Record that staged files must retain windows on the running daemon's UI.
+    /// Retain windows on the running daemon's UI after a deferred installation.
     #[command(hide = true)]
-    RecordDeferredInstall {
-        #[arg(long, requires_all = ["prefix", "version_root"])]
-        #[arg(help = "Stage an installation while retaining running windows.")]
-        stage_only: bool,
-        #[arg(long, requires = "stage_only")]
-        #[arg(help = "Installation destination prefix.")]
-        prefix: Option<PathBuf>,
-        #[arg(long, requires = "stage_only")]
-        #[arg(help = "Directory containing the staged executable version.")]
-        version_root: Option<PathBuf>,
-    },
+    RecordDeferredInstall,
     /// Save, close and reopen every window with this installation's executables.
     #[command(hide = true)]
     RestartWindows {
@@ -2490,17 +2480,6 @@ where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
-    run_from_with_staged_lookup(arguments, crate::install_guard::staged_owner_bin)
-}
-
-fn run_from_with_staged_lookup<I, T>(
-    arguments: I,
-    mut staged_lookup: impl FnMut(&Path, bool) -> io::Result<Option<PathBuf>>,
-) -> ExitCode
-where
-    I: IntoIterator<Item = T>,
-    T: Into<OsString> + Clone,
-{
     let arguments = arguments.into_iter().map(Into::into).collect::<Vec<_>>();
     let wants_json = arguments
         .iter()
@@ -2551,7 +2530,7 @@ where
     }
 
     // These operations govern the whole daemon, not a hosted session's own
-    // actors. Refuse before staged-owner routing, SSH preparation, autostart or
+    // actors. Refuse before SSH preparation, autostart or
     // local installer effects. Presence is enough: malformed/non-Unicode
     // authority must never silently become a User connection.
     let hosted = std::env::var_os(crate::agent_execution::AUTHORITY_ENV).is_some();
@@ -2627,7 +2606,7 @@ where
     }
 
     // Physical-device image receipts are user-managed local files. Refuse
-    // hosted/remote authority before device preparation, staged-owner routing,
+    // hosted/remote authority before device preparation,
     // daemon recovery, or even opening the image store.
     if let TopCommand::Chat {
         command: ChatCommand::ImageAssets { command },
@@ -2669,8 +2648,8 @@ where
             .is_ok_and(|value| matches!(value.to_ascii_lowercase().as_str(), "1" | "true" | "yes"));
     let _start_policy = StartPolicy(NO_START.swap(no_start, std::sync::atomic::Ordering::Relaxed));
 
-    // Local evidence must remain readable when a staged owner, backend, or
-    // daemon cannot start. Do not select/prepare a device or follow a route.
+    // Local evidence must remain readable when a backend or daemon cannot
+    // start. Do not select/prepare a device.
     if matches!(cli.command, TopCommand::Diagnostics) {
         if cli.device.is_some() {
             emit_error(
@@ -2709,9 +2688,7 @@ where
         );
         return ExitCode::FAILURE;
     }
-    // Retain legacy write scope before installer recovery or an older CLI can
-    // handle the command. Legacy reads keep their original routing; a scoped
-    // legacy write uses this client's selected host.
+    // Retain legacy write scope so a scoped write uses this client's selected host.
     let project_channel_context =
         legacy_model_command_mutates(&cli.command).then(ProjectChannelContext::capture);
     if let Some(context) = &project_channel_context
@@ -2720,8 +2697,7 @@ where
         emit_error(cli.json, &error);
         return ExitCode::FAILURE;
     }
-    // Preserve the original caller before operational recovery or delegation
-    // to a staged CLI whose caller-scoped service transport may predate this policy.
+    // Preserve the original caller before operational recovery.
     let service_context = (matches!(
         &cli.command,
         TopCommand::Automation { .. }
@@ -2739,37 +2715,6 @@ where
     {
         emit_error(cli.json, &error);
         return ExitCode::FAILURE;
-    }
-    if !crate::device::is_remote()
-        && routes_to_staged_owner_as(&cli.command, project_channel_context.as_ref())
-        && !service_context
-            .as_ref()
-            .is_some_and(|context| context.scoped())
-    {
-        let recover = !no_start && staged_command_requires_daemon(&cli.command);
-        match staged_lookup(&std::env::current_exe().unwrap_or_default(), recover) {
-            Ok(Some(bin)) => {
-                use std::os::unix::process::CommandExt;
-                let mut command =
-                    Command::new(bin.join(crate::companion::Product::Cli.file_name()));
-                // Carry implicit stop/environment policy into the matched CLI.
-                // An older owner that lacks this flag must refuse parsing
-                // rather than recover/start services before handling the read.
-                if no_start && !cli.no_start {
-                    command.arg("--no-start");
-                }
-                command.args(&arguments[1..]);
-                crate::install_guard::sanitize_child_environment(&mut command);
-                let error = command.exec();
-                emit_error(cli.json, &AppError::new("deferred_install", error));
-                return ExitCode::FAILURE;
-            }
-            Ok(None) => (),
-            Err(error) => {
-                emit_error(cli.json, &AppError::new("deferred_install", error));
-                return ExitCode::FAILURE;
-            }
-        }
     }
     if matches!(
         cli.command,
@@ -2814,60 +2759,6 @@ where
             ExitCode::from(if error.kind == "timeout" { 3 } else { 1 })
         }
     }
-}
-
-fn staged_command_requires_daemon(command: &TopCommand) -> bool {
-    match command {
-        TopCommand::Daemon {
-            command: DaemonCommand::Start,
-        }
-        | TopCommand::Ui { .. }
-        | TopCommand::Terminal { .. }
-        | TopCommand::Project { .. }
-        | TopCommand::Channel { .. }
-        | TopCommand::Automation { .. }
-        | TopCommand::Work { .. }
-        | TopCommand::Account { .. }
-        | TopCommand::Chat { .. }
-        | TopCommand::Whoami
-        | TopCommand::Sessions(_)
-        | TopCommand::Transcript(_)
-        | TopCommand::Send(_)
-        | TopCommand::Ask(_)
-        | TopCommand::Reply(_)
-        | TopCommand::Inbox(_) => true,
-        TopCommand::Agent { command } => !matches!(command, AgentCommand::Console { .. }),
-        // These paths do not call ensure_daemon_ready. Internal helpers and new
-        // commands remain non-recovering until their actual contract requires it.
-        _ => false,
-    }
-}
-
-fn routes_to_staged_owner(command: &TopCommand) -> bool {
-    // `daemon upgrade` enters the served candidate's updater. An older owner's
-    // preflight cannot qualify the panes this candidate knows how to carry.
-    !matches!(
-        command,
-        TopCommand::Completions { .. }
-            | TopCommand::Diagnostics
-            | TopCommand::CoordinateInstall { .. }
-            | TopCommand::VerifyInstallGuard { .. }
-            | TopCommand::RecordDeferredInstall { .. }
-            | TopCommand::UpdateWorker { .. }
-            | TopCommand::RestartWindows { .. }
-            | TopCommand::Daemon {
-                command: DaemonCommand::ProtocolVersion
-                    | DaemonCommand::StopForRebuild { .. }
-                    | DaemonCommand::Upgrade { .. }
-            }
-    )
-}
-
-/// Desktop launches need the same matched owner as CLI launches while a staged
-/// update is pending. Internal helpers and remote devices do not use this route.
-pub fn staged_ui_executable() -> io::Result<Option<PathBuf>> {
-    crate::install_guard::staged_owner_bin(&std::env::current_exe()?, true)
-        .map(|bin| bin.map(|bin| bin.join(crate::companion::Product::Ui.file_name())))
 }
 
 fn execute(command: TopCommand) -> Result<CommandOutput, AppError> {
@@ -2954,17 +2845,8 @@ fn execute_with_model_context(
                 human: "Installer owns the application update fence".into(),
             })
         }
-        TopCommand::RecordDeferredInstall {
-            stage_only,
-            prefix,
-            version_root,
-        } => {
-            let stage = if stage_only {
-                Some((prefix.as_deref().unwrap(), version_root.as_deref().unwrap()))
-            } else {
-                None
-            };
-            crate::install_guard::record_deferred(stage)
+        TopCommand::RecordDeferredInstall => {
+            crate::install_guard::record_deferred()
                 .map_err(|error| AppError::new("install", error))?;
             Ok(CommandOutput {
                 command: "update.record_deferred_install",
@@ -4052,15 +3934,6 @@ fn legacy_model_command_mutates(command: &TopCommand) -> bool {
     }
 }
 
-fn routes_to_staged_owner_as(
-    command: &TopCommand,
-    context: Option<&ProjectChannelContext>,
-) -> bool {
-    routes_to_staged_owner(command)
-        && !(legacy_model_command_mutates(command)
-            && context.is_some_and(|context| context.authority.token().is_some()))
-}
-
 fn terminal_command_mutates(command: &TerminalCommand) -> bool {
     match command {
         TerminalCommand::Spawn { .. }
@@ -4831,28 +4704,6 @@ mod tests {
         assert_eq!(other.reason(), "could not connect to the daemon: refused");
     }
 
-    /// The installed coordinator, not an older owner's updater, chooses who
-    /// performs the update: an older updater would apply its own preflight.
-    /// Daemon lifecycle verbs still reach the owner's matched CLI.
-    #[test]
-    fn upgrade_is_never_handed_to_an_older_owner_cli() {
-        use clap::Parser;
-        let routed = |argv: &[&str]| {
-            super::routes_to_staged_owner(&super::Cli::try_parse_from(argv).unwrap().command)
-        };
-        assert!(!routed(&["cagents", "daemon", "upgrade", "--yes"]));
-        assert!(!routed(&[
-            "cagents",
-            "daemon",
-            "upgrade",
-            "--yes",
-            "--interrupt"
-        ]));
-        assert!(routed(&["cagents", "daemon", "prepare-upgrade", "--yes"]));
-        assert!(routed(&["cagents", "daemon", "abandon-upgrade", "--yes"]));
-        assert!(routed(&["cagents", "daemon", "start"]));
-    }
-
     #[test]
     fn release_upgrade_preserves_the_selected_version_and_review_options() {
         use clap::Parser;
@@ -4867,7 +4718,6 @@ mod tests {
         ])
         .unwrap()
         .command;
-        assert!(!super::routes_to_staged_owner(&command));
         assert!(
             matches!(command, super::TopCommand::Daemon { command: super::DaemonCommand::Upgrade {
             version: Some(version), yes: true, interrupt: true,
@@ -5131,10 +4981,7 @@ mod tests {
                 argv.push("--no-start");
             }
             argv.extend(["daemon", "protocol-version"]);
-            assert_eq!(
-                run_from_with_staged_lookup(argv, |_, _| panic!("local protocol query routed")),
-                ExitCode::SUCCESS
-            );
+            assert_eq!(run_from(argv), ExitCode::SUCCESS);
         }
 
         fn accept(listener: &UnixListener) -> UnixStream {
@@ -5202,12 +5049,7 @@ mod tests {
                 for command in commands {
                     let mut argv = vec!["cagents", "--json", "--device", device];
                     argv.extend_from_slice(command);
-                    assert_eq!(
-                        run_from_with_staged_lookup(argv, |_, _| panic!(
-                            "scoped initiator reached staged routing"
-                        )),
-                        ExitCode::FAILURE
-                    );
+                    assert_eq!(run_from(argv), ExitCode::FAILURE);
                 }
             }
             // Test the bridge's own admission as well as public CLI dispatch.
@@ -5393,10 +5235,7 @@ mod tests {
                 "unknown-must-not-be-selected",
             ];
             argv.extend(command);
-            assert_eq!(
-                run_from_with_staged_lookup(argv, |_, _| panic!("local-only operation routed")),
-                ExitCode::FAILURE
-            );
+            assert_eq!(run_from(argv), ExitCode::FAILURE);
         }
     }
 

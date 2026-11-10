@@ -10,7 +10,6 @@ use crate::{
     work::{Board, Column, Request as WorkRequest, Response as WorkResponse, Scope},
 };
 use std::{
-    cell::Cell,
     fs::{self, File},
     os::unix::{ffi::OsStringExt, fs::PermissionsExt, net::UnixListener},
     thread::JoinHandle,
@@ -300,16 +299,11 @@ fn exercise_local(role: &str) {
     ] {
         let proposal = uuid::Uuid::new_v4();
         let peer = Peer::new(business, proposal, project.clone(), authority.clone());
-        let staged = Cell::new(0);
         let mut args = arguments(business, proposal, &project);
         if no_start {
             args.insert(1, "--no-start".into());
         }
-        let result = run_from_with_staged_lookup(args, |_, recover| {
-            staged.set(staged.get() + 1);
-            assert_eq!(recover, !no_start);
-            Ok(None)
-        });
+        let result = run_from(args);
         assert_eq!(
             result,
             match business {
@@ -329,16 +323,11 @@ fn exercise_local(role: &str) {
                 "an explicit apply must not rewrite the captured request",
             );
         }
-        routing.push((business, staged.get(), probes, raw_probes));
+        routing.push((business, probes, raw_probes));
     }
     // Drive every business envelope before checking routing, so the causal
     // predecessor reaches both nested ChannelWork paths before it fails.
-    for (business, staged, probes, raw_probes) in routing {
-        assert_eq!(
-            staged,
-            usize::from(!scoped),
-            "{business:?}: scoped services must bypass staged owner lookup/recovery after reaching business dispatch"
-        );
+    for (business, probes, raw_probes) in routing {
         assert_eq!(
             probes,
             usize::from(!scoped && !no_start),
@@ -374,11 +363,7 @@ fn exercise_remote() {
         if index == 0 {
             args.splice(1..1, ["--device".into(), "fixture-remote".into()]);
         }
-        let staged = Cell::new(0);
-        let result = run_from_with_staged_lookup(args, |_, _| {
-            staged.set(staged.get() + 1);
-            Ok(None)
-        });
+        let result = run_from(args);
         assert_eq!(result, ExitCode::FAILURE);
         if matches!(business, Business::ChannelApply) {
             assert_eq!(
@@ -388,7 +373,6 @@ fn exercise_remote() {
         }
         assert!(crate::device::is_remote());
         assert_eq!(crate::device::selected().unwrap().name, "fixture-remote");
-        assert_eq!(staged.get(), 0);
         assert!(
             !Path::new(&std::env::var_os(SSH_MARKER).unwrap()).exists(),
             "scoped remote service must refuse before device preparation/SSH"

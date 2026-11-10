@@ -76,17 +76,11 @@ fn exercise() {
                     return (listener, ready, raw);
                 }
             });
-            let staged = Cell::new(0);
-            let result = run_from_with_staged_lookup(arguments(command, no_start), |_, recover| {
-                staged.set(staged.get() + 1);
-                assert_eq!(recover, !no_start);
-                Ok(None)
-            });
+            let result = run_from(arguments(command, no_start));
             // Join even if dispatch failed, so a fixture failure cannot leave a
             // detached peer using an endpoint after its private tree is removed.
             let (listener, ready, raw) = worker.join().unwrap();
             assert_eq!(result, ExitCode::SUCCESS);
-            assert_eq!(staged.get(), 1, "global reads retain staged-owner lookup");
             assert_eq!(
                 ready,
                 usize::from(!no_start),
@@ -119,14 +113,8 @@ fn exercise() {
                     0
                 );
             }
-            let staged = Cell::new(0);
-            let result = run_from_with_staged_lookup(arguments(command, true), |_, recover| {
-                staged.set(staged.get() + 1);
-                assert!(!recover);
-                Ok(None)
-            });
+            let result = run_from(arguments(command, true));
             assert_eq!(result, ExitCode::FAILURE);
-            assert_eq!(staged.get(), 1);
             assert!(!socket.exists(), "missing daemon must remain absent");
             drop(lock);
         }

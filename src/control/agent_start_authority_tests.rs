@@ -7,7 +7,6 @@ use crate::{
     terminal::ipc::ProtocolError,
 };
 use std::{
-    cell::Cell,
     fs::{self, File},
     os::unix::{ffi::OsStringExt, fs::PermissionsExt, net::UnixListener},
     thread::JoinHandle,
@@ -223,12 +222,7 @@ fn exercise(role: &str) {
         if no_start {
             args.insert(1, "--no-start".into());
         }
-        let staged = Cell::new(0);
-        let result = run_from_with_staged_lookup(args, |_, recover| {
-            staged.set(staged.get() + 1);
-            assert_eq!(recover, !no_start);
-            Ok(None)
-        });
+        let result = run_from(args);
         assert_eq!(
             result,
             if matches!(business, Business::List) {
@@ -238,19 +232,14 @@ fn exercise(role: &str) {
             }
         );
         let (ready, raw) = peer.finished();
-        routing.push((business, staged.get(), ready, raw));
+        routing.push((business, ready, raw));
     }
-    for (business, staged, ready, raw) in routing {
+    for (business, ready, raw) in routing {
         let connections = if matches!(business, Business::Send) {
             2
         } else {
             1
         };
-        assert_eq!(
-            staged,
-            usize::from(!scoped),
-            "{business:?}: scoped Agent requests cannot delegate before capture"
-        );
         assert_eq!(
             ready,
             if !scoped && !no_start { connections } else { 0 },
@@ -260,7 +249,7 @@ fn exercise(role: &str) {
     }
 }
 #[test]
-fn public_agent_list_and_exact_submit_retry_keep_scope_before_staged_owner_and_readiness() {
+fn public_agent_list_and_exact_submit_retry_keep_scope_before_readiness() {
     if let Some(role) = std::env::var_os(ROLE) {
         exercise(role.to_str().unwrap());
         return;
