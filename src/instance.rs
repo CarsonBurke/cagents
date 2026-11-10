@@ -26,7 +26,7 @@ use std::{
 mod daemon_admission;
 pub use daemon_admission::DaemonStillStarting;
 pub(crate) use daemon_admission::{
-    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, LaunchFence, inherit_daemon_fence,
+    AdmissionFence, DAEMON_FENCE_ENV, DaemonAdmissionGuard, inherit_daemon_fence,
 };
 
 use directories::ProjectDirs;
@@ -728,17 +728,6 @@ fn running_window_slots(runtime: &Path) -> io::Result<Vec<String>> {
     Ok(slots)
 }
 
-/// A shared launch fence prevents a reviewed handoff from committing while a
-/// public launcher authenticates and restores the surviving window's daemon.
-/// Like a window, it waits out a daemon admission and refuses an update.
-pub(crate) fn recovery_launch_fence() -> io::Result<OwnedLock> {
-    daemon_admission::shared_launch_fence(
-        &runtime_directory()?,
-        daemon_admission::admission_wait_timeout(),
-        &mut |_| {},
-    )
-}
-
 static EDITOR_PROTECTION_READY: OnceLock<OwnedLock> = OnceLock::new();
 
 fn editor_ready_path(runtime: &Path, pid: u32) -> PathBuf {
@@ -979,38 +968,6 @@ impl VerifiedWindow {
 /// The caller must hold the update launch fence throughout use of this proof.
 pub(crate) fn verified_running_windows() -> io::Result<Vec<VerifiedWindow>> {
     verified_windows_in(&runtime_directory()?, Path::new("/proc"))
-}
-
-/// A staged installer itself holds the shared legacy fence. Its validated
-/// exclusive launch guard already rules out a legacy exclusive UI owner.
-pub(crate) fn verified_staged_windows() -> io::Result<Vec<VerifiedWindow>> {
-    validate_stage_guard()?;
-    verified_window_lease_owners_in(&runtime_directory()?, Path::new("/proc"))
-}
-
-/// A candidate whose exact daemon already owns the runtime may reopen while an
-/// older coordinator retains its shared legacy fence. Keep legacy exclusive UI
-/// owners excluded, and authenticate every modern window before routing.
-/// The caller must hold the launch fence and retain the returned legacy guard.
-pub(crate) fn verified_windows_for_daemon(
-    executable: &Path,
-) -> io::Result<(Vec<VerifiedWindow>, OwnedLock)> {
-    let runtime = runtime_directory()?;
-    let legacy = owned_lock(
-        &runtime.join(APPLICATION_LOCK_FILE),
-        libc::LOCK_SH | libc::LOCK_NB,
-    )?;
-    let windows = verified_window_lease_owners_in(&runtime, Path::new("/proc"))?;
-    if crate::daemon::running_executable()
-        .map_err(io::Error::other)?
-        .as_deref()
-        != Some(executable)
-    {
-        return Err(io::Error::other(
-            "candidate daemon ownership changed while checking windows",
-        ));
-    }
-    Ok((windows, legacy))
 }
 
 fn flock_owner(line: &str, metadata: &fs::Metadata) -> Option<u32> {

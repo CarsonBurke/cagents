@@ -121,35 +121,6 @@ fn compatible_window(window: &VerifiedWindow) -> io::Result<()> {
     Ok(())
 }
 
-/// Own locks explicitly unlock at scope exit; inherited descriptors only close.
-/// In particular, a child must never unlock its parent's shared description.
-pub(crate) enum LaunchFence {
-    Owned(OwnedLock),
-    Inherited { file: File, descriptor: i32 },
-}
-impl LaunchFence {
-    fn file(&self) -> &File {
-        match self {
-            Self::Owned(lock) => lock,
-            Self::Inherited { file, .. } => file,
-        }
-    }
-    pub(crate) fn recovery() -> io::Result<Self> {
-        if let Some((file, descriptor)) = inherited_fence()? {
-            Ok(Self::Inherited { file, descriptor })
-        } else {
-            recovery_launch_fence().map(Self::Owned)
-        }
-    }
-    pub(crate) fn inherit(&self, command: &mut process::Command) -> io::Result<()> {
-        let inherited = match self {
-            Self::Inherited { descriptor, .. } => Some(*descriptor),
-            Self::Owned(_) => None,
-        };
-        forward_fence(command, self.file().try_clone()?, inherited)
-    }
-}
-
 fn fence_path() -> io::Result<PathBuf> {
     Ok(fence_path_in(&runtime_directory()?))
 }
@@ -430,10 +401,10 @@ pub(crate) struct DaemonAdmissionGuard {
 enum DaemonLaunch {
     /// This daemon's own fence, declared as an admission while it is held.
     Owned(AdmissionFence),
-    /// An installer's or recovery launcher's fence. It stays held after this
-    /// daemon is ready, for that owner's own work, so it is never declared:
-    /// a window opened meanwhile reports that owner's update.
-    Inherited(LaunchFence),
+    /// An installer's fence stays held after readiness for its remaining work.
+    /// Only close the inherited description here: unlocking it would release
+    /// the installer's fence too. It is never declared as a daemon admission.
+    Inherited(File),
 }
 
 impl DaemonAdmissionGuard {
@@ -446,7 +417,7 @@ impl DaemonAdmissionGuard {
             unsafe {
                 libc::close(descriptor);
             }
-            DaemonLaunch::Inherited(LaunchFence::Inherited { file, descriptor })
+            DaemonLaunch::Inherited(file)
         } else {
             DaemonLaunch::Owned(AdmissionFence::acquire_in(&runtime)?)
         };
@@ -464,7 +435,7 @@ fn upgrade_fence(file: &File) -> io::Result<()> {
     if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == -1 {
         return Err(io::Error::new(
             io::Error::last_os_error().kind(),
-            "daemon launch fence upgrade failed; recovery cancelled",
+            "daemon launch fence upgrade failed; admission cancelled",
         ));
     }
     Ok(())
@@ -907,11 +878,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let path = root.path().join("launch");
         let parent = owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).unwrap();
-        let borrowed = LaunchFence::Inherited {
-            file: parent.try_clone().unwrap(),
-            descriptor: DAEMON_FENCE_FD,
-        };
-        upgrade_fence(borrowed.file()).unwrap();
+        let borrowed = parent.try_clone().unwrap();
+        upgrade_fence(&borrowed).unwrap();
         drop(borrowed);
         assert!(
             owned_lock(&path, libc::LOCK_SH | libc::LOCK_NB).is_err(),
