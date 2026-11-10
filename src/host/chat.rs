@@ -3834,7 +3834,7 @@ pub(super) fn resolve_upgrade(
             )))?;
         if !record.handle.owns_work()
             && !((source.is_saved_claude_history()
-                || crate::upgrade::floor::cached().is_ok_and(|ledger| ledger.blocks_chat(source)))
+                || crate::upgrade::floor::load().is_ok_and(|ledger| ledger.blocks_chat(source)))
                 && record.handle.is_read_only_history())
         {
             return Err(unavailable(

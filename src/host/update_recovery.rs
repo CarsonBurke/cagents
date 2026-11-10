@@ -202,7 +202,6 @@ mod tests {
         model::{
             BootId, HostIncarnation, HostSessionId, HostSessionProof, LaunchRecipe, TerminalId,
         },
-        terminal_ipc::{ClientRequest, ServerResponse},
     };
     use std::{
         fs,
@@ -249,24 +248,26 @@ mod tests {
             boot_id: BootId::new("boot"),
             host_incarnation: HostIncarnation::new(epoch),
         };
-        let source = Session {
+        let mut source = Session {
             id: TerminalId::new(),
             launch: chat::Launch {
                 provider: crate::agent::Provider::Codex,
                 recipe: LaunchRecipe {
                     program: "/must-not-execute-a-recovery-provider".into(),
-                    arguments: Vec::new(),
+                    arguments: vec!["--remote".into(), "unix://".into()],
                     working_directory: root.join("project"),
                     environment: Default::default(),
                     unset_environment: Default::default(),
                 },
-                session_id: Some(uuid::Uuid::new_v4().to_string()),
+                session_id: None,
             },
             proof: Some(proof("old")),
             terminal: None,
             owned_codex_listener: None,
             native_continuity: Default::default(),
         };
+        assert!(source.claim_owned_codex_listener(&root.join("run"), &proof("old")));
+        source.launch.session_id = Some(uuid::Uuid::new_v4().to_string());
         let mut captured = recovery::SnapshotCapture::default();
         captured
             .push(
@@ -375,20 +376,42 @@ mod tests {
         };
         let paused = paused_record(proof("old"), &census, &[source.id], Vec::new()).unwrap();
         assert_eq!(paused.presentations[0].pane, pane);
+        // Retained-owner adoption precedes paused ledger publication during
+        // real recovery. Its canonical pane lineage check reads this same
+        // index before the newly paused conversations have been recorded.
+        let mut adopted = source.clone();
+        adopted.proof = Some(proof("new"));
+        let _ = chat::is_upgrade_recovery(&source, &adopted);
+        let before = crate::upgrade::floor::load().unwrap();
+        assert!(before.resume_source(&alias).is_none());
         paused.save().unwrap();
+        assert!(before.resume_source(&alias).is_none());
+        assert_eq!(
+            crate::upgrade::floor::load().unwrap().resume_source(&alias),
+            Some(&source)
+        );
         let ledger = crate::upgrade::floor::load().unwrap();
         assert_eq!(ledger.resume_source(&alias), Some(&source));
         assert_eq!(ledger.records[0].presentations[0].pane, pane);
         let mut initial = state::HostState::new(proof("new"));
         initial.install_model(registry);
-        initial.register_client(1);
         let host = Arc::new(state::HostLock::new(initial));
-        let resolved = super::super::chat::upgrade_resolution::resolve(&host, 1, &alias).unwrap();
-        assert!(matches!(
-            super::super::chat::process(&host, 1, ClientRequest::ChatAttach { session: resolved })
-                .unwrap(),
-            ServerResponse::ChatAttached { .. }
-        ));
+        let (client, server) = std::os::unix::net::UnixStream::pair().unwrap();
+        let server_host = host.clone();
+        let server = std::thread::spawn(move || {
+            super::super::client::serve(server, 1, server_host);
+        });
+        let client = match chat::client::ClientHandle::fixture_restore(client, alias.clone()) {
+            Ok(client) => client,
+            Err(failure) => {
+                host.lock().unwrap().register_client(2);
+                let underlying = super::super::chat::upgrade_resolution::resolve(&host, 2, &alias);
+                panic!(
+                    "real client restore failed: {failure:?}; direct resolution: {underlying:?}"
+                );
+            }
+        };
+        assert_eq!(client.session().launch.session_id, source.launch.session_id);
         let handle = host.lock().unwrap().chats[&source.id].handle.clone();
         let deadline = Instant::now() + Duration::from_secs(5);
         let snapshot = loop {
@@ -417,5 +440,7 @@ mod tests {
         assert_eq!(snapshot.session_id, source.launch.session_id);
         assert!(!fs::exists("/must-not-execute-a-recovery-provider").unwrap());
         handle.close().unwrap();
+        drop(client);
+        server.join().unwrap();
     }
 }

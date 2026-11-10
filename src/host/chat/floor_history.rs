@@ -53,7 +53,7 @@ impl Adapter for StoppedAdapter {
 }
 
 pub(super) fn recover(host: &SharedHost, requested: &Session) -> Result<(), String> {
-    let ledger = crate::upgrade::floor::cached().map_err(str::to_owned)?;
+    let ledger = crate::upgrade::floor::load()?;
     let original = ledger
         .resume_source(requested)
         .ok_or("The stopped update source changed its saved conversation")?;
@@ -176,7 +176,7 @@ pub(super) fn prepare_resume(
     host: &SharedHost,
     requested: &Session,
 ) -> Result<Option<Session>, String> {
-    let ledger = crate::upgrade::floor::cached().map_err(str::to_owned)?;
+    let ledger = crate::upgrade::floor::load()?;
     let Some(source) = ledger.resume_source(requested) else {
         return Ok(None);
     };

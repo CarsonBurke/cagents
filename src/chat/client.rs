@@ -1123,7 +1123,7 @@ fn restore(
     if session.proof.as_ref() == Some(proof) && !retry_explicit_start {
         return Ok(ClientRequest::ChatAttach { session });
     }
-    if crate::upgrade::floor::cached().is_ok_and(|ledger| {
+    if crate::upgrade::floor::load().is_ok_and(|ledger| {
         ledger
             .resume_source(&session)
             .is_some_and(|original| original.launch.session_id.is_none())
@@ -1288,8 +1288,7 @@ fn restore(
             Err(message) => refusal = Some(message),
         }
     }
-    if crate::upgrade::floor::cached().is_ok_and(|ledger| ledger.resume_source(&session).is_some())
-    {
+    if crate::upgrade::floor::load().is_ok_and(|ledger| ledger.resume_source(&session).is_some()) {
         return Err(StartFailure::retry(
             "This conversation was stopped for the update. Its saved files are kept; the transcript preview could not be attached. Nothing was restarted.",
         ));
@@ -2095,14 +2094,9 @@ impl ClientHandle {
                 )?
             }
         } else if intent == Intent::Start
-            && crate::upgrade::floor::cached()
-                .is_ok_and(|ledger| ledger.resume_source(&session).is_some())
+            && let Ok(ledger) = crate::upgrade::floor::load()
+            && let Some(original) = ledger.resume_source(&session).cloned()
         {
-            let original = crate::upgrade::floor::cached()
-                .map_err(str::to_owned)?
-                .resume_source(&session)
-                .unwrap()
-                .clone();
             let request_id = attach_request;
             attach_request += 1;
             codec
@@ -2618,6 +2612,11 @@ impl ClientHandle {
         }
         session.learn_native_continuity(&snapshot.native_continuity);
         session
+    }
+    /// The identity negotiated by ChatAttached, before snapshot projection.
+    /// A read-only reader cannot move to another conversation after attachment.
+    pub(crate) fn attached_session_id(&self) -> Option<&str> {
+        self.inner.session.launch.session_id.as_deref()
     }
     pub(crate) fn upgrade_recovery(&self) -> Option<&(Session, Session)> {
         self.inner

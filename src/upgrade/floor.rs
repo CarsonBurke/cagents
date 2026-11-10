@@ -350,8 +350,24 @@ fn directory() -> Result<PathBuf, String> {
         .ok_or_else(|| "Cannot discover stopped update panes".into())
 }
 
+/// Read the current durable index for a recovery or lineage decision. Both the
+/// daemon and guarded update helpers can change these records while an existing
+/// daemon or window survives, so a process startup snapshot is not authoritative.
+/// Transcript payloads are skipped; rendering uses its attached snapshot instead.
 pub(crate) fn load() -> Result<Ledger, String> {
+    #[cfg(test)]
+    INDEX_READS.with(|reads| reads.set(reads.get() + 1));
     load_at(&directory()?)
+}
+
+#[cfg(test)]
+thread_local! {
+    static INDEX_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn index_reads_for_test() -> usize {
+    INDEX_READS.with(std::cell::Cell::get)
 }
 
 fn open_directory(directory: &Path) -> Result<Option<crate::fs_safety::Root>, String> {
@@ -717,13 +733,6 @@ mod tests {
         std::os::unix::fs::symlink(directory.path(), directory.path().join("link")).unwrap();
         assert!(load_at(&directory.path().join("link")).is_err());
     }
-}
-
-/// Each daemon/window reads its stopped inventory once. The updater writes it
-/// before starting those processes; old processes keep their existing behavior.
-pub(crate) fn cached() -> Result<&'static Ledger, &'static str> {
-    static LEDGER: std::sync::OnceLock<Result<Ledger, String>> = std::sync::OnceLock::new();
-    LEDGER.get_or_init(load).as_ref().map_err(String::as_str)
 }
 
 pub(crate) fn same_allocation(source: &Session, saved: &Session) -> bool {
