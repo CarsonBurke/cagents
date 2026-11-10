@@ -987,9 +987,10 @@ impl Cagents {
                 .find(|card| card.id == id && card.existence.is_open())
         });
         let Some(owner) = focused.filter(|card| {
-            self.durable.card_scopes.contains_key(&card.id)
-                || card_directory(card)
-                    .is_some_and(|directory| self.worktree_scope_for(directory).is_some())
+            self.card_worktree(card).is_some()
+                && (self.durable.card_scopes.contains_key(&card.id)
+                    || card_directory(card)
+                        .is_some_and(|directory| self.worktree_scope_for(directory).is_some()))
         }) else {
             // Shared panes are retained in every window's store even when the
             // window has never entered their workspace. No selected scope and
