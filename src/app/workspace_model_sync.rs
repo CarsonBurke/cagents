@@ -1076,6 +1076,7 @@ impl Cagents {
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
         tasks.push(self.reconcile_shared_views());
+        tasks.push(self.restore_pending_channel_work());
         if changed {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());

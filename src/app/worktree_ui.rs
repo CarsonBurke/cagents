@@ -962,6 +962,10 @@ impl Cagents {
     /// Must run before initialize_runtimes so hidden restored terminals are
     /// admitted as offscreen, not with another worktree's persisted exposure.
     pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
+        self.restore_workspace_scope(false)
+    }
+
+    pub(super) fn restore_workspace_scope(&mut self, has_saved_view: bool) -> Task<Message> {
         Arc::make_mut(&mut self.durable).normalize_channels();
         self.refresh_worktree_owners(None);
         self.worktree_focus.clone_from(&self.durable.worktree_focus);
@@ -986,12 +990,12 @@ impl Cagents {
                 .iter()
                 .find(|card| card.id == id && card.existence.is_open())
         });
-        let Some(owner) = focused.filter(|card| {
-            self.card_worktree(card).is_some()
-                && (self.durable.card_scopes.contains_key(&card.id)
-                    || card_directory(card)
-                        .is_some_and(|directory| self.worktree_scope_for(directory).is_some()))
-        }) else {
+        // A saved window view comes from a build that records active scopes:
+        // their absence means home. Only older stores without a view need to
+        // infer a scope from their focused pane's directory.
+        let Some(owner) =
+            focused.filter(|card| !has_saved_view && self.card_worktree(card).is_some())
+        else {
             // Shared panes are retained in every window's store even when the
             // window has never entered their workspace. No selected scope and
             // no focused pane is Workspace home, not a request to open the

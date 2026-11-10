@@ -2322,6 +2322,12 @@ struct WindowView {
     worktree_offsets: HashMap<PathBuf, f32>,
     #[serde(default)]
     channel_offsets: HashMap<ChannelId, f32>,
+    #[serde(default)]
+    settings_category: Option<SettingsCategory>,
+    #[serde(default)]
+    settings_search: String,
+    #[serde(default)]
+    saved_channel_work: Option<crate::channel_work::Home>,
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -2424,7 +2430,7 @@ impl ContextTab {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum SettingsCategory {
     Notifications,
     General,
@@ -5602,13 +5608,20 @@ impl Cagents {
             self.worktree_offsets.clone_from(&view.worktree_offsets);
             self.channel_offsets.clone_from(&view.channel_offsets);
         }
-        let scope = self.restore_worktree_scope();
+        let scope = self.restore_workspace_scope(view.is_some());
         // Binding the initial scope clears the previous panel's disclosures.
         // Apply this window's saved presentation after that first binding.
-        if let Some(view) = view {
+        let work = if let Some(view) = view {
             self.sidebar_state.restore_view(view.sidebar);
-        }
-        scope
+            self.settings_category = view
+                .settings_category
+                .unwrap_or(SettingsCategory::Appearance);
+            self.settings_search = view.settings_search;
+            self.restore_channel_work(view.saved_channel_work)
+        } else {
+            Task::none()
+        };
+        Task::batch([scope, work])
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
@@ -14038,6 +14051,9 @@ impl Cagents {
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
             channel_offsets: self.channel_offsets.clone(),
+            settings_category: Some(self.settings_category),
+            settings_search: self.settings_search.clone(),
+            saved_channel_work: self.saved_channel_work(),
         };
         if let Some(channel) = self.durable.active_channel {
             view.channel_offsets

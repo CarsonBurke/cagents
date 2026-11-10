@@ -73,7 +73,14 @@ fn restart(mut app: Cagents, database: &Path, legacy_view: bool) -> Cagents {
         let store = session.operation_store();
         let mut view: serde_json::Value =
             serde_json::from_str(&store.load_window_view().unwrap().unwrap()).unwrap();
-        view.as_object_mut().unwrap().remove("channel_offsets");
+        for field in [
+            "channel_offsets",
+            "settings_category",
+            "settings_search",
+            "saved_channel_work",
+        ] {
+            view.as_object_mut().unwrap().remove(field);
+        }
         let sidebar = view["sidebar"].as_object_mut().unwrap();
         for field in [
             "filter",
@@ -217,15 +224,81 @@ fn home_preserves_utility_and_unowned_terminal_without_opening_retained_scope() 
             focused: Some(visible.id),
             ..WorkspaceState::default()
         });
+        app.settings_category = SettingsCategory::Terminal;
+        app.settings_search = "cursor".into();
         let database = directory
             .path()
             .join(format!("home-{unowned_terminal}.sqlite3"));
         let restored = restart(app, &database, false);
         assert_eq!(restored.active_workspace, None);
+        assert_eq!(restored.settings_category, SettingsCategory::Terminal);
+        assert_eq!(restored.settings_search, "cursor");
         assert_eq!(restored.workspace.order().collect::<Vec<_>>(), [visible.id]);
         assert_eq!(restored.workspace.focused(), Some(visible.id));
         assert!(restored.card_state(hidden.id).is_some());
     }
+}
+
+#[test]
+fn stale_channel_selection_does_not_enter_a_retained_panes_worktree() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("stale-channel.sqlite3");
+    let mut app = fixture(directory.path());
+    let project = app.sidebar_model.projects[0].id;
+    let root = app.sidebar_model.projects[0].worktrees[0].path.clone();
+    let retained = terminal(&root);
+    let retained_channel = ChannelId::new();
+    let stale_channel = ChannelId::new();
+    let durable = Arc::make_mut(&mut app.durable);
+    durable.cards = vec![retained.clone()];
+    durable.focused = Some(retained.id);
+    durable.channels.push(ProjectChannel {
+        id: retained_channel,
+        project_id: project,
+        title: "Retained channel".into(),
+        title_source: Default::default(),
+        ordinal: 0,
+        shared: false,
+        cards: vec![retained.id],
+        focused: Some(retained.id),
+    });
+    let workspace = durable.id;
+    let boot = BootId::new("stale-channel-fixture");
+    let (mut session, _) = SessionRuntime::open(&database, boot.clone()).unwrap();
+    session.snapshot(Arc::clone(&app.durable));
+    session.flush(Duration::from_secs(5)).unwrap();
+    session.shutdown();
+    drop(session);
+
+    // Simulate a selection left behind when its channel disappeared. Normal
+    // saves reject this dangling reference, so inject only that metadata into
+    // the fixture store; leave the other channel and its focused pane intact.
+    let connection = rusqlite::Connection::open(&database).unwrap();
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE metadata SET value = ?1 WHERE key = ?2",
+                rusqlite::params![
+                    serde_json::to_string(&Some(stale_channel)).unwrap(),
+                    format!("workspace:{workspace}:navigation:active_thread"),
+                ],
+            )
+            .unwrap(),
+        1,
+    );
+    drop(connection);
+    let (session, restored) = SessionRuntime::open(&database, boot).unwrap();
+    app.durable = Arc::new(restored.unwrap());
+    assert_eq!(app.durable.focused, Some(retained.id));
+    assert_eq!(app.durable.active_worktree, None);
+    app.workspace = Cagents::rebuild_workspace(&app.durable);
+    drop(app.restore_window_view(None));
+    assert_eq!(app.active_workspace, None);
+    assert_eq!(app.durable.active_channel, None);
+    assert_eq!(app.workspace.focused(), None);
+    assert!(app.workspace.cards().is_empty());
+    assert!(app.card_state(retained.id).is_some());
+    drop(session);
 }
 
 #[test]

@@ -38,6 +38,9 @@ pub(super) struct State {
     restore_card: Option<CardId>,
     deferred: Option<Deferred>,
     navigation_view: Option<ui::ViewOwner>,
+    /// The saved surface waits for authoritative registry/catalog evidence.
+    /// Explicit navigation cancels this request while startup is connecting.
+    pending_restore: Option<Home>,
 }
 
 impl Default for State {
@@ -53,6 +56,7 @@ impl Default for State {
             restore_card: None,
             deferred: None,
             navigation_view: None,
+            pending_restore: None,
         }
     }
 }
@@ -106,6 +110,49 @@ impl Cagents {
         self.channel_work.main && self.channel_work.view.is_open()
     }
 
+    pub(super) fn saved_channel_work(&self) -> Option<Home> {
+        if self.channel_work_is_main() {
+            self.channel_work.view.home()
+        } else {
+            self.channel_work.pending_restore
+        }
+    }
+
+    pub(super) fn restore_channel_work(&mut self, home: Option<Home>) -> Task<Message> {
+        self.channel_work.pending_restore = home.filter(|home| home.validate().is_ok());
+        self.restore_pending_channel_work()
+    }
+
+    /// A saved channel ID alone is insufficient: a registry replacement or
+    /// channel reincarnation must not reopen another channel's Work surface.
+    /// Run after model projection so select_channel can use the local catalog.
+    pub(super) fn restore_pending_channel_work(&mut self) -> Task<Message> {
+        let Some(home) = self.channel_work.pending_restore else {
+            return Task::none();
+        };
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Task::none();
+        }
+        if self.workspace_model.identity != home.registry
+            || !self
+                .workspace_model
+                .channel(home.channel)
+                .is_some_and(|channel| {
+                    channel.ordinal == home.creation_ordinal
+                        && !self.project_ui.closed.contains(&channel.repository)
+                })
+        {
+            self.channel_work.pending_restore = None;
+            return Task::none();
+        }
+        // The registry can arrive before a channel's project finishes opening.
+        if self.channel_directory(home.channel).is_none() {
+            return Task::none();
+        }
+        self.channel_work.pending_restore = None;
+        self.open_channel_work(home.channel)
+    }
+
     pub(super) fn channel_home(&self) -> Option<(Home, String)> {
         if self.channel_work_is_main() {
             return Some((
@@ -150,6 +197,7 @@ impl Cagents {
     }
 
     pub(super) fn open_channel_work(&mut self, channel: ChannelId) -> Task<Message> {
+        self.channel_work.pending_restore = None;
         if self.channel_work.view.has_confirmation() {
             return Task::none();
         }
@@ -196,6 +244,28 @@ impl Cagents {
         &mut self,
         message: &Message,
     ) -> Option<Task<Message>> {
+        if self.channel_work.pending_restore.is_some()
+            && ((workspace_navigation_blocked_during_save(message)
+                && !matches!(
+                    message,
+                    Message::Viewport {
+                        event: WorkspaceViewportEvent::PointerRested(_),
+                        ..
+                    }
+                ))
+                || matches!(
+                    message,
+                    Message::KeyEvent {
+                        event: keyboard::Event::KeyPressed { .. },
+                        captured: false
+                    } | Message::RunCommand(_)
+                        | Message::WorkspaceSwitcherActivate { .. }
+                        | Message::SelectSettingsCategory(_)
+                        | Message::SettingsSearchChanged(_)
+                ))
+        {
+            self.channel_work.pending_restore = None;
+        }
         if !self.channel_work_is_main() || self.modal_is_open() {
             return None;
         }
@@ -906,6 +976,10 @@ mod tests {
         views::{Scope, View},
     };
     use cosmic::iced::futures::StreamExt;
+
+    mod restore {
+        include!("channel_work_restore_tests.rs");
+    }
 
     fn captured() -> Home {
         Home {
