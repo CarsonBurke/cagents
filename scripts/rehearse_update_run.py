@@ -290,6 +290,7 @@ class Rehearsal:
                 self.errors.append('before record has evidence gaps')
             self.observe(self.root/'records/before/windows.json',shots='before')
             update_args = ['--yes'] if args.yes else ['--answer',args.answer]
+            update_args += ['--working',args.working,'--stop',args.stop]
             for flag in args.upgrade_arg:
                 update_args.append(flag)
             code, _ = self.call('update',args.new_dir,args.new_version,args.new_installer,*update_args,timeout=300,check=False)
@@ -383,6 +384,8 @@ def main():
     run.add_argument('--ceditor',metavar='BIN_DIR')
     run.add_argument('--answer',default='yes')
     run.add_argument('--yes',action='store_true')
+    run.add_argument('--working',default='',help='typed at the working-agents choice; empty waits for them')
+    run.add_argument('--stop',default='',help='typed at the destructive stop list; empty cancels')
     run.add_argument('--upgrade-arg',action='append',default=[],help='use --upgrade-arg=--interrupt, for example')
     run.add_argument('--reopen-timeout',type=float,default=45)
     seed_options(run)

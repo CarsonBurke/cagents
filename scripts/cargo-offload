@@ -2321,6 +2321,14 @@ elif command == "run":
             directories = {}
         sys.stdout.write(DIRECTORIES_MARKER + json.dumps(directories) + "\n")
         sys.stdout.flush()
+    if request.get("host_test_helper") is not None:
+        # The helper build and test run share this lease, source copy and Cargo
+        # environment. Keep it beneath the supervised child, so cancellation
+        # and the phase-based memory pricing cover the preparation too.
+        helper = os.path.join(base, "cargo-host-test-helper.py")
+        with open(helper, "w") as file:
+            file.write(request["host_test_helper"])
+        arguments = [sys.executable, "-I", helper, "--run", *arguments]
     if request.get("memory_cap") is not None:
         # The gate's helper travels with this invocation, including installed
         # gates and arbitrary Cargo workspaces that have no repository scripts.
@@ -2951,6 +2959,10 @@ class Offload:
                        "core_dumps": self.environment.get("CAGENTS_BUILD_REMOTE_CORE_DUMPS") == "1"}
             if plan.runs_tests:
                 request["memory_cap"] = self.memory_cap
+            if plan.subcommand == "test":
+                helper = Path(__file__).resolve().with_name("cargo-host-test-helper.py")
+                if helper.is_file():
+                    request["host_test_helper"] = helper.read_text()
             if plan.captures:
                 request["directories"] = [arg for value in configs for arg in ("--config", value)]
             command.stdin.write((json.dumps(request) + "\n").encode())

@@ -179,6 +179,22 @@ fn the_fixture_forge_answers_with_a_seeded_pull_request() {
     let listed = service.list(&request, &cancellation).unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].title, "Teach the sidebar about avatars");
+    let sidebar = service.sidebar_open(&key, 50, &cancellation).unwrap();
+    assert_eq!(sidebar.len(), 1);
+    assert_eq!(
+        sidebar[0].head_repository_key(),
+        listed[0].head_repository_key()
+    );
+    assert!(sidebar[0].check_summaries().is_empty());
+    let mut seeded_checks = seed.clone();
+    seeded_checks[0]["statusCheckRollup"] = serde_json::json!([
+        {"__typename":"StatusContext","context":"ci","state":"FAILURE"}
+    ]);
+    std::fs::write(&forge.seed, seeded_checks.to_string()).unwrap();
+    let failing = service.sidebar_open(&key, 50, &cancellation).unwrap();
+    assert_eq!(failing[0].check_summaries()[0].state.0, "FAILURE");
+    let history = service.recent_history(&key, 50, &cancellation).unwrap();
+    assert!(history[0].check_summaries().is_empty());
     let authored = service
         .list_authored(
             &AuthoredPullRequestsRequest {

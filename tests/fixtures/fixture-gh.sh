@@ -32,6 +32,12 @@ login=fixture
 viewer_id=U_kgDOFixture
 pull_requests=$config/fixture-forge-prs.json
 
+# Opt-in native polling evidence. Record operation labels, never query bodies.
+trace() {
+    [ -e "$config/fixture-forge-trace" ] || return 0
+    printf '%s\t%s\t%s\n' "$(date +%s)" "$PPID" "$1" >> "$config/fixture-forge-requests.tsv"
+}
+
 # gh's refusal of a value flag given last, with no value.
 need() {
     [ "$1" -ge 2 ] || {
@@ -249,6 +255,7 @@ pr() {
     check_seed
     case $subcommand in
         list)
+            trace "pr list author=$author repository=$slug"
             case $state in
                 open | closed | merged | all) ;;
                 *)
@@ -291,7 +298,7 @@ pr() {
 }
 
 api() {
-    include=false method= endpoint= query= number= fields=false
+    include=false method= endpoint= query= number= fields=false owner= name= limit=50
     while [ "$#" -gt 0 ]; do
         case $1 in
             -i | --include) include=true ;;
@@ -303,6 +310,9 @@ api() {
                 case $1 in
                     query=*) query=${1#query=} ;;
                     number=*) number=${1#number=} ;;
+                    owner=*) owner=${1#owner=} ;;
+                    name=*) name=${1#name=} ;;
+                    limit=*) limit=${1#limit=} ;;
                 esac
                 fields=true
                 ;;
@@ -316,7 +326,29 @@ api() {
         if "$fields"; then method=POST; else method=GET; fi
     fi
     if [ "$endpoint" = graphql ]; then
+        trace "api graphql repository=$owner/$name"
         case $query in
+            'query SidebarPullRequests('* | 'query SidebarHistory('*)
+                check_seed
+                ! "$include" || headers '200 OK' graphql
+                open=false
+                case $query in 'query SidebarPullRequests('*) open=true ;; esac
+                seeded "$owner/$name" | jq -c --argjson open "$open" --argjson limit "$limit" '
+                    def aggregate:
+                        map((.conclusion // .state // .status // "UNKNOWN") | ascii_upcase) as $states
+                        | if any($states[]; IN("FAILURE", "ERROR", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE", "STALE")) then "FAILURE"
+                          elif any($states[]; IN("PENDING", "QUEUED", "IN_PROGRESS", "REQUESTED", "WAITING", "EXPECTED")) then "PENDING"
+                          elif all($states[]; IN("SUCCESS", "NEUTRAL", "SKIPPED")) then "SUCCESS"
+                          else "ERROR" end;
+                    map(select(($open | not) or .state == "OPEN")) | .[:$limit]
+                    | map(.headRepository.owner = .headRepositoryOwner
+                        | if $open then
+                            .commits = {nodes:[{commit:{statusCheckRollup:
+                                (if (.statusCheckRollup // [] | length) == 0 then null
+                                 else {state:(.statusCheckRollup | aggregate)} end)}}]}
+                          else del(.statusCheckRollup, .commits) end)
+                    | {data:{rateLimit:{cost:1},repository:{pullRequests:{nodes:.}}}}'
+                ;;
             *'pullRequests(first:'*)
                 # The pull request browser, and the review-request poll, which
                 # also asks who is reading: no open pull requests to list.

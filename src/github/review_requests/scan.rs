@@ -1,9 +1,10 @@
 //! A resumable scan: one page per call, alternating repository discovery and
 //! request history. A long timeline can never starve PRs beyond the first page.
 use super::{Current, Entry, HistoryPage, Page, Viewer};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum History {
     #[default]
     Unknown,
@@ -362,7 +363,7 @@ mod tests {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Requested {
     pub entry: Entry,
     pub current: Current,
@@ -381,7 +382,7 @@ pub enum Work {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingHistory {
     number: u64,
     request: Current,
@@ -390,7 +391,7 @@ struct PendingHistory {
     cursors: BTreeSet<String>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Scan {
     pub viewer: Option<Viewer>,
     pub requested: BTreeMap<u64, Requested>,

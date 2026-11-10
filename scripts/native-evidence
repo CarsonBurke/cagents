@@ -59,6 +59,11 @@ both use the same fixture data and synthetic provider.
   drive ARGS...   Run niri-harness against the session (observe, click, key...).
   nested CMD...   Run a command in the nested compositor's environment.
   shot NAME       Capture shots/SIDE-NAME.webp and record its source revision.
+  relaunch [--chat-stages]
+                  After closing the app window, run the same built UI again in
+                  this session, keeping its daemon and providers alive. Runs in
+                  the foreground; stop still ends the complete session.
+                  --chat-stages records UI stage timings on normal close.
   stop            End the session, its daemon and its processes; release the lock.
                   Also ends what remains of a session whose supervisor was killed.
   save-seed       Keep the stopped fixture as the data every later start restores.
@@ -687,7 +692,7 @@ write_session_cargo() {
             "$state" "run: build $side $checkout" "$cargo_bin/cargo"
         printf 'recorded=%q\n' "$(build_arguments)"
         cat <<'CARGO'
-[ ! -e "$state/ready" ] || exec "$real_cargo" "$@"
+[ ! -e "$state/ready" ] || [ -e "$state/replaying" ] || exec "$real_cargo" "$@"
 refuse() {
     local message="refusing to $1 while holding the native lock${2:+; $2}"
     printf '%s\n' "$message" >"$state/failed.$$"
@@ -755,6 +760,7 @@ run_app() {
     if [ "$(cat "$state/software-rendering" 2>/dev/null)" = true ]; then
         extra_env+=(LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl)
     fi
+    [ -z "${chat_stage_output:-}" ] || extra_env+=("CAGENTS_CHAT_STAGE_OUTPUT=$chat_stage_output")
     set --
     [ "$built_lane" != browserless ] || set -- --browserless
     fixture_env env "${extra_env[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
@@ -765,6 +771,78 @@ run_app() {
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
             "$status" "$harness_root/session.log" "$logs/ui-$side.log" >"$state/failed"
     fi
+    return "$status"
+}
+
+# Observe the explicit machine format; display text is not a window contract.
+app_window_is_open() {
+    local observed
+    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 2
+    /usr/bin/python3 -c 'import json,sys
+try:
+    state=json.load(sys.stdin)
+    if not isinstance(state,dict) or "window" not in state:
+        sys.exit(2)
+    window=state["window"]
+    if window is None:
+        sys.exit(1)
+    sys.exit(0 if isinstance(window,dict) and window else 2)
+except (ValueError,AttributeError):
+    sys.exit(2)
+' <<<"$observed"
+}
+
+cmd_relaunch() {
+    local side watcher observed status=0 chat_stage_output=
+    side=$(current_side)
+    case ${1:-} in
+        --chat-stages)
+            [ "$#" -eq 1 ] || die 'relaunch accepts only --chat-stages'
+            mkdir -p -m 700 -- "$logs/chat-stages"
+            chat_stage_output=$logs/chat-stages/$side-$(date +%s)-$$.json
+            printf 'chat stages: %s\n' "$chat_stage_output"
+            ;;
+        '') ;;
+        *) die 'relaunch accepts only --chat-stages' ;;
+    esac
+    [ -f "$harness_root/session.rc" ] || die 'close the app window before relaunching it'
+    exec 7>"$state/relaunch.lock"
+    flock -n 7 || die 'a relaunched app is already running'
+    nested_session_env
+    local session_environment
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    eval "$session_environment"
+    app_window_is_open && observed=0 || observed=$?
+    case $observed in
+        0) die 'close the app window before relaunching it' ;;
+        1) ;;
+        *) die "could not observe whether the app window is closed; see $harness_root/session.log" ;;
+    esac
+    # Product copies need not contain Cargo dependency lists, so the runner's
+    # ordinary warm-build shortcut may decline them. Replay the exact recorded
+    # builds again until the new window appears; never compile under this lock.
+    touch "$state/replaying"
+    (
+        for _ in {1..300}; do
+            live_session || exit 1
+            if app_window_is_open; then
+                rm -f -- "$state/replaying"
+                exit 0
+            fi
+            sleep 0.1
+        done
+        printf 'the relaunched app window did not appear; see %s\n' "$logs/ui-$side.log" >"$state/failed"
+        touch "$state/stop"
+    ) 7>&- &
+    watcher=$!
+    trap 'rm -f -- "$state/replaying"; kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :' EXIT
+    trap 'exit 143' TERM HUP
+    run_app "$side" 7>&- || status=$?
+    if [ -e "$state/replaying" ]; then
+        printf 'the relaunched app exited before its window appeared; see %s\n' "$logs/ui-$side.log" >"$state/failed"
+        [ "$status" -ne 0 ] || status=1
+    fi
+    exit "$status"
 }
 
 cmd_start() {
@@ -971,6 +1049,7 @@ esac
 case $command in
     build) cmd_build "$@" ;;
     start) cmd_start "$@" ;;
+    relaunch) cmd_relaunch "$@" ;;
     cli)
         side=$(current_side)
         load_side "$side" "$state/source"
