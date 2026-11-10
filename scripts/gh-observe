@@ -247,6 +247,12 @@ class TraceFraming:
         self.opaque = False
 
     def classify(self, line):
+        # readline(MAX_BODY + 1) splits an oversized physical line. Its next
+        # fragment is body content even when it starts like a gh diagnostic.
+        # Check the original bytes: ANSI removal can shorten the first chunk.
+        if self.active and len(line) > MAX_BODY:
+            self.opaque = True
+        line = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", line)
         clean = line.rstrip(b"\r\n")
         if self.opaque:
             return True, True
@@ -369,7 +375,7 @@ class Traffic:
         """Return True for injected debug lines, False for ordinary stderr."""
         parsed = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", line)
         clean = parsed.rstrip(b"\r\n")
-        injected, raw = self.framing.classify(parsed)
+        injected, raw = self.framing.classify(line)
         if not injected:
             return False
         if raw:
@@ -502,8 +508,7 @@ def shim(real, scope, args, http=False):
         try:
             with os.fdopen(read_fd, "rb") as stream:
                 while line := stream.readline(MAX_BODY + 1):
-                    parsed = re.sub(rb"\x1b\[[0-?]*[ -/]*[@-~]", b"", line)
-                    injected, _ = framing.classify(parsed)
+                    injected, _ = framing.classify(line)
                     if parser is not None:
                         try:
                             injected = parser.feed(line)

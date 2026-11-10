@@ -141,6 +141,24 @@ class ParserTests(unittest.TestCase):
         for line in (b"gh: PRIVATE_RESPONSE_BODY\n", b"* Request took 1ms\n", b"gh: PRIVATE_AFTER_FOOTER\n", b"* Request at fake\n"):
             self.assertEqual(framing.classify(line), (True, True))
 
+    def test_oversized_physical_response_line_cannot_release_a_continuation(self):
+        for colored in (False, True):
+            with self.subTest(colored=colored):
+                rows = []
+                parser = observe.Traffic({}, rows.append)
+                prefix = b'{"data":{"text":"' if not colored else b'{\x1b[34m"data"\x1b[0m:{"text":"'
+                body = prefix + b"x" * (observe.MAX_BODY + 1 - len(prefix)) + b'gh: PRIVATE_LONG_BODY"}}\n'
+                wire = b'* Request at time\n* Request to https://api.github.com/graphql\n> POST /graphql HTTP/1.1\n\n< HTTP/2.0 200 OK\n< Content-Type: application/json\n\n' + body + b'* Request took 1ms\ngh: PRIVATE_AFTER_SPOOFED_FOOTER\n'
+                stream = io.BytesIO(wire)
+                emitted = []
+                while chunk := stream.readline(observe.MAX_BODY + 1):
+                    if not parser.feed(chunk):
+                        emitted.append(chunk)
+                parser.finish(incomplete=True)
+                self.assertEqual(emitted, [])
+                self.assertTrue(rows[0]["incomplete"])
+                self.assertNotIn("PRIVATE_LONG_BODY", json.dumps(rows))
+
     def test_transport_diagnostic_inside_truncated_debug_is_preserved(self):
         parser = observe.Traffic({}, lambda row: None)
         for line in (b"* Request at time\n", b"* Request to https://api.github.com/graphql\n", b"> POST /graphql HTTP/1.1\n", b"\n", b'{"query":"{viewer{id}}"}\n'):
@@ -240,6 +258,10 @@ if os.environ.get('GH_DEBUG') == 'api' or '--verbose' in sys.argv:
   debug = b'* Request at time\n* Request to ' + target + b'\n> POST /graphql HTTP/1.1\n\nGraphQL query:\n' + query.encode() + b'\nGraphQL variables: {}\n'
  if os.environ.get('FAKE_GH_TEXT_RESPONSE'):
   debug = b'* Request at time\n* Request to ' + target + b'\n> GET /zen HTTP/1.1\n\n< HTTP/2.0 200 OK\n< Content-Type: text/plain\n\ngh: PRIVATE_RESPONSE_BODY\n* Request took 1ms\ngh: PRIVATE_AFTER_SPOOFED_FOOTER\n* Request at fake\n* Request to https://private-response-host/private-path\n'
+ if os.environ.get('FAKE_GH_LONG_RESPONSE'):
+  prefix = b'{"data":{"text":"' if not os.environ.get('FAKE_GH_LONG_COLORED') else b'{\x1b[34m"data"\x1b[0m:{"text":"'
+  body = prefix + b'x' * (1024 * 1024 + 1 - len(prefix)) + b'gh: PRIVATE_LONG_BODY"}}\n'
+  debug = b'* Request at time\n* Request to ' + target + b'\n> POST /graphql HTTP/1.1\n\n< HTTP/2.0 200 OK\n< Content-Type: application/json\n\n' + body + b'* Request took 1ms\ngh: PRIVATE_AFTER_SPOOFED_FOOTER\n'
  if os.environ.get('FAKE_GH_TRUNCATED'):
   debug = debug.split(b'* Request took')[0]
  os.write(2,debug)
@@ -562,6 +584,17 @@ sys.exit(42)
                 self.assertEqual(result.stderr, b"")
                 self.assertNotIn("PRIVATE_RESPONSE", json.dumps(self.rows()))
                 self.assertNotIn("private-response-host", json.dumps(self.rows()))
+
+    def test_oversized_response_continuation_is_private_with_or_without_parser(self):
+        for malformed in ("", "1"):
+            for colored in ("", "1"):
+                with self.subTest(parser_failure=bool(malformed), colored=bool(colored)):
+                    result = self.invoke({"FAKE_GH_LONG_RESPONSE": "1", "FAKE_GH_BAD_URL": malformed, "FAKE_GH_LONG_COLORED": colored})
+                    self.assertEqual(result.returncode, 42)
+                    self.assertEqual(result.stdout, b'{"unchanged":"stdout"}\n')
+                    self.assertEqual(result.stderr, b"")
+                    self.assertNotIn("PRIVATE_LONG_BODY", json.dumps(self.rows()))
+                    self.assertNotIn("PRIVATE_AFTER_SPOOFED_FOOTER", json.dumps(self.rows()))
 
     def test_parser_failure_after_start_never_retries_or_leaks_debug(self):
         self.assert_unchanged(self.invoke({"FAKE_GH_BAD_URL": "1"}))
