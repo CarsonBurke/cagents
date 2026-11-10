@@ -1308,7 +1308,7 @@ exit 1
         limit.chmod(0o755)
         result = self.run_runner("--browserless", "--instance", "again")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("start --backend headless --name cagents-again", self.harness_calls.read_text())
+        self.assertIn("start --backend headless --renderer auto --name cagents-again", self.harness_calls.read_text())
         self.assertIn("instance again: its session had ended without being stopped", result.stderr)
         self.assert_stopped(runtime, process)
 
