@@ -235,6 +235,102 @@ class Provider(unittest.TestCase):
         for pid in owned:
             self.assertFalse(Path(f"/proc/{pid}").exists(), f"owned helper {pid} outlived fixture")
 
+    def test_helper_refuses_adoption_before_its_parent_death_guard_is_initialized(self):
+        # Execute the actual embedded helper with one test-only stop before
+        # initialization. A separate subreaper owns/reaps both real processes;
+        # the unittest process itself never adopts another test's children.
+        source = SCRIPT.read_text().split("<<'PYTHON' &\n", 1)[1].split("\nPYTHON\n", 1)[0]
+        guarded = "import os, signal; os.kill(os.getpid(), signal.SIGSTOP)\n" + source
+        (self.config / "reply").write_text("An orphan must not stream this.\n" * 40000)
+        (self.config / "pending").write_bytes(b"")
+        harness = r'''
+import ctypes, json, os
+from pathlib import Path
+import signal, subprocess, sys, time
+root = Path(sys.argv[1])
+code = sys.stdin.read()
+assert ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) == 0
+controller_code = r"""
+import os, sys
+from pathlib import Path
+root = Path(sys.argv[1])
+code = sys.stdin.read()
+fd, writer = os.pipe()
+os.close(writer)
+os.dup2(fd, 3, inheritable=True)
+os.set_inheritable(3, True)
+parent = os.getpid()
+child = os.fork()
+if child == 0:
+    os.execv('/usr/bin/python3', ['/usr/bin/python3', '-c', code, str(root), '0.5', str(parent)])
+(root / 'owned-child.tmp').write_text(str(child))
+(root / 'owned-child.tmp').replace(root / 'owned-child')
+os.waitpid(child, 0)
+"""
+controller = subprocess.Popen(['/usr/bin/python3', '-c', controller_code, str(root)],
+    stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    start_new_session=True, text=True)
+controller.stdin.write(code)
+controller.stdin.close()
+owned = None
+pidfd = None
+reaped = False
+try:
+    deadline = time.monotonic() + 2
+    while True:
+        marker = root / 'owned-child'
+        if marker.exists():
+            owned = int(marker.read_text())
+            state = Path(f'/proc/{owned}/stat').read_text().rsplit(')', 1)[1].split()[0]
+            if state == 'T':
+                break
+        assert time.monotonic() < deadline, 'helper did not reach pre-initialization barrier'
+        time.sleep(.01)
+    pidfd = os.pidfd_open(owned)
+    controller.kill()
+    controller.wait(timeout=2)
+    signal.pidfd_send_signal(pidfd, signal.SIGCONT)
+    began = time.monotonic()
+    while time.monotonic() - began < 2:
+        pid, status = os.waitpid(owned, os.WNOHANG)
+        if pid:
+            reaped = True
+            assert os.waitstatus_to_exitcode(status) == 143, (status, controller.stderr.read())
+            print(json.dumps({'exit':143, 'owned_helper_reaped':True,
+                              'elapsed':time.monotonic() - began}))
+            break
+        time.sleep(.01)
+    assert reaped, 'helper accepted an adopting parent and kept streaming'
+finally:
+    if controller.poll() is None:
+        os.killpg(controller.pid, signal.SIGKILL)
+        controller.wait(timeout=2)
+    if pidfd is not None:
+        if not reaped:
+            signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+            os.waitpid(owned, 0)
+        os.close(pidfd)
+    else:
+        # An early barrier/setup assertion still owns the controller's whole
+        # private process group, including any stopped child not yet recorded.
+        cleanup_deadline = time.monotonic() + 2
+        while True:
+            try:
+                pid, _ = os.waitpid(-controller.pid, os.WNOHANG)
+            except ChildProcessError:
+                break
+            if not pid:
+                os.killpg(controller.pid, signal.SIGKILL)
+                assert time.monotonic() < cleanup_deadline, 'owned children did not settle'
+                time.sleep(.01)
+    controller.stderr.close()
+'''
+        result = subprocess.run(['/usr/bin/python3', '-c', harness, str(self.config)],
+                                input=guarded, capture_output=True, text=True, timeout=8)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["exit"], 143)
+        self.assertFalse((self.config / "prefix").exists())
+
     def test_resume_can_branch_from_an_earlier_record_without_removing_turns(self):
         session = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
         interrupt = {"type": "control_request", "request_id": "stop",

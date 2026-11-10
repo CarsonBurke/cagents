@@ -413,7 +413,7 @@ next_frame() {
 }
 
 stream_step() {
-    /usr/bin/python3 - "$stream_directory" "$stream_delay" 3<&0 <<'PYTHON' &
+    /usr/bin/python3 - "$stream_directory" "$stream_delay" "$$" 3<&0 <<'PYTHON' &
 import ctypes
 import json
 import os
@@ -427,7 +427,7 @@ root = Path(sys.argv[1])
 delay = float(sys.argv[2])
 if not 0 <= delay < float("inf"):
     raise ValueError("fixture-stream-reply must hold finite nonnegative seconds")
-parent = os.getppid()
+parent = int(sys.argv[3])
 # The helper creates no children. Even an uncatchable shell death must not
 # leave an orphan scheduling frames after its owning fixture has gone away.
 if ctypes.CDLL(None, use_errno=True).prctl(1, signal.SIGTERM, 0, 0, 0) != 0:
