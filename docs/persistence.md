@@ -581,7 +581,12 @@ measurement on a realistic-size workspace.
    file's contents shrink from 31.8 MB to 25.0 MB, but the file keeps its
    high-water mark (37.7 MB) as free pages SQLite reuses until the converted
    operations age out. Closed panes and drafts move to stage 5.
-4. Deltas to subscribers and per-scope reads (protocol bump).
+4. Deltas to subscribers and per-scope reads (#2573; protocol bump). Edges carry
+   changed revisions and closed ids; a revision gap reads only that scope.
+   Reconnects and changed registry identities establish full baselines, whose
+   pane read is one ordered query. Settled channel presentation reuses scope
+   projection and notification attribution; uncertain ownership or lifecycle
+   state retains full reconciliation. Window-owned copies remain until stage 5.
 5. Daemon-owned closed-pane history and drafts; windows become subscribers
    with per-window stores; migration from all window stores.
 6. Persistent provider history index.

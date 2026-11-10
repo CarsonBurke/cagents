@@ -127,6 +127,9 @@ both windows during the timed interval and retain any fallback reasons. A unit
 fixture's eligibility does not establish that the native workload qualifies.
 Settled channel presentation can project one scope; structural changes,
 derived worktree membership and unsettled admission still require a full pass.
+Selected passes also record `phase_us` for preparation, projection, saving,
+postlude, naming and chrome. These successive phase durations omit proof and
+other common update work; their sum does not replace inclusive handler time.
 
 Before measuring, verify the matched daemon reports the intended busy run count,
 that its resident capacity agrees, and that the processes are the fixture's
@@ -135,6 +138,10 @@ or an agent row alone does not prove a running provider. Keep a busy chat visibl
 in the foreground window and select the edited pane in the other window. Hold
 keyboard focus in the same window on both sides, and record whether the second
 window is occluded. Verify its displayed initial and final titles separately.
+Build before launching and give the native application controller a finite
+lifetime long enough for startup and setup, such as three hours. This is
+separate from each measured workload's owner; keep the tools ready before
+starting that application lifetime.
 
 In the fixture environment, sample the two UI processes while the matched edit
 driver sends a fixed number of metadata edits. For example, use the harness's
@@ -142,10 +149,11 @@ driver sends a fixed number of metadata edits. For example, use the harness's
 rendering partway through the sample:
 
 ```sh
-scripts/bounded --ttl 300 --name workspace-edits -- scripts/measure-workspace-edits \
+scripts/bounded --ttl 600 --name workspace-edits -- scripts/measure-workspace-edits \
   --root "$fixture" --side after --binary "$products/examples/workspace-edit-workload" \
   --log "$task/logs/ui-after-1.log" --log "$task/logs/ui-after-2.log" \
-  --output "$task/measurement-after" --edits 200 --interval-ms 100 --wait-for-selection
+  --output "$task/measurement-after" --edits 200 --interval-ms 100 \
+  --drain-timeout 300 --wait-for-selection
 ```
 
 With `--wait-for-selection`, the driver writes `driver-ready.json` in the output
@@ -155,13 +163,21 @@ beside it. The driver starts its timing origin only after that marker. The
 selection wait is bounded at 120 seconds.
 
 `measure-workspace-edits` refuses an unbounded run, an arbitrary workspace, or a
-fixture without exactly two UI processes. It records per-edit receipt times,
+fixture without exactly two UI processes. It verifies that each process's open
+stderr file is its supplied window log and that the logs are different files.
+It records per-edit receipt times,
 monotonic boundaries, each UI main thread's CPU and runqueue counters, process
 CPU/RSS/thread counts, host pressure and sampler overhead. It also preserves
-both UI traces through the point where each window saves the final edited pane
-title. A bounded drain timeout fails the run when either window never converges.
-Keep the orchestration shell alive through
-the sample: `scripts/bounded` cleans up detached children when its command ends,
+both UI traces until each window saves the final pane title and its UI thread
+processes a later activity redraw. Establish that redraw's main-thread
+provenance separately. A saved title alone does not prove its applying handler
+or common tail has returned. Record store convergence and UI completion
+separately, account work over the common completion interval, and exclude the
+extra second of retained audit data. The bounded drain fails if either window
+never completes. An occluded window's completion includes its background redraw
+cadence.
+Keep the orchestration shell alive through the sample: `scripts/bounded` cleans
+up detached children when its command ends,
 whereas the runner's `--instance` launch returns as soon as its window maps.
 
 Report cumulative UI update wall time per requested edit and notification count
