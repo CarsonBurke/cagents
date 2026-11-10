@@ -566,7 +566,11 @@ impl State {
                         theme,
                         reader_proofs: Arc::default(),
                     }),
-                    priority: AtomicU64::new(0),
+                    // The prompt just sent shows where the reader is, so it
+                    // ranks with the growing answer, and like it never takes
+                    // the last parser while history waits: a short wait
+                    // behind one history parse, rather than none left for it.
+                    priority: AtomicU64::new(TAIL),
                     place: Place::default(),
                     canonical: Mutex::default(),
                     cancelled: AtomicBool::new(false),
@@ -1676,14 +1680,23 @@ impl Pool {
         let Some(ticket) = queue.waiting.remove(&key) else {
             return;
         };
-        if queue.head == Some(*key) {
-            // Its old key is gone; whoever is eligible now is told.
+        let was_head = queue.head == Some(*key);
+        key.0 = rank;
+        let moved = *key;
+        drop(key);
+        queue.waiting.insert(moved, ticket.clone());
+        if was_head {
+            if queue.eligible(self.capacity) == Some(moved) {
+                // Still first, as when an append shifts every rank alike:
+                // it keeps contending, and nobody is woken.
+                queue.head = Some(moved);
+                return;
+            }
+            // Someone else is eligible now: it stops contending, and
+            // `advance` tells the new head.
             queue.head = None;
             ticket.turn.notify_one();
         }
-        key.0 = rank;
-        queue.waiting.insert(*key, ticket);
-        drop(key);
         queue.advance(self.capacity);
     }
     /// Wait for a parser at the rank `priority` holds when this joins the
@@ -1776,6 +1789,9 @@ impl Pool {
                     _permit: permit,
                 });
             }
+            // Told while contending: it may have lost the head.
+            #[cfg(test)]
+            self.wakes.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
@@ -2320,6 +2336,40 @@ mod tests {
             }
             // Waiters report the rank they arrived with.
             assert_eq!(grants, [30, 10, 20]);
+        });
+    }
+
+    #[test]
+    fn ranking_every_waiter_alike_leaves_the_head_contending() {
+        current_thread().block_on(async {
+            let pool = Arc::new(Pool::new(1));
+            let held = pool.permits.clone().try_acquire_owned().unwrap();
+            let (granted, mut order) = tokio::sync::mpsc::unbounded_channel();
+            let places: Vec<_> = (0..3).map(|_| Arc::new(Place::default())).collect();
+            let mut releases: Vec<_> = places
+                .iter()
+                .zip([10, 20, 30])
+                .map(|(place, rank)| waiter(&pool, rank, Some(place.clone()), &granted).1)
+                .collect();
+            settle().await;
+            let wakes = pool.wakes.load(Ordering::Relaxed);
+            // A message arrives: everything already waiting is one further
+            // from the newest.
+            for (place, rank) in places.iter().zip([11, 21, 31]) {
+                pool.rerank(place, rank);
+            }
+            settle().await;
+            assert_eq!(pool.lock().head, Some((11, 0)));
+            assert_eq!(
+                pool.wakes.load(Ordering::Relaxed),
+                wakes,
+                "nobody is woken when the order stays the same"
+            );
+            drop(held);
+            for expected in [10, 20, 30] {
+                assert_eq!(order.recv().await, Some(expected));
+                let _ = releases.remove(0).send(());
+            }
         });
     }
 
