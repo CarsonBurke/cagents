@@ -1966,11 +1966,12 @@ def stop(_number, _frame):
         time.sleep(0.01)
     sys.exit(0)
 signal.signal(signal.SIGTERM, signal.SIG_IGN if sys.argv[2] == 'resistant' else stop)
-(root / 'ready').write_text(str(os.getpid()))
+(root / 'ready.tmp').write_text(str(os.getpid()))
+(root / 'ready.tmp').rename(root / 'ready')
 while True: time.sleep(0.05)
 """)
         offload = str(root / "tools/cargo-offload")
-        command = ["sh", "-c", '"$@" & ' + ("exit 0" if background else "wait"), "worker",
+        command = ["sh", "-c", '"$@" & ' + ('while [ ! -f "$3/ready" ]; do sleep 0.01; done' if background else "wait"), "worker",
                    sys.executable, str(worker), str(root), "resistant" if resistant else "graceful"]
         if nested:
             command = [offload, "--hold", *command]
@@ -2029,9 +2030,18 @@ while True: time.sleep(0.05)
                 def spawn(*arguments, **options):
                     if moment == "before":
                         hold.cancel(signal.SIGTERM, None)
-                    process = original(*arguments, **options)
                     if moment == "after":
+                        barrier = self.host.root / "start-supervisor"
+                        # Hold the helper before it can read the receipt, even
+                        # when the child is scheduled before this parent.
+                        wrapped = ["sh", "-c",
+                                   'while [ ! -f "$1" ]; do sleep 0.01; done; shift; exec "$@"',
+                                   "barrier", str(barrier), *arguments[0]]
+                        process = original(wrapped, **options)
                         hold.cancel(signal.SIGTERM, None)
+                        barrier.touch()
+                    else:
+                        process = original(*arguments, **options)
                     return process
 
                 with patch.object(offload.subprocess, "Popen", side_effect=spawn):
