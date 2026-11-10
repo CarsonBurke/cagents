@@ -79,38 +79,76 @@ fn stop_list(
             _ => (),
         }
     }
-    if service
-        && (inventory.chats.iter().any(|chat| {
-            !items
+    if service {
+        // Older sources expose pending launches in List/ChatList before their
+        // UpgradeImpact acquires an entry. They are still owners the confirmed
+        // service stop ends, so bind them to their exact issued descriptors.
+        for chat in &inventory.chats {
+            if items
                 .iter()
                 .any(|item| item.id == chat.id && item.kind == impact::SessionKind::NativeChat)
-        }) || inventory
-            .terminals
-            .iter()
-            .filter(|terminal| {
-                terminal
-                    .session
-                    .continuity
-                    .can_resume_live(&daemon.capability.proof)
-                    && !inventory
-                        .chats
-                        .iter()
-                        .any(|chat| chat.id == terminal.session.id)
-            })
-            .any(|terminal| {
-                !items.iter().any(|item| {
-                    item.id == terminal.session.id && item.kind == impact::SessionKind::Terminal
-                })
-            }))
-    {
-        return Err(invalid(
-            "The source inventory changed during stop review; review again",
-        ));
+            {
+                continue;
+            }
+            let fallback = format!("{} chat", chat.launch.provider.label());
+            let label = preview.labels.get(&chat.id).unwrap_or(&fallback);
+            let item = descriptor_impact(chat.id, impact::SessionKind::NativeChat, label, chat)?;
+            items.push(chat_item_with_state(
+                chat,
+                &item,
+                label,
+                inventory
+                    .chat_states
+                    .get(&chat.id)
+                    .map(String::as_str)
+                    .unwrap_or("state unavailable"),
+            ));
+        }
+        for terminal in &inventory.terminals {
+            let id = terminal.session.id;
+            if !terminal
+                .session
+                .continuity
+                .can_resume_live(&daemon.capability.proof)
+                || inventory.chats.iter().any(|chat| chat.id == id)
+                || items
+                    .iter()
+                    .any(|item| item.id == id && item.kind == impact::SessionKind::Terminal)
+            {
+                continue;
+            }
+            let label = preview
+                .labels
+                .get(&id)
+                .map(String::as_str)
+                .or(terminal.title.as_deref())
+                .unwrap_or("Terminal");
+            let item =
+                descriptor_impact(id, impact::SessionKind::Terminal, label, &terminal.session)?;
+            items.push(terminal_item(terminal, &item, label));
+        }
     }
     items.sort_by_key(|item| (item.kind, item.id));
     Ok(StopList {
         from_version: preview.from_version.clone(),
         items,
+    })
+}
+
+fn descriptor_impact<T: Serialize>(
+    id: TerminalId,
+    kind: impact::SessionKind,
+    title: &str,
+    descriptor: &T,
+) -> Result<impact::SessionImpact, UpdateError> {
+    Ok(impact::SessionImpact {
+        id,
+        kind,
+        title: title.into(),
+        identity: format!("{:x}", Sha256::digest(serde_json::to_vec(descriptor)?)),
+        disposition: impact::Disposition::Blocked,
+        reason: String::new(),
+        interrupted_subagents: Vec::new(),
     })
 }
 
@@ -1486,6 +1524,148 @@ mod tests {
             [202]
         );
         assert!(live[0].description.contains("terminal service"));
+    }
+
+    fn pending_source() -> (FakeSource, TerminalId) {
+        let mut source = fixture();
+        let daemon = source.preview.daemon.as_mut().unwrap();
+        daemon.sessions.clear();
+        daemon
+            .blockers
+            .push("Wait for starting sessions to finish opening.".into());
+        let pending = crate::chat::Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Claude,
+                recipe: source.inventory.terminals[0].session.launch.clone(),
+                session_id: None,
+            },
+            proof: Some(daemon.capability.proof.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let id = pending.id;
+        source.inventory.chats.push(pending);
+        source.inventory.chat_states.insert(id, "starting".into());
+        source.preview.labels.insert(
+            id,
+            "Untitled conversation in beta, start time unavailable".into(),
+        );
+        (source, id)
+    }
+
+    #[test]
+    fn a_pending_source_launch_omitted_by_impact_is_stopped_after_one_service_confirmation() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut source, pending) = pending_source();
+        let events = source.events.clone();
+        let path = directory.path().to_owned();
+        let worker = thread::spawn(move || {
+            let preview = source.preview.clone();
+            quiesce_source(&path, &mut job(&path), &preview, true, &mut source)
+        });
+        let published = await_stop(directory.path());
+        let list = published
+            .confirmation
+            .as_ref()
+            .unwrap()
+            .stop
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            list.items.len(),
+            2,
+            "both source-listed owners need consent"
+        );
+        let chat = list.items.iter().find(|item| item.id == pending).unwrap();
+        assert_eq!(
+            chat.label,
+            "Untitled conversation in beta, start time unavailable"
+        );
+        assert_eq!(chat.running, "Claude chat, starting (can't be resumed)");
+        assert_eq!(
+            chat.recovery,
+            "the transcript stays visible; Start fresh in the pane"
+        );
+        submit(
+            directory.path(),
+            &published,
+            UpdateChoice::StopListed {
+                items_digest: list.digest(),
+            },
+        );
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !worker.is_finished() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        if !worker.is_finished() {
+            let current: UpdateJob =
+                serde_json::from_slice(&fs::read(directory.path().join("status.json")).unwrap())
+                    .unwrap();
+            submit(directory.path(), &current, UpdateChoice::Cancel);
+            let result = worker.join().unwrap();
+            panic!("pending source owners unexpectedly needed another decision: {result:?}");
+        }
+        worker.join().unwrap().unwrap();
+        assert_eq!(
+            *events.lock().unwrap(),
+            [
+                "ShutdownV1 Preflight",
+                "retain 1 chats 1 terminals",
+                "ShutdownV1 Confirm",
+                "handoff without checkpoint"
+            ]
+        );
+    }
+
+    #[test]
+    fn pending_launch_consent_hashes_exact_descriptors_without_exposing_private_recipes() {
+        let (mut source, pending) = pending_source();
+        source.inventory.chats[0]
+            .launch
+            .recipe
+            .environment
+            .insert("PRIVATE_TOKEN".into(), "private-value-before".into());
+        let before = stop_list(&source.preview, &source.inventory, true).unwrap();
+        assert!(
+            stop_list(&source.preview, &source.inventory, false)
+                .unwrap()
+                .items
+                .is_empty(),
+            "floor A only covers chats Blocked by impact"
+        );
+        let private = serde_json::to_string(&before).unwrap();
+        assert!(!private.contains("PRIVATE_TOKEN") && !private.contains("private-value-before"));
+        let before_chat = before.items.iter().find(|item| item.id == pending).unwrap();
+        assert_eq!(before_chat.identity.len(), 64);
+        source.inventory.chats[0]
+            .launch
+            .recipe
+            .environment
+            .insert("PRIVATE_TOKEN".into(), "private-value-after".into());
+        let after = stop_list(&source.preview, &source.inventory, true).unwrap();
+        assert_ne!(before.digest(), after.digest());
+        assert_ne!(
+            before_chat.identity,
+            after
+                .items
+                .iter()
+                .find(|item| item.id == pending)
+                .unwrap()
+                .identity
+        );
+        source.inventory.terminals[0]
+            .session
+            .launch
+            .arguments
+            .push("a different pending launch".into());
+        assert_ne!(
+            after.digest(),
+            stop_list(&source.preview, &source.inventory, true)
+                .unwrap()
+                .digest()
+        );
     }
 
     #[test]
