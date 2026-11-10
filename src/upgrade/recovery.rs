@@ -188,7 +188,7 @@ pub(crate) struct Receipt {
     worker: File,
     fence: File,
     legacy: File,
-    daemon: File,
+    daemon: Option<File>,
     authority: Authority,
 }
 
@@ -232,6 +232,7 @@ struct TerminalSource {
 #[derive(Deserialize)]
 struct ChatSource {
     source: Session,
+    launch: crate::chat::Launch,
 }
 
 impl Preparation {
@@ -383,13 +384,17 @@ impl CapturedPreparation {
             worker: preparation.worker,
             fence: preparation.fence,
             legacy: preparation.legacy,
-            daemon,
+            daemon: Some(daemon),
             authority: preparation.authority,
         }))
     }
 }
 
 impl Receipt {
+    pub(crate) fn release_daemon_reservation(&mut self) {
+        self.daemon.take();
+    }
+
     pub(crate) fn inherit(&self, command: &mut Command) -> io::Result<()> {
         forward(
             command,
@@ -397,7 +402,9 @@ impl Receipt {
                 &self.receipt,
                 &self.worker,
                 &self.fence,
-                &self.daemon,
+                self.daemon.as_ref().ok_or_else(|| {
+                    io::Error::other("Recovery daemon reservation was already released")
+                })?,
                 &self.legacy,
             ],
         )
@@ -589,7 +596,7 @@ fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, St
                 .census
                 .chats
                 .iter()
-                .any(|known| same_chat(known, source))
+                .any(|known| same_chat(known, source, &item.launch))
         {
             return Err(
                 "The prepared conversation inventory does not match the acknowledged source census"
@@ -615,19 +622,26 @@ fn same_terminal(known: &TerminalSession, source: &TerminalSession) -> bool {
         && known.predecessor == source.predecessor
 }
 
-fn same_chat(known: &Session, source: &Session) -> bool {
+fn same_chat(known: &Session, source: &Session, launch: &crate::chat::Launch) -> bool {
     known.id == source.id
         && known.proof == source.proof
         && known.launch.provider == source.launch.provider
+        && known.launch.provider == launch.provider
         && known.launch.recipe == source.launch.recipe
         && known.owned_codex_listener == source.owned_codex_listener
         && known.terminal.as_ref().map(|item| item.id)
             == source.terminal.as_ref().map(|item| item.id)
-        && known
-            .launch
-            .session_id
-            .as_ref()
-            .is_none_or(|id| source.launch.session_id.as_ref() == Some(id))
+        && known.launch.session_id.as_ref().is_none_or(|id| {
+            // Older sources keep the issued descriptor unchanged for a
+            // provider they will resume. The effective launch must retain the
+            // exact confirmed thread, including when the source has one too.
+            launch.session_id.as_ref() == Some(id)
+                && source
+                    .launch
+                    .session_id
+                    .as_ref()
+                    .is_none_or(|source_id| source_id == id)
+        })
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -1284,6 +1298,59 @@ mod tests {
     }
 
     #[test]
+    fn frozen_source_keeps_confirmed_thread_in_the_effective_checkpoint_launch() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let mut preparation = preparation(root.path());
+        let known = Session {
+            id: TerminalId::new(),
+            launch: crate::chat::Launch {
+                provider: crate::agent::Provider::Codex,
+                recipe: preparation.authority.census.terminals[0].launch.clone(),
+                session_id: Some("confirmed-thread".into()),
+            },
+            proof: Some(preparation.authority.source.clone()),
+            terminal: None,
+            owned_codex_listener: None,
+            native_continuity: Default::default(),
+        };
+        let mut source = known.clone();
+        source.launch.session_id = None;
+        preparation
+            .authority
+            .expected
+            .push((SessionKind::NativeChat, known.id));
+        preparation.authority.census.chats.push(known.clone());
+        for phase in ["Prepared", "Ready"] {
+            let mut value: serde_json::Value =
+                serde_json::from_slice(&checkpoint(&preparation, phase)).unwrap();
+            value["chats"] = serde_json::json!([{"source": source, "launch": known.launch}]);
+            let bytes = serde_json::to_vec(&value).unwrap();
+            assert_eq!(
+                validate_checkpoint(&preparation.authority, &bytes).unwrap(),
+                phase
+            );
+            value["chats"][0]["launch"]["session_id"] = "different-thread".into();
+            assert!(
+                validate_checkpoint(&preparation.authority, &serde_json::to_vec(&value).unwrap())
+                    .is_err()
+            );
+            value["chats"][0]["launch"]["session_id"] = "confirmed-thread".into();
+            value["chats"][0]["source"]["launch"]["session_id"] = "confirmed-thread".into();
+            value["chats"][0]["launch"]["session_id"] = "different-thread".into();
+            assert!(
+                validate_checkpoint(&preparation.authority, &serde_json::to_vec(&value).unwrap())
+                    .is_err()
+            );
+            value["chats"][0]["launch"]["session_id"] = "confirmed-thread".into();
+            value["chats"][0]["source"]["launch"]["session_id"] = "different-thread".into();
+            assert!(
+                validate_checkpoint(&preparation.authority, &serde_json::to_vec(&value).unwrap())
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn preexisting_prepared_or_unknown_evidence_is_preserved_before_any_prepare() {
         let root = tempfile::tempdir_in("/var/tmp").unwrap();
         let preparation = preparation(root.path());
@@ -1402,6 +1469,39 @@ mod tests {
             fs::read(root.path().join("daemon-upgrade.json")).unwrap(),
             ready
         );
+    }
+
+    #[test]
+    fn recovery_receipt_releases_its_daemon_reservation_before_owner_discovery() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let preparation = preparation(root.path());
+        save(
+            &preparation.authority.checkpoint_path,
+            &checkpoint(&preparation, "Prepared"),
+        );
+        let captured = preparation.acknowledged().unwrap();
+        let handoff = handoff(root.path());
+        let mut receipt = captured
+            .receipt(&fs::canonicalize("/bin/sh").unwrap(), &handoff)
+            .unwrap()
+            .unwrap();
+        let path = descriptor_path(receipt.daemon.as_ref().unwrap()).unwrap();
+        let probe = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        drop(handoff);
+        assert_ne!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        receipt.release_daemon_reservation();
+        assert_eq!(
+            unsafe { libc::flock(probe.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(receipt.inherit(&mut Command::new("/bin/true")).is_err());
     }
 
     #[test]

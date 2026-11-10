@@ -1894,19 +1894,13 @@ fn finish_handoff(
     job: &mut UpdateJob,
     result: &Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
-    survivors: &floor::Survivors,
+    survivors: &mut floor::Survivors,
     guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
     let reserved = handoff.is_some() || survivors.needs_daemon_recovery();
-    // Keep any actual serving owner, especially an adoption-only recovery
-    // daemon. Starting the current pointer could otherwise replay Prepared
-    // work or replace a healthy successor after an unrelated installer error.
-    let serving = reserved
-        && result.is_err()
-        && crate::daemon::running_executable()
-            .map_err(|error| invalid(error.to_string()))?
-            .is_some();
-    let restart_allowed = if reserved && result.is_err() && !serving {
+    // Check ordinary replay eligibility while the reservation still protects
+    // the checkpoint. A serving recovery successor does not need this replay.
+    let restart_allowed = if reserved && result.is_err() {
         survivors.require_normal_restart()
     } else {
         Ok(())
@@ -1922,7 +1916,23 @@ fn finish_handoff(
     // Success has confirmed serving readiness. Only close our copy: LOCK_UN
     // would also unlock the successor's shared open-file description.
     drop(handoff.take());
-    if let Err(error) = restart_allowed {
+    survivors.release_recovery_reservation();
+    // Failure is durable and our reservation is released before discovery.
+    // Until then its old PID metadata can name an exited source while our
+    // transferred flock remains held, which is not a serving daemon.
+    let serving = reserved
+        && result.is_err()
+        && crate::daemon::running_executable()
+            .map_err(|error| {
+                invalid(format!(
+                    "{}\nCould not verify the terminal service after releasing the update reservation: {error}",
+                    job.message
+                ))
+            })?
+            .is_some();
+    if let Err(error) = restart_allowed
+        && !serving
+    {
         job.message.push_str(&format!(
             "\nThe terminal service was not restarted: {error}. The checkpoint was retained for explicit recovery."
         ));
@@ -4182,14 +4192,16 @@ finally:
             let lock = OpenOptions::new()
                 .read(true)
                 .write(true)
-                .open(root.join("runtime/cagentsd.lock"))
+                .open(crate::daemon::RuntimePaths::discover().unwrap().lock)
                 .unwrap();
             assert_eq!(
                 unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
                 0
             );
-            let socket =
-                std::os::unix::net::UnixListener::bind(root.join("runtime/cagentsd.sock")).unwrap();
+            let socket = std::os::unix::net::UnixListener::bind(
+                crate::daemon::RuntimePaths::discover().unwrap().socket,
+            )
+            .unwrap();
             fs::write(root.join("daemon-ready"), b"serving").unwrap();
             while !root.join("daemon-exit").exists() {
                 thread::sleep(Duration::from_millis(5));
@@ -4198,8 +4210,8 @@ finally:
             return;
         }
         let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("runtime");
+        let root = PathBuf::from(std::env::var_os("HOME").unwrap());
+        let directory = crate::daemon::RuntimePaths::discover().unwrap().directory;
         let paths = RuntimePaths {
             socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
             lock: directory.join("cagentsd.lock"),
@@ -4212,15 +4224,27 @@ finally:
         };
         drop(HostLease::acquire(&paths, &proof).unwrap());
         let mut lease = Some(LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+        let mut exited = Command::new("/bin/true").spawn().unwrap();
+        let source_pid = exited.id();
+        assert!(exited.wait().unwrap().success());
+        fs::write(
+            &paths.lock,
+            serde_json::to_vec(&serde_json::json!({
+                "pid": source_pid, "proof": proof,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(crate::daemon::running_executable().is_err());
         let installation = Installation {
-            prefix: root.path().into(),
+            prefix: root.as_path().into(),
             version: "old".into(),
         };
-        let bin = root.path().join("versions/old/bin");
+        let bin = root.as_path().join("versions/old/bin");
         fs::create_dir_all(&bin).unwrap();
         // Model the installer's restored pointer after a pre-start failure.
         // There are no UI windows to start a daemon on the worker's behalf.
-        std::os::unix::fs::symlink("versions/old", root.path().join("current")).unwrap();
+        std::os::unix::fs::symlink("versions/old", root.as_path().join("current")).unwrap();
         let script = r#"#!/usr/bin/python3
 import json, os, pathlib, subprocess, sys, time
 root = pathlib.Path(__file__).resolve().parents[3]
@@ -4247,33 +4271,33 @@ while not (root/'daemon-ready').exists():
                 let _ = fs::write(self.0.join("daemon-exit"), b"exit");
             }
         }
-        let _cleanup = Cleanup(root.path().to_owned());
+        let _cleanup = Cleanup(root.as_path().to_owned());
         let mut job = UpdateJob {
             id: uuid::Uuid::new_v4().to_string(),
             version: "new".into(),
             phase: UpdatePhase::Installing,
             message: String::new(),
-            log_path: root.path().join("worker.log"),
+            log_path: root.as_path().join("worker.log"),
             confirmation: None,
         };
         finish_handoff(
             &installation,
-            root.path(),
+            root.as_path(),
             &mut job,
             &Err(invalid("installer failed before replacement startup")),
             &mut lease,
-            &floor::Survivors::default(),
+            &mut floor::Survivors::default(),
             &guard,
         )
         .unwrap();
         assert!(lease.is_none());
-        assert!(root.path().join("daemon-ready").exists());
+        assert!(root.as_path().join("daemon-ready").exists());
         assert!(std::os::unix::net::UnixStream::connect(&paths.socket).is_ok());
         assert!(
             HostLease::is_held(&paths).unwrap(),
             "worker must recover without windows"
         );
-        fs::write(root.path().join("daemon-exit"), b"exit").unwrap();
+        fs::write(root.as_path().join("daemon-exit"), b"exit").unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         while HostLease::is_held(&paths).unwrap() {
             assert!(Instant::now() < deadline);

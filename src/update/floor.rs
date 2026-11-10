@@ -1272,6 +1272,12 @@ impl Survivors {
         Ok(())
     }
 
+    pub(super) fn release_recovery_reservation(&mut self) {
+        if let Some(receipt) = &mut self.receipt {
+            receipt.release_daemon_reservation();
+        }
+    }
+
     /// Failure cleanup cannot fall through to the ordinary checkpoint replay
     /// after an accepted preparation. It may keep a verified serving daemon or
     /// retain Prepared evidence for explicit recovery.
