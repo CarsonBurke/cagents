@@ -986,17 +986,34 @@ impl Cagents {
                 .iter()
                 .find(|card| card.id == id && card.existence.is_open())
         });
-        let owner = focused
-            .filter(|card| self.card_worktree(card).is_some())
-            .or_else(|| {
-                self.durable
-                    .cards
-                    .iter()
-                    .find(|card| card.existence.is_open() && self.card_worktree(card).is_some())
+        let Some(owner) = focused.filter(|card| {
+            self.durable.card_scopes.contains_key(&card.id)
+                || card_directory(card)
+                    .is_some_and(|directory| self.worktree_scope_for(directory).is_some())
+        }) else {
+            // Shared panes are retained in every window's store even when the
+            // window has never entered their workspace. No selected scope and
+            // no focused pane is Workspace home, not a request to open the
+            // first retained terminal. Home may also hold global utilities or
+            // adopted terminals outside any known worktree; restore those only
+            // when this window actually had a pane focused.
+            let mut home = self.durable.as_ref().clone();
+            home.cards.retain(|card| {
+                focused.is_some()
+                    && card.existence.is_open()
+                    && !self.durable.card_scopes.contains_key(&card.id)
+                    && card_directory(card)
+                        .is_none_or(|directory| self.worktree_scope_for(directory).is_none())
+                    && !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.cards.contains(&card.id))
             });
-
-        let Some(owner) = owner else {
-            return Task::none();
+            let width = self.workspace.viewport_width();
+            self.workspace = Self::rebuild_workspace(&home);
+            self.workspace.resize_viewport(width);
+            return self.rebind_source_control();
         };
         let root = self
             .card_worktree(owner)

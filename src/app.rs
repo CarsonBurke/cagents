@@ -2320,6 +2320,8 @@ struct WindowView {
     context_tab: ContextTab,
     sidebar: sidebar::SidebarView,
     worktree_offsets: HashMap<PathBuf, f32>,
+    #[serde(default)]
+    channel_offsets: HashMap<ChannelId, f32>,
 }
 
 /// Captured on the event loop; all storage work runs on the blocking pool.
@@ -5593,6 +5595,20 @@ impl Cagents {
             bootstrap,
             window_view,
         })
+    }
+
+    fn restore_window_view(&mut self, view: Option<WindowView>) -> Task<Message> {
+        if let Some(view) = &view {
+            self.worktree_offsets.clone_from(&view.worktree_offsets);
+            self.channel_offsets.clone_from(&view.channel_offsets);
+        }
+        let scope = self.restore_worktree_scope();
+        // Binding the initial scope clears the previous panel's disclosures.
+        // Apply this window's saved presentation after that first binding.
+        if let Some(view) = view {
+            self.sidebar_state.restore_view(view.sidebar);
+        }
+        scope
     }
 
     fn rebuild_workspace(state: &WorkspaceState) -> Workspace {
@@ -14021,10 +14037,12 @@ impl Cagents {
             context_tab: self.context_tab,
             sidebar: self.sidebar_state.saved_view(),
             worktree_offsets: self.worktree_offsets.clone(),
+            channel_offsets: self.channel_offsets.clone(),
         };
-        if self.durable.active_channel.is_none()
-            && let Some(path) = &self.active_workspace
-        {
+        if let Some(channel) = self.durable.active_channel {
+            view.channel_offsets
+                .insert(channel, self.workspace.camera().offset());
+        } else if let Some(path) = &self.active_workspace {
             view.worktree_offsets
                 .insert(path.clone(), self.workspace.camera().offset());
         }
@@ -14965,10 +14983,6 @@ impl Application for Cagents {
         for warning in restore_warnings.into_iter().chain(settings_warnings) {
             app.notices.record(TransientNotice::warning(warning));
         }
-        if let Some(view) = window_view {
-            app.sidebar_state.restore_view(view.sidebar);
-            app.worktree_offsets = view.worktree_offsets;
-        }
         app.sidebar_state
             .restore_unread_updates(app.durable.agent_updates.clone());
         app.sidebar_model
@@ -15022,7 +15036,7 @@ impl Application for Cagents {
             let chrome = app.sync_chrome();
             return (app, chrome);
         }
-        let scope = app.restore_worktree_scope();
+        let scope = app.restore_window_view(window_view);
         // Closed/exited replacements can still owe a lost durable acknowledgement.
         for card in &app.durable.cards {
             let terminal = match &card.kind {
@@ -27737,6 +27751,10 @@ mod tests {
             assert_eq!(runtime(&app, reopened).navigation(), None);
             assert_eq!(runtime(&app, source).navigation(), original_navigation);
         }
+    }
+
+    mod window_restore {
+        include!("app/window_restore_tests.rs");
     }
 
     mod repository_clone_lsp_ownership {
