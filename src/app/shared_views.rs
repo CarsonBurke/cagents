@@ -1883,6 +1883,12 @@ impl Cagents {
             .iter()
             .flat_map(|view| view.panes.iter().map(|pane| pane.id))
             .collect::<HashSet<_>>();
+        let alias_candidates = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && !owned.contains(&card.id))
+            .collect::<Vec<_>>();
         for view in &self.workspace_model.views {
             for pane in &view.panes {
                 owners
@@ -1891,12 +1897,10 @@ impl Cagents {
                     .insert(view.scope.clone());
                 // A canonical rekey can retire an unowned local alias in a
                 // different scope; its source baseline must settle too.
-                for alias in self.durable.cards.iter().filter(|card| {
-                    card.existence.is_open()
-                        && card.id != pane.id
-                        && !owned.contains(&card.id)
-                        && views::same_resource(&card.kind, &pane.kind)
-                }) {
+                for alias in alias_candidates
+                    .iter()
+                    .filter(|card| views::same_resource(&card.kind, &pane.kind))
+                {
                     let aliases = owners.get(&alias.id).cloned().unwrap_or_default();
                     owners.entry(pane.id).or_default().extend(aliases);
                 }
@@ -2151,19 +2155,18 @@ impl Cagents {
         // Decide which whole views can project before retiring any local alias.
         // Otherwise a later blocked pane could leave an earlier adoption without
         // the canonical descriptor required by its persistence checkpoint.
+        let alias_candidates = self
+            .durable
+            .cards
+            .iter()
+            .filter(|card| card.existence.is_open() && !owned.contains(&card.id))
+            .collect::<Vec<_>>();
         let mut adoptions = Vec::new();
         for view in views {
             for shared in &view.panes {
-                let aliases = self
-                    .durable
-                    .cards
+                let aliases = alias_candidates
                     .iter()
-                    .filter(|card| {
-                        card.existence.is_open()
-                            && card.id != shared.id
-                            && !owned.contains(&card.id)
-                            && views::same_resource(&card.kind, &shared.kind)
-                    })
+                    .filter(|card| views::same_resource(&card.kind, &shared.kind))
                     .map(|card| card.id)
                     .collect::<Vec<_>>();
                 for alias in aliases {
@@ -4591,7 +4594,8 @@ mod tests {
 
     #[test]
     fn repository_loads_project_only_their_affected_views() {
-        let (mut app, unrelated, _, _) = fixture();
+        let (mut app, unrelated, _, pane) = channel_move_fixture();
+        let baseline = app.shared_views.baseline[&Scope::Channel(unrelated)].clone();
         let pending = (
             uuid::Uuid::new_v4(),
             Scope::Channel(unrelated),
@@ -4656,6 +4660,17 @@ mod tests {
             app.shared_views.view_projection_count.get(),
             6 * 8,
             "loading each repository must not project every other repository's views"
+        );
+        assert!(
+            app.durable
+                .channels
+                .iter()
+                .any(|channel| channel.id == unrelated && channel.cards.contains(&pane.id))
+        );
+        assert!(app.card_state(pane.id).unwrap().existence.is_open());
+        assert_eq!(
+            app.shared_views.baseline[&Scope::Channel(unrelated)],
+            baseline
         );
         assert!(
             app.shared_views.pending.contains(&pending),
