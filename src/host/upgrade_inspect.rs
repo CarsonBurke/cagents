@@ -1063,6 +1063,9 @@ impl ExecutionEvidence {
             self.exec_settle,
             self.deadline,
         );
+        if let Some(deadline) = self.deadline {
+            check_deadline(deadline)?;
+        }
         match (scan, retained_processes, unreadable_listener) {
             (Ok(running @ CodexExecution::Running { .. }), _, _) => Ok(running),
             (_, true, _) => Ok(CodexExecution::RetainedProcesses),
@@ -3059,6 +3062,13 @@ mod tests {
                 ..
             }
         ));
+        // An exhausted inspection budget cannot establish absence, even when
+        // every saved descriptor belongs to an earlier boot.
+        let expired = ExecutionEvidence {
+            deadline: Some(Instant::now()),
+            ..current_writer
+        };
+        assert_eq!(expired.classify(&card), SavedExecution::Unchecked);
         // Earlier boots only settle scans whose kernel evidence is unreadable.
         // Matching PIDs alone cannot revive an earlier holder identity.
         let unreadable_kernel = ExecutionEvidence {
