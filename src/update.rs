@@ -461,7 +461,7 @@ fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<Strin
         .as_ref()
         .map(|owner| owner.version_root.join("bin/cagentsd"));
     source.verify_owner(executable.as_deref())?;
-    installed_update_worker(
+    installed_candidate_version(
         window,
         served,
         owner.as_ref(),
@@ -470,9 +470,9 @@ fn installed_entry_worker(window: &InstallLayout, served: &Path) -> Result<Strin
     )
 }
 
-/// The served candidate alone performs an update. Source admission and owner
-/// verification happen before this decision; its worker rechecks both.
-fn installed_update_worker(
+/// Return the served candidate's version after source admission and the no-op
+/// check. The candidate updater rechecks the source and its installed owner.
+fn installed_candidate_version(
     window: &InstallLayout,
     served: &Path,
     daemon: Option<&InstallLayout>,
@@ -1153,7 +1153,7 @@ fn perform_update(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    let inspection = reconcile_saved_sources(staged.identity.protocol)?;
+    let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
     let context = ReviewContext::capture(installation)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
@@ -1286,10 +1286,16 @@ pub(crate) fn inspect_source_panes(
 // user will consent to. Never expand consent after windows have prepared.
 fn reconcile_saved_sources(
     destination_protocol: u16,
+    replaces_compatible_daemon: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
     let guard = crate::instance::UiUpdateGuard::acquire()?;
     let (protocol, proof) = source::inspect_identity(None)?;
-    inspect_source_panes_mode(&guard, proof, protocol != destination_protocol, true)
+    inspect_source_panes_mode(
+        &guard,
+        proof,
+        protocol != destination_protocol || replaces_compatible_daemon,
+        true,
+    )
 }
 
 fn inspect_source_panes_mode(
@@ -3038,8 +3044,8 @@ finally:
             .to_string();
         assert!(
             error.contains("127")
-                && error.contains("too old")
-                && error.contains("intermediate build")
+                && error.contains("protocol 156")
+                && error.contains("0.1.3+local.991daa43e")
         );
         fixture.finish();
         // A fully qualified current peer owned by an older build is updated
@@ -3228,7 +3234,7 @@ finally:
             for window in [&old, &new] {
                 for owner in [&old, &third] {
                     assert_eq!(
-                        installed_update_worker(
+                        installed_candidate_version(
                             window,
                             &new.version_root,
                             Some(owner),
@@ -3243,7 +3249,7 @@ finally:
         }
         // UI-only replacement and a stopped source also use the candidate.
         assert_eq!(
-            installed_update_worker(
+            installed_candidate_version(
                 &old,
                 &new.version_root,
                 Some(&new),
@@ -3254,7 +3260,7 @@ finally:
             "new"
         );
         assert_eq!(
-            installed_update_worker(
+            installed_candidate_version(
                 &old,
                 &new.version_root,
                 None,
@@ -3267,7 +3273,7 @@ finally:
         // Preserve no-op refusal once both window and daemon are already served.
         for (owner, proof) in [(None, None), (Some(&new), Some(&proof))] {
             assert!(
-                installed_update_worker(
+                installed_candidate_version(
                     &new,
                     &new.version_root,
                     owner,
@@ -3277,13 +3283,14 @@ finally:
                 .is_err()
             );
         }
-        let error = installed_update_worker(&new, &new.version_root, Some(&old), 127, Some(&proof))
-            .unwrap_err()
-            .to_string();
+        let error =
+            installed_candidate_version(&new, &new.version_root, Some(&old), 127, Some(&proof))
+                .unwrap_err()
+                .to_string();
         assert!(
             error.contains("127")
-                && error.contains("too old")
-                && error.contains("intermediate build")
+                && error.contains("protocol 156")
+                && error.contains("0.1.3+local.991daa43e")
         );
     }
     use std::os::unix::fs::PermissionsExt;

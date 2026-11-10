@@ -28,8 +28,45 @@ pub struct StoppedWindow {
     pub recovery: String,
 }
 
+/// Flattened into Preview to keep its `labels` JSON map and Rust constructors
+/// intact. Older readers ignore the separate `review_details` field.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewInventory {
+    #[serde(default, rename = "labels")]
+    pub names: BTreeMap<TerminalId, PaneLabel>,
+    #[serde(default, rename = "review_details")]
+    pub details: ReviewDetails,
+}
+
+/// Saved panes absent from the live service still belong in the review.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SavedOutcome {
+    Unchanged,
+    Resumes,
+    KeepsRunning,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InspectedPane {
+    pub kind: super::impact::SessionKind,
+    pub outcome: SavedOutcome,
+    #[serde(default)]
+    pub detail: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReviewDetails {
+    #[serde(default)]
+    pub panes: BTreeMap<TerminalId, InspectedPane>,
+    #[serde(default)]
+    pub notices: Vec<String>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceInspection {
+    #[serde(default)]
+    pub details: ReviewDetails,
     #[serde(default)]
     pub stopped: Vec<StoppedPane>,
     #[serde(default)]
@@ -113,6 +150,7 @@ impl SourceInspection {
 #[cfg(any(feature = "host", test))]
 pub(crate) fn is_untitled(title: &str, chat: bool) -> bool {
     title.is_empty()
+        || matches!(title, "Claude Code" | "Codex" | "OMP")
         || (chat
             && matches!(
                 title,
@@ -131,7 +169,7 @@ pub(crate) fn pane_label(
     started: Option<i64>,
 ) -> PaneLabel {
     let untitled = is_untitled(title, chat);
-    if untitled && chat {
+    if untitled && (chat || matches!(title, "Claude Code" | "Codex" | "OMP")) {
         let started = started.and_then(crate::chat::local_time).map(|time| {
             let month = [
                 "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
@@ -154,33 +192,41 @@ pub(crate) fn pane_label(
 /// modification time. A missing timestamp remains explicitly unavailable.
 #[cfg(feature = "host")]
 pub(crate) fn conversation_started(source: &crate::chat::Session) -> Option<i64> {
-    let id = source.launch.session_id.as_deref()?;
-    if source.launch.provider == crate::agent::Provider::Codex {
+    launch_started(&source.launch)
+}
+
+#[cfg(feature = "host")]
+pub(crate) fn terminal_started(source: &crate::model::TerminalSession) -> Option<i64> {
+    let recipe = source.agent_resume_recipe()?;
+    let provider = crate::agent::Provider::from_program(&recipe.program)?;
+    let session_id = provider.resume_id(&recipe.arguments)?.to_owned();
+    launch_started(&crate::chat::Launch {
+        provider,
+        recipe,
+        session_id: Some(session_id),
+    })
+}
+
+#[cfg(feature = "host")]
+fn launch_started(launch: &crate::chat::Launch) -> Option<i64> {
+    let id = launch.session_id.as_deref()?;
+    if launch.provider == crate::agent::Provider::Codex {
         let id = uuid::Uuid::parse_str(id).ok()?;
         return id
             .get_timestamp()
             .filter(|_| id.get_version_num() == 7)
             .map(|at| at.to_unix().0 as i64);
     }
-    if source.launch.provider != crate::agent::Provider::Claude {
+    if launch.provider != crate::agent::Provider::Claude {
         return None;
     }
     // Claude's long-path resolver scans project directories. Label collection
     // must stay bounded independently of how much provider history exists.
-    if source
-        .launch
-        .recipe
-        .working_directory
-        .to_str()?
-        .chars()
-        .count()
-        > 200
-    {
+    if launch.recipe.working_directory.to_str()?.chars().count() > 200 {
         return None;
     }
-    let root = source.launch.provider.session_root(&source.launch.recipe)?;
-    let path =
-        crate::agent::claude_transcript(&root, &source.launch.recipe.working_directory, id).ok()?;
+    let root = launch.provider.session_root(&launch.recipe)?;
+    let path = crate::agent::claude_transcript(&root, &launch.recipe.working_directory, id).ok()?;
     let file = std::fs::File::open(path).ok()?;
     transcript_started(file)
 }
@@ -246,6 +292,42 @@ mod tests {
                 time.day, time.hour, time.minute
             )
         );
+    }
+
+    #[test]
+    fn old_flat_label_maps_and_typed_review_details_round_trip() {
+        let id = TerminalId::new();
+        let old = serde_json::json!({"labels": {id.to_string(): "kept title"}});
+        let mut inventory: ReviewInventory = serde_json::from_value(old).unwrap();
+        assert_eq!(inventory.names[&id], "kept title");
+        assert_eq!(inventory.details, ReviewDetails::default());
+        inventory
+            .details
+            .notices
+            .push("The running terminal service could not be checked".into());
+        let json = serde_json::to_value(&inventory).unwrap();
+        let legacy: BTreeMap<TerminalId, String> =
+            serde_json::from_value(json["labels"].clone()).unwrap();
+        assert_eq!(legacy[&id], "kept title");
+        assert_eq!(
+            serde_json::from_value::<ReviewInventory>(serde_json::to_value(&inventory).unwrap())
+                .unwrap(),
+            inventory
+        );
+    }
+
+    #[test]
+    fn provider_default_console_titles_use_recorded_start_times() {
+        for title in ["Claude Code", "Codex", "OMP"] {
+            let first = pane_label(title, None, "alpha", true, Some(1_794_232_920));
+            let second = pane_label(title, None, "alpha", true, Some(1_794_233_820));
+            assert!(first.starts_with("Untitled conversation in alpha, started "));
+            assert_ne!(first, second);
+            assert_eq!(
+                pane_label(title, None, "alpha", false, Some(1_794_232_920)),
+                first
+            );
+        }
     }
 
     #[cfg(feature = "host")]

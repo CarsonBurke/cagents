@@ -3083,6 +3083,11 @@ pub(crate) fn read_labeled_migration_sessions_with_budget(
             {
                 crate::update::source_inspection::conversation_started(source)
             }
+            CardKind::Terminal(source)
+                if crate::update::source_inspection::is_untitled(&title, false) =>
+            {
+                crate::update::source_inspection::terminal_started(source)
+            }
             _ => None,
         };
         #[cfg(not(feature = "host"))]
@@ -8025,6 +8030,78 @@ mod tests {
                 sha256: "a".repeat(64),
                 extension: "png".into(),
             }),
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn migration_labels_distinguish_untitled_console_terminals_by_recorded_start() {
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = root.path().join("window.sqlite");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let config = root.path().join("claude-fixture");
+        let transcripts = config.join("projects/-alpha");
+        std::fs::create_dir_all(&transcripts).unwrap();
+        let (mut workspace, _) = agent_workspace(crate::agent::Provider::Claude);
+        let template = workspace.cards[0].clone();
+        workspace.cards.clear();
+        for (id, timestamp) in [
+            (
+                "77777777-1111-4111-8111-111111111111",
+                "2026-11-09T14:02:00Z",
+            ),
+            (
+                "77777777-2222-4222-8222-222222222222",
+                "2026-11-09T14:17:00Z",
+            ),
+        ] {
+            let mut card = template.clone();
+            card.id = CardId::new();
+            card.title = "Claude Code".into();
+            let CardKind::Terminal(terminal) = &mut card.kind else {
+                unreachable!()
+            };
+            terminal.id = TerminalId::new();
+            terminal.launch.working_directory = "/alpha".into();
+            terminal.launch.arguments = vec!["--resume".into(), id.into()];
+            terminal
+                .launch
+                .environment
+                .insert("HOME".into(), root.path().display().to_string());
+            terminal
+                .launch
+                .environment
+                .insert("CLAUDE_CONFIG_DIR".into(), config.display().to_string());
+            terminal.resume_hint = crate::model::agent_recovery::hint_from_launch(&terminal.launch);
+            // Accepted consoles launch the companion; their exact provider
+            // identity remains in the saved resume hint.
+            terminal.launch.program = "/fixture/bin/cagents".into();
+            terminal.launch.arguments = vec![
+                "agent".into(),
+                "console".into(),
+                crate::model::AgentId::new().to_string(),
+            ];
+            std::fs::write(
+                transcripts.join(format!("{id}.jsonl")),
+                format!("{{\"timestamp\":\"{timestamp}\"}}\n"),
+            )
+            .unwrap();
+            workspace.cards.push(card);
+        }
+        workspace.focused = Some(workspace.cards[0].id);
+        SaveLane::default().save(&store, &workspace).unwrap();
+        let mut budget = MigrationInspectionBudget::new(Instant::now() + Duration::from_secs(30));
+        let panes = read_labeled_migration_sessions_with_budget(&path, &mut budget).unwrap();
+        assert_eq!(panes.len(), 2);
+        assert_ne!(panes[0].label, panes[1].label);
+        for pane in panes {
+            assert!(
+                pane.label
+                    .starts_with("Untitled conversation in alpha, started "),
+                "{}",
+                pane.label
+            );
+            assert!(!pane.label.contains("unavailable"));
         }
     }
 
