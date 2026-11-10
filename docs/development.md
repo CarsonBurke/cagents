@@ -1481,7 +1481,9 @@ harness, it provides:
   [Fixtures](fixtures.md#an-offline-github)); `curl` always fails, and Git
   reaches only local repositories. Files in `$CAGENTS_EVIDENCE_FIXTURE/home/.claude`
   switch fixture behaviors. `env CMD` runs your own setup in this environment,
-  with the fixture's root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
+  with the fixture's root in `CAGENTS_EVIDENCE_FIXTURE`; between sessions it
+  also works, under the last session's side, for setup that needs the daemon
+  stopped, such as converting a store. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
 - **Seeded chats reopen.** A chat records its provider home's device and inode
   and won't reopen once that directory is replaced, and a transcript's
