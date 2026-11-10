@@ -306,7 +306,9 @@ class Rehearsal:
                 status_path = self.root/'home/.local/share/cagents-install/.update/status.json'
                 try:
                     status = json.loads(status_path.read_text())
-                    if status['phase'] != 'Failed' or 'forced rehearsal daemon startup failure' not in Path(status['log_path']).read_text():
+                    receipt = (self.root/'logs/daemon-start-failure.txt').read_text().split()
+                    if (status['phase'] != 'Failed' or 'exit status: 1' not in Path(status['log_path']).read_text()
+                            or len(receipt) != 2 or receipt[0] != args.new_version or int(receipt[1]) <= 1):
                         self.errors.append('worker did not report the forced daemon startup failure')
                 except (OSError, KeyError, ValueError) as exc:
                     self.errors.append(f'forced failure evidence missing: {exc}')

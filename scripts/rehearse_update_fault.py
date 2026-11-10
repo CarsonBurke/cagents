@@ -2,6 +2,7 @@
 """Inject a daemon startup failure into a marked rehearsal's staged candidate."""
 import hashlib
 from pathlib import Path
+import shlex
 import sys
 
 
@@ -20,11 +21,13 @@ def fail_start(root, version):
     if original.exists():
         raise ValueError('candidate already has a startup fault')
     daemon.rename(original)
-    daemon.write_text('''#!/bin/sh
+    receipt = shlex.quote(str(root / 'logs/daemon-start-failure.txt'))
+    daemon.write_text(f'''#!/bin/sh
 # Rehearsal fault: informational, inspection and store maintenance still work.
 if [ "$#" -ne 0 ]; then
-    exec "${0%/*}/cagentsd-rehearsal-real" "$@"
+    exec "${{0%/*}}/cagentsd-rehearsal-real" "$@"
 fi
+printf '%s %s\\n' {shlex.quote(version)} \"$$\" > {receipt} || exit 2
 printf '%s\\n' 'forced rehearsal daemon startup failure' >&2
 exit 1
 ''')
