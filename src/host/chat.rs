@@ -1560,18 +1560,34 @@ fn shared_codex_service(
             return Err(error(failure));
         }
     };
-    Ok(match &spec.transport {
+    let service = match &spec.transport {
         chat::protocol::TransportSpec::UnixWebSocket {
             socket,
             device,
             inode,
-        } => match crate::agent::observe::socket::connect(socket, *device, *inode) {
-            Ok(_) => SharedCodexService::Listening,
-            Err(failure) if failure.not_listening => SharedCodexService::Stopped,
-            Err(_) => SharedCodexService::Unknown,
-        },
+        } if *device == endpoint.dev() && *inode == endpoint.ino() => {
+            match crate::agent::observe::socket::connect(socket, *device, *inode) {
+                Ok(_) => SharedCodexService::Listening,
+                Err(failure) if failure.not_listening => SharedCodexService::Stopped,
+                Err(_) => SharedCodexService::Unknown,
+            }
+        }
         _ => SharedCodexService::Unknown,
-    })
+    };
+    // Refusal is not a post-connect identity proof. In particular, replacing
+    // the published endpoint before or during the probe must not turn another
+    // socket's ConnectionRefused into authority to start a private server.
+    Ok(
+        if std::fs::metadata(&shared).is_ok_and(|now| {
+            now.file_type().is_socket()
+                && now.dev() == endpoint.dev()
+                && now.ino() == endpoint.ino()
+        }) {
+            service
+        } else {
+            SharedCodexService::Unknown
+        },
+    )
 }
 
 /// A proofless history selection can join the account's live shared daemon

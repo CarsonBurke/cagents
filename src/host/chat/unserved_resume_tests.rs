@@ -562,11 +562,11 @@ fn an_unknown_shared_endpoint_never_grants_a_private_server() {
     if isolated(NAME).is_some() {
         return;
     }
+    use std::os::unix::fs::MetadataExt;
     let (host, _, path) = fixture();
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let home = root.join("home/.codex");
-    let _writer = ThreadWriter::hold(&home);
     let control = home.join("app-server-control");
     std::fs::create_dir_all(&control).unwrap();
     let shared = control.join("app-server-control.sock");
@@ -577,23 +577,49 @@ fn an_unknown_shared_endpoint_never_grants_a_private_server() {
         } else {
             std::fs::write(&shared, b"not a socket").unwrap();
         }
-        let source = reopened(&root);
-        let failure = process(
+        let before = std::fs::symlink_metadata(&shared).unwrap();
+        let mut source = reopened(&root);
+        source
+            .launch
+            .recipe
+            .environment
+            .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+        // There is no writer to mask a bad Unknown->Missing classification.
+        // This checks the real filesystem boundary before the public flow.
+        assert!(
+            codex_owners::writer(
+                Some(
+                    &home
+                        .join("thread-writer-locks")
+                        .join(format!("{}.lock", thread_id()))
+                ),
+                thread_id()
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert_eq!(
+            shared_codex_service(&source.launch, || Ok(())).unwrap(),
+            SharedCodexService::Unknown
+        );
+        let ServerResponse::ChatResumePrepared { session: prepared } = process(
             &host,
             1,
             ClientRequest::ChatPrepareResume {
                 source: source.clone(),
             },
         )
-        .unwrap_err();
-        assert!(failure.retryable, "{failure:?}");
-        assert_eq!(failure.message, running_codex_process(std::process::id()));
+        .unwrap() else {
+            panic!("expected preparation after ordinary ended-execution proof")
+        };
+        assert_eq!(prepared.launch, source.launch);
+        assert!(!prepared.owns_codex_listener());
         assert!(
             process(
                 &host,
                 1,
                 ClientRequest::ChatStart {
-                    session: source,
+                    session: prepared,
                     source: None,
                     terminate_source: false,
                     execution_environment: Default::default()
@@ -605,8 +631,45 @@ fn an_unknown_shared_endpoint_never_grants_a_private_server() {
             !root.join("codex-arguments").exists(),
             "unknown shared evidence must never become allocation authority"
         );
+        let after = std::fs::symlink_metadata(&shared).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
         std::fs::remove_file(&shared).unwrap();
     }
+}
+
+#[test]
+fn a_replaced_shared_endpoint_remains_unknown() {
+    const NAME: &str =
+        "host::chat::unserved_resume_tests::a_replaced_shared_endpoint_remains_unknown";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (_host, _, path) = fixture();
+    let root = path.parent().unwrap();
+    let home = root.join("home/.codex");
+    let control = home.join("app-server-control");
+    std::fs::create_dir_all(&control).unwrap();
+    let shared = control.join("app-server-control.sock");
+    let _original = UnixListener::bind(&shared).unwrap();
+    let replacement = control.join("replacement.sock");
+    drop(UnixListener::bind(&replacement).unwrap());
+    let mut source = reopened(root);
+    source
+        .launch
+        .recipe
+        .environment
+        .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+    let service = shared_codex_service(&source.launch, || {
+        std::fs::remove_file(&shared).unwrap();
+        std::fs::rename(&replacement, &shared).unwrap();
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        service,
+        SharedCodexService::Unknown,
+        "another socket's refusal must not grant replacement-writer authority"
+    );
 }
 
 #[test]
