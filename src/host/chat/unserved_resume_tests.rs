@@ -42,6 +42,21 @@ fn reopened(root: &Path) -> Session {
     }
 }
 
+/// Public resume preparation authenticates close receipts against the daemon
+/// lease, even when no receipt exists. Model the real daemon startup and keep
+/// its exact lease alive for the whole request flow.
+fn daemon_lease(host: &SharedHost) -> crate::daemon::HostLease {
+    let proof = host.lock().unwrap().proof().clone();
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let lease = crate::daemon::HostLease::acquire(&paths, &proof).unwrap();
+    crate::secure_file::prepare_private_directory(
+        &crate::daemon::holder_registry::directory(crate::daemon::holder_registry::Kind::Native)
+            .unwrap(),
+    )
+    .unwrap();
+    lease
+}
+
 /// Real kernel writer ownership, without a rollout FD or provider argv that
 /// main's process census could otherwise identify as this thread's execution.
 struct ThreadWriter(std::fs::File);
@@ -282,6 +297,7 @@ fn a_reopened_codex_thread_joins_the_shared_daemon_serving_it() {
         return;
     }
     let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let home = root.join("account");
@@ -358,6 +374,7 @@ fn a_reopened_codex_thread_joins_a_long_published_shared_endpoint() {
     }
     use std::os::unix::fs::MetadataExt;
     let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let home = root.join("long-account-directory-".repeat(6));
@@ -435,6 +452,7 @@ fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
     }
     use std::os::unix::fs::MetadataExt;
     let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let home = root.join("long-stale-account-directory-".repeat(5));
@@ -564,6 +582,7 @@ fn an_unknown_shared_endpoint_never_grants_a_private_server() {
     }
     use std::os::unix::fs::MetadataExt;
     let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let home = root.join("home/.codex");
@@ -725,6 +744,7 @@ fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
         return;
     }
     let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let home = root.join("home/.codex");
@@ -1011,6 +1031,7 @@ fn a_reopened_codex_thread_with_uninspectable_writer_evidence_refuses_retryably(
         return;
     }
     let (host, _, path) = fixture();
+    let _lease = daemon_lease(&host);
     let root = path.parent().unwrap().to_owned();
     install_codex(&root);
     let locks = root.join("home/.codex/thread-writer-locks");
