@@ -185,8 +185,29 @@ impl CloseRefusal {
     }
 }
 
-/// How many of what still runs the pane lists; the rest are counted.
+/// How many of what still runs the pane lists in full; the rest are named
+/// together, so that everything the action ends has been shown.
 const LISTED_PROCESSES: usize = 5;
+
+/// The command names of `processes`, each once with how many share it, in the
+/// order they first appear: `python3 ×3, node`.
+fn named_together<'a>(processes: impl IntoIterator<Item = &'a LostProcess>) -> String {
+    let mut names: Vec<(&str, usize)> = Vec::new();
+    for process in processes {
+        match names.iter_mut().find(|(name, _)| *name == process.name) {
+            Some((_, count)) => *count += 1,
+            None => names.push((process.name.as_str(), 1)),
+        }
+    }
+    names
+        .into_iter()
+        .map(|(name, count)| match count {
+            1 => name.to_owned(),
+            count => format!("{name} \u{d7}{count}"),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
 /// The action that ends `count` processes and closes the conversation.
 fn end_label(count: usize) -> String {
@@ -210,7 +231,13 @@ impl Runtime {
             vec![design::body(refusal.reason.as_str()).into()];
         if !refusal.processes.is_empty() {
             rows.push(design::caption("Still running for it:").into());
-            for process in refusal.processes.iter().take(LISTED_PROCESSES) {
+            // What the action ends comes first, then what it leaves running.
+            let (ended, left): (Vec<&LostProcess>, Vec<&LostProcess>) =
+                refusal.processes.iter().partition(|process| process.proved);
+            let listed = ended.len().min(LISTED_PROCESSES);
+            let (ended_listed, ended_rest) = ended.split_at(listed);
+            let (left_listed, left_rest) = left.split_at(left.len().min(LISTED_PROCESSES - listed));
+            for process in ended_listed.iter().chain(left_listed) {
                 let mut line = vec![
                     design::body(process.name.as_str()).into(),
                     design::caption(process.command.as_str()).into(),
@@ -231,9 +258,26 @@ impl Runtime {
                         .into(),
                 );
             }
-            let more = refusal.processes.len().saturating_sub(LISTED_PROCESSES);
-            if more > 0 {
-                rows.push(design::caption(format!("and {more} more")).into());
+            if !ended_rest.is_empty() {
+                rows.push(
+                    design::caption(format!(
+                        "{} more: {}",
+                        ended_rest.len(),
+                        named_together(ended_rest.iter().copied())
+                    ))
+                    .into(),
+                );
+            }
+            if !left_rest.is_empty() {
+                rows.push(
+                    design::caption(format!(
+                        "{} more Cagents can't prove are this conversation's, so it leaves them running: {}",
+                        left_rest.len(),
+                        named_together(left_rest.iter().copied())
+                    ))
+                    .class(cosmic::theme::Text::Custom(design::warning_text))
+                    .into(),
+                );
             }
         }
         let mut buttons: Vec<Element<'_, Message>> = Vec::new();
@@ -272,5 +316,31 @@ impl Runtime {
                 }
             }));
         Some(widget::container(panel).center_x(Length::Fill).into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn process(pid: i32, name: &str) -> LostProcess {
+        LostProcess {
+            process: ProcessStart { pid, start: 1 },
+            name: name.to_owned(),
+            command: name.to_owned(),
+            proved: true,
+        }
+    }
+
+    #[test]
+    fn processes_beyond_the_listed_ones_are_still_named() {
+        let rest = [
+            process(1, "python3"),
+            process(2, "node"),
+            process(3, "python3"),
+            process(4, "python3"),
+        ];
+        assert_eq!(named_together(&rest), "python3 \u{d7}3, node");
+        assert_eq!(named_together(&rest[1..2]), "node");
     }
 }

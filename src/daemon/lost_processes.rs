@@ -284,6 +284,12 @@ pub(crate) fn end(
                 pinned.push(process);
             }
         }
+        if pinned.is_empty() {
+            // Each exited or changed between the scan and the pidfd; the next
+            // scan says which, without spinning on /proc meanwhile.
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
         for process in &pinned {
             process.signal(libc::SIGTERM)?;
         }
