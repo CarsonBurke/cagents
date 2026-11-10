@@ -32,20 +32,24 @@ Usage: scripts/native-evidence --task DIR COMMAND
 Sides are "before" and "after". Each has its own checkout and target directory;
 both use the same fixture data and synthetic provider.
 
-  build SIDE CHECKOUT
-                  Build the runner's three browserless executables in one of
+  build SIDE CHECKOUT [--integrated-browser]
+                  Build the runner's three matched executables in one of
                   the build host's shared slots, and keep them in the side's
-                  target. scripts/prune-build-dirs reclaims a task's targets
+                  target (browserless by default; --integrated-browser selects
+                  Servo). scripts/prune-build-dirs reclaims a task's targets
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
-        [--portal gtk|kde|gnome|cosmic]
+        [--portal gtk|kde|gnome|cosmic] [--trace-wayland] [--software-rendering]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
-                  operate.
+                  operate. --trace-wayland records client protocol requests in
+                  logs/ui-SIDE.log for bounded protocol diagnosis.
+                  --software-rendering explicitly selects software GL clients
+                  for comparison; the default keeps runtime rendering.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -176,14 +180,18 @@ zig_executable() (
 )
 
 # What `build` compiles, and all a session's cargo accepts. Keep these in step with
-# scripts/run-development's browserless builds, which cannot be asked to only build: the
+# scripts/run-development's builds, which cannot be asked to only build: the
 # before side may predate any option. A real-runner test fails if they drift.
 build_arguments() {
     local common='--locked --profile dev-runtime --no-default-features --features'
     printf '%s\n' \
         "$common development --bin cagents" \
-        "$common development,host --bin cagentsd" \
-        "$common development,ui --bin cagents-ui"
+        "$common development,host --bin cagentsd"
+    case ${1:-${built_lane:-browserless}} in
+        browserless) printf '%s\n' "$common development,ui --bin cagents-ui" ;;
+        integrated) printf '%s\n' '--locked --profile dev-runtime --features development,integrated-browser --bin cagents-ui' ;;
+        *) die 'invalid evidence build lane' ;;
+    esac
 }
 
 refuse_running_side() {
@@ -193,12 +201,13 @@ refuse_running_side() {
 }
 
 cmd_build() {
-    local side=${1:-} checkout=${2:-}
+    local side=${1:-} checkout=${2:-} lane=browserless
     require_side "$side"
     [ -n "$checkout" ] || die 'build needs a checkout' 2
     shift 2
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --integrated-browser) lane=integrated; shift ;;
             --seed-target)
                 # A slot already holds a nearby build; a copied target adds only disk.
                 : "${2:?--seed-target needs a directory}"
@@ -243,7 +252,7 @@ cmd_build() {
     # CAGENTS_BUILD_REMOTE=local here. The hold is the checkout's, whose
     # builds alone can use it.
     (cd -- "$checkout" && "$tool_root/scripts/cargo-gate" exec --hold "$self" --task "$task" \
-        __build "$side" "$checkout" "$zig" "${cargo_path%/*}")
+        __build "$side" "$checkout" "$zig" "${cargo_path%/*}" "$lane")
 }
 
 # Whether this build compiles on this host: in its own slots, reached by
@@ -268,7 +277,7 @@ mark_used() {
 }
 
 run_build() {
-    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 target revision
+    local side=$1 checkout=$2 zig=$3 cargo_bin=$4 lane=${5:-browserless} target revision
     # A session may have started during the wait for this slot.
     refuse_running_side "$side"
     target=$(target_of "$side")
@@ -290,13 +299,13 @@ run_build() {
         while IFS= read -r arguments; do
             # shellcheck disable=SC2086 # Deliberately one word per argument.
             cargo build $arguments 8<&-
-        done < <(build_arguments)
+        done < <(build_arguments "$lane")
     )
     [ "$(source_state "$checkout")" = "$revision" ] ||
         die "$checkout changed during the build; build it again"
     {
         printf '%s\n' "$checkout" "$zig" "$cargo_bin"
-        printf '%s\n' "$revision"
+        printf '%s\n' "$revision" "$lane"
     } >"$target/evidence-source"
     printf 'built %s at %s\n' "$side" "$(head -n1 <<<"$revision")"
 }
@@ -318,7 +327,9 @@ load_side() {
         read -r cargo_bin
         read -r built_revision
         read -r built_tree
+        read -r built_lane || built_lane=browserless
     } <"$record"
+    case $built_lane in browserless|integrated) ;; *) die "invalid evidence build lane in $record" ;; esac
     target=$(target_of "$side")
 }
 
@@ -637,8 +648,10 @@ run_inner() {
     load_side "$side" "$state/source"
     local portal
     portal=$(cat "$state/portal" 2>/dev/null) || portal=
-    if ! timeout -k 5 240 niri-harness session start "$session_name" --root "$harness_root" --timeout 180 \
-        --width "$width" ${portal:+--portal "$portal"} --cmd "exec $self --task $task __app $side" \
+    local -a bus=(--host-bus)
+    [ -z "$portal" ] || bus=(--portal "$portal")
+    if ! timeout -k 5 240 niri-harness start --name "$session_name" --backend window --root "$harness_root" --timeout 180 \
+        --width "$width" "${bus[@]}" -- "$self" --task "$task" __app "$side" \
         >"$logs/harness-$side.log" 2>&1; then
         failure="the app window did not appear; see $logs/harness-$side.log, $harness_root/session.log and $logs/ui-$side.log"
     elif ! source_is_current; then
@@ -655,7 +668,7 @@ run_inner() {
         touch "$state/ready"
     fi
     while [ ! -e "$state/stop" ] && kill -0 "$PPID" 2>/dev/null; do sleep 0.5; done
-    timeout -k 5 30 niri-harness session stop "$session_name" >>"$logs/harness-$side.log" 2>&1 || true
+    timeout -k 5 30 niri-harness stop "$session_name" >>"$logs/harness-$side.log" 2>&1 || true
 }
 
 # The session's cargo, until the harness reports it ready, shortly after its window
@@ -734,10 +747,18 @@ run_app() {
     # pruner, under this private HOME, beside the app being captured, and
     # sync the file system for each one while the disk is low. Builds run
     # inside the session once it is ready are not disk-guarded either.
-    local status=0
-    fixture_env env CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
+    local status=0 extra_env=()
+    if [ "$(cat "$state/trace-wayland" 2>/dev/null)" = true ]; then
+        extra_env+=(WAYLAND_DEBUG=client)
+    fi
+    if [ "$(cat "$state/software-rendering" 2>/dev/null)" = true ]; then
+        extra_env+=(LIBGL_ALWAYS_SOFTWARE=1 WGPU_BACKEND=gl)
+    fi
+    set --
+    [ "$built_lane" != browserless ] || set -- --browserless
+    fixture_env env "${extra_env[@]}" CAGENTS_BUILD_LOCK="$state/session-build.lock" CAGENTS_BUILD_SLOTS=1 CAGENTS_BUILD_SEED=0 \
         CAGENTS_BUILD_REMOTE=local CAGENTS_BUILD_FREE_FLOOR_GIB=0 \
-        scripts/run-development --browserless --debug --log-file "$logs/ui-$side.log" || status=$?
+        scripts/run-development "$@" --debug --log-file "$logs/ui-$side.log" || status=$?
     # Don't leave the lock held until the harness gives up on a window.
     if [ ! -e "$state/ready" ] && [ ! -e "$state/failed" ]; then
         printf 'the runner exited with status %s before the app window appeared; see %s and %s\n' \
@@ -746,11 +767,13 @@ run_app() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal= trace_wayland=false software_rendering=false
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
         case $1 in
+            --trace-wayland) trace_wayland=true; shift ;;
+            --software-rendering) software_rendering=true; shift ;;
             --width) width=${2:?--width needs pixels}; shift 2 ;;
             --height) height=${2:?--height needs pixels}; shift 2 ;;
             --keep-state) keep_state=true; shift ;;
@@ -781,6 +804,8 @@ cmd_start() {
     printf '%s\n' "$width" >"$state/width"
     printf '%s\n' "$height" >"$state/height"
     printf '%s\n' "$portal" >"$state/portal"
+    printf '%s\n' "$trace_wayland" >"$state/trace-wayland"
+    printf '%s\n' "$software_rendering" >"$state/software-rendering"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" \
@@ -829,7 +854,7 @@ cmd_nested() {
     current_side >/dev/null
     nested_session_env
     local session_environment
-    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" session env)
+    session_environment=$(timeout -k 5 30 niri-harness --session "$session_name" env)
     eval "$session_environment"
     exec "$@"
 }
@@ -842,7 +867,7 @@ cmd_shot() {
     (
         nested_session_env
         local observed
-        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" --json observe --no-text) ||
+        observed=$(timeout -k 5 30 niri-harness --no-heal --session "$session_name" observe --no-text --json) ||
             die "could not observe the session; see $harness_root/session.log and $logs/ui-$side.log"
         /usr/bin/python3 -c '
 import json, sys
@@ -931,6 +956,16 @@ command=${1:-}
 [ -n "$command" ] || { usage >&2; exit 2; }
 shift
 select_task "$task_argument"
+
+# Each command is a new process. Resolve the same CLI for later captures and
+# interaction too, not only the command that starts the session.
+case $command in
+    start|drive|nested|shot)
+        harness_directory=$("$tool_root/scripts/require-niri-harness") || exit 1
+        PATH=$harness_directory:$PATH
+        export PATH
+        ;;
+esac
 
 case $command in
     build) cmd_build "$@" ;;

@@ -55,12 +55,18 @@ STUBS = {
         printf '%s\\n' "$*" >> "$STUB_LOG/harness"
         printf '%s\\n' "$PATH" >> "$STUB_LOG/harness-path"
         ls -l /proc/self/fd >> "$STUB_LOG/harness-fds" 2>&1
-        if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1 $2" = "session stop" ]; then exec sleep 300; fi
+        if [ "$1" = --help ]; then echo 'start stop list env exec gc'; exit 0; fi
+        if [ "$1 $2" = "start --help" ]; then
+            echo '--root --width --portal --backend --host-bus --renderer'; exit 0
+        fi
+        [ "$1" != session ] || { echo 'legacy session command' >&2; exit 2; }
+        if [ -e "$STUB_LOG/stop-wedges" ] && [ "$1" = stop ]; then exec sleep 300; fi
+        cmd=()
         args=("$@")
         for ((i = 0; i < $#; i++)); do
             case ${args[i]} in
                 --root) root=${args[i + 1]} ;;
-                --cmd) cmd=${args[i + 1]} ;;
+                --) cmd=("${args[@]:i + 1}"); break ;;
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
@@ -78,10 +84,10 @@ STUBS = {
                     ;;
             esac
         done
-        if [ -n "${cmd:-}" ]; then
+        if [ "${#cmd[@]}" -gt 0 ]; then
             [ -z "${STUB_APP_FAILS:-}" ] || exit 3
             mkdir -p "$root"
-            sh -c "$cmd" >>"$STUB_LOG/app-output" 2>&1 &
+            "${cmd[@]}" >>"$STUB_LOG/app-output" 2>&1 &
             # The real harness waits for a window that a failed runner never shows.
             [ ! -e "$STUB_LOG/harness-waits" ] || exec sleep 200
             # Nor does it report ready until the app is up, unless told not to wait.
@@ -272,6 +278,29 @@ class Evidence(unittest.TestCase):
                 return False
             fcntl.flock(lock, fcntl.LOCK_UN)
             return True
+
+    def test_separate_commands_use_the_pinned_harness_after_a_legacy_path_start(self):
+        self.built("after")
+        pinned = Path(self.env["HOME"]) / ".local/lib/cagents/niri-harness/current/bin/niri-harness"
+        pinned.parent.mkdir(parents=True)
+        shutil.copy2(self.bin / "niri-harness", pinned)
+        (self.bin / "niri-harness").write_text("#!/bin/sh\necho legacy-global-harness >&2\nexit 2\n")
+        self.run_tool("start", "after")
+        self.run_tool("drive", "observe", "--no-text", "--json")
+        result = self.run_tool("nested", "sh", "-c", 'echo "$NESTED_MARKER"')
+        self.assertEqual(result.stdout.strip(), "nested")
+        self.run_tool("shot", "pinned")
+        self.run_tool("stop")
+
+    def test_a_legacy_harness_is_refused_before_waiting_for_the_native_lock(self):
+        self.built("after")
+        harness = self.bin / "niri-harness"
+        harness.write_text("#!/bin/sh\necho 'usage: niri-harness session start' >&2\nexit 2\n")
+        harness.chmod(0o755)
+        result = self.run_tool("start", "after", check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("requires a compatible niri-harness CLI", result.stderr)
+        self.assertNotIn("waiting for the native session", result.stdout)
 
     def test_narrow_viewport_keeps_its_explicit_height(self):
         self.built("after")
@@ -600,14 +629,14 @@ class Evidence(unittest.TestCase):
         self.assertTrue(live_lock_held(self.native_lock))
         self.run_tool("stop")
 
-    def test_the_repositorys_own_runner_starts_through_the_session_cargo(self) -> None:
+    def assert_real_runner_starts(self, *build_options):
         checkout = self.checkout("after")
         shutil.copytree(REPOSITORY / "scripts", checkout / "scripts", dirs_exist_ok=True)
         (checkout / "mise.toml").write_text('[tools]\nzig = "0.15.2"\n')
         git = ["git", "-C", str(checkout), "-c", "user.name=t", "-c", "user.email=t@example.invalid"]
         subprocess.run([*git, "add", "."], check=True, env=self.env)
         subprocess.run([*git, "commit", "-qm", "real runner"], check=True, env=self.env)
-        self.run_tool("build", "after", str(checkout))
+        self.run_tool("build", "after", str(checkout), *build_options)
         built = (self.logs / "cargo").read_text()
         metadata = (self.logs / "cargo-metadata").read_text()
         started = self.run_tool("start", "after", check=False)
@@ -620,6 +649,16 @@ class Evidence(unittest.TestCase):
         self.assertEqual((self.logs / "cargo").read_text(), built)
         self.assertEqual((self.logs / "cargo-metadata").read_text(), metadata)
         self.run_tool("stop")
+
+    def test_the_repositorys_own_runner_starts_through_the_session_cargo(self):
+        self.assert_real_runner_starts()
+
+    def test_the_integrated_runner_replays_only_its_recorded_builds(self):
+        self.assert_real_runner_starts("--integrated-browser")
+        cargo = (self.logs / "cargo").read_text()
+        self.assertIn("--features development,integrated-browser --bin cagents-ui", cargo)
+        self.assertNotIn("development,ui --bin cagents-ui", cargo)
+        self.assertEqual((self.task / "target-after/evidence-source").read_text().splitlines()[-1], "integrated")
 
     def test_a_refusals_next_step_works_straight_away(self) -> None:
         path = self.built()
@@ -644,7 +683,7 @@ class Evidence(unittest.TestCase):
     def test_a_session_is_ready_only_once_the_harness_saw_a_window(self) -> None:
         self.built()
         self.run_tool("start", "after")
-        start = next(line for line in (self.logs / "harness").read_text().splitlines() if "--cmd" in line)
+        start = next(line for line in (self.logs / "harness").read_text().splitlines() if line.startswith("start --name"))
         self.assertNotIn("--no-window-wait", start)
         self.run_tool("stop")
 
@@ -663,6 +702,28 @@ class Evidence(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertIn("cargo beside it", result.stderr)
         self.assertFalse((self.logs / "cargo").exists())
+
+    def test_legacy_build_records_default_to_browserless(self):
+        self.built()
+        record = self.task / "target-after/evidence-source"
+        record.write_text("\n".join(record.read_text().splitlines()[:5]) + "\n")
+        self.run_tool("start", "after")
+        self.assertIn("--browserless", (self.logs / "runner").read_text())
+        self.run_tool("stop")
+
+    def test_wayland_trace_is_explicit_and_does_not_persist_to_the_next_start(self):
+        self.built()
+        self.run_tool("start", "after", "--trace-wayland", "--software-rendering")
+        self.assertIn("WAYLAND_DEBUG=client", (self.logs / "runner-env").read_text())
+        self.assertIn("LIBGL_ALWAYS_SOFTWARE=1", (self.logs / "runner-env").read_text())
+        self.assertIn("WGPU_BACKEND=gl", (self.logs / "runner-env").read_text())
+        self.run_tool("stop")
+        (self.logs / "runner-env").unlink()
+        self.run_tool("start", "after")
+        self.assertNotIn("WAYLAND_DEBUG=", (self.logs / "runner-env").read_text())
+        self.assertNotIn("LIBGL_ALWAYS_SOFTWARE=", (self.logs / "runner-env").read_text())
+        self.assertNotIn("WGPU_BACKEND=", (self.logs / "runner-env").read_text())
+        self.run_tool("stop")
 
     def test_the_callers_desktop_settings_do_not_reach_the_session(self) -> None:
         self.built()
@@ -904,7 +965,7 @@ class Evidence(unittest.TestCase):
         self.run_tool("start", "after", "--portal", "gtk")
         self.run_tool("stop")
         starts = [line for line in (self.logs / "harness").read_text().splitlines()
-                  if line.startswith("session start")]
+                  if line.startswith("start --name")]
         self.assertEqual(len(starts), 2, starts)
         self.assertNotIn("--portal", starts[0])
         self.assertIn("--portal gtk", starts[1])
@@ -1426,6 +1487,11 @@ class RemoteEvidence(unittest.TestCase):
         commands = {line.split(" buildhost ", 1)[-1] for line in (self.logs / "ssh").read_text().splitlines()
                     if "receive-pack" not in line}
         self.assertEqual(commands, {"bash -s"})
+
+    def test_remote_build_forwards_the_integrated_lane(self):
+        checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
+        self.run_tool("build", "after", str(checkout), "--integrated-browser")
+        self.assertTrue(any(call.endswith(" --integrated-browser") for call in self.tool_calls()))
 
     def test_uncommitted_and_untracked_files_are_built_without_touching_the_checkout(self) -> None:
         checkout = self.repository("after", {"src.rs": "fn main() {}\n"})
