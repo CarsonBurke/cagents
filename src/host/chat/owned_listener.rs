@@ -308,24 +308,6 @@ pub(super) fn served_before_retire(
     }
 }
 
-/// Whether nothing can be serving at an endpoint this conversation does not own.
-///
-/// Such an endpoint, like an account's shared daemon or another conversation's
-/// listener, is only probed, never retired. An absent endpoint, or a socket
-/// that refuses connections, proves no server there holds a thread; anything
-/// else might. A server binds before it listens, so one starting at this
-/// instant reads as stopped, but it holds no thread until a client opens one.
-pub(super) fn stopped(endpoint: &Path) -> bool {
-    match std::fs::metadata(endpoint) {
-        Ok(bound) => {
-            bound.file_type().is_socket()
-                && socket::connect(endpoint, bound.dev(), bound.ino())
-                    .is_err_and(|failure| failure.not_listening)
-        }
-        Err(failure) => failure.kind() == io::ErrorKind::NotFound,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -694,27 +676,5 @@ mod tests {
         std::fs::write(&socket, b"").unwrap();
         assert!(served(&socket).unwrap());
         assert!(socket.is_file());
-    }
-
-    #[test]
-    fn an_endpoint_is_stopped_only_when_absent_or_refusing() {
-        let (_root, allocation, runtime) = directories();
-        let socket = allocation.join("app-server-control.sock");
-        assert!(stopped(&socket));
-
-        drop(UnixListener::bind(&socket).unwrap());
-        assert!(stopped(&socket));
-        assert!(
-            std::fs::symlink_metadata(&socket).is_ok(),
-            "an account's endpoint is never retired"
-        );
-        std::fs::remove_file(&socket).unwrap();
-
-        let _listening = UnixListener::bind(&socket).unwrap();
-        assert!(!stopped(&socket));
-
-        let file = runtime.join("not-a-socket");
-        std::fs::write(&file, b"").unwrap();
-        assert!(!stopped(&file));
     }
 }

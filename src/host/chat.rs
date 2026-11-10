@@ -1519,6 +1519,61 @@ fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<Terminal
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SharedCodexService {
+    Missing,
+    Stopped,
+    Listening,
+    Unknown,
+}
+
+/// Probe the exact shared transport both preparation and fallback would use.
+/// The adapter owns any verified short alias until the probe has completed.
+/// Only an absent entry or ConnectionRefused proves this endpoint unserved;
+/// unreadable/replaced evidence and every other connection failure stay unknown.
+fn shared_codex_service(
+    launch: &chat::Launch,
+    before_probe: impl FnOnce() -> Result<(), ProtocolError>,
+) -> Result<SharedCodexService, ProtocolError> {
+    use std::os::unix::fs::{FileTypeExt, MetadataExt};
+    let Some(shared) = chat::protocol::codex::shared_daemon_socket(launch) else {
+        return Ok(SharedCodexService::Unknown);
+    };
+    let endpoint = match std::fs::metadata(&shared) {
+        Ok(endpoint) if endpoint.file_type().is_socket() => endpoint,
+        Err(failure) if failure.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(SharedCodexService::Missing);
+        }
+        _ => return Ok(SharedCodexService::Unknown),
+    };
+    before_probe()?;
+    let (spec, _adapter) = match chat::protocol::codex::create(launch) {
+        Ok(created) => created,
+        Err(failure) => {
+            if !std::fs::metadata(&shared).is_ok_and(|now| {
+                now.file_type().is_socket()
+                    && now.dev() == endpoint.dev()
+                    && now.ino() == endpoint.ino()
+            }) {
+                return Ok(SharedCodexService::Unknown);
+            }
+            return Err(error(failure));
+        }
+    };
+    Ok(match &spec.transport {
+        chat::protocol::TransportSpec::UnixWebSocket {
+            socket,
+            device,
+            inode,
+        } => match crate::agent::observe::socket::connect(socket, *device, *inode) {
+            Ok(_) => SharedCodexService::Listening,
+            Err(failure) if failure.not_listening => SharedCodexService::Stopped,
+            Err(_) => SharedCodexService::Unknown,
+        },
+        _ => SharedCodexService::Unknown,
+    })
+}
+
 /// A proofless history selection can join the account's live shared daemon
 /// without retiring an old pane. This grants no replacement-writer authority:
 /// Start receives the unchanged bare descriptor and rechecks the endpoint.
@@ -1541,67 +1596,32 @@ fn prepare_shared_codex_join(host: &SharedHost, source: &Session) -> Result<bool
         &BTreeMap::new(),
         None,
     )?;
-    let Some(shared) = chat::protocol::codex::shared_daemon_socket(&process_launch) else {
-        return Ok(false);
-    };
-    use std::os::unix::fs::{FileTypeExt, MetadataExt};
-    let Ok(endpoint) = std::fs::metadata(&shared) else {
-        return Ok(false);
-    };
-    if !endpoint.file_type().is_socket() {
-        return Ok(false);
-    }
-    // Preserve Start's recorded-selector, effective account and directory
-    // checks. Constructing the adapter validates the exact thread/recipe;
-    // it neither initializes nor launches a provider.
-    super::account_lifecycle::ensure_launch(
-        host,
-        &source.launch.recipe.working_directory,
-        &source.launch.recipe.environment,
-        &Default::default(),
-        true,
-    )?;
-    super::account_lifecycle::ensure_launch_at_directory(
-        host,
-        &process_launch.recipe.working_directory,
-        &process_launch.recipe.environment,
-        &process_launch.recipe.unset_environment,
-        false,
-        None,
-    )?;
-    super::account_lifecycle::ensure_launch(
-        host,
-        &process_launch.recipe.working_directory,
-        &process_launch.recipe.environment,
-        &process_launch.recipe.unset_environment,
-        false,
-    )?;
-    let (spec, _adapter) = match chat::protocol::codex::create(&process_launch) {
-        Ok(created) => created,
-        Err(failure) => {
-            // A changed or disappearing endpoint grants no exemption from the
-            // normal ended-execution and writer proof below.
-            if !std::fs::metadata(&shared).is_ok_and(|now| {
-                now.file_type().is_socket()
-                    && now.dev() == endpoint.dev()
-                    && now.ino() == endpoint.ino()
-            }) {
-                return Ok(false);
-            }
-            return Err(error(failure));
-        }
-    };
-    // Use the constructor's verified transport, including its short symlink
-    // alias for a published path longer than sockaddr_un permits. Keep the
-    // adapter alive until the probe finishes: its Drop owns that alias.
-    Ok(match &spec.transport {
-        chat::protocol::TransportSpec::UnixWebSocket {
-            socket,
-            device,
-            inode,
-        } => crate::agent::observe::socket::connect(socket, *device, *inode).is_ok(),
-        _ => false,
-    })
+    Ok(shared_codex_service(&process_launch, || {
+        // Preserve Start's recorded-selector, effective account and directory
+        // checks before constructing/probing a potential shared transport.
+        super::account_lifecycle::ensure_launch(
+            host,
+            &source.launch.recipe.working_directory,
+            &source.launch.recipe.environment,
+            &Default::default(),
+            true,
+        )?;
+        super::account_lifecycle::ensure_launch_at_directory(
+            host,
+            &process_launch.recipe.working_directory,
+            &process_launch.recipe.environment,
+            &process_launch.recipe.unset_environment,
+            false,
+            None,
+        )?;
+        super::account_lifecycle::ensure_launch(
+            host,
+            &process_launch.recipe.working_directory,
+            &process_launch.recipe.environment,
+            &process_launch.recipe.unset_environment,
+            false,
+        )
+    })? == SharedCodexService::Listening)
 }
 
 /// Read the same execution evidence for restart and picker preparation, so
@@ -2145,8 +2165,10 @@ fn start_with_execution(
             && restart_launch.is_none()
             && !saved_history_only
             && process_launch.provider == Provider::Codex
-            && chat::protocol::codex::shared_daemon_socket(&process_launch)
-                .is_some_and(|shared| owned_listener::stopped(&shared))
+            && matches!(
+                shared_codex_service(&process_launch, || Ok(()))?,
+                SharedCodexService::Missing | SharedCodexService::Stopped
+            )
             && listeners.claim_for_unserved_thread(&mut session, &allocator) =>
         {
             process_launch.recipe.arguments = session.launch.recipe.arguments.clone();

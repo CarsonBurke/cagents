@@ -428,6 +428,188 @@ fn a_reopened_codex_thread_joins_a_long_published_shared_endpoint() {
 }
 
 #[test]
+fn a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately() {
+    const NAME: &str = "host::chat::unserved_resume_tests::a_long_stale_shared_endpoint_waits_for_its_writer_then_reopens_privately";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    use std::os::unix::fs::MetadataExt;
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    install_codex(&root);
+    let home = root.join("long-stale-account-directory-".repeat(5));
+    let writer = ThreadWriter::hold(&home);
+    let control = home.join("app-server-control");
+    std::fs::create_dir_all(&control).unwrap();
+    let published = control.join("app-server-control.sock");
+    assert!(published.as_os_str().as_encoded_bytes().len() >= 108);
+    let runtime = tempfile::tempdir_in("/tmp").unwrap();
+    let stale = runtime.path().join("stale.sock");
+    drop(UnixListener::bind(&stale).unwrap());
+    std::os::unix::fs::symlink(&stale, &published).unwrap();
+    let entry = std::fs::symlink_metadata(&published).unwrap();
+    let target = std::fs::metadata(&published).unwrap();
+    host.lock().unwrap().codex_listeners = CodexListenerRoots::at(runtime.path().into());
+    host.lock().unwrap().register_client(1);
+    let mut requested = reopened(&root);
+    requested
+        .launch
+        .recipe
+        .environment
+        .insert("CODEX_HOME".into(), home.to_str().unwrap().into());
+    let prepare = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: requested.clone(),
+        },
+    )
+    .unwrap_err();
+    assert!(prepare.retryable, "{prepare:?}");
+    assert_eq!(prepare.message, running_codex_process(std::process::id()));
+    let refused = process(
+        &host,
+        1,
+        ClientRequest::ChatStart {
+            session: requested.clone(),
+            source: None,
+            terminate_source: false,
+            execution_environment: Default::default(),
+        },
+    );
+    if refused.is_ok() {
+        crate::host::finish_chat_shutdown(&host).unwrap();
+    }
+    let refused = refused.unwrap_err();
+    assert_eq!(
+        refused.message,
+        format!(
+            "Cannot restart Codex: {}",
+            running_codex_process(std::process::id())
+        ),
+        "a refused long shared socket must reach writer proof before any server is launched"
+    );
+    assert!(refused.retryable, "{refused:?}");
+    assert!(!root.join("codex-arguments").exists());
+    assert!(host.lock().unwrap().chats.is_empty());
+    drop(writer);
+    let ServerResponse::ChatResumePrepared { session: prepared } = process(
+        &host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: requested.clone(),
+        },
+    )
+    .unwrap() else {
+        panic!("expected preparation after the writer exited")
+    };
+    let (methods, received) = mpsc::channel();
+    let (server_root, server_home) = (root.clone(), home);
+    let server = thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let arguments = loop {
+            if let Ok(arguments) = std::fs::read_to_string(server_root.join("codex-arguments")) {
+                break arguments;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no private replacement was launched after writer release"
+            );
+            thread::sleep(Duration::from_millis(10));
+        };
+        let socket = arguments
+            .lines()
+            .last()
+            .unwrap()
+            .strip_prefix("unix://")
+            .unwrap();
+        serve(UnixListener::bind(socket).unwrap(), server_home, methods);
+    });
+    let session = started(
+        process(
+            &host,
+            1,
+            ClientRequest::ChatStart {
+                session: prepared,
+                source: None,
+                terminate_source: false,
+                execution_environment: Default::default(),
+            },
+        )
+        .unwrap(),
+    );
+    resumed(&received);
+    assert!(session.owns_codex_listener());
+    assert_eq!(session.launch.session_id, requested.launch.session_id);
+    let after_entry = std::fs::symlink_metadata(&published).unwrap();
+    let after_target = std::fs::metadata(&published).unwrap();
+    assert_eq!(
+        (entry.dev(), entry.ino()),
+        (after_entry.dev(), after_entry.ino()),
+        "shared discovery is never retired"
+    );
+    assert_eq!(
+        (target.dev(), target.ino()),
+        (after_target.dev(), after_target.ino())
+    );
+    crate::host::finish_chat_shutdown(&host).unwrap();
+    server.join().unwrap();
+}
+
+#[test]
+fn an_unknown_shared_endpoint_never_grants_a_private_server() {
+    const NAME: &str = "host::chat::unserved_resume_tests::an_unknown_shared_endpoint_never_grants_a_private_server";
+    if isolated(NAME).is_some() {
+        return;
+    }
+    let (host, _, path) = fixture();
+    let root = path.parent().unwrap().to_owned();
+    install_codex(&root);
+    let home = root.join("home/.codex");
+    let _writer = ThreadWriter::hold(&home);
+    let control = home.join("app-server-control");
+    std::fs::create_dir_all(&control).unwrap();
+    let shared = control.join("app-server-control.sock");
+    host.lock().unwrap().register_client(1);
+    for looped in [false, true] {
+        if looped {
+            std::os::unix::fs::symlink(&shared, &shared).unwrap();
+        } else {
+            std::fs::write(&shared, b"not a socket").unwrap();
+        }
+        let source = reopened(&root);
+        let failure = process(
+            &host,
+            1,
+            ClientRequest::ChatPrepareResume {
+                source: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(failure.retryable, "{failure:?}");
+        assert_eq!(failure.message, running_codex_process(std::process::id()));
+        assert!(
+            process(
+                &host,
+                1,
+                ClientRequest::ChatStart {
+                    session: source,
+                    source: None,
+                    terminate_source: false,
+                    execution_environment: Default::default()
+                }
+            )
+            .is_err()
+        );
+        assert!(
+            !root.join("codex-arguments").exists(),
+            "unknown shared evidence must never become allocation authority"
+        );
+        std::fs::remove_file(&shared).unwrap();
+    }
+}
+
+#[test]
 fn a_prepared_codex_resume_rechecks_the_shared_service_before_starting() {
     const NAME: &str = "host::chat::unserved_resume_tests::a_prepared_codex_resume_rechecks_the_shared_service_before_starting";
     if isolated(NAME).is_some() {
