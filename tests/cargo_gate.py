@@ -2636,6 +2636,20 @@ class CpuPressureAdmission(TwoSlots):
         temporary.mkdir(exist_ok=True)
         registry = self.root / "start-registry"
         registry.mkdir(exist_ok=True)
+        publish_release = self.root / "release-published-refusal"
+        publish_release.unlink(missing_ok=True)
+        # Force cancellation after the atomic rename but before mv returns.
+        # Ownership must already be recorded when the shell runs its trap.
+        move = binary / "mv"
+        move.write_text(
+            "#!/usr/bin/python3\nimport pathlib,subprocess,sys,time\n"
+            "status = subprocess.call(['/usr/bin/mv', *sys.argv[1:]])\n"
+            "destination = pathlib.Path(sys.argv[-1])\n"
+            f"if not status and destination.parent == pathlib.Path({str(registry)!r}) and destination.name.startswith('wait-gate-'):\n"
+            f"    while not pathlib.Path({str(publish_release)!r}).exists(): time.sleep(0.01)\n"
+            "sys.exit(status)\n"
+        )
+        move.chmod(0o700)
         command = self.root / "start-command"
         command.unlink(missing_ok=True)
         self.report("0.00")
@@ -2687,10 +2701,12 @@ class CpuPressureAdmission(TwoSlots):
                     self.assertEqual(int(refused[0].read_text().split()[0]), process.pid)
                     self.assertFalse(command.exists())
                     process.send_signal(signal.SIGTERM)
+                    publish_release.touch()
                 else:
                     self.assertFalse(refused, "fixture with room refused admission")
                 _stdout, stderr = process.communicate(timeout=5)
             finally:
+                publish_release.touch()
                 if process.poll() is None:
                     process.send_signal(signal.SIGTERM)
                 process.communicate(timeout=5)

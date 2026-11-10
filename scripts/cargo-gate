@@ -34,7 +34,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=24
+gate_version=26
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -625,14 +625,15 @@ record_refusal() {
     [ -z "$refused_written" ] || [ $((now - refused_written)) -ge 2 ] || return 0
     refused_written=$now
     entry=$(wait_entry)
-    if { printf '%s %s %s %s\n%s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" "$build_priority" >"$entry.new" &&
-        mv -f -- "$entry.new" "$entry"; } 2>/dev/null; then
-        wait_recorded=yes
-    fi
+    # This family still owns the queue lock. Establish cleanup ownership
+    # before publishing: a signal trap can run as soon as mv returns.
+    wait_recorded=yes
+    { printf '%s %s %s %s\n%s\n' "$$" "$(start_time "$$")" "$refused_since" "$now" "$build_priority" >"$entry.new" &&
+        mv -f -- "$entry.new" "$entry"; } 2>/dev/null || :
 }
 
 forget_wait() {
-    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" 2>/dev/null || :
+    [ -z "$wait_recorded" ] || rm -f -- "$(wait_entry)" "$(wait_entry).new" 2>/dev/null || :
     wait_recorded=
 }
 
