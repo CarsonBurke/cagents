@@ -14,11 +14,9 @@ person.
 | Before/after screenshots of the native app | [`scripts/native-evidence`](development.md#native-evidence), or with `--remote fw16` from a cagents session |
 | Drive the app by hand for a while, or run several at once | [`scripts/run-development --instance NAME`](development.md#parallel-instances) |
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
-| A populated saved Claude conversation before starting a provider | `tests/fixtures/claude-resume-history.py`, described below |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
 | A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
 | A Codex app-server peer that plays scripted items | `tests/fixtures/terminal-escape-codex.py` and the peers built on its transport, such as `codex-tool-rows.py` |
-| A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
 From a terminal or chat that cagents hosts, your shell carries
@@ -52,60 +50,6 @@ directories, so nothing reaches the real desktop, daemon or provider config:
 `stop` ends all of it: the daemon first, then every process whose environment
 names the task's runtime directory or fixture HOME, which is the proof that it
 belongs to the task.
-
-## A permanent retired-actor refusal
-
-[`tests/fixtures/native-retired-ownership.py`](../tests/fixtures/native-retired-ownership.py)
-creates a deliberate saved-recipe conflict so the real daemon can refuse a
-startup permanently. Use it only in your own isolated `native-evidence` task,
-after the synthetic Claude actor has exited and normal daemon retirement has
-completed. The caller must establish that its provider process is reaped;
-the helper checks the saved retirement receipt, not kernel process liveness.
-It does not retire actors, stop processes, acquire a native lease or launch a
-provider.
-
-From the build host's genuine User shell, with the task's current fixture and
-exact invented conversation UUID:
-
-```sh
-python3 tests/fixtures/native-retired-ownership.py \
-    ~/.local/state/cev/TASK/fixture CONVERSATION_UUID
-# Exercise the pane's normal Retry once; the daemon reads the conflicted recipe.
-# Capture the diagnostic and available controls, then undo only this fault:
-python3 tests/fixtures/native-retired-ownership.py \
-    ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
-```
-
-The helper recognizes only schema 22 shared views or schema 23 normalized
-panes with descriptor format 1. It requires one current committed Claude pane
-for that exact thread, matching ownership source and proof, and a completed
-retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
-ownership row using SQLite compare-and-swap. The card, transcript, provider
-home and retirement receipt stay as they were. This is synthetic database
-fault injection, not a claim that a provider produced the conflicting recipe.
-
-Before changing the row, it exclusively creates a private mode-0600
-`fixture/original-retired-ownership.json` backup. Restore accepts only that
-helper revision's recorded original and faulted strings, the same database
-inode, owner and mode, and unchanged pane, retirement and faulted row. It
-restores that one row by compare-and-swap and writes
-`fixture/restored-retired-ownership.json`; repeated or stale restores refuse.
-Injection is once per fixture. Do not delete the backup or edit it to rearm a
-fault or get past a refusal.
-
-The SQLite change and JSON report are separate writes. If either command
-fails, inspect its backup, report and exact ownership row before taking any
-further action: a missing report does not prove the database was unchanged.
-Do not rerun blindly, overwrite the backup or relax a guard. Stop your task
-and use a fresh fixture when its state cannot be established safely.
-
-The offline checks open only invented in-memory SQLite databases or temporary
-backup files, and need neither Cargo nor a native session:
-
-```sh
-python3 tests/fixtures/native-retired-ownership.py --self-test
-python3 tests/native_retired_ownership.py -v
-```
 
 ## An offline GitHub
 
@@ -215,24 +159,6 @@ sleep 12
 evidence shot sidebar-avatar
 ```
 
-## Saved Claude history
-
-Seed a fresh private fixture with a parent-linked conversation before its first
-native start:
-
-```sh
-python3 tests/fixtures/claude-resume-history.py /path/to/private/fixture --turns 50
-python3 tests/fixtures/check-claude-resume-history.py
-```
-
-The generator writes 100 invented messages for 50 turns and prints the exact
-thread, transcript and project paths as JSON. It launches no provider and uses
-no credentials. It refuses an existing provider home and aliases of the real
-account's Claude home. Use a fresh evidence task when its provider home already
-exists. Save the stopped fixture with `native-evidence save-seed` so both sides
-restore the same transcript and physical provider-home identity, then open its
-project and choose **Resume conversation** in the app.
-
 ## Adding a provider behaviour
 
 The synthetic Claude provider reads switches from files in its config
@@ -312,3 +238,82 @@ Every refusal names its cause and the next command. The common ones:
 If a fixture fails in a way that doesn't point to the fix, that is a fixture
 bug: make the message say what is wrong and what to do, and add a test for it
 beside the others in the fixture's contract suite.
+
+## Resume and retirement fixtures
+
+| Need | Helper |
+| --- | --- |
+| A populated saved Claude conversation before starting a provider | [`tests/fixtures/claude-resume-history.py`](#saved-claude-history) |
+| A permanent startup refusal for an already retired synthetic Claude actor | [`tests/fixtures/native-retired-ownership.py`](#a-permanent-retired-actor-refusal) |
+
+### Saved Claude history
+
+Seed a fresh private fixture with a parent-linked conversation before its first
+native start:
+
+```sh
+python3 tests/fixtures/claude-resume-history.py /path/to/private/fixture --turns 50
+python3 tests/fixtures/check-claude-resume-history.py
+```
+
+The generator writes 100 invented messages for 50 turns and prints the exact
+thread, transcript and project paths as JSON. It launches no provider and uses
+no credentials. It refuses an existing provider home and aliases of the real
+account's Claude home. Use a fresh evidence task when its provider home already
+exists. Save the stopped fixture with `native-evidence save-seed` so both sides
+restore the same transcript and physical provider-home identity, then open its
+project and choose **Resume conversation** in the app.
+
+### A permanent retired-actor refusal
+
+[`tests/fixtures/native-retired-ownership.py`](../tests/fixtures/native-retired-ownership.py)
+creates a deliberate saved-recipe conflict so the real daemon can refuse a
+startup permanently. Use it only in your own isolated `native-evidence` task,
+after the synthetic Claude actor has exited and normal daemon retirement has
+completed. The caller must establish that its provider process is reaped;
+the helper checks the saved retirement receipt, not kernel process liveness.
+It does not retire actors, stop processes, acquire a native lease or launch a
+provider.
+
+From the build host's genuine User shell, with the task's current fixture and
+exact invented conversation UUID:
+
+```sh
+python3 tests/fixtures/native-retired-ownership.py \
+    ~/.local/state/cev/TASK/fixture CONVERSATION_UUID
+# Exercise the pane's normal Retry once; the daemon reads the conflicted recipe.
+# Capture the diagnostic and available controls, then undo only this fault:
+python3 tests/fixtures/native-retired-ownership.py \
+    ~/.local/state/cev/TASK/fixture CONVERSATION_UUID --restore
+```
+
+The helper recognizes only schema 22 shared views or schema 23 normalized
+panes with descriptor format 1. It requires one current committed Claude pane
+for that exact thread, matching ownership source and proof, and a completed
+retirement. It appends one `--fixture-recipe-mismatch` argument to that retired
+ownership row using SQLite compare-and-swap. The card, transcript, provider
+home and retirement receipt stay as they were. This is synthetic database
+fault injection, not a claim that a provider produced the conflicting recipe.
+
+Before changing the row, it exclusively creates a private mode-0600
+`fixture/original-retired-ownership.json` backup. Restore accepts only that
+helper revision's recorded original and faulted strings, the same database
+inode, owner and mode, and unchanged pane, retirement and faulted row. It
+restores that one row by compare-and-swap and writes
+`fixture/restored-retired-ownership.json`; repeated or stale restores refuse.
+Injection is once per fixture. Do not delete the backup or edit it to rearm a
+fault or get past a refusal.
+
+The SQLite change and JSON report are separate writes. If either command
+fails, inspect its backup, report and exact ownership row before taking any
+further action: a missing report does not prove the database was unchanged.
+Do not rerun blindly, overwrite the backup or relax a guard. Stop your task
+and use a fresh fixture when its state cannot be established safely.
+
+The offline checks open only invented in-memory SQLite databases or temporary
+backup files, and need neither Cargo nor a native session:
+
+```sh
+python3 tests/fixtures/native-retired-ownership.py --self-test
+python3 tests/native_retired_ownership.py -v
+```
