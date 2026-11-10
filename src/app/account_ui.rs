@@ -4672,7 +4672,10 @@ impl Cagents {
     /// The longest known worktree or repository root containing `directory`
     /// determines its project. This is a short in-memory scan only when
     /// starting work or drawing the Accounts pane; no filesystem query is needed.
-    fn project_for_directory(&self, directory: &Path) -> Option<(ProjectId, &str, &Path)> {
+    pub(super) fn project_for_directory(
+        &self,
+        directory: &Path,
+    ) -> Option<(ProjectId, &str, &Path)> {
         self.sidebar_model
             .projects
             .iter()

@@ -4447,6 +4447,315 @@ fn abandoned_claude_actor_resumes_only_without_a_surviving_group_member() {
     );
 }
 
+/// #2484: a retained Claude actor killed in this boot leaves no verified
+/// retirement, and its pane's Close refused every time. It closes once its
+/// helper, its provider and everything in their process groups and sessions
+/// are gone, and a survivor keeps the refusal, saying what still runs.
+#[test]
+fn a_same_boot_claude_actor_killed_without_retirement_closes_once_nothing_survives() {
+    if crate::retained_fixture::run_isolated() {
+        return;
+    }
+    let _helper_executable = retained_helper_executable();
+    const MODE: &str = "CAGENTS_ABANDONED_CLAUDE_CLOSE_TEST";
+    if std::env::var_os(MODE).is_none() {
+        for mode in ["abandoned", "survivor", "open", "paired"] {
+            let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+            let root = directory.path();
+            for path in [
+                "home/.claude",
+                "run",
+                "data",
+                "config",
+                "cache",
+                "bin",
+                "project",
+            ] {
+                fs::create_dir_all(root.join(path)).unwrap();
+            }
+            let test = thread::current().name().unwrap().to_owned();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &test, "--nocapture"])
+                .env_clear()
+                .envs(crate::retained_fixture::owner_env())
+                .env(
+                    "CAGENTS_TEST_RETAINED_ACTOR_HELPER",
+                    retained_helper_executable(),
+                )
+                .env(MODE, mode)
+                .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+                .env("CAGENTS_HOLDER_ROOT", root)
+                .env("HOME", root.join("home"))
+                .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+                .env("XDG_RUNTIME_DIR", root.join("run"))
+                .env("XDG_DATA_HOME", root.join("data"))
+                .env("XDG_CONFIG_HOME", root.join("config"))
+                .env("XDG_CACHE_HOME", root.join("cache"))
+                .env(
+                    "PATH",
+                    format!("{}:/usr/bin:/bin", root.join("bin").display()),
+                )
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "abandoned close mode={mode} failed:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        return;
+    }
+    let root = std::path::PathBuf::from(std::env::var_os("CAGENTS_HOLDER_ROOT").unwrap());
+    let mode = std::env::var(MODE).unwrap();
+    let survivor = mode == "survivor";
+    install_provider(&root.join("bin/claude"));
+    if survivor || mode == "open" {
+        fs::write(root.join("leave-survivor"), "").unwrap();
+    }
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    let proof = |incarnation| HostSessionProof {
+        host_session_id: HostSessionId::new("abandoned-close-fixture"),
+        boot_id: crate::daemon::read_boot_id().unwrap(),
+        host_incarnation: HostIncarnation::new(incarnation),
+    };
+    let first = proof("first");
+    let lease = crate::daemon::HostLease::acquire(&paths, &first).unwrap();
+    let registry_path = root.join("registry.sqlite3");
+    let mut state = HostState::new(first.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let host = Arc::new(HostLock::new(state));
+    let launch = chat::fresh_session(
+        Provider::Claude,
+        TerminalId::new(),
+        root.join("project"),
+        &crate::account::Account::system(Provider::Claude),
+    )
+    .unwrap();
+    let id = launch.id;
+    start_execution(
+        &host,
+        0,
+        launch,
+        Arc::new(chat::protocol::ExecutionContext::capture(&root.join("project")).unwrap()),
+    )
+    .unwrap();
+    let handle = host.lock().unwrap().chats[&id].handle.clone();
+    let identity = handle.actor_identity().unwrap();
+    struct Cleanup(crate::daemon::holder_registry::Record, std::path::PathBuf);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for process in [&self.0.root, &self.0.holder] {
+                if process.is_current() {
+                    unsafe {
+                        libc::kill(process.pid, libc::SIGKILL);
+                    }
+                }
+            }
+            if let Ok(pid) = fs::read_to_string(self.1.join("survivor-pid")) {
+                unsafe {
+                    libc::kill(pid.trim().parse().unwrap(), libc::SIGKILL);
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(identity.record.clone(), root.clone());
+    wait_until(
+        || handle.attachment_snapshot().ready,
+        "actor never initialized",
+    );
+    handle
+        .command(chat::Command::Prompt {
+            text: "One explicit turn before the actor is abandoned".into(),
+            attachments: Vec::new(),
+            mode: chat::PromptMode::Send,
+        })
+        .unwrap();
+    wait_until(
+        || root.join("provider-done").exists() && handle.confirmed_session_id().is_some(),
+        "fixture provider never confirmed its completed conversation",
+    );
+    let mut confirmed = None;
+    wait_until(
+        || {
+            let (response, _, _) =
+                super::super::client::process_request(&host, 17, ClientRequest::ChatList).unwrap();
+            let ServerResponse::ChatListed { sessions } = response else {
+                panic!("public metadata did not return chat inventory");
+            };
+            confirmed = sessions.into_iter().find(|session| {
+                session.id == id
+                    && session.launch.session_id.is_some()
+                    && session.launch.session_id == handle.confirmed_session_id()
+            });
+            confirmed.is_some()
+        },
+        "public inventory never published its provider-confirmed descriptor",
+    );
+    let confirmed = confirmed.unwrap();
+    if mode == "paired" {
+        // Its console is paired the way an execution console is published,
+        // and then only the helper dies, while the pane is open: nothing of
+        // the conversation runs but the console's own worker.
+        let recipe = crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.join("project"),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        };
+        host.lock()
+            .unwrap()
+            .chats
+            .get_mut(&id)
+            .unwrap()
+            .console_recipe = Some(recipe.clone());
+        let terminal =
+            crate::terminal_ipc::TerminalDescriptor::relaunchable(id, recipe.clone(), None).session;
+        let (descriptor, console) = super::super::state::spawn_terminal_view_owned(
+            &host,
+            0,
+            terminal,
+            Default::default(),
+            None,
+            true,
+        )
+        .unwrap();
+        let pair = console.holder_identity().unwrap().clone();
+        let _console = Cleanup(pair.clone(), root.clone());
+        let mut saved = host.lock().unwrap().chats[&id].session.clone();
+        saved.launch.session_id = handle.confirmed_session_id();
+        saved.terminal = Some(descriptor.session);
+        handle
+            .update_native_source(saved.clone(), Some(recipe), Some(pair.clone()))
+            .unwrap();
+        {
+            let mut state = host.lock().unwrap();
+            let record = state.chats.get_mut(&id).unwrap();
+            record.session = saved.clone();
+            record.paired_terminal = Some(console.clone());
+        }
+        retained_actor::register_ownership(&host, &handle, &saved).unwrap();
+        drop(handle);
+        unsafe { libc::kill(identity.record.holder.pid, libc::SIGKILL) };
+        wait_until(
+            || !identity.record.holder.is_current() && !identity.record.root.is_current(),
+            "the helper and its provider never exited",
+        );
+        process(&host, 0, ClientRequest::ChatClose { chat_id: id })
+            .expect_err("a dead helper answers no attached close");
+        super::close_retained_from_pane(&host, &saved)
+            .expect("a paired pane whose helper died closes when nothing of it runs");
+        let state = host.lock().unwrap();
+        assert!(state.chats.is_empty());
+        assert!(!state.terminals.contains_key(&saved.terminal.unwrap().id));
+        drop(state);
+        assert!(
+            !pair.root.is_current(),
+            "closing the pane closes its paired console"
+        );
+        return;
+    }
+    if mode == "open" {
+        // Only the helper dies, while the pane is open in this daemon. Claude
+        // reads end of input and exits after it, but the tool it started runs
+        // on in their group and session.
+        drop(handle);
+        unsafe { libc::kill(identity.record.holder.pid, libc::SIGKILL) };
+        wait_until(
+            || !identity.record.holder.is_current() && !identity.record.root.is_current(),
+            "the helper and its provider never exited",
+        );
+        // The pane's Close asks its attachment first, then the retained
+        // close; both name what runs, in the same words.
+        let attached = || process(&host, 0, ClientRequest::ChatClose { chat_id: id });
+        let close = || super::close_retained_from_pane(&host, &confirmed);
+        let refused = attached().expect_err("its provider still runs").message;
+        assert_eq!(close().expect_err("its tool still runs"), refused);
+        assert!(
+            refused.contains("is still running for this conversation"),
+            "{refused}"
+        );
+        let found = super::lost_processes(&host, &confirmed, &[]).unwrap();
+        let tool: i32 = fs::read_to_string(root.join("survivor-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|process| process.process.pid == tool && process.proved),
+            "{tool} missing from {found:?}"
+        );
+        assert_eq!(
+            super::lost_processes(&host, &confirmed, &super::shown(&found)).unwrap(),
+            []
+        );
+        attached().expect_err("a dead helper answers no attached close");
+        close().expect("an open pane whose helper died closes once nothing of it runs");
+        assert!(host.lock().unwrap().chats.is_empty());
+        return;
+    }
+    // The daemon and the actor die together without any retirement: nothing
+    // writes a receipt, as when a crash takes both down.
+    drop(handle);
+    drop(host);
+    drop(lease);
+    kill_helper_then_provider(&identity.record);
+    let next = proof("successor");
+    let _lease = crate::daemon::HostLease::acquire(&paths, &next).unwrap();
+    let mut state = HostState::new(next.clone());
+    state.enable_holder_recovery();
+    state.install_model(super::super::model::Registry::at(&registry_path).unwrap());
+    let successor = Arc::new(HostLock::new(state));
+    let registry = super::super::agent_execution::registry(&successor).unwrap();
+    assert!(
+        registry
+            .lock()
+            .unwrap()
+            .native_actor_retirement(identity.instance)
+            .unwrap()
+            .is_none(),
+        "the fixture must exercise an actor with no retirement at all"
+    );
+    let close = || super::close_retained_from_pane(&successor, &confirmed);
+    if survivor {
+        let pid: i32 = fs::read_to_string(root.join("survivor-pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let refused = close().expect_err("a process left in the provider's group still runs");
+        assert!(
+            refused.contains("is still running for this conversation"),
+            "{refused}"
+        );
+        // The pane names it as the conversation's, and the person ends it
+        // from there.
+        let found = super::lost_processes(&successor, &confirmed, &[]).unwrap();
+        assert!(
+            found
+                .iter()
+                .any(|process| process.process.pid == pid && process.proved),
+            "{found:?}"
+        );
+        assert!(
+            super::lost_processes(&successor, &confirmed, &super::shown(&found))
+                .unwrap()
+                .iter()
+                .all(|process| process.process.pid != pid)
+        );
+        wait_until(
+            || !Path::new(&format!("/proc/{pid}")).exists(),
+            "the survivor never exited",
+        );
+    }
+    close().expect("an actor proved gone closes without its retirement");
+    assert!(successor.lock().unwrap().chats.is_empty());
+}
+
 #[test]
 fn unnamed_claude_card_resumes_only_what_its_ended_actor_confirmed() {
     if crate::retained_fixture::run_isolated() {

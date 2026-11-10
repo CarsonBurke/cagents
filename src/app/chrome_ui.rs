@@ -1412,7 +1412,7 @@ const NEW_TAB_CHOICES: [(&str, &str, NewTab, &str); 4] = [
     ),
     (
         "Resume conversation",
-        "Search saved conversations across projects and accounts",
+        "Pick up an earlier conversation in this project or another",
         NewTab::Resume,
         "chrome.new-tab.resume",
     ),
@@ -1858,6 +1858,7 @@ impl Cagents {
                     && !self.adopt_daemon_health_keyboard_nav(restore)
                     && !self.adopt_automation_approval_keyboard_nav(restore)
                     && !self.adopt_session_recovery_keyboard_nav(restore)
+                    && !self.adopt_resume_keyboard_nav(restore)
                 {
                     self.core.set_keyboard_nav(restore);
                 }

@@ -1,4 +1,6 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
+#[cfg(any(feature = "host", feature = "ui"))]
+use crate::lineage_birth::LineageBirth;
 #[cfg(any(feature = "host", test))]
 use crate::model::HostSessionProof;
 #[cfg(any(feature = "host", feature = "ui", test))]
@@ -205,6 +207,8 @@ pub(crate) struct UnreadableProcess {
     start: Option<u64>,
     /// The kernel's short name for it, unless it exited during the scan.
     pub(crate) name: Option<String>,
+    /// Its unified-hierarchy cgroup, which anyone can read.
+    cgroup: Option<String>,
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
@@ -215,6 +219,27 @@ impl UnreadableProcess {
             pid,
             start: Some(start),
             name: Some(name.into()),
+            cgroup: None,
+        }
+    }
+
+    /// Whether the lineage's records rule this process out of it. See
+    /// [`crate::lineage_birth`] for why each fact does.
+    fn outside_lineage(&self, birth: &LineageBirth, namespace: Option<&str>) -> bool {
+        match birth {
+            LineageBirth::Unborn => true,
+            LineageBirth::Born {
+                since,
+                contained_in,
+            } => {
+                self.start.is_some_and(|start| start < *since)
+                    || (contained_in.is_some()
+                        && contained_in.as_deref() == namespace
+                        && self.cgroup.as_deref().is_some_and(|cgroup| {
+                            crate::lineage_birth::placement(cgroup, crate::daemon::current_uid())
+                                == crate::lineage_birth::Placement::Outside
+                        }))
+            }
         }
     }
 
@@ -274,7 +299,19 @@ pub(crate) fn surviving_process(
     proc_root: &Path,
     leave: &[UnreadableProcess],
 ) -> Result<Option<SurvivingProcess>, ScanError> {
-    scan_for_survivor(session, owner, proc_root, leave)
+    // Only the real process table goes with this instance's records.
+    let real = proc_root == Path::new("/proc");
+    scan_for_survivor(
+        session,
+        owner,
+        proc_root,
+        leave,
+        || {
+            real.then(|| crate::lineage_birth::instance_birth(session))
+                .flatten()
+        },
+        real.then(crate::lineage_birth::cgroup_namespace).flatten(),
+    )
 }
 
 /// A process shows no arguments for a moment while it execs or exits, which on a
@@ -392,6 +429,8 @@ fn scan_for_survivor(
     owner: u32,
     proc_root: &Path,
     leave: &[UnreadableProcess],
+    lineage: impl FnOnce() -> Option<LineageBirth>,
+    namespace: Option<String>,
 ) -> Result<Option<SurvivingProcess>, ScanError> {
     let table = settle(|| ProcessTable::read(proc_root)).map_err(ScanError::Incomplete)?;
     let scan = Scan::new(session, proc_root, &table);
@@ -420,6 +459,13 @@ fn scan_for_survivor(
     }
     if let Some(error) = incomplete {
         return Err(ScanError::Incomplete(error));
+    }
+    // Read after the processes, so it covers every launch that could have
+    // started one of them.
+    if !unreadable.is_empty()
+        && let Some(birth) = lineage()
+    {
+        unreadable.retain(|process| !process.outside_lineage(&birth, namespace.as_deref()));
     }
     if unreadable.is_empty() {
         Ok(None)
@@ -581,6 +627,11 @@ impl<'a> Scan<'a> {
                     pid,
                     start: self.table.starts.get(&pid).copied(),
                     name: process_name(&path),
+                    cgroup: fs::read_to_string(path.join("cgroup"))
+                        .ok()
+                        .and_then(|listing| {
+                            crate::lineage_birth::unified_cgroup(&listing).map(str::to_owned)
+                        }),
                 }));
             }
             Err(error) => return Err(process_error(error)),
@@ -2879,6 +2930,87 @@ mod tests {
             panic!("the process must be unreadable");
         };
         assert!(surviving_process(&source, u32::MAX, directory.path(), &unstarted).is_err());
+    }
+
+    /// #2365: what the lineage's records prove rules an unreadable process out,
+    /// and nothing short of that does.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_lineage_record_rules_out_only_what_it_proves() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let pid = u32::MAX - 1;
+        protected_process(directory.path(), pid, "sshd-session", pid, 100);
+        let uid = crate::daemon::current_uid();
+        let set_cgroup = |cgroup: &str| {
+            fs::write(
+                directory.path().join(pid.to_string()).join("cgroup"),
+                format!("0::{cgroup}\n"),
+            )
+            .unwrap();
+        };
+        let login = format!("/user.slice/user-{uid}.slice/session-4.scope");
+        set_cgroup(&login);
+        let ruled_out =
+            |birth: Option<LineageBirth>, namespace: Option<&str>| match scan_for_survivor(
+                &source,
+                u32::MAX,
+                directory.path(),
+                &[],
+                || birth,
+                namespace.map(str::to_owned),
+            ) {
+                Ok(None) => true,
+                Err(ScanError::Unreadable(processes)) if processes.len() == 1 => false,
+                other => panic!("{other:?}"),
+            };
+        let born = |since, contained_in: Option<&str>| {
+            Some(LineageBirth::Born {
+                since,
+                contained_in: contained_in.map(str::to_owned),
+            })
+        };
+        assert!(!ruled_out(None, Some("ns")), "no records to go by");
+        assert!(ruled_out(Some(LineageBirth::Unborn), None));
+        assert!(
+            ruled_out(born(101, None), None),
+            "started before the lineage"
+        );
+        assert!(
+            !ruled_out(born(100, None), None),
+            "the same tick isn't before"
+        );
+        assert!(
+            ruled_out(born(50, Some("ns")), Some("ns")),
+            "outside the user manager"
+        );
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("other")),
+            "another view"
+        );
+        assert!(!ruled_out(born(50, Some("ns")), None));
+        assert!(
+            !ruled_out(born(50, None), Some("ns")),
+            "a launch was outside"
+        );
+        set_cgroup(&format!(
+            "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ssh-agent.service"
+        ));
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "reachable from the lineage"
+        );
+        set_cgroup("ssh-agent.service");
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "not a path from the root"
+        );
+        fs::remove_file(directory.path().join(pid.to_string()).join("cgroup")).unwrap();
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "no cgroup to read"
+        );
+        assert!(ruled_out(born(101, Some("ns")), Some("ns")));
     }
 
     /// An `ssh-agent -D` started in another shell is in that shell's session.

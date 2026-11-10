@@ -5,6 +5,8 @@ pub(crate) mod child_reaper;
 pub(crate) mod holder_registry;
 pub(crate) mod hosting;
 #[cfg(feature = "host")]
+pub(crate) mod lost_processes;
+#[cfg(feature = "host")]
 pub(crate) mod owned_children;
 #[cfg(feature = "host")]
 pub(crate) mod process_scope;
