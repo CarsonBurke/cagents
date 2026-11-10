@@ -619,10 +619,13 @@ impl Cagents {
         if held.is_empty() {
             return Task::none();
         }
-        // Discovering every local scope is only useful when an unopened held
-        // candidate needs that admission proof. Opening panes already bypass
-        // this barrier. Resolve it before releases mutate attached custody.
-        let needs_scope_admission = held.iter().any(|(_, _, opening, _)| !opening);
+        // Only an unlisted unopened candidate can release its custody after
+        // global admission. Listed passive panes perform no release work, and
+        // opening panes already bypass this barrier. Resolve the proof before
+        // any release mutates attached custody.
+        let needs_scope_admission = held
+            .iter()
+            .any(|(card, _, opening, _)| !opening && !self.listed_in_registry(*card));
         let views_settled = !needs_scope_admission
             || self.shared_views.registry_unavailable
             || self.shared_views_ready_for_startup();
@@ -4983,6 +4986,9 @@ mod tests {
             if let CardKind::Browser(browser) = &mut saved.kind {
                 browser.id = BrowserId::new();
             }
+            if index == 1 {
+                saved.kind = moving_terminal_kind();
+            }
             if index < 83 {
                 let path = PathBuf::from(format!("/repo/open-{index}"));
                 let scope = Scope::Worktree {
@@ -4998,11 +5004,20 @@ mod tests {
                 Arc::make_mut(&mut app.durable)
                     .card_scopes
                     .insert(saved.id, path);
-                app.cards.insert(saved.id, CardRuntime::Completed);
+                if index == 1 {
+                    app.cards.insert(saved.id, CardRuntime::Loading);
+                    app.shared_views.attached.insert(saved.id);
+                } else {
+                    app.cards.insert(saved.id, CardRuntime::Completed);
+                }
             } else {
                 saved.existence = super::super::project_ui::removed_existence("historical fixture");
             }
+            let id = saved.id;
             Arc::make_mut(&mut app.durable).cards.push(saved);
+            if index == 1 {
+                app.register_presence(id, Exposure::Offscreen, Residency::Cold);
+            }
         }
         while app.workspace_model.views.len() < 1_856 {
             app.workspace_model.views.push(View::empty(Scope::Worktree {
@@ -5017,6 +5032,7 @@ mod tests {
         let residency = app.residency(pane.id).clone();
         let exposure = app.exposure(pane.id);
         app.shared_views.pane_attachment_count = 0;
+        let listed_passive = app.durable.cards[1].id;
         let history = app.durable.cards[1..].to_vec();
         let views = app.workspace_model.views[2..].to_vec();
         let update = presentation_edge(&app, Scope::Channel(source), 21, "Remote label", 0.72);
@@ -5052,6 +5068,138 @@ mod tests {
         assert_eq!(app.exposure(pane.id), exposure);
         assert_eq!(app.shared_views.pane_attachment_count, 0);
         assert!(!app.terminal_start_in_flight(pane.id));
+        assert!(matches!(
+            app.cards.get(&listed_passive),
+            Some(CardRuntime::Loading)
+        ));
+        assert_eq!(app.residency(listed_passive), &Residency::Cold);
+        assert!(app.shared_views.attached.contains(&listed_passive));
+        assert!(!app.saved_terminals.entries.contains_key(&listed_passive));
+        assert!(!app.terminal_start_in_flight(listed_passive));
+    }
+
+    fn listed_passive_release_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
+        let (mut app, channel, other, mut pane) = fixture();
+        pane.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: pane.id,
+            generation: 0,
+            title: pane.title.clone(),
+            width_fraction: pane.width_fraction,
+            existence: Existence::Open,
+            kind: pane.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == channel)
+            .unwrap()
+            .cards
+            .push(pane.id);
+        app.workspace_model.views.push(View {
+            scope: Scope::Channel(channel),
+            revision: 1,
+            panes: vec![pane.clone()],
+            retired: vec![],
+        });
+        app.cards.insert(pane.id, CardRuntime::Loading);
+        app.register_presence(pane.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(pane.id);
+        app.shared_views
+            .initialized
+            .remove(&Scope::Channel(channel));
+        (app, channel, other, pane)
+    }
+
+    #[test]
+    fn presentation_release_of_a_listed_passive_terminal_needs_no_global_admission() {
+        for retired in [false, true] {
+            let (mut app, channel, _, pane) = listed_passive_release_fixture();
+            if retired {
+                app.workspace_model.views[0].retired.push(pane.id);
+            }
+            let durable = app.durable.clone();
+            let attached = app.shared_views.attached.clone();
+            let runtime = app.cards.get(&pane.id).unwrap() as *const CardRuntime;
+            app.shared_views.scope_discovery_count.set(0);
+            let task = app.release_held_terminals();
+            assert!(cosmic::iced::runtime::task::into_stream(task).is_none());
+            assert_eq!(app.shared_views.scope_discovery_count.get(), 0);
+            assert!(
+                !app.shared_views
+                    .initialized
+                    .contains(&Scope::Channel(channel))
+            );
+            assert!(Arc::ptr_eq(&durable, &app.durable));
+            assert_eq!(app.shared_views.attached, attached);
+            assert_eq!(
+                app.cards.get(&pane.id).unwrap() as *const CardRuntime,
+                runtime
+            );
+            assert!(matches!(
+                app.cards.get(&pane.id),
+                Some(CardRuntime::Loading)
+            ));
+            assert_eq!(app.residency(pane.id), &Residency::Cold);
+            assert!(app.saved_terminals.entries.is_empty());
+            assert!(app.restored_agent_attaches.is_empty());
+            assert!(!app.terminal_start_in_flight(pane.id));
+            assert!(app.durable.pending_terminal_creations.is_empty());
+        }
+    }
+
+    #[test]
+    fn presentation_listed_passive_terminal_does_not_bypass_an_unlisted_cold_barrier() {
+        let (mut app, channel, other, listed) = listed_passive_release_fixture();
+        let mut unlisted = listed.clone();
+        unlisted.id = CardId::new();
+        unlisted.kind = moving_terminal_kind();
+        Arc::make_mut(&mut app.durable).cards.push(CardState {
+            id: unlisted.id,
+            generation: 0,
+            title: unlisted.title.clone(),
+            width_fraction: unlisted.width_fraction,
+            existence: Existence::Open,
+            kind: unlisted.kind.clone(),
+        });
+        Arc::make_mut(&mut app.durable)
+            .channels
+            .iter_mut()
+            .find(|row| row.id == other)
+            .unwrap()
+            .cards
+            .push(unlisted.id);
+        app.cards.insert(unlisted.id, CardRuntime::Loading);
+        app.register_presence(unlisted.id, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(unlisted.id);
+        let listed_runtime = app.cards.get(&listed.id).unwrap() as *const CardRuntime;
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(app.shared_views.attached.contains(&listed.id));
+        assert!(app.shared_views.attached.contains(&unlisted.id));
+        assert!(app.saved_terminals.entries.is_empty());
+        assert!(!app.terminal_start_in_flight(listed.id));
+        assert!(!app.terminal_start_in_flight(unlisted.id));
+
+        app.shared_views.initialized.insert(Scope::Channel(channel));
+        app.shared_views.scope_discovery_count.set(0);
+        drop(app.release_held_terminals());
+        assert_eq!(app.shared_views.scope_discovery_count.get(), 1);
+        assert!(app.shared_views.attached.contains(&listed.id));
+        assert!(!app.shared_views.attached.contains(&unlisted.id));
+        assert!(!app.saved_terminals.entries.contains_key(&listed.id));
+        assert!(app.saved_terminals.entries.contains_key(&unlisted.id));
+        assert_eq!(
+            app.cards.get(&listed.id).unwrap() as *const CardRuntime,
+            listed_runtime
+        );
+        assert_eq!(app.residency(listed.id), &Residency::Cold);
+        assert_eq!(app.residency(unlisted.id), &Residency::Hibernated);
+        assert!(!app.terminal_start_in_flight(listed.id));
+        assert!(app.durable.pending_terminal_creations.is_empty());
+        assert_eq!(app.card_state(listed.id).unwrap().kind, listed.kind);
+        assert_eq!(app.card_state(unlisted.id).unwrap().kind, unlisted.kind);
     }
 
     #[test]
