@@ -1425,6 +1425,12 @@ impl Cagents {
                         .into_iter()
                         .filter(|pane| !self.durable.pending_terminal_creations.contains(&pane.id))
                         .collect::<Vec<_>>();
+                    tracing::debug!(
+                        ?scope,
+                        panes = legacy.len(),
+                        closed = closed.len(),
+                        "Migrating a local workspace view"
+                    );
                     self.publish_model_edit(ModelEdit::SeedView {
                         scope: scope.clone(),
                         panes: legacy.clone(),
@@ -1677,10 +1683,12 @@ impl Cagents {
         }
     }
 
-    /// An existing empty host view with no local members has nothing to
-    /// migrate. Its snapshot already supplies authority; sending an empty seed
-    /// would only generate another complete-model receipt and reconciliation.
-    fn admit_existing_empty_views(&mut self) {
+    /// A full canonical snapshot already supplies view authority. A seed is
+    /// needed only when local migration could change that view, not as a
+    /// per-client handshake. Keep exact membership and field equality here:
+    /// omitted defaults/retained cards and uncommitted intentions must still
+    /// take the ordinary migration path.
+    fn admit_existing_views_without_migration(&mut self) {
         if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
             return;
         }
@@ -1688,9 +1696,9 @@ impl Cagents {
             .workspace_model
             .views
             .iter()
-            .filter(|view| {
-                view.panes.is_empty()
-                    && !self.shared_views.initialized.contains(&view.scope)
+            .enumerate()
+            .filter(|(_, view)| {
+                !self.shared_views.initialized.contains(&view.scope)
                     && !self.shared_views.seeding.contains(&view.scope)
                     && !self.shared_views.blocked.contains(&view.scope)
                     && self
@@ -1699,29 +1707,16 @@ impl Cagents {
                         .get(&view.scope)
                         .is_none_or(Vec::is_empty)
             })
-            .map(|view| view.scope.clone())
+            .map(|(index, view)| (index, view.scope.clone()))
             .collect::<Vec<_>>();
         if candidates.is_empty() {
             return;
         }
-        // Resolve membership once, without building any Pane descriptors.
-        let ScopeDiscovery {
-            scopes,
-            worktree_cards,
-        } = self.discover_view_scopes();
-        let available = scopes.into_iter().collect::<HashSet<_>>();
-        let occupied_worktrees = worktree_cards
-            .into_iter()
-            .filter(|(card, _)| card.existence.is_open() && !card.kind.is_utility())
-            .map(|(_, path)| path.to_owned())
-            .collect::<HashSet<_>>();
-        let occupied_channels = self
-            .durable
-            .channels
-            .iter()
-            .filter(|channel| !channel.cards.is_empty())
-            .map(|channel| channel.id)
-            .collect::<HashSet<_>>();
+        // Eligibility must see an active strip's current order/focus, not the
+        // preceding durable snapshot. This is one immutable eligibility pass;
+        // canonical projection below gets its own fresh publication baseline.
+        self.snapshot_workspace_scope();
+        let projected = self.local_views();
         let mut pending_scopes = HashSet::new();
         for (_, source, change) in &self.shared_views.pending {
             pending_scopes.insert(source.clone());
@@ -1729,23 +1724,42 @@ impl Cagents {
                 pending_scopes.insert(destination.clone());
             }
         }
-        for scope in candidates {
-            if !available.contains(&scope) || pending_scopes.contains(&scope) {
-                continue;
-            }
-            let occupied = match &scope {
-                Scope::Channel(id) => occupied_channels.contains(id),
-                Scope::Worktree { path, .. } => occupied_worktrees.contains(path),
-            };
-            if occupied
+        let candidate_count = candidates.len();
+        let mut admitted = 0;
+        for (index, scope) in candidates {
+            if pending_scopes.contains(&scope)
                 || matches!(&scope, Scope::Channel(id)
-                if self.channel_ui.was_deleted(*id) || self.channel_ui.is_deleting(*id))
+                    if self.channel_ui.was_deleted(*id) || self.channel_ui.is_deleting(*id))
             {
                 continue;
             }
-            self.shared_views.baseline.insert(scope.clone(), Vec::new());
+            let (Some(members), Some(panes)) =
+                (projected.cards.get(&scope), projected.panes.get(&scope))
+            else {
+                continue;
+            };
+            if !members.iter().copied().eq(panes.iter().map(|pane| pane.id))
+                || *panes != self.workspace_model.views[index].panes
+            {
+                continue;
+            }
+            self.shared_views.attached.extend(
+                panes
+                    .iter()
+                    .filter(|pane| matches!(pane.kind, CardKind::Chat(_)))
+                    .map(|pane| pane.id),
+            );
+            self.shared_views
+                .baseline
+                .insert(scope.clone(), panes.clone());
             self.shared_views.initialized.insert(scope);
+            admitted += 1;
         }
+        tracing::debug!(
+            admitted,
+            candidates = candidate_count,
+            "Admitted existing workspace views without migration"
+        );
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
@@ -1754,7 +1768,7 @@ impl Cagents {
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
         self.shared_views.prune_restoration_requests(&self.durable);
-        self.admit_existing_empty_views();
+        self.admit_existing_views_without_migration();
         // A delayed tombstone must not borrow a newer local actor's identity.
         // Record only raw authoritative panes, never the pending overlay below.
         let local_cards = self
@@ -4512,6 +4526,72 @@ mod tests {
     }
 
     #[test]
+    fn an_exact_populated_view_does_not_need_a_migration_receipt() {
+        let (mut app, source, _, pane) = channel_move_fixture();
+        let scope = Scope::Channel(source);
+        app.shared_views.initialized.remove(&scope);
+        app.shared_views.baseline.remove(&scope);
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        assert!(app.shared_views.initialized.contains(&scope));
+        assert_eq!(app.card_state(pane.id).unwrap().kind, pane.kind);
+        assert!(!std::iter::from_fn(|| rx.try_recv().ok()).any(
+            |edit| matches!(edit, ModelEdit::SeedView { scope: seeded, .. } if seeded == scope)
+        ));
+    }
+
+    #[test]
+    fn populated_admission_checks_the_current_strip_order_before_equality() {
+        let (mut app, source, _, pane) = channel_move_fixture();
+        let mut next = pane.clone();
+        next.id = CardId::new();
+        if let CardKind::Browser(browser) = &mut next.kind {
+            browser.id = BrowserId::new();
+        }
+        let scope = Scope::Channel(source);
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == scope)
+            .unwrap()
+            .panes
+            .push(next.clone());
+        drop(app.reconcile_shared_views());
+        app.shared_views.initialized.remove(&scope);
+        app.shared_views.baseline.remove(&scope);
+        let _ = app.workspace.reorder(next.id, 0).unwrap();
+        let (tx, rx) = async_channel::unbounded();
+        app.workspace_model_tx = tx;
+        drop(app.reconcile_shared_views());
+        assert!(!app.shared_views.initialized.contains(&scope));
+        assert_eq!(
+            app.workspace.order().collect::<Vec<_>>(),
+            [next.id, pane.id]
+        );
+        assert!(std::iter::from_fn(|| rx.try_recv().ok()).any(|edit|
+            matches!(edit, ModelEdit::SeedView { scope: seeded, panes, .. }
+                if seeded == scope && panes.iter().map(|pane| pane.id).collect::<Vec<_>>() == [next.id, pane.id])));
+    }
+
+    #[test]
+    fn populated_admission_does_not_substitute_logical_source_equality() {
+        let (mut app, source, _, pane) = channel_move_fixture();
+        let scope = Scope::Channel(source);
+        app.shared_views.initialized.remove(&scope);
+        app.shared_views.baseline.remove(&scope);
+        let CardKind::Browser(browser) = &mut app.card_state_mut(pane.id).unwrap().kind else {
+            panic!("browser fixture")
+        };
+        browser.current_url = "https://example.test/changed".parse().unwrap();
+        app.admit_existing_views_without_migration();
+        assert!(!app.shared_views.initialized.contains(&scope));
+        app.shared_views.retained.insert(pane.id);
+        app.admit_existing_views_without_migration();
+        assert!(!app.shared_views.initialized.contains(&scope));
+    }
+
+    #[test]
     fn authoritative_empty_views_do_not_round_trip_an_empty_migration() {
         let (mut app, existing, absent, _) = fixture();
         app.shared_views.initialized.clear();
@@ -4553,7 +4633,7 @@ mod tests {
             destination.clone(),
             Change::Remove { id: CardId::new() },
         ));
-        app.admit_existing_empty_views();
+        app.admit_existing_views_without_migration();
         assert!(
             !app.shared_views.initialized.contains(&source),
             "local member still needs migration"
@@ -4565,7 +4645,7 @@ mod tests {
         assert_eq!(app.local_view_cards(&source), vec![pane.id]);
         app.shared_views.pending.clear();
         app.shared_views.seeding.insert(destination.clone());
-        app.admit_existing_empty_views();
+        app.admit_existing_views_without_migration();
         assert!(
             !app.shared_views.initialized.contains(&destination),
             "an in-flight seed still owns its barrier"
@@ -4605,7 +4685,7 @@ mod tests {
             app.local_view_panes(&scope).is_empty(),
             "default is withheld from pane publication"
         );
-        app.admit_existing_empty_views();
+        app.admit_existing_views_without_migration();
         assert!(
             !app.shared_views.initialized.contains(&scope),
             "membership preserves the default's seed barrier"
@@ -4619,7 +4699,7 @@ mod tests {
         app.shared_views.initialized.clear();
         app.workspace_model.identity = crate::workspace_model::NO_REGISTRY;
         app.workspace_model.views = vec![View::empty(scope.clone())];
-        app.admit_existing_empty_views();
+        app.admit_existing_views_without_migration();
         assert!(!app.shared_views.initialized.contains(&scope));
     }
 
