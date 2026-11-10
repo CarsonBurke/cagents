@@ -1665,8 +1665,8 @@ fn what_a_warm_hidden_chat_holds() {
 /// when the frame showing it is drawn, not when the whole history is.
 ///
 /// Each policy runs on its own thread, so it gets its own parser pool:
-/// arrival order with two parsers is what main shipped; ranking and the
-/// parser count are then each varied alone.
+/// arrival order with two parsers is what main shipped; ranking, then the
+/// parser count with ranking, are varied.
 #[test]
 #[ignore = "a measurement, not a check; see the module documentation"]
 fn a_cold_open_parses_what_is_read_first() {
@@ -1675,7 +1675,7 @@ fn a_cold_open_parses_what_is_read_first() {
         ("16 exchanges", transcript(16)),
         ("16 exchanges delegating to agents", delegating(16)),
     ] {
-        for (parsers, ranked) in [(2, false), (2, true), (8, false), (8, true)] {
+        for (parsers, ranked) in [(2, false), (2, true), (4, true), (8, true)] {
             let items = items.clone();
             std::thread::Builder::new()
                 .stack_size(32 << 20)
@@ -1741,6 +1741,8 @@ fn cold_open(items: Vec<chat::Item>, cycles: usize, parsers: usize, ranked: bool
         mut burst,
     ] = std::array::from_fn(|_| Stage::default());
     let mut largest = 0;
+    // The installs and frame of each update, by how many outputs it installed.
+    let mut by_outputs = std::collections::BTreeMap::<usize, Stage>::new();
     for cycle in 0..cycles + 2 {
         let mut pane = Pane::cold(items.clone());
         // The first paint, of placeholders, before any parser is done.
@@ -1816,6 +1818,11 @@ fn cold_open(items: Vec<chat::Item>, cycles: usize, parsers: usize, ranked: bool
                 stall.0.push(update.installing + update.framing);
                 burst.0.push(update.installing);
                 largest = largest.max(update.outputs);
+                by_outputs
+                    .entry(update.outputs)
+                    .or_default()
+                    .0
+                    .push(update.installing + update.framing);
             }
         }
     }
@@ -1833,4 +1840,10 @@ fn cold_open(items: Vec<chat::Item>, cycles: usize, parsers: usize, ranked: bool
     burst.report("installs per UI update");
     stall.report("installs + frame per UI update");
     println!("    at most {largest} outputs installed in one update");
+    for (outputs, stage) in &mut by_outputs {
+        stage.report(&format!(
+            "installs + frame of {} updates installing {outputs}",
+            stage.0.len()
+        ));
+    }
 }
