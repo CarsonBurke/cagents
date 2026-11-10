@@ -1,7 +1,10 @@
 //! Upgrade-only access to an authenticated source daemon. Ordinary application
 //! clients continue to require a fully matched protocol.
+mod turns;
 pub(crate) mod v56;
 mod v77;
+
+pub(super) use turns::TurnReview;
 
 use super::{UpdateError, impact, invalid};
 use crate::{
@@ -436,6 +439,7 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "chat_listed",
             "chat_attached",
             "chat_snapshot",
+            "chat_update",
             "chat_closed",
             "chat_snapshot",
             "detached",

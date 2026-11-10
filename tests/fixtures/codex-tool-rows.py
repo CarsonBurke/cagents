@@ -41,6 +41,8 @@ def items(child):
                   "arguments": None}
     collab = {"type": "collabAgentToolCall", "senderThreadId": "", "receiverThreadIds": [child],
               "agentsStates": {child: {"status": "running", "agentNickname": "Quinn"}}}
+    settled_collab = {**collab, "agentsStates": {
+        child: {"status": "completed", "agentNickname": "Quinn"}}}
     return [
         ({**mcp, "id": "mcp", "status": "inProgress"},
          {**mcp, "id": "mcp", "status": "completed",
@@ -60,10 +62,10 @@ def items(child):
           "output": "Notes: keep the copy control beside the header."}),
         ({**collab, "id": "message", "tool": "sendMessage", "prompt": "Check the docs too.",
           "status": "inProgress"},
-         {**collab, "id": "message", "tool": "sendMessage", "prompt": "Check the docs too.",
+         {**settled_collab, "id": "message", "tool": "sendMessage", "prompt": "Check the docs too.",
           "status": "completed"}),
         ({**collab, "id": "interrupt", "tool": "interruptAgent", "status": "inProgress"},
-         {**collab, "id": "interrupt", "tool": "interruptAgent", "status": "interrupted"}),
+         {**settled_collab, "id": "interrupt", "tool": "interruptAgent", "status": "interrupted"}),
         ({"id": "sleep", "type": "sleep", "durationMs": 30_000},
          {"id": "sleep", "type": "sleep", "durationMs": 30_000}),
         ({"id": "activity", "type": "subAgentActivity", "kind": "started",
@@ -88,13 +90,26 @@ class Scenario:
     def __init__(self):
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
+        self.child_latest = None
 
     def metadata(self, thread):
         child = thread == self.child
+        latest = self.child_latest if child else self.latest
         return {"id": thread, "name": "Child review" if child else "Offline tool rows",
                 "parentThreadId": self.thread if child else None,
                 "agentNickname": "Quinn" if child else None,
-                "status": {"type": "idle"}, "canAcceptDirectInput": not child}
+                "status": {"type": "active" if latest and latest["status"] == "inProgress"
+                           else "idle"}, "canAcceptDirectInput": not child}
+
+    def observe(self, notification):
+        """Publish lifecycle state only as its corresponding frame is sent."""
+        if notification.get("method") not in ("turn/started", "turn/completed"):
+            return
+        params = notification["params"]
+        if params["threadId"] == self.thread:
+            self.latest = params["turn"]
+        elif params["threadId"] == self.child:
+            self.child_latest = params["turn"]
 
     def notifications(self, turn):
         def notify(method, **params):
@@ -107,12 +122,19 @@ class Scenario:
         diff = notify("turn/diff/updated", turnId=turn,
                       diff="diff --git a/README.md b/README.md\n@@ -1 +1 @@\n-old\n+new\n")
         settled = [end for _, end in items(self.child)]
-        self.latest = {"id": turn, "status": "completed", "items": settled}
+        finished = {"id": turn, "status": "completed", "items": settled}
         answer = {"id": "answer", "type": "agentMessage", "text": "Done.", "phase": None}
         return [notify("turn/started", turn={"id": turn, "status": "inProgress", "items": []}),
+                notify("turn/started", threadId=self.child,
+                       turn={"id": f"{turn}-child", "status": "inProgress", "items": []}),
                 *started, diff, {"_sleep": PAUSE}, *completed,
+                # A subAgentActivity item only renders a row. The child needs
+                # its own lifecycle receipt, as an actual app-server sends.
+                notify("turn/completed", threadId=self.child,
+                       turn={"id": f"{turn}-child", "status": "completed", "items": []}),
+                notify("thread/status/changed", threadId=self.child, status={"type": "idle"}),
                 notify("item/completed", turnId=turn, item=answer),
-                notify("turn/completed", turn={**self.latest,
+                notify("turn/completed", turn={**finished,
                                                "items": [*settled, answer]})]
 
     def request(self, frame, codex_home):
@@ -127,7 +149,7 @@ class Scenario:
             thread = params.get("threadId", self.thread)
             if thread not in (self.thread, self.child):
                 return [{"id": identifier, "error": {"code": -32602, "message": "Unknown fixture thread"}}]
-            latest = self.latest if thread == self.thread else None
+            latest = self.latest if thread == self.thread else self.child_latest
             result = {"thread": self.metadata(thread), "model": "fixture-mini",
                       "approvalPolicy": "on-request", "sandbox": {"type": "readOnly"},
                       "initialTurnsPage": {"data": [latest] if latest else [], "nextCursor": None}}
@@ -139,8 +161,15 @@ class Scenario:
         elif method == "thread/list":
             result = {"data": [self.metadata(self.child)], "nextCursor": None}
         elif method == "thread/turns/list":
-            latest = self.latest if params.get("threadId") == self.thread else None
+            latest = self.latest if params.get("threadId") == self.thread else self.child_latest
             result = {"data": [latest] if latest else [], "nextCursor": None}
+        elif method == "thread/prediction/request":
+            # Prediction is optional; a successful request can produce no next
+            # prompt. Keep the response and its notification on the real wire.
+            result = {}
+            after = [{"method": "thread/prediction/updated", "params": {
+                "threadId": params["threadId"], "sourceTurnId": params["sourceTurnId"],
+                "result": {"type": "completed", "text": None}}}]
         elif method in ("skills/list", "thread/queue/list"):
             result = {"data": [], "nextCursor": None}
         elif method == "account/read":
@@ -150,6 +179,8 @@ class Scenario:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
+            self.latest = result["turn"]
+            self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
             after = self.notifications(turn)
         elif method in ("thread/unsubscribe", "turn/interrupt"):
             result = {}
@@ -181,6 +212,8 @@ def serve(connection, codex_home, scenario, request_lock):
                 if "_sleep" in response:
                     time.sleep(response["_sleep"])
                     continue
+                with request_lock:
+                    scenario.observe(response)
                 with send:
                     connection.sendall(transport.frame(response))
         if any("_sleep" in response for response in responses):
