@@ -851,6 +851,7 @@ pub(super) fn announce(host: &SharedHost, registry: &SharedRegistry) {
                 EXECUTION_CLIENT,
                 sequence,
                 &crate::workspace_model::ModelEdit::AgentsChanged,
+                &Default::default(),
             );
     }
     super::automations::wake(host);

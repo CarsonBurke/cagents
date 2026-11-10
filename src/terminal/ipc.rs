@@ -216,7 +216,14 @@ use crate::{
 /// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
 /// which reaches every chat subscriber unasked. 157 to 159 are reserved for
 /// parallel branches and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 160;
+/// Version 161 adds the effects of an edit to `WorkspaceModelEdited`: each
+/// scope's revision before and after it, the panes it closed and the channel
+/// and agent rows it changed, so a window applies a view edge to its copy
+/// instead of reading the whole model. It appends `ReadWorkspaceView` and its
+/// `WorkspaceView` reply for the one scope a window cannot apply an edge to.
+/// The edge changed shape in place, so an older client is refused the watch
+/// that delivers it.
+pub const PROTOCOL_VERSION: u16 = 161;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -594,6 +601,12 @@ pub enum ClientRequest {
     WatchConversationPullRequests {
         conversation: TerminalId,
     },
+    /// Read one scope of the shared model, for a watcher that cannot apply an
+    /// edge to the copy it holds. Answered with
+    /// [`ServerResponse::WorkspaceView`].
+    ReadWorkspaceView {
+        scope: crate::workspace_model::views::Scope,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -783,10 +796,14 @@ pub enum ServerMessage {
     /// The edit travels rather than the whole model so an edge stays the size
     /// of what changed, and `sequence` is the registry's value after applying
     /// it, which is what lets a receiver tell an edge it has already seen from
-    /// one it has not.
+    /// one it has not. `effects` names each scope the edit changed with its
+    /// revision before and after, the panes it closed, and the channel and
+    /// agent rows it changed beyond what the edit says, so a receiver can
+    /// apply the edit to its copy instead of reading the model.
     WorkspaceModelEdited {
         sequence: u64,
         edit: crate::workspace_model::ModelEdit,
+        effects: crate::workspace_model::delta::EditEffects,
     },
     /// What a native chat's provider reported about the account the chat runs
     /// on, delivered to every subscriber whatever its visibility. It names no
@@ -945,6 +962,12 @@ pub enum ServerResponse {
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
     StartupState(StartupState),
+    /// One scope of the shared model and the model sequence it is consistent
+    /// with. `view` is `None` when the registry has no such scope.
+    WorkspaceView {
+        view: Option<crate::workspace_model::views::View>,
+        sequence: u64,
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.

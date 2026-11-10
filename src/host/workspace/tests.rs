@@ -183,7 +183,7 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     if let Ok(applied) = &applied {
         host.lock()
             .unwrap()
-            .announce_model_edit(1, applied.model.sequence, &edit);
+            .announce_model_edit(1, applied.model.sequence, &edit, &applied.effects);
     }
     resume.send(()).unwrap();
     let observed = observer.join().unwrap().unwrap();
@@ -191,7 +191,7 @@ fn watching_before_snapshot_cannot_lose_a_concurrent_execution_writer_edge() {
     delivery.close_after_drain();
     let edges = std::iter::from_fn(|| delivery.pop())
         .filter_map(|envelope| match envelope.message {
-            ServerMessage::WorkspaceModelEdited { sequence, edit } => Some((sequence, edit)),
+            ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => Some((sequence, edit)),
             _ => None,
         })
         .collect::<Vec<_>>();

@@ -839,7 +839,7 @@ impl HostState {
         }
         let applied = super::workspace::apply(self.registry()?, &edit)?;
         if applied.changed {
-            self.announce_model_edit(origin, applied.sequence, &edit);
+            self.announce_model_edit(origin, applied.sequence, &edit, &applied.effects);
         }
         Ok(applied.model)
     }
@@ -854,7 +854,13 @@ impl HostState {
     /// broadcast, because a redraw broadcast returns early for a subscriber that
     /// is not visible and a sidebar edge is not a repaint - a hidden window that
     /// missed one would show a channel that no longer exists until it restarted.
-    pub(super) fn announce_model_edit(&self, origin: ClientId, sequence: u64, edit: &ModelEdit) {
+    pub(super) fn announce_model_edit(
+        &self,
+        origin: ClientId,
+        sequence: u64,
+        edit: &ModelEdit,
+        effects: &crate::workspace_model::delta::EditEffects,
+    ) {
         for client_id in &self.model_watchers {
             if *client_id == origin {
                 continue;
@@ -865,6 +871,7 @@ impl HostState {
                     ServerMessage::WorkspaceModelEdited {
                         sequence,
                         edit: edit.clone(),
+                        effects: effects.clone(),
                     },
                 ));
             }

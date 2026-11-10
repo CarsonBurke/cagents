@@ -319,15 +319,43 @@ one would let a diverged window copy re-insert a closed pane.
 
 ### Subscribers get deltas
 
-`ServerMessage::WorkspaceModelEdited` already carries the edit. It gains the
-resulting revision of every scope the edit changed, and the ids it closed, so
-windows keep a closed-identity set for adoption checks without loading
-history. A window applies a
-`ChangeView` delta to its in-memory model when the delta's base revision equals
-the scope's revision it holds; otherwise it reads that one scope
-(`ReadWorkspaceView { scope }`). Only a changed registry identity or a lost
-connection triggers a full model read. Model reads use one query over `panes`
-ordered by `(scope, position)`, not one query per scope.
+`ServerMessage::WorkspaceModelEdited` carries the edit and its effects
+(`workspace_model::delta::EditEffects`): every scope whose revision the edit
+changed, with its revision before and after (`None` before for a scope the
+edit created, `None` after for one it deleted), the ids it closed, and the
+channel rows and agent records it changed in ways the edit does not say (a
+new primary conversation resetting an automatic title, a conversation title
+suggestion, a transferred agent's placement). A transfer names its source and
+its destination; deleting a channel or closing a project names every scope it
+removed and every pane in them. The edge is the same message for every
+subscriber; only the window that made the edit also gets the full model in
+its reply.
+
+Revisions come from one model-wide clock, so they are not consecutive per
+scope and an edge needs both. The window's observer keeps a copy of every
+view (`delta::Mirror`). It applies a `ChangeView` edge with `View::apply` (or
+`views::transfer`) when the revision it holds is the edge's pre-edit
+revision and its result closes exactly the ids the daemon named; otherwise it
+reads that one scope (`ReadWorkspaceView { scope }`, answered with the view
+and the model sequence it is consistent with). A `SeedView`, or a change
+into a scope the edit created, is always read: the daemon may have registered
+the scope while refusing a pane another view holds. The observer hands the UI
+complete views, which it installs by revision, so a view read past an edge
+is never rewound by it; a snapshot older than an applied edge no longer
+replaces its views.
+
+A full model read remains for a new connection or registry identity, a
+created channel (its rank is the registry's), navigation reorders and resets
+(the settled ordering), an emptied channel's retirement (its canonical work
+evidence), and `AgentsChanged`: the execution service adopts, rebinds and
+retires agents' panes and announces only that agents changed, so that edge
+names no scope. The publisher's own `EditWorkspaceModel` reply still carries
+the full model. Model reads use one query over `panes` ordered by
+`(scope, position)`, not one query per scope.
+
+The closed ids are checked against the window's copy but not yet kept as a
+closed-identity set: each view's `retired` list still serves adoption checks
+until closed history moves into the daemon (stage 5).
 
 ### Windows write only what changed
 

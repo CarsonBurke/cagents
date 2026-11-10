@@ -55,7 +55,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 160,
+    proven_at: 161,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -72,6 +72,14 @@ const FIRING_WITH_SKIPPED_OCCURRENCES: u16 = 156;
 /// The `automations::Response` variants holding a `Firing`. The wire format
 /// proof skips exactly these, so a variant here is one no older client gets.
 const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
+
+/// The first protocol whose `WorkspaceModelEdited` carries the edit's effects.
+/// A client before it cannot read the edge, so it may not watch the model.
+const MODEL_EDGES_WITH_EFFECTS: u16 = 161;
+
+/// The `ServerMessage` variants that changed shape in place for clients before
+/// [`MODEL_EDGES_WITH_EFFECTS`]. The wire format proof skips exactly these.
+const MODEL_EDGES: &[&str] = &["WorkspaceModelEdited"];
 
 /// The older protocol a client opened its connection with, when this daemon
 /// serves it.
@@ -107,6 +115,13 @@ impl OlderClient {
         variant_index(request).is_some_and(|index| index < self.client_requests)
             && !changes_the_daemon(request)
             && !self.cannot_read_the_firing_for(request)
+            && !self.cannot_read_model_edges_for(request)
+    }
+
+    /// A watch would only deliver edges the client cannot read.
+    fn cannot_read_model_edges_for(&self, request: &ClientRequest) -> bool {
+        self.protocol < MODEL_EDGES_WITH_EFFECTS
+            && matches!(request, ClientRequest::WatchWorkspaceModel)
     }
 
     /// A run-now started here would look refused, so its request is turned
@@ -150,6 +165,9 @@ impl OlderClient {
                     _ => true,
                 };
                 nested && variant_index(response).is_some_and(|index| index < self.server_responses)
+            }
+            ServerMessage::WorkspaceModelEdited { .. } => {
+                self.protocol >= MODEL_EDGES_WITH_EFFECTS
             }
             _ => true,
         }
@@ -512,6 +530,27 @@ mod tests {
             ..client
         };
         assert!(changed.admits_request(&asking(Request::ShowFiring { id: Uuid::nil() })));
+    }
+
+    #[test]
+    fn model_edges_are_neither_watched_nor_sent_before_they_carried_effects() {
+        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let edge = ServerMessage::WorkspaceModelEdited {
+            sequence: 1,
+            edit: crate::workspace_model::ModelEdit::AgentsChanged,
+            effects: Default::default(),
+        };
+        // Its index predates the older protocol; its shape does not.
+        assert!(variant_index(&edge).unwrap() < client.server_messages);
+        assert!(!client.admits_request(&ClientRequest::WatchWorkspaceModel));
+        assert!(!client.admits_message(&edge));
+        assert!(client.admits_request(&ClientRequest::ReadWorkspaceModel));
+        let changed = OlderClient {
+            protocol: MODEL_EDGES_WITH_EFFECTS,
+            ..client
+        };
+        assert!(changed.admits_request(&ClientRequest::WatchWorkspaceModel));
+        assert!(changed.admits_message(&edge));
     }
 
     #[test]

@@ -49,6 +49,8 @@ mod schema;
 mod terminal_owners;
 mod terminal_retention;
 #[cfg(test)]
+mod edge_cost_bench;
+#[cfg(test)]
 mod view_cost_bench;
 mod views;
 #[cfg(test)]
@@ -107,6 +109,9 @@ pub(crate) struct Applied {
     /// nor wake a watcher: a window that reacted to it would redraw for nothing
     /// and, worse, could not tell the no-op apart from a real edge.
     pub(crate) changed: bool,
+    /// What the edit changed beyond what it says, for its subscribers' edge.
+    /// Empty when nothing changed.
+    pub(crate) effects: crate::workspace_model::delta::EditEffects,
 }
 
 pub(crate) struct Registry {
@@ -215,38 +220,15 @@ impl Registry {
             })
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
             .map_err(|error| error.to_string())?;
-        let mut channels = self
+        let channels = self
             .db
-            .prepare("SELECT id, repository, title, ordinal, title_source FROM channels ORDER BY ordinal")
-            .map_err(|error| error.to_string())?;
-        let rows = channels
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                ))
-            })
+            .prepare(&format!("SELECT {CHANNEL_COLUMNS} FROM channels ORDER BY ordinal"))
+            .map_err(|error| error.to_string())?
+            .query_map([], channel_columns)
             .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-            .map_err(|error| error.to_string())?;
-        let channels = rows
+            .map_err(|error| error.to_string())?
             .into_iter()
-            .map(|(id, repository, title, ordinal, source)| {
-                Ok(ModelChannel {
-                    title_source: match source {
-                        0 => ChannelTitleSource::Prompt,
-                        1 => ChannelTitleSource::Provider,
-                        2 => ChannelTitleSource::Manual,
-                        _ => return Err("invalid stored channel title source".into()),
-                    },
-                    id: parse_channel_id(&id)?,
-                    repository: PathBuf::from(repository),
-                    title,
-                    ordinal: ordinal as u32,
-                })
-            })
+            .map(ChannelColumns::channel)
             .collect::<Result<Vec<_>, String>>()?;
         let closed_projects = self
             .db
@@ -298,8 +280,9 @@ impl Registry {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(|error| error.to_string())?;
         schema::require_current(&transaction)?;
+        let mut recorder = views::Recorder::default();
         let changed = match edit {
-            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit)?,
+            ModelEdit::SeedView { .. } | ModelEdit::ChangeView { .. } => views::apply(&transaction, edit, &mut recorder)?,
             ModelEdit::ResetNavigation { .. } | ModelEdit::ReorderNavigation { .. } => navigation::apply(&transaction, edit)?,
             ModelEdit::AgentsChanged | ModelEdit::ChannelWorkChanged { .. } => {
                 return Err("Agent model changes are committed by the execution service".into());
@@ -388,7 +371,7 @@ impl Registry {
                     statement.query_map(params![key], |row| row.get::<_, String>(0)).map_err(|e| e.to_string())?
                         .collect::<rusqlite::Result<Vec<_>>>().map_err(|e| e.to_string())?
                 };
-                views::retire_project_placements(&transaction, repository)?;
+                views::retire_project_placements(&transaction, repository, &mut recorder)?;
                 for channel in channels {
                     channel_work::deleted_in(&transaction, channel.parse().map_err(|_| "The channel identity is unreadable")?)?;
                 }
@@ -484,20 +467,24 @@ impl Registry {
                 if view.revision != *expected_revision || view.primary_chat() != Some(*card) {
                     return Err("The channel's primary conversation changed; title suggestion refused".into());
                 }
-                transaction.execute(
+                let retitled = transaction.execute(
                     "UPDATE channels SET title = ?2, title_source = ?3 WHERE id = ?1 AND (title = '' OR title_source <= ?3) AND (title <> ?2 OR title_source <> ?3)",
                     params![id.to_string(), title, *source as i64],
-                ).map_err(|error| error.to_string())? > 0
+                ).map_err(|error| error.to_string())? > 0;
+                if retitled {
+                    recorder.retitled(*id);
+                }
+                retitled
             }
             ModelEdit::RetireEmptyChannel { home, expected_view_revision } => {
                 if channel_work::may_auto_retire_in(&transaction, home, *expected_view_revision)? {
-                    views::retire_channel_placements(&transaction, home.channel)?;
+                    views::retire_channel_placements(&transaction, home.channel, &mut recorder)?;
                     channel_work::deleted_in(&transaction, home.channel)?;
                     transaction.execute("DELETE FROM channels WHERE id=?1", params![home.channel.to_string()]).map_err(|e| e.to_string())? > 0
                 } else { false }
             }
             ModelEdit::DeleteChannel { id } => {
-                views::retire_channel_placements(&transaction, *id)?;
+                views::retire_channel_placements(&transaction, *id, &mut recorder)?;
                 channel_work::deleted_in(&transaction, *id)?;
                 transaction
                     .execute(
@@ -529,6 +516,11 @@ impl Registry {
                 row.get::<_, i64>(0)
             })
             .map_err(|error| error.to_string())? as u64;
+        let effects = if changed {
+            recorder.finish(&transaction)?
+        } else {
+            Default::default()
+        };
         #[cfg(test)]
         pause(Pause::BeforeCommit);
         transaction.commit().map_err(|error| error.to_string())?;
@@ -538,8 +530,60 @@ impl Registry {
             model: self.model()?,
             sequence,
             changed,
+            effects,
         })
     }
+}
+
+const CHANNEL_COLUMNS: &str = "id, repository, title, ordinal, title_source";
+
+/// A `channels` row as [`CHANNEL_COLUMNS`] selects it.
+struct ChannelColumns {
+    id: String,
+    repository: String,
+    title: String,
+    ordinal: i64,
+    title_source: i64,
+}
+
+fn channel_columns(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChannelColumns> {
+    Ok(ChannelColumns {
+        id: row.get(0)?,
+        repository: row.get(1)?,
+        title: row.get(2)?,
+        ordinal: row.get(3)?,
+        title_source: row.get(4)?,
+    })
+}
+
+impl ChannelColumns {
+    fn channel(self) -> Result<ModelChannel, String> {
+        Ok(ModelChannel {
+            title_source: match self.title_source {
+                0 => ChannelTitleSource::Prompt,
+                1 => ChannelTitleSource::Provider,
+                2 => ChannelTitleSource::Manual,
+                _ => return Err("invalid stored channel title source".into()),
+            },
+            id: parse_channel_id(&self.id)?,
+            repository: PathBuf::from(self.repository),
+            title: self.title,
+            ordinal: self.ordinal as u32,
+        })
+    }
+}
+
+/// One channel as the model lists it, or `None` once it is gone.
+fn channel_row(db: &Connection, id: ChannelId) -> Result<Option<ModelChannel>, String> {
+    db.prepare_cached(&format!("SELECT {CHANNEL_COLUMNS} FROM channels WHERE id = ?1"))
+        .and_then(|mut statement| {
+            statement
+                .query_row([id.to_string()], channel_columns)
+                .optional()
+        })
+        .map_err(|error| error.to_string())?
+        .map(ChannelColumns::channel)
+        .transpose()
 }
 
 /// Reserves the next rank of `column` and returns it.

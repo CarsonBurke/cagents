@@ -3034,7 +3034,7 @@ fn edges_through(
     let queue = Arc::clone(watcher);
     std::thread::spawn(move || {
         while let Some(queued) = queue.pop() {
-            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } =
+            if let crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } =
                 queued.message
                 && sender.send((sequence, edit)).is_err()
             {
@@ -3118,7 +3118,7 @@ fn failed_dispatch_announces_its_settlement_exactly_once() {
     watcher.close_after_drain();
     let edges = std::iter::from_fn(|| watcher.pop())
         .filter_map(|queued| match queued.message {
-            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+            crate::terminal_ipc::ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
                 Some((sequence, edit))
             }
             _ => None,

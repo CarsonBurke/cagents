@@ -55,6 +55,16 @@ pub(super) fn snapshot(
     registry.model().map_err(unavailable)
 }
 
+/// One scope and the model sequence it is consistent with.
+pub(super) fn view(
+    host: &SharedHost,
+    scope: &Scope,
+) -> Result<(Option<crate::workspace_model::views::View>, u64), ProtocolError> {
+    let writer = writer(host)?;
+    let registry = writer.lock().unwrap_or_else(|p| p.into_inner());
+    registry.view_snapshot(scope).map_err(unavailable)
+}
+
 /// Called by the request handler while it retains shared control admission.
 /// Explicit close and automatic retention need exclusive admission to reserve
 /// retirement, so the resident check stays valid through commit/publication.
@@ -84,7 +94,7 @@ pub(super) fn edit(
         let waiting = Instant::now();
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
         let acquired = Instant::now();
-        state.announce_model_edit(origin, applied.sequence, &edit);
+        state.announce_model_edit(origin, applied.sequence, &edit, &applied.effects);
         drop(state);
         tracing::debug!(
             operation = "workspace-model-edit",
@@ -214,7 +224,7 @@ pub(super) fn complete_terminal(
         Ok(applied) if applied.changed => host
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .announce_model_edit(0, applied.sequence, &edit),
+            .announce_model_edit(0, applied.sequence, &edit, &applied.effects),
         Ok(_) => {}
         Err(error) => {
             tracing::warn!(%terminal_id, %error, "could not finish automatic terminal reservation")

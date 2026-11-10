@@ -22,6 +22,7 @@ const RECORD: &str = "CAGENTS_RECORD_WIRE_FORMAT";
 const WORK_RESPONSE: &str = "cagents::work::Response";
 const AGENT_REPLY: &str = "cagents::agent_execution::Reply";
 const AUTOMATION_RESPONSE: &str = "cagents::automations::Response";
+const SERVER_MESSAGE: &str = "cagents::terminal::ipc::ServerMessage";
 
 fn fixture(protocol: u16) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -308,11 +309,14 @@ fn every_older_client_is_proven_against_its_recorded_format() {
                 (WORK_RESPONSE, client.work_responses as usize),
                 (AGENT_REPLY, client.agent_replies as usize),
             ],
-            if client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES {
-                vec![(AUTOMATION_RESPONSE, FIRING_REPLIES)]
-            } else {
-                Vec::new()
-            },
+            [
+                (client.protocol < FIRING_WITH_SKIPPED_OCCURRENCES)
+                    .then_some((AUTOMATION_RESPONSE, FIRING_REPLIES)),
+                (client.protocol < MODEL_EDGES_WITH_EFFECTS).then_some((SERVER_MESSAGE, MODEL_EDGES)),
+            ]
+            .into_iter()
+            .flatten()
+            .collect(),
         );
         assert!(
             differences.is_empty(),

@@ -179,6 +179,7 @@ fn may_release_retention(request: &ClientRequest) -> bool {
             | ClientRequest::ChatAcknowledge { .. }
             | ClientRequest::ChatList
             | ClientRequest::ReadWorkspaceModel
+            | ClientRequest::ReadWorkspaceView { .. }
             | ClientRequest::ReadNotifications
     )
 }
@@ -1599,6 +1600,10 @@ pub(super) fn process_request(
         ClientRequest::ReadWorkspaceModel => {
             let model = super::workspace::snapshot(host, None)?;
             Ok((ServerResponse::WorkspaceModel { model }, Vec::new(), false))
+        }
+        ClientRequest::ReadWorkspaceView { scope } => {
+            let (view, sequence) = super::workspace::view(host, &scope)?;
+            Ok((ServerResponse::WorkspaceView { view, sequence }, Vec::new(), false))
         }
         ClientRequest::EditWorkspaceModel { edit } => {
             let model = super::workspace::edit(host, client_id, edit)?;
@@ -5502,7 +5507,7 @@ pub(in crate::host) mod tests {
             delivery.close_after_drain();
             std::iter::from_fn(|| delivery.pop())
                 .filter_map(|queued| match queued.message {
-                    ServerMessage::WorkspaceModelEdited { sequence, edit } => {
+                    ServerMessage::WorkspaceModelEdited { sequence, edit, .. } => {
                         Some((sequence, edit))
                     }
                     _ => None,

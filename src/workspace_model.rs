@@ -9,6 +9,7 @@
 //! resolve it in every build lane; moving the id types into this module or
 //! re-exporting them would give one identity two spellings for no gain.
 
+pub mod delta;
 pub mod views;
 
 use std::path::{Path, PathBuf};
