@@ -1352,6 +1352,77 @@ class Evidence(unittest.TestCase):
         receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
         self.assertEqual(receipt["installed_sha256"], hashlib.sha256(original).hexdigest())
 
+    @unittest.skipIf(os.geteuid() == 0, "root bypasses owner execute permission")
+    def test_real_codex_execute_permission_follows_the_opened_inode(self) -> None:
+        denied = self.codex_elf("owner-cannot-execute")
+        denied.chmod(0o645)  # Other execute bits do not grant the owner X_OK.
+        self.assertFalse(os.access(denied, os.X_OK))
+        allowed = self.codex_elf("executable-replacement")
+        source = self.root / "selected-codex"
+        source.symlink_to(denied)
+        snapshot = self.task / "session/codex-executable"
+        receipt = self.task / "session/codex-executable.json"
+        # Exercise the real copy helper with a deterministic pathname race.
+        # Only the symlink changes: the opened target's identity stays fixed.
+        copy_code = SCRIPT.read_text().split("copy_codex_executable() {", 1)[1]
+        copy_code = copy_code.split("<<'PY'\n", 1)[1].split("\nPY\n}", 1)[0]
+        seam = """
+from pathlib import Path
+import os
+import sys
+code, source, allowed, destination, receipt = sys.argv[1:]
+source, allowed = Path(source), Path(allowed)
+real_access = os.access
+def replaced_access(path, mode, *args, **kwargs):
+    source.unlink()
+    source.symlink_to(allowed)
+    return real_access(path, mode, *args, **kwargs)
+os.access = replaced_access
+sys.argv = ["copy", str(source), destination, receipt]
+exec(compile(code, "native-evidence copy helper", "exec"))
+"""
+        result = subprocess.run(
+            ["/usr/bin/python3", "-c", seam, copy_code, str(source), str(allowed),
+             str(snapshot), str(receipt)], capture_output=True, text=True, timeout=5,
+        )
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("must name an executable file", result.stderr)
+        self.assertEqual(source.resolve(), allowed)
+        self.assertFalse(snapshot.exists())
+        self.assertFalse(receipt.exists())
+
+    def test_a_changed_queued_codex_snapshot_is_refused_before_the_compositor(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        with self.native_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = subprocess.Popen(
+                [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                 "--codex-executable", str(source)], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(lambda: child.poll() is not None or child.terminate())
+            receipt = self.task / "session/codex-executable.json"
+            for _ in range(100):
+                if receipt.exists() or child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(receipt.exists())
+            snapshot = self.task / "session/codex-executable"
+            with snapshot.open("r+b") as changed:
+                changed.seek(-1, os.SEEK_END)
+                byte = changed.read(1)[0]
+                changed.seek(-1, os.SEEK_END)
+                changed.write(bytes([byte ^ 1]))
+            fcntl.flock(held, fcntl.LOCK_UN)
+        stdout, stderr = child.communicate(timeout=30)
+        self.assertNotEqual(child.returncode, 0, stdout + stderr)
+        self.assertIn("Codex snapshot changed before installation",
+                      (self.task / "logs/session-after.log").read_text())
+        self.assertFalse((self.logs / "kwin").exists())
+        self.assertFalse((self.task / "fixture/bin/codex").exists())
+        self.assertFalse((self.task / "fixture/libexec/codex").exists())
+
     def test_the_fixture_has_no_forge_or_network_until_switched_on(self) -> None:
         self.built()
         self.run_tool("start", "after")
