@@ -232,6 +232,7 @@ struct TerminalSource {
 #[derive(Deserialize)]
 struct ChatSource {
     source: Session,
+    launch: crate::chat::Launch,
 }
 
 impl Preparation {
@@ -295,7 +296,17 @@ impl Preparation {
 
     /// Call only after the exact peer acknowledges PrepareConfirmedUpgrade.
     /// A connection loss or an unacknowledged request cannot mint this receipt.
-    pub(crate) fn acknowledged(mut self) -> Result<CapturedPreparation, String> {
+    pub(crate) fn acknowledged(self) -> Result<CapturedPreparation, String> {
+        let result = self.capture_acknowledged();
+        if let Err(error) = &result {
+            eprintln!(
+                "The source accepted preparation, but its recovery checkpoint could not be captured: {error}"
+            );
+        }
+        result
+    }
+
+    fn capture_acknowledged(mut self) -> Result<CapturedPreparation, String> {
         self.validate_continuity()?;
         let bytes = read_checkpoint(&self.authority.checkpoint_path)?
             .ok_or("The acknowledged preparation has no checkpoint")?;
@@ -321,7 +332,13 @@ impl CapturedPreparation {
         target_daemon: &Path,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        self.make_receipt(target_daemon, None, handoff)
+        let result = self.make_receipt(target_daemon, None, handoff);
+        if let Err(error) = &result {
+            eprintln!(
+                "The acknowledged preparation could not authorize successor recovery: {error}"
+            );
+        }
+        result
     }
 
     /// A release archive already verified by the updater can name the daemon
@@ -332,7 +349,13 @@ impl CapturedPreparation {
         verified_daemon_sha256: &str,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff)
+        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff);
+        if let Err(error) = &result {
+            eprintln!(
+                "The acknowledged preparation could not authorize successor recovery: {error}"
+            );
+        }
+        result
     }
 
     fn make_receipt(
@@ -589,7 +612,7 @@ fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, St
                 .census
                 .chats
                 .iter()
-                .any(|known| same_chat(known, source))
+                .any(|known| same_chat(known, source, &item.launch))
         {
             return Err(
                 "The prepared conversation inventory does not match the acknowledged source census"
@@ -615,7 +638,7 @@ fn same_terminal(known: &TerminalSession, source: &TerminalSession) -> bool {
         && known.predecessor == source.predecessor
 }
 
-fn same_chat(known: &Session, source: &Session) -> bool {
+fn same_chat(known: &Session, source: &Session, effective: &crate::chat::Launch) -> bool {
     known.id == source.id
         && known.proof == source.proof
         && known.launch.provider == source.launch.provider
@@ -623,11 +646,28 @@ fn same_chat(known: &Session, source: &Session) -> bool {
         && known.owned_codex_listener == source.owned_codex_listener
         && known.terminal.as_ref().map(|item| item.id)
             == source.terminal.as_ref().map(|item| item.id)
+        // ChatList projects the provider's confirmed identity over the issued
+        // descriptor. Frozen sources keep that original descriptor unchanged
+        // in `source`, and put the current conversation in the separate launch.
+        && effective.provider == known.launch.provider
         && known
             .launch
             .session_id
             .as_ref()
-            .is_none_or(|id| source.launch.session_id.as_ref() == Some(id))
+            .is_none_or(|id| effective.session_id.as_ref() == Some(id))
+        && same_effective_recipe(&known.launch, effective)
+}
+
+fn same_effective_recipe(known: &crate::chat::Launch, effective: &crate::chat::Launch) -> bool {
+    let mut confirmed = known.clone();
+    confirmed.session_id.clone_from(&effective.session_id);
+    match (confirmed.terminal_recipe(), effective.terminal_recipe()) {
+        (Some(before), Some(after)) => before == after,
+        // A retained Claude actor can precede its first conversation ID. There
+        // is no identity normalization to permit in its recipe at that point.
+        (None, None) => confirmed.session_id.is_none() && confirmed.recipe == effective.recipe,
+        _ => false,
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -1281,6 +1321,93 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issued_alias() {
+        for original_id in [None, Some(uuid::Uuid::new_v4().to_string())] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut preparation = preparation(root.path());
+            let confirmed = uuid::Uuid::new_v4().to_string();
+            // Frozen 991daa43e ChatList overlays the handle's confirmed ID,
+            // while its checkpoint source retains the initially issued alias.
+            let listed = Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: LaunchRecipe {
+                        program: "codex".into(),
+                        arguments: vec!["--remote".into(), "unix:///fixture/control.sock".into()],
+                        working_directory: root.path().to_owned(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(confirmed.clone()),
+                },
+                proof: Some(preparation.authority.source.clone()),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
+            };
+            let mut issued = listed.clone();
+            issued.launch.session_id = original_id;
+            preparation
+                .authority
+                .expected
+                .push((SessionKind::NativeChat, listed.id));
+            preparation.authority.census.chats.push(listed.clone());
+            let mut captured_page = SnapshotCapture::default();
+            captured_page
+                .push(
+                    listed.clone(),
+                    crate::chat::Snapshot {
+                        session_id: Some(confirmed.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            preparation.authority.census.snapshots = captured_page.finish();
+            let mut checkpoint: serde_json::Value =
+                serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+            checkpoint["chats"] =
+                serde_json::json!([{ "source": issued, "launch": listed.launch }]);
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            save(&preparation.authority.checkpoint_path, &bytes);
+            let captured = preparation.acknowledged().unwrap();
+            assert_eq!(captured.0.authority.checkpoint_hash, digest(&bytes));
+            // Ready fallback uses this same distinction and still requires the
+            // exact current conversation, including after an actor reset.
+            checkpoint["phase"] = "Ready".into();
+            assert_eq!(
+                validate_checkpoint(
+                    &captured.0.authority,
+                    &serde_json::to_vec(&checkpoint).unwrap()
+                )
+                .unwrap(),
+                "Ready"
+            );
+            checkpoint["chats"][0]["launch"]["session_id"] =
+                uuid::Uuid::new_v4().to_string().into();
+            assert!(
+                validate_checkpoint(
+                    &captured.0.authority,
+                    &serde_json::to_vec(&checkpoint).unwrap()
+                )
+                .is_err(),
+                "a different effective conversation is never recovery authority"
+            );
+            checkpoint["chats"][0]["launch"]["session_id"] = confirmed.into();
+            checkpoint["chats"][0]["launch"]["recipe"]["arguments"] =
+                serde_json::json!(["--different-provider-target"]);
+            assert!(
+                validate_checkpoint(
+                    &captured.0.authority,
+                    &serde_json::to_vec(&checkpoint).unwrap()
+                )
+                .is_err(),
+                "normalization cannot change any other launch option"
+            );
+        }
     }
 
     #[test]
