@@ -59,6 +59,10 @@ class Rehearsal:
             slot = 'ceditor' if 'ceditor' in (window.get('app_id') or '').lower() else 'main'
             if '--window' in argv:
                 slot = argv[argv.index('--window')+1]
+            # Relaunched windows name the main window explicitly
+            # (instance::PRIMARY_WINDOW); it is the same window and store.
+            if slot == 'primary':
+                slot = 'main'
             if slot in slots:
                 raise RuntimeError(f'more than one mapped window for {slot}')
             slots[slot] = window

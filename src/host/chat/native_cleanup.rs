@@ -48,7 +48,7 @@ struct RetainedPair {
 /// authority. Exact ownership and the current daemon lease authorize either
 /// route; disappearance never proves a successful close. A Codex owner that
 /// ended without a receipt settles only on the evidence that nothing of it can
-/// still run; see `close_lost_codex_owner`.
+/// still run; see `settle_lost_execution`.
 pub(in crate::host) fn close_retained(host: &SharedHost, source: &Session) -> Result<(), String> {
     close_retained_inner(host, source, None, None)
 }
@@ -201,13 +201,19 @@ fn close_retained_inner(
                 Some(record) if !chat::native_holder::retire_abandoned(&record)? => record,
                 // The owner ended without a receipt and left nothing to
                 // adopt. The resident, if any, is removed below.
-                _ => return super::close_lost_codex_owner(host, source, &proof),
+                _ => return super::settle_lost_execution(host, source, &proof),
             },
         };
         preflight_current_retirements(host, source, &owner, &proof)?;
         if let Some((record, true)) = &receipt {
             retire_closed_execution(host, source, record, &proof)?;
             return Ok(());
+        }
+        // A holder that died while its provider runs on can no longer be
+        // asked to stop it, and nothing else may: say so, rather than fail
+        // reaching the holder.
+        if let Some(refusal) = super::holder_lost_refusal(source, &owner)? {
+            return Err(refusal);
         }
         let mut pending = match pending {
             Some(pending) => pending,
@@ -302,7 +308,7 @@ fn close_retained_inner(
         if pending.paired.is_none() && chat::native_holder::closed_source(source, &proof)?.is_none()
         {
             chat::native_holder::retire_abandoned(&pending.owner.record)?;
-            return super::close_lost_codex_owner(host, source, &proof);
+            return super::settle_lost_execution(host, source, &proof);
         }
         if let Some(pair) = &pending.paired {
             if let Some(source) = &pair.source {

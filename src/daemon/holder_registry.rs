@@ -589,6 +589,20 @@ fn holding_process_in(directory: &Path, terminal: TerminalId) -> io::Result<Opti
     }
 }
 
+/// Whether nothing of a dead holder's execution is left. A native holder's
+/// record is the only evidence of which session and process group its
+/// conversation ran in, and its Close needs that evidence for as long as a
+/// provider or tool of it runs on (see [`crate::daemon::lost_processes`]).
+fn ended_with_holder(record: &Record) -> bool {
+    #[cfg(feature = "host")]
+    if record.kind == Kind::Native {
+        return crate::daemon::lost_processes::census(&record.holder, &record.root)
+            .is_ok_and(|left| left.iter().all(|survivor| survivor.zombie));
+    }
+    let _ = record;
+    true
+}
+
 pub(crate) fn discover(directory: &Path, boot: &BootId, kind: Kind) -> Result<Vec<Record>, String> {
     discover_inner(directory, boot, kind, false)
 }
@@ -640,7 +654,7 @@ fn discover_inner(
         if !record.holder.is_current() {
             // Candidate intake grants no mutation authority over the other
             // package's evidence, including an unresolved orphan root.
-            if record.application == crate::instance::APPLICATION_ID {
+            if record.application == crate::instance::APPLICATION_ID && ended_with_holder(&record) {
                 record.remove(directory);
             }
             continue;
