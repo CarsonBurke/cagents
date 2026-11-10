@@ -1946,7 +1946,7 @@ raise SystemExit(79)
         0
     );
     let independent = File::open(daemon_dir.join("cagentsd.lock")).unwrap();
-    for verb in ["status", "start"] {
+    for verb in ["status", "start", "verify-update-lease"] {
         for (descriptor, lease_marker) in [
             (None, "199"),
             (None, "3"),
@@ -1964,18 +1964,29 @@ raise SystemExit(79)
             assert!(!launched.exists(), "invalid authority launched a daemon");
         }
     }
+    let missing_verification = run("verify-update-lease", None, None);
+    assert!(!missing_verification.status.success());
+    for descriptor in ["3", "199"] {
+        let verified = run("verify-update-lease", Some(&lock), Some(descriptor));
+        assert!(verified.status.success(), "{verified:?}");
+        let reply: serde_json::Value = serde_json::from_slice(&verified.stdout).unwrap();
+        assert_eq!(reply["command"], "daemon.verify_update_lease");
+        assert_eq!(reply["data"]["inherited_lease"], true);
+        assert!(!launched.exists(), "lease verification started a daemon");
+    }
     let status = run("status", Some(&lock), Some("199"));
     assert!(status.status.success(), "{status:?}");
     let response: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(response["data"]["running"], true);
+    assert_eq!(response["data"]["running"], false);
+    assert_eq!(response["data"]["daemon_present"], false);
     assert_eq!(response["data"]["inherited_lease"], true);
     assert!(response["data"]["daemon_version"].is_null());
     assert!(
         !launched.exists(),
         "read-only handoff status started a daemon"
     );
-    // Without inherited daemon authority, status still reports a held lease as
-    // running/starting. Remove only this fixture's staged-routing marker so
+    // A held updater reservation is not a daemon even for an ordinary probe.
+    // Remove only this fixture's staged-routing marker so
     // the former source identity does not independently refuse that control.
     let parked_marker = marker.with_extension("parked");
     fs::rename(&marker, &parked_marker).unwrap();
@@ -1983,7 +1994,8 @@ raise SystemExit(79)
     fs::rename(&parked_marker, &marker).unwrap();
     assert!(ordinary_status.status.success(), "{ordinary_status:?}");
     let response: serde_json::Value = serde_json::from_slice(&ordinary_status.stdout).unwrap();
-    assert_eq!(response["data"]["running"], true);
+    assert_eq!(response["data"]["running"], false);
+    assert_eq!(response["data"]["daemon_present"], false);
     for marker in ["199", "3"] {
         let status = run("status", Some(&lock), Some(marker));
         assert!(status.status.success(), "{status:?}");

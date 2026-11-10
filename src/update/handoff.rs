@@ -12,6 +12,7 @@ pub(super) fn wait_daemon_stopped(
     state: &Path,
     job: &mut UpdateJob,
 ) -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {
+    let proof = source.proof.clone();
     wait_with_observers(
         paths,
         source,
@@ -20,21 +21,34 @@ pub(super) fn wait_daemon_stopped(
         |paths| {
             // A successful authenticated handshake means shutdown was abandoned.
             // A shutting-down daemon rejects Connect with host_shutting_down.
-            source_answered(source::Client::connect(&paths.socket))
+            source_answered(source::Client::connect(&paths.socket), &proof)
         },
         stop_empty_contender,
     )
 }
 
-fn source_answered(reply: Result<source::Client, crate::control::ControlError>) -> bool {
-    use crate::control::ControlError;
-    match reply {
-        Ok(_) => true,
-        Err(ControlError::UnexpectedMessage { actual, .. }) => actual != "host_shutting_down",
-        // An explicit rejection is also an answer: the daemon is no longer
-        // advertising its shutdown barrier. Leave it running and reopen clients.
-        Err(ControlError::Remote { .. } | ControlError::ConnectionRejected { .. }) => true,
-        Err(_) => false,
+fn source_answered(
+    reply: Result<source::Client, crate::control::ControlError>,
+    expected: &crate::model::HostSessionProof,
+) -> bool {
+    reply.is_ok_and(|client| client.proof() == expected)
+}
+
+/// Every exit from the observer loop cancels and joins its lock waiter before
+/// recovery can launch a daemon. Dropping an unjoined thread would leave a
+/// hidden lock contender after an abandoned handoff.
+struct LeaseWaiter {
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for LeaseWaiter {
+    fn drop(&mut self) {
+        self.cancelled
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
     }
 }
 
@@ -52,11 +66,21 @@ fn wait_with_observers(
     let (sender, receiver) = mpsc::sync_channel(1);
     let waiting_paths = paths.clone();
     let pid = source.pid;
-    thread::Builder::new()
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiting_cancelled = cancelled.clone();
+    let waiter = thread::Builder::new()
         .name("daemon-lease-handoff".into())
         .spawn(move || {
-            let _ = sender.send(LeaseHandoff::wait(&waiting_paths, pid));
+            let _ = sender.send(LeaseHandoff::wait_cancellable(
+                &waiting_paths,
+                pid,
+                &waiting_cancelled,
+            ));
         })?;
+    let _waiter = LeaseWaiter {
+        cancelled,
+        thread: Some(waiter),
+    };
     let mut last_progress = Instant::now();
     let mut source_exited_at = None;
     let mut contenders = 0;
@@ -64,10 +88,15 @@ fn wait_with_observers(
     loop {
         match receiver.recv_timeout(Duration::from_millis(100)) {
             Ok(result) => {
-                return result.map_err(|error| {
-                    eprintln!("Could not acquire daemon descriptor: {error}");
-                    invalid(SERVICE_NOT_STOPPED)
-                });
+                return result
+                    .and_then(|lease| {
+                        lease
+                            .ok_or_else(|| io::Error::other("daemon lease waiter cancelled").into())
+                    })
+                    .map_err(|error| {
+                        eprintln!("Could not acquire daemon descriptor: {error}");
+                        invalid(SERVICE_NOT_STOPPED)
+                    });
             }
             Err(RecvTimeoutError::Disconnected) => {
                 eprintln!("Daemon descriptor waiter exited unexpectedly");
@@ -76,7 +105,7 @@ fn wait_with_observers(
             Err(RecvTimeoutError::Timeout) => {}
         }
         let exited = source.exited()?;
-        if !exited && serving(&paths) {
+        if !exited && serving(&paths) && !source.exited()? {
             return Err(invalid(SOURCE_RESUMED));
         }
         // Older clients can win the kernel waiter wakeup. Their own CLI does
@@ -311,9 +340,33 @@ while not Path(sys.argv[3]).exists(): time.sleep(.005)
         assert_eq!(result.err().unwrap().to_string(), SOURCE_RESUMED);
         assert!(source_service.0.try_wait().unwrap().is_none());
         assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
-        // Settle the blocked waiter without leaving a child behind.
+        // Returning already cancelled and joined the waiter while the source
+        // still held its lock. Releasing it cannot wake a forgotten contender.
         fs::write(root.path().join("release"), b"exit").unwrap();
         assert!(source_service.0.wait().unwrap().success());
+    }
+
+    #[test]
+    fn source_exiting_during_successful_probe_is_not_reported_as_resumed() {
+        let root = tempfile::tempdir().unwrap();
+        let (paths, mut job) = fixture(root.path());
+        let (mut source_service, source) = service(root.path(), &paths);
+        let lease = wait_with_observers(
+            paths.clone(),
+            source,
+            root.path(),
+            &mut job,
+            |_| {
+                fs::write(root.path().join("release"), b"exit").unwrap();
+                assert!(source_service.0.wait().unwrap().success());
+                true
+            },
+            |_, _| panic!("the original daemon must not be stopped"),
+        )
+        .unwrap();
+        assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
+        drop(lease);
+        assert!(!crate::daemon::HostLease::is_held(&paths).unwrap());
     }
 
     #[test]
@@ -383,106 +436,165 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
     }
 
     #[test]
-    fn resumed_source_handshake_ends_wait_with_original_service_still_running() {
+    fn only_the_pinned_source_handshake_ends_wait_with_original_service_running() {
         use crate::terminal_ipc::{
             ClientEnvelope, ClientRequest, PROTOCOL_VERSION, ServerEnvelope, ServerMessage,
             ServerResponse, read_frame, write_frame,
         };
         use std::os::unix::net::UnixListener;
 
-        let root = tempfile::tempdir().unwrap();
-        let (paths, mut job) = fixture(root.path());
-        fs::create_dir(&paths.directory).unwrap();
-        fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
-        let proof = crate::model::HostSessionProof {
-            host_session_id: crate::model::HostSessionId::new("resumed-source"),
-            boot_id: crate::daemon::read_boot_id().unwrap(),
-            host_incarnation: crate::model::HostIncarnation::new("resumed-source"),
-        };
-        let lock = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .mode(0o600)
-            .open(&paths.lock)
+        for matches_source in [true, false] {
+            let root = tempfile::tempdir().unwrap();
+            let (paths, mut job) = fixture(root.path());
+            fs::create_dir(&paths.directory).unwrap();
+            fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
+            let proof = crate::model::HostSessionProof {
+                host_session_id: crate::model::HostSessionId::new("resumed-source"),
+                boot_id: crate::daemon::read_boot_id().unwrap(),
+                host_incarnation: crate::model::HostIncarnation::new("resumed-source"),
+            };
+            let lock = OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&paths.lock)
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            serde_json::to_writer(
+                &lock,
+                &serde_json::json!({
+                    "pid": std::process::id(), "proof": &proof,
+                }),
+            )
             .unwrap();
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        serde_json::to_writer(
-            &lock,
-            &serde_json::json!({
-                "pid": std::process::id(), "proof": &proof,
-            }),
-        )
-        .unwrap();
-        let source = HandoffSource::pin(&paths, &proof).unwrap();
-        assert!(!source.exited().unwrap());
-        let listener = UnixListener::bind(&paths.socket).unwrap();
-        listener.set_nonblocking(true).unwrap();
-        let server = thread::spawn(move || {
-            // Source discovery and its fresh authenticated handshake are
-            // separate connections, both handled by this still-running owner.
-            for _ in 0..2 {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(Instant::now() < deadline, "source probe never connected");
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(error) => panic!("source accept: {error}"),
-                    }
+            let source = HandoffSource::pin(&paths, &proof).unwrap();
+            assert!(!source.exited().unwrap());
+            let proof = if matches_source {
+                proof
+            } else {
+                let changed = crate::model::HostSessionProof {
+                    host_incarnation: crate::model::HostIncarnation::new("different-incarnation"),
+                    ..proof
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                stream
-                    .set_write_timeout(Some(Duration::from_secs(5)))
-                    .unwrap();
-                let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
-                assert!(matches!(connect.request, ClientRequest::Connect { .. }));
-                write_frame(
-                    &mut stream,
-                    &ServerEnvelope {
-                        version: PROTOCOL_VERSION,
-                        request_id: Some(connect.request_id),
-                        proof: proof.clone(),
-                        message: ServerMessage::Response {
-                            response: ServerResponse::Connected {
-                                proof: proof.clone(),
-                                resumed: Vec::new(),
-                            },
-                        },
-                    },
+                lock.set_len(0).unwrap();
+                use std::io::{Seek, SeekFrom};
+                (&lock).seek(SeekFrom::Start(0)).unwrap();
+                serde_json::to_writer(
+                    &lock,
+                    &serde_json::json!({"pid": std::process::id(), "proof": &changed}),
                 )
                 .unwrap();
+                changed
+            };
+            let server_lock = lock.try_clone().unwrap();
+            let (release_server_lock, release_lock) = std::sync::mpsc::channel();
+            let listener = UnixListener::bind(&paths.socket).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let server = thread::spawn(move || {
+                // Source discovery and its fresh authenticated handshake are
+                // separate connections, both handled by this still-running owner.
+                for _ in 0..2 {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    let mut stream = loop {
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                                assert!(Instant::now() < deadline, "source probe never connected");
+                                thread::sleep(Duration::from_millis(5));
+                            }
+                            Err(error) => panic!("source accept: {error}"),
+                        }
+                    };
+                    stream
+                        .set_read_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    stream
+                        .set_write_timeout(Some(Duration::from_secs(5)))
+                        .unwrap();
+                    let connect: ClientEnvelope = read_frame(&mut stream).unwrap().unwrap();
+                    assert!(matches!(connect.request, ClientRequest::Connect { .. }));
+                    write_frame(
+                        &mut stream,
+                        &ServerEnvelope {
+                            version: PROTOCOL_VERSION,
+                            request_id: Some(connect.request_id),
+                            proof: proof.clone(),
+                            message: ServerMessage::Response {
+                                response: ServerResponse::Connected {
+                                    proof: proof.clone(),
+                                    resumed: Vec::new(),
+                                },
+                            },
+                        },
+                    )
+                    .unwrap();
+                }
+                // Prevent a concurrent fork from keeping this fixture listener live.
+                crate::daemon::shut_down_test_listener(listener);
+                if !matches_source {
+                    release_lock.recv_timeout(Duration::from_secs(5)).unwrap();
+                    assert_eq!(
+                        unsafe { libc::flock(server_lock.as_raw_fd(), libc::LOCK_UN) },
+                        0
+                    );
+                }
+            });
+            let result = if matches_source {
+                wait_daemon_stopped(paths.clone(), source, root.path(), &mut job)
+            } else {
+                let expected = source.proof.clone();
+                wait_with_observers(
+                    paths.clone(),
+                    source,
+                    root.path(),
+                    &mut job,
+                    |paths| {
+                        let connected = source::Client::connect(&paths.socket).unwrap();
+                        let answered = source_answered(Ok(connected), &expected);
+                        release_server_lock.send(()).unwrap();
+                        answered
+                    },
+                    stop_empty_contender,
+                )
+            };
+            server.join().unwrap();
+            if matches_source {
+                assert_eq!(result.err().unwrap().to_string(), SOURCE_RESUMED);
+            } else {
+                // A successful, authenticated Connected for another incarnation
+                // must not be mistaken for the pinned source resuming.
+                drop(result.unwrap());
             }
-            // Prevent a concurrent fork from keeping this fixture listener live.
-            crate::daemon::shut_down_test_listener(listener);
-        });
-        let result = wait_daemon_stopped(paths.clone(), source, root.path(), &mut job);
-        server.join().unwrap();
-        assert_eq!(result.err().unwrap().to_string(), SOURCE_RESUMED);
-        assert!(crate::daemon::HostLease::is_held(&paths).unwrap());
-        // The source is this test process: it kept its exact lease throughout
-        // the cancelled update and was never signalled or asked to stop.
-        assert_eq!(
-            unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
-            libc::FD_CLOEXEC
-        );
-        // Release explicitly so copies inherited by concurrent test forks do
-        // not leave the off-thread flock waiter behind.
-        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+            assert_eq!(
+                crate::daemon::HostLease::is_held(&paths).unwrap(),
+                matches_source
+            );
+            // The source is this test process: it kept its exact lease throughout
+            // the cancelled update and was never signalled or asked to stop.
+            assert_eq!(
+                unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                libc::FD_CLOEXEC
+            );
+            // Release explicitly so copies inherited by concurrent test forks do
+            // not extend the fixture lifetime. The waiter was already joined.
+            assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        }
     }
 
     #[test]
-    fn explicit_source_answers_end_wait_but_shutdown_and_absence_keep_waiting() {
+    fn only_a_successful_matching_source_handshake_can_end_wait() {
         use crate::control::ControlError;
         use crate::terminal_ipc::ProtocolErrorCode;
 
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("source"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("source"),
+        };
         for error in [
             ControlError::Remote {
                 code: ProtocolErrorCode::InvalidRequest,
@@ -498,10 +610,6 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
                 expected: "the connect response",
                 actual: "terminal_created",
             },
-        ] {
-            assert!(source_answered(Err(error)));
-        }
-        for error in [
             ControlError::UnexpectedMessage {
                 expected: "the connect response",
                 actual: "host_shutting_down",
@@ -510,7 +618,7 @@ print(json.dumps({{'ok':True,'command':'daemon.stop','data':{{'outcome':'accepte
             ControlError::Connect(io::Error::from(io::ErrorKind::NotFound)),
             ControlError::Connect(io::Error::from(io::ErrorKind::ConnectionRefused)),
         ] {
-            assert!(!source_answered(Err(error)));
+            assert!(!source_answered(Err(error), &proof));
         }
     }
 }

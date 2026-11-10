@@ -4,7 +4,10 @@ use std::{
     os::fd::BorrowedFd,
     os::unix::process::CommandExt,
     process::Command,
-    sync::{Mutex, OnceLock},
+    sync::{
+        Mutex, OnceLock,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 pub(crate) const DAEMON_LEASE_ENV: &str = "CAGENTS_DAEMON_LEASE_FD";
@@ -24,6 +27,7 @@ pub(crate) struct LeaseHandoff {
 
 pub(crate) struct HandoffSource {
     pub(crate) pid: u32,
+    pub(crate) proof: HostSessionProof,
     process: File,
     // An adopted flock retains the original updater PID, which can differ
     // from the serving daemon pinned above. Compare like identities.
@@ -41,6 +45,7 @@ impl HandoffSource {
         let locker_pid = holder_pid(paths)?;
         Ok(Self {
             pid,
+            proof: proof.clone(),
             process,
             locker_pid,
         })
@@ -62,15 +67,36 @@ impl HandoffSource {
 
 impl LeaseHandoff {
     pub(crate) fn wait(paths: &RuntimePaths, expected_pid: u32) -> Result<Self, PlatformError> {
+        Self::wait_cancellable(paths, expected_pid, &AtomicBool::new(false))?
+            .ok_or_else(|| io::Error::other("daemon lease wait cancelled").into())
+    }
+
+    /// The caller must join the polling thread before abandoning the handoff.
+    /// Cancellation never leaves a kernel flock waiter that could acquire later.
+    pub(crate) fn wait_cancellable(
+        paths: &RuntimePaths,
+        expected_pid: u32,
+        cancelled: &AtomicBool,
+    ) -> Result<Option<Self>, PlatformError> {
         let lock = open_lock(paths)?;
         loop {
-            // SAFETY: a live validated regular file; flock blocks off the job thread.
-            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            if cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            // SAFETY: a live validated regular file; acquisition never blocks.
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                if cancelled.load(Ordering::Acquire) {
+                    return Ok(None);
+                }
                 break;
             }
             let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error.into());
+            match error.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(20))
+                }
+                _ => return Err(error.into()),
             }
         }
         validate_inode(&lock, paths)?;
@@ -82,7 +108,23 @@ impl LeaseHandoff {
                 stored.pid
             );
         }
-        Ok(Self { lock })
+        Ok(Some(Self { lock }))
+    }
+
+    /// Reserve a stopped runtime for recovery without waiting on an unknown
+    /// owner. A failed handoff must never turn recovery into another blocker.
+    pub(crate) fn try_acquire(paths: &RuntimePaths) -> Result<Option<Self>, PlatformError> {
+        let lock = open_lock(paths)?;
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = io::Error::last_os_error();
+            return if error.kind() == io::ErrorKind::WouldBlock {
+                Ok(None)
+            } else {
+                Err(error.into())
+            };
+        }
+        validate_inode(&lock, paths)?;
+        Ok(Some(Self { lock }))
     }
 
     pub(crate) fn inherit(&self, command: &mut Command) -> io::Result<()> {
@@ -295,4 +337,48 @@ pub(crate) fn holder_pid(paths: &RuntimePaths) -> io::Result<Option<i32>> {
             i32::try_from(pid).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         })
         .transpose()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+    use std::sync::Arc;
+
+    #[test]
+    fn lease_handoff_cancelled_waiter_is_joined_before_source_releases_lock() {
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            socket: root.path().join("cagentsd.sock"),
+            lock: root.path().join("cagentsd.lock"),
+            directory: root.path().to_owned(),
+        };
+        let lock = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        assert_eq!(
+            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let waiter_cancelled = cancelled.clone();
+        let waiter_paths = paths.clone();
+        let waiter = std::thread::spawn(move || {
+            LeaseHandoff::wait_cancellable(&waiter_paths, std::process::id(), &waiter_cancelled)
+        });
+        cancelled.store(true, Ordering::Release);
+        assert!(waiter.join().unwrap().unwrap().is_none());
+        // Joining completes while the source still owns the lock. Nothing can
+        // wake later and steal a replacement daemon's reservation.
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) }, 0);
+        let replacement = LeaseHandoff::wait(&paths, std::process::id()).unwrap();
+        assert!(HostLease::is_held(&paths).unwrap());
+        drop(replacement);
+        assert!(!HostLease::is_held(&paths).unwrap());
+    }
 }

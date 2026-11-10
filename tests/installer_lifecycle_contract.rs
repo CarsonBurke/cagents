@@ -283,10 +283,18 @@ fn coordinated_release_mode(
     let status = r#"#!/bin/sh
 CLI=old
 if [ "$FIXTURE_HANDOFF" = true ]; then
-  "$FIXTURE_LEASE_CHECK" || exit 97
-  # Match CLI startup: no ordinary helper may retain update authority.
-  exec 3<&-
-  unset CAGENTS_DAEMON_LEASE_FD
+  case "$CLI:$*" in
+    'new:daemon verify-update-lease'|'new:daemon start')
+      "$FIXTURE_LEASE_CHECK" || exit 97
+      # Match CLI startup: ordinary helpers cannot retain update authority.
+      exec 3<&-
+      unset CAGENTS_DAEMON_LEASE_FD
+      ;;
+    *)
+      # Includes older installed coordinators and every liveness/help probe.
+      [ -z "${CAGENTS_DAEMON_LEASE_FD:-}" ] && [ ! -e /proc/self/fd/3 ] || exit 97
+      ;;
+  esac
   # The worker already owns window coordination in this fixture. This CLI
   # stands in for its verified inherited fence; real guard/adoption validation
   # is covered by installer_guard_contract and the daemon process tests.
@@ -318,15 +326,17 @@ case "$*" in
     fi
     exec "$FIXTURE_REAL_CLI" "$@"
     ;;
+  'daemon verify-update-lease')
+    [ "$CLI" = new ] && [ "$FIXTURE_HANDOFF" = true ] || exit 98
+    ;;
   '--json daemon status')
     [ "$#" -eq 3 ] || exit 98
     if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-unknown ] || [ "$FIXTURE_RESTART" = empty-start-unknown ]; }; then exit 9; fi
     if [ "$CLI" = new ] && [ "$FIXTURE_COMPATIBLE" = false ] &&
        [ "$(cat "$FIXTURE_RUNNING" 2>/dev/null)" = old ]; then exit 9; fi
     if [ -e "$FIXTURE_RUNNING" ]; then running=true; else running=false; fi
-    # A held lease reports running/starting before a listener exists, including
-    # when only the worker reservation survives a failed startup command.
-    if [ "$FIXTURE_HANDOFF" = true ]; then running=true; fi
+    # Only the fixture's actual daemon marker reports a serving service.
+    # A worker retaining its reservation after a dead candidate is not one.
     if [ -e "$FIXTURE_PENDING" ]; then
       [ "$CLI" = old ] || exit 98
       printf '%s\n' old:draining >> "$FIXTURE_ACTIONS"
@@ -335,9 +345,9 @@ case "$*" in
       printf '%s:stopped\n' "$CLI" >> "$FIXTURE_ACTIONS"
     fi
     if [ "$FIXTURE_COORDINATOR:$CLI" = starting:new ] || [ "$FIXTURE_RESTART:$CLI" = handoff-starting:new ]; then
-      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":null,"inherited_lease":%s}}\n' "$running" "$FIXTURE_HANDOFF"
+      printf '{"ok":true,"command":"daemon.status","data":{"running":false,"daemon_present":%s,"daemon_version":null,"inherited_lease":false}}\n' "$running"
     else
-      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture","inherited_lease":%s}}\n' "$running" "$FIXTURE_HANDOFF"
+      printf '{"ok":true,"command":"daemon.status","data":{"running":%s,"daemon_version":"fixture","inherited_lease":false}}\n' "$running"
     fi
     ;;
   'daemon store-schema --help'|'daemon downgrade-store --help')
@@ -824,10 +834,21 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         assert_eq!(output.status.success(), success, "{output:?}");
         assert_eq!(
             fs::read_link(prefix.join("current")).unwrap(),
-            Path::new("versions/9.9.9")
+            Path::new(if success || starting {
+                "versions/9.9.9"
+            } else {
+                "versions/old"
+            })
         );
         let actions = fs::read_to_string(&actions).unwrap();
-        assert_eq!(actions, "new:start\n");
+        assert_eq!(
+            actions,
+            if success || starting {
+                "new:start\n"
+            } else {
+                "new:start\nnew:stopped\n"
+            }
+        );
         let utility_calls = fs::read_to_string(&utility_log).unwrap();
         for tool in [
             "id", "uname", "getconf", "awk", "mktemp", "cp", "tar", "find", "chmod", "mkdir",
@@ -859,13 +880,13 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             );
         } else {
             assert!(!running.exists());
-            assert!(prefix.join("versions/9.9.9/bin/cagents").exists());
+            assert!(!prefix.join("versions/9.9.9").exists());
             assert!(
                 String::from_utf8_lossy(&output.stderr)
                     .contains("replacement daemon startup failed")
             );
             assert!(
-                String::from_utf8_lossy(&output.stderr)
+                !String::from_utf8_lossy(&output.stderr)
                     .contains("replacement daemon shutdown is not proven"),
                 "{output:?}"
             );
@@ -1365,8 +1386,8 @@ fn lease_path_installer_transaction() {
     }
 }
 
-/// A held daemon lease is startup evidence even before the socket and version
-/// round trip become available. Cleanup must keep its executable tree.
+/// A real starting daemon is distinct from the worker's held reservation.
+/// Cleanup must retain the live process's executable tree.
 #[test]
 fn inherited_starting_daemon_keeps_its_new_version_on_installer_failure() {
     upgrade_fixture(false, 7, None, Some("handoff-starting"));

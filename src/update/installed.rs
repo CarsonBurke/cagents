@@ -148,9 +148,12 @@ pub(super) fn perform(
         Err(UpdateError::Cancelled) => UpdateError::Cancelled,
         _ => UpdateError::from(error),
     })?;
+    let mut shutdown_requested = false;
+    let mut previous = None;
+    let mut original_schema = None;
     let mut startup_attempted = false;
     let mut startup_owned = false;
-    let result = (|| {
+    let mut result = (|| {
         let current = observe(
             confirmed
                 .daemon
@@ -175,11 +178,27 @@ pub(super) fn perform(
             let source =
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
+            // Read the executable of the pidfd-pinned source, rather than
+            // retaining an owner observed before the user reviewed the update.
+            let executable = fs::read_link(format!("/proc/{}/exe", source.pid))?;
+            let owner = locate(&executable)?;
+            if owner.prefix != installation.prefix || source.exited()? {
+                return Err(invalid("The installed source changed before shutdown"));
+            }
+            previous = (owner.version_root != root).then_some(owner.version_root);
             confirmation::prepared(state, job)?;
+            shutdown_requested = true;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
             *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
+            if previous.is_some() {
+                original_schema = Some(stopped_store_schema(
+                    root,
+                    &guard,
+                    handoff.as_ref().unwrap(),
+                )?);
+            }
         }
         confirmation::prepared(state, job)?;
         set_phase(
@@ -224,29 +243,167 @@ pub(super) fn perform(
         }
         Ok(())
     })();
-    // Before startup, retain the previous matched executable on failure. Once
-    // the successor owns the runtime or an actual startup command was spawned,
-    // reopen that candidate's recovery UI instead of an incompatible old UI.
+    let mut restored_previous = false;
+    if result.is_err()
+        && shutdown_requested
+        && let Some(previous) = previous.as_ref()
+    {
+        match rollback_stopped_candidate(
+            &installation.prefix,
+            root,
+            previous,
+            original_schema,
+            startup_attempted,
+            &guard,
+            handoff,
+        ) {
+            Ok(restored) => restored_previous = restored,
+            Err(error) => {
+                eprintln!("Installed candidate rollback failed: {error}");
+                result = Err(invalid(format!(
+                    "{} Recovery could not restore the previous installation: {error}",
+                    result.unwrap_err()
+                )));
+            }
+        }
+    }
+    // A failed command can have left a serving successor. Keep that writer's
+    // matched UI; a proven-dead candidate instead restores the old matched set.
     let successor_owns_runtime = startup_attempted
         && !startup_owned
         && result.is_err()
         && crate::daemon::running_executable()
             .is_ok_and(|executable| executable == Some(root.join("bin/cagentsd")));
-    let reopen = if result.is_ok() || successor_owns_runtime || startup_owned {
+    let reopen = if restored_previous {
+        previous.as_ref().unwrap().clone()
+    } else if result.is_ok() || successor_owns_runtime || startup_owned {
         root.to_owned()
     } else {
-        installation
-            .prefix
-            .join("versions")
-            .join(&installation.version)
+        previous.unwrap_or_else(|| root.to_owned())
     };
-    let recovery_result = finish_handoff(installation, state, job, &result, handoff, &guard);
+    let recovery_result = finish_handoff(
+        installation,
+        state,
+        job,
+        &result,
+        handoff,
+        shutdown_requested,
+        &guard,
+    );
     let reopened = guard
         .relaunch_windows(&windows, &reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
     recovery_result?;
     result?;
     reopened
+}
+
+/// Store maintenance receives the reservation intentionally; status probes
+/// never do. This keeps conversion and the following startup in one handoff.
+fn candidate_maintenance(
+    root: &Path,
+    arguments: &[&str],
+    guard: &crate::instance::UiUpdateGuard,
+    handoff: &crate::daemon::lease_handoff::LeaseHandoff,
+) -> Result<File, UpdateError> {
+    let mut command = Command::new(root.join("bin/cagents"));
+    command.args(arguments);
+    crate::install_guard::sanitize_child_environment(&mut command);
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+    guard.inherit_for_install(&mut command)?;
+    handoff.inherit(&mut command)?;
+    bounded_command(
+        &mut command,
+        "Preparing terminal service recovery",
+        SMALL_ASSET_LIMIT,
+        Duration::from_secs(30),
+        &CancellationToken::new(),
+    )
+}
+
+fn stopped_store_schema(
+    root: &Path,
+    guard: &crate::instance::UiUpdateGuard,
+    handoff: &crate::daemon::lease_handoff::LeaseHandoff,
+) -> Result<u32, UpdateError> {
+    let mut output = candidate_maintenance(root, &["daemon", "store-schema"], guard, handoff)?;
+    let mut schema = String::new();
+    output.read_to_string(&mut schema)?;
+    let schema = schema.trim();
+    // Match installer rollback when the source had no shared-model store.
+    if schema.is_empty() {
+        Ok(22)
+    } else {
+        schema
+            .parse()
+            .map_err(|_| invalid("The stopped terminal store schema is unreadable"))
+    }
+}
+
+fn rollback_stopped_candidate(
+    prefix: &Path,
+    candidate: &Path,
+    previous: &Path,
+    schema: Option<u32>,
+    startup_attempted: bool,
+    guard: &crate::instance::UiUpdateGuard,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+) -> Result<bool, UpdateError> {
+    selected_candidate(prefix, candidate)?;
+    let paths =
+        crate::daemon::RuntimePaths::discover().map_err(|error| invalid(error.to_string()))?;
+    if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
+        return Ok(false);
+    }
+    if handoff.is_none() {
+        *handoff = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths)
+            .map_err(|error| invalid(error.to_string()))?;
+    }
+    let Some(lease) = handoff.as_ref() else {
+        return Ok(false);
+    };
+    if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
+        return Ok(false);
+    }
+    if startup_attempted {
+        let schema = schema.ok_or_else(|| invalid("The previous store schema was not captured"))?;
+        candidate_maintenance(
+            candidate,
+            &["daemon", "downgrade-store", &schema.to_string()],
+            guard,
+            lease,
+        )?;
+    }
+    restore_current(prefix, candidate, previous)?;
+    Ok(true)
+}
+
+fn selected_candidate(prefix: &Path, candidate: &Path) -> Result<(), UpdateError> {
+    let current = prefix.join("current");
+    if current.canonicalize()? != candidate
+        || !fs::symlink_metadata(&current)?.file_type().is_symlink()
+    {
+        return Err(invalid("The selected installation changed during recovery"));
+    }
+    Ok(())
+}
+
+fn restore_current(prefix: &Path, candidate: &Path, previous: &Path) -> Result<(), UpdateError> {
+    selected_candidate(prefix, candidate)?;
+    let current = prefix.join("current");
+    // Both roots came from the authenticated installation layout. Keep a new
+    // relative link beside current, then replace it atomically under the fence.
+    let previous = previous
+        .strip_prefix(prefix)
+        .map_err(|_| invalid("The previous version belongs to another installation"))?;
+    let temporary = prefix.join(format!(".rollback-{}", uuid::Uuid::new_v4()));
+    std::os::unix::fs::symlink(previous, &temporary)?;
+    let replaced = fs::rename(&temporary, &current);
+    if replaced.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    replaced?;
+    Ok(())
 }
 
 /// A compatible protocol is not proof that the daemon already runs the
@@ -478,6 +635,148 @@ fn startup_failure(error: &io::Error, reason: Option<&str>, successor_runs: bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stopped_installed_candidate_rolls_back_only_without_a_live_writer() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        const ROOT: &str = "CAGENTS_INSTALLED_ROLLBACK_FIXTURE_ROOT";
+        let Some(root) = std::env::var_os(ROOT) else {
+            let root = tempfile::tempdir().unwrap();
+            for member in ["runtime", "home"] {
+                fs::create_dir(root.path().join(member)).unwrap();
+                fs::set_permissions(root.path().join(member), fs::Permissions::from_mode(0o700))
+                    .unwrap();
+            }
+            let selector = thread::current().name().unwrap().to_owned();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &selector, "--nocapture", "--test-threads=1"])
+                .env(ROOT, root.path())
+                .env("XDG_RUNTIME_DIR", root.path().join("runtime"))
+                .env("HOME", root.path().join("home"))
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        };
+        let root = PathBuf::from(root);
+        let old = root.join("versions/old");
+        let candidate = root.join("versions/candidate");
+        for version in [&old, &candidate] {
+            fs::create_dir_all(version.join("bin")).unwrap();
+        }
+        symlink("versions/candidate", root.join("current")).unwrap();
+        let cli = candidate.join("bin/cagents");
+        fs::write(
+            &cli,
+            r#"#!/usr/bin/python3
+import fcntl, os, pathlib, sys
+assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '199'
+assert 'FLOCK' in pathlib.Path('/proc/self/fdinfo/199').read_text()
+fcntl.flock(199, fcntl.LOCK_EX | fcntl.LOCK_NB)
+root=pathlib.Path(__file__).resolve().parents[3]
+if sys.argv[1:] == ['daemon', 'store-schema']:
+ print(23)
+elif sys.argv[1:] == ['daemon', 'downgrade-store', '23']:
+ if (root/'fail-conversion').exists(): sys.exit(1)
+ (root/'converted').write_text('23')
+else: raise AssertionError(sys.argv)
+"#,
+        )
+        .unwrap();
+        fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = crate::daemon::RuntimePaths::discover().unwrap();
+        fs::create_dir_all(&paths.directory).unwrap();
+        fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut stopped = Command::new("/bin/true").spawn().unwrap();
+        let stopped_pid = stopped.id();
+        stopped.wait().unwrap();
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("installed-rollback"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("installed-rollback"),
+        };
+        let metadata =
+            |pid| serde_json::to_vec(&serde_json::json!({"pid":pid,"proof":proof})).unwrap();
+        let mut lock = OpenOptions::new()
+            .write(true)
+            .read(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        lock.write_all(&metadata(stopped_pid)).unwrap();
+        let mut lease = crate::daemon::lease_handoff::LeaseHandoff::try_acquire(&paths).unwrap();
+        let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+        let schema = stopped_store_schema(&candidate, &guard, lease.as_ref().unwrap()).unwrap();
+        assert_eq!(schema, 23);
+        // Conversion failure must leave the only readable installation selected.
+        fs::write(root.join("fail-conversion"), "fail").unwrap();
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .is_err()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), candidate);
+        fs::remove_file(root.join("fail-conversion")).unwrap();
+        // A live metadata owner keeps its matched installation and store.
+        lock.seek(SeekFrom::Start(0)).unwrap();
+        lock.set_len(0).unwrap();
+        lock.write_all(&metadata(std::process::id())).unwrap();
+        assert!(
+            !rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert!(!root.join("converted").exists());
+        // Once the new daemon is dead, retain the reservation through conversion
+        // and atomically restore the authenticated old source's matched set.
+        lock.seek(SeekFrom::Start(0)).unwrap();
+        lock.set_len(0).unwrap();
+        lock.write_all(&metadata(stopped_pid)).unwrap();
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .unwrap()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert_eq!(fs::read_to_string(root.join("converted")).unwrap(), "23");
+        fs::remove_file(root.join("converted")).unwrap();
+        // An independently changed current is rejected before store conversion.
+        assert!(
+            rollback_stopped_candidate(
+                &root,
+                &candidate,
+                &old,
+                Some(schema),
+                true,
+                &guard,
+                &mut lease
+            )
+            .is_err()
+        );
+        assert!(!root.join("converted").exists());
+    }
 
     fn run_captured(
         script: &str,

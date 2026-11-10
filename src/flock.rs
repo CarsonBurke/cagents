@@ -57,14 +57,14 @@ pub(crate) fn holder_pid(proc_root: &Path, expected: &fs::Metadata) -> io::Resul
         match fs::metadata(&process) {
             Ok(metadata) if metadata.uid() != expected.uid() => continue,
             Ok(_) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error),
+            // A process may exit, revoke inspection, or change namespaces
+            // between the index read and this proof. It is not a proven owner.
+            Err(_) => continue,
         }
         match process_owns_lock(&process, pid, expected) {
             Ok(true) => return Ok(Some(pid)),
             Ok(false) => {}
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
+            Err(_) => {}
         }
     }
     Ok(None)
@@ -124,6 +124,25 @@ mod tests {
         symlink(lock.path(), process.join("fd/7")).unwrap();
         fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
         assert_eq!(holder_pid(root.path(), &expected).unwrap(), Some(PID));
+    }
+
+    #[test]
+    fn lease_handoff_skips_uninspectable_candidates_and_continues_to_proven_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let lock = tempfile::NamedTempFile::new().unwrap();
+        let expected = lock.as_file().metadata().unwrap();
+        let record = lock_record(&expected);
+        let inaccessible = record.replace(&format!("WRITE {PID} "), "WRITE 41 ");
+        let process = fake_process(root.path(), &format!("{inaccessible}{record}"));
+        fs::create_dir(root.path().join("41")).unwrap();
+        // Reading a vanished or inaccessible fdinfo is not ownership proof.
+        // ENOTDIR also exercises the error path reliably under root test runs.
+        fs::write(root.path().join("41/fdinfo"), "not a directory").unwrap();
+        symlink(lock.path(), process.join("fd/7")).unwrap();
+        fs::write(process.join("fdinfo/7"), format!("lock: {record}")).unwrap();
+        assert_eq!(holder_pid(root.path(), &expected).unwrap(), Some(PID));
+        fs::remove_file(process.join("fdinfo/7")).unwrap();
+        assert_eq!(holder_pid(root.path(), &expected).unwrap(), None);
     }
 
     #[test]

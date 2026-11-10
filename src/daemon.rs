@@ -616,6 +616,85 @@ struct StoredLockMetadata {
     pid: u32,
 }
 
+/// Distinguish a live daemon process from an updater's retained reservation.
+/// A successful handshake establishes serving readiness separately; a live
+/// process still holding the recorded descriptor can be starting or stopping.
+pub(crate) fn daemon_process_alive_at(paths: &RuntimePaths) -> Result<bool, PlatformError> {
+    if !HostLease::is_held(paths)? {
+        return Ok(false);
+    }
+    let lock = match OpenOptions::new()
+        .read(true)
+        .custom_flags(LOCK_OPEN_FLAGS | libc::O_CLOEXEC)
+        .open(&paths.lock)
+    {
+        Ok(lock) => lock,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    validate_lock_file(&paths.lock, &lock.metadata()?, current_uid())?;
+    let stored: StoredLockMetadata = serde_json::from_reader(&lock)?;
+    let pid = i32::try_from(stored.pid)
+        .ok()
+        .filter(|pid| *pid > 1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid daemon PID"))?;
+    // Pin and check exit before inspecting descriptors: an exited zombie has
+    // no descriptors even though its /proc directory and pidfd still exist.
+    let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+    if descriptor < 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(libc::ESRCH) {
+            Ok(false)
+        } else {
+            Err(error.into())
+        };
+    }
+    // SAFETY: successful pidfd_open returned a fresh descriptor owned here.
+    let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+    let exited = || -> io::Result<bool> {
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd referring to the pinned process.
+        if unsafe { libc::poll(&mut poll, 1, 0) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(poll.revents != 0)
+    };
+    if exited()? {
+        return Ok(false);
+    }
+    let process_path = Path::new("/proc").join(stored.pid.to_string());
+    let ownership = (|| -> io::Result<bool> {
+        validate_owner(
+            &process_path,
+            &fs::symlink_metadata(&process_path)?,
+            current_uid(),
+        )
+        .map_err(io::Error::other)?;
+        let expected = lock.metadata()?;
+        for entry in fs::read_dir(process_path.join("fd"))? {
+            let entry = entry?;
+            let actual = match fs::metadata(entry.path()) {
+                Ok(actual) => actual,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if actual.dev() == expected.dev() && actual.ino() == expected.ino() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })();
+    // A process can finish while its descriptor ownership is being inspected.
+    if exited()? {
+        return Ok(false);
+    }
+    ownership.map_err(Into::into)
+}
+
 /// Locate the executable of this instance's live, kernel-verified lock owner.
 /// Update coordination uses its sibling CLI to speak the owner's own protocol.
 pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
@@ -1220,6 +1299,44 @@ mod tests {
         let expected = unsafe { libc::geteuid() };
         assert_eq!(peer_uid(&client).unwrap(), expected);
         assert_eq!(peer_uid(&server).unwrap(), expected);
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
+    fn lease_handoff_reservation_is_not_a_live_daemon_process() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let paths = RuntimePaths {
+            directory: root.path().to_owned(),
+            socket: root.path().join("cagentsd.sock"),
+            lock: root.path().join("cagentsd.lock"),
+        };
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let pid = child.id();
+        let lock = OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&paths.lock)
+            .unwrap();
+        fs::write(&paths.lock, format!("{{\"pid\":{pid}}}")).unwrap();
+        assert_eq!(unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) }, 0);
+        // Wait for exit without reaping to exercise the zombie case too.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0) };
+        assert!(descriptor >= 0);
+        let process = unsafe { File::from_raw_fd(descriptor as c_int) };
+        let mut poll = libc::pollfd {
+            fd: process.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut poll, 1, 5000) }, 1);
+        assert!(HostLease::is_held(&paths).unwrap());
+        assert!(!daemon_process_alive_at(&paths).unwrap());
+        assert!(child.wait().unwrap().success());
+        assert!(!daemon_process_alive_at(&paths).unwrap());
     }
 
     #[cfg(feature = "host")]

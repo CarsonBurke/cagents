@@ -1,17 +1,19 @@
 #!/bin/sh
 set -eu
 
-# Only candidate CLIs may receive the update's held descriptor. POSIX sh can
-# close the installer's low transport slot before invoking ordinary tools;
-# the CLI seals that slot on startup and forwards it to the daemon as fd 199.
-if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then
-    installer_tool() (
+# Only explicit candidate lease validation, store maintenance and daemon start
+# receive the reservation. Every ordinary command closes the shell's transport
+# descriptor, including older installed CLIs that do not know how to seal it.
+installer_tool() (
+    if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then
         exec 3<&-
-        unset CAGENTS_DAEMON_LEASE_FD
-        exec "$@"
-    )
+    fi
+    unset CAGENTS_DAEMON_LEASE_FD
+    exec "$@"
+)
+if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then
     # Preserve command -v detection for optional and missing tools. Aliases
-    # apply inside the functions below as well as their command substitutions.
+    # apply inside functions and command substitutions too.
     for installer_utility in awk cat chmod cp curl find getconf gh \
         gtk-update-icon-cache id ln mkdir mktemp mv readlink rm rmdir sed \
         sha256sum shasum sleep tar uname update-desktop-database; do
@@ -217,10 +219,15 @@ remove_owned_link() {
 
 read_daemon_status() {
     daemon_cli=$1
-    if daemon_output=$("$daemon_cli" --json daemon status 2>/dev/null); then
+    if daemon_output=$(installer_tool "$daemon_cli" --json daemon status 2>/dev/null); then
         case $daemon_output in
             *'
 '*) DAEMON_STATUS=unknown ;;
+            *'"running":false'*'"daemon_present":true'*|*'"daemon_present":true'*'"running":false'*)
+                # A real daemon can still be starting or draining. A held
+                # reservation alone is never evidence of such a process.
+                DAEMON_STATUS=unknown
+                ;;
             '{"ok":true,"command":"daemon.status","data":{'*'"running":true'*|\
             '{"command":"daemon.status","data":{'*'"running":true,'*'},"ok":true}')
                 DAEMON_STATUS=running
@@ -245,7 +252,7 @@ stop_daemon_and_wait() {
         *) fail 'cannot verify daemon status; installation was not changed' ;;
     esac
 
-    "$daemon_cli" daemon stop --require-empty >/dev/null \
+    installer_tool "$daemon_cli" daemon stop --require-empty >/dev/null \
         || fail 'daemon was not stopped: finish terminals or explicitly confirm their termination with cagents daemon stop --confirm, then retry; installation was not changed'
 
     wait_for_daemon_shutdown "$daemon_cli"
@@ -266,7 +273,7 @@ wait_for_daemon_shutdown() {
 prepare_daemon_upgrade() {
     daemon_cli=$1
     # Discover support without issuing an unknown mutation to a legacy CLI.
-    if ! daemon_help=$("$daemon_cli" daemon --help 2>/dev/null) \
+    if ! daemon_help=$(installer_tool "$daemon_cli" daemon --help 2>/dev/null) \
         || ! printf '%s\n' "$daemon_help" | awk '
             $1 == "prepare-upgrade" { supported = 1 }
             END { exit !supported }
@@ -275,7 +282,7 @@ prepare_daemon_upgrade() {
     fi
     set -- --yes
     if [ -n "$RELAUNCH_AGENTS" ]; then
-        relaunch_help=$("$daemon_cli" daemon prepare-upgrade --help 2>/dev/null) \
+        relaunch_help=$(installer_tool "$daemon_cli" daemon prepare-upgrade --help 2>/dev/null) \
             || fail 'cannot inspect installed upgrade support; installation was not changed'
         if [ "$RELAUNCH_AGENTS" -eq 1 ]; then
             printf '%s\n' "$relaunch_help" | awk '$1 == "--relaunch-agents" { supported = 1 } END { exit !supported }' \
@@ -286,7 +293,7 @@ prepare_daemon_upgrade() {
             set -- "$@" --no-relaunch-agents
         fi
     fi
-    "$daemon_cli" --json daemon prepare-upgrade "$@" >/dev/null \
+    installer_tool "$daemon_cli" --json daemon prepare-upgrade "$@" >/dev/null \
         || fail 'daemon checkpoint preparation failed; installation was not changed'
     wait_for_daemon_shutdown "$daemon_cli"
     DAEMON_STOPPED_FOR_SWITCH=1
@@ -577,7 +584,7 @@ cleanup() {
         && [ "$DAEMON_STOPPED_FOR_SWITCH" -eq 1 ] \
         && [ "$OLD_DAEMON_WAS_RUNNING" -eq 1 ] \
         && [ "$ROLLBACK_OK" -eq 1 ]; then
-        "$PREFIX/current/bin/cagents" daemon start >/dev/null 2>&1 \
+        installer_tool "$PREFIX/current/bin/cagents" daemon start >/dev/null 2>&1 \
             || printf '%s: restored the previous version but could not restart its daemon\n' \
                 "$PROGRAM" >&2
     fi
@@ -761,14 +768,14 @@ tar -xOzf "$ARCHIVE_PATH" -- "$TOP_LEVEL/bin/cagentsd" > "$CANDIDATE_INSPECTOR" 
 chmod 0700 "$CANDIDATE_COORDINATOR" "$CANDIDATE_INSPECTOR"
 supports_install_guard() {
     [ -x "$1" ] \
-        && "$1" coordinate-install --help >/dev/null 2>&1 \
-        && "$1" verify-install-guard --help >/dev/null 2>&1 \
-        && "$1" record-deferred-install --help >/dev/null 2>&1
+        && installer_tool "$1" coordinate-install --help >/dev/null 2>&1 \
+        && installer_tool "$1" verify-install-guard --help >/dev/null 2>&1 \
+        && installer_tool "$1" record-deferred-install --help >/dev/null 2>&1
 }
 supports_stage_guard() {
     supports_install_guard "$1" || return 1
     for stage_command in coordinate-install verify-install-guard record-deferred-install; do
-        stage_help=$("$1" "$stage_command" --help 2>/dev/null) || return 1
+        stage_help=$(installer_tool "$1" "$stage_command" --help 2>/dev/null) || return 1
         printf '%s\n' "$stage_help" | awk '$1 == "--stage-only" { found = 1 } END { exit !found }' || return 1
     done
 }
@@ -776,8 +783,8 @@ supports_stage_guard() {
 # the shared-model store, without starting anything.
 supports_store_conversion() {
     [ -x "$1" ] \
-        && "$1" daemon store-schema --help >/dev/null 2>&1 \
-        && "$1" daemon downgrade-store --help >/dev/null 2>&1
+        && installer_tool "$1" daemon store-schema --help >/dev/null 2>&1 \
+        && installer_tool "$1" daemon downgrade-store --help >/dev/null 2>&1
 }
 supports_selected_guard() {
     if [ "$STAGE_ONLY" -eq 1 ]; then supports_stage_guard "$1"; else supports_install_guard "$1"; fi
@@ -800,7 +807,7 @@ fi
 if [ -n "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
     set -- verify-install-guard
     [ "$STAGE_ONLY" -eq 0 ] || set -- "$@" --stage-only
-    "$COORDINATOR" "$@" >/dev/null \
+    installer_tool "$COORDINATOR" "$@" >/dev/null \
         || fail 'inherited application update fence is invalid; installation was not changed'
 else
     INSTALLER_SOURCE=$0
@@ -838,7 +845,7 @@ else
         set -- --prefix "$PREFIX" --installer "$INSTALLER_SOURCE" -- "$@"
     fi
     CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH \
-        "$COORDINATOR" coordinate-install "$@" &
+        installer_tool "$COORDINATOR" coordinate-install "$@" &
     COORDINATOR_PID=$!
     if [ "$COORDINATOR_INTERRUPTED" -eq 1 ]; then
         kill -TERM "$COORDINATOR_PID" 2>/dev/null || :
@@ -1084,7 +1091,7 @@ OWNER_CLI=${CAGENTS_INSTALL_OWNER_CLI:-$PREFIX/current/bin/cagents}
 if [ "$STAGE_ONLY" -eq 1 ]; then
     # Private routing is recorded in the complete candidate tree BEFORE it can
     # become current. The coordinator authenticates the unchanged live owner.
-    "$COORDINATOR" record-deferred-install --stage-only --prefix "$PREFIX" --version-root "$NEW_VERSION_DIR" >/dev/null \
+    installer_tool "$COORDINATOR" record-deferred-install --stage-only --prefix "$PREFIX" --version-root "$NEW_VERSION_DIR" >/dev/null \
         || fail 'cannot preserve the running owner for this staged update; installation was not changed'
     DAEMON_DEFERRED=1
 elif [ "$HAD_CURRENT" -eq 1 ]; then
@@ -1093,11 +1100,8 @@ elif [ "$HAD_CURRENT" -eq 1 ]; then
             # The reviewed worker already checkpointed the source and holds
             # its lease. The candidate validates the exact inherited lock;
             # an environment marker alone cannot authorize skipping prepare.
-            read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
-            case $DAEMON_STATUS:$daemon_output in
-                running:*'"inherited_lease":true'*|stopped:*'"inherited_lease":true'*) ;;
-                *) fail 'cannot verify the terminal service is ready for the update; installation was not changed' ;;
-            esac
+            "$NEW_VERSION_DIR/bin/cagents" daemon verify-update-lease >/dev/null \
+                || fail 'cannot verify the terminal service is ready for the update; installation was not changed'
         else
             read_daemon_status "$OWNER_CLI"
             case $DAEMON_STATUS in
@@ -1138,7 +1142,7 @@ elif [ "$HAD_CURRENT" -eq 1 ]; then
                         # Routing is recorded before current changes. The
                         # outer owner reopens the previous UI even if a later
                         # publication failure rolls this transaction back.
-                        "$COORDINATOR" record-deferred-install >/dev/null \
+                        installer_tool "$COORDINATOR" record-deferred-install >/dev/null \
                             || fail 'cannot preserve the running application for a deferred update; installation was not changed'
                         DAEMON_DEFERRED=1
                         ;;

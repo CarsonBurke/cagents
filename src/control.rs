@@ -289,6 +289,9 @@ pub enum DaemonCommand {
     Start,
     /// Report whether the daemon is running.
     Status,
+    /// Validate inherited updater authority without probing daemon liveness.
+    #[command(hide = true)]
+    VerifyUpdateLease,
     /// Finish a staged installation through the same reviewed update flow as the app.
     Upgrade {
         /// Approve the displayed impact without an interactive prompt.
@@ -2809,6 +2812,7 @@ fn routes_to_staged_owner(command: &TopCommand) -> bool {
             | TopCommand::RestartWindows { .. }
             | TopCommand::Daemon {
                 command: DaemonCommand::ProtocolVersion
+                    | DaemonCommand::VerifyUpdateLease
                     | DaemonCommand::StopForRebuild { .. }
                     | DaemonCommand::Upgrade { .. }
                     | DaemonCommand::StoreSchema
@@ -3362,9 +3366,19 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                 human: format!("{} daemon running ({})", instance::NAME, socket.display()),
             })
         }
+        DaemonCommand::VerifyUpdateLease => {
+            let inherited = crate::daemon::lease_handoff::has_inherited_lease()
+                .map_err(|error| AppError::new("daemon_lease", error))?;
+            if !inherited {
+                return Err(AppError::new("daemon_lease", "no inherited update lease"));
+            }
+            Ok(CommandOutput {
+                command: "daemon.verify_update_lease",
+                data: json!({ "inherited_lease": true }),
+                human: "Update lease verified".into(),
+            })
+        }
         DaemonCommand::Status => {
-            let paths = crate::daemon::RuntimePaths::discover()
-                .map_err(|error| AppError::new("socket_path", error))?;
             let selected_socket =
                 daemon_socket_path().map_err(|error| AppError::new("socket_path", error))?;
             let socket = &selected_socket;
@@ -3380,16 +3394,23 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                         io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
                 {
-                    // Ownership proves startup or shutdown is still in progress,
-                    // including a daemon that adopted the updater's descriptor.
-                    crate::daemon::HostLease::is_held(&paths)
-                        .map_err(|error| AppError::new("daemon_status", error))?
+                    // A reservation can belong to the updater or a probe itself.
+                    // Only an authenticated serving handshake establishes running.
+                    false
                 }
                 Err(error) => return Err(AppError::new("protocol", error)),
             };
+            let daemon_present = running
+                || crate::daemon::daemon_process_alive_at(&crate::daemon::RuntimePaths {
+                    directory: socket.parent().unwrap_or(Path::new("/")).to_owned(),
+                    lock: socket.with_file_name("cagentsd.lock"),
+                    socket: socket.clone(),
+                })
+                .map_err(|error| AppError::new("daemon_status", error))?;
             let mut data = json!({
                 "instance": instance::NAME,
                 "running": running,
+                "daemon_present": daemon_present,
                 "socket": socket,
                 "daemon_version": daemon_version,
                 "inherited_lease": crate::daemon::lease_handoff::has_inherited_lease()
@@ -4830,7 +4851,7 @@ mod tests {
     }
 
     #[test]
-    fn inherited_daemon_lease_reports_starting_before_listener_is_bound() {
+    fn inherited_daemon_lease_is_not_a_serving_daemon() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         const CHILD: &str = "CAGENTS_TEST_INHERITED_STATUS";
@@ -4839,11 +4860,12 @@ mod tests {
             let descriptor: i32 = descriptor.parse().unwrap();
             crate::daemon::lease_handoff::initialize_inherited_lease().unwrap();
             let output = super::execute_daemon(super::DaemonCommand::Status).unwrap();
-            assert_eq!(output.data["running"], true);
+            assert_eq!(output.data["running"], false);
             assert_eq!(output.data["inherited_lease"], true);
             assert!(output.data["daemon_version"].is_null());
-            assert!(output.human.contains("starting running"));
-            assert!(!output.human.contains("stopped"));
+            assert!(output.human.contains("stopped"));
+            let verified = super::execute_daemon(super::DaemonCommand::VerifyUpdateLease).unwrap();
+            assert_eq!(verified.data["inherited_lease"], true);
             // Startup seals either transport even without a child sealing hook.
             assert_ne!(
                 unsafe { libc::fcntl(descriptor, libc::F_GETFD) } & libc::FD_CLOEXEC,
@@ -4903,17 +4925,17 @@ mod tests {
                     .unwrap();
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
-            .args([
-                "--exact",
-                "control::tests::inherited_daemon_lease_reports_starting_before_listener_is_bound",
-                "--nocapture",
-                "--test-threads=1",
-            ])
-            .env(CHILD, descriptor.to_string())
-            .env("XDG_RUNTIME_DIR", runtime.path())
-            .env("XDG_CONFIG_HOME", runtime.path().join("config"))
-            .env("XDG_STATE_HOME", runtime.path().join("state"))
-            .env("HOME", runtime.path());
+                .args([
+                    "--exact",
+                    "control::tests::inherited_daemon_lease_is_not_a_serving_daemon",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(CHILD, descriptor.to_string())
+                .env("XDG_RUNTIME_DIR", runtime.path())
+                .env("XDG_CONFIG_HOME", runtime.path().join("config"))
+                .env("XDG_STATE_HOME", runtime.path().join("state"))
+                .env("HOME", runtime.path());
             if descriptor == 3 {
                 handoff.inherit_for_installer(&mut command).unwrap();
             } else {

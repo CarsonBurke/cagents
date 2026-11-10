@@ -1180,6 +1180,7 @@ fn perform_update(
         Err(UpdateError::Cancelled) => UpdateError::Cancelled,
         _ => UpdateError::from(error),
     })?;
+    let mut shutdown_requested = false;
     let install_result = (|| {
         Installation::detect()?;
         let current = observe_impact(
@@ -1205,6 +1206,7 @@ fn perform_update(
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
             confirmation::prepared(state, job)?;
+            shutdown_requested = true;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
@@ -1228,8 +1230,15 @@ fn perform_update(
             handoff.as_ref(),
         )
     })();
-    let recovery_result =
-        finish_handoff(installation, state, job, &install_result, handoff, &guard);
+    let recovery_result = finish_handoff(
+        installation,
+        state,
+        job,
+        &install_result,
+        handoff,
+        shutdown_requested,
+        &guard,
+    );
     let reopen_result = guard
         .relaunch_windows(
             &windows,
@@ -1559,14 +1568,15 @@ fn finish_handoff(
     job: &mut UpdateJob,
     result: &Result<(), UpdateError>,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    shutdown_requested: bool,
     guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
-    let reserved = handoff.is_some();
-    record_handoff_failure(state, job, result, handoff)?;
+    let recovery_needed = shutdown_requested || handoff.is_some();
+    let recorded = record_handoff_failure(state, job, result, handoff);
     // Success has confirmed serving readiness. Only close our copy: LOCK_UN
     // would also unlock the successor's shared open-file description.
     drop(handoff.take());
-    if reserved && result.is_err() {
+    if recovery_needed && result.is_err() && !daemon_serving() {
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);
@@ -1583,7 +1593,15 @@ fn finish_handoff(
             return Err(invalid(job.message.clone()));
         }
     }
-    Ok(())
+    recorded
+}
+
+/// A lock reservation alone is not a serving daemon. Recovery must work even
+/// when shutdown failed before the worker acquired that reservation.
+fn daemon_serving() -> bool {
+    crate::terminal_ipc::daemon_socket_path()
+        .ok()
+        .is_some_and(|socket| source::Client::connect(&socket).is_ok())
 }
 
 fn run_installer(
@@ -3717,18 +3735,24 @@ finally:
             let runtime = isolated.path().join("runtime");
             fs::create_dir(&runtime).unwrap();
             fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
-            let output = Command::new(std::env::current_exe().unwrap())
-                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
-                .env(MODE, "worker")
-                .env(
-                    "CAGENTS_TEST_HEADLESS_EXEC",
-                    std::env::current_exe().unwrap(),
-                )
-                .env("XDG_RUNTIME_DIR", &runtime)
-                .env("HOME", isolated.path())
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{output:?}");
+            for failure in [
+                "reserved-start-failure",
+                "shutdown-requested-without-reservation",
+            ] {
+                let output = Command::new(std::env::current_exe().unwrap())
+                    .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                    .env(MODE, "worker")
+                    .env("CAGENTS_TEST_RECOVERY_FAILURE", failure)
+                    .env(
+                        "CAGENTS_TEST_HEADLESS_EXEC",
+                        std::env::current_exe().unwrap(),
+                    )
+                    .env("XDG_RUNTIME_DIR", &runtime)
+                    .env("HOME", isolated.path())
+                    .output()
+                    .unwrap();
+                assert!(output.status.success(), "{failure}: {output:?}");
+            }
             return;
         }
         if std::env::var(MODE).unwrap() == "daemon" {
@@ -3768,7 +3792,9 @@ finally:
             host_incarnation: crate::model::HostIncarnation::new("headless-recovery"),
         };
         drop(HostLease::acquire(&paths, &proof).unwrap());
-        let mut lease = Some(LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+        let failure = std::env::var("CAGENTS_TEST_RECOVERY_FAILURE").unwrap();
+        let mut lease = (failure == "reserved-start-failure")
+            .then(|| LeaseHandoff::wait(&paths, std::process::id()).unwrap());
         let installation = Installation {
             prefix: root.path().into(),
             version: "old".into(),
@@ -3817,8 +3843,9 @@ while not (root/'daemon-ready').exists():
             &installation,
             root.path(),
             &mut job,
-            &Err(invalid("installer failed before replacement startup")),
+            &Err(invalid(failure)),
             &mut lease,
+            true,
             &guard,
         )
         .unwrap();
