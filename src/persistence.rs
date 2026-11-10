@@ -255,6 +255,7 @@ pub struct WorkspaceManifest {
     pub card_scopes: HashMap<CardId, PathBuf>,
     pub chat_drafts: HashMap<CardId, String>,
     pub chat_draft_attachments: HashMap<CardId, Vec<crate::chat::Attachment>>,
+    pub chat_waiting_messages: HashMap<CardId, crate::model::SavedQueue>,
     pub agent_updates: BTreeMap<CardId, Option<(ProjectId, WorktreeId)>>,
     pub workspace_history: Vec<WorkspaceDestination>,
     pub repository_navigation: HashMap<CardId, crate::model::RepositoryNavigation>,
@@ -2168,6 +2169,7 @@ impl StateStore {
             card_scopes: manifest.card_scopes,
             chat_drafts: manifest.chat_drafts,
             chat_draft_attachments: manifest.chat_draft_attachments,
+            chat_waiting_messages: manifest.chat_waiting_messages,
             agent_updates: manifest.agent_updates,
             workspace_history: manifest.workspace_history,
             repository_navigation: manifest.repository_navigation,
@@ -2180,6 +2182,9 @@ impl StateStore {
         state
             .pending_chat_admissions
             .retain(|id, source| open_chats.get(id).is_some_and(|open| **open == *source));
+        state
+            .chat_waiting_messages
+            .retain(|id, _| open_chats.contains_key(id));
         if !warnings.is_empty() {
             retarget_dropped_cards(&mut state);
         }
@@ -4066,6 +4071,23 @@ fn save_workspace_transaction(
         &format!("workspace:{workspace_id}:navigation:chat_draft_attachments"),
         &ordered_map_json(&state.chat_draft_attachments)?,
     )?;
+    // Only an open chat can come back to show what its provider held.
+    let open_chats = open_chat_sessions(&state.cards);
+    let waiting = state
+        .chat_waiting_messages
+        .iter()
+        .filter(|(id, queue)| !queue.messages.is_empty() && open_chats.contains_key(id))
+        .map(|(id, queue)| {
+            let mut queue = queue.clone();
+            queue.messages.truncate(crate::chat::QueuedMessage::LIMIT);
+            (*id, queue)
+        })
+        .collect::<HashMap<_, _>>();
+    set_metadata(
+        transaction,
+        &format!("workspace:{workspace_id}:navigation:chat_waiting_messages"),
+        &ordered_map_json(&waiting)?,
+    )?;
     set_metadata(
         transaction,
         &format!("workspace:{workspace_id}:navigation:repository_navigation"),
@@ -5683,6 +5705,13 @@ fn load_workspace_manifest_connection(
         .map(|value| from_json("workspace chat draft attachments", &value))
         .transpose()?
         .unwrap_or_default(),
+        chat_waiting_messages: metadata(
+            connection,
+            &format!("workspace:{id}:navigation:chat_waiting_messages"),
+        )?
+        .map(|value| from_json("workspace chat waiting messages", &value))
+        .transpose()?
+        .unwrap_or_default(),
         local_only_cards: metadata(
             connection,
             &format!("workspace:{id}:navigation:local_only_cards"),
@@ -6372,6 +6401,7 @@ mod tests {
             card_scopes: HashMap::new(),
             chat_drafts: HashMap::new(),
             chat_draft_attachments: HashMap::new(),
+            chat_waiting_messages: HashMap::new(),
             agent_updates: BTreeMap::new(),
             workspace_history: Vec::new(),
             repository_navigation: HashMap::new(),
@@ -7881,6 +7911,61 @@ mod tests {
                 extension: "png".into(),
             }),
         }
+    }
+
+    /// What a provider held is kept with the open chat that showed it, and
+    /// a store written before the key existed reads as holding nothing (#2208).
+    #[test]
+    fn waiting_messages_are_saved_for_open_chats_and_absent_keys_read_empty() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("waiting.sqlite3");
+        let store = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let (mut workspace, source) = agent_workspace(crate::agent::Provider::Claude);
+        let chat = workspace.cards[0].id;
+        workspace.cards[0].kind = CardKind::Chat(source);
+        let mut message =
+            crate::chat::QueuedMessage::new("queued-1".into(), "Then run the tests".into());
+        message.attachments = vec![crate::chat::Attachment::file("/project/notes.txt")];
+        let queue = crate::model::SavedQueue {
+            host: Some(HostSessionProof {
+                host_session_id: "daemon".into(),
+                boot_id: "chat-boot".into(),
+                host_incarnation: "1".into(),
+            }),
+            messages: vec![message],
+        };
+        workspace.chat_waiting_messages.insert(chat, queue.clone());
+        // A card this workspace no longer holds keeps nothing.
+        workspace
+            .chat_waiting_messages
+            .insert(CardId::new(), queue.clone());
+        SaveLane::default().save(&store, &workspace).unwrap();
+        drop(store);
+        let reopened = StateStore::open(&path, boot("chat-boot")).unwrap();
+        let saved = reopened
+            .load_workspace(workspace.id, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.chat_waiting_messages, HashMap::from([(chat, queue)]));
+        reopened
+            .lock_inner()
+            .unwrap()
+            .connection
+            .execute(
+                "DELETE FROM metadata WHERE key LIKE '%:navigation:chat_waiting_messages'",
+                [],
+            )
+            .unwrap();
+        drop(reopened);
+        let older = StateStore::open(&path, boot("chat-boot")).unwrap();
+        assert!(
+            older
+                .load_workspace(workspace.id, None)
+                .unwrap()
+                .unwrap()
+                .chat_waiting_messages
+                .is_empty()
+        );
     }
 
     #[test]
