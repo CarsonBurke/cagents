@@ -1331,7 +1331,6 @@ mod tests {
                 proof: None,
                 require_resumable: true,
                 reconcile_retained: false,
-                accept_unreopenable: false,
             };
             // Qualified sources reach the ownership check. Unqualified sources
             // are refused before reading any service namespace or opening a socket.
