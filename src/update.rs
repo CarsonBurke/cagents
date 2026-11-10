@@ -1686,7 +1686,7 @@ fn finish_handoff(
     let socket_has_listener = crate::terminal_ipc::daemon_socket_path()
         .ok()
         .is_some_and(|p| std::os::unix::net::UnixStream::connect(p).is_ok());
-    if result.is_ok() || verified.has_listener() || socket_has_listener {
+    if verified.has_listener() || socket_has_listener {
         if let Err(error) = verified.save(&outcome_path) {
             eprintln!("Could not save recovery proof: {error}");
         }
@@ -3922,6 +3922,7 @@ finally:
         if std::env::var_os(MODE).is_none() {
             for failure in [
                 "reserved-start-failure",
+                "installer-success-daemon-exited",
                 "shutdown-requested-without-reservation",
                 "start-exit-zero-without-service",
                 "ready-missing-terminal",
@@ -4090,7 +4091,8 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-exit-zero-without-service
 assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
 assert not pathlib.Path('/proc/self/fd/199').exists()
 if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']!='recovery-recording-failure':
-    assert json.loads((root/'status.json').read_text())['phase'] == 'Failed'
+    expected = 'Installing' if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='installer-success-daemon-exited' else 'Failed'
+    assert json.loads((root/'status.json').read_text())['phase'] == expected
 os.environ['CAGENTS_TEST_HEADLESS_RECOVERY']='daemon'
 os.environ['CAGENTS_TEST_HEADLESS_ROOT']=str(root)
 child = subprocess.Popen([os.environ['CAGENTS_TEST_HEADLESS_EXEC'], '--exact',
@@ -4159,11 +4161,17 @@ if os.environ['CAGENTS_TEST_RECOVERY_FAILURE']=='start-nonzero-with-service': sy
             fs::create_dir(root.path().join("status.json")).unwrap();
             fs::create_dir(recovery::outcome_path(root.path(), &job.id)).unwrap();
         }
+        let installer_result = if failure == "installer-success-daemon-exited" {
+            write_job(root.path(), &job).unwrap();
+            Ok(())
+        } else {
+            Err(invalid(failure.clone()))
+        };
         let settled = finish_handoff(
             &installation,
             root.path(),
             &mut job,
-            &Err(invalid(failure.clone())),
+            &installer_result,
             &mut lease,
             &context,
             &guard,
