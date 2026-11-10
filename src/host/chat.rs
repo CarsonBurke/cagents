@@ -1129,7 +1129,8 @@ fn codex_owner_lost(
     }
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
-        if state.chat_handoffs.contains_key(&session.id)
+        if codex_terminal_owner(&state, session).is_some()
+            || state.chat_handoffs.contains_key(&session.id)
             || state.native_actor_startups.values().any(|startup| {
                 startup.source.id == session.id || startup.requested.id == session.id
             })
@@ -1156,19 +1157,77 @@ fn codex_owner_lost(
     )
 }
 
+/// A recorded terminal conversation is writer evidence even without a pane
+/// marker (for example, a CLI resumed against the shared Codex daemon).
+fn codex_terminal_owner(state: &HostState, session: &Session) -> Option<TerminalId> {
+    let id = session.launch.session_id.as_ref()?;
+    state.terminals.iter().find_map(|(terminal_id, record)| {
+        if record.handle.is_completed() {
+            return None;
+        }
+        let observed = record
+            .session
+            .resume_hint
+            .as_deref()
+            .and_then(crate::model::agent_recovery::observed_launch_from_hint);
+        let recipe = observed.as_ref().unwrap_or(&record.session.launch);
+        ((Provider::from_program(&recipe.program) == Some(Provider::Codex)
+            || Provider::recognize_launch(recipe) == Some(Provider::Codex))
+            && recipe
+                .arguments
+                .iter()
+                .any(|arg| arg == id || arg.split_once('=').is_some_and(|(_, value)| value == id)))
+        .then_some(*terminal_id)
+    })
+}
+
 /// Read the same execution evidence for restart and picker preparation, so
 /// unreadable evidence retains its concrete diagnostic in both paths.
 fn require_ended_codex_execution(
+    host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
 ) -> std::io::Result<()> {
     use super::upgrade_inspect::{CodexExecution, codex_execution};
+    {
+        let state = host.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(id) = codex_terminal_owner(&state, session) {
+            return Err(std::io::Error::other(format!(
+                "Codex is still running this conversation in terminal {id}. Close that terminal, then try again."
+            )));
+        }
+        // Holders only publish records when recovery was enabled. Older and
+        // in-process consoles can lack them, so a live paired console remains
+        // unproved even if its CLI has not recorded a conversation ID yet.
+        // Check current state rather than the saved descriptor: once its
+        // terminal is gone, a clean kernel/holder scan can prove it ended.
+        if session.terminal.as_ref().is_some_and(|terminal| {
+            state
+                .terminals
+                .get(&terminal.id)
+                .is_some_and(|record| !record.handle.is_completed())
+        }) {
+            return Err(std::io::Error::other(
+                "The paired Codex console is still live; its conversation could not be checked. Close that terminal, then try again.",
+            ));
+        }
+    }
     let message = match codex_execution(session, boot) {
         CodexExecution::Ended => return Ok(()),
-        CodexExecution::Running { pid } => format!(
-            "Codex is still running this conversation in another process{}. Stop it, or close this pane and resume the conversation from the picker.",
-            pid.map(|pid| format!(" (pid {pid})")).unwrap_or_default()
+        CodexExecution::Running { pid: Some(pid), .. } => format!(
+            "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
         ),
+        CodexExecution::Running { pid: None, socket } => format!(
+            "Codex is still serving this conversation at {}. Stop that server, then try again.",
+            socket.display()
+        ),
+        CodexExecution::RetainedProcesses =>
+            "The previous Codex execution still has live processes. Wait for them to finish, then try again.".into(),
+        CodexExecution::Unproved { reason }
+            if reason == super::upgrade_inspect::CODEX_PROCESS_STARTING =>
+        {
+            "A process was still starting; try again in a moment.".into()
+        }
         CodexExecution::Unproved { reason } => format!(
             "The old Codex execution could not be checked: {reason}. This conversation was not restarted. Restore access to this evidence and try again."
         ),
@@ -1178,13 +1237,17 @@ fn require_ended_codex_execution(
 
 /// Admit a replacement writer using the original descriptor, then retire only
 /// ended discovery under the caller's allocation reservation.
-fn prepare_codex_restart(session: &Session, boot: &crate::model::BootId) -> std::io::Result<()> {
+fn prepare_codex_restart(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+) -> std::io::Result<()> {
     use crate::daemon::holder_registry::{self as registry, Kind};
     use std::os::unix::fs::MetadataExt;
     if session.launch.session_id.is_none() {
         return Ok(());
     }
-    require_ended_codex_execution(session, boot)?;
+    require_ended_codex_execution(host, session, boot)?;
     let directory = registry::directory(Kind::Native).map_err(std::io::Error::other)?;
     let control = registry::socket(&directory, session.id);
     let record = registry::execution_record(&control)?;
@@ -1567,7 +1630,7 @@ fn start_with_execution(
     let owned_socket = match owned_socket {
         Some(socket)
             if !owned_listener::served_before_retire(&socket, || {
-                prepare_codex_restart(&requested_source, &allocator.boot_id)
+                prepare_codex_restart(host, &requested_source, &allocator.boot_id)
             })
             .map_err(|failure| unavailable(format!("Cannot restart Codex: {failure}")))? =>
         {
@@ -3031,7 +3094,7 @@ fn process_inner(
                     .is_some_and(|(_, paired_closed)| paired_closed)
                     || match reserve_unhosted_allocation(host, &source, None) {
                         Ok(_fence) => {
-                            require_ended_codex_execution(&source, &proof.boot_id)
+                            require_ended_codex_execution(host, &source, &proof.boot_id)
                                 .map_err(|error| unavailable(error.to_string()))?;
                             true
                         }

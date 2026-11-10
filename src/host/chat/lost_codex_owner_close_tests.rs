@@ -352,20 +352,7 @@ fn a_process_naming_the_listener_keeps_the_refusal() {
         return;
     };
     let fixture = Fixture::new(&root);
-    struct Killed(std::process::Child);
-    impl Drop for Killed {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let named = Killed(
-        std::process::Command::new("/bin/sh")
-            .args(["-c", "sleep 30; :"])
-            .arg(fixture.socket())
-            .spawn()
-            .unwrap(),
-    );
+    let named = CodexProcess::new(&root, &[fixture.socket().to_str().unwrap()]);
     close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
     assert!(fixture.socket().parent().unwrap().exists());
     drop(named);
@@ -718,11 +705,53 @@ fn assert_codex_started(fixture: &Fixture, root: &std::path::Path) {
     );
 }
 
+/// A readable same-user process with a Codex executable name and controlled
+/// arguments. It never contacts a provider; stdin keeps it alive until drop.
+struct CodexProcess(std::process::Child);
+
+impl CodexProcess {
+    fn new(root: &std::path::Path, arguments: &[&str]) -> Self {
+        use std::io::Read;
+        let program = root.join("writer/codex");
+        std::fs::create_dir_all(program.parent().unwrap()).unwrap();
+        std::fs::copy("/bin/bash", &program).unwrap();
+        let mut child = std::process::Command::new(&program)
+            .args(["-c", "printf ready; IFS= read -r release", "codex"])
+            .args(arguments)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut ready = [0; 5];
+        child
+            .stdout
+            .as_mut()
+            .unwrap()
+            .read_exact(&mut ready)
+            .unwrap();
+        assert_eq!(&ready, b"ready");
+        Self(child)
+    }
+
+    fn refusal(&self) -> String {
+        let pid = self.0.id();
+        format!(
+            "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
+        )
+    }
+}
+
+impl Drop for CodexProcess {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 /// Startup and a lost/unlinked endpoint can leave a writer alive with no
 /// served socket. The same ChatStart must refuse until that writer exits.
 #[test]
 fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
-    use std::io::Read;
     let Some(root) = isolated("codex_start_refuses_a_surviving_process_then_starts_after_it_exits")
     else {
         return;
@@ -730,49 +759,22 @@ fn codex_start_refuses_a_surviving_process_then_starts_after_it_exits() {
     let mut fixture = codex_start_fixture(&root);
     let old_socket = fixture.socket().to_owned();
     fixture.source.owned_codex_listener = None;
-    struct Named(std::process::Child);
-    impl Drop for Named {
-        fn drop(&mut self) {
-            let _ = self.0.kill();
-            let _ = self.0.wait();
-        }
-    }
-    let mut named = Named(
-        std::process::Command::new("/bin/sh")
-            .args(["-c", "printf ready; IFS= read -r release"])
-            .arg(&old_socket)
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .spawn()
-            .unwrap(),
-    );
-    let mut ready = [0; 5];
-    named
-        .0
-        .stdout
-        .as_mut()
-        .unwrap()
-        .read_exact(&mut ready)
-        .unwrap();
-    assert_eq!(&ready, b"ready");
+    let named = CodexProcess::new(&root, &[old_socket.to_str().unwrap()]);
     assert!(!old_socket.exists());
     let failure = codex_start(&fixture).unwrap_err();
     assert!(
-        failure
-            .message
-            .contains("Codex is still running this conversation"),
+        failure.message.ends_with(&named.refusal()),
         "{}",
         failure.message
     );
+    // A stale saved boot is no permission to replace this boot's orphaned
+    // app-server, even after its ownership record and socket disappeared.
+    fixture.source.proof.as_mut().unwrap().boot_id = crate::model::BootId::new("earlier-boot");
+    let stale_failure = codex_start(&fixture).unwrap_err();
     assert!(
-        failure.message.contains(&format!("pid {}", named.0.id())),
+        stale_failure.message.ends_with(&named.refusal()),
         "{}",
-        failure.message
-    );
-    assert!(
-        failure
-            .message
-            .contains("resume the conversation from the picker")
+        stale_failure.message
     );
     assert!(!root.join("started-argv").exists());
     assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
@@ -1033,9 +1035,10 @@ fn codex_start_refuses_a_bound_unlinked_published_target() {
     std::fs::remove_file(&target).unwrap();
     let failure = codex_start(&fixture).unwrap_err();
     assert!(
-        failure
-            .message
-            .contains("Codex is still running this conversation"),
+        failure.message.ends_with(&format!(
+            "Codex is still serving this conversation at {}. Stop that server, then try again.",
+            target.display()
+        )),
         "{}",
         failure.message
     );
@@ -1073,4 +1076,250 @@ fn codex_start_joins_a_served_listener_without_launching() {
         .handle
         .clone();
     handle.close().unwrap();
+}
+
+#[test]
+fn codex_picker_resume_refuses_the_old_panes_surviving_marked_process() {
+    let Some(root) = isolated("codex_picker_resume_refuses_the_old_panes_surviving_marked_process")
+    else {
+        return;
+    };
+    let fixture = codex_start_fixture(&root);
+    let socket = fixture.socket().to_str().unwrap();
+    let writer = CodexProcess::new(&root, &["app-server", "--listen", socket]);
+    let failure = process_inner(
+        &fixture.host,
+        1,
+        ClientRequest::ChatPrepareResume {
+            source: fixture.source.clone(),
+        },
+    )
+    .unwrap_err();
+    assert!(
+        failure.message.ends_with(&writer.refusal()),
+        "{}",
+        failure.message
+    );
+    assert!(!root.join("started-argv").exists());
+    assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
+}
+
+#[test]
+fn codex_picker_resume_refuses_a_terminal_writer_by_thread_id() {
+    let Some(root) = isolated("codex_picker_resume_refuses_a_terminal_writer_by_thread_id") else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    let writer = CodexProcess::new(
+        &root,
+        &[
+            "resume",
+            fixture.source.launch.session_id.as_deref().unwrap(),
+        ],
+    );
+    // The legacy picker chooses a new pane and drops endpoint provenance. The
+    // conversation ID still identifies the writer using the user's daemon.
+    fixture.source.reset_owned_codex_listener();
+    fixture.source.id = TerminalId::new();
+    fixture.source.proof = None;
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure.message.ends_with(&writer.refusal()),
+        "{}",
+        failure.message
+    );
+    assert!(!root.join("started-argv").exists());
+    assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
+}
+
+#[test]
+fn codex_picker_resume_refuses_a_live_terminals_recorded_conversation() {
+    let Some(root) = isolated("codex_picker_resume_refuses_a_live_terminals_recorded_conversation")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.host.lock().unwrap().register_client(1);
+    let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+        TerminalId::new(),
+        crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.join("project"),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        None,
+    )
+    .session;
+    let terminal_id = terminal.id;
+    crate::host::state::spawn_terminal(&fixture.host, 1, terminal, Default::default()).unwrap();
+    let handle = {
+        let mut state = fixture.host.lock().unwrap();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        let mut recorded = fixture.source.launch.recipe.clone();
+        recorded.arguments = vec![
+            "resume".into(),
+            fixture.source.launch.session_id.clone().unwrap(),
+        ];
+        terminal.session.resume_hint = crate::model::agent_recovery::hint_from_launch(&recorded);
+        assert!(terminal.session.resume_hint.is_some());
+        terminal.handle.clone()
+    };
+    // Close uses the same recorded terminal ownership evidence; otherwise it
+    // could classify this conversation as lost while the CLI still owns it.
+    close_retained_from_pane(&fixture.host, &fixture.source).unwrap_err();
+    assert!(fixture.socket().parent().unwrap().exists());
+    // The recorded launch can also be an interpreter, before its native
+    // child publishes a marker. Exercise the recipe fallback without a hint.
+    {
+        let mut state = fixture.host.lock().unwrap();
+        let terminal = state.terminals.get_mut(&terminal_id).unwrap();
+        terminal.session.resume_hint = None;
+        terminal.session.launch.program = "bun".into();
+        terminal.session.launch.arguments = vec![
+            "/path/codex.js".into(),
+            "resume".into(),
+            fixture.source.launch.session_id.clone().unwrap(),
+        ];
+    }
+    fixture.source.reset_owned_codex_listener();
+    fixture.source.id = TerminalId::new();
+    fixture.source.proof = None;
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure.message.ends_with(&format!(
+            "Codex is still running this conversation in terminal {terminal_id}. Close that terminal, then try again."
+        )),
+        "{}",
+        failure.message
+    );
+    assert!(!root.join("started-argv").exists());
+    assert!(fixture.host.lock().unwrap().chat_spawning.is_empty());
+    handle.shutdown().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_completed() {
+        assert!(Instant::now() < deadline, "the terminal did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_start_ignores_an_ordinary_process_merely_mentioning_the_listener() {
+    let Some(root) =
+        isolated("codex_start_ignores_an_ordinary_process_merely_mentioning_the_listener")
+    else {
+        return;
+    };
+    use std::io::Read;
+    let fixture = codex_start_fixture(&root);
+    let mut mention = CodexProcess(
+        std::process::Command::new("/bin/bash")
+            .args(["-c", "printf ready; IFS= read -r release"])
+            .arg(fixture.socket())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .unwrap(),
+    );
+    let mut ready = [0; 5];
+    mention
+        .0
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(&ready, b"ready");
+    assert_codex_started(&fixture, &root);
+    assert!(mention.0.try_wait().unwrap().is_none());
+}
+
+#[test]
+fn codex_start_waits_for_a_live_paired_console_without_a_holder_record() {
+    let Some(root) =
+        isolated("codex_start_waits_for_a_live_paired_console_without_a_holder_record")
+    else {
+        return;
+    };
+    let mut fixture = codex_start_fixture(&root);
+    fixture.host.lock().unwrap().register_client(1);
+    let terminal = crate::terminal_ipc::TerminalDescriptor::relaunchable(
+        fixture.source.id,
+        crate::model::LaunchRecipe {
+            program: "/bin/cat".into(),
+            arguments: Vec::new(),
+            working_directory: root.join("project"),
+            environment: Default::default(),
+            unset_environment: Default::default(),
+        },
+        None,
+    )
+    .session;
+    let descriptor =
+        crate::host::state::spawn_terminal(&fixture.host, 1, terminal, Default::default()).unwrap();
+    fixture.source.terminal = Some(descriptor.session);
+    let id = fixture.source.id;
+    let handle = fixture.host.lock().unwrap().terminals[&id].handle.clone();
+    assert!(
+        registry::execution_record(&registry::socket(
+            &registry::directory(Kind::Terminal).unwrap(),
+            id
+        ))
+        .unwrap()
+        .is_none(),
+        "the fixture must exercise an in-process console"
+    );
+    let failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        failure.message.contains("could not be checked"),
+        "{}",
+        failure.message
+    );
+    // The client descriptor can lag this daemon's live console, just as it
+    // can lag an orphaned server. Its boot must not overrule the live handle.
+    if let crate::model::TerminalContinuity::Live { boot_id, .. } =
+        &mut fixture.source.terminal.as_mut().unwrap().continuity
+    {
+        *boot_id = crate::model::BootId::new("stale-console-boot");
+    } else {
+        panic!("spawned console must have live continuity");
+    }
+    let stale_failure = codex_start(&fixture).unwrap_err();
+    assert!(
+        stale_failure.message.contains("could not be checked"),
+        "{}",
+        stale_failure.message
+    );
+    assert!(!root.join("started-argv").exists());
+    handle.shutdown().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !handle.is_completed() {
+        assert!(Instant::now() < deadline, "the paired console did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    fixture.host.lock().unwrap().terminals.remove(&id);
+    assert_codex_started(&fixture, &root);
+}
+
+#[test]
+fn codex_retained_processes_do_not_claim_an_unbound_socket_is_serving() {
+    let Some(root) = isolated("codex_retained_processes_do_not_claim_an_unbound_socket_is_serving")
+    else {
+        return;
+    };
+    let fixture = Fixture::new(&root);
+    fixture.record(current(), current());
+    assert!(!fixture.socket().exists());
+    let failure = require_ended_codex_execution(
+        &fixture.host,
+        &fixture.source,
+        &crate::daemon::read_boot_id().unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(
+        failure.to_string(),
+        "The previous Codex execution still has live processes. Wait for them to finish, then try again."
+    );
 }
