@@ -387,21 +387,77 @@ pub(crate) fn lock(
     path: &Path,
     cancellation: &CancellationToken,
 ) -> Result<crate::instance::OwnedLock, String> {
-    let deadline = Instant::now() + Duration::from_secs(60);
+    lock_until(path, cancellation, Instant::now() + Duration::from_secs(60))
+}
+
+fn lock_until(
+    path: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<crate::instance::OwnedLock, String> {
     loop {
         if cancellation.is_cancelled() {
             return Err("GitHub status read cancelled".into());
+        }
+        if Instant::now() >= deadline {
+            return Err("Another GitHub status read is still in progress; retry later".into());
         }
         match crate::instance::owned_lock(path, libc::LOCK_EX | libc::LOCK_NB) {
             Ok(file) => return Ok(file),
             Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
             Err(error) => return Err(format!("Cannot lock the GitHub cache: {error}")),
         }
-        if Instant::now() >= deadline {
-            return Err("Another GitHub status read is still in progress; retry later".into());
-        }
         thread::sleep(Duration::from_millis(25));
     }
+}
+
+/// Serializes queries while giving each launched child independent custody.
+/// Keep the existing path as the lifetime lock so older exclusive-lock callers
+/// also wait for a query whose owner died before its child finished.
+pub(crate) struct QueryFlight {
+    // Release the scoped lifetime share before admitting the next caller.
+    lifetime: crate::instance::OwnedLock,
+    _admission: crate::instance::OwnedLock,
+}
+
+impl AsRawFd for QueryFlight {
+    fn as_raw_fd(&self) -> std::os::fd::RawFd {
+        self.lifetime.as_raw_fd()
+    }
+}
+
+pub(crate) fn query_flight(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<QueryFlight, String> {
+    let deadline = Instant::now() + Duration::from_secs(60);
+    let admission = lock_until(
+        &path.with_extension("admission.lock"),
+        cancellation,
+        deadline,
+    )?;
+    let lifetime = lock_until(path, cancellation, deadline)?;
+    retain_query_flight(lifetime, admission)
+}
+
+fn retain_query_flight(
+    lifetime: crate::instance::OwnedLock,
+    admission: crate::instance::OwnedLock,
+) -> Result<QueryFlight, String> {
+    // New callers remain excluded by admission while this exclusive lock is
+    // downgraded. An older caller can win the non-atomic conversion; fail before
+    // fetching rather than waiting or launching alongside that caller.
+    // SAFETY: lifetime owns this live descriptor for the entire call.
+    if unsafe { libc::flock(lifetime.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) } != 0 {
+        return Err(format!(
+            "Cannot retain the GitHub query lock: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(QueryFlight {
+        lifetime,
+        _admission: admission,
+    })
 }
 
 fn host_paths(root: &Path, credentials: &str, host: &str) -> (PathBuf, PathBuf) {
@@ -534,7 +590,7 @@ fn read_with<E: ProcessExecutor>(
     i32::try_from(key.number).map_err(|_| "The pull request number exceeds GitHub's Int range")?;
     private_directory(root).map_err(|error| error.to_string())?;
     let name = target_name(credentials, key);
-    let _flight = lock(&root.join(format!("{name}.lock")), cancellation)?;
+    let _flight = query_flight(&root.join(format!("{name}.lock")), cancellation)?;
     let path = root.join(format!("{name}.json"));
     let mut cached = load::<Cached>(&path)
         .map_err(|error| error.to_string())?
@@ -1244,6 +1300,316 @@ mod tests {
             first,
             probe("fixture-token-a", &root.path().join("other-config"))
         );
+    }
+
+    struct CancelOnDrop(CancellationToken);
+
+    impl Drop for CancelOnDrop {
+        fn drop(&mut self) {
+            self.0.cancel();
+        }
+    }
+
+    #[test]
+    fn query_flight_expired_deadline_does_not_acquire_or_create_a_lock() {
+        let root = private_tempdir();
+        let path = root.path().join("query.lock");
+        assert!(lock_until(&path, &CancellationToken::new(), Instant::now()).is_err());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn query_flight_scope_exit_releases_copied_descriptions() {
+        let root = private_tempdir();
+        let path = root.path().join("query.lock");
+        let flight = query_flight(&path, &CancellationToken::new()).unwrap();
+        // dup models unrelated children paused before their CLOEXEC boundary.
+        let copied_lifetime = flight.lifetime.try_clone().unwrap();
+        let copied_admission = flight._admission.try_clone().unwrap();
+        drop(flight);
+        let next = query_flight(&path, &CancellationToken::new()).unwrap();
+        drop(copied_lifetime);
+        drop(copied_admission);
+        assert_eq!(
+            crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(next);
+        assert!(crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
+    }
+
+    #[test]
+    fn query_flight_aborts_when_a_legacy_caller_wins_downgrade() {
+        let root = private_tempdir();
+        let path = root.path().join("query.lock");
+        let admission = lock(
+            &path.with_extension("admission.lock"),
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        let lifetime = lock(&path, &CancellationToken::new()).unwrap();
+        // Reproduce the competing EX owner that can win flock's non-atomic
+        // conversion gap, without relying on a scheduler race in the test.
+        // SAFETY: lifetime owns this live descriptor.
+        assert_eq!(
+            unsafe { libc::flock(lifetime.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        let legacy = crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        assert!(
+            retain_query_flight(lifetime, admission)
+                .err()
+                .unwrap()
+                .contains("Cannot retain")
+        );
+        assert!(
+            crate::instance::owned_lock(
+                &path.with_extension("admission.lock"),
+                libc::LOCK_EX | libc::LOCK_NB
+            )
+            .is_ok()
+        );
+        assert_eq!(
+            crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        drop(legacy);
+    }
+
+    #[test]
+    fn query_flight_cancelled_lifetime_wait_releases_admission() {
+        let root = private_tempdir();
+        let path = root.path().join("query.lock");
+        let legacy = crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).unwrap();
+        let cancellation = CancellationToken::new();
+        thread::scope(|scope| {
+            let waiting = scope.spawn(|| query_flight(&path, &cancellation));
+            let _cancel_on_exit = CancelOnDrop(cancellation.clone());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match crate::instance::owned_lock(
+                    &path.with_extension("admission.lock"),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                ) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Ok(probe) => drop(probe),
+                    Err(error) => panic!("admission probe failed: {error}"),
+                }
+                assert!(Instant::now() < deadline, "waiter never acquired admission");
+                thread::sleep(Duration::from_millis(5));
+            }
+            cancellation.cancel();
+            assert!(waiting.join().unwrap().err().unwrap().contains("cancelled"));
+        });
+        assert!(
+            crate::instance::owned_lock(
+                &path.with_extension("admission.lock"),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+            .is_ok()
+        );
+        drop(legacy);
+        assert!(query_flight(&path, &CancellationToken::new()).is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn query_flight_keeps_orphan_children_serialized() {
+        use std::os::unix::process::CommandExt;
+        const OWNER_ROOT: &str = "CAGENTS_QUERY_FLIGHT_OWNER_ROOT";
+        const TEST: &str = "github_status::tests::query_flight_keeps_orphan_children_serialized";
+        if let Some(root) = std::env::var_os(OWNER_ROOT) {
+            let root = PathBuf::from(root);
+            let flight = query_flight(&root.join("query.lock"), &CancellationToken::new()).unwrap();
+            let mut command = CommandSpec::new("/bin/bash")
+                .args([
+                    "-c",
+                    "printf ready > \"$READY\"; IFS= read -r -t 30 ignored < \"$RELEASE\"",
+                ])
+                .env("READY", root.join("ready"))
+                .env("RELEASE", root.join("release"));
+            command.inherited_lease = Some(flight.as_raw_fd());
+            let mut child = command
+                .to_command()
+                // Keep this fixture family together for cleanup on every unwind
+                // path; the inherited lifetime lease still uses its real pre_exec.
+                .process_group(unsafe { libc::getpgrp() })
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap();
+            assert!(child.wait().unwrap().success());
+            return;
+        }
+        const SUPERVISOR: &str = "CAGENTS_QUERY_FLIGHT_TEST_SUPERVISOR";
+        if std::env::var_os(SUPERVISOR).is_none() {
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(SUPERVISOR, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}; {}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        // Only this exact subprocess adopts and reaps the orphan fixture.
+        // SAFETY: prctl changes this isolated process's child-reaper role.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        struct Family(std::process::Child);
+        impl Drop for Family {
+            fn drop(&mut self) {
+                // The owner remains unreaped, reserving its PID/group identity.
+                // Its bash child shares that group even before publishing readiness.
+                // SAFETY: this test created and retains the exact group leader.
+                unsafe {
+                    libc::kill(-(self.0.id() as libc::pid_t), libc::SIGKILL);
+                }
+                let _ = self.0.kill();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    // This exact subprocess is a subreaper with only this family.
+                    // SAFETY: waitpid writes no status through the null pointer.
+                    let reaped = unsafe { libc::waitpid(-1, std::ptr::null_mut(), libc::WNOHANG) };
+                    if reaped > 0 {
+                        continue;
+                    }
+                    if reaped < 0 {
+                        let error = io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::ECHILD) {
+                            break;
+                        }
+                        if error.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        if thread::panicking() {
+                            eprintln!("Cannot reap query fixture family: {error}");
+                            break;
+                        }
+                        panic!("Cannot reap query fixture family: {error}");
+                    }
+                    if Instant::now() >= deadline {
+                        if thread::panicking() {
+                            eprintln!("Query fixture family did not exit after SIGKILL");
+                            break;
+                        }
+                        panic!("Query fixture family did not exit after SIGKILL");
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+            }
+        }
+        let root = private_tempdir();
+        let release = root.path().join("release");
+        let release_c = std::ffi::CString::new(release.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: release_c is a terminated path in our private directory.
+        assert_eq!(unsafe { libc::mkfifo(release_c.as_ptr(), 0o600) }, 0);
+        let mut release = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(release)
+            .unwrap();
+        let owner_log = root.path().join("owner.log");
+        let mut owner = Family(
+            Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture"])
+                .env(OWNER_ROOT, root.path())
+                .process_group(0)
+                .stdout(Stdio::null())
+                .stderr(fs::File::create(&owner_log).unwrap())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !root.path().join("ready").exists() {
+            assert!(
+                Instant::now() < deadline,
+                "query child did not start: {}",
+                fs::read_to_string(&owner_log).unwrap_or_default()
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        owner.0.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            // Observe owner death without reaping its group identity until cleanup.
+            // SAFETY: info is writable and the retained Child owns this PID.
+            let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+            let observed = unsafe {
+                libc::waitid(
+                    libc::P_PID,
+                    owner.0.id(),
+                    &mut info,
+                    libc::WEXITED | libc::WNOWAIT | libc::WNOHANG,
+                )
+            };
+            if observed == 0 {
+                // SAFETY: waitid initialized this siginfo, with zero PID if not ready.
+                if unsafe { info.si_pid() } != 0 {
+                    break;
+                }
+            } else {
+                let error = io::Error::last_os_error();
+                assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+            }
+            assert!(
+                Instant::now() < deadline,
+                "query owner did not exit after SIGKILL"
+            );
+            thread::sleep(Duration::from_millis(5));
+        }
+        let path = root.path().join("query.lock");
+        assert_eq!(
+            crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+        thread::scope(|scope| {
+            let (sent, received) = std::sync::mpsc::channel();
+            let path = &path;
+            let cancellation = CancellationToken::new();
+            let _cancel_on_exit = CancelOnDrop(cancellation.clone());
+            let waiting = scope.spawn(move || {
+                let flight = query_flight(path, &cancellation).unwrap();
+                sent.send(()).unwrap();
+                drop(flight);
+            });
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                match crate::instance::owned_lock(
+                    &path.with_extension("admission.lock"),
+                    libc::LOCK_EX | libc::LOCK_NB,
+                ) {
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+                    Ok(probe) => drop(probe),
+                    Err(error) => panic!("admission probe failed: {error}"),
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "new caller never reached lifetime wait"
+                );
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                received.try_recv().is_err(),
+                "new caller overlapped orphan child"
+            );
+            writeln!(release, "finish").unwrap();
+            waiting.join().unwrap();
+            received.recv().unwrap();
+        });
+        assert!(crate::instance::owned_lock(&path, libc::LOCK_EX | libc::LOCK_NB).is_ok());
     }
 
     #[test]

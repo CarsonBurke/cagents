@@ -178,7 +178,7 @@ fn poll_with(
     repository.validate().map_err(|error| error.to_string())?;
     pr_status::private_directory(root).map_err(|error| error.to_string())?;
     let name = name(credentials, repository);
-    let flight = pr_status::lock(&root.join(format!("{name}.lock")), cancellation)?;
+    let flight = pr_status::query_flight(&root.join(format!("{name}.lock")), cancellation)?;
     validate_context()?;
     let path = root.join(format!("{name}.json"));
     let mut stored = pr_status::load::<Stored>(&path)
@@ -368,6 +368,47 @@ pub(crate) mod tests {
                 .collect(),
             next_cursor: next.map(str::to_owned),
         })
+    }
+
+    #[test]
+    fn shared_poll_launches_actual_query_and_reuses_publication() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = private_root();
+        let script = root.path().join("gh");
+        let calls = root.path().join("calls");
+        let quoted = format!("'{}'", calls.to_str().unwrap().replace('\'', "'\\''"));
+        fs::write(&script, format!("#!/bin/sh\nprintf x >> {quoted}\ncat <<'RESPONSE'\n{{\"data\":{{\"rateLimit\":{{\"cost\":1}},\"viewer\":{{\"id\":\"viewer\",\"login\":\"viewer\"}},\"repository\":{{\"pullRequests\":{{\"nodes\":[],\"pageInfo\":{{\"hasNextPage\":false,\"endCursor\":null}}}}}}}}}}\nRESPONSE\n")).unwrap();
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o700)).unwrap();
+        let cancellation = CancellationToken::new();
+        let first = poll_with(
+            root.path(),
+            "actual-query-flight-account",
+            &repository(),
+            &cancellation,
+            || 1000,
+            |work, lease| {
+                assert!(matches!(work, Work::Page { cursor: None }));
+                GitHubService::new(&script, Arc::new(FlightExecutor(lease)))
+                    .review_request_page(&repository(), None, &cancellation)
+                    .map(Reply::Page)
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(first.error.is_none(), "{:?}", first.error);
+        assert_eq!(first.scan.viewer.unwrap().id, "viewer");
+        let second = poll_with(
+            root.path(),
+            "actual-query-flight-account",
+            &repository(),
+            &cancellation,
+            || 1001,
+            |_, _| panic!("the published query must be reused"),
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(second.error.is_none());
+        assert_eq!(fs::read(calls).unwrap(), b"x");
     }
 
     #[test]
