@@ -40,7 +40,9 @@ reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
 What a later protocol only added detail to is sent as the CLI knew it: on
 protocols before 166, a subagent waiting on its own background work reads as
-running.
+running; before 167, agent replies leave out what a live provider is doing and
+whether a prompt is still queued, and an interrupt answers with the requests
+still pending.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol
 encodes the same way, except for what is refused, withheld or restated. It checks

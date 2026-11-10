@@ -93,7 +93,20 @@ pub struct Entry {
     /// The channel's owning repository, independent of this session's cwd.
     #[serde(default)]
     pub channel_repository: Option<PathBuf>,
+    /// The main turn. Delegated work is counted apart in `background_agents`,
+    /// so an idle session can take a prompt while its agents work.
     pub state: ActivityState,
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::new_in_provider_activity"
+    )]
+    pub background_agents: u32,
+    /// How many of those are waiting on background work of their own.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::terminal_ipc::new_in_provider_activity"
+    )]
+    pub waiting_agents: u32,
     pub directory: Option<PathBuf>,
     /// The checkout that contains `directory`: a repository or linked worktree.
     pub worktree: Option<PathBuf>,

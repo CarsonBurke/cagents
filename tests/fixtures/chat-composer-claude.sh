@@ -261,15 +261,104 @@ tools_turn() {
 # with "_history": true is only recorded, as Claude records a queued
 # notification. A frame with "_live": true is only emitted, as a subagent's
 # frames are, which Claude records in the subagent's own transcript. A line
-# {"_sleep": SECONDS} pauses, so a running state can be observed. A line
-# {"_end": true} ends the turn there: the frames supply its closing result,
-# such as a failed one, and the fixture adds no answer of its own. A line
+# {"_sleep": SECONDS} pauses, so a running state can be observed; the
+# provider still answers meanwhile, and an interrupt ends the turn there, as
+# it does Claude's. A line {"_end": true} ends the turn there: the frames
+# supply its closing result, such as a failed one, and the fixture adds no
+# answer of its own. A line
 # {"_exit": STATUS} ends the provider there, as a crash does, mid-turn and
 # without a result; with "_once": true each such line does so only once,
 # which fixture-frames.exited records by line number, so the resumed
 # provider goes on.
 frames_file=$config/fixture-frames.jsonl
 frames_ended=0
+# Holds a turn for SECONDS, answering the app meanwhile as Claude does: a
+# prompt is acknowledged as queued, as one sent to a busy turn is, and an
+# interrupt ends the turn, returning 1. The provider's input is fd 3, since
+# the frames loop reads its file.
+pause_turn() {
+    pause_end=$(awk -v now="$(date +%s.%N)" -v delay="$1" 'BEGIN { printf "%.3f", now + delay }')
+    while :; do
+        left=$(awk -v now="$(date +%s.%N)" -v end="$pause_end" 'BEGIN { if (end - now >= 0.001) printf "%.3f", end - now }')
+        [ -n "$left" ] || return 0
+        # The shell's read takes a pipe one byte at a time, so a read that
+        # times out leaves the next frame whole.
+        waited=0
+        request=$(timeout "$left" sh -c 'IFS= read -r line && printf "%s\n" "$line"' <&3) || waited=$?
+        case $waited in
+            0) ;;
+            124) return 0 ;;
+            *) exit 0 ;;
+        esac
+        case $(printf '%s' "$request" | jq -r '.type') in
+            control_request) answer_control "$request" || return 1 ;;
+            user)
+                jq -cn --arg uuid "$(printf '%s' "$request" | jq -r '.uuid')" \
+                    '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
+                ;;
+        esac
+    done
+}
+
+# Answers one of the app's control requests. An interrupt ends the turn and
+# returns 1, so a turn interrupted mid-stream emits nothing more.
+answer_control() {
+    id=$(printf '%s' "$1" | jq -r '.request_id')
+    subtype=$(printf '%s' "$1" | jq -r '.request.subtype')
+    metadata='{}'
+    if [ "$subtype" = initialize ]; then
+        metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
+        if [ "$fast_fixture" = 1 ]; then
+            metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
+        fi
+        if [ -f "$models_file" ]; then
+            metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile listed "$models_file" '$metadata + {models: $listed[0].models}')
+        fi
+        # Optional advertised commands and skills: a JSON object with
+        # `commands` ([{name, description}]) and `skills` ([name]).
+        if [ -f "$config/fixture-commands.json" ]; then
+            metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
+        fi
+    elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
+        metadata=$(jq -c . "$usage_file")
+    elif [ "$subtype" = set_model ]; then
+        model=$(printf '%s' "$1" | jq -r '.request.model // "haiku"')
+    elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
+        requested=$(printf '%s' "$1" | jq -r '.request.settings.fastMode // false')
+        if [ "$requested" = true ]; then fast=on; else fast=off; fi
+        metadata=$(jq -cn --arg fast "$fast" '{fast_mode_state:$fast}')
+    fi
+    jq -cn --arg id "$id" --argjson metadata "$metadata" \
+        '{type:"control_response",response:{subtype:"success",request_id:$id,response:$metadata}}'
+    case $subtype in
+        cancel_async_message)
+            uuid=$(printf '%s' "$1" | jq -r '.request.message_uuid')
+            jq -cn --arg uuid "$uuid" \
+                '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
+            ;;
+        stop_task)
+            task=$(printf '%s' "$1" | jq -r '.request.task_id')
+            case " $background_agents " in
+                *" ${task#fixture-task-} "*) stop_agent "${task#fixture-task-}" ;;
+                # Any other task, such as one fixture-frames.jsonl started,
+                # has already sent its notice: Claude Code 2.1.296 answers a
+                # stop for an agent waiting on its own background work by
+                # patching it killed, with no further notice.
+                *) jq -cn --arg task "$task" \
+                    '{type:"system",subtype:"task_updated",uuid:("fixture-"+$task+"-killed"),task_id:$task,patch:{status:"killed"}}' ;;
+            esac
+            ;;
+        interrupt)
+            busy=false
+            for tool in $background_agents; do stop_agent "$tool"; done
+            jq -cn --arg session "$session" --arg turn "$turn" \
+                '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
+            return 1
+            ;;
+    esac
+    return 0
+}
+
 frames_turn() {
     frames_ended=0
     frame_line=0
@@ -278,7 +367,10 @@ frames_turn() {
         [ -n "$spec" ] || continue
         delay=$(printf '%s' "$spec" | jq -r '._sleep // empty')
         if [ -n "$delay" ]; then
-            sleep "$delay"
+            if ! pause_turn "$delay"; then
+                frames_ended=1
+                return
+            fi
             continue
         fi
         if [ "$(printf '%s' "$spec" | jq -r '._end // false')" = true ]; then
@@ -377,6 +469,9 @@ fi
 
 busy=false
 fast=off
+# The provider's input, which a paused turn reads while the frames loop has
+# its own file on standard input.
+exec 3<&0
 model=haiku
 if [ "$fast_fixture" = 1 ]; then model=opus; fi
 # Optional model list: fixture-models.json holds an initialize response's
@@ -403,61 +498,7 @@ usage_file=$config/fixture-usage.json
 while IFS= read -r frame; do
     kind=$(printf '%s' "$frame" | jq -r '.type')
     case $kind in
-        control_request)
-            id=$(printf '%s' "$frame" | jq -r '.request_id')
-            subtype=$(printf '%s' "$frame" | jq -r '.request.subtype')
-            metadata='{}'
-            if [ "$subtype" = initialize ]; then
-                metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
-                if [ "$fast_fixture" = 1 ]; then
-                    metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
-                fi
-                if [ -f "$models_file" ]; then
-                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile listed "$models_file" '$metadata + {models: $listed[0].models}')
-                fi
-                # Optional advertised commands and skills: a JSON object with
-                # `commands` ([{name, description}]) and `skills` ([name]).
-                if [ -f "$config/fixture-commands.json" ]; then
-                    metadata=$(jq -cn --argjson metadata "$metadata" --slurpfile extra "$config/fixture-commands.json" '$metadata + $extra[0]')
-                fi
-            elif [ "$subtype" = get_usage ] && [ -f "$usage_file" ]; then
-                metadata=$(jq -c . "$usage_file")
-            elif [ "$subtype" = set_model ]; then
-                model=$(printf '%s' "$frame" | jq -r '.request.model // "haiku"')
-            elif [ "$subtype" = apply_flag_settings ] && [ "$fast_fixture" = 1 ]; then
-                requested=$(printf '%s' "$frame" | jq -r '.request.settings.fastMode // false')
-                if [ "$requested" = true ]; then fast=on; else fast=off; fi
-                metadata=$(jq -cn --arg fast "$fast" '{fast_mode_state:$fast}')
-            fi
-            jq -cn --arg id "$id" --argjson metadata "$metadata" \
-                '{type:"control_response",response:{subtype:"success",request_id:$id,response:$metadata}}'
-            case $subtype in
-                cancel_async_message)
-                    uuid=$(printf '%s' "$frame" | jq -r '.request.message_uuid')
-                    jq -cn --arg uuid "$uuid" \
-                        '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
-                    ;;
-                stop_task)
-                    task=$(printf '%s' "$frame" | jq -r '.request.task_id')
-                    case " $background_agents " in
-                        *" ${task#fixture-task-} "*) stop_agent "${task#fixture-task-}" ;;
-                        # Any other task, such as one fixture-frames.jsonl
-                        # started, has already sent its notice: Claude Code
-                        # 2.1.296 answers a stop for an agent waiting on its
-                        # own background work by patching it killed, with no
-                        # further notice.
-                        *) jq -cn --arg task "$task" \
-                            '{type:"system",subtype:"task_updated",uuid:("fixture-"+$task+"-killed"),task_id:$task,patch:{status:"killed"}}' ;;
-                    esac
-                    ;;
-                interrupt)
-                    busy=false
-                    for tool in $background_agents; do stop_agent "$tool"; done
-                    jq -cn --arg session "$session" --arg turn "$turn" \
-                        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,session_id:$session}'
-                    ;;
-            esac
-            ;;
+        control_request) answer_control "$frame" || : ;;
         user)
             uuid=$(printf '%s' "$frame" | jq -r '.uuid')
             if [ "$busy" = true ]; then

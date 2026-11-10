@@ -191,10 +191,13 @@ frames, such as a background task's `task_started` and `task_notification`,
 are live only, as they are from Claude Code. A frame with `"_history": true` is
 only recorded, the way Claude Code records a queued notification as a
 `queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
-state can be captured. A line `{"_exit": STATUS}` makes the provider exit
-there with that status, from 0 to 255, mid-turn and without a result, as a
-crash does. Every turn that reaches the line exits again: the app doesn't
-resend the interrupted prompt, but the next prompt sent after it reconnects
+state can be captured. The provider still answers meanwhile: a prompt is
+acknowledged as queued, as one sent to a busy turn is, though neither is run
+afterwards as Claude would; and an interrupt ends the turn there, as it does
+Claude's. A line `{"_exit": STATUS}` makes the
+provider exit there with that status, from 0 to 255, mid-turn and without a
+result, as a crash does. Every turn that reaches the line exits again: the app
+doesn't resend the interrupted prompt, but the next prompt sent after it reconnects
 replays the same frames. Add `"_once": true` to exit only the first time a
 turn reaches that line: the fixture records each such line's number in
 `fixture-frames.exited`, so the reconnected provider goes on, and removing

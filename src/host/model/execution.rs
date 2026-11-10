@@ -216,29 +216,47 @@ impl Registry {
     /// it owns a hosted actor. Do not lose it from impact merely because there
     /// is no terminal/chat to project yet. Call outside HostState; final update
     /// admission also holds the control write gate to exclude new acceptance.
+    /// A queued prompt blocks too: an update would turn work someone is waiting
+    /// on into a failure they find out about later. Its turn can outlast any
+    /// wait, so the refusal names the way to withdraw it.
     pub(crate) fn agent_update_blockers(&self) -> Result<Vec<String>, String> {
-        let mut query = self.db.prepare(
-            "SELECT a.record FROM agents a WHERE a.closed = 0 AND (
+        let mut query = self
+            .db
+            .prepare(
+                "SELECT a.record, EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id
+                     AND r.state = 'accepted'
+                     AND json_extract(r.record, '$.queued_ms') IS NOT NULL)
+                 FROM agents a WHERE a.closed = 0 AND (
                  EXISTS(SELECT 1 FROM agent_launches p WHERE p.agent = a.id)
                  OR EXISTS(SELECT 1 FROM agent_runs r WHERE r.agent = a.id AND
-                     (r.state = 'accepted' OR (a.session_id IS NULL AND r.state IN ('running', 'waiting'))))
+                     (r.state = 'accepted'
+                      OR (a.session_id IS NULL AND r.state IN ('running', 'waiting'))))
              ) ORDER BY a.id LIMIT ?1",
-        ).map_err(|error| error.to_string())?;
+            )
+            .map_err(|error| error.to_string())?;
         let records = query
-            .query_map([MAX_RUNNING as u64 + 1], |row| row.get::<_, String>(0))
+            .query_map([MAX_RUNNING as u64 + 1], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, bool>(1)?))
+            })
             .map_err(|error| error.to_string())?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(|error| error.to_string())?;
         let mut blockers = records
             .iter()
             .take(MAX_RUNNING)
-            .map(|record| {
+            .map(|(record, queued)| {
                 let agent: Agent = decode(record)?;
-                Ok(format!(
-                    "{} agent {} has accepted work or launch ownership awaiting confirmation",
-                    agent.spec.provider.label(),
-                    agent.id
-                ))
+                let label = agent.spec.provider.label();
+                let id = agent.id;
+                Ok(if *queued {
+                    format!(
+                        "{label} agent {id} has a queued prompt that hasn't been sent. It goes when the current turn ends; to withdraw it, run `cagents agent interrupt {id} --prompt-only` as its owner, or stop the turn from the agent's chat"
+                    )
+                } else {
+                    format!(
+                        "{label} agent {id} has accepted work or launch ownership awaiting confirmation"
+                    )
+                })
             })
             .collect::<Result<Vec<_>, String>>()?;
         if records.len() > MAX_RUNNING {
@@ -665,13 +683,17 @@ impl Registry {
         Ok(sources)
     }
 
+    /// A person's action takes the agent over, and `run` is a prompt they
+    /// sent. Their later actions without one leave that prompt recorded as
+    /// theirs, so its owner still can't withdraw it.
     pub(crate) fn claim_agent_interaction(
         &mut self,
         id: AgentId,
         run: Option<RunId>,
     ) -> Result<(), String> {
         self.db.execute("INSERT INTO agent_policies(agent, interactive, interactive_run) VALUES (?1, 1, ?2)
-            ON CONFLICT(agent) DO UPDATE SET interactive = 1, interactive_run = excluded.interactive_run",
+            ON CONFLICT(agent) DO UPDATE SET interactive = 1,
+                interactive_run = COALESCE(excluded.interactive_run, agent_policies.interactive_run)",
             params![id.to_string(), run.map(|run| run.to_string())]).map_err(|error| error.to_string())?;
         Ok(())
     }
@@ -1122,16 +1144,32 @@ impl Registry {
                 if agent.closed {
                     return Err("The agent is closed".into());
                 }
-                let active: bool = tx
+                let unsettled: Option<(String, bool)> = tx
                     .query_row(
-                        "SELECT EXISTS(SELECT 1 FROM agent_runs WHERE agent = ?1
-                     AND state IN ('accepted', 'running', 'waiting', 'interrupted'))",
+                        "SELECT state, json_extract(record, '$.queued_ms') IS NOT NULL
+                     FROM agent_runs WHERE agent = ?1
+                     AND state IN ('accepted', 'running', 'waiting', 'interrupted')
+                     ORDER BY state = 'interrupted' DESC LIMIT 1",
                         [id.to_string()],
-                        |row| row.get(0),
+                        |row| Ok((row.get(0)?, row.get(1)?)),
                     )
+                    .optional()
                     .map_err(|error| error.to_string())?;
-                if active {
-                    return Err("The agent has unfinished or unverified work; inspect and close it before starting another run".into());
+                match unsettled {
+                    None => {}
+                    Some((state, _)) if state == "interrupted" => {
+                        return Err("The outcome of this agent's last prompt is uncertain, so it can't safely take another: inspect its conversation, then close it".into());
+                    }
+                    // Interrupting would stop the turn the prompt waits for,
+                    // which its owner may want to keep.
+                    Some((_, true)) => {
+                        return Err(format!(
+                            "The agent already has a prompt queued, waiting for its current turn to end, and takes one at a time. Wait for it with `cagents agent wait {id}`, or replace it: withdraw it with `cagents agent interrupt {id} --prompt-only`, which leaves the turn running, then send again"
+                        ));
+                    }
+                    Some(_) => {
+                        return Err("The agent already has a prompt in progress. Wait for it with `cagents agent wait`, stop it with `cagents agent interrupt`, or leave a message with `cagents send`, which arrives once the agent is idle".into());
+                    }
                 }
                 // A removed channel must never be resurrected by a follow-up.
                 require_placement(&tx, &agent.placement, &agent.spec.target.repository)?;
@@ -1221,6 +1259,7 @@ impl Registry {
             started_ms: None,
             finished_ms: None,
             provider_key: None,
+            queued_ms: None,
             result: Default::default(),
         };
         tx.execute(
@@ -1599,6 +1638,12 @@ impl Registry {
                     run.state = State::Cancelled;
                     if pending.is_some() {
                         run.result.diagnostic = Some("The provider was retired before its launch could be bound; no prompt was submitted".into());
+                    } else if run.queued_ms.take().is_some() {
+                        changed = true;
+                        run.result.diagnostic = Some(match end {
+                            ProcessEnd::Closed => "The agent was closed while this prompt waited for another turn to end; it was not sent",
+                            ProcessEnd::Stopped => "The agent's process stopped while this prompt waited for another turn to end; it was not sent",
+                        }.into());
                     } else if end == ProcessEnd::Stopped {
                         changed = true;
                         run.result.diagnostic = Some("The agent's process stopped before this prompt finished, so its effects may be incomplete. It was not resent; inspect the conversation before sending more work.".into());
@@ -1973,6 +2018,18 @@ impl Registry {
             }) {
                 continue;
             }
+            // A queued prompt never reached the provider, so nothing about it
+            // is uncertain and it must not hold the agent for inspection.
+            if run.queued_ms.is_some() {
+                self.update_agent_run(run.id, run.revision, Update::Finished {
+                    state: State::Failed,
+                    result: ResultSummary {
+                        diagnostic: Some("The daemon restarted while this prompt waited for another turn to end. It was not sent; send it again if it is still needed.".into()),
+                        ..Default::default()
+                    },
+                }, now_ms)?;
+                continue;
+            }
             self.update_agent_run(run.id, run.revision, Update::Finished {
                 state: State::Interrupted,
                 result: ResultSummary {
@@ -2039,6 +2096,12 @@ pub(super) fn update_agent_run_in(
         }
         Update::Waiting if run.state == State::Running => run.state = State::Waiting,
         Update::Resumed if run.state == State::Waiting => run.state = State::Running,
+        Update::Queued if run.state == State::Accepted && run.queued_ms.is_none() => {
+            run.queued_ms = Some(now_ms);
+        }
+        Update::Dequeued if run.state == State::Accepted && run.queued_ms.is_some() => {
+            run.queued_ms = None;
+        }
         Update::Finished { state, mut result } if state.is_terminal() => {
             if state == State::Succeeded && run.provider_key.is_none() {
                 return Err("An unconfirmed provider turn cannot succeed".into());
@@ -2046,6 +2109,7 @@ pub(super) fn update_agent_run_in(
             result.bound();
             run.result = result;
             run.state = state;
+            run.queued_ms = None;
             run.finished_ms = Some(now_ms);
         }
         _ => return Err("The provider update does not match the agent run state".into()),
@@ -3069,6 +3133,42 @@ mod tests {
             }),
         };
         ended
+    }
+
+    /// A prompt still queued never reached the provider, so neither way a
+    /// process ends may report it as possibly having had effects.
+    #[test]
+    fn a_prompt_still_queued_when_its_process_ends_is_reported_as_unsent() {
+        for (end, words) in [
+            (
+                ProcessEnd::Stopped,
+                "The agent's process stopped while this prompt waited",
+            ),
+            (
+                ProcessEnd::Closed,
+                "The agent was closed while this prompt waited",
+            ),
+        ] {
+            let (mut registry, _directory, request) = fixture();
+            let accepted = registry.submit_agent(&Origin::User, &request, 1).unwrap();
+            let source = source();
+            registry
+                .bind_agent(accepted.agent.id, None, source.clone())
+                .unwrap();
+            registry.register_agent_authority(&source).unwrap();
+            registry
+                .update_agent_run(accepted.run.id, accepted.run.revision, Update::Queued, 2)
+                .unwrap();
+
+            assert!(registry.end_agent_process(&source, 5, end, None).unwrap());
+
+            let run = registry.agent_run(accepted.run.id).unwrap();
+            assert_eq!(run.state, State::Cancelled);
+            assert_eq!(run.queued_ms, None);
+            let diagnostic = run.result.diagnostic.unwrap();
+            assert!(diagnostic.starts_with(words), "{diagnostic}");
+            assert!(diagnostic.ends_with("it was not sent"), "{diagnostic}");
+        }
     }
 
     /// A daemon stop ends the exact provider's authority and turn but keeps

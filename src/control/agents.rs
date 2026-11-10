@@ -70,7 +70,8 @@ pub enum AgentCommand {
         #[command(flatten)]
         show: ShowArgs,
     },
-    /// Send a follow-up prompt to an owned, settled agent.
+    /// Send a follow-up prompt to an owned agent. It waits behind a turn no run
+    /// started, unsent, until that turn ends; `interrupt` withdraws it.
     Send {
         /// The agent, by ID or a unique prefix of it.
         agent: String,
@@ -130,14 +131,19 @@ pub enum AgentCommand {
         #[arg(long = "field", value_name = "FIELD=VALUE")]
         fields: Vec<String>,
     },
-    /// Interrupt an owned agent's active run.
+    /// Interrupt an owned agent's current turn and withdraw a prompt queued behind it.
+    /// With `--prompt-only`, withdraw the prompt and interrupt nothing.
     Interrupt {
         #[arg(help = "Agent handle, ID, or unique ID prefix.")]
         agent: String,
         /// Permit the interrupt to stop the provider's background subagents,
         /// including any waiting on their own background work.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "prompt_only")]
         including_subagents: bool,
+        /// Only withdraw a prompt queued behind the current turn, leaving that
+        /// turn and any background subagents running.
+        #[arg(long)]
+        prompt_only: bool,
     },
     /// Stop and close an agent, including its background subagents.
     Close {
@@ -308,7 +314,7 @@ fn checkout(project: &Path) -> PathBuf {
 
 pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str {
     match state {
-        crate::agent_execution::State::Accepted => "Queued",
+        crate::agent_execution::State::Accepted => "Accepted",
         crate::agent_execution::State::Running => "Running",
         crate::agent_execution::State::Waiting => "Waiting for input",
         crate::agent_execution::State::Succeeded => "Succeeded",
@@ -320,7 +326,15 @@ pub(super) fn state_label(state: crate::agent_execution::State) -> &'static str 
 
 fn list_human(summaries: &[Summary]) -> String {
     super::format::table(
-        ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"],
+        [
+            "AGENT",
+            "PROVIDER",
+            "STATE",
+            "NOW",
+            "RUN",
+            "DIRECTORY",
+            "NAME",
+        ],
         summaries
             .iter()
             .map(|summary| {
@@ -328,6 +342,9 @@ fn list_human(summaries: &[Summary]) -> String {
                     short(summary.agent.id),
                     summary.agent.spec.provider.executable().into(),
                     state_label(summary.state).into(),
+                    summary
+                        .provider
+                        .map_or_else(|| "not running".to_owned(), |now| now.label()),
                     short(summary.run),
                     summary.agent.spec.target.directory.display().to_string(),
                     summary.agent.name.clone().unwrap_or_default(),
@@ -1073,11 +1090,13 @@ pub(super) fn execute_with_context(
         AgentCommand::Status { agent, show } => {
             let agent = session.agent(&agent)?;
             let reply = session.call(Operation::Status(agent))?;
+            let provider = status_activity(&reply);
             let (agent, run) = status_reply(reply)?;
             let members = session.members(&[agent.id]);
             let member = member_of(&members, agent.id);
-            let human = with_standing(status_lines(&agent, &run, false, show), member);
-            let mut data = json!({"agent": agent, "run": run, "timed_out": false});
+            let human = with_standing(status_lines(&agent, &run, provider, false, show), member);
+            let mut data =
+                json!({"agent": agent, "run": run, "provider": provider, "timed_out": false});
             standing_json(&mut data, member);
             Ok(CommandOutput {
                 command: "agent.status",
@@ -1111,6 +1130,7 @@ pub(super) fn execute_with_context(
                 timed_out,
                 messages,
             } = waited;
+            let activities: Vec<_> = replies.iter().map(status_activity).collect();
             let statuses = replies
                 .into_iter()
                 .map(status_reply)
@@ -1123,9 +1143,16 @@ pub(super) fn execute_with_context(
             );
             let mut human = statuses
                 .iter()
-                .map(|(agent, run)| {
+                .zip(activities)
+                .map(|((agent, run), provider)| {
                     with_standing(
-                        status_lines(agent, run, timed_out && !run.state.wait_ready(), show),
+                        status_lines(
+                            agent,
+                            run,
+                            provider,
+                            timed_out && !run.state.wait_ready(),
+                            show,
+                        ),
                         member_of(&members, agent.id),
                     )
                 })
@@ -1189,26 +1216,50 @@ pub(super) fn execute_with_context(
         AgentCommand::Interrupt {
             agent,
             including_subagents,
+            prompt_only,
         } => {
             let agent = session.agent(&agent)?;
-            let requests = requests_reply(session.call(Operation::Control {
+            let Reply::Interrupted {
+                requests,
+                interrupted,
+                withdrawn,
+            } = session.call(Operation::Control {
                 agent,
-                command: Control::Interrupt {
-                    including_subagents,
+                command: if prompt_only {
+                    Control::WithdrawQueued
+                } else {
+                    Control::Interrupt {
+                        including_subagents,
+                    }
                 },
-            })?)?;
+            })?
+            else {
+                return Err(AppError::new(
+                    "agent.interrupt",
+                    "Unexpected interrupt response",
+                ));
+            };
             Ok(CommandOutput {
                 command: "agent.interrupt",
-                data: json!({"agent": agent, "requests": requests, "including_subagents": including_subagents}),
-                human: format!(
-                    "Interrupted agent {}{}",
-                    short(agent),
-                    if including_subagents {
-                        " including its background subagents"
-                    } else {
-                        ""
-                    }
-                ),
+                human: if prompt_only {
+                    withdrawal_line(withdrawn)
+                } else {
+                    interrupt_lines(
+                        agent,
+                        interrupted,
+                        withdrawn,
+                        including_subagents,
+                        requests.len(),
+                    )
+                },
+                data: json!({
+                    "agent": agent,
+                    "requests": requests,
+                    "including_subagents": including_subagents,
+                    "prompt_only": prompt_only,
+                    "interrupted": interrupted,
+                    "withdrawn": withdrawn,
+                }),
             })
         }
         AgentCommand::Close { agent } => {
@@ -1319,12 +1370,13 @@ fn submitted(
             timed_out,
             messages,
         } = waited;
+        let provider = replies.last().and_then(status_activity);
         let (agent, run) = match replies.pop() {
             Some(reply) => status_reply(reply)
                 .map_err(|error| accepted_wait_error(error, &accepted, &key, device))?,
             None => (accepted.agent.clone(), accepted.run.clone()),
         };
-        human = status_lines(&agent, &run, timed_out, show);
+        human = status_lines(&agent, &run, provider, timed_out, show);
         human.push_str(&arrived_lines(&messages));
         data["agent"] = json!(agent);
         data["run"] = json!(run);
@@ -1479,11 +1531,84 @@ fn wait_data(statuses: &[(Agent, Run)], any: bool, timed_out: bool, ended_by: &s
     })
 }
 
+/// Whether the provider is doing something its latest run's state doesn't say.
+fn worth_reporting(now: crate::agent_execution::ProviderActivity, run: &Run) -> bool {
+    use crate::agent::ActivityState;
+    use crate::agent_execution::State;
+    now.background_agents > 0
+        || !matches!(
+            (now.turn, run.state),
+            (ActivityState::Working, State::Running)
+                | (ActivityState::Waiting, State::Waiting)
+                | (ActivityState::Idle, _)
+        )
+}
+
 fn status_reply(reply: Reply) -> Result<(Agent, Run), AppError> {
     match reply {
-        Reply::Status { agent, run } => Ok((agent, run)),
+        Reply::Status { agent, run, .. } => Ok((agent, run)),
         _ => Err(AppError::new("agent.status", "Unexpected status response")),
     }
+}
+
+fn status_activity(reply: &Reply) -> Option<crate::agent_execution::ProviderActivity> {
+    match reply {
+        Reply::Status { provider, .. } => *provider,
+        _ => None,
+    }
+}
+
+fn withdrawal_line(withdrawn: Option<crate::model::RunId>) -> String {
+    withdrawn.map_or_else(
+        || "Nothing was withdrawn, and nothing was interrupted.".into(),
+        |run| {
+            format!(
+                "Withdrew queued run {}; its prompt was not sent. The current turn keeps running.",
+                short(run)
+            )
+        },
+    )
+}
+
+fn interrupt_lines(
+    agent: crate::model::AgentId,
+    interrupted: bool,
+    withdrawn: Option<crate::model::RunId>,
+    including_subagents: bool,
+    requests: usize,
+) -> String {
+    let agent = short(agent);
+    let mut lines = if interrupted {
+        format!(
+            "Interrupted agent {agent}{}",
+            if including_subagents {
+                " including its background subagents"
+            } else {
+                ""
+            }
+        )
+    } else {
+        format!("Nothing to interrupt on agent {agent}")
+    };
+    if let Some(run) = withdrawn {
+        lines.push_str(&format!(
+            "\nWithdrew queued run {}; its prompt was not sent",
+            short(run)
+        ));
+    }
+    if requests > 0 {
+        lines.push_str(&format!(
+            "\nStill waiting on {requests} request(s): cagents agent requests {agent}"
+        ));
+    }
+    lines
+}
+
+fn queued_line(agent: crate::model::AgentId) -> String {
+    format!(
+        "Queued behind another turn; not sent yet. It goes when that turn ends and any pending request is answered. To withdraw it and leave that turn running: cagents agent interrupt {} --prompt-only",
+        short(agent)
+    )
 }
 
 fn requests_reply(reply: Reply) -> Result<Vec<crate::chat::Request>, AppError> {
@@ -1514,7 +1639,13 @@ fn arrived_lines(messages: &[crate::agent_execution::mailbox::Message]) -> Strin
 
 /// An agent's latest run in a few lines: who and where, how the run stands,
 /// and the end of its result.
-fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> String {
+fn status_lines(
+    agent: &Agent,
+    run: &Run,
+    provider: Option<crate::agent_execution::ProviderActivity>,
+    timed_out: bool,
+    show: ShowArgs,
+) -> String {
     let mut lines = format!(
         "agent {} ({}) run {} {:?}{}",
         short(agent.id),
@@ -1523,11 +1654,20 @@ fn status_lines(agent: &Agent, run: &Run, timed_out: bool, show: ShowArgs) -> St
         run.state,
         if timed_out { " (wait timed out)" } else { "" }
     );
-    if run.state == crate::agent_execution::State::Waiting {
+    if let Some(now) = provider.filter(|now| worth_reporting(*now, run)) {
+        lines.push_str(&format!("\nNow: {}", now.label()));
+    }
+    if run.state == crate::agent_execution::State::Waiting
+        || provider.is_some_and(|now| now.turn == crate::agent::ActivityState::Waiting)
+    {
         lines.push_str(&format!(
             "\nWaiting for input: cagents agent requests {}",
             short(agent.id)
         ));
+    }
+    if run.queued_ms.is_some() {
+        lines.push('\n');
+        lines.push_str(&queued_line(agent.id));
     }
     if let Some(diagnostic) = &run.result.diagnostic {
         lines.push('\n');
@@ -1878,9 +2018,17 @@ mod tests {
             started_ms: Some(1),
             finished_ms: None,
             provider_key: Some("exact-turn".into()),
+            queued_ms: None,
             result: Default::default(),
         };
-        (run.id, Reply::Status { agent, run })
+        (
+            run.id,
+            Reply::Status {
+                agent,
+                run,
+                provider: None,
+            },
+        )
     }
 
     /// Answers the next request, which `expected` must accept.
@@ -2604,6 +2752,7 @@ mod tests {
             revision: 1,
             accepted_ms: 0,
             started_ms: None,
+            queued_ms: None,
             finished_ms: None,
             provider_key: None,
             result: ResultSummary::default(),
@@ -2955,7 +3104,7 @@ mod tests {
         );
         assert!(answers(&["scope".into()]).is_err());
         assert!(
-            matches!(parse(&["interrupt", "1a2b"]), AgentCommand::Interrupt { agent, including_subagents: false } if agent == "1a2b")
+            matches!(parse(&["interrupt", "1a2b"]), AgentCommand::Interrupt { agent, including_subagents: false, prompt_only: false } if agent == "1a2b")
         );
     }
 
@@ -2963,8 +3112,10 @@ mod tests {
     fn interrupt_requires_explicit_background_permission() {
         assert!(
             matches!(parse(&["interrupt", "1a2b", "--including-subagents"]),
-            AgentCommand::Interrupt { agent, including_subagents: true } if agent == "1a2b")
+            AgentCommand::Interrupt { agent, including_subagents: true, prompt_only: false } if agent == "1a2b")
         );
+        assert!(matches!(parse(&["interrupt", "1a2b", "--prompt-only"]),
+            AgentCommand::Interrupt { agent, including_subagents: false, prompt_only: true } if agent == "1a2b"));
     }
 
     fn summary(agent: &str, run: &str) -> Summary {
@@ -2994,6 +3145,7 @@ mod tests {
             },
             run: run.parse().unwrap(),
             state: crate::agent_execution::State::Running,
+            provider: None,
         }
     }
 
@@ -3015,13 +3167,89 @@ mod tests {
                 .unwrap()
                 .split_whitespace()
                 .collect::<Vec<_>>(),
-            ["AGENT", "PROVIDER", "STATE", "RUN", "DIRECTORY", "NAME"]
+            [
+                "AGENT",
+                "PROVIDER",
+                "STATE",
+                "NOW",
+                "RUN",
+                "DIRECTORY",
+                "NAME"
+            ]
         );
         assert!(human.contains("abcdef00"));
         assert!(human.contains("Waiting for input"));
         assert!(human.ends_with("reviewer next"));
+        assert!(human.contains("not running"));
         entry.state = crate::agent_execution::State::Interrupted;
         assert!(list_human(&[entry]).contains("Outcome uncertain"));
+    }
+
+    #[test]
+    fn agent_output_says_what_a_settled_runs_provider_is_doing_now() {
+        use crate::agent::ActivityState;
+        use crate::agent_execution::{ProviderActivity, State};
+        let mut entry = summary(
+            "abcdef00-0000-4000-8000-000000000001",
+            "12345678-0000-4000-8000-000000000001",
+        );
+        entry.state = State::Succeeded;
+        entry.provider = Some(ProviderActivity {
+            turn: ActivityState::Idle,
+            background_agents: 2,
+            waiting_agents: 0,
+        });
+        assert!(list_human(&[entry.clone()]).contains("idle; 2 background agents"));
+        entry.provider = Some(ProviderActivity {
+            turn: ActivityState::Idle,
+            background_agents: 2,
+            waiting_agents: 1,
+        });
+        assert!(list_human(&[entry]).contains(
+            "idle; 2 background agents; 1 waiting on its own background work, so its result so far may be interim"
+        ));
+
+        let (_, Reply::Status { agent, mut run, .. }) = running() else {
+            panic!("expected status");
+        };
+        let now = |turn, background_agents| {
+            Some(ProviderActivity {
+                turn,
+                background_agents,
+                waiting_agents: 0,
+            })
+        };
+        let line = |run: &Run, provider| {
+            status_lines(
+                &agent,
+                run,
+                provider,
+                false,
+                ShowArgs {
+                    full: false,
+                    tail: 20,
+                },
+            )
+            .lines()
+            .find_map(|line| line.strip_prefix("Now: ").map(str::to_owned))
+        };
+        run.state = State::Failed;
+        assert_eq!(
+            line(&run, now(ActivityState::Working, 0)).as_deref(),
+            Some("working")
+        );
+        assert_eq!(line(&run, now(ActivityState::Idle, 0)), None);
+        assert_eq!(line(&run, None), None);
+        run.state = State::Running;
+        assert_eq!(
+            line(&run, now(ActivityState::Working, 0)),
+            None,
+            "the run already says so"
+        );
+        assert_eq!(
+            line(&run, now(ActivityState::Working, 1)).as_deref(),
+            Some("working; 1 background agent")
+        );
     }
 
     #[test]
@@ -3071,6 +3299,8 @@ mod tests {
                 view_scope: None,
                 channel_repository: None,
                 state: crate::agent::ActivityState::Idle,
+                background_agents: 0,
+                waiting_agents: 0,
                 directory: None,
                 worktree: None,
                 project: None,
@@ -3165,6 +3395,8 @@ mod tests {
             view_scope: Some(Placement::Channel(channel)),
             channel_repository: Some("/repo".into()),
             state: crate::agent::ActivityState::Idle,
+            background_agents: 0,
+            waiting_agents: 0,
             directory: Some("/repo".into()),
             worktree: Some("/repo".into()),
             project: Some("/repo".into()),
@@ -3387,6 +3619,9 @@ fn run_console(agent: AgentId) -> Result<CommandOutput, AppError> {
                         if let Some(diagnostic) = &view.run.result.diagnostic {
                             println!("{diagnostic}");
                         }
+                    }
+                    if view.run.queued_ms.is_some() {
+                        println!("{}", queued_line(agent));
                     }
                     last_run = Some((view.run.id, view.run.revision));
                 }

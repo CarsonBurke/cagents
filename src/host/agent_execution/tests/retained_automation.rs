@@ -13,75 +13,85 @@ fn wait_until(mut condition: impl FnMut() -> bool, reason: &str) {
     }
 }
 
+/// Runs `test` again beneath the retained-fixture supervisor, in a private
+/// environment that selects the real retained helper, and returns whether
+/// this was an outer run. Only the inner fixture run returns false.
+pub(super) fn reran_in_retained_fixture(test: &str) -> bool {
+    if crate::retained_fixture::run_isolated() {
+        return true;
+    }
+    if std::env::var(MODE).as_deref() == Ok("fixture") {
+        return false;
+    }
+    let directory = tempfile::tempdir_in("/var/tmp").unwrap();
+    let root = directory.path();
+    for path in [
+        "bin",
+        "home/.claude",
+        "data",
+        "config",
+        "cache",
+        "tmp",
+        "run",
+        "project",
+    ] {
+        std::fs::create_dir_all(root.join(path)).unwrap();
+    }
+    install_claude(&root.join("bin/claude"));
+    let helper = std::path::PathBuf::from(
+        std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+            .expect("retained fixtures require the same-head cagentsd executable"),
+    );
+    assert!(helper.is_absolute());
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    // Keep opaque delegation and the selected helper by normal inheritance;
+    // every remaining input belongs to this private fixture.
+    for (name, _) in std::env::vars_os() {
+        if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
+            && name != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
+        {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .args(["--exact", test, "--nocapture"])
+        .envs(crate::retained_fixture::owner_env())
+        .env(MODE, "fixture")
+        .env(
+            SCOPE,
+            if Authority::from_environment() != Authority::default() {
+                "present"
+            } else {
+                "absent"
+            },
+        )
+        .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
+        .env("CAGENTS_EXECUTION_FIXTURE", root)
+        .env("HOME", root.join("home"))
+        .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
+        .env("XDG_DATA_HOME", root.join("data"))
+        .env("XDG_CONFIG_HOME", root.join("config"))
+        .env("XDG_CACHE_HOME", root.join("cache"))
+        .env("TMPDIR", root.join("tmp"))
+        .env("XDG_RUNTIME_DIR", root.join("run"))
+        .env(
+            "PATH",
+            format!("{}:/usr/bin:/bin", root.join("bin").display()),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "isolated retained fixture failed:\n{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    true
+}
+
 #[test]
 fn completed_retained_automation_retires_only_after_exact_idle_close() {
-    if crate::retained_fixture::run_isolated() {
-        return;
-    }
-    if std::env::var(MODE).as_deref() != Ok("fixture") {
-        let directory = tempfile::tempdir_in("/var/tmp").unwrap();
-        let root = directory.path();
-        for path in [
-            "bin",
-            "home/.claude",
-            "data",
-            "config",
-            "cache",
-            "tmp",
-            "run",
-            "project",
-        ] {
-            std::fs::create_dir_all(root.join(path)).unwrap();
-        }
-        install_claude(&root.join("bin/claude"));
-        let helper = std::path::PathBuf::from(
-            std::env::var_os("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
-                .expect("retained automation requires the same-head cagentsd executable"),
-        );
-        assert!(helper.is_absolute());
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        // Keep opaque delegation and the selected helper by normal inheritance;
-        // every remaining input belongs to this private fixture.
-        for (name, _) in std::env::vars_os() {
-            if name != std::ffi::OsStr::new(crate::agent_execution::AUTHORITY_ENV)
-                && name != std::ffi::OsStr::new("CAGENTS_TEST_RETAINED_ACTOR_HELPER")
-            {
-                command.env_remove(name);
-            }
-        }
-        let output = command
-            .args(["--exact", TEST, "--nocapture"])
-            .envs(crate::retained_fixture::owner_env())
-            .env(MODE, "fixture")
-            .env(
-                SCOPE,
-                if Authority::from_environment() != Authority::default() {
-                    "present"
-                } else {
-                    "absent"
-                },
-            )
-            .env("CAGENTS_RETAINED_ACTOR_FIXTURE", "1")
-            .env("CAGENTS_EXECUTION_FIXTURE", root)
-            .env("HOME", root.join("home"))
-            .env("CLAUDE_CONFIG_DIR", root.join("home/.claude"))
-            .env("XDG_DATA_HOME", root.join("data"))
-            .env("XDG_CONFIG_HOME", root.join("config"))
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .env("TMPDIR", root.join("tmp"))
-            .env("XDG_RUNTIME_DIR", root.join("run"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            )
-            .output()
-            .unwrap();
-        assert!(
-            output.status.success(),
-            "isolated retained automation failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr),
-        );
+    if reran_in_retained_fixture(TEST) {
         return;
     }
 

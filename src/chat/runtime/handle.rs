@@ -374,6 +374,25 @@ impl Handle {
             Owner::Remote(remote) => remote.submit(Some(run), command).map_err(String::from),
         }
     }
+    /// Starts an accepted run's turn. The actor refuses it unless the
+    /// conversation is idle at that moment.
+    pub(crate) fn prompt_for_run(
+        &self,
+        run: crate::model::RunId,
+        text: String,
+    ) -> Result<(), Rejection> {
+        match &self.0 {
+            Owner::Local(local) => local.prompt_for_run(run, text),
+            Owner::Remote(remote) => remote.submit(
+                Some(run),
+                Command::Prompt {
+                    text,
+                    attachments: Vec::new(),
+                    mode: chat::PromptMode::Send,
+                },
+            ),
+        }
+    }
     pub(crate) fn close_if_idle(&self, generation: u64) -> Result<(), String> {
         match &self.0 {
             Owner::Local(local) => local.try_close_if_idle(generation).and_then(|closed| {
@@ -675,6 +694,48 @@ impl Handle {
         match &self.0 {
             Owner::Local(local) => local.is_idle(),
             Owner::Remote(remote) => remote.state().idle,
+        }
+    }
+    /// Whether the main turn is running, apart from any delegated work.
+    pub(crate) fn turn_is_busy(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.turn_is_busy(),
+            Owner::Remote(remote) => remote.state().busy,
+        }
+    }
+    /// Whether the provider is gone, which no later turn can change.
+    pub(crate) fn has_exited(&self) -> bool {
+        match &self.0 {
+            Owner::Local(local) => local.has_exited(),
+            Owner::Remote(remote) => remote.has_exited(),
+        }
+    }
+    /// The main turn and delegated work apart, without loading the transcript.
+    pub(crate) fn provider_activity(&self) -> crate::agent_execution::ProviderActivity {
+        use crate::agent::ActivityState;
+        match &self.0 {
+            Owner::Local(local) => local.provider_activity(),
+            Owner::Remote(remote) => {
+                let state = remote.state();
+                if let Some(provider) = state.provider {
+                    return provider;
+                }
+                // A helper started by an older build reports only the aggregate.
+                // Working without a busy turn is delegated work, even one
+                // launched in the foreground.
+                let delegated = state.activity == ActivityState::Working && !state.busy;
+                crate::agent_execution::ProviderActivity {
+                    turn: if delegated {
+                        ActivityState::Idle
+                    } else {
+                        state.activity
+                    },
+                    background_agents: u32::try_from(state.background_subagents.len())
+                        .unwrap_or(u32::MAX)
+                        .max(u32::from(delegated)),
+                    waiting_agents: 0,
+                }
+            }
         }
     }
     pub(crate) fn requests(&self) -> Vec<chat::Request> {

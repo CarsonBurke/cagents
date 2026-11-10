@@ -198,6 +198,31 @@ impl Shapes {
     }
 }
 
+/// A value of `T` decoded from what the tracer invents, for checking how such
+/// a value encodes.
+pub(super) fn invent<T: for<'de> Deserialize<'de>>() -> std::result::Result<T, String> {
+    let mut tracer = Tracer::default();
+    let mut shape = Shape::Unknown;
+    let mut error = String::new();
+    for _ in 0..100 {
+        tracer.progressed = false;
+        tracer.unfinished = unfinished(&tracer.containers);
+        tracer.position = "invented".into();
+        tracer.last_string = None;
+        match T::deserialize(Trace::new(&mut tracer, &mut shape)) {
+            Ok(value) => return Ok(value),
+            Err(failure) => {
+                tracer.retry_string(&failure);
+                error = failure.to_string();
+            }
+        }
+        if !tracer.progressed {
+            break;
+        }
+    }
+    Err(error)
+}
+
 #[derive(Default)]
 struct Tracer {
     containers: BTreeMap<String, Container>,

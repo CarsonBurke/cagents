@@ -5,8 +5,8 @@ use super::{model::Registry, state::SharedHost};
 use crate::{
     account::{Account, home::Homes, registry::Store},
     agent_execution::{
-        Accepted, Agent, Authority, Destination, HostedSession, Origin, Run, Spec, State, Submit,
-        Surface, Update,
+        Accepted, Agent, Authority, Destination, HostedSession, Origin, Reply, Run, Spec, State,
+        Submit, Surface, Update,
     },
     chat::{self, Command, PromptMode},
     model::{AgentId, RunId, TerminalId},
@@ -422,11 +422,6 @@ fn await_provider_ready_until(
             return Err(before("Provider exited before accepting the prompt".into()));
         }
         if snapshot.ready {
-            if snapshot.busy || snapshot.waiting || !snapshot.requests.is_empty() {
-                return Err(before(
-                    "The hosted provider is not idle; no additional prompt was submitted".into(),
-                ));
-            }
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -675,58 +670,198 @@ fn dispatch(
     if claim.is_none_or(|claim| claim.withdrawn) {
         return Err((State::Cancelled, UNDELIVERED_CANCELLATION.into()));
     }
-    {
-        let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-        if registry.agent(accepted.agent.id).map_err(before)?.closed
-            || registry.agent_run(accepted.run.id).map_err(before)? != accepted.run
-            || (matches!(accepted.agent.origin, Origin::Automation { .. })
-                && !registry
-                    .agent_dispatch_is_authorized(accepted.agent.id, accepted.run.id)
-                    .map_err(before)?)
+    // A scheduled firing has its own overlap policy and cancels only a turn the
+    // provider has confirmed. A caller's prompt waits for the turn it came upon.
+    let scheduled = matches!(accepted.agent.origin, Origin::Automation { .. });
+    let mut run = accepted.run.clone();
+    let mut _control = Some(_control);
+    let mut console = accepted.agent.console.is_some();
+    // Still held from reclaiming the claim, so nothing can act on this run
+    // before its first check below.
+    let mut held = Some(dispatch);
+    let mut lost_idle: u32 = 0;
+    loop {
+        if !handle.is_idle() && !handle.has_exited() {
+            if scheduled {
+                return Err(before(
+                    "The hosted provider is not idle; no additional prompt was submitted".into(),
+                ));
+            }
+            // A turn can outlast anything that needs the control gate
+            // exclusively, so a queued prompt must not hold it meanwhile.
+            _control = None;
+            run = queue_until_idle(host, &registry, &gate, held.take(), &handle, run)?;
+            lost_idle = 0;
+            let guard = control.read().unwrap_or_else(|p| p.into_inner());
+            super::client::ensure_control_open(host)
+                .map_err(|error| before(format!("{}; {UNSENT_AFTER_WAIT}", error.message)))?;
+            _control = Some(guard);
+        }
+        let _dispatch = held
+            .take()
+            .unwrap_or_else(|| gate.lock().unwrap_or_else(|p| p.into_inner()));
         {
-            return Err(before(
-                "Execution ownership changed while the provider initialized".into(),
-            ));
+            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+            if registry.agent(accepted.agent.id).map_err(before)?.closed
+                || registry.agent_run(run.id).map_err(before)? != run
+                || (scheduled
+                    && !registry
+                        .agent_dispatch_is_authorized(accepted.agent.id, run.id)
+                        .map_err(before)?)
+            {
+                return Err(before(unsent_after_wait(
+                    &run,
+                    "Execution ownership changed before prompt dispatch".into(),
+                )));
+            }
+        }
+        if !host
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .chats
+            .get(&session.id)
+            .is_some_and(|record| record.handle.same_actor(&handle))
+        {
+            return Err(before(unsent_after_wait(
+                &run,
+                "The exact provider changed before prompt dispatch".into(),
+            )));
+        }
+        if accepted.agent.spec.surface == Surface::Terminal && !console {
+            create_console(host, &registry, accepted.agent.id, &session, &handle)
+                .map_err(ConsoleError::run_failure)?;
+            console = true;
+        }
+        context
+            .verify_directory(&accepted.agent.spec.target.directory)
+            .map_err(|error| before(unsent_after_wait(&run, error)))?;
+        if scheduled {
+            // Live interactive work may survive removal; each scheduled prompt
+            // still requires its explicitly selected account to be registered.
+            selected_account(&accepted.agent.spec).map_err(before)?;
+        }
+        if run.queued_ms.is_some() {
+            if handle.has_exited() {
+                return Err(before(PROVIDER_EXITED_UNSENT.into()));
+            }
+            run = advance_run(&registry, &run, Update::Dequeued).map_err(before)?;
+            announce(host, &registry);
+        }
+        given_work(host, session.id);
+        // Once command submission begins an absent acknowledgement is ambiguous.
+        // Only the adapter's exact correlated result may declare success.
+        match handle.prompt_for_run(run.id, request.prompt.clone()) {
+            Ok(()) => return Ok(()),
+            // Another turn won the idle provider, and the actor refused this
+            // prompt without sending it. A retained actor's reported state can
+            // briefly lag that refusal, so give it time to catch up, longer
+            // each time it keeps lagging.
+            Err(error) if !scheduled && error.lost_idle_to_another_turn() => {
+                // Queued again before the gate opens, so an interrupt, a Stop
+                // or a restart in this gap still finds a prompt proven unsent.
+                run = advance_run(&registry, &run, Update::Queued).map_err(before)?;
+                announce(host, &registry);
+                drop(_dispatch);
+                std::thread::sleep(Duration::from_millis(50 << lost_idle.min(4)));
+                lost_idle += 1;
+            }
+            // Only a refusal made before the prompt could reach the provider
+            // proves it unsent; any other failure may follow queued input.
+            Err(error) if !scheduled && error.proves_unsent() => {
+                return Err(before(format!(
+                    "{}; the prompt was not sent",
+                    String::from(error)
+                )));
+            }
+            Err(error) => return Err((State::Interrupted, error.into())),
         }
     }
-    if !host
+}
+
+fn nothing_queued(run: &Run) -> String {
+    format!(
+        "The agent has no queued prompt, so nothing was withdrawn. Its latest run is {:?}.",
+        run.state
+    )
+}
+
+const UNSENT_AFTER_WAIT: &str = "this prompt waited for another turn to end and was not sent.";
+
+/// A failure before dispatch, which says the prompt went unsent when the
+/// failure follows its wait.
+fn unsent_after_wait(run: &Run, error: String) -> String {
+    if run.queued_ms.is_some() {
+        format!("{error}; {UNSENT_AFTER_WAIT}")
+    } else {
+        error
+    }
+}
+const PROVIDER_EXITED_UNSENT: &str = "The daemon can no longer reach the provider, which may have exited, while this prompt waited for another turn to end. It was not sent. Check `cagents agent status`: send it again if the agent is still live, otherwise close the agent and spawn a new one.";
+
+fn advance_run(registry: &SharedRegistry, run: &Run, update: Update) -> Result<Run, String> {
+    registry
         .lock()
         .unwrap_or_else(|p| p.into_inner())
-        .chats
-        .get(&session.id)
-        .is_some_and(|record| record.handle.same_actor(&handle))
-    {
-        return Err(before(
-            "The exact provider changed before prompt dispatch".into(),
-        ));
+        .update_agent_run(run.id, run.revision, update, now())
+}
+
+/// Holds an accepted prompt until the conversation can take it, leaving the
+/// turn it waits for alone. Closing the agent or withdrawing the prompt settles
+/// the run, which ends the wait.
+fn queue_until_idle(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    gate: &Mutex<Option<Undelivered>>,
+    held: Option<std::sync::MutexGuard<'_, Option<Undelivered>>>,
+    handle: &chat::runtime::Handle,
+    run: Run,
+) -> Result<Run, (State, String)> {
+    const POLL: Duration = Duration::from_millis(250);
+    let before = |message| (State::Failed, message);
+    // Queued before the gate it arrived with opens, so a Stop or an interrupt
+    // taking the gate next finds this prompt to withdraw.
+    let run = if run.queued_ms.is_none() {
+        let _settling = held.unwrap_or_else(|| gate.lock().unwrap_or_else(|p| p.into_inner()));
+        let queued = advance_run(registry, &run, Update::Queued).map_err(before)?;
+        announce(host, registry);
+        queued
+    } else {
+        drop(held);
+        run
+    };
+    loop {
+        if handle.is_idle() {
+            return Ok(run);
+        }
+        if handle.has_exited() {
+            // Closing the agent exits its provider too, and settles the run
+            // itself under this gate.
+            let _settling = gate.lock().unwrap_or_else(|p| p.into_inner());
+            let current = registry
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_run(run.id)
+                .map_err(before)?;
+            return Err(before(if current == run {
+                PROVIDER_EXITED_UNSENT.into()
+            } else {
+                "The queued prompt was settled before it was sent".into()
+            }));
+        }
+        std::thread::sleep(POLL);
+        let current = registry
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .agent_run(run.id)
+            .map_err(before)?;
+        if current != run {
+            return Err(before(
+                "The queued prompt was settled before it was sent".into(),
+            ));
+        }
+        super::client::ensure_control_open(host)
+            .map_err(|error| before(format!("{}; {UNSENT_AFTER_WAIT}", error.message)))?;
     }
-    if accepted.agent.spec.surface == Surface::Terminal && accepted.agent.console.is_none() {
-        create_console(host, &registry, accepted.agent.id, &session, &handle)
-            .map_err(ConsoleError::run_failure)?;
-    }
-    context
-        .verify_directory(&accepted.agent.spec.target.directory)
-        .map_err(before)?;
-    if matches!(accepted.agent.origin, Origin::Automation { .. }) {
-        // Live interactive work may survive removal; each scheduled prompt
-        // still requires its explicitly selected account to be registered.
-        selected_account(&accepted.agent.spec).map_err(before)?;
-    }
-    given_work(host, session.id);
-    // Once command submission begins an absent acknowledgement is ambiguous.
-    // Only the adapter's exact correlated result may declare success.
-    handle
-        .command_for_run(
-            accepted.run.id,
-            Command::Prompt {
-                text: request.prompt,
-                attachments: Vec::new(),
-                mode: PromptMode::Send,
-            },
-        )
-        .map_err(|error| (State::Interrupted, error))?;
-    let _ = session;
-    Ok(())
 }
 
 pub(super) fn observed(
@@ -835,6 +970,24 @@ pub(super) fn status(
     let run = registry.latest_agent_run(id)?;
     Ok((agent, run))
 }
+
+/// What the agent's exact live provider is doing, if it has one.
+fn provider_activity(
+    host: &SharedHost,
+    agent: &Agent,
+) -> Option<crate::agent_execution::ProviderActivity> {
+    let source = agent.session.as_ref()?;
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    state
+        .chats
+        .get(&source.id())
+        .filter(|record| {
+            !record.handle.is_completed()
+                && source.same_process(&HostedSession::Chat(record.session.clone()))
+        })
+        .map(|record| record.handle.provider_activity())
+}
+
 fn now() -> u64 {
     chat::now_ms().unwrap_or(0)
 }
@@ -1304,36 +1457,54 @@ pub(super) fn process(
     match operation {
         Operation::Console { agent, command } => console(host, &authority, agent, command),
         Operation::Submit(request) => submit(host, &authority, request).map(Reply::Accepted),
-        Operation::Status(id) => {
-            status(host, &authority, id).map(|(agent, run)| Reply::Status { agent, run })
-        }
+        Operation::Status(id) => status(host, &authority, id).map(|(agent, run)| Reply::Status {
+            provider: provider_activity(host, &agent),
+            agent,
+            run,
+        }),
         Operation::Run(id) => {
             let origin = origin(host, &authority)?;
             let registry = registry(host)?;
-            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            let run = registry.agent_run(id)?;
-            let agent = registry.agent(run.agent)?;
+            let (agent, run) = {
+                let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                let run = registry.agent_run(id)?;
+                (registry.agent(run.agent)?, run)
+            };
             if agent.origin != origin {
                 return Err("This caller does not own the agent".into());
             }
-            Ok(Reply::Status { agent, run })
+            // Read outside the registry guard: `announce` locks registry, then host.
+            let provider = provider_activity(host, &agent);
+            Ok(Reply::Status {
+                agent,
+                run,
+                provider,
+            })
         }
         Operation::List => {
             let origin = origin(host, &authority)?;
             let registry = registry(host)?;
-            let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
-            let summaries = registry
-                .agents(Some(&origin))?
-                .into_iter()
-                .map(|agent| {
-                    let run = registry.latest_agent_run(agent.id)?;
-                    Ok(Summary {
-                        agent,
-                        run: run.id,
-                        state: run.state,
+            let agents = {
+                let registry = registry.lock().unwrap_or_else(|p| p.into_inner());
+                registry
+                    .agents(Some(&origin))?
+                    .into_iter()
+                    .map(|agent| {
+                        let run = registry.latest_agent_run(agent.id)?;
+                        Ok((agent, run))
                     })
+                    .collect::<Result<Vec<_>, String>>()?
+            };
+            // Read outside the registry guard: `announce` locks registry, then host.
+            let summaries = agents
+                .into_iter()
+                .map(|(agent, run)| Summary {
+                    provider: provider_activity(host, &agent),
+                    agent,
+                    run: run.id,
+                    state: run.state,
                 })
-                .collect::<Result<_, String>>()?;
+                .collect();
             Ok(Reply::Listed(summaries))
         }
         Operation::Close(id) => close(host, &authority, id).map(Reply::Closed),
@@ -1348,9 +1519,7 @@ pub(super) fn process(
             refresh_retained_requests(&handle);
             Ok(Reply::Requests(displayed_requests(&handle)))
         }
-        Operation::Control { agent, command } => {
-            control(host, &authority, agent, command).map(Reply::Requests)
-        }
+        Operation::Control { agent, command } => control(host, &authority, agent, command),
         Operation::SendMessage(outgoing) => mailbox::send(host, &authority, outgoing)
             .map(Reply::Sent)
             .map_err(|error| error.to_string()),
@@ -1430,19 +1599,19 @@ fn hide_secrets(requests: &mut [chat::Request]) {
 
 /// Interrupts or answers an owned agent's provider without a console. The
 /// owner acts as the agent's caller, not as a person taking it over, so the
-/// agent stays under its owner's control afterwards. Both act only on the
-/// owner's own active run: once a person has taken the agent over, its turns
-/// and the questions they raise are that person's.
+/// agent stays under its owner's control afterwards. Once a person has taken
+/// the agent over, its turns and the questions they raise are that person's.
 ///
 /// A run settles when its main turn ends, while a background subagent may
 /// still wait on a decision. The owner may still turn that down, since a
-/// refusal authorizes no work, but approving it needs an active run.
+/// refusal authorizes no work, but approving it needs an active run. Interrupting
+/// needs no run: the provider can be busy with work none of them started.
 fn control(
     host: &SharedHost,
     authority: &Authority,
     id: AgentId,
     command: crate::agent_execution::Control,
-) -> Result<Vec<chat::Request>, String> {
+) -> Result<Reply, String> {
     use crate::agent_execution::Control;
     // Ownership first, so a caller cannot make the daemon keep a gate for an
     // agent it does not own.
@@ -1455,22 +1624,68 @@ fn control(
         .unwrap_or_else(|p| p.into_inner())
         .agent_is_interactive(id)?
     {
-        return Err("A person took this agent over; its controls are theirs".into());
-    }
-    if run.state.is_terminal() && !matches!(&command, Control::Answer { .. }) {
+        // Retracting a prompt that was never sent authorizes no work, so it
+        // stays the owner's; the turn and its requests stay the person's, as
+        // does a prompt the person sent.
+        if matches!(command, Control::Interrupt { .. } | Control::WithdrawQueued)
+            && run.queued_ms.is_some()
+        {
+            if registry(host)?
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .agent_dispatch_is_authorized(id, run.id)?
+            {
+                return Err("A person sent this queued prompt after taking the agent over, so only they can withdraw it, from the agent's chat or console.".into());
+            }
+            withdraw_queued(host, &run)?;
+            return Ok(Reply::Interrupted {
+                requests: displayed_requests(&handle),
+                interrupted: false,
+                withdrawn: Some(run.id),
+            });
+        }
+        if matches!(command, Control::WithdrawQueued) {
+            return Err(nothing_queued(&run));
+        }
         return Err(format!(
-            "The agent has no active run; its latest is {:?}",
-            run.state
+            "A person took this agent over, so only a person can answer its requests or stop it, from the agent's chat or console. You can still send it a prompt with `cagents agent send`, and withdraw a queued prompt of yours with `cagents agent interrupt {id} --prompt-only`."
         ));
     }
     let answered = match command {
+        Control::WithdrawQueued => {
+            if withdraw_undelivered(host, &mut dispatch, Some(run.id))? {
+                return Ok(Reply::Interrupted {
+                    requests: displayed_requests(&handle),
+                    interrupted: false,
+                    withdrawn: Some(run.id),
+                });
+            }
+            if run.queued_ms.is_none() {
+                return Err(nothing_queued(&run));
+            }
+            withdraw_queued(host, &run)?;
+            return Ok(Reply::Interrupted {
+                requests: displayed_requests(&handle),
+                interrupted: false,
+                withdrawn: Some(run.id),
+            });
+        }
         Control::Interrupt {
             including_subagents,
         } => {
-            if !withdraw_undelivered(host, &mut dispatch, Some(run.id))? {
-                handle.interrupt_owned(Some(run.id), including_subagents)?;
+            if withdraw_undelivered(host, &mut dispatch, Some(run.id))? {
+                return Ok(Reply::Interrupted {
+                    requests: displayed_requests(&handle),
+                    interrupted: false,
+                    withdrawn: Some(run.id),
+                });
             }
-            None
+            let (interrupted, withdrawn) = interrupt_run(host, &handle, &run, including_subagents)?;
+            return Ok(Reply::Interrupted {
+                requests: displayed_requests(&handle),
+                interrupted,
+                withdrawn,
+            });
         }
         Control::Answer {
             request_id,
@@ -1505,7 +1720,9 @@ fn control(
                 answers,
             };
             let synchronization = super::chat::retained_actor::AnswerSync::capture(host, &handle)?;
-            if run.state.is_terminal() {
+            // A queued prompt hasn't started anything a person's approval could
+            // belong to, so it grants no more than a settled run does.
+            if run.state.is_terminal() || run.queued_ms.is_some() {
                 handle.decline_answer(command)?;
             } else {
                 handle.command(command)?;
@@ -1522,7 +1739,146 @@ fn control(
     // provider has dropped it.
     let mut requests = displayed_requests(&handle);
     requests.retain(|request| Some(&request.id) != answered.as_ref());
-    Ok(requests)
+    Ok(Reply::Requests(requests))
+}
+
+/// Whether a run the provider says isn't active may have gone to it anyway. A
+/// retained helper journals a run when it admits it, and its `Started` reaches
+/// the registry later, so the turn can end first. Unknown counts as sent, since
+/// a caller told "not sent" would send it again.
+fn reached_retained_actor(handle: &chat::runtime::Handle, run: RunId) -> bool {
+    handle.refresh_retained_state().is_err() || handle.retained_runs().contains(&run)
+}
+
+/// Whether the interrupt stopped anything, and the unsent prompt it withdrew.
+/// An `Accepted` run the provider isn't running and doesn't hold hasn't reached
+/// it: dispatch holds this gate from before it submits until the actor has it.
+fn interrupt_run(
+    host: &SharedHost,
+    handle: &chat::runtime::Handle,
+    run: &Run,
+    including_subagents: bool,
+) -> Result<(bool, Option<RunId>), String> {
+    let unsent = run.queued_ms.is_some();
+    if run.state.is_terminal() || unsent {
+        return interrupt_unowned_turn(host, handle, run, including_subagents, unsent);
+    }
+    match handle.interrupt_owned(Some(run.id), including_subagents) {
+        Ok(()) => Ok((true, None)),
+        Err(error) if run.state == State::Accepted && error == chat::runtime::NOT_ACTIVE_RUN => {
+            let unsent = !reached_retained_actor(handle, run.id);
+            interrupt_unowned_turn(host, handle, run, including_subagents, unsent)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Interrupts what the provider is doing when no accepted run owns that work:
+/// a turn begun by a task notification or a delivered message, or the background
+/// work a settled run left behind. A prompt still waiting behind that work goes
+/// with it, as it was meant for the work being stopped; a refusal leaves it queued.
+fn interrupt_unowned_turn(
+    host: &SharedHost,
+    handle: &chat::runtime::Handle,
+    run: &Run,
+    including_subagents: bool,
+    unsent: bool,
+) -> Result<(bool, Option<RunId>), String> {
+    let reachable = handle.turn_is_busy() || !handle.interrupt_subagents().is_empty();
+    if reachable {
+        handle.interrupt_owned(None, including_subagents).map_err(|error| {
+            if unsent {
+                format!("{error} The prompt queued behind it is still queued; to withdraw only that, use `cagents agent interrupt --prompt-only`.")
+            } else {
+                error
+            }
+        })?;
+    } else if !unsent {
+        return Err(nothing_to_interrupt(
+            run.state,
+            &handle.work_hold(),
+            handle.requests().len(),
+        ));
+    }
+    if unsent {
+        withdraw_queued(host, run)?;
+    }
+    Ok((reachable, unsent.then_some(run.id)))
+}
+
+/// Why an interrupt found nothing to stop: the main turn is idle, and whatever
+/// still holds the agent is out of the interrupt's reach.
+fn nothing_to_interrupt(latest: State, hold: &chat::WorkHold, requests: usize) -> String {
+    let mut message = format!(
+        "The agent has no active run and its main turn is idle, so there is nothing to interrupt. Its latest run is {latest:?}."
+    );
+    let background = hold.subagents();
+    if !background.is_empty() {
+        message.push_str(&format!(
+            " This provider's interrupt doesn't reach its {}; stop {} in the agent's chat, or close the agent.",
+            background.counted(),
+            background.where_to_stop()
+        ));
+    }
+    if requests > 0 {
+        message.push_str(&format!(
+            " It is waiting on {requests} request(s): see `cagents agent requests`."
+        ));
+    }
+    message
+}
+
+/// A person's Stop from the agent's console: the agent's turns become theirs,
+/// and a prompt waiting behind the stopped turn must not start as it ends.
+fn stop_for_person(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    handle: &chat::runtime::Handle,
+    id: AgentId,
+    including_subagents: bool,
+) -> Result<(), String> {
+    let gate = agent_gate(host, id);
+    let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
+    if !withdraw_undelivered(host, &mut dispatch, None)? {
+        handle.interrupt_owned(None, including_subagents)?;
+    }
+    registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .claim_agent_interaction(id, None)?;
+    withdraw_latest_queued(host, registry, id)
+}
+
+fn withdraw_latest_queued(
+    host: &SharedHost,
+    registry: &SharedRegistry,
+    agent: AgentId,
+) -> Result<(), String> {
+    let latest = registry
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .latest_agent_run(agent)?;
+    if latest.queued_ms.is_some() {
+        withdraw_queued(host, &latest)?;
+    }
+    Ok(())
+}
+
+fn withdraw_queued(host: &SharedHost, run: &Run) -> Result<(), String> {
+    let registry = registry(host)?;
+    advance_run(
+        &registry,
+        run,
+        Update::Finished {
+            state: State::Cancelled,
+            result: crate::agent_execution::ResultSummary {
+                diagnostic: Some("An interrupt withdrew this prompt; it was not sent".into()),
+                ..Default::default()
+            },
+        },
+    )?;
+    announce(host, &registry);
+    Ok(())
 }
 
 enum ConsoleError {
@@ -1789,15 +2145,7 @@ fn console(
         ConsoleCommand::Interrupt {
             including_subagents,
         } => {
-            let gate = agent_gate(host, id);
-            let mut dispatch = gate.lock().unwrap_or_else(|p| p.into_inner());
-            if !withdraw_undelivered(host, &mut dispatch, None)? {
-                handle.interrupt_owned(None, including_subagents)?;
-            }
-            registry
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .claim_agent_interaction(id, None)?;
+            stop_for_person(host, &registry, &handle, id, including_subagents)?;
             Ok(Reply::Console(None))
         }
         ConsoleCommand::Control(command) => {
