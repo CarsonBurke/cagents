@@ -24,6 +24,8 @@ struct FakeSource {
     lose_prepare_ack: bool,
     predicted_service: bool,
     fail_inventory: bool,
+    foreign_preparation: bool,
+    preparation_checks: usize,
     close_attempts: usize,
     fail_close_at: Option<usize>,
     change_on_first_close: bool,
@@ -98,6 +100,31 @@ impl FloorSource for FakeSource {
             return Err(invalid("legacy lifecycle source has no pane inventory API"));
         }
         Ok(self.inventory.clone())
+    }
+    fn begin_preparation(
+        &mut self,
+        _: &Path,
+        _: &UpdateJob,
+        _: &impact::DaemonImpact,
+    ) -> Result<(), UpdateError> {
+        if self.fail_inventory {
+            self.preparation_checks += 1;
+            preparation_census(
+                true,
+                || {
+                    if self.foreign_preparation {
+                        Err(
+                            "A checkpoint already exists; it was kept without preparing the source"
+                                .into(),
+                        )
+                    } else {
+                        Ok(())
+                    }
+                },
+                || Err(invalid("legacy lifecycle source has no pane inventory API")),
+            )?;
+        }
+        Ok(())
     }
     fn prepare(&mut self, _: &impact::DaemonImpact) -> Result<(), source::PrepareError> {
         if self.lose_prepare_ack {
@@ -396,6 +423,8 @@ fn fixture() -> FakeSource {
         lose_prepare_ack: false,
         predicted_service: false,
         fail_inventory: false,
+        foreign_preparation: false,
+        preparation_checks: 0,
         close_attempts: 0,
         fail_close_at: None,
         change_on_first_close: false,
@@ -605,13 +634,13 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
     let unrecorded = add_chat(&mut source, impact::Disposition::Resumes, false);
     let mut survivors = Survivors::default();
     survivors.record_prepared(&source.preview, source.preview.daemon.as_ref().unwrap());
-    survivors.prepared_source = Some((
-        source.preview.daemon.clone().unwrap(),
-        crate::upgrade::recovery::Census {
+    survivors.prepared_source = Some(PreparationEvidence::Full {
+        daemon: source.preview.daemon.clone().unwrap(),
+        census: crate::upgrade::recovery::Census {
             chats: source.inventory.chats.clone(),
             ..Default::default()
         },
-    ));
+    });
     let terminal = TerminalId::new();
     survivors
         .labels
@@ -651,6 +680,142 @@ fn recovered_paused_conversations_name_the_manual_resume_action() {
             .prepared_report()
             .contains("resumes after the update")
     );
+}
+
+#[test]
+fn zombie_source_metadata_does_not_mask_prepared_failure_or_start_another_daemon() {
+    use std::os::unix::fs::PermissionsExt;
+
+    const CHILD: &str = "CAGENTS_TEST_UPDATE_ZOMBIE_CLEANUP";
+    const TEST: &str = "update::floor::tests::zombie_source_metadata_does_not_mask_prepared_failure_or_start_another_daemon";
+    let Some(root) = std::env::var_os(CHILD) else {
+        let root = tempfile::tempdir().unwrap();
+        let runtime = root.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env(CHILD, root.path())
+            .env("HOME", root.path())
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("XDG_DATA_HOME", root.path().join("data"))
+            .env("XDG_CONFIG_HOME", root.path().join("config"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        return;
+    };
+    let root = PathBuf::from(root);
+    let paths = crate::daemon::RuntimePaths::discover().unwrap();
+    fs::create_dir_all(&paths.directory).unwrap();
+    fs::set_permissions(&paths.directory, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut daemon = fixture().preview.daemon.unwrap();
+    daemon.sessions.clear();
+    daemon.capability.live_terminals = 0;
+    daemon.capability.proof.boot_id = crate::daemon::read_boot_id().unwrap();
+    let child = Command::new("/usr/bin/python3")
+        .arg("-c")
+        .arg(
+            r#"import fcntl,json,os,socket,sys
+lock=os.open(sys.argv[1],os.O_RDWR|os.O_CREAT,0o600)
+fcntl.flock(lock,fcntl.LOCK_EX)
+os.write(lock,json.dumps({'pid':os.getpid(),'proof':json.loads(sys.argv[3])}).encode())
+listener=socket.socket(socket.AF_UNIX,socket.SOCK_STREAM)
+listener.bind(sys.argv[2]);listener.listen()
+"#,
+        )
+        .arg(&paths.lock)
+        .arg(&paths.socket)
+        .arg(serde_json::to_string(&daemon.capability.proof).unwrap())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .unwrap();
+    let mut source = StreamingChild::new(child).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while source.observed_exit_status().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "private source did not exit");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(source.observed_exit_status().unwrap().unwrap().success());
+    // WNOWAIT pins this real exited child as a zombie through the handoff.
+    let stat = fs::read_to_string(format!("/proc/{}/stat", source.child.id())).unwrap();
+    assert_eq!(
+        stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
+        Some("Z")
+    );
+    let mut handoff =
+        Some(crate::daemon::lease_handoff::LeaseHandoff::wait(&paths, source.child.id()).unwrap());
+    assert!(
+        crate::daemon::running_executable_at(&paths).is_err(),
+        "a stale source PID cannot authenticate the worker's held handoff"
+    );
+    assert!(matches!(
+        cleanup_daemon(&paths, true),
+        CleanupDaemon::Absent
+    ));
+    let store = crate::upgrade::handoff::Store::discover().unwrap();
+    let checkpoint = serde_json::to_vec(&serde_json::json!({
+        "version": 5, "proof": daemon.capability.proof, "phase": "Prepared",
+        "terminals": [], "carried": [], "chats": []
+    }))
+    .unwrap();
+    let mut file = private_create(&store.path).unwrap();
+    file.write_all(&checkpoint).unwrap();
+    file.sync_all().unwrap();
+    let mut survivors = Survivors {
+        source_prepared: true,
+        prepared_source: Some(PreparationEvidence::Full {
+            daemon,
+            census: crate::upgrade::recovery::Census::default(),
+        }),
+        ..Default::default()
+    };
+    let state = root.join("update");
+    fs::create_dir(&state).unwrap();
+    let mut job = job(&state);
+    let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+    let installation = Installation {
+        prefix: root.join("install"),
+        version: "old".into(),
+    };
+    let marker = root.join("unexpected-daemon-start");
+    let bin = installation.prefix.join("current/bin");
+    fs::create_dir_all(&bin).unwrap();
+    let cli = bin.join("cagents");
+    fs::write(
+        &cli,
+        format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&cli, fs::Permissions::from_mode(0o700)).unwrap();
+    let original = "the original accepted preparation could not produce a recovery receipt";
+    let error = finish_handoff(
+        &installation,
+        &state,
+        &mut job,
+        &Err(invalid(original)),
+        &mut handoff,
+        &mut survivors,
+        &guard,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with(original), "{error}");
+    assert!(error.contains("still Prepared"), "{error}");
+    assert!(!error.contains("PID does not own"), "{error}");
+    let saved: UpdateJob =
+        serde_json::from_slice(&fs::read(state.join("status.json")).unwrap()).unwrap();
+    assert_eq!(saved.phase, UpdatePhase::Failed);
+    assert_eq!(saved.message, error);
+    assert!(
+        !marker.exists(),
+        "Prepared must never reach ordinary daemon start"
+    );
+    assert_eq!(fs::read(&store.path).unwrap(), checkpoint);
+    assert!(handoff.is_none());
+    source.finish(false).unwrap();
 }
 
 #[test]
@@ -1828,6 +1993,7 @@ fn ordinary_prepare_preserves_legacy_sources_without_floor_inventory_operations(
         &mut source,
     )
     .unwrap();
+    assert_eq!(source.preparation_checks, 1);
     assert_eq!(
         *source.events.lock().unwrap(),
         [
@@ -1836,6 +2002,60 @@ fn ordinary_prepare_preserves_legacy_sources_without_floor_inventory_operations(
         ]
     );
     assert_no_destructive_actions(&source);
+}
+
+#[test]
+fn legacy_preparation_checks_absence_without_reading_unqualified_inventory() {
+    use std::cell::Cell;
+    for absent in [true, false] {
+        let checked = Cell::new(false);
+        let observed = preparation_census(
+            true,
+            || {
+                checked.set(true);
+                if absent {
+                    Ok(())
+                } else {
+                    Err("Foreign Prepared was kept".into())
+                }
+            },
+            || panic!("legacy preparation must not request current inventory DTOs"),
+        );
+        assert!(checked.get());
+        if absent {
+            assert!(observed.unwrap().is_none());
+        } else {
+            assert!(
+                observed
+                    .unwrap_err()
+                    .to_string()
+                    .contains("Foreign Prepared was kept")
+            );
+        }
+    }
+}
+
+#[test]
+fn preexisting_legacy_checkpoint_refuses_before_prepare_or_destructive_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path();
+    let mut source = fixture();
+    source.prepare_refusals = 0;
+    source.fail_inventory = true;
+    source.foreign_preparation = true;
+    let preview = source.preview.clone();
+    let mut current = job(path);
+    let error = quiesce_source(path, &mut current, &preview, true, &mut source)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("checkpoint already exists"), "{error}");
+    assert_eq!(source.preparation_checks, 1);
+    assert!(source.events.lock().unwrap().is_empty());
+    assert_no_destructive_actions(&source);
+    assert!(
+        confirmation::cancel_at(path, &current.id).unwrap(),
+        "a preflight refusal must not close cancellation admission"
+    );
 }
 
 #[test]

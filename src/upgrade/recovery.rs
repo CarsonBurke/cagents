@@ -296,7 +296,17 @@ impl Preparation {
 
     /// Call only after the exact peer acknowledges PrepareConfirmedUpgrade.
     /// A connection loss or an unacknowledged request cannot mint this receipt.
-    pub(crate) fn acknowledged(mut self) -> Result<CapturedPreparation, String> {
+    pub(crate) fn acknowledged(self) -> Result<CapturedPreparation, String> {
+        let result = self.capture_acknowledged();
+        if let Err(error) = &result {
+            eprintln!(
+                "The source accepted preparation, but its recovery checkpoint could not be captured: {error}"
+            );
+        }
+        result
+    }
+
+    fn capture_acknowledged(mut self) -> Result<CapturedPreparation, String> {
         self.validate_continuity()?;
         let bytes = read_checkpoint(&self.authority.checkpoint_path)?
             .ok_or("The acknowledged preparation has no checkpoint")?;
@@ -322,7 +332,13 @@ impl CapturedPreparation {
         target_daemon: &Path,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        self.make_receipt(target_daemon, None, handoff)
+        let result = self.make_receipt(target_daemon, None, handoff);
+        if let Err(error) = &result {
+            eprintln!(
+                "The acknowledged preparation could not authorize successor recovery: {error}"
+            );
+        }
+        result
     }
 
     /// A release archive already verified by the updater can name the daemon
@@ -333,7 +349,13 @@ impl CapturedPreparation {
         verified_daemon_sha256: &str,
         handoff: &LeaseHandoff,
     ) -> Result<Option<Receipt>, String> {
-        self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff)
+        let result = self.make_receipt(target_daemon, Some(verified_daemon_sha256), handoff);
+        if let Err(error) = &result {
+            eprintln!(
+                "The acknowledged preparation could not authorize successor recovery: {error}"
+            );
+        }
+        result
     }
 
     fn make_receipt(
@@ -562,6 +584,109 @@ pub(crate) fn require_ready(daemon: &DaemonImpact, census: &Census) -> Result<()
     Ok(())
 }
 
+/// Frozen protocol68/77 sources cannot expose today's full census. Their
+/// authenticated prepare can still authorize ordinary Ready restoration, but
+/// never the candidate-owned recovery of an incomplete Prepared checkpoint.
+pub(crate) fn require_ready_scope(daemon: &DaemonImpact) -> Result<(), String> {
+    let bytes = super::handoff::Store::discover()?
+        .read_bytes()?
+        .ok_or("The acknowledged legacy source has no Ready checkpoint")?;
+    validate_ready_scope(daemon, &bytes)
+}
+
+fn validate_ready_scope(daemon: &DaemonImpact, bytes: &[u8]) -> Result<(), String> {
+    #[derive(Deserialize)]
+    struct ScopeCheckpoint {
+        version: u16,
+        proof: HostSessionProof,
+        phase: String,
+        terminals: Vec<ScopeEntry>,
+        #[serde(default)]
+        carried: Vec<ScopeEntry>,
+        chats: Vec<ScopeEntry>,
+    }
+    #[derive(Deserialize)]
+    struct ScopeEntry {
+        source: ScopeSource,
+    }
+    #[derive(Deserialize)]
+    struct ScopeSource {
+        id: TerminalId,
+        #[serde(default)]
+        terminal: Option<ScopePair>,
+    }
+    #[derive(Deserialize)]
+    struct ScopePair {
+        id: TerminalId,
+    }
+
+    if bytes.len() > SNAPSHOT_LIMIT {
+        return Err("Legacy Ready checkpoint exceeds its bounded byte limit".into());
+    }
+    let checkpoint: ScopeCheckpoint =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    // Both qualified frozen sources write checkpoint formats 1 through 4,
+    // with at most 1024 terminals and 128 native conversations.
+    if !(1..=4).contains(&checkpoint.version)
+        || checkpoint.phase != "Ready"
+        || !daemon.capability.proof.is_complete()
+        || checkpoint.proof != daemon.capability.proof
+        || !daemon.ready()
+        || checkpoint.terminals.len() + checkpoint.carried.len() > 1024
+        || checkpoint.chats.len() > 128
+    {
+        return Err("The acknowledged legacy checkpoint is not Ready for this exact source scope; checkpoint evidence was preserved".into());
+    }
+    let mut expected_terminals = BTreeSet::new();
+    let mut expected_chats = BTreeSet::new();
+    for item in &daemon.sessions {
+        let expected = match item.kind {
+            SessionKind::Terminal => &mut expected_terminals,
+            SessionKind::NativeChat => &mut expected_chats,
+        };
+        if !expected.insert(item.id) {
+            return Err("The reviewed legacy source scope contains duplicate owners".into());
+        }
+    }
+    if !expected_terminals.is_disjoint(&expected_chats) {
+        return Err("The reviewed legacy source scope has an ambiguous paired owner".into());
+    }
+    let mut terminals = BTreeSet::new();
+    for item in checkpoint.terminals.iter().chain(&checkpoint.carried) {
+        if item.source.terminal.is_some() || !terminals.insert(item.source.id) {
+            return Err(
+                "The legacy Ready checkpoint contains duplicate or ambiguous terminal owners"
+                    .into(),
+            );
+        }
+    }
+    let mut chats = BTreeSet::new();
+    for item in &checkpoint.chats {
+        let source = &item.source;
+        if !chats.insert(source.id)
+            || source
+                .terminal
+                .as_ref()
+                .is_some_and(|pair| pair.id != source.id)
+            || terminals.contains(&source.id) && source.terminal.is_none()
+        {
+            return Err("The legacy Ready checkpoint has an unproven native terminal pair".into());
+        }
+        // Historical UpgradeImpact represents a chat and its same-ID console
+        // as one native owner. Only an explicitly recorded pair may account
+        // for that otherwise-extra terminal slot in the checkpoint.
+        if source.terminal.is_some() {
+            terminals.remove(&source.id);
+        }
+    }
+    if terminals != expected_terminals || chats != expected_chats {
+        return Err(
+            "The legacy Ready checkpoint differs from the exact reviewed owner scope".into(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_checkpoint(authority: &Authority, bytes: &[u8]) -> Result<String, String> {
     let checkpoint: CheckpointIndex = serde_json::from_slice(bytes).map_err(|e| e.to_string())?;
     if !(1..=5).contains(&checkpoint.version)
@@ -622,26 +747,36 @@ fn same_terminal(known: &TerminalSession, source: &TerminalSession) -> bool {
         && known.predecessor == source.predecessor
 }
 
-fn same_chat(known: &Session, source: &Session, launch: &crate::chat::Launch) -> bool {
+fn same_chat(known: &Session, source: &Session, effective: &crate::chat::Launch) -> bool {
     known.id == source.id
         && known.proof == source.proof
         && known.launch.provider == source.launch.provider
-        && known.launch.provider == launch.provider
         && known.launch.recipe == source.launch.recipe
         && known.owned_codex_listener == source.owned_codex_listener
         && known.terminal.as_ref().map(|item| item.id)
             == source.terminal.as_ref().map(|item| item.id)
-        && known.launch.session_id.as_ref().is_none_or(|id| {
-            // Older sources keep the issued descriptor unchanged for a
-            // provider they will resume. The effective launch must retain the
-            // exact confirmed thread, including when the source has one too.
-            launch.session_id.as_ref() == Some(id)
-                && source
-                    .launch
-                    .session_id
-                    .as_ref()
-                    .is_none_or(|source_id| source_id == id)
-        })
+        // ChatList projects the provider's confirmed identity over the issued
+        // descriptor. Frozen sources keep that original descriptor unchanged
+        // in `source`, and put the current conversation in the separate launch.
+        && effective.provider == known.launch.provider
+        && known
+            .launch
+            .session_id
+            .as_ref()
+            .is_none_or(|id| effective.session_id.as_ref() == Some(id))
+        && same_effective_recipe(&known.launch, effective)
+}
+
+fn same_effective_recipe(known: &crate::chat::Launch, effective: &crate::chat::Launch) -> bool {
+    let mut confirmed = known.clone();
+    confirmed.session_id.clone_from(&effective.session_id);
+    match (confirmed.terminal_recipe(), effective.terminal_recipe()) {
+        (Some(before), Some(after)) => before == after,
+        // A retained Claude actor can precede its first conversation ID. There
+        // is no identity normalization to permit in its recipe at that point.
+        (None, None) => confirmed.session_id.is_none() && confirmed.recipe == effective.recipe,
+        _ => false,
+    }
 }
 
 fn digest(bytes: &[u8]) -> String {
@@ -682,6 +817,11 @@ fn require_absent_checkpoint(path: &Path) -> Result<(), String> {
         return Err("An earlier upgrade checkpoint already exists. Its bytes were preserved and this update did not prepare the source; resolve that checkpoint before attempting another preparation.".into());
     }
     Ok(())
+}
+
+/// Refuse before any source prepare can overwrite earlier checkpoint bytes.
+pub(crate) fn require_checkpoint_absent() -> Result<(), String> {
+    require_absent_checkpoint(&super::handoff::Store::discover()?.path)
 }
 
 fn executable_hash(path: &Path) -> Result<String, String> {
@@ -1297,55 +1437,210 @@ mod tests {
         );
     }
 
-    #[test]
-    fn frozen_source_keeps_confirmed_thread_in_the_effective_checkpoint_launch() {
-        let root = tempfile::tempdir_in("/var/tmp").unwrap();
-        let mut preparation = preparation(root.path());
-        let known = Session {
-            id: TerminalId::new(),
-            launch: crate::chat::Launch {
-                provider: crate::agent::Provider::Codex,
-                recipe: preparation.authority.census.terminals[0].launch.clone(),
-                session_id: Some("confirmed-thread".into()),
-            },
-            proof: Some(preparation.authority.source.clone()),
-            terminal: None,
-            owned_codex_listener: None,
-            native_continuity: Default::default(),
+    fn legacy_scope_fixture() -> (DaemonImpact, serde_json::Value) {
+        let proof = HostSessionProof {
+            host_session_id: HostSessionId::new("frozen-source"),
+            boot_id: BootId::new("boot"),
+            host_incarnation: HostIncarnation::new("legacy-daemon"),
         };
-        let mut source = known.clone();
-        source.launch.session_id = None;
-        preparation
-            .authority
-            .expected
-            .push((SessionKind::NativeChat, known.id));
-        preparation.authority.census.chats.push(known.clone());
-        for phase in ["Prepared", "Ready"] {
-            let mut value: serde_json::Value =
-                serde_json::from_slice(&checkpoint(&preparation, phase)).unwrap();
-            value["chats"] = serde_json::json!([{"source": source, "launch": known.launch}]);
-            let bytes = serde_json::to_vec(&value).unwrap();
+        let terminal = TerminalId::new();
+        let chat = TerminalId::new();
+        let daemon = DaemonImpact {
+            capability: crate::terminal_ipc::ShutdownCapability {
+                proof: proof.clone(),
+                token: "accepted-scope".into(),
+                inventory_generation: 1,
+                live_terminals: 2,
+                background_subagents: 0,
+                background_identity: String::new(),
+                expires_at_unix_ms: 100,
+            },
+            policy: crate::update::impact::Policy::WhenIdle,
+            sessions: [
+                (SessionKind::Terminal, terminal),
+                (SessionKind::NativeChat, chat),
+            ]
+            .into_iter()
+            .map(|(kind, id)| crate::update::impact::SessionImpact {
+                id,
+                kind,
+                title: String::new(),
+                identity: "reviewed-source-owner".into(),
+                disposition: crate::update::impact::Disposition::Resumes,
+                reason: String::new(),
+                interrupted_subagents: Vec::new(),
+            })
+            .collect(),
+            blockers: Vec::new(),
+        };
+        // Source ID metadata only: this guard must not decode today's recipe,
+        // continuity, provider, or snapshot DTOs to qualify a frozen source.
+        let checkpoint = serde_json::json!({
+            "version":4,"phase":"Ready","proof":proof,
+            "terminals":[{"source":{"id":terminal,"launch":{"legacy_format":"not a current LaunchRecipe"}}}],
+            "carried":[{"source":{"id":chat}}],
+            "chats":[{"source":{"id":chat,"terminal":{"id":chat}},"launch":{"legacy_format":"not a current Launch"}}],
+        });
+        (daemon, checkpoint)
+    }
+
+    #[test]
+    fn legacy_ready_scope_reads_only_frozen_identity_metadata_and_accounts_for_a_proven_pair() {
+        let (mut daemon, mut checkpoint) = legacy_scope_fixture();
+        validate_ready_scope(&daemon, &serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+        // Format one has no carried entries; a simple terminal-only Ready
+        // checkpoint remains a supported ordinary restore path.
+        checkpoint["version"] = 1.into();
+        checkpoint.as_object_mut().unwrap().remove("carried");
+        checkpoint["chats"] = serde_json::json!([]);
+        daemon
+            .sessions
+            .retain(|item| item.kind == SessionKind::Terminal);
+        validate_ready_scope(&daemon, &serde_json::to_vec(&checkpoint).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn legacy_ready_scope_refuses_incomplete_foreign_changed_and_ambiguous_owners_without_touching_bytes()
+     {
+        let (daemon, original) = legacy_scope_fixture();
+        let mut invalid = Vec::new();
+        for phase in ["Prepared", "Restoring", "Unknown"] {
+            let mut changed = original.clone();
+            changed["phase"] = phase.into();
+            invalid.push(changed);
+        }
+        let mut foreign = original.clone();
+        foreign["proof"]["host_incarnation"] = "another-source".into();
+        invalid.push(foreign);
+        let mut unsupported = original.clone();
+        unsupported["version"] = 5.into();
+        invalid.push(unsupported);
+        let mut missing = original.clone();
+        missing["chats"] = serde_json::json!([]);
+        invalid.push(missing);
+        let mut extra = original.clone();
+        extra["terminals"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!({"source":{"id":TerminalId::new()}}));
+        invalid.push(extra);
+        let mut duplicate = original.clone();
+        duplicate["carried"]
+            .as_array_mut()
+            .unwrap()
+            .push(original["terminals"][0].clone());
+        invalid.push(duplicate);
+        let mut unproven = original.clone();
+        unproven["chats"][0]["source"]["terminal"] = serde_json::Value::Null;
+        invalid.push(unproven);
+        let mut wrong_pair = original.clone();
+        wrong_pair["chats"][0]["source"]["terminal"]["id"] = TerminalId::new().to_string().into();
+        invalid.push(wrong_pair);
+        let root = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = root.path().join("daemon-upgrade.json");
+        for checkpoint in invalid {
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            save(&path, &bytes);
+            assert!(
+                validate_ready_scope(&daemon, &read_checkpoint(&path).unwrap().unwrap()).is_err()
+            );
             assert_eq!(
-                validate_checkpoint(&preparation.authority, &bytes).unwrap(),
-                phase
+                fs::read(&path).unwrap(),
+                bytes,
+                "scope refusal must preserve foreign or incomplete evidence"
             );
-            value["chats"][0]["launch"]["session_id"] = "different-thread".into();
-            assert!(
-                validate_checkpoint(&preparation.authority, &serde_json::to_vec(&value).unwrap())
-                    .is_err()
+        }
+        let mut duplicate_review = daemon.clone();
+        duplicate_review.sessions.push(daemon.sessions[0].clone());
+        assert!(
+            validate_ready_scope(&duplicate_review, &serde_json::to_vec(&original).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn frozen_source_checkpoint_binds_confirmed_thread_to_effective_launch_not_issued_alias() {
+        for original_id in [None, Some(uuid::Uuid::new_v4().to_string())] {
+            let root = tempfile::tempdir_in("/var/tmp").unwrap();
+            let mut preparation = preparation(root.path());
+            let confirmed = uuid::Uuid::new_v4().to_string();
+            // Frozen 991daa43e ChatList overlays the handle's confirmed ID,
+            // while its checkpoint source retains the initially issued alias.
+            let listed = Session {
+                id: TerminalId::new(),
+                launch: crate::chat::Launch {
+                    provider: crate::agent::Provider::Codex,
+                    recipe: LaunchRecipe {
+                        program: "codex".into(),
+                        arguments: vec!["--remote".into(), "unix:///fixture/control.sock".into()],
+                        working_directory: root.path().to_owned(),
+                        environment: Default::default(),
+                        unset_environment: Default::default(),
+                    },
+                    session_id: Some(confirmed.clone()),
+                },
+                proof: Some(preparation.authority.source.clone()),
+                terminal: None,
+                owned_codex_listener: None,
+                native_continuity: crate::chat::NativeContinuity::ReconnectOnly,
+            };
+            let mut issued = listed.clone();
+            issued.launch.session_id = original_id;
+            preparation
+                .authority
+                .expected
+                .push((SessionKind::NativeChat, listed.id));
+            preparation.authority.census.chats.push(listed.clone());
+            let mut captured_page = SnapshotCapture::default();
+            captured_page
+                .push(
+                    listed.clone(),
+                    crate::chat::Snapshot {
+                        session_id: Some(confirmed.clone()),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            preparation.authority.census.snapshots = captured_page.finish();
+            let mut checkpoint: serde_json::Value =
+                serde_json::from_slice(&checkpoint(&preparation, "Prepared")).unwrap();
+            checkpoint["chats"] =
+                serde_json::json!([{ "source": issued, "launch": listed.launch }]);
+            let bytes = serde_json::to_vec(&checkpoint).unwrap();
+            save(&preparation.authority.checkpoint_path, &bytes);
+            let captured = preparation.acknowledged().unwrap();
+            assert_eq!(captured.0.authority.checkpoint_hash, digest(&bytes));
+            // Ready fallback uses this same distinction and still requires the
+            // exact current conversation, including after an actor reset.
+            checkpoint["phase"] = "Ready".into();
+            assert_eq!(
+                validate_checkpoint(
+                    &captured.0.authority,
+                    &serde_json::to_vec(&checkpoint).unwrap()
+                )
+                .unwrap(),
+                "Ready"
             );
-            value["chats"][0]["launch"]["session_id"] = "confirmed-thread".into();
-            value["chats"][0]["source"]["launch"]["session_id"] = "confirmed-thread".into();
-            value["chats"][0]["launch"]["session_id"] = "different-thread".into();
+            checkpoint["chats"][0]["launch"]["session_id"] =
+                uuid::Uuid::new_v4().to_string().into();
             assert!(
-                validate_checkpoint(&preparation.authority, &serde_json::to_vec(&value).unwrap())
-                    .is_err()
+                validate_checkpoint(
+                    &captured.0.authority,
+                    &serde_json::to_vec(&checkpoint).unwrap()
+                )
+                .is_err(),
+                "a different effective conversation is never recovery authority"
             );
-            value["chats"][0]["launch"]["session_id"] = "confirmed-thread".into();
-            value["chats"][0]["source"]["launch"]["session_id"] = "different-thread".into();
+            checkpoint["chats"][0]["launch"]["session_id"] = confirmed.into();
+            checkpoint["chats"][0]["launch"]["recipe"]["arguments"] =
+                serde_json::json!(["--different-provider-target"]);
             assert!(
-                validate_checkpoint(&preparation.authority, &serde_json::to_vec(&value).unwrap())
-                    .is_err()
+                validate_checkpoint(
+                    &captured.0.authority,
+                    &serde_json::to_vec(&checkpoint).unwrap()
+                )
+                .is_err(),
+                "normalization cannot change any other launch option"
             );
         }
     }

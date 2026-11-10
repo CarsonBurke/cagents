@@ -1886,6 +1886,64 @@ fn record_handoff_failure(
     Ok(())
 }
 
+/// Socket evidence is separate from the lease metadata left by an old source.
+enum CleanupDaemon {
+    Ready,
+    Absent,
+    Unknown(String),
+}
+
+fn cleanup_daemon(paths: &crate::daemon::RuntimePaths, owns_handoff: bool) -> CleanupDaemon {
+    let source = match source::Client::connect(&paths.socket) {
+        Ok(source) => source,
+        Err(crate::control::ControlError::Connect(error))
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            // A handoff owns the old daemon's lease while its metadata can
+            // still name an unreaped, exited source. That is a reservation,
+            // not proof of a serving daemon. Other holders remain uncertain.
+            return if owns_handoff {
+                CleanupDaemon::Absent
+            } else {
+                match crate::daemon::HostLease::is_held(paths) {
+                    Ok(false) => CleanupDaemon::Absent,
+                    Ok(true) => CleanupDaemon::Unknown(
+                        "the daemon lease is held without an answering service".into(),
+                    ),
+                    Err(error) => CleanupDaemon::Unknown(error.to_string()),
+                }
+            };
+        }
+        Err(error) => return CleanupDaemon::Unknown(error.to_string()),
+    };
+    let source::Client::Current { mut client, peer } = source else {
+        return CleanupDaemon::Unknown("the answering service uses an older protocol".into());
+    };
+    if client.protocol() != crate::terminal_ipc::PROTOCOL_VERSION {
+        return CleanupDaemon::Unknown("the answering service uses a different protocol".into());
+    }
+    let verified = (|| {
+        peer.verify(client.proof())?;
+        let state = client
+            .startup_state()
+            .map_err(|error| invalid(error.to_string()))?;
+        peer.verify(client.proof())?;
+        if state != crate::terminal_ipc::StartupState::Ready {
+            return Err(invalid(
+                "the answering service has not finished restoring its panes",
+            ));
+        }
+        Ok(())
+    })();
+    match verified {
+        Ok(()) => CleanupDaemon::Ready,
+        Err(error) => CleanupDaemon::Unknown(error.to_string()),
+    }
+}
+
 /// Settle the reservation before reopening clients. The worker, including a
 /// headless update with no windows, owns restarting the selected installation.
 fn finish_handoff(
@@ -1898,9 +1956,20 @@ fn finish_handoff(
     guard: &crate::instance::UiUpdateGuard,
 ) -> Result<(), UpdateError> {
     let reserved = handoff.is_some() || survivors.needs_daemon_recovery();
-    // Check ordinary replay eligibility while the reservation still protects
-    // the checkpoint. A serving recovery successor does not need this replay.
-    let restart_allowed = if reserved && result.is_err() {
+    // Metadata can name the old zombie while this worker owns the handoff.
+    // Only a live authenticated socket and Ready response prove serving;
+    // failures to establish ownership preserve it without masking the update's
+    // original error or allowing another startup over uncertain ownership.
+    let daemon = if reserved && result.is_err() {
+        match crate::daemon::RuntimePaths::discover() {
+            Ok(paths) => cleanup_daemon(&paths, handoff.is_some()),
+            Err(error) => CleanupDaemon::Unknown(error.to_string()),
+        }
+    } else {
+        CleanupDaemon::Absent
+    };
+    let restart = reserved && result.is_err() && matches!(daemon, CleanupDaemon::Absent);
+    let restart_allowed = if restart {
         survivors.require_normal_restart()
     } else {
         Ok(())
@@ -1917,29 +1986,21 @@ fn finish_handoff(
     // would also unlock the successor's shared open-file description.
     drop(handoff.take());
     survivors.release_recovery_reservation();
-    // Failure is durable and our reservation is released before discovery.
-    // Until then its old PID metadata can name an exited source while our
-    // transferred flock remains held, which is not a serving daemon.
-    let serving = reserved
-        && result.is_err()
-        && crate::daemon::running_executable()
-            .map_err(|error| {
-                invalid(format!(
-                    "{}\nCould not verify the terminal service after releasing the update reservation: {error}",
-                    job.message
-                ))
-            })?
-            .is_some();
-    if let Err(error) = restart_allowed
-        && !serving
-    {
+    if let CleanupDaemon::Unknown(reason) = daemon {
+        job.message.push_str(&format!(
+            "\nNo other terminal service was started because the current owner could not be verified: {reason}. Existing processes were kept."
+        ));
+        write_job(state, job)?;
+        return Err(invalid(job.message.clone()));
+    }
+    if let Err(error) = restart_allowed {
         job.message.push_str(&format!(
             "\nThe terminal service was not restarted: {error}. The checkpoint was retained for explicit recovery."
         ));
         write_job(state, job)?;
         return Err(invalid(job.message.clone()));
     }
-    if reserved && result.is_err() && !serving {
+    if restart {
         let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
         command.args(["daemon", "start"]);
         crate::install_guard::sanitize_child_environment(&mut command);

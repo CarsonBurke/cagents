@@ -314,6 +314,21 @@ struct NativeSource<'a, O> {
     preparation: Option<crate::upgrade::recovery::Preparation>,
 }
 
+/// Frozen lifecycle sources can prepare and prove Ready without exposing the
+/// current inventory/snapshot DTOs. They never acquire Prepared recovery power.
+fn preparation_census(
+    legacy: bool,
+    checkpoint_absent: impl FnOnce() -> Result<(), String>,
+    observe: impl FnOnce() -> Result<crate::upgrade::recovery::Census, UpdateError>,
+) -> Result<Option<crate::upgrade::recovery::Census>, UpdateError> {
+    if legacy {
+        checkpoint_absent().map_err(invalid)?;
+        Ok(None)
+    } else {
+        observe().map(Some)
+    }
+}
+
 impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSource
     for NativeSource<'_, O>
 {
@@ -368,32 +383,49 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         daemon: &impact::DaemonImpact,
     ) -> Result<(), UpdateError> {
         let mut client = source_client_for(daemon)?;
-        let chats = client.list_chats()?;
-        let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
-        for chat in &chats {
-            let snapshot = client.capture_chat_snapshot(chat.clone())?;
-            snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
-        }
-        let census = crate::upgrade::recovery::Census {
-            terminals: client
-                .list()?
-                .into_iter()
-                .map(|item| item.session)
-                .collect(),
-            chats,
-            snapshots: snapshots.finish(),
-        };
-        self.preparation = Some(
-            crate::upgrade::recovery::Preparation::begin(
-                state,
-                &job.id,
-                daemon,
-                census.clone(),
-                self.guard,
-            )
-            .map_err(invalid)?,
-        );
-        self.survivors.prepared_source = Some((daemon.clone(), census));
+        let census = preparation_census(
+            matches!(&client, source::Client::Legacy(_)),
+            crate::upgrade::recovery::require_checkpoint_absent,
+            || {
+                let chats = client.list_chats()?;
+                let mut snapshots = crate::upgrade::recovery::SnapshotCapture::default();
+                for chat in &chats {
+                    let snapshot = client.capture_chat_snapshot(chat.clone())?;
+                    snapshots.push(chat.clone(), snapshot).map_err(invalid)?;
+                }
+                Ok(crate::upgrade::recovery::Census {
+                    terminals: client
+                        .list()?
+                        .into_iter()
+                        .map(|item| item.session)
+                        .collect(),
+                    chats,
+                    snapshots: snapshots.finish(),
+                })
+            },
+        )?;
+        self.survivors.prepared_source = Some(match census {
+            Some(census) => {
+                self.preparation = Some(
+                    crate::upgrade::recovery::Preparation::begin(
+                        state,
+                        &job.id,
+                        daemon,
+                        census.clone(),
+                        self.guard,
+                    )
+                    .map_err(invalid)?,
+                );
+                PreparationEvidence::Full {
+                    daemon: daemon.clone(),
+                    census,
+                }
+            }
+            None => {
+                self.preparation = None;
+                PreparationEvidence::ScopeOnly(daemon.clone())
+            }
+        });
         for item in &daemon.sessions {
             self.survivors.labels.insert(
                 item.id,
@@ -1153,7 +1185,7 @@ pub(super) struct Survivors {
     ended: BTreeMap<(impact::SessionKind, TerminalId), super::floor_display::StopItem>,
     service_stopped: bool,
     source_prepared: bool,
-    prepared_source: Option<(impact::DaemonImpact, crate::upgrade::recovery::Census)>,
+    prepared_source: Option<PreparationEvidence>,
     captured_preparation: Option<crate::upgrade::recovery::CapturedPreparation>,
     recovery_capture_error: Option<String>,
     receipt: Option<crate::upgrade::recovery::Receipt>,
@@ -1168,6 +1200,32 @@ pub(super) struct Survivors {
     scopes: BTreeMap<String, (TerminalId, String)>,
     ambient_scopes: BTreeSet<String>,
     markers: BTreeMap<Vec<u8>, (TerminalId, String)>,
+}
+
+enum PreparationEvidence {
+    Full {
+        daemon: impact::DaemonImpact,
+        census: crate::upgrade::recovery::Census,
+    },
+    ScopeOnly(impact::DaemonImpact),
+}
+
+impl PreparationEvidence {
+    fn census(&self) -> Option<&crate::upgrade::recovery::Census> {
+        match self {
+            Self::Full { census, .. } => Some(census),
+            Self::ScopeOnly(_) => None,
+        }
+    }
+
+    fn require_ready(&self) -> Result<(), String> {
+        match self {
+            Self::Full { daemon, census } => {
+                crate::upgrade::recovery::require_ready(daemon, census)
+            }
+            Self::ScopeOnly(daemon) => crate::upgrade::recovery::require_ready_scope(daemon),
+        }
+    }
 }
 
 struct InterruptedTurn {
@@ -1189,13 +1247,16 @@ impl Survivors {
         if !self.source_prepared {
             return Ok(());
         }
-        let (daemon, census) = self
+        let evidence = self
             .prepared_source
             .as_ref()
             .ok_or_else(|| invalid("The acknowledged source has no captured preparation census"))?;
         let handoff = handoff.ok_or_else(|| {
             invalid("The acknowledged source has not released its daemon lease for recovery")
         })?;
+        if matches!(evidence, PreparationEvidence::ScopeOnly(_)) {
+            return evidence.require_ready().map_err(invalid);
+        }
         if let Some(captured) = self.captured_preparation.take() {
             let receipt = match verified_digest {
                 Some(digest) => captured.receipt_with_digest(target_daemon, digest, handoff),
@@ -1209,7 +1270,7 @@ impl Survivors {
                 Err(error) => self.recovery_capture_error = Some(error),
             }
         }
-        crate::upgrade::recovery::require_ready(daemon, census).map_err(|error| {
+        evidence.require_ready().map_err(|error| {
             invalid(match &self.recovery_capture_error {
                 Some(capture) => format!("{error}. Automatic recovery was refused: {capture}"),
                 None => error,
@@ -1285,11 +1346,11 @@ impl Survivors {
         if !self.source_prepared {
             return Ok(());
         }
-        let (daemon, census) = self
+        let evidence = self
             .prepared_source
             .as_ref()
             .ok_or_else(|| invalid("The acknowledged source has no captured preparation census"))?;
-        crate::upgrade::recovery::require_ready(daemon, census).map_err(invalid)
+        evidence.require_ready().map_err(invalid)
     }
 
     pub(super) fn paused_report(&self) -> String {
@@ -1306,16 +1367,20 @@ impl Survivors {
                 .get(id)
                 .map(String::as_str)
                 .unwrap_or("Conversation");
-            let recorded = self.prepared_source.as_ref().is_some_and(|(_, census)| {
-                census.chats.iter().any(|chat| {
-                    chat.id == *id
-                        && chat
-                            .launch
-                            .session_id
-                            .as_ref()
-                            .is_some_and(|id| !id.trim().is_empty())
-                })
-            });
+            let recorded = self
+                .prepared_source
+                .as_ref()
+                .and_then(PreparationEvidence::census)
+                .is_some_and(|census| {
+                    census.chats.iter().any(|chat| {
+                        chat.id == *id
+                            && chat
+                                .launch
+                                .session_id
+                                .as_ref()
+                                .is_some_and(|id| !id.trim().is_empty())
+                    })
+                });
             let action = if recorded {
                 "choose Resume conversation in the new tab (+) menu to continue"
             } else {
