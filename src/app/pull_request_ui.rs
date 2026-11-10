@@ -169,7 +169,7 @@ impl State {
         if same_identity {
             self.loading = false;
             if self.target.as_ref().is_some_and(|target| {
-                !crate::github::polling::ready(&target.repository().host, false)
+                !crate::github::polling::ready(&target.repository().authority(), false)
             }) {
                 return ActionTask::none();
             }
@@ -206,8 +206,8 @@ impl State {
         let Some(target) = self.target.clone() else {
             return ActionTask::none();
         };
-        if !crate::github::polling::ready(&target.repository().host, true) {
-            self.error = crate::github::polling::rate_limit(&target.repository().host)
+        if !crate::github::polling::ready(&target.repository().authority(), true) {
+            self.error = crate::github::polling::rate_limit(&target.repository().authority())
                 .map(|limit| limit.to_string());
             return ActionTask::none();
         }
@@ -336,11 +336,6 @@ impl State {
                 self.loaded = true;
                 match result {
                     Ok(inspection) => {
-                        if inspection.as_ref().is_none_or(|inspection| {
-                            inspection.checks.is_ok() && inspection.conversation.is_ok()
-                        }) {
-                            crate::github::polling::succeeded(&target.repository().host);
-                        }
                         self.comment_markdown.clear();
                         if let Some(inspection) = &inspection
                             && let Ok(conversation) = &inspection.conversation
@@ -1633,7 +1628,7 @@ impl Cagents {
                 .target
                 .as_ref()
                 .is_none_or(|target| {
-                    !crate::github::polling::ready(&target.repository().host, false)
+                    !crate::github::polling::ready(&target.repository().authority(), false)
                 })
         {
             return Task::none();
@@ -2109,9 +2104,9 @@ mod tests {
         crate::github::polling::failed(
             host,
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
         let mut state = State::default();
@@ -2296,11 +2291,11 @@ mod tests {
             GitHubRepoKey::new("review-inspector-pause.invalid", None, "o", "r").unwrap();
         let target = Target::from(branch);
         crate::github::polling::failed(
-            &target.repository().host,
+            &target.repository().authority(),
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
         let mut state = State::default();
@@ -2329,7 +2324,7 @@ mod tests {
             GitHubRepoKey::new("review-inspector-backoff.invalid", None, "o", "r").unwrap();
         let target = Target::from(branch);
         crate::github::polling::failed(
-            &target.repository().host,
+            &target.repository().authority(),
             &crate::github::GitHubError::Inspection("offline".into()),
         );
         app.context_inspector_open = true;
