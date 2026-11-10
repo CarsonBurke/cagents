@@ -729,8 +729,8 @@ impl ControlClient {
     }
 
     /// Handshake with an update source at its own protocol number. Only the
-    /// update source client calls this, for a number whose wire is this
-    /// release's except for appended requests the update never sends.
+    /// update source client calls this, after proving that the restricted
+    /// upgrade messages retain their tags and payloads for that source.
     pub(crate) fn from_stream_at_source_protocol(
         stream: UnixStream,
         deadline: Instant,

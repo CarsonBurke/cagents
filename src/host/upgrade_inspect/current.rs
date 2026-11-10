@@ -387,7 +387,8 @@ impl Client {
 // and inventory DTOs. Version 100 appends capacity operations; 101 requires
 // atomic managed-pane adoption without changing these DTOs. This restricted
 // Inventory uses the frozen restricted decoder. The separate retained/history
-// methods admit full snapshots only for the explicitly qualified119/current pair.
+// methods admit full snapshots only for the qualified 119, 128, 160 and current
+// protocols.
 // Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
 // appended Work board request) preserve this subset, including the existing
 // continuity enum discriminants.

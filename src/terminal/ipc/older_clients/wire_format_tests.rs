@@ -367,12 +367,14 @@ fn pre_removal_protocol_preserves_the_restricted_upgrade_and_inspection_subset()
     }
     // Compare only messages this upgrade path exchanges, preserving each
     // original enum position and recursively comparing its complete payload.
+    // Both directions are exact: a current writer must not send an appended
+    // nested variant to a historical source, or misread one of its replies.
     // Comparing all requests would correctly reject the removed channel work;
     // ordinary client admission remains separate and refuses this protocol.
     for (name, direction, variants) in [
         (
             "ClientRequest",
-            Direction::Request,
+            Direction::Reply,
             &[
                 "Connect",
                 "List",
