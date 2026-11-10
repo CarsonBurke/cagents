@@ -148,6 +148,9 @@ pub(super) struct State {
     default_requests: HashSet<CardId>,
     pub blocked: HashSet<Scope>,
     pub adoptions: Vec<crate::persistence::TerminalPaneAdoption>,
+    /// Chat cards whose shared view re-pointed them since this window last
+    /// saved, which its own store must be told explicitly.
+    pub chat_adoptions: HashMap<CardId, crate::session::ChatIdentityAdoption>,
     pub restorations: Vec<crate::persistence::TerminalPaneRestoration>,
     restoration_requests: HashMap<CardId, TerminalId>,
 }
@@ -2254,7 +2257,16 @@ impl Cagents {
                             (CardKind::Chat(a), CardKind::Chat(b)) => a.id == b.id,
                             (a, b) => a == b,
                         };
-                        if !same_session {
+                        if let (CardKind::Chat(saved), CardKind::Chat(canonical)) =
+                            (&card.kind, &pane.kind)
+                        {
+                            self.adopt_shared_chat_identity(pane.id, saved, canonical);
+                        }
+                        // A draft choosing or loading files follows a
+                        // conversation started from it once that ends.
+                        let inserting = matches!(&pane.kind, CardKind::Chat(canonical) if !canonical.is_unstarted())
+                            && self.chat_draft_inserting(pane.id);
+                        if !same_session && !inserting {
                             // A held title belongs to the replaced session.
                             self.reported_title_save.cards.remove(&pane.id);
                             self.forget_peer_started(pane.id);
@@ -2271,7 +2283,8 @@ impl Cagents {
                                 && matches!(self.cards.get(&pane.id),
                                     Some(CardRuntime::Chat(runtime)) if runtime.session.is_unstarted())
                             {
-                                self.stash_unsent_chat(pane.id);
+                                let started = matches!(&pane.kind, CardKind::Chat(canonical) if !canonical.is_unstarted());
+                                self.carry_unsent_chat(pane.id, started);
                             }
                             self.cards.remove(&pane.id);
                             self.lifecycle.remove(pane.id);
@@ -2316,6 +2329,14 @@ impl Cagents {
                     }
                 }
                 _ => {
+                    // A closed card the view reopens may hold another
+                    // conversation than the one it last saved.
+                    if let (Some(CardKind::Chat(saved)), CardKind::Chat(canonical)) = (
+                        self.card_state(pane.id).map(|card| card.kind.clone()),
+                        &pane.kind,
+                    ) {
+                        self.adopt_shared_chat_identity(pane.id, &saved, canonical);
+                    }
                     let card = CardState {
                         id: pane.id,
                         generation: self.durable.generation,
@@ -2419,6 +2440,48 @@ impl Cagents {
             return Task::none();
         }
         self.attach_shared_pane(&pane)
+    }
+
+    /// Records that chat card `card`, which this window holds as `saved`,
+    /// now shows the shared view's `canonical` conversation.
+    ///
+    /// Storage refuses a snapshot that re-points a chat card at another
+    /// conversation, or changes what its conversation is bound to, unless the
+    /// change is recorded explicitly. The client that made the change recorded
+    /// it in its own store; this window, which only follows the canonical
+    /// view, records it in its own before the next save (#2176, #2349,
+    /// #2402).
+    ///
+    /// A stopgap for windows that keep their own copy of each card: once the
+    /// daemon's store is the only one holding card content, this and
+    /// `StateStore::adopt_chat_identity` have nothing left to reconcile.
+    pub(super) fn adopt_shared_chat_identity(
+        &mut self,
+        card: CardId,
+        saved: &crate::chat::Session,
+        canonical: &crate::chat::Session,
+    ) {
+        use std::collections::hash_map::Entry;
+        // While this window's own first send is saving, storage is about to
+        // hold the conversation it queued rather than the draft memory still
+        // shows; a peer's start that wins replaces that one. A refused send
+        // leaves the draft, and the writer then expects that instead.
+        let stored = self.draft_start_candidate(card).unwrap_or(saved).clone();
+        match self.shared_views.chat_adoptions.entry(card) {
+            // Storage decides at the write whether anything is left to adopt,
+            // including a return to the conversation it already holds.
+            Entry::Occupied(mut entry) => entry.get_mut().canonical = canonical.clone(),
+            Entry::Vacant(entry)
+                if crate::persistence::chat_identity_change(&stored, canonical).is_some() =>
+            {
+                entry.insert(crate::session::ChatIdentityAdoption {
+                    card,
+                    expected: stored.id,
+                    canonical: canonical.clone(),
+                });
+            }
+            Entry::Vacant(_) => {}
+        }
     }
 
     fn attach_shared_pane(&mut self, pane: &Pane) -> Task<Message> {
