@@ -1707,10 +1707,13 @@ scripts/rehearse-update --root /var/tmp/cr/u1 run \
 The scenario installs OLD, starts a KWin virtual desktop with nested niri,
 opens the main and `second` windows, seeds offline work, records and captures
 both windows, stages NEW, and invokes the staged CLI's `daemon upgrade` on a
-controlling pseudo-terminal. `--answer` responds to each observed confirmation;
-`--yes` instead passes the updater's approval flag. Extra upgrade flags use
-`--upgrade-arg=--interrupt` or `--upgrade-arg=--accept-unreopenable`. The harness
-does not add either policy automatically. Refusals are measured outcomes: even
+controlling pseudo-terminal. `--answer` responds to each observed `[Y/n]`
+confirmation; `--yes` instead passes the updater's approval flag. `--working`
+is typed at the choice offered while agents are mid-turn (empty presses Enter,
+which waits for them; `i` interrupts them). `--stop` is typed at the destructive
+stop list; it defaults to empty, which cancels, so a rehearsal stops panes only
+with `--stop stop`, as a person would type. Extra upgrade flags use
+`--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
 Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch
