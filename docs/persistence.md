@@ -342,9 +342,13 @@ For settled channel presentation, the UI projects only the changed scope and
 refreshes pane chrome. This requires unchanged membership, source descriptors
 and filing, complete ownership evidence, and no pending admission or lifecycle
 obligation. A retained unavailable browser surface keeps its error and recovery
-controls. Structural changes, inconsistent local placement and derived worktree
-membership retain full reconciliation; this stage does not remove all global
-projection work.
+controls. Repository loads project their complete affected ownership closure,
+including aliases and managed panes outside that repository. They retain global
+structural preparation, ownership evidence, admission, notification attribution
+and immediate snapshots. Stable presentation is a separate mode; structural
+subsets do not acquire its capture policy. Inconsistent local placement and
+uncertain derived worktree membership retain full reconciliation. This stage
+does not remove all global projection work.
 
 Canonical rows, settled projection baselines and edit acknowledgments update
 immediately. For a settled presentation change, the window delays capturing
