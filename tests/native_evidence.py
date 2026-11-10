@@ -1142,6 +1142,57 @@ class Evidence(unittest.TestCase):
         (fixture / "home" / ".config" / "fixture-forge").touch()
         return fixture
 
+    def test_codex_is_installed_only_as_the_peer_a_session_asks_for(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        fixture = self.task / "fixture"
+        self.assertFalse((fixture / "bin" / "codex").exists())
+        self.assertNotEqual(self.fixture_shell("command -v codex", check=False).returncode, 0)
+        self.run_tool("stop")
+
+        self.run_tool("start", "after", "--codex", "tool-rows")
+        # What each peer checks before serving, with no step of the agent's own.
+        self.assertEqual(fixture.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(self.fixture_shell("codex --version").stdout,
+                         "codex-cli 0.162.0 (offline tool-rows fixture)\n")
+        served = self.fixture_shell(
+            'socket="$XDG_RUNTIME_DIR/codex-test.sock"; '
+            'codex app-server --listen "unix://$socket" 2>"$XDG_RUNTIME_DIR/codex-test.log" & peer=$!; '
+            'for _ in $(seq 100); do [ -S "$socket" ] && break; kill -0 "$peer" 2>/dev/null || break; sleep 0.1; done; '
+            'if [ -S "$socket" ]; then echo listening; else cat "$XDG_RUNTIME_DIR/codex-test.log"; fi; '
+            'kill "$peer" 2>/dev/null; wait "$peer" 2>/dev/null; :')
+        self.assertEqual(served.stdout, "listening\n", served.stderr)
+        self.assertTrue((fixture / "home" / ".codex").is_dir())
+        self.run_tool("stop")
+
+        # The other peers, and the plain fixture again: each start installs afresh.
+        self.run_tool("start", "after", "--codex", "child-errors")
+        self.assertIn("child", self.fixture_shell("codex --version").stdout)
+        self.run_tool("stop")
+        self.run_tool("start", "after", "--codex", "terminal-escape")
+        self.assertIn("terminal", self.fixture_shell("codex --version").stdout)
+        self.run_tool("stop")
+        self.run_tool("start", "after")
+        self.assertFalse((fixture / "bin" / "codex").exists())
+        self.assertFalse((fixture / "libexec" / "codex").exists())
+
+    def test_codex_peer_preserves_an_explicit_narrow_viewport(self) -> None:
+        self.built()
+        self.run_tool("start", "after", "--width", "900", "--height", "800",
+                      "--codex", "tool-rows")
+        self.assertIn("size=900,800", (self.logs / "kwinrules").read_text())
+        self.assertIn("--width 900 --height 800", (self.logs / "kwin").read_text())
+        self.assertEqual(self.fixture_shell("codex --version").stdout,
+                         "codex-cli 0.162.0 (offline tool-rows fixture)\n")
+        self.run_tool("stop")
+
+    def test_an_unknown_codex_peer_is_refused_before_the_lock(self) -> None:
+        self.built()
+        result = self.run_tool("start", "after", "--codex", "codex", check=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("unknown Codex peer: codex; use tool-rows, child-errors or terminal-escape", result.stderr)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+
     def test_the_fixture_has_no_forge_or_network_until_switched_on(self) -> None:
         self.built()
         self.run_tool("start", "after")
@@ -1550,11 +1601,12 @@ class RemoteEvidence(unittest.TestCase):
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
-                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk")
+                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
+                      "--codex", "tool-rows")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
-        self.assertIn("start before --width 1200 --height 800 --portal gtk", calls)
+        self.assertIn("start before --width 1200 --height 800 --portal gtk --codex tool-rows", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 

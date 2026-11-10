@@ -1732,6 +1732,10 @@ harness, it provides:
   opens inside the session, where `drive` can operate it: `drive key ctrl+l`,
   `drive type PATH`, `drive key Return`. `kde`, `gnome` and `cosmic` select
   those backends where they are installed.
+- **Codex chats.** `start SIDE --codex tool-rows` (or `child-errors`,
+  `terminal-escape`) installs that offline Codex app-server peer as the
+  fixture's `codex`; see [An offline Codex](fixtures.md#an-offline-codex).
+  Without it, the app lists Codex as not installed.
 - **Who holds the lock.** `scripts/lock-holders /var/tmp/cagents-fw16-native.lock` shows
   the holder and whether it is doing anything, when `start` seems stuck.
 - **Cleanup.** `stop` stops the fixture daemon, then ends any process that
