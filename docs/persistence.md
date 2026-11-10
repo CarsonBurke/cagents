@@ -338,6 +338,14 @@ when an edit receipt overtakes an observer notification. A full read occurs
 only on connection or registry identity changes. Full reads scan `panes` once,
 ordered by `(scope, position, id)`.
 
+For settled channel presentation, the UI projects only the changed scope and
+refreshes pane chrome. This requires unchanged membership, source descriptors
+and filing, complete ownership evidence, and no pending admission or lifecycle
+obligation. A retained unavailable browser surface keeps its error and recovery
+controls. Structural changes, inconsistent local placement and derived worktree
+membership retain full reconciliation; this stage does not remove all global
+projection work.
+
 Current windows publish through `ApplyWorkspaceEdit`, whose `WorkspaceEdit`
 reply carries an `EditReceipt` rather than the model. A revision conflict reads
 only the source scope before retrying with the original operation identity and

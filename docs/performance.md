@@ -121,11 +121,20 @@ shared-model update, including its projection tail. Visible activity indicators
 also record redraw-event intervals, once per event on the UI thread. With the
 target disabled these paths read no clock and allocate nothing.
 
+For scope-projection qualification, also enable
+`cagents::workspace_projection=trace`. Count selected and full projections in
+both windows during the timed interval and retain any fallback reasons. A unit
+fixture's eligibility does not establish that the native workload qualifies.
+Settled channel presentation can project one scope; structural changes,
+derived worktree membership and unsettled admission still require a full pass.
+
 Before measuring, verify the matched daemon reports the intended busy run count,
 that its resident capacity agrees, and that the processes are the fixture's
 synthetic providers under its own HOME and config directory. A requested spawn
-or an agent row alone does not prove a running provider. Keep one busy chat
-visible in each window and hold keyboard focus in the same window on both sides.
+or an agent row alone does not prove a running provider. Keep a busy chat visible
+in the foreground window and select the edited pane in the other window. Hold
+keyboard focus in the same window on both sides, and record whether the second
+window is occluded. Verify its displayed initial and final titles separately.
 
 In the fixture environment, sample the two UI processes while the matched edit
 driver sends a fixed number of metadata edits. For example, use the harness's
