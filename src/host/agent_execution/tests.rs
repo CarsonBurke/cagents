@@ -3538,7 +3538,7 @@ fn only_an_agents_owner_reads_its_requests_and_controls_it() {
     assert!(requests(&child_authority, Operation::Requests(child.agent.id)).is_err());
 }
 
-/// Polls until the agent's latest run waits on a request, and returns them.
+/// Polls until the run records that it waits on a request.
 fn awaiting_answer(host: &SharedHost, run: RunId) {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
@@ -3556,6 +3556,7 @@ fn awaiting_answer(host: &SharedHost, run: RunId) {
     }
 }
 
+/// Polls until the agent's latest run waits on a request, and returns them.
 fn pending_requests(host: &SharedHost, agent: AgentId) -> Vec<chat::Request> {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {

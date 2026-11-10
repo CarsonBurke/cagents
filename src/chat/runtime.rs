@@ -2925,7 +2925,7 @@ impl Actor {
                         };
                         if !valid {
                             let _ = refuse(
-                                "Without an active run of yours, you may only decline a current pending request. Only a person can approve it, from the agent's chat or console".into(),
+                                "Without an active run of yours, you may only decline a current pending request. Only a person can approve it, from the agent's chat or console.".into(),
                             );
                             continue;
                         }

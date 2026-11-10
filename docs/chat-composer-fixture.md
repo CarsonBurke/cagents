@@ -192,8 +192,9 @@ are live only, as they are from Claude Code. A frame with `"_history": true` is
 only recorded, the way Claude Code records a queued notification as a
 `queue-operation`. A line `{"_sleep": SECONDS}` pauses the stream, so a running
 state can be captured. The provider still answers meanwhile: a prompt is
-acknowledged as queued, as one sent to a busy turn is, and an interrupt ends
-the turn there, as it does Claude's. A line `{"_exit": STATUS}` makes the
+acknowledged as queued, as one sent to a busy turn is, though neither is run
+afterwards as Claude would; and an interrupt ends the turn there, as it does
+Claude's. A line `{"_exit": STATUS}` makes the
 provider exit there with that status, from 0 to 255, mid-turn and without a
 result, as a crash does. Every turn that reaches the line exits again: the app
 doesn't resend the interrupted prompt, but the next prompt sent after it reconnects
