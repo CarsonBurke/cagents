@@ -200,6 +200,13 @@ turn reaches that line: the fixture records each such line's number in
 `fixture-frames.exited`, so the reconnected provider goes on, and removing
 that file arms them all again.
 
+A Stop on an agent the frames started answers as Claude Code 2.1.296 does
+for an agent that already sent its notice and is waiting on its own
+background work: a `task_updated` frame patching the task `killed`, with no
+further notice. `tests/fixtures/waiting-agent-scene.sh` builds a scene on
+this: an agent that reports it is waiting, then is resumed, finishes, fails,
+is resumed elsewhere, or is stopped from its tab.
+
 To check model and usage reporting, copy a recorded `initialize` response to
 `fixture-models.json`, such as `fixtures/accounts/claude-initialize-models.json`,
 the list Claude Code 2.1.296 offered with Fable 5.2. Its `models` replace the

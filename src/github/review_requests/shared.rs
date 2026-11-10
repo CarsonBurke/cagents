@@ -412,6 +412,45 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_scan_flight_allows_its_actual_query_child_to_run() {
+        let root = private_root();
+        let cancellation = CancellationToken::new();
+        let result = poll_with(
+            root.path(),
+            "actual-flight-test",
+            &repository(),
+            &cancellation,
+            || 1000,
+            |_, lease| {
+                let output = FlightExecutor(lease)
+                    .execute(
+                        &CommandSpec::new("/bin/sh").args(["-c", "printf query"]),
+                        &cancellation,
+                    )
+                    .expect("the scan's real child must start while its flight is locked");
+                assert!(output.success);
+                assert_eq!(output.stdout, b"query");
+                Ok(page("viewer", &[1], None))
+            },
+            || Ok(()),
+        )
+        .unwrap();
+        assert!(result.error.is_none(), "{:?}", result.error);
+        assert!(result.scan.requested.contains_key(&1));
+        let cached = poll_with(
+            root.path(),
+            "actual-flight-test",
+            &repository(),
+            &cancellation,
+            || 1001,
+            |_, _| panic!("the completed real query must be cached"),
+            || Ok(()),
+        )
+        .unwrap();
+        assert_eq!(cached.observation, result.observation);
+    }
+
+    #[test]
     fn process_worker() {
         let Some(root) = std::env::var_os("CAGENTS_REVIEW_POLL_TEST_ROOT") else {
             return;

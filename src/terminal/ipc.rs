@@ -219,13 +219,15 @@ use crate::{
 /// Version 165 appends `ChatLostProcesses`, which lists and ends what a dead
 /// Cagents helper left running for a conversation, and its reply. 161 to 164
 /// are reserved for parallel branches and are not adopted here.
-/// Version 166 adds scope revisions, closed pane identities and canonical
+/// Version 166 adds a tool status for an agent waiting on its own background
+/// work, which an older client is sent as running.
+/// Version 167 adds scope revisions, closed pane identities and canonical
 /// changed rows to `WorkspaceModelEdited`. Windows apply matching revisions or
 /// read only the affected scope with `ReadWorkspaceView`; reconnect snapshots,
 /// typed edit receipts and narrow metadata reads have appended requests/replies.
 /// The changed watch snapshot and edge shape require matched windows; older
 /// carried CLIs retain explicit whole-model reads/edits but cannot watch.
-pub const PROTOCOL_VERSION: u16 = 166;
+pub const PROTOCOL_VERSION: u16 = 167;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -238,6 +240,7 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
+pub(crate) use older_clients::{WAITING_TOOL_STATUS, encoding_before};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after
@@ -768,13 +771,28 @@ impl PreparedResponse {
 ///
 /// The field order, names and types are exactly [`ServerEnvelope`]'s, so the
 /// postcard encoding is byte-identical; `borrowed_envelope_encodes_identically`
-/// pins that.
-#[derive(Debug, Serialize)]
+/// pins that. An envelope in an older client's version encodes its message as
+/// that client decodes it.
+#[derive(Debug)]
 pub struct ServerEnvelopeRef<'envelope> {
     pub version: u16,
     pub request_id: Option<u64>,
     pub proof: &'envelope HostSessionProof,
     pub message: &'envelope ServerMessage,
+}
+
+impl Serialize for ServerEnvelopeRef<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        older_clients::encoding_for(self.version, || {
+            let mut envelope = serializer.serialize_struct("ServerEnvelopeRef", 4)?;
+            envelope.serialize_field("version", &self.version)?;
+            envelope.serialize_field("request_id", &self.request_id)?;
+            envelope.serialize_field("proof", self.proof)?;
+            envelope.serialize_field("message", self.message)?;
+            envelope.end()
+        })
+    }
 }
 
 // Boxing the large payload would change this public wire type's construction and
@@ -2661,6 +2679,64 @@ mod tests {
         )
         .unwrap();
         assert_eq!(owned, borrowed);
+    }
+
+    #[test]
+    fn an_envelope_for_an_older_client_encodes_its_message_for_it() {
+        use crate::chat::*;
+        let chat_id = TerminalId::new();
+        let message = |status| ServerMessage::Response {
+            response: ServerResponse::ChatFileChangePatches {
+                chat_id,
+                page: FileChangePage {
+                    request_id: 8,
+                    key: FileChangeKey {
+                        source: FileChangeSource::Subagent {
+                            id: "delegate".into(),
+                        },
+                        path: "a.rs".into(),
+                    },
+                    revision: 5,
+                    patches: vec![FileChangePatch {
+                        ownership_unverified: false,
+                        item_id: "edit".into(),
+                        kind: ChangeKind::Updated,
+                        status,
+                        imported: false,
+                        offset: 0,
+                        total_bytes: 3,
+                        diff: "+a\n".into(),
+                    }],
+                    next: None,
+                    error: None,
+                },
+            },
+        };
+        let proof = proof("session", "boot", "incarnation");
+        let encode = |version, message: &ServerMessage| {
+            let mut bytes = Vec::new();
+            write_frame(
+                &mut bytes,
+                &ServerEnvelopeRef {
+                    version,
+                    request_id: Some(7),
+                    proof: &proof,
+                    message,
+                },
+            )
+            .unwrap();
+            bytes
+        };
+        let waiting = message(ToolStatus::Waiting);
+        let running = message(ToolStatus::Running);
+        assert_eq!(
+            encode(CANDIDATE_LINE_PROTOCOL, &waiting),
+            encode(CANDIDATE_LINE_PROTOCOL, &running)
+        );
+        assert_ne!(
+            encode(PROTOCOL_VERSION, &waiting),
+            encode(PROTOCOL_VERSION, &running)
+        );
     }
 
     #[test]

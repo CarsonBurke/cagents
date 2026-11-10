@@ -39,13 +39,14 @@ both use the same fixture data and synthetic provider.
                   once no build or session has used them for 12 hours, or 1
                   hour while the disk is low.
   start SIDE [--width PX] [--height PX] [--keep-state] [--wait-lock SECONDS] [--limit SECONDS]
-        [--portal gtk|kde|gnome|cosmic]
+        [--portal gtk|kde|gnome|cosmic] [--codex tool-rows|child-errors|terminal-escape]
                   Take the native lock and start a headless session at the
                   requested logical width and height (default 1500x900). The lock is
                   released by stop, or after --limit seconds (default 2700).
                   --portal runs xdg-desktop-portal with that backend inside the
                   session, so the app's file chooser opens there for drive to
-                  operate.
+                  operate. --codex installs that offline Codex app-server peer
+                  as the fixture's codex; without it, Codex is not installed.
   cli ARGS...     Run this side's cagents CLI in the fixture environment.
   env CMD...      Run a command in the fixture environment, which keeps nothing
                   from this shell beyond locale and terminal settings and
@@ -402,6 +403,8 @@ prepare_fixture() {
     # home/.config holds the forge's switch and avatars its seeds; a steps file
     # writes into both without creating them.
     mkdir -p "$fixture"/{bin,home/.claude,home/.config,avatars,data,config,cache,state,project}
+    # The Codex peers refuse a root others can read; so would a seed's mode.
+    chmod 700 -- "$fixture"
     # Both sides get this tool's synthetic provider: the data must not differ
     # because an older before checkout carries an older fixture.
     install -m 755 "$tool_root/tests/fixtures/chat-composer-claude.sh" "$fixture/bin/claude"
@@ -410,6 +413,7 @@ prepare_fixture() {
     # Avatars come only from the seeds the forge copies into the app's cache.
     printf '#!/bin/sh\necho "curl: (7) the fixture has no network access" >&2\nexit 7\n' >"$fixture/bin/curl"
     chmod 755 "$fixture/bin/curl"
+    install_codex_peer
     if [ ! -e "$fixture/project/.git" ]; then
         (
             export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
@@ -418,6 +422,20 @@ prepare_fixture() {
                 commit --quiet --allow-empty --message 'Fixture project'
         )
     fi
+}
+
+# Codex is installed only for a session started with --codex, as that peer:
+# a codex on PATH is what makes the app list Codex as installed.
+install_codex_peer() {
+    local peer peers=$fixture/libexec/codex
+    peer=$(cat -- "$state/codex" 2>/dev/null) || peer=
+    rm -rf -- "$peers" "$fixture/bin/codex"
+    [ -n "$peer" ] || return 0
+    mkdir -p -- "$peers" "$fixture/home/.codex"
+    # The peers load their transport from beside them.
+    install -m 644 -t "$peers" -- "$tool_root"/tests/fixtures/{terminal-escape-codex,codex-tool-rows,codex-child-errors}.py
+    printf '%s\n' "$peer" >"$peers/peer"
+    install -m 755 "$tool_root/tests/fixtures/fixture-codex.sh" "$fixture/bin/codex"
 }
 
 # The fixture's runtime directory and HOME are the proof of ownership: nothing else
@@ -752,19 +770,21 @@ run_app() {
     return "$status"
 }
 
-# Observe the explicit machine format; display text is not a window contract.
+# Query the isolated compositor, which represents a closed window as [].
 app_window_is_open() {
     local observed
-    observed=$(timeout -k 1 10 niri-harness --no-heal --session "$session_name" --json observe --no-text 2>/dev/null) || return 2
+    observed=$(timeout -k 1 10 niri msg --json windows 2>/dev/null) || return 2
     /usr/bin/python3 -c 'import json,sys
 try:
-    state=json.load(sys.stdin)
-    if not isinstance(state,dict) or "window" not in state:
+    windows=json.load(sys.stdin)
+    if not isinstance(windows,list):
         sys.exit(2)
-    window=state["window"]
-    if window is None:
-        sys.exit(1)
-    sys.exit(0 if isinstance(window,dict) and window else 2)
+    for window in windows:
+        if not isinstance(window,dict) or "app_id" not in window:
+            sys.exit(2)
+        if window["app_id"] is not None and not isinstance(window["app_id"],str):
+            sys.exit(2)
+    sys.exit(0 if any(window["app_id"] == "dev.cagents.Cagents.Development" for window in windows) else 1)
 except (ValueError,AttributeError):
     sys.exit(2)
 ' <<<"$observed"
@@ -824,7 +844,7 @@ cmd_relaunch() {
 }
 
 cmd_start() {
-    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal=
+    local side=${1:-} width=1500 height=900 keep_state=false wait_lock=1800 limit=2700 portal= codex=
     require_side "$side"
     shift
     while [ "$#" -gt 0 ]; do
@@ -835,6 +855,7 @@ cmd_start() {
             --wait-lock) wait_lock=${2:?--wait-lock needs seconds}; shift 2 ;;
             --limit) limit=${2:?--limit needs seconds}; shift 2 ;;
             --portal) portal=${2:?--portal needs a backend: gtk, kde, gnome or cosmic}; shift 2 ;;
+            --codex) codex=${2:?--codex needs a peer: tool-rows, child-errors or terminal-escape}; shift 2 ;;
             *) die "unknown start option: $1" 2 ;;
         esac
     done
@@ -842,6 +863,8 @@ cmd_start() {
         die 'width and height must be positive pixels; lock wait and session limit must be whole numbers' 2
     [[ -z $portal || $portal =~ ^(gtk|kde|gnome|cosmic)$ ]] ||
         die "unknown portal backend: $portal; use gtk, kde, gnome or cosmic" 2
+    [[ -z $codex || $codex =~ ^(tool-rows|child-errors|terminal-escape)$ ]] ||
+        die "unknown Codex peer: $codex; use tool-rows, child-errors or terminal-escape" 2
     [[ $self =~ ^/[A-Za-z0-9._/-]+$ ]] || die "the tool's path has unsupported characters: $self" 2
     live_session && die 'a session is already running for this task; stop it first'
     if [ "$keep_state" = false ] && [ -d "$seed" ] && [ -d "$fixture" ] && ! command -v rsync >/dev/null 2>&1; then
@@ -859,6 +882,7 @@ cmd_start() {
     printf '%s\n' "$width" >"$state/width"
     printf '%s\n' "$height" >"$state/height"
     printf '%s\n' "$portal" >"$state/portal"
+    printf '%s\n' "$codex" >"$state/codex"
     printf 'waiting for the native session (lock wait up to %ss)\n' "$wait_lock"
     # The session outlives this command, so it starts in its own process session.
     setsid nohup "$self" --task "$task" __session "$side" "$width" "$keep_state" "$wait_lock" "$limit" "$$" "$height" \

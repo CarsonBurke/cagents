@@ -176,6 +176,10 @@ pub(crate) struct Resident {
     pub confirmed_session: Option<String>,
     pub background_subagents: Vec<String>,
     pub interrupt_subagents: Vec<String>,
+    /// What holds the conversation, by name. A helper that predates it
+    /// reports none; see [`Resident::work_hold`].
+    #[serde(default)]
+    work_hold: Option<chat::WorkHold>,
     pub account_reports: Vec<Update>,
     next_input: u64,
     acknowledged_input_count: usize,
@@ -184,6 +188,24 @@ pub(crate) struct Resident {
     pub outbox_ack: u64,
     pub outbox_latest: u64,
     changed: u64,
+}
+impl Resident {
+    /// What holds the conversation. A helper that predates names reports its
+    /// background subagents only as running ones it cannot name; it never
+    /// reports one waiting.
+    pub(crate) fn work_hold(&self) -> chat::WorkHold {
+        self.work_hold.clone().unwrap_or_else(|| chat::WorkHold {
+            turn: self.busy || self.waiting || !self.requests.is_empty(),
+            subagents: self
+                .background_subagents
+                .iter()
+                .map(|_| chat::HeldSubagent {
+                    name: String::new(),
+                    waiting: false,
+                })
+                .collect(),
+        })
+    }
 }
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct ActorInspection {
@@ -456,6 +478,7 @@ impl RemoteActor {
             confirmed_session: None,
             background_subagents: Vec::new(),
             interrupt_subagents: Vec::new(),
+            work_hold: None,
             account_reports: Vec::new(),
             next_input: 1,
             acknowledged_input_count: 0,
@@ -2686,6 +2709,7 @@ impl Server {
         let usage = state.usage.clone();
         let requests = state.requests.clone();
         let sampled_activity = state.activity();
+        let work_hold = state.work_hold();
         let prompt_eligible =
             super::super::accepts_prompt(&state) && !self.actor.0.draining.load(Ordering::Acquire);
         use crate::notifications::Kind;
@@ -2775,6 +2799,7 @@ impl Server {
             confirmed_session,
             background_subagents,
             interrupt_subagents,
+            work_hold: Some(work_hold),
             account_reports,
             next_input: journal.next_input()?,
             acknowledged_input_count: journal.acknowledged_input_count(),
@@ -5413,6 +5438,27 @@ exec /bin/sleep 60
         let before = next.prompt_revision;
         notify(Update::Presentation);
         assert_eq!(fixture.server.resident().unwrap().prompt_revision, before);
+    }
+    #[test]
+    fn a_helper_that_predates_named_holds_still_reports_its_background_work() {
+        let mut resident = serde_json::to_value(RemoteActor::fixture().state().as_ref()).unwrap();
+        let fields = resident.as_object_mut().unwrap();
+        assert!(fields.remove("work_hold").is_some());
+        fields.insert("background_subagents".into(), json!(["toolu_old"]));
+        let older: Resident = serde_json::from_value(resident).unwrap();
+        let hold = older.work_hold();
+        assert!(!hold.turn);
+        assert_eq!(
+            hold.subagents,
+            [chat::HeldSubagent {
+                name: String::new(),
+                waiting: false
+            }]
+        );
+        assert_eq!(
+            hold.subagents().detail(),
+            "1 background subagent is still running."
+        );
     }
     #[test]
     fn protocol_one_attachment_is_refused_without_starting_or_retiring_its_owner() {

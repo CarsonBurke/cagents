@@ -1375,6 +1375,7 @@ impl Runtime {
     pub(super) fn native_child_status(agent: &chat::Subagent) -> &'static str {
         match agent.status {
             chat::ToolStatus::Running if agent.waiting => "Waiting",
+            chat::ToolStatus::Waiting => "Waiting on background work",
             chat::ToolStatus::Running => "Working",
             chat::ToolStatus::Succeeded => "Finished",
             chat::ToolStatus::Failed => "Failed",
@@ -1463,6 +1464,11 @@ impl Runtime {
             .iter()
             .filter(|child| child.status == chat::ToolStatus::Running && child.waiting)
             .count();
+        let on_background_work = snapshot
+            .subagents
+            .iter()
+            .filter(|child| child.status == chat::ToolStatus::Waiting)
+            .count();
         let failed = snapshot
             .subagents
             .iter()
@@ -1505,12 +1511,13 @@ impl Runtime {
         } else if snapshot.busy
             || snapshot.waiting
             || !snapshot.requests.is_empty()
-            || (working == 0 && waiting == 0)
+            || (working == 0 && waiting == 0 && on_background_work == 0)
         {
             parts.push(Self::short_description(label, 72));
         }
         if failure_label.is_some()
             || snapshot.subagents.len() > 1
+            || on_background_work > 0
             || ((snapshot.waiting || !snapshot.requests.is_empty()) && working > 0)
         {
             let subagents = |count: usize| {
@@ -1526,6 +1533,12 @@ impl Runtime {
             if waiting > 0 {
                 parts.push(format!("{} waiting", subagents(waiting)));
             }
+            if on_background_work > 0 {
+                parts.push(format!(
+                    "{} waiting on background work",
+                    subagents(on_background_work)
+                ));
+            }
             if failed > 0 {
                 parts.push(format!("{} failed", subagents(failed)));
             }
@@ -1535,6 +1548,10 @@ impl Runtime {
                         Some(Icon::AgentWorking)
                     } else if failure_label.is_some() || failed > 0 {
                         Some(Icon::Warning)
+                    } else if on_background_work > 0 {
+                        // Not a finished check: a subagent's background work
+                        // goes on, though nothing is asked of the reader.
+                        None
                     } else {
                         glyph
                     },
@@ -1567,6 +1584,12 @@ impl Runtime {
             return None;
         }
         if let Some(agent) = selected {
+            if agent.status == chat::ToolStatus::Waiting {
+                return Some((
+                    Icon::AgentBackground,
+                    Self::native_child_status(agent).to_owned(),
+                ));
+            }
             return (agent.status == chat::ToolStatus::Running).then(|| {
                 if agent.waiting {
                     (Icon::AgentWaiting, "Waiting for you".to_owned())
@@ -1597,6 +1620,15 @@ impl Runtime {
                     .any(|agent| agent.waiting && agent.status == chat::ToolStatus::Running) =>
             {
                 Some((Icon::AgentWaiting, label))
+            }
+            // Nothing is asked of the reader, but the finished stamp alone
+            // would read as everything being done.
+            _ if snapshot
+                .subagents
+                .iter()
+                .any(|agent| agent.status == chat::ToolStatus::Waiting) =>
+            {
+                Some((Icon::AgentBackground, label))
             }
             _ => None,
         }
@@ -2118,8 +2150,9 @@ impl Runtime {
                 .width(Length::Fill)
                 .into();
             selected_identity = Some(
-                if agent.status == chat::ToolStatus::Running && snapshot.capabilities.stop_subagent
-                {
+                // One waiting on its own background work is still going, and
+                // stopping it is how that work ends.
+                if agent.status.is_live() && snapshot.capabilities.stop_subagent {
                     widget::row::with_children(vec![
                         heading.into(),
                         crate::ui_controls::button::quiet("Stop")
@@ -7604,6 +7637,43 @@ mod tests {
         assert_eq!(state(&runtime), None);
         Arc::make_mut(&mut runtime.snapshot).detail = "Turn failed".into();
         assert_eq!(runtime.parent_tab_state(), Some((Icon::Warning, "Failed")));
+    }
+
+    #[test]
+    fn an_agent_on_its_background_work_is_reported_without_asking_for_the_user() {
+        let (mut runtime, _handle) = frame_cost::live_runtime(&[]);
+        let mut child = native_child_fixture();
+        child.status = chat::ToolStatus::Waiting;
+        assert_eq!(
+            Runtime::native_child_status(&child),
+            "Waiting on background work"
+        );
+        let snapshot = Arc::make_mut(&mut runtime.snapshot);
+        snapshot.subagents.push(child);
+        snapshot.finished_at = Some(42);
+        let (glyph, label) = runtime.conversation_status(false);
+        assert!(
+            label.contains("1 subagent waiting on background work"),
+            "{label}"
+        );
+        assert!(!label.contains("Waiting for you"), "{label}");
+        assert!(!label.contains("Finished"), "{label}");
+        // Neither working, asking, nor done.
+        assert_eq!(glyph, None);
+        // The row outlasts the card scrolling away, and the same quiet glyph as
+        // the card says nothing is asked of the reader.
+        assert_eq!(
+            runtime.timeline_activity(false, None),
+            Some((
+                Icon::AgentBackground,
+                "1 subagent waiting on background work".into()
+            ))
+        );
+        let child = runtime.snapshot.subagents[0].clone();
+        assert_eq!(
+            runtime.timeline_activity(false, Some(&child)),
+            Some((Icon::AgentBackground, "Waiting on background work".into()))
+        );
     }
 
     #[test]

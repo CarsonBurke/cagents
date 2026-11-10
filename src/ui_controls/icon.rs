@@ -63,6 +63,7 @@ icons! {
         AddedFile => "added-file",
         Agent => "agent",
         AgentWaiting => "waiting",
+        AgentBackground => "background-work",
         AgentWorking => "working",
         Attention => "attention",
         Board => "board",
