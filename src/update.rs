@@ -1191,8 +1191,8 @@ struct ReviewContext {
 
 impl ReviewContext {
     fn capture(installation: &Installation) -> Result<Self, UpdateError> {
-        let _guard = crate::instance::UiUpdateGuard::acquire()?;
-        let windows = crate::instance::verified_running_windows()?;
+        let guard = crate::instance::UiUpdateGuard::acquire()?;
+        let windows = guard.verified_windows()?;
         let layout = locate(&std::env::current_exe()?)?;
         let from_version = installed_daemon_owner(&layout)?
             .map(|owner| owner.version)
