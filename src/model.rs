@@ -1668,6 +1668,23 @@ mod tests {
         assert_eq!(copy.shared_with(&original), 2);
     }
 
+    #[test]
+    fn shared_cards_preserve_nan_value_inequality() {
+        let mut card = titled("non-reflexive width");
+        card.width_fraction = f64::NAN;
+        let shared = Shared::new(card.clone());
+        let alias = shared.clone();
+        assert!(Shared::ptr_eq(&shared, &alias));
+        assert_ne!(shared, shared);
+        assert_ne!(shared, alias);
+
+        let cards = Cards::from([card]);
+        let copy = cards.clone();
+        assert!(copy.copied_from(&cards).is_empty());
+        assert_ne!(cards, cards);
+        assert_ne!(cards, copy);
+    }
+
     /// Moving, filtering and rearranging cards hands on the cards themselves.
     #[test]
     fn moving_cards_copies_none_of_them() {
