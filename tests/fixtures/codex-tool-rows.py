@@ -7,11 +7,15 @@ image generation, a context compaction and a turn diff, first as started and
 then, after a short pause, as completed. It exists to check how each item
 reads in the native transcript, running and settled.
 
+Set CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT=1 to acknowledge interruptions
+without completing either the interrupted turn or its delayed successful script.
+
 Requires a private CAGENTS_TOOL_ROWS_FIXTURE_ROOT and CODEX_HOME beneath it,
 and a private XDG_RUNTIME_DIR. Launch it through the ordinary development
 runner as the isolated Codex executable. It models the app-server protocol
 only: no provider, credentials, network service or tool is contacted.
 """
+import copy
 import importlib.util
 import json
 import os
@@ -91,10 +95,19 @@ class Scenario:
         self.thread, self.child = str(uuid.uuid4()), str(uuid.uuid4())
         self.latest = None
         self.child_latest = None
+        self.interrupting = set()
+        self.never_confirm_interrupt = os.environ.get("CAGENTS_TOOL_ROWS_NEVER_CONFIRM_INTERRUPT") == "1"
+
+    def latest_turn(self, thread):
+        if thread == self.thread:
+            return self.latest
+        if thread == self.child:
+            return self.child_latest
+        return None
 
     def metadata(self, thread):
         child = thread == self.child
-        latest = self.child_latest if child else self.latest
+        latest = self.latest_turn(thread)
         return {"id": thread, "name": "Child review" if child else "Offline tool rows",
                 "parentThreadId": self.thread if child else None,
                 "agentNickname": "Quinn" if child else None,
@@ -103,13 +116,73 @@ class Scenario:
 
     def observe(self, notification):
         """Publish lifecycle state only as its corresponding frame is sent."""
-        if notification.get("method") not in ("turn/started", "turn/completed"):
+        method = notification.get("method")
+        if method not in ("turn/started", "turn/completed", "item/started", "item/completed"):
             return
         params = notification["params"]
-        if params["threadId"] == self.thread:
-            self.latest = params["turn"]
+        if method.startswith("item/"):
+            latest = self.latest_turn(params["threadId"])
+            if latest and latest["id"] == params["turnId"]:
+                latest["items"] = [item for item in latest["items"]
+                                   if item["id"] != params["item"]["id"]] + [copy.deepcopy(params["item"])]
+        elif params["threadId"] == self.thread:
+            self.latest = copy.deepcopy(params["turn"])
         elif params["threadId"] == self.child:
-            self.child_latest = params["turn"]
+            self.child_latest = copy.deepcopy(params["turn"])
+
+    def publish(self, frame, origin=None):
+        """Discard superseded scripted frames before changing state or sending."""
+        if "method" not in frame:
+            return frame
+        if origin is not None and self.latest["id"] != origin:
+            return None
+        params = frame.get("params", {})
+        thread = params.get("threadId")
+        latest = self.latest_turn(thread)
+        turn = params.get("turn", {}).get("id", params.get("turnId"))
+        interrupted_receipt = (frame["method"] == "turn/completed"
+                               and params["turn"]["status"] == "interrupted")
+        if turn is not None and (not latest or latest["id"] != turn
+                                 or (thread, turn) in self.interrupting and not interrupted_receipt):
+            return None
+        if frame["method"] == "thread/status/changed" and latest:
+            if (origin is not None and (thread, latest["id"]) in self.interrupting
+                    or params["status"]["type"] == "idle" and latest["status"] == "inProgress"):
+                return None
+        frame = copy.deepcopy(frame)
+        # Parent collaboration snapshots must not overwrite a child's exact
+        # interruption receipt, or claim that an unconfirmed interrupt ended it.
+        if self.child_latest and (self.child, self.child_latest["id"]) in self.interrupting:
+            params = frame["params"]
+            recorded = ([params["item"]] if "item" in params else
+                        params.get("turn", {}).get("items", []))
+            for item in recorded:
+                child = item.get("agentsStates", {}).get(self.child)
+                if child is not None:
+                    child["status"] = ("running" if self.child_latest["status"] == "inProgress"
+                                       else self.child_latest["status"])
+        self.observe(frame)
+        return frame
+
+    def interrupt(self, params):
+        thread, turn = params.get("threadId"), params.get("turnId")
+        latest = self.latest_turn(thread)
+        if not latest or latest["id"] != turn or latest["status"] != "inProgress":
+            return None
+        # Codex background children own separate turns: interrupting the
+        # parent does not interrupt them, and they still finish their script.
+        self.interrupting.add((thread, turn))
+        if self.never_confirm_interrupt:
+            return []
+        partial = copy.deepcopy(latest)
+        partial["status"] = "interrupted"
+        for item in partial["items"]:
+            if item.get("status") == "inProgress":
+                item["status"] = "interrupted"
+        return [
+            {"method": "turn/completed", "params": {"threadId": thread, "turn": partial}},
+            {"method": "thread/status/changed", "params": {"threadId": thread, "status": {"type": "idle"}}},
+        ]
 
     def notifications(self, turn):
         def notify(method, **params):
@@ -177,16 +250,37 @@ class Scenario:
         elif method == "turn/start":
             if params.get("threadId") != self.thread:
                 return [{"id": identifier, "error": {"code": -32602, "message": "Prompt the fixture thread"}}]
+            if any(latest and latest["status"] == "inProgress"
+                   for latest in (self.latest, self.child_latest)):
+                return [{"id": identifier, "error": {"code": -32602, "message": "A fixture turn is already active"}}]
+            self.interrupting.clear()
             turn = str(uuid.uuid4())
             result = {"turn": {"id": turn, "status": "inProgress", "items": []}}
             self.latest = result["turn"]
             self.child_latest = {"id": f"{turn}-child", "status": "inProgress", "items": []}
             after = self.notifications(turn)
-        elif method in ("thread/unsubscribe", "turn/interrupt"):
+        elif method == "turn/interrupt":
+            after = self.interrupt(params)
+            if after is None:
+                return [{"id": identifier, "error": {"code": -32602, "message": "No matching active fixture turn"}}]
+            result = {}
+        elif method == "thread/unsubscribe":
             result = {}
         else:
             return [{"id": identifier, "error": {"code": -32601, "message": "Unsupported offline fixture method"}}]
         return [{"id": identifier, "result": result}, *after]
+
+
+def play(responses, scenario, request_lock, send, origin=None, pause=time.sleep):
+    """Deliver one script, with interruption and publication serialized."""
+    for response in responses:
+        if "_sleep" in response:
+            pause(response["_sleep"])
+            continue
+        with request_lock:
+            published = scenario.publish(response, origin)
+            if published is not None:
+                send(published)
 
 
 def serve(connection, codex_home, scenario, request_lock):
@@ -201,25 +295,24 @@ def serve(connection, codex_home, scenario, request_lock):
         key + b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11").digest())
     connection.sendall(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: " + accept + b"\r\n\r\n")
     send = threading.Lock()
+
+    def send_response(response):
+        with send:
+            connection.sendall(transport.frame(response))
+
     while True:
         request = transport.receive(connection, lambda payload: connection.sendall(transport.frame(payload, opcode=10)))
         with request_lock:
             responses = scenario.request(request, codex_home)
+        origin = (responses[0]["result"]["turn"]["id"]
+                  if request.get("method") == "turn/start" and "result" in responses[0] else None)
         # A turn's later frames follow its pause on their own thread, so the
         # client's requests in the meantime are still answered.
-        def play(responses=responses):
-            for response in responses:
-                if "_sleep" in response:
-                    time.sleep(response["_sleep"])
-                    continue
-                with request_lock:
-                    scenario.observe(response)
-                with send:
-                    connection.sendall(transport.frame(response))
+        arguments = (responses, scenario, request_lock, send_response, origin)
         if any("_sleep" in response for response in responses):
-            threading.Thread(target=play, daemon=True).start()
+            threading.Thread(target=play, args=arguments, daemon=True).start()
         else:
-            play()
+            play(*arguments)
 
 
 def main():

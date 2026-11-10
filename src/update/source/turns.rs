@@ -80,7 +80,18 @@ impl From<Snapshot> for TurnActivity {
 
 impl TurnActivity {
     fn review(&self, item: &mut impact::SessionImpact) {
-        if self.parent_finished && !self.background.is_empty() {
+        if item.disposition == impact::Disposition::Interrupted {
+            // Codex parent interruption spares background children. Disclose
+            // their exact IDs in this review before the updater can stop them
+            // individually to settle the conversation for a legacy prepare.
+            item.interrupted_subagents = self.background.clone();
+            if !self.background.is_empty() {
+                item.reason = format!(
+                    "The active turn and {} running background subagent(s) will stop; background work will not resume automatically.",
+                    self.background.len()
+                );
+            }
+        } else if self.parent_finished && !self.background.is_empty() {
             item.disposition = impact::Disposition::Blocked;
             item.reason = "Its turn finished, but background agents are still running. Review stopping them to continue the update.".into();
             item.interrupted_subagents = self.background.clone();
@@ -101,10 +112,13 @@ impl TurnReview {
             .sessions
             .iter()
             .filter(|item| {
-                daemon.policy == impact::Policy::WhenIdle
-                    && daemon.capability.background_subagents > 0
+                daemon.capability.background_subagents > 0
                     && item.kind == impact::SessionKind::NativeChat
-                    && item.disposition == impact::Disposition::WaitsForIdle
+                    && matches!(
+                        (daemon.policy, item.disposition),
+                        (impact::Policy::WhenIdle, impact::Disposition::WaitsForIdle)
+                            | (impact::Policy::Interrupt, impact::Disposition::Interrupted)
+                    )
             })
             .map(|item| (item.id, item.identity.clone()))
             .collect();
@@ -287,6 +301,23 @@ mod tests {
         .review(&mut impact);
         assert_eq!(impact.disposition, impact::Disposition::WaitsForIdle);
         assert!(impact.interrupted_subagents.is_empty());
+    }
+
+    #[test]
+    fn interruption_review_discloses_codex_children_that_parent_interrupt_spares() {
+        let mut impact = item();
+        impact.disposition = impact::Disposition::Interrupted;
+        TurnActivity::from(Snapshot {
+            ready: true,
+            busy: true,
+            subagents: vec![child(ToolStatus::Running)],
+            ..Default::default()
+        })
+        .review(&mut impact);
+        assert_eq!(impact.disposition, impact::Disposition::Interrupted);
+        assert_eq!(impact.interrupted_subagents, ["background-child"]);
+        assert!(impact.reason.contains("background work will not resume"));
+        assert_eq!(impact.identity, "exact-source-owner");
     }
 
     #[test]

@@ -226,6 +226,13 @@ trait FloorSource {
         service: bool,
     ) -> Result<Inventory, UpdateError>;
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), UpdateError>;
+    fn begin_interrupts(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+        deadline: Instant,
+    ) -> Result<(), UpdateError>;
+    fn pending_interrupts(&mut self) -> Result<Vec<TerminalId>, UpdateError>;
+    fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError>;
     fn close_chat(
         &mut self,
         daemon: &impact::DaemonImpact,
@@ -293,6 +300,8 @@ struct NativeSource<'a, O> {
     survivors: &'a mut Survivors,
     reviewed: &'a impact::Preview,
     guard: &'a crate::instance::UiUpdateGuard,
+    interrupts: Option<source::Interrupts>,
+    interrupt_reviewed: Option<impact::DaemonImpact>,
 }
 
 impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSource
@@ -343,9 +352,43 @@ impl<O: FnMut(impact::Policy) -> Result<impact::Preview, UpdateError>> FloorSour
         })
     }
     fn prepare(&mut self, daemon: &impact::DaemonImpact) -> Result<(), UpdateError> {
-        source_client_for(daemon)?.prepare_confirmed_upgrade(daemon.clone(), false)?;
+        let mut client = source_client_for(daemon)?;
+        client.prepare_confirmed_upgrade(daemon.clone(), false)?;
         self.survivors.record_prepared(self.reviewed, daemon);
+        if let Some(interrupted) = &self.interrupt_reviewed {
+            self.survivors.record_prepared(self.reviewed, interrupted);
+        }
         Ok(())
+    }
+    fn begin_interrupts(
+        &mut self,
+        daemon: &impact::DaemonImpact,
+        deadline: Instant,
+    ) -> Result<(), UpdateError> {
+        self.survivors
+            .record_interrupt_requests(self.reviewed, daemon);
+        self.interrupt_reviewed = Some(daemon.clone());
+        self.interrupts = Some(source::Interrupts::begin(daemon, deadline)?);
+        Ok(())
+    }
+    fn pending_interrupts(&mut self) -> Result<Vec<TerminalId>, UpdateError> {
+        let interrupts = self
+            .interrupts
+            .as_mut()
+            .ok_or_else(|| invalid("The update has not requested these interruptions"))?;
+        let pending = interrupts.poll()?;
+        if let Some(reviewed) = &self.interrupt_reviewed {
+            self.survivors
+                .record_settled_interruptions(self.reviewed, reviewed, &pending);
+        }
+        self.survivors.late_turns.extend(interrupts.late_turns());
+        Ok(pending)
+    }
+    fn interrupt_impact(&self) -> Result<impact::DaemonImpact, UpdateError> {
+        self.interrupts
+            .as_ref()
+            .map(|interrupts| interrupts.current_impact().clone())
+            .ok_or_else(|| invalid("The update has not observed interruption settlement"))
     }
     fn close_chat(
         &mut self,
@@ -506,6 +549,8 @@ pub(super) fn quiesce(
         survivors,
         reviewed: confirmed,
         guard,
+        interrupts: None,
+        interrupt_reviewed: None,
     };
     quiesce_source(state, job, confirmed, terminal, &mut source)
 }
@@ -633,6 +678,10 @@ fn quiesce_inner(
             source.observe_policy(policy)
         })?;
     }
+    // Interrupted is a consented outcome, not a provider receipt. Old sources
+    // prepare their checkpoint before attempting interruption during shutdown;
+    // settle it while they can still serve, before crossing that boundary.
+    preview = settle_interrupts(state, job, preview, source, Duration::from_secs(30))?;
     let daemon = preview
         .daemon
         .as_ref()
@@ -840,12 +889,133 @@ fn quiesce_inner(
             .daemon
             .as_ref()
             .ok_or_else(|| invalid("The source disappeared after ending conversations"))?;
+        if daemon
+            .sessions
+            .iter()
+            .any(|item| item.disposition == impact::Disposition::Interrupted)
+        {
+            return Err(invalid(
+                "A conversation started working again; review the update before preparing it",
+            ));
+        }
         // No prompt or new destructive scope is permitted after the first end.
         if completed.is_empty() {
             confirmation::prepared(state, job)?;
         }
         source.prepare(daemon)?;
         return source.stopped(state, job, false);
+    }
+}
+
+fn settle_interrupts(
+    state: &Path,
+    job: &mut UpdateJob,
+    preview: impact::Preview,
+    source: &mut impl FloorSource,
+    timeout: Duration,
+) -> Result<impact::Preview, UpdateError> {
+    let Some(daemon) = preview.daemon.as_ref() else {
+        return Ok(preview);
+    };
+    let interrupted: BTreeMap<_, _> = daemon
+        .sessions
+        .iter()
+        .filter(|item| item.disposition == impact::Disposition::Interrupted)
+        .map(|item| {
+            let label = preview.labels.names.get(&item.id).unwrap_or(&item.title);
+            (item.id, label.clone())
+        })
+        .collect();
+    if interrupted.is_empty() {
+        return Ok(preview);
+    }
+    confirmation::check_cancelled(state, job)?;
+    let deadline = Instant::now() + timeout;
+    let timeout_error = |pending: &[TerminalId]| {
+        let names: Vec<_> = if pending.is_empty() {
+            interrupted.values().map(String::as_str).collect()
+        } else {
+            pending
+                .iter()
+                .filter_map(|id| interrupted.get(id).map(String::as_str))
+                .collect()
+        };
+        invalid(format!(
+            "{} did not stop in time; nothing was changed in the installation. The source daemon and panes are still running.",
+            names.join(", ")
+        ))
+    };
+    let mut pending: Vec<_> = interrupted.keys().copied().collect();
+    set_phase(
+        state,
+        job,
+        UpdatePhase::ClosingWindows,
+        "Waiting for the confirmed interruptions before preparing the update",
+    )?;
+    eprintln!(
+        "Waiting for these conversations to stop: {}",
+        interrupted.values().cloned().collect::<Vec<_>>().join(", ")
+    );
+    if let Err(error) = source.begin_interrupts(daemon, deadline) {
+        return Err(if Instant::now() >= deadline {
+            timeout_error(&pending)
+        } else {
+            error
+        });
+    }
+    loop {
+        confirmation::check_cancelled(state, job)?;
+        if Instant::now() >= deadline {
+            return Err(timeout_error(&pending));
+        }
+        pending = match source.pending_interrupts() {
+            Ok(pending) => pending,
+            Err(error) => {
+                return Err(if Instant::now() >= deadline {
+                    timeout_error(&pending)
+                } else {
+                    error
+                });
+            }
+        };
+        confirmation::check_cancelled(state, job)?;
+        if Instant::now() >= deadline {
+            return Err(timeout_error(&pending));
+        }
+        if pending.is_empty() {
+            // The interrupt observer obtains this final idle capability with
+            // the same deadline. An independent observation here could extend
+            // the bound or allow Interrupt preparation of newly busy work.
+            let mut current = preview.clone();
+            current.daemon = Some(source.interrupt_impact()?);
+            let mut expected = preview.clone();
+            let idle = expected.daemon.as_mut().unwrap();
+            idle.policy = impact::Policy::WhenIdle;
+            for item in &mut idle.sessions {
+                if interrupted.contains_key(&item.id) {
+                    item.disposition = impact::Disposition::Resumes;
+                }
+            }
+            confirmation::check_cancelled(state, job)?;
+            if !expected.preserves_consent(&current)
+                || current.daemon.as_ref().is_none_or(|daemon| {
+                    !daemon.ready()
+                        || daemon.policy != impact::Policy::WhenIdle
+                        || daemon.sessions.iter().any(|item| {
+                            interrupted.contains_key(&item.id)
+                                && item.disposition == impact::Disposition::Interrupted
+                        })
+                })
+            {
+                return Err(invalid(
+                    "Conversations changed while stopping their turns; review the update again. The source daemon is still running.",
+                ));
+            }
+            return Ok(current);
+        }
+        thread::sleep(
+            Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now())),
+        );
     }
 }
 
@@ -910,6 +1080,8 @@ pub(super) struct Survivors {
     service_stopped: bool,
     source_prepared: bool,
     interrupted: BTreeMap<(impact::SessionKind, TerminalId), InterruptedTurn>,
+    unconfirmed_interrupts: BTreeMap<(impact::SessionKind, TerminalId), String>,
+    late_turns: BTreeSet<TerminalId>,
     background_tasks: u64,
     processes: BTreeMap<(i32, u64), Survivor>,
     labels: BTreeMap<TerminalId, String>,
@@ -926,15 +1098,44 @@ struct InterruptedTurn {
 }
 
 impl Survivors {
+    fn record_interrupt_requests(
+        &mut self,
+        reviewed: &impact::Preview,
+        daemon: &impact::DaemonImpact,
+    ) {
+        for session in &daemon.sessions {
+            if session.disposition == impact::Disposition::Interrupted {
+                self.unconfirmed_interrupts.insert(
+                    (session.kind, session.id),
+                    reviewed
+                        .labels
+                        .names
+                        .get(&session.id)
+                        .unwrap_or(&session.title)
+                        .clone(),
+                );
+            }
+        }
+    }
     /// Call only after the source accepts preparation. An interrupted turn is
     /// different from a whole chat ended by the floor, so retain that scope in
     /// its report rather than describing the conversation itself as stopped.
     fn record_prepared(&mut self, reviewed: &impact::Preview, daemon: &impact::DaemonImpact) {
         self.source_prepared = true;
+        self.record_settled_interruptions(reviewed, daemon, &[]);
+    }
+
+    fn record_settled_interruptions(
+        &mut self,
+        reviewed: &impact::Preview,
+        daemon: &impact::DaemonImpact,
+        pending: &[TerminalId],
+    ) {
         for session in &daemon.sessions {
             let key = (session.kind, session.id);
             if session.disposition != impact::Disposition::Interrupted
                 || self.ended.contains_key(&key)
+                || pending.contains(&session.id)
             {
                 continue;
             }
@@ -944,6 +1145,7 @@ impl Survivors {
                 .get(&session.id)
                 .unwrap_or(&session.title)
                 .clone();
+            self.unconfirmed_interrupts.remove(&key);
             let recovery = reviewed
                 .stopped
                 .iter()
@@ -969,18 +1171,39 @@ impl Survivors {
             .filter(|(key, _)| !self.ended.contains_key(*key))
             .map(|(_, turn)| turn)
             .collect();
-        if turns.is_empty() {
+        if turns.is_empty() && self.unconfirmed_interrupts.is_empty() {
             return String::new();
         }
-        let mut report = String::from("\nCurrent turns interrupted:\n");
+        let mut report = String::new();
+        if !turns.is_empty() {
+            report.push_str("\nCurrent turns interrupted:\n");
+        }
         for turn in &turns {
             report.push_str(&format!(
                 "  {}: current turn interrupted; {}\n",
                 turn.label, turn.recovery
             ));
         }
+        for ((_, id), turn) in &self.interrupted {
+            if self.late_turns.contains(id) {
+                report.push_str(&format!(
+                    "  {}: also stopped a turn that started during review\n",
+                    turn.label
+                ));
+            }
+        }
         let background_tasks: usize = turns.iter().map(|turn| turn.background_tasks.len()).sum();
         report.push_str(&background_recovery(background_tasks as u64));
+        if !self.unconfirmed_interrupts.is_empty() {
+            report.push_str("\nInterruption was not confirmed:\n");
+            for (key, label) in &self.unconfirmed_interrupts {
+                if !self.ended.contains_key(key) {
+                    report.push_str(&format!(
+                        "  {label}: check its current turn in the running daemon\n"
+                    ));
+                }
+            }
+        }
         report
     }
 

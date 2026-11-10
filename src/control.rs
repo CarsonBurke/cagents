@@ -1067,21 +1067,35 @@ impl ControlClient {
         &mut self,
         session: crate::chat::Session,
     ) -> Result<crate::chat::Snapshot, ControlError> {
+        self.observe_update_chat_until(session, Instant::now() + IO_TIMEOUT)
+    }
+
+    pub(crate) fn observe_update_chat_until(
+        &mut self,
+        session: crate::chat::Session,
+        deadline: Instant,
+    ) -> Result<crate::chat::Snapshot, ControlError> {
         let id = session.id;
         self.attached_chats.insert(id);
-        let snapshot = match self.request_strict(ClientRequest::ChatAttach {
-            session: session.clone(),
-        })? {
+        let snapshot = match self.request_with_deadline(
+            ClientRequest::ChatAttach {
+                session: session.clone(),
+            },
+            deadline,
+        )? {
             ServerResponse::ChatAttached {
                 session: attached,
                 snapshot,
             } if attached == session => snapshot,
             response => return Err(unexpected_response("the observed chat's owner", &response)),
         };
-        match self.request_strict(ClientRequest::ChatVisibility {
-            chat_id: id,
-            visible: true,
-        })? {
+        match self.request_with_deadline(
+            ClientRequest::ChatVisibility {
+                chat_id: id,
+                visible: true,
+            },
+            deadline,
+        )? {
             ServerResponse::Accepted => Ok(snapshot),
             response => Err(unexpected_response("chat observation admission", &response)),
         }
@@ -1092,10 +1106,22 @@ impl ControlClient {
         chat_id: TerminalId,
         generation: u64,
     ) -> Result<Option<crate::chat::Snapshot>, ControlError> {
-        match self.request_strict(ClientRequest::ChatRead {
-            chat_id,
-            after_generation: Some(generation),
-        })? {
+        self.read_update_chat_until(chat_id, generation, Instant::now() + IO_TIMEOUT)
+    }
+
+    pub(crate) fn read_update_chat_until(
+        &mut self,
+        chat_id: TerminalId,
+        generation: u64,
+        deadline: Instant,
+    ) -> Result<Option<crate::chat::Snapshot>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatRead {
+                chat_id,
+                after_generation: Some(generation),
+            },
+            deadline,
+        )? {
             ServerResponse::ChatSnapshot {
                 chat_id: actual,
                 snapshot,
@@ -1117,6 +1143,36 @@ impl ControlClient {
                 &response,
             )),
         }
+    }
+
+    /// The update-only source boundary uses only these qualified, non-launching
+    /// operations. Every request shares its caller's absolute quiescence budget.
+    pub(crate) fn update_quiescence_request(
+        &mut self,
+        request: ClientRequest,
+        deadline: Instant,
+    ) -> Result<ServerResponse, ControlError> {
+        if !matches!(
+            &request,
+            ClientRequest::ChatList
+                | ClientRequest::UpgradeImpact { .. }
+                | ClientRequest::ChatCommand {
+                    command: crate::chat::Command::Interrupt
+                        | crate::chat::Command::StopSubagent { .. },
+                    ..
+                }
+                | ClientRequest::Agent {
+                    operation: crate::agent_execution::Operation::Directory(
+                        crate::agent_execution::directory::Scope::All
+                    ),
+                    ..
+                }
+        ) {
+            return Err(ControlError::Configure(io::Error::other(
+                "Unqualified update quiescence operation",
+            )));
+        }
+        self.request_with_deadline(request, deadline)
     }
 
     /// Capture a listed chat's transcript immediately before acting on it.

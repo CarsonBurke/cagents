@@ -1,8 +1,10 @@
 //! Upgrade-only access to an authenticated source daemon. Ordinary application
 //! clients continue to require a fully matched protocol.
+mod interrupts;
 mod turns;
 mod v77;
 
+pub(super) use interrupts::Interrupts;
 pub(super) use turns::TurnReview;
 
 use super::{UpdateError, impact, invalid};
@@ -116,7 +118,10 @@ impl Client {
                 "Cross-version application upgrades require the local source daemon",
             )));
         }
-        let deadline = Instant::now() + Duration::from_secs(5);
+        Self::connect_until(socket, Instant::now() + Duration::from_secs(5))
+    }
+
+    fn connect_until(socket: &Path, deadline: Instant) -> Result<Self, ControlError> {
         // The source may answer a newer Connect with an old error DTO. Read
         // only its bounded version header before choosing a decoder. Discovery
         // authorizes nothing: the selected client authenticates its own fresh
@@ -386,8 +391,9 @@ impl InstalledIdentity {
 }
 
 /// Frozen lifecycle and inspector contract, using the wire variant names.
-/// Only these outer variants are compared; every reachable payload type (including
-/// errors and historical unsolicited chat traffic) must match in full.
+/// Named variants define each qualified operation; unselected commands grant
+/// no source authority. Remaining reachable payloads, including errors and
+/// historical unsolicited chat traffic, must match in full.
 /// ShutdownV1 includes preflight, stop and confirmed shutdown; List/BuildInfo
 /// include status reads. Current-only ChatLimit cannot arrive from historical
 /// sources; the full current-wire recording test covers that message.
@@ -400,6 +406,8 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "Connect",
             "List",
             "ChatList",
+            "ChatCommand",
+            "Agent",
             "ChatStart",
             "ChatAttach",
             "ChatVisibility",
@@ -437,8 +445,12 @@ pub(crate) const LIFECYCLE_VARIANTS: &[(&str, &[&str])] = &[
             "upgrade_impact",
             "upgrade_prepared",
             "build_info",
+            "agent",
         ],
     ),
+    ("cagents::chat::Command", &["Interrupt", "StopSubagent"]),
+    ("cagents::agent_execution::Operation", &["Directory"]),
+    ("cagents::agent_execution::Reply", &["Directory"]),
     (
         "ServerMessage",
         &[

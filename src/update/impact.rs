@@ -124,6 +124,9 @@ impl DaemonImpact {
                         && (previous.disposition == current.disposition
                             || (self.policy == Policy::WhenIdle
                                 && previous.disposition == Disposition::WaitsForIdle
+                                && current.disposition == Disposition::Resumes)
+                            || (self.policy == Policy::Interrupt
+                                && previous.disposition == Disposition::Interrupted
                                 && current.disposition == Disposition::Resumes))
                 })
             })
@@ -207,6 +210,22 @@ mod tests {
             .interrupted_subagents
             .push("third".into());
         assert!(!confirmed.preserves_consent(&current));
+    }
+
+    #[test]
+    fn interruption_consent_survives_settlement_only_for_the_same_conversation() {
+        let mut confirmed = waiting();
+        confirmed.policy = Policy::Interrupt;
+        confirmed.sessions[0].disposition = Disposition::Interrupted;
+        let mut settled = confirmed.clone();
+        settled.sessions[0].disposition = Disposition::Resumes;
+        assert!(confirmed.preserves_consent(&settled));
+        assert!(
+            !settled.preserves_consent(&confirmed),
+            "a new turn needs consent"
+        );
+        settled.sessions[0].identity.push_str(" replacement owner");
+        assert!(!confirmed.preserves_consent(&settled));
     }
 
     #[test]
