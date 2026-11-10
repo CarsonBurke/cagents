@@ -346,6 +346,18 @@ controls. Structural changes, inconsistent local placement and derived worktree
 membership retain full reconciliation; this stage does not remove all global
 projection work.
 
+Canonical rows, settled projection baselines and edit acknowledgments update
+immediately. For a settled presentation change, the window delays capturing
+its local saved snapshot until the existing autosave debounce expires: 250 ms
+after the latest change, capped at one second after the first. It retains only
+the original change times and registry, workspace and writer identities until
+then. The writer receives those times with the snapshot, so capture does not
+start another debounce. Only an accepted queue offer clears this save debt.
+Ordinary saves absorb it; flushes, ownership transitions, navigation and shutdown
+materialize it before their barriers. Ordered identity checkpoints and uncertain
+projections keep their immediate snapshot path. This does not change window-store
+ownership or move drafts out of the workspace snapshot; those remain stage 5.
+
 Current windows publish through `ApplyWorkspaceEdit`, whose `WorkspaceEdit`
 reply carries an `EditReceipt` rather than the model. A revision conflict reads
 only the source scope before retrying with the original operation identity and
