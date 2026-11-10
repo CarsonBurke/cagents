@@ -21694,11 +21694,11 @@ mod tests {
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
     }
 
-    /// Starting over is a start, not a reopen, and says so when it fails. A
-    /// conversation that turns out never to have been named opens as a draft,
-    /// with nothing left to reopen, so its failure notice goes too.
+    /// Starting over is a start, not a reopen, and says so when it fails.
+    /// Its cleared ownership also lets a later window open it as a draft
+    /// without asking the daemon to restore a conversation that never began.
     #[test]
-    fn a_fresh_start_reports_a_start_and_a_draft_withdraws_the_failure() {
+    fn a_fresh_start_reports_a_start_and_restores_as_an_unstarted_draft() {
         let mut app = crate::app::tests::context_inspector_test_app(false);
         let card = live_chat(&mut app, Some(KNOWN_THREAD));
         let session = chat_runtime(&app, card).session.clone();
@@ -21726,20 +21726,62 @@ mod tests {
             Some(unavailable)
         );
 
-        // Restored later, the never-named conversation turns out to be gone.
         let Some(CardKind::Chat(unnamed)) = app.card_state(card).map(|state| state.kind.clone())
         else {
             unreachable!();
         };
+        assert!(unnamed.is_unstarted());
+        let mut restored = crate::app::tests::context_inspector_test_app(false);
+        restored.durable = app.durable.clone();
+        restored
+            .chat_ui
+            .drafts
+            .insert(card, "Keep this unsent note.".into());
+        let _ = restored.open_chat(card, unnamed.clone(), chat::Intent::Restore);
+        let runtime = chat_runtime(&restored, card);
+        assert!(runtime.is_draft());
+        assert_eq!(runtime.session, unnamed);
+        assert_eq!(runtime.composer.text().trim_end(), "Keep this unsent note.");
+        assert!(restored.chat_ui.attempt(card).is_none());
+        assert!(errors(&restored).is_empty(), "{:?}", errors(&restored));
+    }
+
+    /// Older versions could begin a provider before its first message or
+    /// confirmed name. If that actor is gone, its failure notice no longer
+    /// applies when the daemon tells the card to return to a draft.
+    #[test]
+    fn a_begun_but_unnamed_conversation_withdraws_its_failure_when_restored_as_a_draft() {
+        let mut app = crate::app::tests::context_inspector_test_app(false);
+        let card = live_chat(&mut app, None);
+        let unnamed = chat_runtime(&app, card).session.clone();
         assert_eq!(unnamed.launch.session_id, None);
+        assert!(unnamed.proof.is_some());
+        assert!(!unnamed.is_unstarted());
         app.chat_forget(card);
         app.cards.insert(card, CardRuntime::Loading);
         let _ = app.open_chat(card, unnamed, chat::Intent::Restore);
         let attempt = chat_runtime_attempt(&app, card);
-        answer_start(&mut app, attempt, Err(chat::StartFailure::fresh(gone)));
-        assert!(
-            matches!(app.cards.get(&card), Some(CardRuntime::Chat(runtime)) if runtime.is_draft())
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::retry("fixture: executable unavailable")),
         );
+        let pane = app.notice_pane_name(card).unwrap();
+        assert_eq!(errors(&app), [format!("Could not reopen {pane}.")]);
+
+        let _ = app.update(Message::RetryCard(card));
+        let attempt = chat_runtime_attempt(&app, card);
+        answer_start(
+            &mut app,
+            attempt,
+            Err(chat::StartFailure::fresh(
+                "the provider no longer has this conversation",
+            )),
+        );
+        let runtime = chat_runtime(&app, card);
+        assert!(runtime.is_draft());
+        assert!(runtime.session.is_unstarted());
+        assert!(app.chat_ui.attempt(card).is_none());
         assert!(errors(&app).is_empty(), "{:?}", errors(&app));
     }
 
@@ -23969,11 +24011,12 @@ mod tests {
         assert_ne!(session.id, moved.id);
         assert_eq!(session.launch.recipe, moved.launch.recipe);
         assert_eq!(identity(&flushed(&app)), identity(&session));
-        let handle = fixture_handle(&app, card, Some("replacement"));
+        let replacement = "33333333-4444-4aaa-8bbb-cccccccccccc";
+        let handle = fixture_handle(&app, card, Some(replacement));
         answer_start(&mut app, started, Ok(handle));
         let stored = flushed(&app);
         assert_eq!(identity(&stored), identity(&session));
-        assert_eq!(stored.launch.session_id.as_deref(), Some("replacement"));
+        assert_eq!(stored.launch.session_id.as_deref(), Some(replacement));
 
         // A resume the provider refused is offered a fresh start, which
         // drops the saved conversation on purpose.
@@ -23983,11 +24026,12 @@ mod tests {
         let attempt = app.chat_ui.attempt(card).unwrap();
         let (target, fresh) = (attempt.target, attempt.session.clone());
         assert_eq!(fresh.launch.session_id, None);
-        let handle = fixture_handle(&app, card, Some("fresh"));
+        let fresh_id = "44444444-5555-4bbb-8ccc-dddddddddddd";
+        let handle = fixture_handle(&app, card, Some(fresh_id));
         answer_start(&mut app, target, Ok(handle));
         let stored = flushed(&app);
         assert_eq!(identity(&stored), identity(&fresh));
-        assert_eq!(stored.launch.session_id.as_deref(), Some("fresh"));
+        assert_eq!(stored.launch.session_id.as_deref(), Some(fresh_id));
         // A late or repeated press, once nothing offers it, keeps it.
         let _ = app.update(Message::ChatUi(Action::StartFresh(card)));
         assert!(!app.chat_ui.attempt(card).is_some());
