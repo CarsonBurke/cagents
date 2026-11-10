@@ -251,13 +251,10 @@ Changed session ownership or impact requires another confirmation. A compatible
 replacement reopens windows while keeping the daemon and sessions alive.
 Newer matched sets already installed under the same managed installation,
 including local builds, use this same flow. Whichever window you update
-from, the newer build's own updater performs the update whenever it can carry
-the running sessions, so its checks decide what continues. When it cannot,
-such as across an incompatible protocol, an older updater (the running
-daemon's or the window's own) performs it and may refuse sessions the newer
-build would carry. Windows from builds that predate this behavior always use
-their own updater; run `cagents daemon upgrade` to start the update from the
-newer build instead. Source trees and OS packages retain their own update
+from, the newer build's own updater performs the update, so its checks decide
+what continues. Supported source protocols are wire-proven for the updater's
+lifecycle operations. If the running daemon is too old, update it to an
+intermediate build first. Source trees and OS packages retain their own update
 method; browserless builds do not download full releases.
 
 The detached updater rechecks the selected release, verifies and seals the
