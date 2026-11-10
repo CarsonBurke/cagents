@@ -1073,6 +1073,7 @@ impl Cagents {
             super::shared_views::blocked_managed_view_scopes(&model, &model.views);
         let display_index = crate::workspace_model::views::ManagedDisplayIndex::new(&model);
         let mut new_managed_panes = Vec::new();
+        let mut adopted_scopes = HashSet::new();
         for agent in &model.agents {
             // Scheduled agents stay headless until an explicit history or
             // notification action opens their exact live run.
@@ -1091,6 +1092,7 @@ impl Cagents {
                     continue;
                 }
                 if let Some(task) = self.adopt_execution_agent_display(agent, display) {
+                    adopted_scopes.insert(scope.clone());
                     if unpublished {
                         new_managed_panes.push((scope, card));
                     }
@@ -1116,7 +1118,9 @@ impl Cagents {
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
         tasks.push(match repository {
-            Some(repository) => self.reconcile_shared_views_for_repository(repository),
+            Some(repository) => {
+                self.reconcile_shared_views_for_repository(repository, &adopted_scopes)
+            }
             None => self.reconcile_shared_views(),
         });
         if changed {

@@ -1811,7 +1811,11 @@ impl Cagents {
     /// A repository load changes ownership boundaries, not registry authority.
     /// Follow pane ownership across local, baseline and canonical scopes so a
     /// discovered child root, transfer or rekeyed alias settles both ends.
-    fn repository_view_scopes(&self, repository: &Path) -> HashSet<Scope> {
+    fn repository_view_scopes(
+        &self,
+        repository: &Path,
+        additional: &HashSet<Scope>,
+    ) -> HashSet<Scope> {
         let discovery = self.discover_view_scopes();
         let projects = self
             .sidebar_model
@@ -1856,20 +1860,24 @@ impl Cagents {
                     .insert(Scope::Channel(channel.id));
             }
         }
-        let scopes_by_path = discovery
-            .scopes
-            .iter()
-            .filter_map(|scope| match scope {
-                Scope::Worktree { path, .. } => Some((path.as_path(), scope)),
-                Scope::Channel(_) => None,
-            })
-            .collect::<HashMap<_, _>>();
+        let mut scopes_by_path = HashMap::<&Path, Vec<&Scope>>::new();
+        for scope in &discovery.scopes {
+            if let Scope::Worktree { path, .. } = scope {
+                scopes_by_path
+                    .entry(path.as_path())
+                    .or_default()
+                    .push(scope);
+            }
+        }
         for (card, path) in discovery.worktree_cards {
             if card.existence.is_open()
                 && !card.kind.is_utility()
-                && let Some(scope) = scopes_by_path.get(path)
+                && let Some(scopes) = scopes_by_path.get(path)
             {
-                owners.entry(card.id).or_default().insert((*scope).clone());
+                owners
+                    .entry(card.id)
+                    .or_default()
+                    .extend(scopes.iter().map(|scope| (*scope).clone()));
             }
         }
         for (scope, panes) in &self.shared_views.baseline {
@@ -1921,15 +1929,25 @@ impl Cagents {
                 entries.insert(destination.clone());
             }
         }
-        loop {
-            let before = selected.len();
-            for scopes in owners.values() {
-                if scopes.iter().any(|scope| selected.contains(scope)) {
-                    selected.extend(scopes.iter().cloned());
-                }
+        selected.extend(additional.iter().cloned());
+        let mut cards_by_scope = HashMap::<&Scope, Vec<CardId>>::new();
+        for (id, scopes) in &owners {
+            for scope in scopes {
+                cards_by_scope.entry(scope).or_default().push(*id);
             }
-            if selected.len() == before {
-                break;
+        }
+        let mut queued = selected.iter().cloned().collect::<VecDeque<_>>();
+        let mut visited = HashSet::new();
+        while let Some(scope) = queued.pop_front() {
+            for id in cards_by_scope.get(&scope).into_iter().flatten() {
+                if !visited.insert(*id) {
+                    continue;
+                }
+                for owner in &owners[id] {
+                    if selected.insert(owner.clone()) {
+                        queued.push_back(owner.clone());
+                    }
+                }
             }
         }
         selected
@@ -1942,16 +1960,21 @@ impl Cagents {
     pub(super) fn reconcile_shared_views_for_repository(
         &mut self,
         repository: &Path,
+        adopted: &HashSet<Scope>,
     ) -> Task<Message> {
-        self.reconcile_shared_views_in(Some(repository))
+        self.reconcile_shared_views_in(Some((repository, adopted)))
     }
 
-    fn reconcile_shared_views_in(&mut self, repository: Option<&Path>) -> Task<Message> {
+    fn reconcile_shared_views_in(
+        &mut self,
+        repository: Option<(&Path, &HashSet<Scope>)>,
+    ) -> Task<Message> {
         self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.
         self.retarget_transferred_pane_updates(None);
-        let selected = repository.map(|repository| self.repository_view_scopes(repository));
+        let selected = repository
+            .map(|(repository, adopted)| self.repository_view_scopes(repository, adopted));
         let selected = selected.as_ref();
         self.shared_views.prune_restoration_requests(&self.durable);
         self.admit_existing_views_in(selected);
@@ -4590,6 +4613,71 @@ mod tests {
         }));
         assert!(rx.try_recv().is_err());
         assert!(!app.pane_transfer_pending(pane.id));
+    }
+
+    #[test]
+    fn repository_scope_closure_keeps_all_owners_of_a_shared_path() {
+        let (mut app, source, _, pane) = channel_move_fixture();
+        let first = PathBuf::from("/repo/.git");
+        let second = PathBuf::from("/other/.git");
+        let path = PathBuf::from("/repo/shared-tree");
+        let first_project = app.durable.channels[0].project_id;
+        for (id, repository) in [
+            (first_project, first.clone()),
+            (ProjectId::new(), second.clone()),
+        ] {
+            app.sidebar_model.projects.push(SidebarProject::new(
+                id,
+                RepositoryId::new(),
+                "repo".into(),
+                repository,
+                vec![],
+                vec![],
+            ));
+        }
+        let a = Scope::Worktree {
+            repository: first,
+            path: path.clone(),
+        };
+        let b = Scope::Worktree {
+            repository: second.clone(),
+            path: path.clone(),
+        };
+        // Both scopes receive this path's members in local_views. Put `a`
+        // last to catch a path index that keeps only the last authority.
+        app.workspace_model
+            .views
+            .extend([View::empty(b.clone()), View::empty(a.clone())]);
+        app.known_worktree_roots.insert(path.clone());
+        let durable = Arc::make_mut(&mut app.durable);
+        for channel in &mut durable.channels {
+            channel.cards.retain(|id| *id != pane.id);
+        }
+        durable.card_scopes.insert(pane.id, path);
+        let selected = app.repository_view_scopes(&second, &HashSet::new());
+        assert!(selected.contains(&a));
+        assert!(selected.contains(&b));
+        assert!(selected.contains(&Scope::Channel(source)));
+    }
+
+    #[test]
+    fn repository_scope_closure_follows_adopted_scopes_and_pending_transfers() {
+        let (mut app, source, destination, pane) = channel_move_fixture();
+        app.shared_views.pending.push((
+            uuid::Uuid::new_v4(),
+            Scope::Channel(source),
+            Change::Transfer {
+                id: pane.id,
+                destination: Scope::Channel(destination),
+                before: None,
+            },
+        ));
+        let selected = app.repository_view_scopes(
+            Path::new("/unrelated"),
+            &HashSet::from([Scope::Channel(destination)]),
+        );
+        assert!(selected.contains(&Scope::Channel(source)));
+        assert!(selected.contains(&Scope::Channel(destination)));
     }
 
     #[test]
