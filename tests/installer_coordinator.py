@@ -38,7 +38,7 @@ elif args[0] == 'coordinate-install':
     # The real coordinator resolves this exact sibling, never a PATH fallback.
     inspected = subprocess.run([str(helper), '--inspect-upgrade-source', 'fixture'],
                                check=True, capture_output=True, text=True)
-    assert json.loads(inspected.stdout) == {'Ok': None}
+    assert json.loads(inspected.stdout) == {'Ok': {'stopped': [], 'stopped_windows': [], 'labels': {}}}
     record('coordinate', executable=str(pathlib.Path(sys.argv[0]).resolve()),
            helper=str(helper), mode=helper.stat().st_mode & 0o777)
     installer = args[args.index('--installer') + 1]
@@ -96,7 +96,7 @@ elif args[:1] == ['--downgrade-store']:
         sys.exit(1)
 elif args == ['--inspect-upgrade-source', 'fixture']:
     record('inspect')
-    print(json.dumps({'Ok': None}))
+    print(json.dumps({'Ok': {'stopped': [], 'stopped_windows': [], 'labels': {}}}))
 else:
     # A release before the converter would start a daemon here.
     record('unexpected', args=args)

@@ -12,6 +12,7 @@ hot=false
 log_file=
 daemon_log=
 instance=
+in_session=false
 stop_instance=false
 list_instances=false
 keep_instance=false
@@ -49,6 +50,7 @@ while [ "$#" -gt 0 ]; do
                 exit 2
             }
             ;;
+        --in-session) in_session=true ;;
         --list-instances) list_instances=true ;;
         --keep) keep_instance=true ;;
         --ttl)
@@ -112,6 +114,8 @@ Options:
   --instance NAME  Run an isolated instance, with its own storage and daemon, in
                    a headless niri-harness session named cagents-NAME. Returns
                    once its window maps; --fresh-daemon replaces a running one
+  --in-session     With --instance, stay in the current private niri-harness
+                   session in the foreground; the caller owns its lifetime
   --stop-instance NAME
                    Stop that instance's daemon, its jobs and its session; keep
                    its storage
@@ -154,6 +158,31 @@ USAGE
     esac
     shift
 done
+
+if [ "$in_session" = true ]; then
+    if [ -z "$instance" ] || [ "$stop_instance" = true ] || [ "$keep_instance" = true ] ||
+        [ -n "$instance_ttl" ] || [ "$fresh_daemon" = true ] || [ "$hot" = true ] ||
+        [ "$list_instances" = true ] || [ "$collect_garbage" = true ]; then
+        printf '%s\n' "--in-session requires --instance and cannot manage a session's lifetime" >&2
+        exit 2
+    fi
+    private_session=false
+    case ${XDG_RUNTIME_DIR:-}:${DISPLAY:-}:${NIRI_SOCKET:-} in
+        */nh-?*::?*) private_session=true ;;
+        /*::?*)
+            # native-evidence keeps its app runtime beside the compositor's.
+            if [ -n "${CAGENTS_EVIDENCE_FIXTURE:-}" ] &&
+                [ "$XDG_RUNTIME_DIR" = "${CAGENTS_EVIDENCE_FIXTURE%/fixture}/rt" ] &&
+                [ -f "${CAGENTS_EVIDENCE_FIXTURE%/fixture}/.native-evidence" ]; then
+                private_session=true
+            fi
+            ;;
+    esac
+    if [ "$private_session" = false ]; then
+        printf '%s\n' "--in-session requires a private niri-harness session" >&2
+        exit 2
+    fi
+fi
 
 if [ -n "$storage_days" ] && [ "$collect_garbage" = false ]; then
     printf '%s\n' "--storage only goes with --gc" >&2
@@ -706,7 +735,7 @@ if [ "$list_instances" = true ]; then
     exit 0
 fi
 
-if [ -n "$instance" ]; then
+if [ -n "$instance" ] && [ "$in_session" = false ]; then
     if [ "$hot" = true ] || [ -n "$log_file" ]; then
         printf '%s\n' "--instance runs in niri-harness, which keeps the UI log; it cannot be combined with --hot or --log-file" >&2
         exit 2
@@ -729,7 +758,11 @@ if [ -n "$instance" ]; then
     export CAGENTS_DEVELOPMENT_INSTANCE="$instance"
 else
     # The flags choose the instance, never an inherited environment.
-    unset CAGENTS_DEVELOPMENT_INSTANCE
+    if [ "$in_session" = true ]; then
+        export CAGENTS_DEVELOPMENT_INSTANCE="$instance"
+    else
+        unset CAGENTS_DEVELOPMENT_INSTANCE
+    fi
     # Agents opt in so that a failed nested session can never put their UI on
     # the user's desktop. niri-harness exec gives each command a session's
     # private runtime directory and removes the caller's display variables.
@@ -1267,7 +1300,7 @@ fi
 
 # Keep the current development session alive if any part of the matched build
 # fails. Only stop its daemon once the replacement set is ready to launch.
-if [ -n "$instance" ]; then
+if [ -n "$instance" ] && [ "$in_session" = false ]; then
     if [ "$fresh_daemon" = true ]; then
         printf '%s\n' "Replacing instance $instance stops its terminal/chat jobs and all their background subagents." >&2
         stop_instance_session
