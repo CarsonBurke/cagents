@@ -1,7 +1,9 @@
 //! Explicit, self-managed release updates. `gh` owns authentication; discovery
 //! never writes installation state. The detached worker alone may run an installer.
+mod cancellation;
 mod candidate;
 mod confirmation;
+mod handoff;
 mod installed;
 pub(crate) mod source;
 pub use confirmation::{Choice as UpdateChoice, Confirmation as UpdateConfirmation, decide};
@@ -45,16 +47,26 @@ const ARCHIVE_LIMIT: u64 = 4 * 1024 * 1024 * 1024;
 const WORKER_LOCK_FD: i32 = 198;
 
 #[derive(Clone, Default)]
-pub struct CancellationToken(Arc<AtomicBool>);
+pub struct CancellationToken {
+    requested: Arc<AtomicBool>,
+    marker: Option<PathBuf>,
+}
 impl CancellationToken {
     pub fn new() -> Self {
         Self::default()
     }
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.requested.store(true, Ordering::Relaxed);
     }
     fn cancelled(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.requested.load(Ordering::Relaxed)
+            || self.marker.as_ref().is_some_and(|marker| marker.exists())
+    }
+    fn for_job(state: &Path, job: &str) -> Result<Self, UpdateError> {
+        Ok(Self {
+            requested: Arc::default(),
+            marker: confirmation::cancellation_path(state, job)?,
+        })
     }
 }
 
@@ -64,7 +76,7 @@ pub enum UpdateError {
     Invalid(String),
     #[error("another update is already running")]
     Busy,
-    #[error("update check or download cancelled")]
+    #[error("Update cancelled")]
     Cancelled,
     #[error("{0} timed out")]
     Timeout(&'static str),
@@ -508,6 +520,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
             "Review the update in the app, or pass --yes to approve its displayed impact; --interrupt additionally permits active native turns and their background subagents to stop.",
         ));
     }
+    let _interrupt = cancellation::Interrupt::install()?;
     let layout = locate(&std::env::current_exe()?)?;
     let candidate = served_version_root(&layout)?.join("bin/cagents-ui");
     let initial = apply_installed(&candidate)?;
@@ -519,6 +532,7 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
     let mut submitted = None;
     let mut policy_requested = None;
     let deadline = Instant::now() + Duration::from_secs(45 * 60);
+    let mut finishing_message_shown = false;
     loop {
         let job = status()?
             .filter(|job| job.id == initial.id)
@@ -532,7 +546,15 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                 Err(invalid(job.message))
             };
         }
-        if let Some(confirmation) = job.active_confirmation() {
+        if cancellation::requested() {
+            if confirmation::cancel(&job.id)? {
+                return Err(UpdateError::Cancelled);
+            }
+            if !finishing_message_shown {
+                eprintln!("The update is already being applied; finishing it before returning.");
+                finishing_message_shown = true;
+            }
+        } else if let Some(confirmation) = job.active_confirmation() {
             if confirmation
                 .preview
                 .daemon
@@ -569,6 +591,12 @@ pub fn upgrade_installed(yes: bool, interrupt: bool) -> Result<UpdateJob, Update
                     match prompt_review(&confirmation.preview) {
                         Ok(choice) => choice,
                         Err(error) => {
+                            if cancellation::requested() {
+                                if confirmation::cancel(&job.id)? {
+                                    return Err(UpdateError::Cancelled);
+                                }
+                                continue;
+                            }
                             let _ = decide(&job.id, &confirmation.nonce, UpdateChoice::Cancel);
                             return Err(error.into());
                         }
@@ -618,11 +646,20 @@ fn prompt_review(preview: &impact::Preview) -> io::Result<UpdateChoice> {
                 .iter()
                 .any(|session| session.disposition == impact::Disposition::WaitsForIdle)
     });
-    read_review_choice(&mut io::stdin().lock(), &mut io::stderr().lock(), working)
+    read_review_choice_from(cancellation::read_line, &mut io::stderr().lock(), working)
 }
 
+#[cfg(test)]
 fn read_review_choice(
     input: &mut impl io::BufRead,
+    output: &mut impl Write,
+    working: bool,
+) -> io::Result<UpdateChoice> {
+    read_review_choice_from(|answer| input.read_line(answer), output, working)
+}
+
+fn read_review_choice_from(
+    mut read_line: impl FnMut(&mut String) -> io::Result<usize>,
     output: &mut impl Write,
     working: bool,
 ) -> io::Result<UpdateChoice> {
@@ -638,7 +675,7 @@ fn read_review_choice(
         )?;
         output.flush()?;
         let mut answer = String::new();
-        if input.read_line(&mut answer)? == 0 {
+        if read_line(&mut answer)? == 0 {
             return Ok(UpdateChoice::Cancel);
         }
         if let Some(choice) = review_answer(&answer, working) {
@@ -719,6 +756,7 @@ fn start_job(
         confirmation: None,
     };
     let log = private_create(&job.log_path)?;
+    confirmation::initialize(&state, &id)?;
     write_job(&state, &job)?;
     let request_file = private_create(&state.join(format!("{id}.request")))?;
     serde_json::to_writer(&request_file, request)?;
@@ -1036,8 +1074,9 @@ pub fn run_worker(job_id: &str) -> Result<(), UpdateError> {
     if job.id != job_id || job.phase != UpdatePhase::Starting {
         return Err(invalid("update job is no longer pending"));
     }
-    // Keep the shared lease through the durable final outcome, including a
-    // startup failure. Dropping a worker copy must never unlock the successor.
+    // Reserve startup until readiness or a recorded failure. Success closes
+    // our copy before reopening windows; recovery closes it before restarting
+    // the selected version. Neither close may unlock a serving successor.
     let mut handoff = None;
     let result = perform_update(&installation, &state, &mut job, &mut handoff);
     job.phase = if matches!(result, Err(UpdateError::Cancelled)) {
@@ -1075,7 +1114,7 @@ fn perform_update(
             return installed::perform(installation, state, job, &root, handoff);
         }
     };
-    let cancellation = CancellationToken::new();
+    let cancellation = CancellationToken::for_job(state, &job.id)?;
     let endpoint = format!("repos/{REPOSITORY}/releases/{}", selected.id);
     let release = applicable_release(serde_json::from_slice(&metadata(
         &endpoint,
@@ -1128,6 +1167,7 @@ fn perform_update(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+        confirmation::check_cancelled(state, job).map_err(io::Error::other)?;
         let inspected = crate::install_guard::preflight_source_panes(guard,
             confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
         let latest = observe_impact(&staged.identity, confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
@@ -1136,6 +1176,9 @@ fn perform_update(
             return Err(io::Error::other("Session ownership changed during pane inspection; existing windows were kept open"));
         }
         Ok(())
+    }).map_err(|error| match confirmation::check_cancelled(state, job) {
+        Err(UpdateError::Cancelled) => UpdateError::Cancelled,
+        _ => UpdateError::from(error),
     })?;
     let install_result = (|| {
         Installation::detect()?;
@@ -1161,11 +1204,13 @@ fn perform_update(
             let source =
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
+            confirmation::prepared(state, job)?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
             *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
         }
+        confirmation::prepared(state, job)?;
         set_phase(
             state,
             job,
@@ -1183,13 +1228,15 @@ fn perform_update(
             handoff.as_ref(),
         )
     })();
-    record_handoff_failure(state, job, &install_result, handoff)?;
+    let recovery_result =
+        finish_handoff(installation, state, job, &install_result, handoff, &guard);
     let reopen_result = guard
         .relaunch_windows(
             &windows,
             &installation.prefix.join("current/bin/cagents-ui"),
         )
         .map_err(UpdateError::from);
+    recovery_result?;
     install_result?;
     reopen_result
 }
@@ -1473,63 +1520,7 @@ fn observe_impact(
     })
 }
 
-fn wait_daemon_stopped(
-    paths: crate::daemon::RuntimePaths,
-    source: crate::daemon::lease_handoff::HandoffSource,
-    state: &Path,
-    job: &mut UpdateJob,
-) -> Result<crate::daemon::lease_handoff::LeaseHandoff, UpdateError> {
-    use crate::daemon::lease_handoff::{LeaseHandoff, holder_pid};
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    const WAITING: &str = "Waiting for the terminal service to save its panes";
-    let (sender, receiver) = mpsc::sync_channel(1);
-    let waiting_paths = paths.clone();
-    let pid = source.pid;
-    thread::Builder::new()
-        .name("daemon-lease-handoff".into())
-        .spawn(move || {
-            let _ = sender.send(LeaseHandoff::wait(&waiting_paths, pid));
-        })?;
-    let mut last_progress = Instant::now();
-    let mut source_exited_at = None;
-    loop {
-        match receiver.recv_timeout(Duration::from_secs(1)) {
-            Ok(result) => return result.map_err(|error| invalid(error.to_string())),
-            Err(RecvTimeoutError::Disconnected) => {
-                return Err(invalid("Terminal service lease handoff thread exited"));
-            }
-            Err(RecvTimeoutError::Timeout) => {}
-        }
-        // A nonblocking older client can race the kernel's waiter wakeup.
-        // Never start a successor against that unexpected holder, or wait
-        // indefinitely for it under the original daemon's identity.
-        let exited = source.exited()?;
-        if let Some(holder) = holder_pid(&paths)? {
-            if holder != std::process::id() as i32 && (Some(holder) != source.locker_pid || exited)
-            {
-                return Err(invalid(format!(
-                    "Terminal service lease handoff was interrupted by holder process {holder} (expected process {pid}); saved panes were retained. Check cagents daemon status before retrying"
-                )));
-            }
-        }
-        // An inherited flock can outlive its original process, and its
-        // kernel record may no longer be visible in this PID namespace. Never
-        // impose a checkpoint deadline while the pinned source lives; after
-        // exit, allow the waiter to run before diagnosing a leaked description.
-        if exited
-            && source_exited_at.get_or_insert_with(Instant::now).elapsed() >= Duration::from_secs(5)
-        {
-            return Err(invalid(format!(
-                "Terminal service process {pid} exited but its lease was not handed over (holder PID unavailable); saved panes were retained. Check cagents daemon status before retrying"
-            )));
-        }
-        if last_progress.elapsed() >= Duration::from_secs(15) {
-            eprintln!("{WAITING}");
-            set_phase(state, job, UpdatePhase::Installing, WAITING)?;
-            last_progress = Instant::now();
-        }
-    }
-}
+use handoff::wait_daemon_stopped;
 
 /// Recovery windows may autostart the old version. Publish failure before
 /// allowing that start, rather than keeping the runtime reserved until reopen.
@@ -1541,11 +1532,50 @@ fn record_handoff_failure(
 ) -> Result<(), UpdateError> {
     if let Err(error) = result {
         eprintln!("{error}");
-        job.phase = UpdatePhase::Failed;
+        job.phase = if matches!(error, UpdateError::Cancelled) {
+            UpdatePhase::Cancelled
+        } else {
+            UpdatePhase::Failed
+        };
         job.confirmation = None;
         job.message = error.to_string();
         write_job(state, job)?;
         drop(handoff.take());
+    }
+    Ok(())
+}
+
+/// Settle the reservation before reopening clients. The worker, including a
+/// headless update with no windows, owns restarting the selected installation.
+fn finish_handoff(
+    installation: &Installation,
+    state: &Path,
+    job: &mut UpdateJob,
+    result: &Result<(), UpdateError>,
+    handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
+    guard: &crate::instance::UiUpdateGuard,
+) -> Result<(), UpdateError> {
+    let reserved = handoff.is_some();
+    record_handoff_failure(state, job, result, handoff)?;
+    // Success has confirmed serving readiness. Only close our copy: LOCK_UN
+    // would also unlock the successor's shared open-file description.
+    drop(handoff.take());
+    if reserved && result.is_err() {
+        let mut command = Command::new(installation.prefix.join("current/bin/cagents"));
+        command.args(["daemon", "start"]);
+        crate::install_guard::sanitize_child_environment(&mut command);
+        unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
+        guard.inherit_for_install(&mut command)?;
+        let started = crate::install_guard::wait_daemon_start(
+            &mut command,
+            crate::install_guard::daemon_start_timeout()?,
+        );
+        if let Err(failure) = started {
+            eprintln!("Recovery daemon start failed: {}", failure.error);
+            job.message.push_str(" The terminal service could not restart. Run `cagents daemon start` to recover your saved panes.");
+            write_job(state, job)?;
+            return Err(invalid(job.message.clone()));
+        }
     }
     Ok(())
 }
@@ -1560,18 +1590,32 @@ fn run_installer(
     guard: &crate::instance::UiUpdateGuard,
     handoff: Option<&crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<(), UpdateError> {
-    let files = [
-        installer.as_raw_fd(),
-        archive.as_raw_fd(),
-        checksums.as_raw_fd(),
-    ];
+    // Keep sources above the destinations so remapping cannot overwrite a
+    // still-needed input, even in a worker with many open descriptors.
+    let files: Vec<File> = [installer, archive, checksums]
+        .into_iter()
+        .map(|file| {
+            let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+            if fd < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(unsafe { File::from_raw_fd(fd) })
+        })
+        .collect::<io::Result<_>>()?;
+    let inherited_files = [190, 191, 192];
     let mut command = Command::new("/bin/sh");
     command
-        .arg(format!("/proc/self/fd/{}", files[0]))
+        .arg(format!("/proc/self/fd/{}", inherited_files[0]))
         .args(["--version", &release.version, "--prefix"])
         .arg(&installation.prefix)
-        .env("CAGENTS_ARCHIVE", format!("/proc/self/fd/{}", files[1]))
-        .env("CAGENTS_CHECKSUMS", format!("/proc/self/fd/{}", files[2]))
+        .env(
+            "CAGENTS_ARCHIVE",
+            format!("/proc/self/fd/{}", inherited_files[1]),
+        )
+        .env(
+            "CAGENTS_CHECKSUMS",
+            format!("/proc/self/fd/{}", inherited_files[2]),
+        )
         .env("CAGENTS_REPOSITORY", REPOSITORY)
         .env(
             "CAGENTS_INSTALL_OWNER_CLI",
@@ -1588,13 +1632,16 @@ fn run_installer(
     if restart_daemon {
         command.arg("--restart-daemon");
     }
+    unsafe { command.pre_exec(crate::daemon::seal_inherited_descriptors) };
     guard.inherit_for_install(&mut command)?;
     // SAFETY: descriptor flags only; sealed anonymous files cannot be replaced
     // between checksum verification and the installer's own second verification.
     unsafe {
         command.pre_exec(move || {
-            for fd in files {
-                if libc::fcntl(fd, libc::F_SETFD, 0) == -1 {
+            for (fd, target) in files.iter().zip(inherited_files) {
+                if libc::dup2(fd.as_raw_fd(), target) == -1
+                    || libc::fcntl(target, libc::F_SETFD, 0) == -1
+                {
                     return Err(io::Error::last_os_error());
                 }
             }
@@ -1602,7 +1649,7 @@ fn run_installer(
         });
     }
     if let Some(handoff) = handoff {
-        handoff.inherit(&mut command)?;
+        handoff.inherit_for_installer(&mut command)?;
     }
     // Do not kill an installer mid-transaction. Its migration protocol owns
     // bounded shutdown/startup and rollback, and its log survives every UI.
@@ -3617,6 +3664,137 @@ finally:
     }
     #[cfg(feature = "host")]
     #[test]
+    fn transferred_lease_skips_source_prepare_and_survives_installer_start_failure() {
+        use crate::daemon::{HostLease, RuntimePaths, lease_handoff::LeaseHandoff};
+        const MODE: &str = "CAGENTS_TEST_HEADLESS_RECOVERY";
+        const TEST: &str = "update::tests::transferred_lease_skips_source_prepare_and_survives_installer_start_failure";
+        if std::env::var_os(MODE).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let runtime = isolated.path().join("runtime");
+            fs::create_dir(&runtime).unwrap();
+            fs::set_permissions(&runtime, fs::Permissions::from_mode(0o700)).unwrap();
+            let output = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(MODE, "worker")
+                .env(
+                    "CAGENTS_TEST_HEADLESS_EXEC",
+                    std::env::current_exe().unwrap(),
+                )
+                .env("XDG_RUNTIME_DIR", &runtime)
+                .env("HOME", isolated.path())
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            return;
+        }
+        if std::env::var(MODE).unwrap() == "daemon" {
+            // Exercise the real admission barrier while the worker still owns
+            // the update fence. Recovery has to inherit that exact authority.
+            let _admission = crate::instance::DaemonAdmissionGuard::acquire().unwrap();
+            let root = PathBuf::from(std::env::var_os("CAGENTS_TEST_HEADLESS_ROOT").unwrap());
+            let lock = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(root.join("runtime/cagentsd.lock"))
+                .unwrap();
+            assert_eq!(
+                unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+                0
+            );
+            let socket =
+                std::os::unix::net::UnixListener::bind(root.join("runtime/cagentsd.sock")).unwrap();
+            fs::write(root.join("daemon-ready"), b"serving").unwrap();
+            while !root.join("daemon-exit").exists() {
+                thread::sleep(Duration::from_millis(5));
+            }
+            crate::daemon::shut_down_test_listener(socket);
+            return;
+        }
+        let guard = crate::instance::UiUpdateGuard::acquire().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("runtime");
+        let paths = RuntimePaths {
+            socket: directory.join(crate::terminal_ipc::SOCKET_FILE_NAME),
+            lock: directory.join("cagentsd.lock"),
+            directory,
+        };
+        let proof = crate::model::HostSessionProof {
+            host_session_id: crate::model::HostSessionId::new("headless-recovery"),
+            boot_id: crate::daemon::read_boot_id().unwrap(),
+            host_incarnation: crate::model::HostIncarnation::new("headless-recovery"),
+        };
+        drop(HostLease::acquire(&paths, &proof).unwrap());
+        let mut lease = Some(LeaseHandoff::wait(&paths, std::process::id()).unwrap());
+        let installation = Installation {
+            prefix: root.path().into(),
+            version: "old".into(),
+        };
+        let bin = root.path().join("versions/old/bin");
+        fs::create_dir_all(&bin).unwrap();
+        // Model the installer's restored pointer after a pre-start failure.
+        // There are no UI windows to start a daemon on the worker's behalf.
+        std::os::unix::fs::symlink("versions/old", root.path().join("current")).unwrap();
+        let script = r#"#!/usr/bin/python3
+import json, os, pathlib, subprocess, sys, time
+root = pathlib.Path(__file__).resolve().parents[3]
+assert sys.argv[1:] == ['daemon','start']  # No second source prepare.
+assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
+assert not pathlib.Path('/proc/self/fd/199').exists()
+assert json.loads((root/'status.json').read_text())['phase'] == 'Failed'
+os.environ['CAGENTS_TEST_HEADLESS_RECOVERY']='daemon'
+os.environ['CAGENTS_TEST_HEADLESS_ROOT']=str(root)
+child = subprocess.Popen([os.environ['CAGENTS_TEST_HEADLESS_EXEC'], '--exact',
+    'update::tests::transferred_lease_skips_source_prepare_and_survives_installer_start_failure',
+    '--nocapture', '--test-threads=1'],
+    pass_fds=(int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD']),),
+    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=None)
+while not (root/'daemon-ready').exists():
+    if child.poll() is not None: sys.exit(1)
+    time.sleep(.005)
+"#;
+        fs::write(bin.join("cagents"), script).unwrap();
+        fs::set_permissions(bin.join("cagents"), fs::Permissions::from_mode(0o700)).unwrap();
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::write(self.0.join("daemon-exit"), b"exit");
+            }
+        }
+        let _cleanup = Cleanup(root.path().to_owned());
+        let mut job = UpdateJob {
+            id: uuid::Uuid::new_v4().to_string(),
+            version: "new".into(),
+            phase: UpdatePhase::Installing,
+            message: String::new(),
+            log_path: root.path().join("worker.log"),
+            confirmation: None,
+        };
+        finish_handoff(
+            &installation,
+            root.path(),
+            &mut job,
+            &Err(invalid("installer failed before replacement startup")),
+            &mut lease,
+            &guard,
+        )
+        .unwrap();
+        assert!(lease.is_none());
+        assert!(root.path().join("daemon-ready").exists());
+        assert!(std::os::unix::net::UnixStream::connect(&paths.socket).is_ok());
+        assert!(
+            HostLease::is_held(&paths).unwrap(),
+            "worker must recover without windows"
+        );
+        fs::write(root.path().join("daemon-exit"), b"exit").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while HostLease::is_held(&paths).unwrap() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(feature = "host")]
+    #[test]
     fn handoff_reports_an_exited_source_with_a_leaked_lock_description() {
         use crate::daemon::{RuntimePaths, lease_handoff::HandoffSource};
         use std::io::BufRead;
@@ -3653,7 +3831,6 @@ sys.stdin.buffer.read(1)
             .read_line(&mut ready)
             .unwrap();
         let leaked_pid: u32 = ready.trim().parse().unwrap();
-        let source_pid = daemon.id();
         let source = HandoffSource::pin(&paths, &proof).unwrap();
         // Pin the deliberate leak before allowing the original daemon to exit.
         let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, leaked_pid, 0) };
@@ -3697,10 +3874,6 @@ sys.stdin.buffer.read(1)
             .err()
             .expect("a leaked lock is not a completed handoff")
             .to_string();
-        assert!(error.contains(&source_pid.to_string()), "{error}");
-        assert!(
-            error.contains("holder process") || error.contains("holder PID unavailable"),
-            "{error}"
-        );
+        assert_eq!(error, handoff::SERVICE_NOT_STOPPED);
     }
 }

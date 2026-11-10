@@ -103,7 +103,7 @@ pub(super) fn perform(
         return Err(invalid("installed CLI exceeds update size limit"));
     }
     seal_file(&executable)?;
-    let cancellation = CancellationToken::new();
+    let cancellation = CancellationToken::for_job(state, &job.id)?;
     let staged =
         candidate::Staged::from_file(executable, job.version.clone(), identity, &cancellation)?;
     let observe = |policy| {
@@ -130,6 +130,7 @@ pub(super) fn perform(
     )?;
     let mut guard = crate::instance::UiUpdateGuard::acquire()?;
     let windows = guard.prepare_and_close_windows_with_preflight(Duration::from_secs(45), |guard| {
+        confirmation::check_cancelled(state, job).map_err(io::Error::other)?;
         let inspected = crate::install_guard::preflight_source_panes(guard,
             confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
         let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
@@ -138,6 +139,9 @@ pub(super) fn perform(
             return Err(io::Error::other("The installed build or session ownership changed during pane inspection; existing windows were kept open"));
         }
         Ok(())
+    }).map_err(|error| match confirmation::check_cancelled(state, job) {
+        Err(UpdateError::Cancelled) => UpdateError::Cancelled,
+        _ => UpdateError::from(error),
     })?;
     let mut startup_attempted = false;
     let mut startup_owned = false;
@@ -166,11 +170,13 @@ pub(super) fn perform(
             let source =
                 crate::daemon::lease_handoff::HandoffSource::pin(&paths, &daemon.capability.proof)
                     .map_err(|error| invalid(error.to_string()))?;
+            confirmation::prepared(state, job)?;
             client
                 .prepare_confirmed_upgrade(daemon, false)
                 .map_err(|error| invalid(error.to_string()))?;
             *handoff = Some(wait_daemon_stopped(paths, source, state, job)?);
         }
+        confirmation::prepared(state, job)?;
         set_phase(
             state,
             job,
@@ -229,10 +235,11 @@ pub(super) fn perform(
             .join("versions")
             .join(&installation.version)
     };
-    record_handoff_failure(state, job, &result, handoff)?;
+    let recovery_result = finish_handoff(installation, state, job, &result, handoff, &guard);
     let reopened = guard
         .relaunch_windows(&windows, &reopen.join("bin/cagents-ui"))
         .map_err(UpdateError::from);
+    recovery_result?;
     result?;
     reopened
 }

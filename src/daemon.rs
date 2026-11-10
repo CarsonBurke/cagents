@@ -507,7 +507,12 @@ struct StoredLockMetadata {
 /// Locate the executable of this instance's live, kernel-verified lock owner.
 /// Update coordination uses its sibling CLI to speak the owner's own protocol.
 pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
-    let paths = RuntimePaths::discover()?;
+    running_executable_at(&RuntimePaths::discover()?)
+}
+
+pub(crate) fn running_executable_at(
+    paths: &RuntimePaths,
+) -> Result<Option<PathBuf>, PlatformError> {
     let mut lock = match OpenOptions::new()
         .read(true)
         .custom_flags(LOCK_OPEN_FLAGS)
@@ -517,7 +522,7 @@ pub(crate) fn running_executable() -> Result<Option<PathBuf>, PlatformError> {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(error) => return Err(error.into()),
     };
-    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, &paths)? else {
+    let Some(_pidfd) = daemon_pidfd_from_lock(&mut lock, paths)? else {
         return Ok(None);
     };
     lock.seek(SeekFrom::Start(0))?;
@@ -2004,6 +2009,7 @@ while True: time.sleep(1)
                 .unwrap()
                 .unwrap();
             assert!(env::var_os(lease_handoff::DAEMON_LEASE_ENV).is_none());
+            assert!(!lease_handoff::has_inherited_lease().unwrap());
             assert_ne!(
                 unsafe { libc::fcntl(inherited.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
                 0
@@ -2029,8 +2035,13 @@ while True: time.sleep(1)
             println!("lease-adopted-and-child-sealed");
             io::stdout().flush().unwrap();
             io::stdin().read_exact(&mut [0_u8]).unwrap();
-            drop(successor);
-            std::process::exit(env::var(EXIT).unwrap().parse().unwrap());
+            let exit = env::var(EXIT).unwrap().parse().unwrap();
+            if exit != 0 {
+                drop(successor);
+            }
+            // On the serving-success path skip destructors, as a daemon crash
+            // would: the kernel must release its last copy of the descriptor.
+            std::process::exit(exit);
         }
 
         struct FixtureChild(Child);
@@ -2045,7 +2056,8 @@ while True: time.sleep(1)
             let paths = paths(runtime.path().join(instance::runtime_subdirectory()));
             let original = HostLease::acquire(&paths, &proof()).unwrap();
             drop(original);
-            let handoff = lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap();
+            let mut handoff =
+                Some(lease_handoff::LeaseHandoff::wait(&paths, std::process::id()).unwrap());
             let mut command = Command::new(env::current_exe().unwrap());
             command
                 .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
@@ -2056,7 +2068,7 @@ while True: time.sleep(1)
                 .stdout(Stdio::piped())
                 .stderr(Stdio::inherit());
             unsafe { command.pre_exec(seal_inherited_descriptors) };
-            handoff.inherit(&mut command).unwrap();
+            handoff.as_ref().unwrap().inherit(&mut command).unwrap();
             let mut child = FixtureChild(command.spawn().unwrap());
             // A Command retains its forwarding hook and therefore a duplicate
             // of the lease; release it before testing the worker guard's lifetime.
@@ -2079,6 +2091,12 @@ while True: time.sleep(1)
                 HostLease::acquire(&paths, &proof()),
                 Err(PlatformError::AlreadyRunning { .. })
             ));
+            if exit == 0 {
+                // The serving successor owns the lease independently once the
+                // worker closes its copy, before any client-window reopening.
+                drop(handoff.take());
+                assert!(HostLease::is_held(&paths).unwrap());
+            }
             child.0.stdin.take().unwrap().write_all(b"x").unwrap();
             let deadline = Instant::now() + Duration::from_secs(10);
             let status = loop {
@@ -2089,12 +2107,18 @@ while True: time.sleep(1)
                 std::thread::sleep(Duration::from_millis(10));
             };
             assert_eq!(status.code(), Some(exit));
-            // Even the failed daemon's destructor cannot explicitly unlock
-            // the worker's shared open-file description before failure recording.
-            assert!(matches!(
-                HostLease::acquire(&paths, &proof()),
-                Err(PlatformError::AlreadyRunning { .. })
-            ));
+            if exit == 17 {
+                // A failed startup retains the worker's recovery reservation
+                // until the failure is durably recorded and recovery can start.
+                assert!(matches!(
+                    HostLease::acquire(&paths, &proof()),
+                    Err(PlatformError::AlreadyRunning { .. })
+                ));
+            } else {
+                // A crash after readiness must permit another start even
+                // while the updater is still alive reopening its clients.
+                assert!(!HostLease::is_held(&paths).unwrap());
+            }
             drop(handoff);
             let _manual_restart = HostLease::acquire(&paths, &proof()).unwrap();
         }

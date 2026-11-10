@@ -1,9 +1,20 @@
 //! Transfer one flock open-file description from the updater to its successor.
 use super::*;
-use std::{os::fd::BorrowedFd, os::unix::process::CommandExt, process::Command};
+use std::{
+    os::fd::BorrowedFd,
+    os::unix::process::CommandExt,
+    process::Command,
+    sync::{Mutex, OnceLock},
+};
 
 pub(crate) const DAEMON_LEASE_ENV: &str = "CAGENTS_DAEMON_LEASE_FD";
 const DAEMON_LEASE_FD: i32 = 199;
+const INSTALLER_LEASE_FD: i32 = 3;
+
+// Validate once at CLI/daemon startup and immediately seal the reserved slot.
+// Only explicit forwarding reopens it across exec; ordinary children never
+// inherit the inventory reservation, even without a descriptor-sealing hook.
+static INHERITED_LEASE: OnceLock<io::Result<Mutex<Option<File>>>> = OnceLock::new();
 
 /// Unlike HostLease, this guard never unlinks a socket or explicitly unlocks:
 /// the successor shares its open-file description and must retain the lock.
@@ -63,12 +74,13 @@ impl LeaseHandoff {
             }
         }
         validate_inode(&lock, paths)?;
-        let stored: StoredLockMetadata = serde_json::from_reader(&lock)?;
-        if stored.pid != expected_pid {
-            return Err(io::Error::other(format!(
-                "Terminal service lease changed during handoff: expected process {expected_pid}, found holder process {}",
+        if let Ok(stored) = serde_json::from_reader::<_, StoredLockMetadata>(&lock)
+            && stored.pid != expected_pid
+        {
+            eprintln!(
+                "daemon lease metadata changed: expected process {expected_pid}, found process {}",
                 stored.pid
-            )).into());
+            );
         }
         Ok(Self { lock })
     }
@@ -76,10 +88,33 @@ impl LeaseHandoff {
     pub(crate) fn inherit(&self, command: &mut Command) -> io::Result<()> {
         forward(
             command,
-            self.lock.try_clone()?,
+            clone_for_forward(&self.lock)?,
+            DAEMON_LEASE_FD,
             self.lock.as_raw_fd() == DAEMON_LEASE_FD,
         )
     }
+
+    /// Shells preserve this low descriptor while running the verified
+    /// installer; only its explicit daemon commands forward it to fd 199.
+    pub(crate) fn inherit_for_installer(&self, command: &mut Command) -> io::Result<()> {
+        forward(
+            command,
+            clone_for_forward(&self.lock)?,
+            INSTALLER_LEASE_FD,
+            true,
+        )
+    }
+}
+
+// Forwarding runs after the installer's asset and fence remaps. Keep every
+// source above their reserved slots so one hook cannot overwrite another.
+fn clone_for_forward(lock: &File) -> io::Result<File> {
+    let descriptor = unsafe { libc::fcntl(lock.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 200) };
+    if descriptor < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful F_DUPFD_CLOEXEC returned a fresh owned descriptor.
+    Ok(unsafe { File::from_raw_fd(descriptor) })
 }
 
 fn open_lock(paths: &RuntimePaths) -> Result<File, PlatformError> {
@@ -132,30 +167,71 @@ pub(super) fn validate_inherited(lock: &File, paths: &RuntimePaths) -> Result<()
     Ok(())
 }
 
-fn inherited() -> io::Result<Option<File>> {
+fn read_inherited() -> io::Result<Option<File>> {
     let Some(value) = env::var_os(DAEMON_LEASE_ENV) else {
         return Ok(None);
     };
-    if value != "199" {
+    let descriptor = if value == "199" {
+        DAEMON_LEASE_FD
+    } else if value == "3" {
+        INSTALLER_LEASE_FD
+    } else {
         return Err(io::Error::other("invalid daemon lease descriptor"));
-    }
+    };
     // SAFETY: check existence before borrowing; clone gives this caller ownership.
-    if unsafe { libc::fcntl(DAEMON_LEASE_FD, libc::F_GETFD) } == -1 {
+    if unsafe { libc::fcntl(descriptor, libc::F_GETFD) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    let lock = File::from(unsafe { BorrowedFd::borrow_raw(DAEMON_LEASE_FD) }.try_clone_to_owned()?);
+    let lock = File::from(unsafe { BorrowedFd::borrow_raw(descriptor) }.try_clone_to_owned()?);
     let paths = RuntimePaths::discover().map_err(io::Error::other)?;
     validate_inherited(&lock, &paths).map_err(io::Error::other)?;
-    Ok(Some(lock))
+    // SAFETY: this reserved descriptor is startup authority owned by this
+    // process. No other code may close it before take_inherited_lease.
+    if unsafe { libc::fcntl(descriptor, libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(lock);
+    // SAFETY: the checked original startup descriptor transfers ownership once
+    // into the process-wide cache; subsequent calls only borrow or clone it.
+    Ok(Some(unsafe { File::from_raw_fd(descriptor) }))
+}
+
+fn inherited_cache() -> io::Result<&'static Mutex<Option<File>>> {
+    INHERITED_LEASE
+        .get_or_init(|| read_inherited().map(Mutex::new))
+        .as_ref()
+        .map_err(|error| io::Error::new(error.kind(), error.to_string()))
+}
+
+/// Called at CLI startup, before any child can inherit the reserved slot.
+pub(crate) fn initialize_inherited_lease() -> io::Result<()> {
+    inherited_cache().map(|_| ())
+}
+
+fn inherited() -> io::Result<Option<(File, bool)>> {
+    inherited_cache()?
+        .lock()
+        .map_err(|_| io::Error::other("daemon startup reservation is unavailable"))?
+        .as_ref()
+        .map(|lock| {
+            Ok((
+                clone_for_forward(lock)?,
+                lock.as_raw_fd() == DAEMON_LEASE_FD,
+            ))
+        })
+        .transpose()
 }
 
 pub(crate) fn has_inherited_lease() -> io::Result<bool> {
-    Ok(inherited()?.is_some())
+    Ok(inherited_cache()?
+        .lock()
+        .map_err(|_| io::Error::other("daemon startup reservation is unavailable"))?
+        .is_some())
 }
 
 pub(crate) fn inherit_daemon_lease(command: &mut Command) -> io::Result<()> {
-    if let Some(lock) = inherited()? {
-        forward(command, lock, true)?;
+    if let Some((lock, inherited_slot)) = inherited()? {
+        forward(command, lock, DAEMON_LEASE_FD, inherited_slot)?;
     }
     Ok(())
 }
@@ -165,38 +241,38 @@ pub(crate) fn inherit_daemon_lease(command: &mut Command) -> io::Result<()> {
 /// The caller must be the single-threaded daemon entry point.
 #[cfg(feature = "host")]
 pub(crate) unsafe fn take_inherited_lease() -> io::Result<Option<File>> {
-    let lock = inherited()?;
+    let lock = inherited_cache()?
+        .lock()
+        .map_err(|_| io::Error::other("daemon startup reservation is unavailable"))?
+        .take();
     if lock.is_some() {
         // SAFETY: caller guarantees exclusive environment access; the reserved
-        // original is owned by this startup contract. All retained copies use CLOEXEC.
-        unsafe {
-            env::remove_var(DAEMON_LEASE_ENV);
-            libc::close(DAEMON_LEASE_FD);
-        }
+        // original is owned by the returned File. All retained copies use CLOEXEC.
+        unsafe { env::remove_var(DAEMON_LEASE_ENV) };
     }
     Ok(lock)
 }
 
-fn forward(command: &mut Command, lock: File, inherited_slot: bool) -> io::Result<()> {
+fn forward(command: &mut Command, lock: File, target: i32, inherited_slot: bool) -> io::Result<()> {
     if !inherited_slot
-        && lock.as_raw_fd() != DAEMON_LEASE_FD
-        && unsafe { libc::fcntl(DAEMON_LEASE_FD, libc::F_GETFD) } != -1
+        && lock.as_raw_fd() != target
+        && unsafe { libc::fcntl(target, libc::F_GETFD) } != -1
     {
         return Err(io::Error::from_raw_os_error(libc::EBUSY));
     }
-    command.env(DAEMON_LEASE_ENV, DAEMON_LEASE_FD.to_string());
+    command.env(DAEMON_LEASE_ENV, target.to_string());
     // SAFETY: only descriptor syscalls after fork. Capturing the File keeps
     // the source alive until spawn; this hook follows descriptor sealing.
     unsafe {
         command.pre_exec(move || {
             if !inherited_slot
-                && lock.as_raw_fd() != DAEMON_LEASE_FD
-                && libc::fcntl(DAEMON_LEASE_FD, libc::F_GETFD) != -1
+                && lock.as_raw_fd() != target
+                && libc::fcntl(target, libc::F_GETFD) != -1
             {
                 return Err(io::Error::from_raw_os_error(libc::EBUSY));
             }
-            if libc::dup2(lock.as_raw_fd(), DAEMON_LEASE_FD) == -1
-                || libc::fcntl(DAEMON_LEASE_FD, libc::F_SETFD, 0) == -1
+            if libc::dup2(lock.as_raw_fd(), target) == -1
+                || libc::fcntl(target, libc::F_SETFD, 0) == -1
             {
                 return Err(io::Error::last_os_error());
             }

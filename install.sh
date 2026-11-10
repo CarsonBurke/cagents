@@ -1,6 +1,26 @@
 #!/bin/sh
 set -eu
 
+# Only candidate CLIs may receive the update's held descriptor. POSIX sh can
+# close the installer's low transport slot before invoking ordinary tools;
+# the CLI seals that slot on startup and forwards it to the daemon as fd 199.
+if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then
+    installer_tool() (
+        exec 3<&-
+        unset CAGENTS_DAEMON_LEASE_FD
+        exec "$@"
+    )
+    # Preserve command -v detection for optional and missing tools. Aliases
+    # apply inside the functions below as well as their command substitutions.
+    for installer_utility in awk cat chmod cp curl find getconf gh \
+        gtk-update-icon-cache id ln mkdir mktemp mv readlink rm rmdir sed \
+        sha256sum shasum sleep tar uname update-desktop-database; do
+        if command -v "$installer_utility" >/dev/null 2>&1; then
+            alias "$installer_utility=installer_tool $installer_utility"
+        fi
+    done
+fi
+
 PROGRAM=cagents-install
 DEFAULT_REPOSITORY='<OWNER>/<REPO>'
 
@@ -1041,8 +1061,10 @@ elif [ "$HAD_CURRENT" -eq 1 ]; then
             # its lease. The candidate validates the exact inherited lock;
             # an environment marker alone cannot authorize skipping prepare.
             read_daemon_status "$NEW_VERSION_DIR/bin/cagents"
-            [ "$DAEMON_STATUS" = stopped ] \
-                || fail 'cannot verify the transferred daemon lease; installation was not changed'
+            case $DAEMON_STATUS:$daemon_output in
+                running:*'"inherited_lease":true'*|stopped:*'"inherited_lease":true'*) ;;
+                *) fail 'cannot verify the terminal service is ready for the update; installation was not changed' ;;
+            esac
         else
             read_daemon_status "$OWNER_CLI"
             case $DAEMON_STATUS in
