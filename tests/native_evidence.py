@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -1175,7 +1176,7 @@ class Evidence(unittest.TestCase):
         (fixture / "home" / ".config" / "fixture-forge").touch()
         return fixture
 
-    def test_codex_is_installed_only_as_the_peer_a_session_asks_for(self) -> None:
+    def test_plain_and_offline_codex_sessions_install_only_the_requested_peer(self) -> None:
         self.built()
         self.run_tool("start", "after")
         fixture = self.task / "fixture"
@@ -1225,6 +1226,131 @@ class Evidence(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("unknown Codex peer: codex; use tool-rows, child-errors or terminal-escape", result.stderr)
         self.assertTrue(self.lock_is_free(self.native_lock))
+
+    def codex_elf(self, name: str = "real codex") -> Path:
+        # false is an ELF that fails if executed. Validation only reads it;
+        # these contracts never launch a real provider or compile a binary.
+        source = self.root / name
+        shutil.copyfile("/usr/bin/false", source)
+        source.chmod(0o755)
+        return source
+
+    def test_real_codex_is_copied_without_credentials_or_privileged_metadata(self) -> None:
+        self.built()
+        source = self.codex_elf("codex '$(not-a-command)")
+        source.chmod(0o6755)
+        os.setxattr(source, "user.cagents-fixture", b"not copied")
+        original = source.read_bytes()
+        identity = source.stat()
+        (source.parent / "auth.json").write_text("invented credential, not fixture data")
+        self.run_tool("start", "after", "--width", "900", "--height", "750",
+                      "--codex-executable", str(source))
+        fixture = self.task / "fixture"
+        installed = fixture / "libexec/codex/codex"
+        self.assertEqual(installed.read_bytes(), original)
+        self.assertEqual(installed.stat().st_mode & 0o7777, 0o755)
+        self.assertNotIn("user.cagents-fixture", os.listxattr(installed))
+        self.assertNotIn("security.capability", os.listxattr(installed))
+        self.assertNotEqual(installed.stat().st_ino, identity.st_ino)
+        self.assertEqual(source.stat().st_ino, identity.st_ino)
+        self.assertEqual(source.stat().st_mode, identity.st_mode)
+        self.assertEqual(source.read_bytes(), original)
+        self.assertEqual((fixture / "bin/codex").resolve(), installed)
+        self.assertFalse((fixture / "home/.codex/auth.json").exists())
+        receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
+        self.assertEqual(receipt["source_path"], str(source))
+        self.assertEqual(receipt["source_identity"]["inode"], identity.st_ino)
+        self.assertEqual(receipt["sha256"], hashlib.sha256(original).hexdigest())
+        self.assertEqual(receipt["installed_sha256"], receipt["sha256"])
+        self.assertEqual(receipt["installed_identity"]["inode"], installed.stat().st_ino)
+        self.assertEqual(receipt["installed_identity"]["mode"], 0o755)
+        self.assertIn("size=900,750", (self.logs / "kwinrules").read_text())
+        inherited = (self.logs / "runner-env").read_text()
+        self.assertIn(f"HOME={fixture}/home\n", inherited)
+        self.assertNotIn("/must/not/reach/the/fixture", inherited)
+        self.run_tool("stop")
+
+        # Neither a named peer nor a plain start inherits the real executable.
+        self.run_tool("start", "after", "--codex", "tool-rows")
+        self.assertIn("offline tool-rows fixture", self.fixture_shell("codex --version").stdout)
+        self.assertFalse((self.task / "session/codex-executable-installed.json").exists())
+        self.run_tool("stop")
+        self.run_tool("start", "after")
+        self.assertFalse((fixture / "bin/codex").exists())
+        self.assertFalse((fixture / "libexec/codex").exists())
+
+    def test_invalid_real_codex_is_refused_before_waiting_or_spawning(self) -> None:
+        self.built()
+        non_elf = self.root / "script"
+        non_elf.write_text("#!/bin/sh\nexit 0\n")
+        non_elf.chmod(0o755)
+        not_executable = self.codex_elf("not-executable")
+        not_executable.chmod(0o644)
+        unreadable = self.codex_elf("unreadable")
+        unreadable.chmod(0o111)
+        fifo = self.root / "fifo"
+        os.mkfifo(fifo)
+        cases = [
+            ("relative/codex", "absolute path"),
+            (str(non_elf), "ELF executable"),
+            (str(not_executable), "executable file"),
+            (str(self.root), "regular file"),
+            (str(fifo), "regular file"),
+            (str(self.root / "missing"), "No such file"),
+        ]
+        if os.geteuid() != 0:
+            cases.append((str(unreadable), "Permission denied"))
+        with self.native_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            for source, message in cases:
+                with self.subTest(source=source):
+                    result = self.run_tool("start", "after", "--wait-lock", "0",
+                                           "--codex-executable", source, check=False)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(message, result.stderr)
+                    self.assertNotIn("waiting for the native session", result.stdout)
+        self.assertFalse((self.logs / "kwin").exists())
+
+    def test_real_codex_and_an_offline_peer_are_mutually_exclusive(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        for options in (("--codex", "tool-rows", "--codex-executable", str(source)),
+                        ("--codex-executable", str(source), "--codex", "tool-rows")):
+            with self.subTest(options=options):
+                result = self.run_tool("start", "after", *options, check=False)
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("mutually exclusive", result.stderr)
+                self.assertNotIn("waiting for the native session", result.stdout)
+        self.assertTrue(self.lock_is_free(self.native_lock))
+        self.assertFalse((self.logs / "kwin").exists())
+
+    def test_queued_real_codex_uses_the_validated_snapshot(self) -> None:
+        self.built()
+        source = self.codex_elf()
+        original = source.read_bytes()
+        with self.native_lock.open("a") as held:
+            fcntl.flock(held, fcntl.LOCK_EX)
+            child = subprocess.Popen(
+                [str(SCRIPT), "start", "after", "--wait-lock", "30",
+                 "--codex-executable", str(source)], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(lambda: child.poll() is not None or child.terminate())
+            snapshot = self.task / "session/codex-executable.json"
+            for _ in range(100):
+                if snapshot.exists() or child.poll() is not None:
+                    break
+                time.sleep(0.05)
+            self.assertTrue(snapshot.exists())
+            self.assertFalse((self.logs / "kwin").exists())
+            source.write_text("original path replaced while queued")
+            fcntl.flock(held, fcntl.LOCK_UN)
+        stdout, stderr = child.communicate(timeout=30)
+        self.assertEqual(child.returncode, 0, stdout + stderr)
+        installed = self.task / "fixture/libexec/codex/codex"
+        self.assertEqual(installed.read_bytes(), original)
+        receipt = json.loads((self.task / "session/codex-executable-installed.json").read_text())
+        self.assertEqual(receipt["installed_sha256"], hashlib.sha256(original).hexdigest())
 
     def test_the_fixture_has_no_forge_or_network_until_switched_on(self) -> None:
         self.built()
@@ -1642,6 +1768,21 @@ class RemoteEvidence(unittest.TestCase):
         self.assertIn("start before --width 1200 --height 800 --portal gtk --codex tool-rows", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
+
+    def test_pair_forwards_a_real_codex_host_path_without_shell_evaluation(self) -> None:
+        before = self.repository("before", {"src.rs": "old\n"})
+        after = self.repository("after", {"src.rs": "new\n"})
+        steps = self.root / "steps.sh"
+        steps.write_text('evidence shot "real-$SIDE"\n')
+        marker = self.root / "must-not-be-created"
+        executable = f"/a path/codex '$(touch {marker})"
+        self.run_tool("pair", "--before", str(before), "--after", str(after),
+                      "--steps", str(steps), "--width", "900", "--height", "750",
+                      "--codex-executable", executable)
+        calls = self.tool_calls()
+        for side in ("before", "after"):
+            self.assertIn(f"start {side} --width 900 --height 750 --codex-executable {executable}", calls)
+        self.assertFalse(marker.exists())
 
     def test_steps_name_the_fixture_on_the_host(self) -> None:
         before = self.repository("before", {"src.rs": "old\n"})
