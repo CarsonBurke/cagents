@@ -3425,6 +3425,13 @@ fn execute_daemon(command: DaemonCommand) -> Result<CommandOutput, AppError> {
                     socket.display(),
                     crate::version()
                 )
+            } else if daemon_present {
+                format!(
+                    "{} daemon is starting or stopping ({}); cli {}",
+                    instance::NAME,
+                    socket.display(),
+                    crate::version()
+                )
             } else {
                 format!(
                     "{} daemon stopped; cli {}",
@@ -4863,7 +4870,7 @@ mod tests {
             assert_eq!(output.data["running"], false);
             assert_eq!(output.data["inherited_lease"], true);
             assert!(output.data["daemon_version"].is_null());
-            assert!(output.human.contains("stopped"));
+            assert!(!output.human.contains("running"));
             let verified = super::execute_daemon(super::DaemonCommand::VerifyUpdateLease).unwrap();
             assert_eq!(verified.data["inherited_lease"], true);
             // Startup seals either transport even without a child sealing hook.

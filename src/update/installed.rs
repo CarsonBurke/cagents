@@ -253,7 +253,7 @@ pub(super) fn perform(
             root,
             previous,
             original_schema,
-            startup_attempted,
+            startup_owned,
             &guard,
             handoff,
         ) {
@@ -345,7 +345,7 @@ fn rollback_stopped_candidate(
     candidate: &Path,
     previous: &Path,
     schema: Option<u32>,
-    startup_attempted: bool,
+    startup_spawned: bool,
     guard: &crate::instance::UiUpdateGuard,
     handoff: &mut Option<crate::daemon::lease_handoff::LeaseHandoff>,
 ) -> Result<bool, UpdateError> {
@@ -365,7 +365,7 @@ fn rollback_stopped_candidate(
     if crate::daemon::daemon_process_alive_at(&paths).map_err(|error| invalid(error.to_string()))? {
         return Ok(false);
     }
-    if startup_attempted {
+    if startup_spawned {
         let schema = schema.ok_or_else(|| invalid("The previous store schema was not captured"))?;
         candidate_maintenance(
             candidate,
@@ -724,6 +724,16 @@ else: raise AssertionError(sys.argv)
             .is_err()
         );
         assert_eq!(root.join("current").canonicalize().unwrap(), candidate);
+        // A command that never spawned cannot have converted the store; old
+        // recovery must not depend on invoking that unavailable candidate.
+        assert!(
+            rollback_stopped_candidate(&root, &candidate, &old, None, false, &guard, &mut lease,)
+                .unwrap()
+        );
+        assert_eq!(root.join("current").canonicalize().unwrap(), old);
+        assert!(!root.join("converted").exists());
+        fs::remove_file(root.join("current")).unwrap();
+        symlink("versions/candidate", root.join("current")).unwrap();
         fs::remove_file(root.join("fail-conversion")).unwrap();
         // A live metadata owner keeps its matched installation and store.
         lock.seek(SeekFrom::Start(0)).unwrap();
