@@ -48,24 +48,31 @@ class LiveProvider:
                                  + trailing)
         self.process.stdin.flush()
 
+    def receive_ready(self, ready):
+        for key, _ in ready:
+            data = os.read(key.fileobj.fileno(), 65536)
+            if not data:
+                self.selector.unregister(key.fileobj)
+                continue
+            if key.data == "stderr":
+                self.stderr += data
+                continue
+            self.buffers["stdout"] += data
+            while b"\n" in self.buffers["stdout"]:
+                line, self.buffers["stdout"] = self.buffers["stdout"].split(b"\n", 1)
+                self.output.append(json.loads(line))
+
+    def drain_available(self):
+        while ready := self.selector.select(0):
+            self.receive_ready(ready)
+
     def read_until(self, condition, timeout=2):
         deadline = time.monotonic() + timeout
         while not condition():
             remaining = deadline - time.monotonic()
             self.case.assertGreater(remaining, 0, (self.output[-3:], self.stderr))
             self.case.assertTrue(self.selector.get_map(), (self.process.poll(), self.stderr))
-            for key, _ in self.selector.select(min(remaining, .05)):
-                data = os.read(key.fileobj.fileno(), 65536)
-                if not data:
-                    self.selector.unregister(key.fileobj)
-                    continue
-                if key.data == "stderr":
-                    self.stderr += data
-                    continue
-                self.buffers["stdout"] += data
-                while b"\n" in self.buffers["stdout"]:
-                    line, self.buffers["stdout"] = self.buffers["stdout"].split(b"\n", 1)
-                    self.output.append(json.loads(line))
+            self.receive_ready(self.selector.select(min(remaining, .05)))
         return self.output
 
     def deltas(self):
@@ -254,7 +261,12 @@ os.execv("/usr/bin/rm", ["/usr/bin/rm", *args])
         stopped = lambda: any(frame.get("event", {}).get("type") == "content_block_stop"
                               for frame in live.output)
         live.read_until(lambda: marker.exists() or stopped())
-        premature = stopped()
+        # While rm is held, every prior completion write is already in the
+        # pipe. Observe those bytes before accepting the filesystem barrier.
+        live.drain_available()
+        premature = any(frame.get("event", {}).get("type") == "content_block_stop"
+                        or frame.get("type") in ("assistant", "result")
+                        for frame in live.output)
         if premature:
             live.cleanup()
         self.assertFalse(premature, "stream completed before scratch settlement")
