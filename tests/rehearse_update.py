@@ -72,6 +72,18 @@ class Comparison(unittest.TestCase):
         after["sessions"]["lineage"]["state"] = "Stopped"
         self.assertTrue(any(row["regression"] for row in records.compare(before, after)))
 
+    def test_titles_that_follow_content_are_changes_and_blank_titles_are_losses(self):
+        before, after = snapshot(), snapshot()
+        after["windows"]["main"]["title"] = "~/s/alpha (2) \u2014 cagents"
+        after["channels"]["channel"]["title"] = "Offline tool rows"
+        after["stores"]["windows/main/sessions.sqlite3"]["rows"]["cards"][0]["title"] = "bash \u00b7 alpha"
+        changes = records.compare(before, after)
+        self.assertEqual(len(changes), 3)
+        self.assertFalse(any(row["regression"] for row in changes))
+        after["channels"]["channel"]["title"] = ""
+        self.assertTrue(any(row["regression"] and row["kind"] == "channels"
+                            for row in records.compare(before, after)))
+
     def test_evidence_failure_is_not_an_empty_successful_inventory(self):
         before, after = snapshot(), snapshot()
         after["errors"].append("terminals.json: command refused")

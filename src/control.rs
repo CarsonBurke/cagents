@@ -96,6 +96,9 @@ const CHAT_CLOSE_TIMEOUT: Duration = crate::chat::INTERRUPT_TIMEOUT
     .saturating_add(crate::chat::TERMINATE_GRACE)
     .saturating_add(Duration::from_secs(8));
 // Retained-owner cleanup can retire both the native holder and its paired PTY.
+/// Ending a lost conversation's processes gives each a grace period to stop,
+/// then waits for them to be collected, for at most ten seconds in all.
+const LOST_PROCESSES_TIMEOUT: Duration = Duration::from_secs(20);
 const RETAINED_CHAT_CLOSE_TIMEOUT: Duration = Duration::from_secs(75);
 const SNAPSHOT_RETRY_INTERVAL: Duration = Duration::from_millis(25);
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1148,6 +1151,26 @@ impl ControlClient {
         }
     }
 
+    /// What still runs for a conversation whose Cagents helper died, after
+    /// ending those of `end` proved to be the conversation's; see
+    /// [`ClientRequest::ChatLostProcesses`].
+    pub fn lost_chat_processes(
+        &mut self,
+        session: crate::chat::Session,
+        end: Vec<crate::terminal::ipc::ProcessStart>,
+    ) -> Result<Vec<crate::terminal::ipc::LostProcess>, ControlError> {
+        match self.request_with_deadline(
+            ClientRequest::ChatLostProcesses { session, end },
+            Instant::now() + LOST_PROCESSES_TIMEOUT,
+        )? {
+            ServerResponse::ChatLostProcesses { processes } => Ok(processes),
+            response => Err(unexpected_response(
+                "a lost conversation's processes",
+                &response,
+            )),
+        }
+    }
+
     pub fn prepare_chat_resume(
         &mut self,
         source: crate::chat::Session,
@@ -2193,6 +2216,7 @@ fn response_name(response: &ServerResponse) -> &'static str {
         ServerResponse::ChatListed { .. } => "chat_listed",
         ServerResponse::ChatCapacity { .. } => "chat_capacity",
         ServerResponse::ChatReleaseInspected { .. } => "chat_release_inspected",
+        ServerResponse::ChatLostProcesses { .. } => "chat_lost_processes",
         ServerResponse::ChatReleased { .. } => "chat_released",
         ServerResponse::ChatClosed { .. } => "chat_closed",
         ServerResponse::ChatTerminal { .. } => "chat_terminal",

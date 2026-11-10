@@ -216,10 +216,12 @@ use crate::{
 /// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
 /// which reaches every chat subscriber unasked. 157 to 159 are reserved for
 /// parallel branches and are not adopted here.
-/// Version 162 adds a tool status for an agent waiting on its own background
-/// work, which an older client is sent as running. Version 161 is reserved
-/// for parallel branches and is not adopted.
-pub const PROTOCOL_VERSION: u16 = 162;
+/// Version 165 appends `ChatLostProcesses`, which lists and ends what a dead
+/// Cagents helper left running for a conversation, and its reply. 161 to 164
+/// are reserved for parallel branches and are not adopted here.
+/// Version 166 adds a tool status for an agent waiting on its own background
+/// work, which an older client is sent as running.
+pub const PROTOCOL_VERSION: u16 = 166;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -597,6 +599,15 @@ pub enum ClientRequest {
     /// arrives as [`ServerMessage::ConversationPullRequests`].
     WatchConversationPullRequests {
         conversation: TerminalId,
+    },
+    /// Lists what still runs for a conversation whose Cagents helper died,
+    /// which is what holds its Close. It first ends each process in `end`
+    /// that is still the one listed and proved to be the conversation's: the
+    /// ones the person was shown and chose to end. Ends nothing while its
+    /// helper runs.
+    ChatLostProcesses {
+        session: crate::chat::Session,
+        end: Vec<ProcessStart>,
     },
 }
 
@@ -989,6 +1000,11 @@ pub enum ServerResponse {
     Work(crate::work::Response),
     ChannelWork(crate::channel_work_api::Response),
     StartupState(StartupState),
+    /// What [`ClientRequest::ChatLostProcesses`] found still running, after
+    /// ending what it ended.
+    ChatLostProcesses {
+        processes: Vec<LostProcess>,
+    },
 }
 
 /// The daemon's startup recovery, as [`ClientRequest::StartupState`] reports it.
@@ -1033,6 +1049,28 @@ pub struct ChatReleaseProof {
     pub session: crate::chat::Session,
     pub execution_instance: uuid::Uuid,
     pub generation: u64,
+}
+
+/// One process, as it was when it was listed: a PID, and the start time
+/// that tells it apart from a later process given the same PID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ProcessStart {
+    pub pid: i32,
+    /// Clock ticks after boot, as `/proc/<pid>/stat` gives it.
+    pub start: u64,
+}
+
+/// A process that still runs for a conversation whose Cagents helper died.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LostProcess {
+    pub process: ProcessStart,
+    /// The executable's short name, as `ps` shows it.
+    pub name: String,
+    /// Its command line, shortened; empty when it shows none.
+    pub command: String,
+    /// Whether it is proved to be the conversation's, so that Cagents may
+    /// end it. One that isn't is only named, and still holds the Close.
+    pub proved: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

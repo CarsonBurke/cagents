@@ -39,7 +39,7 @@ version. It refuses requests to stop, update or hand off the daemon, and request
 reply the CLI couldn't read, such as `automation history`, `automation run` and
 `automation run-now` on protocols before 156. It withholds notifications the CLI couldn't read.
 What a later protocol only added detail to is sent as the CLI knew it: on
-protocols before 162, a subagent waiting on its own background work reads as
+protocols before 166, a subagent waiting on its own background work reads as
 running.
 Each protocol's postcard wire format is recorded under
 `tests/fixtures/wire-formats/`. A test checks that every listed older protocol

@@ -2692,6 +2692,9 @@ impl Runtime {
                 _ => "Switching or closing this session… Editing and session controls are disabled. You can still read and copy the conversation.",
             }));
         }
+        if let Some(refusal) = self.close_refusal_view() {
+            content.push(refusal);
+        }
         if self.closed_elsewhere {
             content.push(self.closed_draft_controls(transitioning));
         } else if self.capacity_refused {
@@ -9068,6 +9071,7 @@ mod tests {
             .unwrap()
             .set_visible(false)
             .unwrap();
+        app.chat_runtime_mut(target).unwrap().cool();
         preparation::retirement_barrier();
         assert!(runtime(&app, target).cache.is_empty());
         app.chat_runtime_mut(target)
@@ -9296,6 +9300,7 @@ mod tests {
                 .unwrap()
                 .set_visible(false)
                 .unwrap();
+            app.chat_runtime_mut(target).unwrap().cool();
             preparation::retirement_barrier();
             assert!(runtime(&app, target).cache.is_empty());
             app.chat_runtime_mut(target)
@@ -10262,6 +10267,7 @@ mod tests {
                 .unwrap()
                 .set_visible(false)
                 .unwrap();
+            app.chat_runtime_mut(target).unwrap().cool();
             preparation::retirement_barrier();
             assert!(runtime(&app, target).cache.is_empty());
             app.chat_runtime_mut(target)

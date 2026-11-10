@@ -9186,6 +9186,61 @@
               ]
             ]
           }
+        ],
+        [
+          "ChatLostProcesses",
+          {
+            "Struct": [
+              [
+                "session",
+                {
+                  "Container": "cagents::chat::Session"
+                }
+              ],
+              [
+                "end",
+                {
+                  "Seq": {
+                    "Container": "cagents::terminal::ipc::ProcessStart"
+                  }
+                }
+              ]
+            ]
+          }
+        ]
+      ]
+    },
+    "cagents::terminal::ipc::LostProcess": {
+      "Struct": [
+        [
+          "process",
+          {
+            "Container": "cagents::terminal::ipc::ProcessStart"
+          }
+        ],
+        [
+          "name",
+          "Str"
+        ],
+        [
+          "command",
+          "Str"
+        ],
+        [
+          "proved",
+          "Bool"
+        ]
+      ]
+    },
+    "cagents::terminal::ipc::ProcessStart": {
+      "Struct": [
+        [
+          "pid",
+          "I32"
+        ],
+        [
+          "start",
+          "U64"
         ]
       ]
     },
@@ -10132,6 +10187,21 @@
             "Newtype": {
               "Container": "cagents::terminal::ipc::StartupState"
             }
+          }
+        ],
+        [
+          "chat_lost_processes",
+          {
+            "Struct": [
+              [
+                "processes",
+                {
+                  "Seq": {
+                    "Container": "cagents::terminal::ipc::LostProcess"
+                  }
+                }
+              ]
+            ]
           }
         ]
       ]

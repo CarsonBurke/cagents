@@ -263,9 +263,13 @@ def compare(before: dict, after: dict) -> list[dict]:
                     # the change in the report without calling idle a loss.
                     healthy_state = field == "state" and str(b.get(field)).lower() in {"running", "idle", "working", "waiting", "succeeded"}
                     resumed_id = name == "sessions" and field == "id"
+                    # Titles follow live content: a shell's directory, a
+                    # provider-named thread, the focused pane in a window's
+                    # title. Only a title that goes blank was lost.
+                    retitled = field == "title" and (name == "windows" or bool(b.get(field)))
                     changes.append({"kind": name, "id": key, "change": field,
                                     "before": a.get(field), "after": b.get(field),
-                                    "regression": not (healthy_state or resumed_id)})
+                                    "regression": not (healthy_state or resumed_id or retitled)})
         for key in sorted(right.keys() - left.keys()):
             changes.append({"kind": name, "id": key, "change": "added", "regression": False})
     current = {(row["pid"], row["start_ticks"]): row for row in after["processes"]}

@@ -57,7 +57,7 @@ pub struct OlderClient {
 /// across an update to this release and keep running its CLI.
 const CANDIDATE_LINE: OlderClient = OlderClient {
     protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 162,
+    proven_at: 166,
     client_requests: 74,
     server_messages: 17,
     server_responses: 40,
@@ -77,7 +77,7 @@ const FIRING_REPLIES: &[&str] = &["Firing", "History", "Detail"];
 
 /// The first protocol with `ToolStatus::Waiting`. An older client is told such
 /// an agent is running, which is what it was before: it hasn't finished.
-pub(crate) const WAITING_TOOL_STATUS: u16 = 162;
+pub(crate) const WAITING_TOOL_STATUS: u16 = 166;
 
 /// Variants a later protocol appended that a client from before it is sent as
 /// a variant it knows: the enum's type name, the variant, and the protocol that
