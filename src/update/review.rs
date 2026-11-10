@@ -155,7 +155,13 @@ fn items(preview: &Preview) -> Vec<Item> {
                 && (stops_service || live.disposition == Disposition::Blocked)
             {
                 outcome = Outcome::Stops;
-                detail.clear();
+                // A completed turn can still own background agents. Explain
+                // why its idle wait became a stop review instead of hiding
+                // that change behind the ordinary group guidance.
+                if live.disposition != Disposition::Blocked || live.interrupted_subagents.is_empty()
+                {
+                    detail.clear();
+                }
             }
             Item {
                 #[cfg(test)]
@@ -775,6 +781,26 @@ mod tests {
             1,
             "{review}"
         );
+    }
+
+    #[test]
+    fn background_stop_review_explains_why_the_parent_idle_wait_ended() {
+        let mut preview = preview();
+        let mut live = session(
+            "Offline tool rows · alpha",
+            Disposition::Blocked,
+            "Its turn finished, but background agents are still running. Review stopping them to continue the update.",
+        );
+        live.interrupted_subagents
+            .push("child-still-running".into());
+        preview.daemon.as_mut().unwrap().sessions.push(live);
+        let review = render_review(&preview);
+        assert!(review.contains("Stops (1)"), "{review}");
+        assert!(
+            review.contains("its turn finished, but background agents are still running"),
+            "{review}"
+        );
+        assert!(!review.contains("Working now"), "{review}");
     }
 
     #[test]
