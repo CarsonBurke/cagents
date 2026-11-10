@@ -11,6 +11,7 @@ use crate::install_guard::SourceInspectionRequest as Request;
 use crate::{
     chat::Session,
     model::{CardKind, HostSessionProof},
+    update::source::{self, ClientFamily},
     upgrade::handoff,
 };
 use std::{
@@ -79,12 +80,6 @@ impl Reader {
             Self::Legacy68(client) => client.terminals(),
         }
     }
-    fn reconcile_retained(&mut self, source: &Session) -> Result<(), String> {
-        match self {
-            Self::Current(client) => client.reconcile_retained(source),
-            _ => Ok(()),
-        }
-    }
     fn resolve(&mut self, source: &Session) -> Result<Session, String> {
         match self {
             Self::Current(client) => client.resolve(source),
@@ -101,15 +96,10 @@ impl Reader {
 }
 
 fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
-    if !current::supports_protocol(request.protocol)
-        && request.protocol != 77
-        && request.protocol != 68
-    {
-        return Err(
-            "Source protocol has no qualified migration inspector; source windows remain usable"
-                .into(),
-        );
-    }
+    let family = source::client_family(request.protocol).ok_or_else(|| {
+        "Source protocol has no qualified migration inspector; source windows remain usable"
+            .to_owned()
+    })?;
     let proof = request
         .proof
         .as_ref()
@@ -117,12 +107,13 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
         .ok_or("Saved conversations have no authenticated source service")?;
     let socket = crate::terminal::ipc::daemon_socket_path()
         .map_err(|_| "Source service namespace is unavailable")?;
-    if current::supports_protocol(request.protocol) {
-        current::Client::connect(&socket, proof, deadline, request.protocol).map(Reader::Current)
-    } else if request.protocol == 68 {
-        v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68)
-    } else {
-        v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy)
+    match family {
+        ClientFamily::Current => {
+            current::Client::connect(&socket, proof, deadline, request.protocol)
+                .map(Reader::Current)
+        }
+        ClientFamily::V68 => v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68),
+        ClientFamily::V77 => v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy),
     }
 }
 
@@ -245,9 +236,7 @@ fn inspect(request: Request) -> Result<(), String> {
                     continue;
                 }
                 let result = if missing && request.reconcile_retained {
-                    reader
-                        .reconcile_retained(source)
-                        .and_then(|()| reader.resolve(source))
+                    reader.resolve(source)
                 } else if missing {
                     Err(
                         "Saved owner changed after preview; review the recovered inventory again"
@@ -1561,6 +1550,38 @@ mod tests {
         chat::{Launch, NativeContinuity},
         model::{BootId, HostIncarnation, HostSessionId, LaunchRecipe, TerminalId},
     };
+
+    #[test]
+    fn inspector_and_lifecycle_admit_exactly_the_same_source_protocols() {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for protocol in 0..=u16::MAX {
+            let request = Request {
+                protocol,
+                proof: None,
+                require_resumable: true,
+                reconcile_retained: false,
+                accept_unreopenable: false,
+            };
+            // Qualified sources reach the ownership check. Unqualified sources
+            // are refused before reading any service namespace or opening a socket.
+            let error = connect(&request, deadline).err().unwrap();
+            assert_eq!(
+                error == "Saved conversations have no authenticated source service",
+                source::is_qualified_source(protocol),
+                "protocol {protocol}: {error}"
+            );
+            assert_eq!(
+                current::supports_protocol(protocol),
+                source::client_family(protocol) == Some(ClientFamily::Current),
+                "protocol {protocol}"
+            );
+        }
+        assert!(current::supports_protocol(156));
+        assert_eq!(
+            source::protocols().collect::<Vec<_>>(),
+            [68, 77, 128, 156, crate::terminal_ipc::PROTOCOL_VERSION]
+        );
+    }
 
     #[test]
     fn cold_terminal_history_never_requires_replaying_a_launch_or_inventing_an_exit() {

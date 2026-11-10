@@ -74,16 +74,10 @@ pub(super) fn perform(
     accept_unreopenable: bool,
 ) -> Result<(), UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
-    let (source_protocol, source_proof) = source::inspect_identity(None)?;
-    // Retain the existing exact installation boundary even for a legacy peer.
-    let source_owner = installed_daemon_owner(&layout)?;
-    let candidate_source = candidate_can_upgrade_source(
-        root,
-        source_owner.as_ref(),
-        source_protocol,
-        source_proof.as_ref(),
-    );
-    if served_version_root(&layout)? != root || (root == layout.version_root && !candidate_source) {
+    let (source_protocol, _) = source::inspect_identity(None)?;
+    // Retain the exact installation boundary even for an older source.
+    installed_daemon_owner(&layout)?;
+    if served_version_root(&layout)? != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
         ));
