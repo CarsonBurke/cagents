@@ -1145,8 +1145,12 @@ and a `scripts/native-evidence` session. A command already under any memory limi
 keeps that one, even a looser one, and `CAGENTS_MEMORY_MAX` then has no effect. A
 capped command leaves the caller's cgroup, so a caller's CPU quota stops applying
 to it. It doesn't cover outer `cargo-gate test --doc`, `cargo-gate run`, `--hot`,
-tests run on a build host through `cargo-offload`, or a harness that runs Cargo or a
-test binary itself.
+or a harness that runs Cargo or a test binary itself. Test and bench commands
+sent to a build host through `cargo-offload`, including loopback and commands
+inside `exec --hold`, carry the same helper and memory/swap settings to the
+host. The whole remote Cargo test/bench command, including any compilation and
+doctests, runs inside the limit; `--no-run` only compiles and is not capped.
+A missing helper refuses the offloaded test rather than silently losing its cap.
 
 A script's `cargo test` under `cargo-gate exec` reaches the gate's `cargo`, so it is
 covered, and so is its compile, which runs inside the limit there. A UI test rebuild
