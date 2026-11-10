@@ -1669,6 +1669,14 @@ impl Cagents {
     }
 
     pub(super) fn reconcile_shared_views(&mut self) -> Task<Message> {
+        let cancelled = self.cancel_stale_channel_work_restore();
+        let restore = self.channel_work_restore_before_projection();
+        let task = self.reconcile_shared_views_inner();
+        self.channel_work_restore_after_projection(restore);
+        Task::batch([cancelled, task])
+    }
+
+    fn reconcile_shared_views_inner(&mut self) -> Task<Message> {
         self.publish_unpublished_local_chats();
         // A watcher snapshot can announce the destination before the explicit
         // transfer response arrives. Rebase before either snapshot projects.

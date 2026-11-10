@@ -947,6 +947,7 @@ impl Cagents {
         if self.workspace_model.identity == NO_REGISTRY {
             return Task::none();
         }
+        self.bind_channel_work_restore_repository();
         // Taken rather than cloned: reconciling needs `&mut self` for the
         // window's own store, and the model is put back untouched.
         let model = std::mem::take(&mut self.workspace_model);
@@ -1076,6 +1077,7 @@ impl Cagents {
         // sources before reconciliation persists. Publishing earlier would mix
         // old descriptors with newly received pending-start flags.
         tasks.push(self.reconcile_shared_views());
+        tasks.push(self.restore_pending_channel_work());
         if changed {
             self.refresh_sidebar_channels();
             tasks.push(self.sync_chrome());
@@ -1489,6 +1491,7 @@ impl Cagents {
             return Adoption::Retained;
         }
         if !repository.is_dir() {
+            self.channel_work_restore_project_unavailable(repository);
             // Not a repository this window can read - it may live on a
             // filesystem that is not mounted here. The row stays in the model
             // and renders nothing, rather than becoming a project that cannot

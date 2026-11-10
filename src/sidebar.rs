@@ -147,7 +147,7 @@ impl SidebarMode {
 }
 
 /// Coarse filters which can be combined with the free-text query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum SidebarFilter {
     #[default]
     All,
@@ -1379,7 +1379,9 @@ impl SidebarFocus {
 
 /// The collapsible sections of the Changes tab: one per working-tree change
 /// area, so every group discloses the same way rather than `Untracked` alone.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub enum PanelSection {
     Conflicts,
     Staged,
@@ -1427,8 +1429,20 @@ impl PanelSection {
 /// ordered from nearest to farthest: what is not committed yet, what this
 /// branch changes, then every commit behind it.
 ///
-/// Local to the surface and never persisted; see [`SidebarState`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+/// Local to the surface and restored with its window; see [`SidebarState`].
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum ChangesTab {
     #[default]
     Changes,
@@ -2721,7 +2735,7 @@ enum PanelSelection {
     Commit { oid: Oid, path: RepoPath },
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum FileListMode {
     #[default]
     Tree,
@@ -2746,6 +2760,20 @@ pub struct SidebarView {
     expanded_directories: BTreeSet<RepoPath>,
     #[serde(default)]
     collapsed_change_directories: Vec<(ChangeTreeScope, Vec<RepoPath>)>,
+    #[serde(default)]
+    filter: SidebarFilter,
+    #[serde(default)]
+    toggled_sections: BTreeSet<PanelSection>,
+    #[serde(default)]
+    panel_open: bool,
+    #[serde(default)]
+    files_query: String,
+    #[serde(default)]
+    files_filter_open: bool,
+    #[serde(default)]
+    change_list_mode: FileListMode,
+    #[serde(default)]
+    changes_tab: ChangesTab,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2945,6 +2973,13 @@ impl SidebarState {
                 String::new()
             },
             controls_expanded: self.controls_expanded,
+            filter: self.filter,
+            toggled_sections: self.toggled_sections.clone(),
+            panel_open: self.panel_open,
+            files_query: self.files_query.clone(),
+            files_filter_open: self.files_filter_open,
+            change_list_mode: self.change_list_mode,
+            changes_tab: self.changes_tab,
             collapsed_projects: self.collapsed_projects.clone(),
             selection: self.selection,
             expanded_directories: self.expanded_directories.clone(),
@@ -2964,6 +2999,17 @@ impl SidebarState {
             String::new()
         };
         self.controls_expanded = view.controls_expanded;
+        self.filter = if !view.controls_expanded && view.filter == SidebarFilter::PullRequests {
+            SidebarFilter::All
+        } else {
+            view.filter
+        };
+        self.toggled_sections = view.toggled_sections;
+        self.panel_open = view.panel_open;
+        self.files_query = view.files_query;
+        self.files_filter_open = view.files_filter_open;
+        self.change_list_mode = view.change_list_mode;
+        self.changes_tab = view.changes_tab;
         self.collapsed_projects = view.collapsed_projects;
         self.selection = view.selection;
         self.expanded_directories = view.expanded_directories;

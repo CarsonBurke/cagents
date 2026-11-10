@@ -9,6 +9,64 @@ use crate::{
 /// Bound a deferred reopen's wait without assuming the retirement was refused.
 pub(super) const RETIREMENT_ANSWERED: std::time::Duration = std::time::Duration::from_secs(10);
 
+/// Restoring a presentation is startup work, not an instruction to reopen it
+/// indefinitely if its project never becomes available.
+const RESTORE_TIMEOUT: Duration = Duration::from_secs(30);
+
+struct PendingRestore {
+    home: Home,
+    token: uuid::Uuid,
+    armed: Instant,
+    navigation: RestoreNavigation,
+    repository: Option<PathBuf>,
+    project_unavailable: bool,
+}
+
+struct RestoreNavigation {
+    scope: RestoreScope,
+    focused: Option<CardId>,
+    settings_category: SettingsCategory,
+    settings_search: String,
+}
+
+enum RestoreScope {
+    Home,
+    Channel(ChannelId),
+    Worktree(PathBuf),
+}
+
+impl RestoreNavigation {
+    fn capture(app: &Cagents) -> Self {
+        Self {
+            scope: match (app.durable.active_channel, &app.active_workspace) {
+                (Some(channel), _) => RestoreScope::Channel(channel),
+                (None, Some(path)) => RestoreScope::Worktree(path.clone()),
+                (None, None) => RestoreScope::Home,
+            },
+            focused: app.workspace.focused(),
+            settings_category: app.settings_category,
+            settings_search: app.settings_search.clone(),
+        }
+    }
+
+    fn matches(&self, app: &Cagents) -> bool {
+        let same_scope = match (
+            &self.scope,
+            app.durable.active_channel,
+            &app.active_workspace,
+        ) {
+            (RestoreScope::Channel(expected), Some(current), _) => *expected == current,
+            (RestoreScope::Worktree(expected), None, Some(current)) => expected == current,
+            (RestoreScope::Home, None, None) => true,
+            _ => false,
+        };
+        same_scope
+            && self.focused == app.workspace.focused()
+            && self.settings_category == app.settings_category
+            && self.settings_search == app.settings_search
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum Surface {
     Conversations,
@@ -38,6 +96,9 @@ pub(super) struct State {
     restore_card: Option<CardId>,
     deferred: Option<Deferred>,
     navigation_view: Option<ui::ViewOwner>,
+    /// The saved surface waits for authoritative registry/catalog evidence.
+    /// Explicit navigation cancels this request while startup is connecting.
+    pending_restore: Option<PendingRestore>,
 }
 
 impl Default for State {
@@ -53,6 +114,7 @@ impl Default for State {
             restore_card: None,
             deferred: None,
             navigation_view: None,
+            pending_restore: None,
         }
     }
 }
@@ -106,6 +168,170 @@ impl Cagents {
         self.channel_work.main && self.channel_work.view.is_open()
     }
 
+    pub(super) fn saved_channel_work(&self) -> Option<Home> {
+        if self.channel_work_is_main() {
+            self.channel_work.view.home()
+        } else {
+            self.channel_work
+                .pending_restore
+                .as_ref()
+                .filter(|pending| self.channel_work_restore_valid(pending))
+                .map(|pending| pending.home)
+        }
+    }
+
+    pub(super) fn restore_channel_work(&mut self, home: Option<Home>) -> Task<Message> {
+        self.channel_work.pending_restore =
+            home.filter(|home| home.validate().is_ok())
+                .map(|home| PendingRestore {
+                    home,
+                    token: uuid::Uuid::new_v4(),
+                    armed: Instant::now(),
+                    navigation: RestoreNavigation::capture(self),
+                    repository: None,
+                    project_unavailable: false,
+                });
+        let restore = self.restore_pending_channel_work();
+        let Some(pending) = &self.channel_work.pending_restore else {
+            return restore;
+        };
+        let token = pending.token;
+        Task::batch([
+            restore,
+            cosmic::task::future(async move {
+                tokio::time::sleep(RESTORE_TIMEOUT).await;
+                Message::ChannelWorkRestoreExpired(token)
+            }),
+        ])
+    }
+
+    /// Bootstrap can create an unsaved default pane before the window is
+    /// published. Fence navigation from that finished initial view, not from
+    /// the intermediate strip that happened to be loaded from storage.
+    pub(super) fn finish_window_restore(&mut self) {
+        let navigation = RestoreNavigation::capture(self);
+        if let Some(pending) = &mut self.channel_work.pending_restore {
+            pending.navigation = navigation;
+            pending.armed = Instant::now();
+        }
+    }
+
+    pub(super) fn bind_channel_work_restore_repository(&mut self) {
+        if let Some(pending) = &mut self.channel_work.pending_restore
+            && self.workspace_model.identity == pending.home.registry
+            && let Some(channel) = self.workspace_model.channel(pending.home.channel)
+        {
+            pending.repository = Some(channel.repository.clone());
+        }
+    }
+
+    pub(super) fn channel_work_restore_before_projection(&self) -> Option<uuid::Uuid> {
+        self.channel_work
+            .pending_restore
+            .as_ref()
+            .filter(|pending| self.channel_work_restore_valid(pending))
+            .map(|pending| pending.token)
+    }
+
+    /// Canonical pane adoption and automatic placeholders can replace focus
+    /// without choosing another view. Scope changes and interaction remain
+    /// fenced; only the pure projection's focus replacement is accepted.
+    pub(super) fn channel_work_restore_after_projection(&mut self, token: Option<uuid::Uuid>) {
+        if let Some(pending) = &mut self.channel_work.pending_restore
+            && Some(pending.token) == token
+            && !self.input_trace.interacted_since(pending.armed)
+        {
+            pending.navigation.focused = self.workspace.focused();
+        }
+    }
+
+    fn channel_work_restore_valid(&self, pending: &PendingRestore) -> bool {
+        !pending.project_unavailable
+            && pending.armed.elapsed() < RESTORE_TIMEOUT
+            && !self.input_trace.interacted_since(pending.armed)
+            && pending.navigation.matches(self)
+            && (self.workspace_model.identity == crate::workspace_model::NO_REGISTRY
+                || self.workspace_model.identity == pending.home.registry
+                    && self
+                        .workspace_model
+                        .channel(pending.home.channel)
+                        .is_some_and(|channel| {
+                            channel.ordinal == pending.home.creation_ordinal
+                                && !self.project_ui.closed.contains(&channel.repository)
+                                && !self
+                                    .sidebar_model
+                                    .projects
+                                    .iter()
+                                    .find(|project| project.repository == channel.repository)
+                                    .is_some_and(|project| {
+                                        project.unreachable.is_some() && !project.reloading
+                                    })
+                        }))
+    }
+
+    /// Check the destination itself, not the message that happened to change
+    /// it. New navigation handlers and external activations inherit this fence.
+    /// Raw interaction also retires the lease when the chosen view is unchanged.
+    pub(super) fn cancel_stale_channel_work_restore(&mut self) -> Task<Message> {
+        if self
+            .channel_work
+            .pending_restore
+            .as_ref()
+            .is_some_and(|pending| !self.channel_work_restore_valid(pending))
+        {
+            return self.abandon_channel_work_restore();
+        }
+        Task::none()
+    }
+
+    pub(super) fn abandon_channel_work_restore(&mut self) -> Task<Message> {
+        if self.channel_work.pending_restore.take().is_none() {
+            return Task::none();
+        }
+        self.persist();
+        self.save_settings_task(false)
+    }
+
+    pub(super) fn expire_channel_work_restore(&mut self, token: uuid::Uuid) -> Task<Message> {
+        if self
+            .channel_work
+            .pending_restore
+            .as_ref()
+            .is_some_and(|pending| pending.token == token)
+        {
+            return self.abandon_channel_work_restore();
+        }
+        Task::none()
+    }
+
+    pub(super) fn channel_work_restore_project_unavailable(&mut self, repository: &Path) {
+        if let Some(pending) = &mut self.channel_work.pending_restore
+            && pending.repository.as_deref() == Some(repository)
+        {
+            pending.project_unavailable = true;
+        }
+    }
+
+    /// A saved channel ID alone is insufficient: a registry replacement or
+    /// channel reincarnation must not reopen another channel's Work surface.
+    /// Run after model projection so select_channel can use the local catalog.
+    pub(super) fn restore_pending_channel_work(&mut self) -> Task<Message> {
+        let cancelled = self.cancel_stale_channel_work_restore();
+        let Some(pending) = &self.channel_work.pending_restore else {
+            return cancelled;
+        };
+        let home = pending.home;
+        if self.workspace_model.identity == crate::workspace_model::NO_REGISTRY {
+            return Task::none();
+        }
+        // The registry can arrive before a channel's project finishes opening.
+        if self.channel_directory(home.channel).is_none() {
+            return Task::none();
+        }
+        self.channel_work.pending_restore = None;
+        self.open_channel_work(home.channel)
+    }
+
     pub(super) fn channel_home(&self) -> Option<(Home, String)> {
         if self.channel_work_is_main() {
             return Some((
@@ -150,6 +376,7 @@ impl Cagents {
     }
 
     pub(super) fn open_channel_work(&mut self, channel: ChannelId) -> Task<Message> {
+        self.channel_work.pending_restore = None;
         if self.channel_work.view.has_confirmation() {
             return Task::none();
         }
@@ -906,6 +1133,10 @@ mod tests {
         views::{Scope, View},
     };
     use cosmic::iced::futures::StreamExt;
+
+    mod restore {
+        include!("channel_work_restore_tests.rs");
+    }
 
     fn captured() -> Home {
         Home {

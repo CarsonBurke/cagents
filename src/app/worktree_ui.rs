@@ -370,7 +370,8 @@ impl Cagents {
     /// when the user opens it from the sidebar. The switch is saved with the
     /// next save, or within [`NAVIGATION_SAVE_DELAY`].
     pub(super) fn navigate_to_channel(&mut self, id: ChannelId) -> Task<Message> {
-        self.show_channel(id, DurableChange::Navigation)
+        let restore = self.abandon_channel_work_restore();
+        Task::batch([restore, self.show_channel(id, DurableChange::Navigation)])
     }
 
     fn show_channel(&mut self, id: ChannelId, change: DurableChange) -> Task<Message> {
@@ -728,7 +729,11 @@ impl Cagents {
     /// saved with the next save, or within [`NAVIGATION_SAVE_DELAY`]; a
     /// default pane opened for an empty worktree saves itself.
     pub(super) fn navigate_to_worktree(&mut self, path: PathBuf) -> Task<Message> {
-        self.show_worktree(path, true, DurableChange::Navigation).1
+        let restore = self.abandon_channel_work_restore();
+        Task::batch([
+            restore,
+            self.show_worktree(path, true, DurableChange::Navigation).1,
+        ])
     }
 
     fn show_worktree(
@@ -959,10 +964,69 @@ impl Cagents {
         )
     }
 
+    /// Exercise pre-window-view stores through the legacy test adapter.
+    #[cfg(test)]
+    pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
+        self.restore_workspace_scope(false)
+    }
+
+    /// The nearest surviving project can provide a useful destination after
+    /// its saved checkout disappeared. An unrelated project's first worktree
+    /// is never a substitute for the removed one.
+    fn surviving_project_scope(&self, removed: &Path) -> Option<PathBuf> {
+        self.sidebar_model
+            .projects
+            .iter()
+            .filter_map(|project| {
+                let root = project
+                    .repository
+                    .parent()
+                    .filter(|parent| sidebar::is_primary_worktree(&project.repository, parent))
+                    .unwrap_or(&project.repository);
+                if !removed.starts_with(root)
+                    && !project
+                        .worktrees
+                        .iter()
+                        .any(|worktree| worktree.path == removed)
+                {
+                    return None;
+                }
+                let available = |path: &Path| path != removed && worktree_directory_available(path);
+                let target = project
+                    .worktrees
+                    .iter()
+                    .filter(|worktree| available(&worktree.path))
+                    .min_by_key(|worktree| {
+                        !sidebar::is_primary_worktree(&project.repository, &worktree.path)
+                    })
+                    .map(|worktree| worktree.path.clone())
+                    .or_else(|| {
+                        (project.kind == ProjectKind::Folder && available(&project.repository))
+                            .then(|| project.repository.clone())
+                    })?;
+                Some((root.components().count(), target))
+            })
+            .max_by_key(|(depth, _)| *depth)
+            .map(|(_, target)| target)
+    }
+
     /// Must run before initialize_runtimes so hidden restored terminals are
     /// admitted as offscreen, not with another worktree's persisted exposure.
-    pub(super) fn restore_worktree_scope(&mut self) -> Task<Message> {
+    pub(super) fn restore_workspace_scope(&mut self, has_saved_view: bool) -> Task<Message> {
         Arc::make_mut(&mut self.durable).normalize_channels();
+        // At startup these roots come from every catalog record, including
+        // retired ones. Check that evidence before directory-bearing panes add
+        // inferred roots: a live unregistered launch directory remains valid.
+        let removed_scope = self.durable.active_worktree.clone().filter(|scope| {
+            let catalogued = self.known_worktree_roots.contains(scope);
+            (!worktree_directory_available(scope) && (has_saved_view || catalogued))
+                || (catalogued && self.sidebar_model.worktree_at(scope).is_none())
+        });
+        if let Some(scope) = &removed_scope {
+            // Retained panes keep their former boundary instead of falling
+            // into the surviving parent project's strip.
+            self.known_worktree_roots.insert(scope.clone());
+        }
         self.refresh_worktree_owners(None);
         self.worktree_focus.clone_from(&self.durable.worktree_focus);
         if let Some(id) = self.durable.active_channel {
@@ -978,7 +1042,13 @@ impl Cagents {
             Arc::make_mut(&mut self.durable).active_channel = None;
         }
         if let Some(scope) = self.durable.active_worktree.clone() {
-            return self.select_worktree(scope, false);
+            if removed_scope.is_none() {
+                return self.select_worktree(scope, false);
+            }
+            Arc::make_mut(&mut self.durable).active_worktree = None;
+            if let Some(fallback) = self.surviving_project_scope(&scope) {
+                return self.select_worktree(fallback, false);
+            }
         }
         let focused = self.durable.focused.and_then(|id| {
             self.durable
@@ -986,17 +1056,39 @@ impl Cagents {
                 .iter()
                 .find(|card| card.id == id && card.existence.is_open())
         });
-        let owner = focused
-            .filter(|card| self.card_worktree(card).is_some())
-            .or_else(|| {
-                self.durable
-                    .cards
-                    .iter()
-                    .find(|card| card.existence.is_open() && self.card_worktree(card).is_some())
+        // A saved window view comes from a build that records active scopes:
+        // their absence means home. Only older stores without a view need to
+        // infer a scope from their focused pane's directory.
+        let Some(owner) = focused.filter(|card| {
+            !has_saved_view && removed_scope.is_none() && self.card_worktree(card).is_some()
+        }) else {
+            // Shared panes are retained in every window's store even when the
+            // window has never entered their workspace. No selected scope and
+            // no focused pane is Workspace home, not a request to open the
+            // first retained terminal. Home may also hold global utilities or
+            // adopted terminals outside any known worktree; restore those only
+            // when this window actually had a pane focused.
+            let mut home = self.durable.as_ref().clone();
+            home.cards.retain(|card| {
+                focused.is_some()
+                    && card.existence.is_open()
+                    && !self.durable.card_scopes.contains_key(&card.id)
+                    && card_directory(card)
+                        .is_none_or(|directory| self.worktree_scope_for(directory).is_none())
+                    && !self
+                        .durable
+                        .channels
+                        .iter()
+                        .any(|channel| channel.cards.contains(&card.id))
             });
-
-        let Some(owner) = owner else {
-            return Task::none();
+            let width = self.workspace.viewport_width();
+            self.workspace = Self::rebuild_workspace(&home);
+            self.workspace.resize_viewport(width);
+            if removed_scope.is_some() {
+                Arc::make_mut(&mut self.durable).focused = self.workspace.focused();
+                self.persist();
+            }
+            return self.rebind_source_control();
         };
         let root = self
             .card_worktree(owner)
