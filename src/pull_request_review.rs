@@ -4713,10 +4713,11 @@ pub(crate) mod tests {
                 assert!(state.notice.as_deref().unwrap().contains("Retrying at"));
             }
 
-            // A successful in-flight load clears transient failures, while a
-            // server deadline learned by another poller remains authoritative.
+            // A UI completion has no credential authority. Only the service
+            // that completed the request may clear its captured host budget;
+            // a late callback must not alter another account's current budget.
             finish_load(&mut state, loaded(vec![], vec![]));
-            assert_eq!(crate::github::polling::ready(host, false), manual_allowed);
+            assert!(!crate::github::polling::ready(host, false));
             assert!(!state.refreshing);
         }
     }
