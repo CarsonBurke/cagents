@@ -138,6 +138,7 @@ pub(crate) fn sanitize_child_environment(command: &mut Command) {
         crate::instance::INSTALL_GUARD_ENV,
         crate::instance::DAEMON_FENCE_ENV,
         crate::daemon::lease_handoff::DAEMON_LEASE_ENV,
+        "CAGENTS_UPDATE_RECOVERY_FD",
         RESULT_FD_ENV,
         crate::update::recovery::CENSUS_ENV,
         crate::update::recovery::OUTCOME_ENV,
@@ -785,6 +786,44 @@ fn running_owner_bin(prefix: &Path, executable: &Path) -> io::Result<std::path::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lease_handoff_ordinary_child_receives_no_recovery_authority() {
+        if !crate::daemon::isolated_handoff_coordinator() {
+            return;
+        }
+        let file = tempfile::tempfile().unwrap();
+        let descriptor = file.as_raw_fd();
+        let mut child = Command::new("/bin/sh");
+        child
+            .args([
+                "-c",
+                r#"
+            test -z "${CAGENTS_UPDATE_RECOVERY_FD+x}" || exit 91
+            for fd in 189 193 194 195 196; do
+                test ! -e "/proc/self/fd/$fd" || exit 92
+            done
+        "#,
+            ])
+            .env("CAGENTS_UPDATE_RECOVERY_FD", "193");
+        sanitize_child_environment(&mut child);
+        // Model authority slots before the ordinary-child sealing hook. No
+        // parent descriptor is remapped, and the isolated coordinator has no
+        // concurrent fork that could retain a copied description.
+        unsafe {
+            child.pre_exec(move || {
+                for target in [189, 193, 194, 195, 196] {
+                    if libc::dup2(descriptor, target) == -1
+                        || libc::fcntl(target, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                crate::daemon::seal_inherited_descriptors()
+            });
+        }
+        assert!(child.status().unwrap().success());
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

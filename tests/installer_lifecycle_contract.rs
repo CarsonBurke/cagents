@@ -2,6 +2,130 @@
 
 use std::{fs, os::unix::fs::PermissionsExt, path::Path, process::Command};
 
+// Opaque transport only: these descriptors are not a usable production
+// recovery receipt, and validating them never marks a fixture daemon Ready.
+struct RecoveryTransportFixture {
+    descriptors: Vec<(i32, fs::File)>,
+}
+
+impl RecoveryTransportFixture {
+    const PAYLOAD: &'static [u8] =
+        b"opaque installer transport fixture; no recovery authorization\n";
+
+    fn new(root: &Path, daemon: &fs::File, candidate: &Path) -> Self {
+        use std::io::Write;
+        use std::os::{
+            fd::{AsRawFd, FromRawFd},
+            unix::fs::{MetadataExt, OpenOptionsExt},
+        };
+        let raw = unsafe {
+            libc::memfd_create(
+                c"installer-transport-fixture".as_ptr(),
+                libc::MFD_CLOEXEC | libc::MFD_ALLOW_SEALING,
+            )
+        };
+        assert!(raw >= 0);
+        let mut receipt = unsafe { fs::File::from_raw_fd(raw) };
+        receipt.write_all(Self::PAYLOAD).unwrap();
+        assert_eq!(unsafe { libc::fchmod(raw, 0o600) }, 0);
+        assert_eq!(
+            unsafe {
+                libc::fcntl(
+                    raw,
+                    libc::F_ADD_SEALS,
+                    libc::F_SEAL_SEAL
+                        | libc::F_SEAL_SHRINK
+                        | libc::F_SEAL_GROW
+                        | libc::F_SEAL_WRITE,
+                )
+            },
+            0
+        );
+        let mut roles = Vec::new();
+        for (fd, name, shared) in [
+            (189, "legacy", true),
+            (194, "worker", false),
+            (195, "ui", false),
+        ] {
+            let path = root.join(format!("transport-{name}.lock"));
+            let file = fs::OpenOptions::new()
+                .create_new(true)
+                .read(true)
+                .write(true)
+                .mode(0o600)
+                .open(&path)
+                .unwrap();
+            let mode = if shared { libc::LOCK_SH } else { libc::LOCK_EX };
+            assert_eq!(
+                unsafe { libc::flock(file.as_raw_fd(), mode | libc::LOCK_NB) },
+                0
+            );
+            roles.push((fd, file, Some(path), shared));
+        }
+        roles.push((193, receipt, None, false));
+        roles.push((
+            196,
+            daemon.try_clone().unwrap(),
+            Some(root.join("runtime/worker-held.lock")),
+            false,
+        ));
+        let mut descriptors = Vec::new();
+        let mut identities = serde_json::Map::new();
+        for (fd, file, path, shared) in roles {
+            // Keep source descriptors above all remap targets. Each duplicate
+            // retains the same OFD; a post-start shared offset proves that too.
+            let raw = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 220) };
+            assert!(raw >= 220);
+            let file = unsafe { fs::File::from_raw_fd(raw) };
+            let metadata = file.metadata().unwrap();
+            identities.insert(fd.to_string(), serde_json::json!({"dev":metadata.dev(),"ino":metadata.ino(),"offset":9000 + fd,"path":path,"shared":shared}));
+            assert_eq!(
+                unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_SET) },
+                0
+            );
+            descriptors.push((fd, file));
+        }
+        fs::write(root.join("recovery-identities.json"), serde_json::to_vec(&serde_json::json!({"roles":identities,"payload":String::from_utf8_lossy(Self::PAYLOAD),"candidate":candidate})).unwrap()).unwrap();
+        Self { descriptors }
+    }
+
+    fn inherit(&self, command: &mut Command) {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        let mapping: Vec<_> = self
+            .descriptors
+            .iter()
+            .map(|(target, file)| (file.as_raw_fd(), *target))
+            .collect();
+        command.env("CAGENTS_UPDATE_RECOVERY_FD", "193");
+        // SAFETY: only descriptor syscalls run after fork; self owns every
+        // source until the child has exited and the observations are checked.
+        unsafe {
+            command.pre_exec(move || {
+                for (source, target) in &mapping {
+                    if libc::dup2(*source, *target) == -1
+                        || libc::fcntl(*target, libc::F_SETFD, 0) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
+    fn assert_shared_offsets(&self, forwarded: bool) {
+        use std::os::fd::AsRawFd;
+        for (target, file) in &self.descriptors {
+            let expected = if forwarded { 9000 + *target } else { 0 };
+            assert_eq!(
+                unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) },
+                i64::from(expected),
+                "transport fd {target} lost its open-file description or reached an unintended process"
+            );
+        }
+    }
+}
+
 // Exercise both public uninstall entrypoints. They share the upgrade gate that
 // must recognize the CLI's JSON before removing an existing installation.
 fn uninstall_fixture(script: &str, status: &str, expect_removal: bool) {
@@ -262,6 +386,11 @@ fn coordinated_release_mode(
     stage_only: bool,
 ) {
     let handoff = restart.is_some_and(|mode| mode.starts_with("handoff-"));
+    let orphan_bundle = coordinator == "bundle-orphan" || restart == Some("handoff-orphan-ui");
+    let recovery_bundle = handoff || orphan_bundle;
+    let bundle_forwarded = handoff && publish_failure.is_none() && !orphan_bundle;
+    let maintenance = restart == Some("handoff-maintenance-failure");
+    let bootstrap = restart == Some("handoff-bootstrap");
     let home = tempfile::tempdir().unwrap();
     let coordinator_bin = home.path().join("coordinator-bin");
     fs::create_dir(&coordinator_bin).unwrap();
@@ -282,6 +411,18 @@ fn coordinated_release_mode(
     }
     let status = r#"#!/bin/sh
 CLI=old
+if [ "$CLI:$*:$FIXTURE_RECOVERY_START_EXPECTED" = 'new:daemon start:true' ]; then
+  "$FIXTURE_RECOVERY_CHECK" "$0" || exit 97
+  # Model the real CLI's early sealing/consumption: no ordinary helper below
+  # this point may inherit bundle or daemon startup authority.
+  eval 'exec 189<&- 193<&- 194<&- 195<&- 196<&-'
+  unset CAGENTS_UPDATE_RECOVERY_FD
+else
+  [ -z "${CAGENTS_UPDATE_RECOVERY_FD:-}" ] || exit 97
+  for transport_fd in 189 193 194 195 196; do
+    [ ! -e /proc/self/fd/$transport_fd ] || exit 97
+  done
+fi
 fixture_recovery_receipt() {
   printf '{"version":1,"transaction":"00000000-0000-4000-8000-000000000001","census_digest":"0000000000000000000000000000000000000000000000000000000000000000","outcome":{"state":"%s"' "$2" > "$1"
   # These are mocked helper observations; the native proof is tested through
@@ -299,7 +440,7 @@ fixture_recovery_receipt() {
 }
 if [ "$FIXTURE_HANDOFF" = true ]; then
   case "$CLI:$*" in
-    'new:daemon verify-update-lease'|'new:daemon start')
+    'new:daemon verify-update-lease'|'new:daemon start'|'new:daemon store-schema'|'new:daemon downgrade-store 22')
       "$FIXTURE_LEASE_CHECK" || exit 97
       # Match CLI startup: ordinary helpers cannot retain update authority.
       exec 3<&-
@@ -428,9 +569,18 @@ case "$*" in
     ;;
   'daemon store-schema --help'|'daemon downgrade-store --help')
     [ "$#" -eq 3 ] || exit 98
-    # This legacy CLI predates store conversion. The installer may discover
-    # that with read-only help probes; unknown operations still fail below.
+    # Maintenance uses only the daemon lease, never the recovery bundle.
+    if [ "$CLI" = new ] && [ "$FIXTURE_MAINTENANCE" = true ]; then exit 0; fi
     exit 64
+    ;;
+  'daemon store-schema')
+    [ "$CLI" = new ] && [ "$FIXTURE_MAINTENANCE" = true ] || exit 98
+    printf 'new:schema\n' >> "$FIXTURE_ACTIONS"
+    printf '22\n'
+    ;;
+  'daemon downgrade-store 22')
+    [ "$CLI" = new ] && [ "$FIXTURE_MAINTENANCE" = true ] || exit 98
+    printf 'new:downgrade:22\n' >> "$FIXTURE_ACTIONS"
     ;;
   'daemon --help')
     [ "$#" -eq 2 ] || exit 98
@@ -473,7 +623,7 @@ case "$*" in
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
-    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ] || [ "$FIXTURE_RESTART" = handoff-start-failure ] || [ "$FIXTURE_RESTART" = empty-recovery-unready ]; }; then exit 4; fi
+    if [ "$CLI" = new ] && { [ "$FIXTURE_RESTART" = start-failure ] || [ "$FIXTURE_RESTART" = empty-start-failure ] || [ "$FIXTURE_RESTART" = handoff-start-failure ] || [ "$FIXTURE_RESTART" = handoff-maintenance-failure ] || [ "$FIXTURE_RESTART" = empty-recovery-unready ]; }; then exit 4; fi
     if [ -e "$FIXTURE_CHECKPOINT" ]; then
       [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
       expected=versions/old
@@ -500,7 +650,10 @@ esac
     let archive_root = home.path().join("archive");
     let candidate = archive_root.join("cagents-9.9.9");
     fs::create_dir_all(candidate.join("bin")).unwrap();
-    let candidate_cli = status.replace("CLI=old", "CLI=new");
+    let candidate_cli =
+        status
+            .replace("CLI=old", "CLI=new")
+            .replacen("#!/bin/sh", "#!/bin/bash", 1);
     executable(&candidate.join("bin/cagents"), &candidate_cli);
     for binary in ["cagents-ui", "cagentsd", "cagents-uninstall"] {
         executable(&candidate.join("bin").join(binary), "#!/bin/sh\nexit 0\n");
@@ -569,7 +722,8 @@ trap - TERM
 # exit failure here would also roll back and hide broken signal forwarding.
 sleep 1"#
         } else if failure == "external-recovery" {
-            r#"printf 'new\n' > "$FIXTURE_RUNNING"; printf 'external:ready\n' >> "$FIXTURE_ACTIONS"; exit 8"#
+            r#"if [ -e "$FIXTURE_CHECKPOINT" ]; then cp "$FIXTURE_CHECKPOINT" "$FIXTURE_RESTORED"; fi
+printf 'new\n' > "$FIXTURE_RUNNING"; printf 'external:ready\n' >> "$FIXTURE_ACTIONS"; exit 8"#
         } else if failure == "signal" {
             "kill -TERM \"$PPID\"; exit 8"
         } else {
@@ -652,7 +806,7 @@ esac
 "#,
     );
     let utility_log = home.path().join("utility-descriptors");
-    if handoff {
+    if recovery_bundle {
         // Every external installer utility is checked at exec, including
         // utilities reached through pipelines, substitutions and find -exec.
         for tool in [
@@ -699,7 +853,12 @@ esac
                     r#"#!/usr/bin/python3
 import errno, os, sys
 assert 'CAGENTS_DAEMON_LEASE_FD' not in os.environ
-for fd in (3, 199):
+assert 'CAGENTS_UPDATE_RECOVERY_FD' not in os.environ
+if os.environ['FIXTURE_BOOTSTRAP'] == 'true' and {tool:?} == 'id':
+    parent = os.stat('/proc/' + str(os.getppid()) + '/exe')
+    expected = os.stat('/bin/bash')
+    assert (parent.st_dev, parent.st_ino) == (expected.st_dev, expected.st_ino), 'installer did not bootstrap system Bash before utilities'
+for fd in (3, 189, 193, 194, 195, 196, 199):
     try:
         os.fstat(fd)
     except OSError as error:
@@ -736,11 +895,11 @@ os.execv(target, [target, *sys.argv[1:]])
     let running = home.path().join("running");
     let checkpoint = home.path().join("checkpoint");
     let restored = home.path().join("restored");
-    if handoff {
+    if handoff && !maintenance {
         // Prepare/checkpoint already completed in the worker; the installer
         // receives a held lock and no running service, just as after shutdown.
         fs::write(&checkpoint, "exact-conversation-and-shells\n").unwrap();
-    } else if coordinator != "stage-no-source" {
+    } else if !handoff && coordinator != "stage-no-source" {
         fs::write(&running, "old\n").unwrap();
     }
     let runtime = home.path().join("runtime");
@@ -750,7 +909,29 @@ os.execv(target, [target, *sys.argv[1:]])
         publish_failure,
         Some("outer-signal" | "outer-signal-invalid-target")
     );
-    let mut command = Command::new("sh");
+    let bootstrap_poison = home.path().join("bootstrap-poisoned");
+    let bootstrap_hook = home.path().join("bootstrap-hook");
+    let shell = if bootstrap {
+        let directory = home.path().join("bootstrap");
+        fs::create_dir(&directory).unwrap();
+        let shell = directory.join("sh");
+        fs::copy("/bin/bash", &shell).unwrap();
+        executable(
+            &bootstrap_hook,
+            r#"printf 'poisoned\n' > "$FIXTURE_BOOTSTRAP_POISON"
+"#,
+        );
+        shell
+    } else {
+        std::path::PathBuf::from("sh")
+    };
+    let mut command = Command::new(shell);
+    if bootstrap {
+        command
+            .env("BASH_ENV", &bootstrap_hook)
+            .env("ENV", &bootstrap_hook)
+            .env("BASH_VERSION", "spoofed-by-fixture");
+    }
     if outer_signal {
         // Publish from the child before the installer can reach the signal
         // fixture. exec preserves this PID as the actual outer installer.
@@ -793,17 +974,65 @@ exec sh "$@""#,
             .env("CAGENTS_CHECKSUMS", &checksums);
     }
     let lease_path = runtime.join("worker-held.lock");
-    let handoff_lease = handoff.then(|| {
-        use std::os::fd::AsRawFd;
-        let lease = fs::File::create(&lease_path).unwrap();
+    let handoff_lease = recovery_bundle.then(|| {
+        use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+        let lease = fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&lease_path)
+            .unwrap();
         assert_eq!(
             unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
         lease
     });
+    let mut transport = recovery_bundle.then(|| {
+        RecoveryTransportFixture::new(
+            home.path(),
+            handoff_lease.as_ref().unwrap(),
+            &prefix.join("versions/9.9.9/bin/cagents"),
+        )
+    });
+    let recovery_check = home.path().join("check-recovery-transport");
+    executable(
+        &recovery_check,
+        r#"#!/usr/bin/python3
+import fcntl, json, os, pathlib, sys
+assert os.environ['CAGENTS_UPDATE_RECOVERY_FD'] == '193'
+assert os.environ['CAGENTS_DAEMON_LEASE_FD'] == '3'
+manifest = json.loads(pathlib.Path(os.environ['FIXTURE_RECOVERY_IDENTITIES']).read_text())
+assert pathlib.Path(sys.argv[1]) == pathlib.Path(manifest['candidate']), 'bundle reached current routing instead of exact candidate'
+seals = fcntl.F_SEAL_SEAL | fcntl.F_SEAL_SHRINK | fcntl.F_SEAL_GROW | fcntl.F_SEAL_WRITE
+assert fcntl.fcntl(193, fcntl.F_GET_SEALS) & seals == seals
+payload = manifest['payload'].encode()
+assert os.pread(193, len(payload) + 1, 0) == payload
+for number, expected in manifest['roles'].items():
+    fd = int(number)
+    actual = os.fstat(fd)
+    assert (actual.st_dev, actual.st_ino) == (expected['dev'], expected['ino']), f'wrong role fd {fd}'
+    assert not fcntl.fcntl(fd, fcntl.F_GETFD) & fcntl.FD_CLOEXEC
+    if expected['path']:
+        with open(expected['path'], 'r+') as contender:
+            try: fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError: pass
+            else: raise AssertionError(f'role fd {fd} lost its real flock')
+            if expected['shared']:
+                fcntl.flock(contender, fcntl.LOCK_SH | fcntl.LOCK_NB)
+    os.lseek(fd, expected['offset'], os.SEEK_SET)
+assert os.lseek(3, 0, os.SEEK_CUR) == manifest['roles']['196']['offset']
+with open(os.environ['FIXTURE_RECOVERY_CALLS'], 'a') as log: log.write('candidate-start-transport\n')
+"#,
+    );
+    if let Some(transport) = &transport {
+        transport.inherit(&mut command);
+    } else {
+        command.env_remove("CAGENTS_UPDATE_RECOVERY_FD");
+    }
     let lease_check = home.path().join("check-lease");
-    if let Some(lease) = &handoff_lease {
+    if handoff {
         use std::os::{fd::AsRawFd, unix::process::CommandExt};
         executable(
             &lease_check,
@@ -826,7 +1055,15 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         command
             .env("CAGENTS_DAEMON_LEASE_FD", "3")
             .env("CAGENTS_UI_UPDATE_GUARD_FD", "198");
-        let descriptor = lease.as_raw_fd();
+        let descriptor = transport
+            .as_ref()
+            .unwrap()
+            .descriptors
+            .iter()
+            .find(|(target, _)| *target == 196)
+            .unwrap()
+            .1
+            .as_raw_fd();
         // SAFETY: the parent guard outlives installation, and only descriptor
         // syscalls run after fork. The fixed descriptor matches the real path.
         unsafe {
@@ -840,6 +1077,9 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
     } else if restart.is_some_and(|mode| mode.starts_with("provided-census-")) {
         command.env("CAGENTS_UI_UPDATE_GUARD_FD", "198");
     } else {
+        command.env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
+    }
+    if restart == Some("handoff-orphan-ui") {
         command.env_remove("CAGENTS_UI_UPDATE_GUARD_FD");
     }
     if handoff || restart.is_some_and(|mode| mode.starts_with("provided-census-")) {
@@ -857,6 +1097,19 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .env("XDG_CONFIG_HOME", home.path().join("config"))
         .env("XDG_RUNTIME_DIR", &runtime)
         .env("FIXTURE_HANDOFF", handoff.to_string())
+        .env("FIXTURE_MAINTENANCE", maintenance.to_string())
+        .env("FIXTURE_BOOTSTRAP", bootstrap.to_string())
+        .env("FIXTURE_BOOTSTRAP_POISON", &bootstrap_poison)
+        .env("FIXTURE_RECOVERY_START_EXPECTED", handoff.to_string())
+        .env("FIXTURE_RECOVERY_CHECK", &recovery_check)
+        .env(
+            "FIXTURE_RECOVERY_IDENTITIES",
+            home.path().join("recovery-identities.json"),
+        )
+        .env(
+            "FIXTURE_RECOVERY_CALLS",
+            home.path().join("recovery-transport-calls"),
+        )
         .env("FIXTURE_LEASE_CHECK", &lease_check)
         .env("FIXTURE_LEASE_PATH", &lease_path)
         .env("FIXTURE_UTILITY_LOG", &utility_log)
@@ -917,6 +1170,47 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
         .unwrap();
     let outer_pid = output.id();
     let output = output.wait_with_output().unwrap();
+    if let Some(transport) = &transport {
+        transport.assert_shared_offsets(bundle_forwarded);
+    }
+    assert!(
+        !bootstrap_poison.exists(),
+        "Bash bootstrap must clear ENV/BASH_ENV before reexec"
+    );
+    if orphan_bundle {
+        assert!(
+            !output.status.success(),
+            "orphan recovery authority was accepted: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr)
+                .contains("requires the worker daemon lease and launch fence")
+        );
+        assert!(
+            !utility_log.exists(),
+            "orphan bundle reached an external utility"
+        );
+        assert!(!actions.exists(), "orphan bundle changed source lifecycle");
+        assert!(
+            !census_log.exists(),
+            "orphan bundle reached census/controller probes"
+        );
+        assert!(!home.path().join("coordinator-used").exists());
+        assert_eq!(
+            fs::read_link(prefix.join("current")).unwrap(),
+            Path::new("versions/old")
+        );
+        assert!(!prefix.join("versions/9.9.9").exists());
+        if handoff {
+            assert_eq!(
+                fs::read(&checkpoint).unwrap(),
+                b"exact-conversation-and-shells\n"
+            );
+        } else {
+            assert_eq!(fs::read_to_string(&running).unwrap(), "old\n");
+        }
+        return;
+    }
     let source_inspected = home.path().join("source-inspected");
     if stage_only || handoff || !home.path().join("coordinator-used").exists() {
         assert!(
@@ -938,19 +1232,25 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             })
         );
     }
-    if handoff {
+    if handoff && publish_failure != Some("external-recovery") {
         use std::os::fd::AsRawFd;
-        let success = restart == Some("handoff-success");
+        let success = matches!(restart, Some("handoff-success" | "handoff-bootstrap"));
         let starting = restart == Some("handoff-starting");
         assert_eq!(output.status.success(), success, "{output:?}");
         assert_eq!(
             fs::read_link(prefix.join("current")).unwrap(),
-            Path::new("versions/9.9.9")
+            Path::new(if maintenance {
+                "versions/old"
+            } else {
+                "versions/9.9.9"
+            })
         );
         let actions = fs::read_to_string(&actions).unwrap();
         assert_eq!(
             actions,
-            if success || starting {
+            if maintenance {
+                "new:schema\nnew:start\nnew:downgrade:22\n"
+            } else if success || starting {
                 "new:start\n"
             } else {
                 "new:start\nnew:stopped\n"
@@ -970,11 +1270,23 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             !actions.contains("old:start") && !actions.contains("old:prepare"),
             "the stopped source must not be prepared or restarted: {actions}"
         );
+        if maintenance {
+            assert!(!checkpoint.exists());
+        } else {
+            assert_eq!(
+                fs::read(&checkpoint).unwrap(),
+                b"exact-conversation-and-shells\n"
+            );
+        }
         assert_eq!(
-            fs::read(&checkpoint).unwrap(),
-            b"exact-conversation-and-shells\n"
+            fs::read_to_string(home.path().join("recovery-transport-calls")).unwrap(),
+            "candidate-start-transport\n"
         );
-        if success {
+        if maintenance {
+            assert!(!running.exists());
+            assert!(!restored.exists());
+            assert!(prefix.join("versions/9.9.9").exists());
+        } else if success {
             assert_eq!(fs::read(&restored).unwrap(), fs::read(&checkpoint).unwrap());
             assert_eq!(fs::read_to_string(&running).unwrap(), "new\n");
         } else if starting {
@@ -1002,7 +1314,9 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
         assert_eq!(
             receipt["outcome"]["state"],
-            if success {
+            if maintenance {
+                "restart_permitted"
+            } else if success {
                 "usable"
             } else if starting {
                 "unverified"
@@ -1019,6 +1333,7 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             std::io::Error::last_os_error().kind(),
             std::io::ErrorKind::WouldBlock
         );
+        drop(transport.take());
         drop(handoff_lease);
         let released = unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         if released != 0 {
@@ -1105,10 +1420,22 @@ with open(os.environ['FIXTURE_LEASE_PATH'], 'r+') as contender:
             calls, "external:ready\n",
             "no installer start, old restart or stop is permitted"
         );
-        assert!(
-            !checkpoint.exists(),
-            "the converter and checkpoint paths were not involved"
-        );
+        if handoff {
+            assert_eq!(
+                fs::read(&checkpoint).unwrap(),
+                fs::read(&restored).unwrap(),
+                "the serving recovery fixture retained the original checkpoint contents"
+            );
+            assert!(
+                !home.path().join("recovery-transport-calls").exists(),
+                "preserving a serving recovery must not invoke candidate start"
+            );
+        } else {
+            assert!(
+                !checkpoint.exists(),
+                "the converter and checkpoint paths were not involved"
+            );
+        }
         let receipt: serde_json::Value =
             serde_json::from_slice(&fs::read(&outcome).unwrap()).unwrap();
         assert_eq!(
@@ -1656,7 +1983,20 @@ fn isolated_handoff_fixture(test: &str, modes: &[&str]) {
         return;
     }
     for mode in modes {
-        upgrade_fixture(false, 7, None, Some(mode));
+        upgrade_fixture(
+            false,
+            if *mode == "handoff-maintenance-failure" {
+                0
+            } else {
+                7
+            },
+            if *mode == "handoff-external" {
+                Some("external-recovery")
+            } else {
+                None
+            },
+            Some(mode),
+        );
     }
 }
 
@@ -1715,4 +2055,41 @@ fn supplied_census_must_validate_and_match_before_source_shutdown() {
     ] {
         upgrade_fixture(false, 7, None, Some(mode));
     }
+}
+
+#[test]
+fn recovery_bundle_is_preserved_only_for_candidate_start_and_excluded_from_maintenance() {
+    isolated_handoff_fixture(
+        "recovery_bundle_is_preserved_only_for_candidate_start_and_excluded_from_maintenance",
+        &["handoff-maintenance-failure"],
+    );
+}
+
+#[test]
+fn recovery_bundle_bootstraps_system_bash_before_any_utility() {
+    isolated_handoff_fixture(
+        "recovery_bundle_bootstraps_system_bash_before_any_utility",
+        &["handoff-bootstrap"],
+    );
+}
+
+#[test]
+fn orphan_recovery_bundle_without_daemon_lease_is_rejected_before_tools() {
+    coordinated_release_mode(true, 7, None, None, None, "bundle-orphan", false);
+}
+
+#[test]
+fn orphan_recovery_bundle_without_application_guard_is_rejected_before_tools() {
+    isolated_handoff_fixture(
+        "orphan_recovery_bundle_without_application_guard_is_rejected_before_tools",
+        &["handoff-orphan-ui"],
+    );
+}
+
+#[test]
+fn recovery_bundle_does_not_restart_or_rewind_an_already_serving_recovery() {
+    isolated_handoff_fixture(
+        "recovery_bundle_does_not_restart_or_rewind_an_already_serving_recovery",
+        &["handoff-external"],
+    );
 }

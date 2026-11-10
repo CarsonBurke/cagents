@@ -1,17 +1,67 @@
 #!/bin/sh
 set -eu
 
+# Recovery carries high descriptors that POSIX-only shells cannot close. Move
+# that transport into Bash before running any utility; ordinary installs retain
+# the portable sh path. The recovery worker must preflight this capability before
+# asking its source to shut down.
+if [ -n "${CAGENTS_UPDATE_RECOVERY_FD:-}" ]; then
+    if [ "$CAGENTS_UPDATE_RECOVERY_FD" != 193 ]; then
+        printf '%s\n' 'cagents-install: invalid update recovery descriptor' >&2
+        exit 1
+    fi
+    if [ "${CAGENTS_DAEMON_LEASE_FD:-}" != 3 ] \
+        || [ -z "${CAGENTS_UI_UPDATE_GUARD_FD:-}" ]; then
+        printf '%s\n' 'cagents-install: update recovery requires the worker daemon lease and launch fence; keep the checkpoint and use the staged update worker' >&2
+        exit 1
+    fi
+    # Compare the running interpreter itself; an exported BASH_VERSION can be
+    # stale or supplied by a different shell.
+    if ! [ /proc/$$/exe -ef /bin/bash ]; then
+        if [ ! -x /bin/bash ]; then
+            printf '%s\n' 'cagents-install: update recovery requires /bin/bash; keep the checkpoint and use the staged recovery build' >&2
+            exit 1
+        fi
+        unset BASH_ENV ENV
+        exec /bin/bash --noprofile --norc "$0" "$@"
+    fi
+fi
+
+installer_drop_recovery() {
+    if [ "${CAGENTS_UPDATE_RECOVERY_FD:-}" = 193 ]; then
+        # eval keeps this function parseable by ordinary POSIX sh. Recovery's
+        # Bash bootstrap above owns these reserved slots, including the legacy
+        # read fence; archive descriptors 190..192 are separate transport.
+        eval 'exec 189<&- 193<&- 194<&- 195<&- 196<&-'
+    fi
+    unset CAGENTS_UPDATE_RECOVERY_FD
+}
+
 # Only explicit candidate lease validation, store maintenance and daemon start
-# receive the reservation. Every ordinary command closes the shell's transport
-# descriptor, including older installed CLIs that do not know how to seal it.
+# receive the ordinary daemon lease. Recovery authority reaches only the exact
+# candidate daemon start, never probes, maintenance, or an older coordinator.
+installer_lease_tool() (
+    installer_drop_recovery
+    exec "$@"
+)
 installer_tool() (
     if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then
         exec 3<&-
     fi
     unset CAGENTS_DAEMON_LEASE_FD
+    installer_drop_recovery
     exec "$@"
 )
-if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then
+installer_start_candidate() (
+    if [ "${CAGENTS_UPDATE_RECOVERY_FD:-}" = 193 ]; then
+        # current could have changed independently to an older CLI that cannot
+        # seal this bundle. Only the extracted target may validate/forward it.
+        exec "$NEW_VERSION_DIR/bin/cagents" daemon start
+    fi
+    exec "$PREFIX/current/bin/cagents" daemon start
+)
+if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ] \
+    || [ "${CAGENTS_UPDATE_RECOVERY_FD:-}" = 193 ]; then
     # Preserve command -v detection for optional and missing tools. Aliases
     # apply inside functions and command substitutions too.
     for installer_utility in awk cat chmod cp curl find getconf gh \
@@ -602,7 +652,7 @@ cleanup() {
         && [ -n "$STORE_SCHEMA_BEFORE" ]; then
         restored_schema=$STORE_SCHEMA_BEFORE
         [ "$restored_schema" != none ] || restored_schema=$OLDEST_STORE_SCHEMA
-        if ! "$NEW_VERSION_DIR/bin/cagents" daemon downgrade-store "$restored_schema" >/dev/null; then
+        if ! installer_lease_tool "$NEW_VERSION_DIR/bin/cagents" daemon downgrade-store "$restored_schema" >/dev/null; then
             TRANSACTION_COMMITTED=1
             printf '%s: could not convert the shared-model store back to schema %s, which the previous version reads; retained the new installation, which reads the store; inspect cagents daemon status before retrying\n' \
                 "$PROGRAM" "$restored_schema" >&2
@@ -942,6 +992,7 @@ else
     (
         if [ "${CAGENTS_DAEMON_LEASE_FD:-}" = 3 ]; then exec 3<&-; fi
         unset CAGENTS_DAEMON_LEASE_FD
+        installer_drop_recovery
         export CAGENTS_ARCHIVE=$ARCHIVE_PATH CAGENTS_CHECKSUMS=$CHECKSUMS_PATH
         exec "$COORDINATOR" coordinate-install "$@"
     ) &
@@ -1221,7 +1272,7 @@ elif [ "$HAD_CURRENT" -eq 1 ]; then
             # The reviewed worker already checkpointed the source and holds
             # its lease. The candidate validates the exact inherited lock;
             # an environment marker alone cannot authorize skipping prepare.
-            "$NEW_VERSION_DIR/bin/cagents" daemon verify-update-lease >/dev/null \
+            installer_lease_tool "$NEW_VERSION_DIR/bin/cagents" daemon verify-update-lease >/dev/null \
                 || fail 'cannot verify the terminal service is ready for the update; installation was not changed'
         else
             read_daemon_status "$OWNER_CLI"
@@ -1295,7 +1346,7 @@ fi
 # them predates every conversion, so it has nothing to undo.
 if [ "$HAD_CURRENT" -eq 1 ] && [ "$RESTART_DAEMON" -eq 1 ] && [ "$DAEMON_DEFERRED" -eq 0 ] \
     && supports_store_conversion "$NEW_VERSION_DIR/bin/cagents"; then
-    STORE_SCHEMA_BEFORE=$("$NEW_VERSION_DIR/bin/cagents" daemon store-schema) \
+    STORE_SCHEMA_BEFORE=$(installer_lease_tool "$NEW_VERSION_DIR/bin/cagents" daemon store-schema) \
         || fail 'cannot read the shared-model store schema; installation was not changed'
     case $STORE_SCHEMA_BEFORE in
         '') STORE_SCHEMA_BEFORE=none ;;
@@ -1320,7 +1371,7 @@ ensure_link "$AUTOSTART_MEMBER" "$AUTOSTART_LINK" autostart
 # after the candidate proves serving readiness and the captured census matches.
 if [ "$DAEMON_DEFERRED" -eq 1 ]; then
     : # The installed candidate must not try to start beside the older daemon.
-elif DAEMON_START_ATTEMPTED=1 && "$PREFIX/current/bin/cagents" daemon start >/dev/null; then
+elif DAEMON_START_ATTEMPTED=1 && installer_start_candidate >/dev/null; then
     :
 else
     fail 'replacement daemon startup failed; checking rollback safety while preserving durable recovery state'

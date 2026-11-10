@@ -828,7 +828,7 @@ fn external_installer_saves_closes_and_reopens_windows_even_on_failure() {
         let ui = bin.join("cagents-ui");
         fs::write(
             &ui,
-            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}${CAGENTS_INSTALL_CENSUS_PATH+x}${CAGENTS_INSTALL_OUTCOME_PATH+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
+            "#!/bin/sh\ntest -z \"${CAGENTS_UI_UPDATE_GUARD_FD+x}${CAGENTS_INSTALL_RESULT_FD+x}${CAGENTS_ARCHIVE+x}${CAGENTS_CHECKSUMS+x}${CAGENTS_REPOSITORY+x}${CAGENTS_INSTALL_CENSUS_PATH+x}${CAGENTS_INSTALL_OUTCOME_PATH+x}${CAGENTS_UPDATE_RECOVERY_FD+x}\" || exit 92\nprintf 'old %s\\n' \"$*\" > \"$HOME/reopened\"\nprintf 'ready\\n'\n",
         )
         .unwrap();
         fs::set_permissions(&ui, fs::Permissions::from_mode(0o700)).unwrap();
@@ -982,7 +982,7 @@ assert json.loads(sys.argv[2]) == {'protocol':int(os.environ['FIXTURE_SOURCE_PRO
     'proof':None, 'require_resumable':False, 'reconcile_retained':False}
 assert not any(key in os.environ for key in ['CAGENTS_INSTALL_RESULT_FD',
     'CAGENTS_INSTALL_OWNER_CLI', 'CAGENTS_ARCHIVE', 'CAGENTS_CHECKSUMS', 'CAGENTS_REPOSITORY',
-    'CAGENTS_INSTALL_CENSUS_PATH', 'CAGENTS_INSTALL_OUTCOME_PATH'])
+    'CAGENTS_INSTALL_CENSUS_PATH', 'CAGENTS_INSTALL_OUTCOME_PATH', 'CAGENTS_UPDATE_RECOVERY_FD'])
 fd=int(os.environ['CAGENTS_UI_UPDATE_GUARD_FD'])
 verified=subprocess.run([os.environ['FIXTURE_REAL_CLI'], 'verify-install-guard', '--stage-only'],
     pass_fds=(fd,), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
