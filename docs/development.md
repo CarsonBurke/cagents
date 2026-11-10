@@ -1481,7 +1481,9 @@ harness, it provides:
   [Fixtures](fixtures.md#an-offline-github)); `curl` always fails, and Git
   reaches only local repositories. Files in `$CAGENTS_EVIDENCE_FIXTURE/home/.claude`
   switch fixture behaviors. `env CMD` runs your own setup in this environment,
-  with the fixture's root in `CAGENTS_EVIDENCE_FIXTURE`. Terminals and agents still enroll in scopes on
+  with the fixture's root in `CAGENTS_EVIDENCE_FIXTURE`; between sessions it
+  also works, under the last session's side, for setup that needs the daemon
+  stopped, such as converting a store. Terminals and agents still enroll in scopes on
   the host's user manager, as development sessions do.
 - **Seeded chats reopen.** A chat records its provider home's device and inode
   and won't reopen once that directory is replaced, and a transcript's
@@ -1670,6 +1672,124 @@ branch is built, and the script names it.
 
 Published releases still come from `scripts/build-release-linux`; see
 [Releasing](releasing.md).
+
+## Rehearsing an update
+
+`scripts/rehearse-update` runs installed archives in a disposable user environment.
+It measures what an update does to two windows, their saved panes, channels,
+agents, chats, terminals and a long-lived terminal child. It never builds or
+changes product code. Use a fresh, absent root outside a checkout, under
+`/var/tmp`, `/tmp` or `/dev/shm`, at most 40 bytes long, such as `/var/tmp/cr/u1`.
+`init` records its absolute path in `.rehearse-update`; `cleanup` requires that
+marker to match the root before removing it.
+
+Run from a genuine user shell. A hosted agent uses plain `ssh fw16`; never
+remove or forward `CAGENTS_AGENT_AUTHORITY`, `CAGENTS_AGENT_TOKEN` or
+`CAGENTS_SESSION_TOKEN` to bypass the harness's refusal. On fw16, fetch the
+branch and use your own worktree under the repository's `.worktrees/`.
+
+Each input directory must contain
+`cagents-VERSION-x86_64-unknown-linux-gnu.tar.gz` and `SHA256SUMS`. Supply the
+matching revision's `install.sh`, for example from `git show SHA:install.sh`.
+The archive bytes, rather than the harness checkout, select the tested code.
+
+```sh
+scripts/rehearse-update --root /var/tmp/cr/u1 run \
+  --old-dir /var/tmp/cagents-rehearsal/builds/0.1.3+local.991daa43e \
+  --old-version 0.1.3+local.991daa43e \
+  --old-installer /var/tmp/cagents-rehearsal/builds/0.1.3+local.991daa43e/install.sh \
+  --new-dir /var/tmp/cagents-rehearsal/builds/0.1.3+local.d25093651 \
+  --new-version 0.1.3+local.d25093651 \
+  --new-installer /var/tmp/cagents-rehearsal/builds/0.1.3+local.d25093651/install.sh \
+  --answer yes
+```
+
+The scenario installs OLD, starts a KWin virtual desktop with nested niri,
+opens the main and `second` windows, seeds offline work, records and captures
+both windows, stages NEW, and invokes the staged CLI's `daemon upgrade` on a
+controlling pseudo-terminal. `--answer` responds to each observed confirmation;
+`--yes` instead passes the updater's approval flag. Extra upgrade flags use
+`--upgrade-arg=--interrupt` or `--upgrade-arg=--accept-unreopenable`. The harness
+does not add either policy automatically. Refusals are measured outcomes: even
+a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
+
+Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch
+that build with its matched `cagents` and `cagentsd`, in the same private runtime.
+The scenario verifies its mapped window too. The default seed includes Claude
+chat and console agents, an offline Codex app-server, two untitled conversations
+in one project, a channel containing ` Details: `, a shell and `sleep 86400`.
+Use `--untitled 0|1|2`, `--no-codex` and `--no-child` to vary that baseline.
+
+Optional problem states each have their own switch:
+
+- `--no-init`: a Claude peer that accepts work without reporting a session ID.
+- `--exit-mid-turn`: a Claude peer that exits without a completion receipt.
+- `--ignore-term`: a terminal job that ignores SIGTERM.
+- `--uncarryable`: a live job plus OLD's `prepare-upgrade --yes
+  --no-relaunch-agents` probe. Local jobs normally carry, so this option
+  temporarily replaces the private holder registry directory with a file,
+  retaining the directory beside it. This makes preservation unavailable and
+  exercises the active-job refusal. `stop` restores the directory before
+  cleanup. If preparation unexpectedly succeeds, it can stop the private
+  daemon; the report identifies that outcome.
+- `--unreachable`: SIGSTOP the selected terminal's private holder.
+
+A seeded state does not guarantee a particular refusal on every revision.
+`seeds.json` preserves spawn results, OLD's actual inventories, verification
+failures and the preparation probe. Retained Claude actors can carry work
+without an exact resume ID on builds that support that protocol.
+
+The root owns HOME, XDG directories, XDG_RUNTIME_DIR, CLAUDE_CONFIG_DIR and
+CODEX_HOME. Fakes precede every real provider on PATH. This is environment and
+fixture isolation, not an OS network sandbox. The installed daemon and editor
+service use that private namespace. Terminals and holders deliberately register
+transient scopes with the real systemd user manager for update fidelity, just
+as the development runner does: `src/daemon/process_scope.rs` and
+`src/upgrade.rs` connect to the hard-coded `/run/user/UID/systemd/private`.
+Before killing private processes, `stop` attributes their cgroup scope names
+using their private HOME or XDG_RUNTIME_DIR. It then checks the real user
+manager's running scopes and fails if any attributed scope survives. It never
+stops a unit it did not attribute to this root.
+
+The desktop holds
+`/var/tmp/cagents-fw16-native.lock` (override with
+`CAGENTS_EVIDENCE_NATIVE_LOCK`), shared with native evidence work. `run` stops
+its desktop and all private processes on completion; keep manual sessions short.
+Do not run the harness inside `native-evidence`: both acquire the same native
+lock, so the inner invocation would wait on its caller.
+
+`report.txt` contains step durations, the complete update transcript, prompts,
+refusals, comparison changes and seed verification. `records/before/` and
+`records/after/` contain CLI envelopes and stable `snapshot.json` inventories,
+including read-only SQLite/WAL card and terminal recipe rows for each window.
+`shots/` contains a WebP for each mapped window before and after. A missing
+inventory is an evidence failure, not proof that no items existed. A nonzero
+exit means an update refusal, lost/changed state, or a harness/evidence failure;
+read the report to distinguish them. Healthy completion and chat resumption
+are listed as changes without being counted as losses.
+
+For a manual investigation, compose the same commands:
+
+```sh
+scripts/rehearse-update --root /var/tmp/cr/u1 status
+scripts/rehearse-update --root /var/tmp/cr/u1 compare before after
+# On a manually initialized/installed root:
+scripts/rehearse-update --root /var/tmp/cr/u2 desktop start --limit 300
+scripts/rehearse-update --root /var/tmp/cr/u2 launch main
+scripts/rehearse-update --root /var/tmp/cr/u2 launch second
+scripts/rehearse-update --root /var/tmp/cr/u2 seed --no-init
+scripts/rehearse-update --root /var/tmp/cr/u2 record before
+scripts/rehearse-update --root /var/tmp/cr/u2 drive --json observe --no-text
+scripts/rehearse-update --root /var/tmp/cr/u2 desktop stop
+scripts/rehearse-update --root /var/tmp/cr/u2 cleanup
+```
+
+`env CMD...` runs inside the private user; `app CMD...` also receives the nested
+display. `ceditor start BIN_DIR`, `record NAME`, `shot NAME` and `update DIR
+VERSION INSTALLER --answer yes` are available separately. `stop` retains evidence;
+`cleanup` stops everything and removes the marked root. Copy reports and images
+elsewhere before cleanup. Run the pure checks with
+`/usr/bin/python3 tests/rehearse_update.py`; no compositor or Rust build is needed.
 
 ## Troubleshooting
 
