@@ -725,6 +725,112 @@ mod tests {
     }
 
     #[test]
+    fn stale_terminal_i_renews_only_the_work_that_changed_before_submission() {
+        struct Terminal {
+            job: UpdateJob,
+            output: Vec<u8>,
+            reads: usize,
+            decisions: usize,
+        }
+        impl Write for Terminal {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.output.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        impl TerminalReview for Terminal {
+            fn status(&mut self) -> Result<Option<UpdateJob>, UpdateError> {
+                Ok(Some(self.job.clone()))
+            }
+            fn decide(&mut self, _: &str, nonce: &str, choice: Choice) -> Result<(), UpdateError> {
+                assert!(matches!(choice, Choice::InterruptNow));
+                self.decisions += 1;
+                if self.decisions == 1 {
+                    assert_eq!(nonce, "first");
+                    let confirmation = self.job.confirmation.as_mut().unwrap();
+                    confirmation.nonce = "changed".into();
+                    confirmation.preview.daemon.as_mut().unwrap().sessions[0].identity =
+                        "another accepted turn".into();
+                    return Err(invalid("the update preview changed"));
+                }
+                assert_eq!(self.decisions, 2);
+                assert_eq!(nonce, "changed");
+                self.job.phase = UpdatePhase::Complete;
+                self.job.confirmation = None;
+                Ok(())
+            }
+            fn cancel(&mut self, _: &str) -> Result<bool, UpdateError> {
+                panic!("a stale review must reload without cancellation")
+            }
+            fn read_line(&mut self, answer: &mut String) -> io::Result<usize> {
+                self.reads += 1;
+                assert!(
+                    self.reads <= 2,
+                    "a changed list needs only one renewed choice"
+                );
+                answer.push_str("i\n");
+                Ok(2)
+            }
+            fn is_terminal(&self) -> bool {
+                true
+            }
+            fn interrupted(&self) -> bool {
+                false
+            }
+            fn pause(&mut self) {}
+        }
+        let mut preview = working_preview();
+        let daemon = preview.daemon.as_mut().unwrap();
+        daemon.sessions[0].title = "Changed working agent".into();
+        let mut unchanged = daemon.sessions[0].clone();
+        unchanged.id = crate::model::TerminalId::new();
+        unchanged.title = "Unchanged working agent".into();
+        daemon.sessions.push(unchanged);
+        let job = UpdateJob {
+            id: "stale-interrupt".into(),
+            version: "9.8.7".into(),
+            phase: UpdatePhase::AwaitingConfirmation,
+            message: String::new(),
+            log_path: "/fake/update.log".into(),
+            confirmation: Some(Confirmation {
+                nonce: "first".into(),
+                stop: None,
+                preview,
+                expires_at_unix_ms: u64::MAX,
+            }),
+        };
+        let mut terminal = Terminal {
+            job: job.clone(),
+            output: Vec::new(),
+            reads: 0,
+            decisions: 0,
+        };
+        drive_terminal_review_with(job, false, false, &mut terminal).unwrap();
+        let output = String::from_utf8(terminal.output).unwrap();
+        assert_eq!(terminal.reads, 2, "{output}");
+        assert_eq!(output.matches("Update cagents ").count(), 1, "{output}");
+        assert_eq!(
+            output.matches("Update review changed:").count(),
+            1,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("Changed working agent").count(),
+            2,
+            "{output}"
+        );
+        assert_eq!(
+            output.matches("Unchanged working agent").count(),
+            1,
+            "{output}"
+        );
+        assert!(!output.contains("Update now?"), "{output}");
+    }
+
+    #[test]
     fn interrupt_now_approves_the_same_work_without_a_second_decision() {
         let directory = tempfile::tempdir().unwrap();
         let initial = working_preview();

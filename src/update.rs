@@ -838,7 +838,7 @@ fn drive_terminal_review_with(
                         return Err(UpdateError::Cancelled);
                     }
                     OrdinaryChoice::InterruptNow => {
-                        reviewed = Some(review::interruption_review(&confirmation.preview));
+                        reviewed = Some(confirmation.preview.clone());
                         if !submit_current_choice(
                             terminal,
                             &job.id,
@@ -847,6 +847,7 @@ fn drive_terminal_review_with(
                         )? {
                             continue;
                         }
+                        reviewed = Some(review::interruption_review(&confirmation.preview));
                         policy = impact::Policy::Interrupt;
                         policy_requested = Some(confirmation.nonce.clone());
                         submitted.insert(confirmation.nonce.clone());
