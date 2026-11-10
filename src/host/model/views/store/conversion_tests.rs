@@ -67,11 +67,6 @@ fn schema_22(path: &Path) -> (ChannelId, ChannelId) {
     let tx = db.transaction().unwrap();
     migrate_through(&tx, 0, 22).unwrap();
     tx.execute(
-        "INSERT INTO channel_work_placement_clock(id,last_epoch) VALUES(1,0)",
-        [],
-    )
-    .unwrap();
-    tx.execute(
         "INSERT INTO projects(repository,name,ordinal,kind) VALUES('/repo','repo',1,'folder')",
         [],
     )

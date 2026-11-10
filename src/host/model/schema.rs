@@ -340,6 +340,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -353,6 +354,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
+        24 => &TWENTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -1530,7 +1532,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");
