@@ -20,10 +20,6 @@ pub enum SessionKind {
     NativeChat,
 }
 
-/// Historical source wording retained only to identify the stopped-provider
-/// state from older daemons. The candidate never emits this instruction.
-pub const STOPPED_WITH_UNSETTLED_WORK: &str = "Its provider stopped but may still hold unfinished work. Close this conversation to release it.";
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Disposition {

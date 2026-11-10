@@ -63,23 +63,6 @@ fn inline(value: &str) -> String {
         .collect()
 }
 
-pub(super) fn chat_item(
-    chat: &crate::chat::Session,
-    impact: &impact::SessionImpact,
-    label: &str,
-) -> StopItem {
-    let state = match impact.disposition {
-        impact::Disposition::Continues => "running",
-        impact::Disposition::Resumes | impact::Disposition::ResumePicker => "idle",
-        impact::Disposition::WaitsForIdle | impact::Disposition::Interrupted => "working",
-        impact::Disposition::Blocked if impact.reason == impact::STOPPED_WITH_UNSETTLED_WORK => {
-            "stopped with unconfirmed work"
-        }
-        impact::Disposition::Blocked => "cannot be handed over",
-    };
-    chat_item_with_state(chat, impact, label, state)
-}
-
 pub(super) fn chat_item_with_state(
     chat: &crate::chat::Session,
     impact: &impact::SessionImpact,
@@ -372,12 +355,13 @@ mod tests {
     #[test]
     fn chat_confirmation_distinguishes_recorded_conversations() {
         let (source, impact) = chat(true);
-        let recorded = chat_item(&source, &impact, "Review Details: alpha");
+        let recorded = chat_item_with_state(&source, &impact, "Review Details: alpha", "working");
         assert_eq!(recorded.label, "Review Details: alpha");
         assert_eq!(recorded.running, "Claude chat, working");
         assert_eq!(recorded.recovery, "press Resume in the pane");
         let (source, impact) = chat(false);
-        let unrecorded = chat_item(&source, &impact, "Untitled conversation in beta");
+        let unrecorded =
+            chat_item_with_state(&source, &impact, "Untitled conversation in beta", "working");
         assert_eq!(
             unrecorded.running,
             "Claude chat, working (can't be resumed)"

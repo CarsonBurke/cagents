@@ -244,7 +244,7 @@ impl HostState {
             let (disposition, reason) = if record.returning_terminal {
                 (
                     Disposition::Blocked,
-                    "Finish the pending return to terminal or close this conversation.",
+                    "A return to terminal is pending and cannot be checkpointed.",
                 )
             } else if self.provider_ended(id, record) {
                 (
@@ -268,7 +268,7 @@ impl HostState {
             } else if (!aligned || launch.terminal_recipe().is_none()) && !retained_claude {
                 (
                     Disposition::Blocked,
-                    "Its provider has not reported which conversation it is running, so it cannot be resumed after the update. Send it a message or close it.",
+                    "Its provider has not reported a conversation this update can resume; the pane can reopen stopped.",
                 )
             } else if durable
                 && self.terminals.get(&id).is_some_and(|terminal| {
