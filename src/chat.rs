@@ -1144,7 +1144,8 @@ impl Session {
     }
 
     /// Point this Codex thread's first `--remote` at its own listener.
-    /// A bare `unix://` requests a new allocation, including for disk resume.
+    /// A new thread's bare `unix://` requests an allocation. Begun threads
+    /// require the daemon's separate shared-service and writer checks.
     ///
     /// Only the daemon chooses `root`. Existing evidence must have come from
     /// trusted retained/checkpointed state before invoking this method. Legacy
@@ -3513,6 +3514,11 @@ mod tests {
 
         let mut resumed = session(&["--remote", "unix://"], Some("begun"));
         let requested = resumed.clone();
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
         assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
         resumed.proof = Some(allocator.clone());
         assert!(resumed.owns_codex_listener());
@@ -3522,6 +3528,11 @@ mod tests {
         assert!(!requested.resolved_to_owned_codex_listener(&changed));
         let mut resumed = session(&["--remote=unix://"], Some("begun"));
         let requested = resumed.clone();
+        assert!(!resumed.claim_owned_codex_listener(root, &allocator));
+        assert_eq!(
+            resumed, requested,
+            "a begun bare remote needs launch checks"
+        );
         assert!(resumed.claim_owned_codex_listener_for_unserved_thread(root, &allocator));
         resumed.proof = Some(allocator.clone());
         assert!(resumed.owns_codex_listener());

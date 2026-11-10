@@ -1526,6 +1526,17 @@ fn require_ended_codex_execution(
     session: &Session,
     boot: &crate::model::BootId,
 ) -> std::io::Result<()> {
+    require_ended_codex_execution_for_launch(host, session, boot, &session.launch)
+}
+
+/// The process launch may add the effective account home without changing the
+/// saved descriptor whose old execution must be proved ended.
+fn require_ended_codex_execution_for_launch(
+    host: &SharedHost,
+    session: &Session,
+    boot: &crate::model::BootId,
+    launch: &chat::Launch,
+) -> std::io::Result<()> {
     use super::upgrade_inspect::{CodexExecution, codex_execution};
     {
         let state = host.lock().unwrap_or_else(|p| p.into_inner());
@@ -1550,11 +1561,25 @@ fn require_ended_codex_execution(
             ));
         }
     }
-    let message = match codex_execution(session, boot) {
+    let execution = match codex_execution(session, boot) {
+        CodexExecution::Ended => match launch.session_id.as_deref() {
+            Some(thread) => match codex_owners::writer(
+                chat::protocol::codex::thread_writer_lock(launch, thread).as_deref(),
+                thread,
+            ) {
+                Ok(Some(writer)) => {
+                    return Err(std::io::Error::other(running_codex_process(writer.pid)));
+                }
+                Ok(None) => CodexExecution::Ended,
+                Err(reason) => CodexExecution::Unproved { reason },
+            },
+            None => CodexExecution::Ended,
+        },
+        execution => execution,
+    };
+    let message = match execution {
         CodexExecution::Ended => return Ok(()),
-        CodexExecution::Running { pid: Some(pid), .. } => format!(
-            "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
-        ),
+        CodexExecution::Running { pid: Some(pid), .. } => running_codex_process(pid),
         CodexExecution::Running { pid: None, socket } => format!(
             "Codex is still serving this conversation at {}. Stop that server, then try again.",
             socket.display()
@@ -1573,19 +1598,26 @@ fn require_ended_codex_execution(
     Err(std::io::Error::other(message))
 }
 
+fn running_codex_process(pid: impl std::fmt::Display) -> String {
+    format!(
+        "Codex is still running this conversation (process {pid}). Stop process {pid}, then try again."
+    )
+}
+
 /// Admit a replacement writer using the original descriptor, then retire only
 /// ended discovery under the caller's allocation reservation.
 fn prepare_codex_restart(
     host: &SharedHost,
     session: &Session,
     boot: &crate::model::BootId,
+    launch: &chat::Launch,
 ) -> std::io::Result<()> {
     use crate::daemon::holder_registry::{self as registry, Kind};
     use std::os::unix::fs::MetadataExt;
     if session.launch.session_id.is_none() {
         return Ok(());
     }
-    require_ended_codex_execution(host, session, boot)?;
+    require_ended_codex_execution_for_launch(host, session, boot, launch)?;
     let directory = registry::directory(Kind::Native).map_err(std::io::Error::other)?;
     let control = registry::socket(&directory, session.id);
     let record = registry::execution_record(&control)?;
@@ -1961,21 +1993,6 @@ fn start_with_execution(
             .socket
             .clone()
     });
-    // Join a served listener. Before replacing a saved conversation's server,
-    // prove its old execution ended, even if its endpoint vanished. Inspect
-    // the original descriptor: claiming a legacy listener above grants no
-    // evidence about the execution that used to serve it.
-    let owned_socket = match owned_socket {
-        Some(socket)
-            if !owned_listener::served_before_retire(&socket, || {
-                prepare_codex_restart(host, &requested_source, &allocator.boot_id)
-            })
-            .map_err(|failure| unavailable(format!("Cannot restart Codex: {failure}")))? =>
-        {
-            Some(socket)
-        }
-        _ => None,
-    };
     // An authenticated checkpoint may need different resume argv from the
     // immutable recipe issued to windows. Keep that execution detail out of
     // the descriptor, authority registry and runtime's installed identity.
@@ -2044,43 +2061,31 @@ fn start_with_execution(
                 .unwrap()
                 .socket
                 .clone();
-            (!served_owned_listener(&socket)?).then_some(socket)
+            Some(socket)
         }
         owned_socket => owned_socket,
     };
-    // A server launched on an existing thread would be a second writer beside
-    // any process still writing it: a Codex CLI, the desktop app, or a server
-    // an earlier daemon left running. A checkpointed restart replaces the
-    // server it was taken from, so it is not checked.
-    if owned_socket.is_some()
-        && restart_launch.is_none()
-        && let Some(thread) = session.launch.session_id.as_deref()
-        && let Some(writer) = codex_owners::writer(
-            chat::protocol::codex::thread_writer_lock(&process_launch, thread).as_deref(),
-            thread,
-        )
-        .map_err(|message| {
-            ProtocolError::new(ProtocolErrorCode::TerminalUnavailable, message, true)
-        })?
-    {
-        // Refuse every attempt while the writer remains. The same card can
-        // retry after that writer closes; this never authorizes a second one.
-        return Err(ProtocolError::new(
-            ProtocolErrorCode::InvalidRequest,
-            if writer.hosted {
-                format!(
-                    "This conversation is still open in another chat or terminal here (pid {}). Close it there, then resume it here.",
-                    writer.pid
+    // Join a served listener. Before replacing a saved conversation's server,
+    // prove its old execution ended and no outside process writes the thread.
+    // Inspect the original descriptor before retiring any endpoint: assigning
+    // a listener above grants no evidence about the execution that served it.
+    let owned_socket = match owned_socket {
+        Some(socket)
+            if !owned_listener::served_before_retire(&socket, || {
+                prepare_codex_restart(host, &requested_source, &allocator.boot_id, &process_launch)
+            })
+            .map_err(|failure| {
+                ProtocolError::new(
+                    ProtocolErrorCode::TerminalUnavailable,
+                    format!("Cannot restart Codex: {failure}"),
+                    true,
                 )
-            } else {
-                format!(
-                    "This conversation is open in another Codex process ({}, pid {}). Close it there, then resume it here.",
-                    writer.name, writer.pid
-                )
-            },
-            true,
-        ));
-    }
+            })? =>
+        {
+            Some(socket)
+        }
+        _ => None,
+    };
     if process_launch.provider != Provider::Codex && !saved_history_only {
         check_launch_account(&process_launch)?;
     }
@@ -4525,18 +4530,6 @@ fn restore_selection(
         }
         thread::sleep(Duration::from_millis(20));
     }
-}
-
-/// Whether this daemon's allocated listener at `socket` is still served,
-/// retiring an endpoint its stopped server left behind.
-fn served_owned_listener(socket: &std::path::Path) -> Result<bool, ProtocolError> {
-    owned_listener::served(socket).map_err(|failure| {
-        ProtocolError::new(
-            ProtocolErrorCode::TerminalUnavailable,
-            format!("Cannot retire stopped provider socket: {failure}"),
-            true,
-        )
-    })
 }
 
 /// The environment a conversation started without a proven source runs with:

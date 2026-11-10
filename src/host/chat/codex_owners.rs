@@ -23,9 +23,6 @@ const MAX_PROCESSES: usize = 65_536;
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct Writer {
     pub(super) pid: libc::pid_t,
-    pub(super) name: String,
-    /// Whether this daemon started it, as a chat's server or a terminal's CLI.
-    pub(super) hosted: bool,
 }
 
 /// Find the process writing `thread`, whose writer lock is at `lock`.
@@ -43,13 +40,7 @@ pub(super) fn writer(lock: Option<&Path>, thread: &str) -> Result<Option<Writer>
         Some(pid) => Some(pid),
         None => rollout_writer(thread)?,
     };
-    Ok(pid.map(|pid| Writer {
-        pid,
-        name: std::fs::read_to_string(format!("/proc/{pid}/comm"))
-            .map(|name| name.trim_end().to_owned())
-            .unwrap_or_default(),
-        hosted: descends_from(pid, std::process::id() as libc::pid_t),
-    }))
+    Ok(pid.map(|pid| Writer { pid }))
 }
 
 fn read(path: &str) -> Result<String, String> {
@@ -226,32 +217,6 @@ fn exited(error: &io::Error) -> bool {
     matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH))
 }
 
-/// Whether `pid` is `ancestor` or one of its descendants.
-fn descends_from(mut pid: libc::pid_t, ancestor: libc::pid_t) -> bool {
-    // Bounded, as a parent chain read across exits may briefly loop.
-    for _ in 0..64 {
-        if pid == ancestor {
-            return true;
-        }
-        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
-            return false;
-        };
-        // The command name may hold spaces and parentheses; fields follow its last ')'.
-        let Some(parent) = stat
-            .rsplit_once(')')
-            .and_then(|(_, fields)| fields.split_whitespace().nth(1))
-            .and_then(|parent| parent.parse().ok())
-        else {
-            return false;
-        };
-        if parent <= 1 {
-            return false;
-        }
-        pid = parent;
-    }
-    false
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -331,7 +296,6 @@ mod tests {
         assert_eq!(unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX) }, 0);
         let found = writer(Some(&lock), "unrelated").unwrap().unwrap();
         assert_eq!(found.pid, std::process::id() as libc::pid_t);
-        assert!(found.hosted);
         // Another test may fork before exec while this file is open. Those
         // inherited descriptors share its open file description, just like
         // this duplicate, so dropping our original alone need not unlock it.
@@ -403,8 +367,6 @@ mod tests {
         });
         let found = found.unwrap();
         assert_eq!(found.pid, loaded.id() as libc::pid_t);
-        assert_eq!(found.name, "sleep");
-        assert!(found.hosted, "a child of this process is one it started");
         std::fs::remove_file(&segment).unwrap();
         assert_eq!(writer(None, &thread).unwrap().unwrap().pid, found.pid);
         for child in readers.iter_mut().chain([&mut loaded]) {

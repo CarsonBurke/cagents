@@ -326,10 +326,7 @@ fn a_reopened_codex_thread_another_process_has_open_is_refused() {
     cli.wait().unwrap();
     assert!(refusal.retryable, "{refusal:?}");
     assert!(
-        refusal.message.contains(&format!(
-            "pid {}). Close it there, then resume it here.",
-            cli.id()
-        )),
+        refusal.message == format!("Cannot restart Codex: {}", running_codex_process(cli.id())),
         "{refusal:?}"
     );
     assert!(
@@ -390,6 +387,17 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
     assert_eq!(writer.pid, server.id() as libc::pid_t);
     host.lock().unwrap().register_client(1);
     let requested = reopened(&root);
+    // A stopped entry allocated for this pane must remain available to the
+    // execution proof until every writer check has passed.
+    host.lock().unwrap().codex_listeners = CodexListenerRoots::at(private.path().into());
+    let allocation = private
+        .path()
+        .join(format!("cagents-codex-{}", requested.id));
+    std::fs::create_dir(&allocation).unwrap();
+    std::fs::set_permissions(&allocation, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let allocated_socket = allocation.join("control.sock");
+    drop(UnixListener::bind(&allocated_socket).unwrap());
+    let before = std::fs::symlink_metadata(&allocated_socket).unwrap();
     let result = start(
         &host,
         1,
@@ -408,15 +416,23 @@ fn a_reopened_codex_thread_served_on_another_private_listener_is_refused() {
         !root.join("codex-arguments").exists(),
         "no second private server was launched"
     );
+    use std::os::unix::fs::MetadataExt;
+    let after = std::fs::symlink_metadata(&allocated_socket)
+        .expect("a live writer must prevent retirement of the pane's stopped endpoint");
+    assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
     let refusal = result.unwrap_err();
     let repeated = repeated.unwrap_err();
-    assert_eq!(refusal.code, ProtocolErrorCode::InvalidRequest);
+    assert_eq!(refusal.code, ProtocolErrorCode::TerminalUnavailable);
     assert_eq!(
         repeated, refusal,
         "Retry while held must repeat the refusal"
     );
     assert!(
-        refusal.message.contains(&format!("pid {})", writer.pid)),
+        refusal.message
+            == format!(
+                "Cannot restart Codex: {}",
+                running_codex_process(writer.pid)
+            ),
         "{refusal:?}"
     );
     assert!(
