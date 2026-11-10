@@ -80,12 +80,6 @@ impl Reader {
             Self::Legacy68(client) => client.terminals(),
         }
     }
-    fn reconcile_retained(&mut self, source: &Session) -> Result<(), String> {
-        match self {
-            Self::Current(client) => client.reconcile_retained(source),
-            _ => Ok(()),
-        }
-    }
     fn resolve(&mut self, source: &Session) -> Result<Session, String> {
         match self {
             Self::Current(client) => client.resolve(source),
@@ -242,9 +236,7 @@ fn inspect(request: Request) -> Result<(), String> {
                     continue;
                 }
                 let result = if missing && request.reconcile_retained {
-                    reader
-                        .reconcile_retained(source)
-                        .and_then(|()| reader.resolve(source))
+                    reader.resolve(source)
                 } else if missing {
                     Err(
                         "Saved owner changed after preview; review the recovered inventory again"
