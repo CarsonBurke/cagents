@@ -246,8 +246,8 @@ mod tests {
         }
     }
 
-    /// Construct published18 using the real17 then placement18 migrations.
-    /// Populate the saved17 view BEFORE placement backfill; never downgrade a newer store.
+    /// Construct published18 through the real 17 and 18 migrations, saving the
+    /// view between them; never downgrade a newer store.
     fn published18(path: &Path, pane: &Pane) -> (String, String) {
         let mut db = Connection::open(path).unwrap();
         let tx = db.transaction().unwrap();
@@ -255,7 +255,6 @@ mod tests {
         let channel = crate::model::ChannelId::new();
         tx.execute("INSERT INTO projects(repository,name,ordinal,kind) VALUES('/saved','saved',1,'folder')", []).unwrap();
         tx.execute("INSERT INTO channels(id,repository,title,ordinal,title_source) VALUES(?1,'/saved','saved',1,2)", [channel.to_string()]).unwrap();
-        super::super::channel_work::created_in(&tx, channel).unwrap();
         let scope = serde_json::to_string(&Scope::Channel(channel)).unwrap();
         let panes = serde_json::to_string(&vec![pane.clone()]).unwrap();
         tx.execute(
@@ -404,7 +403,7 @@ mod tests {
     }
 
     #[test]
-    fn published18_migration_backfills_saved_panes_without_changing_model_or_work() {
+    fn published18_migration_backfills_saved_panes_without_changing_model() {
         for as_chat in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("registry.sqlite3");
@@ -428,13 +427,6 @@ mod tests {
             }
             let (identity, scope) = published18(&path, &pane);
             let before = Connection::open(&path).unwrap();
-            let work: String = before
-                .query_row(
-                    "SELECT group_concat(channel||':'||revision) FROM channel_work_homes",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap();
             assert_eq!(
                 before
                     .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
@@ -451,22 +443,6 @@ mod tests {
                     .unwrap(),
                 0
             );
-            let placement_before: Vec<(String, i64)> = before
-                .prepare("SELECT pane,epoch FROM channel_work_placement_epochs ORDER BY pane")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            assert_eq!(placement_before, vec![(pane.id.to_string(), 1)]);
-            let clock_before: Vec<(i64, i64)> = before
-                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            assert_eq!(clock_before, vec![(1, 1)]);
             drop(before);
             let registry = Registry::at(&path).unwrap();
             assert_eq!(
@@ -476,30 +452,6 @@ mod tests {
                     .unwrap(),
                 super::super::SCHEMA_VERSION
             );
-            let placement_after: Vec<(String, i64)> = registry
-                .db
-                .prepare("SELECT pane,epoch FROM channel_work_placement_epochs ORDER BY pane")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            assert_eq!(
-                placement_after, placement_before,
-                "retention migration must preserve published active placement epochs"
-            );
-            let clock_after: Vec<(i64, i64)> = registry
-                .db
-                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            assert_eq!(
-                clock_after, clock_before,
-                "retention migration must preserve the published global allocator"
-            );
             assert_eq!(registry.model().unwrap().identity.to_string(), identity);
             let saved = super::super::views::read(
                 &registry.db,
@@ -508,17 +460,6 @@ mod tests {
             .unwrap();
             assert_eq!(saved.panes, vec![pane.clone()]);
             assert_eq!(saved.revision, 7);
-            assert_eq!(
-                registry
-                    .db
-                    .query_row(
-                        "SELECT group_concat(channel||':'||revision) FROM channel_work_homes",
-                        [],
-                        |row| row.get::<_, String>(0)
-                    )
-                    .unwrap(),
-                work
-            );
             assert!(
                 registry
                     .pinned_terminals(&BTreeSet::from([terminal(&pane)]))
@@ -709,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn authentic_outbox19_migrates_to_retention20_without_changing_receipts_or_placement() {
+    fn authentic_outbox19_migrates_to_retention20_without_changing_receipts() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("outbox19.sqlite3");
         let pane = terminal_pane();
@@ -732,8 +673,8 @@ mod tests {
         assert_eq!(before["automation_notifications"].len(), 1);
         assert_eq!(before["automation_lifecycle"].len(), 2);
         assert_eq!(before["shared_view_edits"].len(), 1);
-        assert_eq!(before["channel_work_placement_epochs"].len(), 1);
-        assert_eq!(before["channel_work_placement_clock"].len(), 1);
+        // Schema 24 drops the retired channel-work tables.
+        before.retain(|name, _| !name.starts_with("channel_work_"));
         let attention = super::super::automation_notifications::pending(&db, 100).unwrap();
         assert_eq!(attention.len(), 1);
         drop(db);
@@ -808,7 +749,7 @@ mod tests {
             );
             assert_eq!(
                 after, before,
-                "every original table value, including audit/outbox/view receipts and placement allocator, must remain exact"
+                "every original table value, including audit/outbox/view receipts, must remain exact"
             );
             assert_eq!(
                 registry.pending_automation_notifications(100).unwrap(),

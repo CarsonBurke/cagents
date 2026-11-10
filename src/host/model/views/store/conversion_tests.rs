@@ -1,7 +1,7 @@
 //! Schema 22 <-> 23 conversion, applied-operation retention and the row-level
 //! writer, against real stores on disk.
 use super::*;
-use crate::host::model::{Registry, SCHEMA_VERSION, channel_work, migrate_through};
+use crate::host::model::{Registry, SCHEMA_VERSION, migrate_through};
 use crate::model::{BrowserId, BrowserRestoreFidelity, BrowserSession, ChannelId};
 use crate::workspace_model::{ModelEdit, views::Change};
 use std::path::Path;
@@ -78,7 +78,12 @@ fn schema_22(path: &Path) -> (ChannelId, ChannelId) {
             params![channel.to_string(), ordinal],
         )
         .unwrap();
-        channel_work::created_in(&tx, channel).unwrap();
+        tx.execute(
+            "INSERT INTO channel_work_homes(channel,incarnation,repository,title,lifecycle,revision)
+             VALUES(?1,?2,'/repo','c','active','0')",
+            params![channel.to_string(), ordinal],
+        )
+        .unwrap();
     }
     tx.pragma_update(None, "user_version", 22).unwrap();
     tx.commit().unwrap();
@@ -278,7 +283,10 @@ fn schema_22_views_convert_whole_and_convert_back_unchanged() {
     );
     drop(registry);
 
-    assert_eq!(Registry::downgrade_at(&path, 22).unwrap(), Some(23));
+    assert_eq!(
+        Registry::downgrade_at(&path, 22).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
     assert_eq!(user_version(&path), 22);
     assert_eq!(
         rows_22(&Connection::open(&path).unwrap()),
@@ -291,7 +299,7 @@ fn schema_22_views_convert_whole_and_convert_back_unchanged() {
 }
 
 #[test]
-fn edits_made_under_schema_23_survive_the_conversion_back() {
+fn edits_made_under_the_current_schema_survive_the_conversion_back() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("model.sqlite3");
     let (a, b) = schema_22(&path);
@@ -341,7 +349,10 @@ fn edits_made_under_schema_23_survive_the_conversion_back() {
     );
     drop(registry);
 
-    assert_eq!(Registry::downgrade_at(&path, 22).unwrap(), Some(23));
+    assert_eq!(
+        Registry::downgrade_at(&path, 22).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
     let db = Connection::open(&path).unwrap();
     for view in &edited {
         let (revision, saved, retired): (i64, String, String) = db
@@ -381,7 +392,7 @@ fn edits_made_under_schema_23_survive_the_conversion_back() {
             .unwrap();
         assert!(
             seen,
-            "an operation applied under 23 must still be recognized by 22"
+            "an operation applied under the current schema must still be recognized by 22"
         );
     }
     // The pin followed its pane across the transfer and back to schema 22.
@@ -420,6 +431,17 @@ fn also_list_22(db: &Connection, scope: &Scope, panes: &[Pane]) {
         ],
     )
     .unwrap();
+}
+
+/// Exercise the historical normalization separately: schema 23 must preserve
+/// valid placement mappings before schema 24 intentionally removes them.
+fn convert_to_23(path: &Path) {
+    let mut db = Connection::open(path).unwrap();
+    db.execute_batch("PRAGMA foreign_keys=ON").unwrap();
+    let tx = db.transaction().unwrap();
+    migrate_through(&tx, 22, 23).unwrap();
+    tx.pragma_update(None, "user_version", 23).unwrap();
+    tx.commit().unwrap();
 }
 
 fn epochs(db: &Connection) -> Vec<String> {
@@ -490,6 +512,10 @@ fn a_pane_listed_in_two_views_stays_open_in_the_view_schema_22_used() {
             )
             .unwrap();
         }
+        convert_to_23(&path);
+        let mut expected_epochs = vec![shared.id.to_string(), own.id.to_string()];
+        expected_epochs.sort();
+        assert_eq!(epochs(&Connection::open(&path).unwrap()), expected_epochs);
         let mut registry = Registry::at(&path).expect("a damaged store still converts");
         let (kept, left, kept_revision) = if indexed_in_second {
             (&b, &a, 5)
@@ -503,18 +529,17 @@ fn a_pane_listed_in_two_views_stays_open_in_the_view_schema_22_used() {
         assert!(!ids(&registry, left).contains(&shared.id));
         assert!(ids(&registry, &b).contains(&own.id));
         // What hung off the pane stays with it.
-        let hung: (String, String, String) = registry
+        let hung: (String, String) = registry
             .db
             .query_row(
-                "SELECT (SELECT pane FROM shared_terminal_retention_pins WHERE terminal = ?2),
-                        (SELECT pane FROM shared_view_terminal_sources),
-                        (SELECT pane FROM channel_work_placement_epochs WHERE pane = ?1)",
-                params![shared.id.to_string(), pinned_terminal],
-                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                "SELECT (SELECT pane FROM shared_terminal_retention_pins WHERE terminal = ?1),
+                        (SELECT pane FROM shared_view_terminal_sources)",
+                [pinned_terminal],
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
         let id = shared.id.to_string();
-        assert_eq!(hung, (id.clone(), id.clone(), id));
+        assert_eq!(hung, (id.clone(), id));
         // The view it left retires it and moves past every stored revision,
         // so a stale window's edit there conflicts instead of vanishing.
         let left_view = read(&registry.db, left).unwrap();
@@ -583,6 +608,16 @@ fn a_second_pane_for_one_resource_gives_way_to_the_first_and_cannot_return() {
         put_22(&db, &a, 1, &[one.clone(), two.clone()], &[], &[]);
         put_22(&db, &b, 1, std::slice::from_ref(&three), &[], &[]);
     }
+    convert_to_23(&path);
+    assert_eq!(
+        epochs(&Connection::open(&path).unwrap()),
+        {
+            let mut kept = vec![one.id.to_string(), two.id.to_string()];
+            kept.sort();
+            kept
+        },
+        "schema 23 must remove the placement of a pane that gave way"
+    );
     let mut registry = Registry::at(&path).expect("a damaged store still converts");
     assert_eq!(
         read(&registry.db, &a).unwrap().panes,
@@ -592,15 +627,6 @@ fn a_second_pane_for_one_resource_gives_way_to_the_first_and_cannot_return() {
     assert_eq!(gave_way.panes, vec![]);
     assert_eq!(gave_way.retired, vec![three.id]);
     assert!(gave_way.revision > 1);
-    assert_eq!(
-        epochs(&registry.db),
-        {
-            let mut kept = vec![one.id.to_string(), two.id.to_string()];
-            kept.sort();
-            kept
-        },
-        "the pane that gave way kept a placement"
-    );
     still_edits(&mut registry, &a);
     still_edits(&mut registry, &b);
     // Its holder closing does not let a stale window seed it back.
@@ -1033,12 +1059,15 @@ fn a_real_store_converts_forward_and_back_without_losing_a_pane() {
         .unwrap();
 
     let started = std::time::Instant::now();
-    assert_eq!(Registry::downgrade_at(&path, 22).unwrap(), Some(23));
+    assert_eq!(
+        Registry::downgrade_at(&path, 22).unwrap(),
+        Some(SCHEMA_VERSION)
+    );
     let back = started.elapsed();
     assert_eq!(rows_22(&Connection::open(&path).unwrap()), original);
     println!(
         "views {} panes {} operations {edits}: converted in {converted:?}, model read in {read_model:?}, \
-         converted back in {back:?}; {before} bytes at 22, {} bytes at 23 after VACUUM",
+         converted back in {back:?}; {before} bytes at 22, {} bytes at schema {SCHEMA_VERSION} after VACUUM",
         expected.len(),
         expected.iter().map(|view| view.panes.len()).sum::<usize>(),
         size(&vacuumed),

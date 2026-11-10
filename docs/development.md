@@ -1276,6 +1276,14 @@ this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
 
+The Codex reconnect-only upgrade fixture also needs `/usr/bin/unshare` and
+permission to create Linux user and PID namespaces with a private procfs mount.
+Its recovery scan then sees real fixture processes without depending on
+unrelated same-user services whose `/proc` data may be unreadable. The fixture
+proves the namespace and procfs identities, and namespace teardown removes any
+remaining providers. Production process scans and their refusal tests are
+unchanged.
+
 Tests that spawn the retained helper call `retained_fixture::run_isolated()`
 first. The helper calls `setsid` and enters its own systemd scope, so killing a
 process group or cgroup misses it. `run_isolated()` reruns the exact test as a
@@ -1631,6 +1639,23 @@ unlinked old executable. It installs, upgrades, and removes fixture Debian
 packages using the generated maintainer-script contract, checks
 mixed-generation interruption, and preserves unrelated files and fixture user
 data. It does not signal the host daemon or install anything on the host.
+
+To qualify channel-work retirement with actual historical writers, run this
+from a plain SSH shell on fw16 after building matched development binaries
+through the gate:
+
+```sh
+python3 tests/channel_work_rollback.py --schema22-bin SCHEMA22_BIN \
+  --schema23-bin SCHEMA23_BIN --current-bin CURRENT_BIN \
+  --evidence-dir NEW_PRIVATE_DIRECTORY
+```
+
+The fixture upgrades a populated schema 23 store, induces an installer startup
+failure, and checks conversion back to 23 without losing the replacement's
+write. It then requires real schema 23 and 22 daemons to move an existing pane.
+The installer coordinator uses fixture processes; store admission, conversion
+and pane edits use the supplied real binaries. The evidence directory must be
+new and remains available for inspection.
 
 ## Installing your checkout
 

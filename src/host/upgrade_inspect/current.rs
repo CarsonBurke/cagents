@@ -288,7 +288,13 @@ impl Client {
     /// descriptor or presented as evidence of an old provider's execution.
     /// The host's normal owner/managed-work fences remain. No resident data is evicted.
     pub(super) fn inspect_saved_history(&mut self, source: &Session) -> Result<(), String> {
-        if ![119, ipc::CANDIDATE_LINE_PROTOCOL, ipc::PROTOCOL_VERSION].contains(&self.protocol)
+        if ![
+            119,
+            ipc::CANDIDATE_LINE_PROTOCOL,
+            ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL,
+            ipc::PROTOCOL_VERSION,
+        ]
+        .contains(&self.protocol)
             || !source.is_saved_claude_history()
         {
             return Err("Saved history has no qualified read-only inspection API".into());
@@ -381,12 +387,14 @@ impl Client {
 // and inventory DTOs. Version 100 appends capacity operations; 101 requires
 // atomic managed-pane adoption without changing these DTOs. This restricted
 // Inventory uses the frozen restricted decoder. The separate retained/history
-// methods admit full snapshots only for the explicitly qualified119/current pair.
+// methods admit full snapshots only for the qualified 119, 128, 160 and current
+// protocols.
 // Versions 102 (Copy sidecars), 103 (retained Claude continuity) and 104 (the
 // appended Work board request) preserve this subset, including the existing
 // continuity enum discriminants.
 pub(super) fn supports_protocol(protocol: u16) -> bool {
-    // The install candidate line speaks this release's wire under its own number.
+    // The candidate and pre-removal lines share only this inspection subset,
+    // not the whole current wire format.
     [
         99,
         100,
@@ -395,6 +403,7 @@ pub(super) fn supports_protocol(protocol: u16) -> bool {
         103,
         119,
         ipc::CANDIDATE_LINE_PROTOCOL,
+        ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL,
         ipc::PROTOCOL_VERSION,
     ]
     .contains(&protocol)
@@ -576,6 +585,7 @@ mod tests {
             103,
             119,
             ipc::CANDIDATE_LINE_PROTOCOL,
+            ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL,
             ipc::PROTOCOL_VERSION,
         ]
         .into()

@@ -14,7 +14,7 @@ use crate::{
 use super::state::ClientId;
 
 pub(crate) const DEFAULT_CLIENT_QUEUE_CAPACITY: usize = 512;
-/// Native transcript, channel-work and Work board pages can be several MiB. They share
+/// Native transcript and Work board pages can be several MiB. They share
 /// two queued page credits, preserving the existing single-read-credit bound
 /// rather than letting the ordinary small-message count retain gigabytes.
 const MAX_QUEUED_BULK_PAGES: usize = 2;
@@ -127,11 +127,6 @@ fn bulk_page(message: &ServerMessage) -> bool {
                 | ServerResponse::ChatFileChanges { .. }
                 | ServerResponse::ChatFileChangePatches { .. }
                 | ServerResponse::ChatTextCopy { .. }
-                | ServerResponse::ChannelWork(
-                    crate::channel_work_api::Response::Snapshot(_)
-                        | crate::channel_work_api::Response::Applied(_)
-                        | crate::channel_work_api::Response::Target(_)
-                )
                 | ServerResponse::Work(
                     crate::work::Response::Board(_) | crate::work::Response::Watching { .. }
                 )
@@ -838,103 +833,5 @@ mod tests {
         assert_eq!(error.code, ProtocolErrorCode::QueueFull);
         assert!(error.retryable);
         assert!(queue.pop().is_none());
-    }
-
-    #[test]
-    fn channel_work_pages_share_chat_credit_preserve_order_and_close_on_mixed_overflow() {
-        use crate::channel_work::{
-            Home, HomeLifecycle, Receipt, Reply, Snapshot, Target, TargetSnapshot,
-        };
-        use crate::channel_work_api::Response;
-        use crate::github_identity::{GitHubRepoKey, PullRequestKey};
-        let home = Home {
-            registry: uuid::Uuid::new_v4(),
-            channel: crate::model::ChannelId::new(),
-            creation_ordinal: 1,
-        };
-        let snapshot = Snapshot {
-            home,
-            lifecycle: HomeLifecycle::Active,
-            revision: 0,
-            entries: vec![],
-            history: vec![],
-            next_current: None,
-            next_history: None,
-        };
-        let target = Target::PullRequest(
-            PullRequestKey::new(
-                GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
-                1,
-            )
-            .unwrap(),
-        );
-        let pages = [
-            Response::Snapshot(snapshot.clone()),
-            Response::Applied(Reply {
-                receipt: Receipt {
-                    operation: uuid::Uuid::new_v4(),
-                    home,
-                    revision: 0,
-                    sequence: 0,
-                    changed: false,
-                },
-                snapshot,
-            }),
-            Response::Target(TargetSnapshot {
-                home,
-                lifecycle: HomeLifecycle::Active,
-                revision: 0,
-                target,
-                entry: None,
-            }),
-        ];
-        let envelope = |id, response| {
-            let mut envelope = redraw(TerminalId::new(), 0);
-            envelope.request_id = Some(id);
-            envelope.message = ServerMessage::Response { response };
-            envelope
-        };
-        for page in pages {
-            let queue = DeliveryQueue::new(7, DEFAULT_CLIENT_QUEUE_CAPACITY);
-            queue
-                .push(envelope(1, ServerResponse::ChatListed { sessions: vec![] }))
-                .unwrap();
-            queue
-                .push(envelope(2, ServerResponse::ChannelWork(page.clone())))
-                .unwrap();
-            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 2);
-            assert_eq!(queue.pop().unwrap().request_id, Some(1));
-            assert_eq!(queue.state.lock().unwrap().queued_bulk_pages, 1);
-            queue
-                .push(envelope(3, ServerResponse::ChannelWork(page.clone())))
-                .unwrap();
-            let first_work = queue.pop().unwrap();
-            assert_eq!(first_work.request_id, Some(2));
-            assert!(
-                matches!(first_work.message, ServerMessage::Response { response: ServerResponse::ChannelWork(returned) } if returned == page)
-            );
-            queue
-                .push(envelope(4, ServerResponse::ChatListed { sessions: vec![] }))
-                .unwrap();
-            assert_eq!(
-                queue.push(envelope(5, ServerResponse::ChannelWork(page.clone()))),
-                Err(DeliveryError::Full)
-            );
-            assert_eq!(
-                queue.state.lock().unwrap().queued_bulk_pages,
-                0,
-                "overflow discards every bulk credit"
-            );
-            assert_eq!(
-                queue.push(envelope(6, ServerResponse::ChannelWork(page))),
-                Err(DeliveryError::Closed)
-            );
-            let ServerMessage::Error(error) = queue.pop().unwrap().message else {
-                panic!("bounded queue must report its overflow")
-            };
-            assert_eq!(error.code, ProtocolErrorCode::QueueFull);
-            assert!(error.retryable);
-            assert!(queue.pop().is_none());
-        }
     }
 }

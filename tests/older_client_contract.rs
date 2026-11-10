@@ -1,20 +1,14 @@
 #![cfg(all(feature = "host", target_os = "linux"))]
 
-//! A private daemon serves a client of an older protocol it lists, the way a
-//! chat carried across an update keeps running the CLI it launched with.
-//!
-//! The client here writes and reads raw frames at protocol 128, as the
-//! 0.1.3+local.c68275e94 CLI does; it never uses this release's client. The
-//! daemon serves only the `cagents` executable at an older protocol, so that
-//! client runs as this test binary linked under that name.
+//! A private daemon refuses older wire formats after channel-work variants
+//! were removed, even when the peer is the `cagents` executable. The Connect
+//! handshake has the same encoding in those protocols and is safe to exchange;
+//! no shifted request reaches dispatch. A matching client remains usable.
 use cagents::{
-    agent_execution::{Authority, Operation, Reply},
-    automations,
     model::HostSessionProof,
     terminal_ipc::{
         CANDIDATE_LINE_PROTOCOL, ClientEnvelope, ClientRequest, PROTOCOL_VERSION,
-        ProtocolErrorCode, SHUTDOWN_VERSION, ServerEnvelope, ServerMessage, ServerResponse,
-        ShutdownOperation, read_frame, write_frame,
+        ProtocolErrorCode, ServerEnvelope, ServerMessage, ServerResponse, read_frame, write_frame,
     },
 };
 use std::{
@@ -200,93 +194,25 @@ fn unsupported_version(message: &ServerMessage) -> &str {
     }
 }
 
-/// The older CLI's side, run only in the child the main test starts.
+/// Runs under the CLI's executable name so peer identity cannot hide a
+/// mistaken older-protocol admission.
 #[test]
 fn older_cli_session() {
     let Some(socket) = std::env::var_os(CHILD_SOCKET) else {
         return;
     };
     let socket = PathBuf::from(socket);
-    let mut older = RawClient::connect(&socket, CANDIDATE_LINE_PROTOCOL);
-    older.handshake();
-    // What `cagents agent list` sends from a session outside any agent scope.
-    assert!(matches!(
-        older.request(ClientRequest::Authenticate {
-            authority: Authority::default(),
-        }),
-        ServerMessage::Response {
-            response: ServerResponse::Accepted
-        }
-    ));
-    match older.request(ClientRequest::Agent {
-        authority: Authority::default(),
-        operation: Operation::List,
-    }) {
-        ServerMessage::Response {
-            response: ServerResponse::Agent(Reply::Listed(agents)),
-        } => assert!(agents.is_empty()),
-        other => panic!("unexpected agent list reply: {other:?}"),
-    }
-
-    // It may not stop or update a daemon it was not built for; the refusal
-    // answers that request and the connection stays usable.
-    let refused = older.request(ClientRequest::ShutdownV1 {
-        version: SHUTDOWN_VERSION,
-        operation: ShutdownOperation::Preflight,
-    });
-    assert!(
-        unsupported_version(&refused).contains("Start a new session"),
-        "{refused:?}"
-    );
-
-    // A reply holding a Firing changed shape after this protocol. A run-now
-    // refused only at its reply would have started anyway.
-    for operation in [
-        automations::Request::RunNow {
-            id: uuid::Uuid::nil(),
-            execution_revision: 0,
-            request: uuid::Uuid::nil(),
-            confirmed: true,
-        },
-        automations::Request::History {
-            id: None,
-            before: None,
-            limit: 1,
-        },
-    ] {
-        let refused = older.request(ClientRequest::Automation {
-            authority: Authority::default(),
-            operation,
-        });
+    for protocol in [CANDIDATE_LINE_PROTOCOL, 160] {
+        let refusal = RawClient::connect(&socket, protocol).refused_handshake();
+        assert_eq!(refusal.version, PROTOCOL_VERSION);
         assert!(
-            unsupported_version(&refused).contains("Start a new session"),
-            "{refused:?}"
+            unsupported_version(&refusal.message).contains(&format!("expected {PROTOCOL_VERSION}"))
         );
     }
-    assert!(matches!(
-        older.request(ClientRequest::ChatList),
-        ServerMessage::Response {
-            response: ServerResponse::ChatListed { .. }
-        }
-    ));
-
-    // A connection keeps the protocol it opened with: a frame in another
-    // version is refused, in the connection's own, and ends it.
-    let switched = older.send_at(PROTOCOL_VERSION, ClientRequest::ChatList);
-    let reply = older.reply(switched);
-    assert!(
-        unsupported_version(&reply).contains(&format!("expected {CANDIDATE_LINE_PROTOCOL}")),
-        "{reply:?}"
-    );
-    assert!(
-        read_frame::<ServerEnvelope>(&mut older.stream)
-            .map(|frame| frame.is_none())
-            .unwrap_or(true)
-    );
 }
 
 #[test]
-fn a_candidate_line_cli_is_answered_in_its_own_protocol() {
+fn older_cli_and_window_handshakes_are_refused_without_disturbing_matching_clients() {
     if std::env::var_os(CHILD_SOCKET).is_some() {
         return;
     }
@@ -328,7 +254,7 @@ fn a_candidate_line_cli_is_answered_in_its_own_protocol() {
         }
     ));
 
-    // The older CLI, running as `cagents`, alongside it.
+    // Older CLIs, running as `cagents`, must be refused before dispatch.
     let image = CliImage::link();
     let child = Command::new(&image.executable)
         .env_clear()
@@ -371,4 +297,13 @@ fn a_candidate_line_cli_is_answered_in_its_own_protocol() {
             response: ServerResponse::ChatListed { .. }
         }
     ));
+    // A matching connection cannot switch to an old wire format later.
+    let switched = current.send_at(CANDIDATE_LINE_PROTOCOL, ClientRequest::ChatList);
+    let reply = current.reply(switched);
+    assert!(unsupported_version(&reply).contains(&format!("expected {PROTOCOL_VERSION}")));
+    assert!(
+        read_frame::<ServerEnvelope>(&mut current.stream)
+            .map(|frame| frame.is_none())
+            .unwrap_or(true)
+    );
 }

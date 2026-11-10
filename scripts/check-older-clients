@@ -7,7 +7,8 @@ The Rust test `every_older_client_is_proven_against_its_recorded_format` makes
 that proof, but CI does not run Rust tests. A protocol bump that merges beside a
 change to the older clients can leave them unproven, so this runs on the merge
 result: PROTOCOL_VERSION must have a recording, which must be the latest, and
-every literal `proven_at` must name it. It checks the claim, not the proof: a
+every listed client must name it in a literal `proven_at`. An explicit empty
+list is valid after a breaking wire change. It checks the claim, not the proof: a
 re-proof still needs the Rust test.
 """
 
@@ -44,13 +45,31 @@ def problems(root: Path) -> list[str]:
         found.append(
             f"{RECORDINGS}/{recordings[-1]}.json is newer than PROTOCOL_VERSION {protocol}"
         )
-    proven = [int(value) for value in re.findall(r"\bproven_at: (\d+),", older.read_text())]
-    if not proven:
-        found.append(f"{OLDER_CLIENTS}: no literal proven_at found")
-    for value in proven:
-        if value != protocol:
+    source = older.read_text()
+    listed = re.findall(
+        r"^const OLDER_CLIENTS: &\[OlderClient\] = &\[([^\]]*)\];$", source, re.MULTILINE
+    )
+    if len(listed) != 1:
+        found.append(f"{OLDER_CLIENTS}: expected one literal OLDER_CLIENTS list")
+        return found
+    for client in filter(None, (entry.strip() for entry in listed[0].split(","))):
+        if re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", client) is None:
+            found.append(f"{OLDER_CLIENTS}: unsupported older client list entry {client!r}")
+            continue
+        declarations = re.findall(
+            rf"^const {re.escape(client)}: OlderClient = OlderClient \{{([^}}]*)\}};",
+            source, re.MULTILINE,
+        )
+        proven = [
+            int(value) for body in declarations
+            for value in re.findall(r"\bproven_at: (\d+),", body)
+        ]
+        if len(declarations) != 1 or len(proven) != 1:
+            found.append(f"{OLDER_CLIENTS}: {client} needs one literal proven_at")
+            continue
+        if proven[0] != protocol:
             found.append(
-                f"{OLDER_CLIENTS}: an older client was proven at protocol {value}, not "
+                f"{OLDER_CLIENTS}: an older client was proven at protocol {proven[0]}, not "
                 f"{protocol}. Re-prove it against {RECORDINGS}/{protocol}.json, or remove it."
             )
     return found

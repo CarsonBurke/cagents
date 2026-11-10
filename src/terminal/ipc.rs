@@ -216,16 +216,18 @@ use crate::{
 /// the gated `Member` with them. It also appends `ServerMessage::ChatLimit`,
 /// which reaches every chat subscriber unasked. 157 to 159 are reserved for
 /// parallel branches and are not adopted here.
-pub const PROTOCOL_VERSION: u16 = 160;
-/// The install candidate line's protocol. Every message an update exchanges
-/// with its daemon (Connect, the upgrade preview and preparation, and the
-/// inspector's frozen and saved-history requests) has this release's
-/// encoding, so an update may speak it as a source with this release's
-/// client. Its daemons and windows are never peers. Its CLI, which chats
-/// carried across an update keep running, is served as an [`OlderClient`]:
-/// the one wire difference, the device account `Restore` operation this
-/// release appended, is a request that CLI cannot send.
+/// Version 161 removes channel-work requests, replies and workspace edits.
+/// Their positional removal requires matching clients; older CLIs must use
+/// the current daemon's companion executable.
+pub const PROTOCOL_VERSION: u16 = 161;
+/// The install candidate line's protocol, retained for the frozen upgrade
+/// inspector. Its CLI cannot speak this release's wire format after the
+/// channel-work variants were removed.
 pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
+/// The last protocol before channel-work removal. Its restricted upgrade and
+/// inspection messages keep their encoding, so it remains a qualified source
+/// for an update. Ordinary clients still require the current protocol.
+pub const PRE_CHANNEL_WORK_REMOVAL_PROTOCOL: u16 = 160;
 
 mod older_clients;
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
@@ -579,10 +581,6 @@ pub enum ClientRequest {
     /// the same response, as [`crate::work::Response::Watching`]. Each later
     /// change arrives as [`ServerMessage::WorkBoard`].
     WatchWork,
-    ChannelWork {
-        authority: crate::agent_execution::Authority,
-        request: crate::channel_work_api::Request,
-    },
     /// Whether startup recovery finished, is still awaiting original owners,
     /// or kept them after a failure. Answered during recovery, unlike every
     /// request that recovery refuses with the same `TerminalUnavailable`.
@@ -943,7 +941,6 @@ pub enum ServerResponse {
         page: crate::chat::TextCopyPage,
     },
     Work(crate::work::Response),
-    ChannelWork(crate::channel_work_api::Response),
     StartupState(StartupState),
 }
 

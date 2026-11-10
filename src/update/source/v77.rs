@@ -540,6 +540,7 @@ mod tests {
             77u16,
             119,
             crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
+            crate::terminal_ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL,
             crate::terminal_ipc::PROTOCOL_VERSION,
         ] {
             let mut bytes = postcard::to_stdvec(&version).unwrap();
@@ -816,14 +817,24 @@ mod tests {
         }
     }
 
-    /// The install candidate line's daemon (128) is reached through discovery
-    /// and then this release's client speaking 128, through the preview and
-    /// the confirmed preparation, and its update is this release's to run.
+    /// Qualified historical sources are discovered and then reached at their
+    /// exact protocol through preview and confirmed preparation. Whole-wire
+    /// incompatibility must not prevent this restricted update flow.
     #[cfg(feature = "host")]
     #[test]
-    fn authenticated_candidate_line_source_previews_and_prepares_at_its_own_protocol() {
+    fn authenticated_historical_sources_preview_and_prepare_at_their_own_protocol() {
+        for protocol in [
+            crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL,
+            crate::terminal_ipc::PRE_CHANNEL_WORK_REMOVAL_PROTOCOL,
+        ] {
+            authenticated_historical_source_preview(protocol);
+        }
+    }
+
+    #[cfg(feature = "host")]
+    fn authenticated_historical_source_preview(protocol: u16) {
         use std::os::unix::net::UnixListener;
-        let protocol = crate::terminal_ipc::CANDIDATE_LINE_PROTOCOL;
+        assert!(super::super::is_qualified_source(protocol));
         let directory = tempfile::tempdir().unwrap();
         let socket = directory.path().join("cagentsd.sock");
         let paths = crate::daemon::RuntimePaths {

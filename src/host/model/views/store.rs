@@ -1061,7 +1061,9 @@ pub(in crate::host::model) fn migrate(tx: &rusqlite::Transaction<'_>) -> Result<
         &format!("{TERMINAL_SOURCES}; {RETENTION_PINS}; {RETENTION_PINS_BY_TERMINAL};"),
         "panes",
     )?;
-    // A pane that gave way above keeps no placement, as a removed pane does not.
+    // This is the historical 22 -> 23 conversion: schema 23 still requires
+    // placement epochs. A pane that gave way above keeps none. Schema 24
+    // removes the placement tables in its separate migration.
     tx.execute(
         "DELETE FROM channel_work_placement_epochs WHERE pane NOT IN (SELECT id FROM panes)",
         [],

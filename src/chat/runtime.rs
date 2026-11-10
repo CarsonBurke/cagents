@@ -9115,7 +9115,7 @@ for line in sys.stdin:
             // provider's process group, as a tool may start its commands.
             arguments: vec![
                 "-c".into(),
-                "read go; sleep 300 & echo $!; sh -c 'setsid sleep 300 & echo $!; wait' & echo $!; read done"
+                "read go; sleep 300 & printf 'alone %s\\n' \"$!\"; sh -c 'setsid sleep 300 & printf \"inner %s\\n\" \"$!\"; wait' & printf 'shell %s\\n' \"$!\"; read done"
                     .into(),
             ],
             working_directory: std::env::current_dir().unwrap(),
@@ -9152,23 +9152,27 @@ for line in sys.stdin:
         // Commands start only after the split, as a provider's do.
         writeln!(provider.child.stdin.as_mut().unwrap(), "go").unwrap();
         let mut stdout = std::io::BufReader::new(provider.child.stdout.take().unwrap());
-        let mut pids = Vec::new();
+        let mut pids = std::collections::BTreeMap::new();
         for _ in 0..3 {
             let mut line = String::new();
             stdout.read_line(&mut line).unwrap();
-            pids.push(line.trim().parse::<u32>().unwrap());
+            let (role, pid) = line.trim().split_once(' ').unwrap();
+            assert!(matches!(role, "alone" | "shell" | "inner"), "{line}");
+            assert!(
+                pids.insert(role.to_owned(), pid.parse::<u32>().unwrap())
+                    .is_none(),
+                "duplicate command role: {line}"
+            );
         }
-        let is_shell =
-            |pid: u32| std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap() == "sh\n";
-        let find = |wanted: &dyn Fn(u32) -> bool| {
-            *pids
-                .iter()
-                .find(|pid| wanted(**pid))
-                .unwrap_or_else(|| panic!("unexpected command tree: {pids:?}"))
-        };
-        let alone = find(&|pid| parent(pid) == root && !is_shell(pid));
-        let shell = find(&|pid| parent(pid) == root && is_shell(pid));
-        let inner = find(&|pid| parent(pid) == shell);
+        // A forked child may still have its shell's comm before exec. The
+        // spawning shells identify roles; procfs independently proves the tree.
+        let alone = pids["alone"];
+        let shell = pids["shell"];
+        let inner = pids["inner"];
+        assert_ne!(alone, shell);
+        assert_eq!(parent(alone), root);
+        assert_eq!(parent(shell), root);
+        assert_eq!(parent(inner), shell);
         let deadline = Instant::now() + Duration::from_secs(5);
         while [alone, shell, inner]
             .iter()

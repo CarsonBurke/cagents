@@ -27,6 +27,26 @@ use crate::model::{ChannelId, ProjectKind};
 /// when the registry's answer arrives it is the highest real rank anyway.
 pub const PENDING_ORDINAL: u32 = u32::MAX;
 
+/// One channel as one registry created it. A channel's id outlives a registry
+/// reset, and the registry ranks every channel it creates once, so the three
+/// together name exactly the channel a window saw, never a later one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ChannelIncarnation {
+    pub registry: Uuid,
+    pub channel: ChannelId,
+    pub creation_ordinal: u32,
+}
+
+impl ChannelIncarnation {
+    /// Whether the registry has answered for this channel: a window's own
+    /// optimistic channel has no rank and a registry-less window no identity.
+    pub fn is_confirmed(self) -> bool {
+        !self.registry.is_nil()
+            && !self.channel.as_uuid().is_nil()
+            && self.creation_ordinal != PENDING_ORDINAL
+    }
+}
+
 /// A project as every window agrees on it.
 ///
 /// The canonical repository path is the key because a [`crate::model::ProjectId`]
@@ -319,9 +339,9 @@ impl WorkspaceModel {
                     channel.title_source = *source;
                 }
             }
-            // Requires canonical work and pane evidence; an optimistic client
-            // cannot infer whether retirement was accepted.
-            ModelEdit::RetireEmptyChannel { .. } | ModelEdit::ChannelWorkChanged { .. } => {}
+            // Retirement requires canonical pane evidence, so an optimistic
+            // client cannot infer whether it was accepted.
+            ModelEdit::RetireEmptyChannel { .. } => {}
             ModelEdit::DeleteChannel { id } => {
                 self.channels.retain(|channel| channel.id != *id);
             }
@@ -407,10 +427,10 @@ pub enum ModelEdit {
         title: String,
         source: crate::model::ChannelTitleSource,
     },
-    /// Daemon-only invalidation after a committed channel-work transaction.
-    ChannelWorkChanged { home: crate::channel_work::Home },
+    /// Removes an emptied channel when it is still the incarnation the window
+    /// saw and its view still holds no pane at the revision the window saw.
     RetireEmptyChannel {
-        home: crate::channel_work::Home,
+        home: ChannelIncarnation,
         expected_view_revision: u64,
     },
 }
@@ -499,7 +519,6 @@ impl ModelEdit {
             | Self::SuggestConversationTitle { .. }
             | Self::DeleteChannel { .. }
             | Self::AgentsChanged
-            | Self::ChannelWorkChanged { .. }
             | Self::RetireEmptyChannel { .. }) => edit,
         })
     }
@@ -612,29 +631,22 @@ mod tests {
     }
 
     #[test]
-    fn channel_work_edits_preserve_captured_home_and_retirement_revision() {
-        let home = crate::channel_work::Home {
+    fn channel_edits_preserve_captured_incarnation_retirement_revision_and_position() {
+        let home = ChannelIncarnation {
             registry: Uuid::new_v4(),
             channel: ChannelId::new(),
             creation_ordinal: 73,
         };
-        for (edit, tag) in [
-            (ModelEdit::ChannelWorkChanged { home }, 13),
-            (
-                ModelEdit::RetireEmptyChannel {
-                    home,
-                    expected_view_revision: u64::MAX,
-                },
-                14,
-            ),
-        ] {
-            let canonical = edit.clone().canonicalized().unwrap();
-            assert_eq!(canonical, edit);
-            assert_eq!(canonical.clone().canonicalized().unwrap(), edit);
-            let bytes = postcard::to_allocvec(&canonical).unwrap();
-            assert_eq!(bytes[0], tag);
-            assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
-        }
+        let edit = ModelEdit::RetireEmptyChannel {
+            home,
+            expected_view_revision: u64::MAX,
+        };
+        let canonical = edit.clone().canonicalized().unwrap();
+        assert_eq!(canonical, edit);
+        assert_eq!(canonical.clone().canonicalized().unwrap(), edit);
+        let bytes = postcard::to_allocvec(&canonical).unwrap();
+        assert_eq!(bytes[0], 13);
+        assert_eq!(postcard::from_bytes::<ModelEdit>(&bytes).unwrap(), edit);
     }
 
     #[test]

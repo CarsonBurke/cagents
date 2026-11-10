@@ -26,6 +26,9 @@ class OlderClientProof(unittest.TestCase):
             f"const C{index}: OlderClient = OlderClient {{\n    proven_at: {value},\n}};\n"
             for index, value in enumerate(proven)
         )
+        clients += "const OLDER_CLIENTS: &[OlderClient] = &[" + ", ".join(
+            f"C{index}" for index in range(len(proven))
+        ) + "];\n"
         # A test fixture's symbolic value is not a claim about the release.
         clients += "fn knowing() -> OlderClient { OlderClient { proven_at: PROTOCOL_VERSION, } }\n"
         (root / "src/terminal/ipc/older_clients.rs").write_text(clients)
@@ -36,6 +39,32 @@ class OlderClientProof(unittest.TestCase):
 
     def test_clients_proven_at_the_recorded_protocol_pass(self):
         self.assertEqual(checker.problems(self.tree(151, [151], [128, 129, 151])), [])
+
+    def test_an_explicitly_empty_list_passes_with_the_current_recording(self):
+        self.assertEqual(checker.problems(self.tree(161, [], [160, 161])), [])
+
+    def test_a_missing_list_fails_even_with_a_literal_proof(self):
+        root = self.tree(151, [151], [151])
+        path = root / "src/terminal/ipc/older_clients.rs"
+        path.write_text(path.read_text().replace(
+            "const OLDER_CLIENTS: &[OlderClient] = &[C0];\n", ""
+        ))
+        (problem,) = checker.problems(root)
+        self.assertIn("expected one literal OLDER_CLIENTS list", problem)
+
+    def test_a_nonempty_list_with_a_missing_claim_fails(self):
+        root = self.tree(151, [151], [151])
+        path = root / "src/terminal/ipc/older_clients.rs"
+        path.write_text(path.read_text().replace("&[C0];", "&[C0, UNPROVEN];"))
+        (problem,) = checker.problems(root)
+        self.assertIn("UNPROVEN needs one literal proven_at", problem)
+
+    def test_a_symbolic_claim_cannot_admit_a_client(self):
+        root = self.tree(151, [151], [151])
+        path = root / "src/terminal/ipc/older_clients.rs"
+        path.write_text(path.read_text().replace("proven_at: 151,", "proven_at: PROTOCOL_VERSION,"))
+        (problem,) = checker.problems(root)
+        self.assertIn("C0 needs one literal proven_at", problem)
 
     def test_a_bump_without_a_recording_fails(self):
         (problem,) = checker.problems(self.tree(152, [152], [128, 151]))

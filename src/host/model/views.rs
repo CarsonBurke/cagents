@@ -744,7 +744,6 @@ pub(super) fn adopt_authenticated_agent_pane(
         return Ok(false);
     };
     let mut view = read(db, &scope)?;
-    let before = view.clone();
     if view.retired.contains(&id) || view.panes.iter().filter(|pane| pane.id == id).count() != 1 {
         return Ok(false);
     }
@@ -804,7 +803,6 @@ pub(super) fn adopt_authenticated_agent_pane(
     }
     *pane = adopted;
     view.revision = store::next_revision(db)?;
-    channel_work::placement::observe_view_transition(db, &before, &view)?;
     // Holder continuity does not start a new channel naming choice, including
     // learning a previously unobserved provider thread. Preserve all placement,
     // presentation, retirement and naming state outside the descriptor itself.
@@ -832,7 +830,6 @@ pub(super) fn rebind_agent_pane(
         return Ok(false);
     };
     let mut view = read(db, &scope)?;
-    let before = view.clone();
     if view.retired.contains(&id) {
         return Ok(false);
     }
@@ -853,32 +850,8 @@ pub(super) fn rebind_agent_pane(
     }
     *pane = rebound;
     view.revision = store::next_revision(db)?;
-    channel_work::placement::observe_view_transition(db, &before, &view)?;
     store::store(db, &view)?;
     Ok(true)
-}
-
-/// Record removal before foreign-key cascades erase canonical membership.
-/// Like normal view writes, this must participate in the deleting transaction.
-pub(super) fn retire_channel_placements(db: &Connection, channel: ChannelId) -> Result<(), String> {
-    retire_scope_placements(db, &Scope::Channel(channel))
-}
-
-pub(super) fn retire_project_placements(db: &Connection, repository: &Path) -> Result<(), String> {
-    if db.is_autocommit() {
-        return Err("Placement removal requires the canonical view transaction".into());
-    }
-    for scope in store::project_scopes(db, repository_key(repository)?)? {
-        retire_scope_placements(db, &scope)?;
-    }
-    Ok(())
-}
-
-fn retire_scope_placements(db: &Connection, scope: &Scope) -> Result<(), String> {
-    let before = read(db, scope)?;
-    let mut after = before.clone();
-    after.panes.clear();
-    channel_work::placement::observe_view_transition(db, &before, &after)
 }
 
 fn write(db: &Connection, view: &View) -> Result<(), String> {
@@ -890,7 +863,6 @@ fn write(db: &Connection, view: &View) -> Result<(), String> {
 /// its pane row has already moved, but each view's derived state must still
 /// observe the transition from what the view held.
 fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String> {
-    channel_work::placement::observe_view_transition(db, before, view)?;
     if let Scope::Channel(id) = &view.scope {
         let primary = |view: &View| {
             view.panes.iter().find_map(|pane| match &pane.kind {
@@ -911,7 +883,6 @@ fn write_from(db: &Connection, before: &View, view: &View) -> Result<(), String>
                 [id.to_string()],
             )
             .map_err(|error| error.to_string())?;
-            channel_work::renamed_in(db, *id)?;
         }
     }
     // Pins hang off pane rows, so the rows come first.
@@ -1231,7 +1202,7 @@ mod tests {
     }
 
     #[test]
-    fn primary_chat_change_keeps_work_home_title_in_the_canonical_transaction() {
+    fn primary_chat_change_clears_only_an_inferred_channel_title() {
         for manual in [false, true] {
             let (mut registry, _directory, _, _) = setup();
             let channel = ChannelId::new();
@@ -1302,22 +1273,6 @@ mod tests {
             let model = registry.model().unwrap();
             let canonical = model.channel(channel).unwrap();
             assert_eq!(canonical.title, if manual { "User chosen" } else { "" });
-            let title: String = registry
-                .db
-                .query_row(
-                    "SELECT title FROM channel_work_homes WHERE channel=?1 AND incarnation=?2",
-                    params![channel.to_string(), canonical.ordinal],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(
-                title, canonical.title,
-                "retained title follows the exact current canonical incarnation"
-            );
-            assert!(
-                channel_work::renamed_in(&registry.db, channel).is_err(),
-                "title synchronization cannot escape the canonical transaction"
-            );
         }
     }
 
@@ -2526,30 +2481,325 @@ mod tests {
         }
     }
 
-    include!("views/placement_tests.rs");
+    #[test]
+    fn an_empty_channel_retires_only_as_the_incarnation_and_view_revision_seen() {
+        use crate::workspace_model::ChannelIncarnation;
+        let (mut registry, _directory, a, b) = setup();
+        let model = registry.model().unwrap();
+        let home = |channel| ChannelIncarnation {
+            registry: model.identity,
+            channel,
+            creation_ordinal: model.channel(channel).unwrap().ordinal,
+        };
+        let retire = |home, expected_view_revision| ModelEdit::RetireEmptyChannel {
+            home,
+            expected_view_revision,
+        };
+        let refusal = |registry: &mut Registry, edit: &ModelEdit| registry.apply(edit).err();
+        let elsewhere = ChannelIncarnation {
+            registry: Uuid::new_v4(),
+            ..home(a)
+        };
+        assert_eq!(
+            refusal(&mut registry, &retire(elsewhere, 0)).as_deref(),
+            Some("The channel belongs to another registry")
+        );
+        let reborn = ChannelIncarnation {
+            creation_ordinal: home(a).creation_ordinal + 100,
+            ..home(a)
+        };
+        assert_eq!(
+            refusal(&mut registry, &retire(reborn, 0)).as_deref(),
+            Some("The channel incarnation changed")
+        );
+        let missing = ChannelIncarnation {
+            channel: ChannelId::new(),
+            ..home(a)
+        };
+        assert_eq!(
+            refusal(&mut registry, &retire(missing, 0)).as_deref(),
+            Some("The channel no longer exists")
+        );
+        // A pane, or a publication since the window looked, keeps the channel.
+        seed(&mut registry, b, vec![pane()]);
+        let held = registry.view_revision(&Scope::Channel(b)).unwrap();
+        assert!(!registry.apply(&retire(home(b), held)).unwrap().changed);
+        let seen = registry.view_revision(&Scope::Channel(a)).unwrap();
+        assert!(!registry.apply(&retire(home(a), seen + 1)).unwrap().changed);
+        assert!(registry.model().unwrap().channel(a).is_some());
+        // The empty view at the revision the window saw retires it alone.
+        assert!(registry.apply(&retire(home(a), seen)).unwrap().changed);
+        let after = registry.model().unwrap();
+        assert!(after.channel(a).is_none());
+        assert!(after.channel(b).is_some());
+    }
+
+    #[test]
+    fn authenticated_direct_adoption_publishes_only_on_a_committed_process_handoff() {
+        use crate::agent_execution::HostedSession;
+        let (mut registry, _directory, a, _) = setup();
+        let original = live_source_pane();
+        seed(&mut registry, a, vec![original.clone()]);
+        let CardKind::Terminal(current) = &original.kind else {
+            panic!()
+        };
+        let source = HostedSession::Terminal(current.clone());
+        let mut next = current.clone();
+        next.continuity = crate::model::TerminalContinuity::Live {
+            host_session_id: crate::model::HostSessionId::new("live"),
+            boot_id: crate::model::BootId::new("boot"),
+            host_incarnation: crate::model::HostIncarnation::new("successor"),
+        };
+        let successor = HostedSession::Terminal(next.clone());
+        let agent = crate::model::AgentId::from_uuid(original.id.as_uuid());
+        let before = read(&registry.db, &Scope::Channel(a)).unwrap();
+        registry.db.execute_batch("CREATE TRIGGER reject_fixture_view BEFORE UPDATE ON panes BEGIN SELECT RAISE(ABORT,'fixture publication failure'); END;").unwrap();
+        {
+            let tx = registry
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                adopt_authenticated_agent_pane(
+                    &tx,
+                    agent,
+                    std::slice::from_ref(&source),
+                    &successor
+                )
+                .is_err()
+            );
+            // Drop rolls back the rejected descriptor write.
+        }
+        assert_eq!(read(&registry.db, &Scope::Channel(a)).unwrap(), before);
+        registry
+            .db
+            .execute_batch("DROP TRIGGER reject_fixture_view;")
+            .unwrap();
+        {
+            let tx = registry
+                .db
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                .unwrap();
+            assert!(
+                adopt_authenticated_agent_pane(
+                    &tx,
+                    agent,
+                    std::slice::from_ref(&source),
+                    &successor
+                )
+                .unwrap()
+            );
+            tx.commit().unwrap();
+        }
+        let after = read(&registry.db, &Scope::Channel(a)).unwrap();
+        assert!(after.revision > before.revision);
+        assert_eq!(
+            after.panes[0],
+            Pane {
+                kind: CardKind::Terminal(next),
+                ..original
+            }
+        );
+    }
+
+    #[test]
+    fn channel_and_project_cascades_release_only_their_own_panes() {
+        let (mut registry, _directory, a, b) = setup();
+        let channel_actor = live_source_pane();
+        let other_actor = live_source_pane();
+        let worktree_actor = live_source_pane();
+        seed(&mut registry, a, vec![channel_actor.clone()]);
+        seed(&mut registry, b, vec![other_actor.clone()]);
+        let worktree = Scope::Worktree {
+            repository: "/repo".into(),
+            path: "/repo/tree".into(),
+        };
+        registry
+            .apply(&ModelEdit::SeedView {
+                scope: worktree.clone(),
+                panes: vec![worktree_actor.clone()],
+                closed: vec![],
+            })
+            .unwrap();
+        registry.apply(&ModelEdit::DeleteChannel { id: a }).unwrap();
+        assert!(owner(&registry.db, channel_actor.id).unwrap().is_none());
+        assert_eq!(
+            owner(&registry.db, other_actor.id).unwrap(),
+            Some(Scope::Channel(b))
+        );
+        assert_eq!(
+            owner(&registry.db, worktree_actor.id).unwrap(),
+            Some(worktree)
+        );
+        registry
+            .apply(&ModelEdit::CloseProject {
+                repository: "/repo".into(),
+            })
+            .unwrap();
+        assert!(all(&registry.db).unwrap().is_empty());
+        for id in [channel_actor.id, other_actor.id, worktree_actor.id] {
+            assert!(owner(&registry.db, id).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn publication_failures_roll_back_transfer_agent_index_and_ledger() {
+        use crate::agent_execution::{
+            Destination, HostedSession, Origin, Spec, Submit, Surface, Target,
+        };
+        let (mut registry, _directory, a, b) = setup();
+        let accepted = registry
+            .submit_agent(
+                &Origin::User,
+                &Submit {
+                    name: Some("fixture-worker".into()),
+                    destination: Destination::New(Spec {
+                        provider: crate::agent::Provider::Codex,
+                        account: None,
+                        target: Target {
+                            repository: "/repo".into(),
+                            directory: "/repo".into(),
+                            placement: Some(Scope::Channel(a)),
+                        },
+                        surface: Surface::Terminal,
+                        model: None,
+                        permission_mode: None,
+                        reasoning_effort: None,
+                    }),
+                    prompt: "Fixture only; never dispatched".into(),
+                    idempotency_key: "placement-transfer-rollback".into(),
+                },
+                1,
+            )
+            .unwrap();
+        let mut original = live_source_pane();
+        original.id = CardId::from_uuid(accepted.agent.id.as_uuid());
+        let CardKind::Terminal(session) = &original.kind else {
+            panic!()
+        };
+        registry
+            .bind_agent(
+                accepted.agent.id,
+                None,
+                HostedSession::Terminal(session.clone()),
+            )
+            .unwrap();
+        seed(&mut registry, a, vec![original.clone()]);
+        seed(&mut registry, b, vec![]);
+        let source = Scope::Channel(a);
+        let target = Scope::Channel(b);
+        let source_before = read(&registry.db, &source).unwrap();
+        let target_before = read(&registry.db, &target).unwrap();
+        let model_before = registry.model().unwrap();
+        let agent_before = registry.agent(accepted.agent.id).unwrap();
+        let transfer = edit(
+            &mut registry,
+            a,
+            Change::Transfer {
+                id: original.id,
+                destination: target.clone(),
+                before: None,
+            },
+        );
+        let ModelEdit::ChangeView { operation, .. } = &transfer else {
+            panic!()
+        };
+        assert!(!operation_seen(&registry.db, *operation).unwrap());
+        // TEMP keeps the published main schema unchanged. Both failures occur
+        // after agent/index/ledger work. The target's distinct error also proves
+        // the real source view was empty before its prepared target was written.
+        let source_id: i64 = registry
+            .db
+            .query_row(
+                "SELECT id FROM view_scopes WHERE channel=?1",
+                [a.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let target_id: i64 = registry
+            .db
+            .query_row(
+                "SELECT id FROM view_scopes WHERE channel=?1",
+                [b.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        for fail_source in [true, false] {
+            let (scope_id, expected, failure) = if fail_source {
+                (
+                    source_id,
+                    "fixture source publication failure",
+                    "SELECT RAISE(ABORT,'fixture source publication failure');".to_owned(),
+                )
+            } else {
+                (
+                    target_id,
+                    "fixture target publication failure",
+                    format!(
+                        "SELECT CASE WHEN EXISTS(SELECT 1 FROM main.panes WHERE scope={source_id})
+                     THEN RAISE(ABORT,'fixture target preceded source')
+                     ELSE RAISE(ABORT,'fixture target publication failure') END;"
+                    ),
+                )
+            };
+            registry
+                .db
+                .execute_batch(&format!(
+                "CREATE TEMP TRIGGER reject_fixture_publication BEFORE UPDATE OF revision ON main.view_scopes
+                 WHEN NEW.id={scope_id} BEGIN {failure} END;",
+            ))
+                .unwrap();
+            assert!(registry.apply(&transfer).unwrap_err().contains(expected));
+            assert_eq!(read(&registry.db, &source).unwrap(), source_before);
+            assert_eq!(read(&registry.db, &target).unwrap(), target_before);
+            assert_eq!(registry.model().unwrap(), model_before);
+            assert_eq!(registry.agent(accepted.agent.id).unwrap(), agent_before);
+            assert_eq!(
+                owner(&registry.db, original.id).unwrap(),
+                Some(source.clone())
+            );
+            assert!(!operation_seen(&registry.db, *operation).unwrap());
+            registry
+                .db
+                .execute_batch("DROP TRIGGER temp.reject_fixture_publication;")
+                .unwrap();
+        }
+        registry.apply(&transfer).unwrap();
+        assert!(operation_seen(&registry.db, *operation).unwrap());
+        assert!(read(&registry.db, &source).unwrap().panes.is_empty());
+        assert_eq!(
+            read(&registry.db, &target).unwrap().panes,
+            [original.clone()]
+        );
+        assert_eq!(
+            owner(&registry.db, original.id).unwrap(),
+            Some(target.clone())
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, target);
+        let back = edit(
+            &mut registry,
+            b,
+            Change::Transfer {
+                id: original.id,
+                destination: source.clone(),
+                before: None,
+            },
+        );
+        registry.apply(&back).unwrap();
+        assert_eq!(
+            read(&registry.db, &source).unwrap().panes,
+            [original.clone()]
+        );
+        assert_eq!(
+            owner(&registry.db, original.id).unwrap(),
+            Some(source.clone())
+        );
+        assert_eq!(registry.agent(accepted.agent.id).unwrap().placement, source);
+    }
 
     #[test]
     fn terminal_retention_projection_tracks_view_changes_and_rolls_back_with_them() {
         use std::collections::BTreeSet;
-        fn placement_storage(registry: &Registry) -> (Vec<(String, i64)>, Vec<(i64, i64)>) {
-            let active = registry
-                .db
-                .prepare("SELECT pane,epoch FROM channel_work_placement_epochs ORDER BY pane")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            let clock = registry
-                .db
-                .prepare("SELECT id,last_epoch FROM channel_work_placement_clock ORDER BY id")
-                .unwrap()
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .unwrap()
-                .collect::<rusqlite::Result<_>>()
-                .unwrap();
-            (active, clock)
-        }
         let (mut registry, directory, a, b) = setup();
         let original = live_source_pane();
         let terminal_id = |pane: &Pane| {
@@ -2583,7 +2833,6 @@ mod tests {
             },
         );
         let before = registry.model().unwrap();
-        let placement_before = placement_storage(&registry);
         registry.db.execute_batch("CREATE TEMP TRIGGER reject_retention BEFORE UPDATE ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'retention projection failure'); END;").unwrap();
         assert!(
             registry
@@ -2592,11 +2841,6 @@ mod tests {
                 .contains("retention projection failure")
         );
         assert_eq!(registry.model().unwrap(), before);
-        assert_eq!(
-            placement_storage(&registry),
-            placement_before,
-            "rejected pin publication must also roll back active epochs and the allocator"
-        );
         assert_eq!(
             registry.pinned_terminals(&candidates).unwrap(),
             BTreeSet::from([old])
@@ -2696,7 +2940,6 @@ mod tests {
             },
         );
         let before_transfer = registry.model().unwrap();
-        let placement_before_transfer = placement_storage(&registry);
         registry.db.execute_batch("CREATE TEMP TRIGGER reject_retention_transfer BEFORE INSERT ON shared_terminal_retention_pins BEGIN SELECT RAISE(ABORT, 'retention transfer failure'); END;").unwrap();
         assert!(
             registry
@@ -2706,11 +2949,6 @@ mod tests {
         );
         assert_eq!(registry.model().unwrap(), before_transfer);
         assert_eq!(
-            placement_storage(&registry),
-            placement_before_transfer,
-            "source-first Transfer and its failed target pins must roll back together"
-        );
-        assert_eq!(
             registry.pinned_terminals(&candidates).unwrap(),
             BTreeSet::from([new])
         );
@@ -2719,14 +2957,6 @@ mod tests {
             .execute_batch("DROP TRIGGER reject_retention_transfer;")
             .unwrap();
         registry.apply(&transfer).unwrap();
-        let placement_after_transfer = placement_storage(&registry);
-        let next = placement_before_transfer.1[0].1 + 1;
-        assert_eq!(placement_after_transfer.1, vec![(1, next)]);
-        assert_eq!(
-            placement_after_transfer.0,
-            vec![(replacement.id.to_string(), next)],
-            "Transfer must leave one fresh active mapping, not a source tombstone"
-        );
         assert!(
             read(&registry.db, &Scope::Channel(a))
                 .unwrap()

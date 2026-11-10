@@ -1,4 +1,8 @@
-//! Clients of an older protocol that this daemon still serves.
+//! Admission and delivery limits for proven older CLI wire formats.
+//!
+//! Protocol 161 removes positional channel-work variants, so no older client
+//! is currently admitted. Historical formats remain recorded to make a future
+//! admission prove all request and reply shapes again.
 //!
 //! An update carries a running provider process across, and that process keeps
 //! the `PATH` its daemon gave it at launch, so it keeps running the older
@@ -29,8 +33,8 @@ use serde::{
 };
 
 use super::{
-    CANDIDATE_LINE_PROTOCOL, ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode,
-    ServerMessage, ServerResponse,
+    ClientRequest, PROTOCOL_VERSION, ProtocolError, ProtocolErrorCode, ServerMessage,
+    ServerResponse,
 };
 
 /// What an older protocol's client can decode, as variant counts of the three
@@ -51,19 +55,10 @@ pub struct OlderClient {
     agent_replies: u32,
 }
 
-/// The install candidate line, 0.1.3+local.c68275e94. Its chats are carried
-/// across an update to this release and keep running its CLI.
-const CANDIDATE_LINE: OlderClient = OlderClient {
-    protocol: CANDIDATE_LINE_PROTOCOL,
-    proven_at: 160,
-    client_requests: 74,
-    server_messages: 17,
-    server_responses: 40,
-    work_responses: 6,
-    agent_replies: 11,
-};
-
-const OLDER_CLIENTS: &[OlderClient] = &[CANDIDATE_LINE];
+// Removing channel-work variants shifts request, response and ModelEdit tags.
+// No published older client has this wire format. Keep the admission list empty
+// until a later release proves compatibility against its recorded format.
+const OLDER_CLIENTS: &[OlderClient] = &[];
 
 /// The first protocol whose `Firing` carries its skipped occurrences. Postcard
 /// is positional, so a client before this one cannot read a reply holding one.
@@ -367,7 +362,21 @@ mod wire_shape;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::terminal_ipc::{ServerResponse, TerminalCloseResult};
+    use crate::terminal_ipc::{CANDIDATE_LINE_PROTOCOL, ServerResponse, TerminalCloseResult};
+
+    // A synthetic client exercises the generic gates without admitting an
+    // incompatible published protocol at runtime.
+    fn limited_client() -> OlderClient {
+        OlderClient {
+            protocol: CANDIDATE_LINE_PROTOCOL,
+            proven_at: PROTOCOL_VERSION,
+            client_requests: 74,
+            server_messages: 17,
+            server_responses: 40,
+            work_responses: 6,
+            agent_replies: 11,
+        }
+    }
 
     #[test]
     fn variant_index_is_the_declaration_position_at_every_payload_shape() {
@@ -421,20 +430,19 @@ mod tests {
     }
 
     #[test]
-    fn only_this_protocol_and_the_listed_older_ones_are_served() {
+    fn removed_channel_work_positions_require_matching_clients() {
         assert_eq!(older_client(PROTOCOL_VERSION), None);
-        assert_eq!(
-            older_client(CANDIDATE_LINE_PROTOCOL).map(|client| client.protocol),
-            Some(CANDIDATE_LINE_PROTOCOL)
-        );
-        for protocol in [0, 77, 119, 127, PROTOCOL_VERSION + 1, u16::MAX] {
+        for protocol in 0..PROTOCOL_VERSION {
+            assert_eq!(older_client(protocol), None, "{protocol}");
+        }
+        for protocol in [PROTOCOL_VERSION + 1, u16::MAX] {
             assert_eq!(older_client(protocol), None, "{protocol}");
         }
     }
 
     #[test]
     fn a_work_reply_after_the_older_protocol_is_refused() {
-        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let client = limited_client();
         let reply = |response| ServerMessage::Response {
             response: ServerResponse::Work(response),
         };
@@ -457,7 +465,7 @@ mod tests {
     fn an_automation_reply_holding_a_firing_is_refused_before_it_changed() {
         use crate::automations::{HistoryPage, Response};
 
-        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let client = limited_client();
         let reply = |response| ServerMessage::Response {
             response: ServerResponse::Automation(response),
         };
@@ -483,7 +491,7 @@ mod tests {
         use crate::{agent_execution::Authority, automations::Request};
         use uuid::Uuid;
 
-        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let client = limited_client();
         let asking = |operation| ClientRequest::Automation {
             authority: Authority::default(),
             operation,
@@ -520,7 +528,7 @@ mod tests {
             Reply,
             directory::{Directory, Members, Scope, Sessions},
         };
-        let client = older_client(CANDIDATE_LINE_PROTOCOL).unwrap();
+        let client = limited_client();
         let reply = |reply| ServerMessage::Response {
             response: ServerResponse::Agent(reply),
         };

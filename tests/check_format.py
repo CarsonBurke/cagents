@@ -24,7 +24,6 @@ INCLUDED = (
     "src/app/repository_clone_lsp_ownership_tests.rs",
     "src/control/handshake_deadline_tests.rs",
     "src/terminal/worker/bounded_input_tests.rs",
-    "src/host/model/views/placement_tests.rs",
     "tests/support/iced_tree.rs",
     "tests/support/repository_scale.rs",
 )
@@ -606,7 +605,6 @@ edition = "2024"
         # that rustfmt can traverse; direct checking must cover every one.
         self.write("src/gated.rs", """pub fn gated() {}
 include!("terminal/worker/bounded_input_tests.rs");
-include!("host/model/views/placement_tests.rs");
 include!("../tests/support/iced_tree.rs");
 include!("../tests/support/repository_scale.rs");
 """)

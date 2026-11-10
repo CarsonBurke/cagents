@@ -140,7 +140,6 @@ fn open_existing(path: &Path) -> Result<Connection, String> {
     checkpoint("admitted")?;
     super::migrate_through(&tx, inspected.version, SCHEMA_VERSION)?;
     require_layout(&tx)?;
-    super::channel_work::repair_missing_homes_in(&tx)?;
     // Also forces the rollback-mode EXCLUSIVE write before commit for an
     // already-current store. No future writer can enter the conversion gap.
     tx.pragma_update(None, "user_version", SCHEMA_VERSION)
@@ -227,6 +226,7 @@ pub(super) fn downgrade(path: &Path, target: u32) -> Result<Option<u32>, String>
     require_open_layout(&tx, version)?;
     for step in (target + 1..=version).rev() {
         match step {
+            24 => super::retired_channel_work::restore(&tx)?,
             23 => super::views::store::downgrade(&tx)?,
             _ => {
                 return Err(format!(
@@ -340,6 +340,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
     static TWENTY_ONE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_TWO: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     static TWENTY_THREE: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
+    static TWENTY_FOUR: OnceLock<Result<(Layout, Layout), String>> = OnceLock::new();
     let published = match version {
         12 => &TWELVE,
         13 => &THIRTEEN,
@@ -353,6 +354,7 @@ fn published_layouts(version: u32) -> Result<&'static (Layout, Layout), String> 
         21 => &TWENTY_ONE,
         22 => &TWENTY_TWO,
         23 => &TWENTY_THREE,
+        24 => &TWENTY_FOUR,
         _ => return Err(format!("unsupported published registry layout {version}")),
     };
     published
@@ -578,8 +580,8 @@ mod tests {
         } else {
             tx.execute("INSERT INTO channels(id,repository,title,ordinal) VALUES(?1,'/kept','My channel',5)", [channel.to_string()]).unwrap();
         }
-        if version >= 17 {
-            super::super::channel_work::created_in(&tx, channel).unwrap();
+        if (17..24).contains(&version) {
+            tx.execute("INSERT INTO channel_work_homes(channel,incarnation,repository,title,lifecycle,revision) VALUES(?1,5,'/kept','My channel','active','0')", [channel.to_string()]).unwrap();
         }
         tx.pragma_update(None, "user_version", version).unwrap();
         tx.commit().unwrap();
@@ -1104,7 +1106,9 @@ mod tests {
             "shared_view_terminal_sources",
         ];
         let mut old_layout = inspect(&db).unwrap().objects;
-        old_layout.retain(|object| !replaced_views.contains(&object.2.as_str()));
+        old_layout.retain(|object| {
+            !replaced_views.contains(&object.2.as_str()) && !object.2.starts_with("channel_work_")
+        });
         let audit_rows = |db: &Connection| {
             db.prepare("SELECT sequence,automation,repository,record FROM automation_lifecycle ORDER BY sequence")
                 .unwrap()
@@ -1140,7 +1144,8 @@ mod tests {
                     tokens(super::super::automation_notifications::SCHEMA_SQL).unwrap(),
                 )
             );
-            // This current opener also applies retention20, run-attention21 and history22.
+            // This current opener also applies retention20, run-attention21, history22
+            // and the channel-work removal of 24.
             // Admit only those known objects here; every predecessor object
             // and the exact lifecycle outbox assertion stay intact.
             let retention_names = [
@@ -1192,7 +1197,7 @@ mod tests {
             firing.3.drain(start..start + column.len());
             assert_eq!(
                 inventory, old_layout,
-                "only lifecycle/run outboxes, retention objects and the exact history column may be added"
+                "only lifecycle/run outboxes, retention objects and the exact history column may be added, and only channel work removed"
             );
             assert!(
                 registry
@@ -1251,88 +1256,96 @@ mod tests {
     }
 
     #[test]
-    fn published_sixteen_channel_work_upgrade_preserves_home_without_inferring_prs() {
-        use super::super::channel_work::TrustedResolvedOrigin;
-        use crate::channel_work::{Change, Home, Mutation, Origin, Page, Role, Target};
-        use crate::github_identity::{GitHubRepoKey, PullRequestKey};
-
+    fn failed_twenty_three_to_twenty_four_keeps_published_history_and_header() {
+        let _clear = Clear;
         let directory = fixture_dir();
-        let path = directory.path().join("channel-work16.sqlite3");
-        let (identity, channel) = legacy(&path, 16);
-        // A historical title mentioning a PR is metadata, never work intent.
+        let path = directory.path().join("channel-work23-rollback.sqlite3");
+        legacy(&path, 23);
         let db = Connection::open(&path).unwrap();
-        db.execute(
-            "UPDATE channels SET title='Review github.com/owner/repo/pull/7' WHERE id=?1",
-            [channel.to_string()],
-        )
+        db.execute("INSERT INTO channel_work_entries(channel,incarnation,target,entry,bucket,sequence) SELECT channel,incarnation,'pr','{}','history',1 FROM channel_work_homes", []).unwrap();
+        let old_layout = inspect(&db).unwrap();
+        drop(db);
+        let before = bytes(&path);
+        FAIL_STEP.with(|step| step.set(Some(24)));
+        let error = Registry::at(&path)
+            .err()
+            .expect("injected schema24 failure");
+        FAIL_STEP.with(|step| step.set(None));
+        assert!(error.contains("failure at 24"), "{error}");
+        assert_eq!(bytes(&path), before);
+        let db = Connection::open(&path).unwrap();
+        assert_eq!(inspect(&db).unwrap(), old_layout);
+        assert_eq!(
+            db.query_row("SELECT count(*) FROM channel_work_entries", [], |row| row
+                .get::<_, i64>(
+                0
+            ))
+            .unwrap(),
+            1
+        );
+        drop(db);
+        schema_current_after_retry(&path);
+    }
+
+    fn schema_current_after_retry(path: &Path) {
+        let registry = Registry::at(path).unwrap();
+        require_current(&registry.db).unwrap();
+        assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn published_twenty_two_upgrade_drops_channel_work_and_keeps_its_channel() {
+        let _clear = Clear;
+        let directory = fixture_dir();
+        let path = directory.path().join("channel-work22.sqlite3");
+        let (identity, channel) = legacy(&path, 22);
+        // Declarations, their receipts and placement epochs, as schema 22
+        // stored them. Nothing reads them any more.
+        let db = Connection::open(&path).unwrap();
+        db.execute_batch(&format!(
+            "INSERT INTO channel_work_entries(channel,incarnation,target,entry,bucket,sequence)
+                 VALUES('{channel}',5,'pr','{{}}','ongoing',1);
+             INSERT INTO channel_work_operations(operation,channel,incarnation,record)
+                 VALUES('{operation}','{channel}',5,'{{}}');
+             INSERT INTO channel_work_placement_epochs(pane,epoch) VALUES('{pane}',1);
+             UPDATE channel_work_placement_clock SET last_epoch=1 WHERE id=1;",
+            operation = uuid::Uuid::new_v4(),
+            pane = crate::model::CardId::new(),
+        ))
         .unwrap();
         drop(db);
-        let mut registry = Registry::at(&path).unwrap();
-        let before = registry.model().unwrap();
-        assert_eq!(before.identity.to_string(), identity);
-        assert_eq!(before.sequence, 7);
-        assert_eq!(before.channel(channel).unwrap().ordinal, 5);
-        assert_eq!(
-            before.channel(channel).unwrap().title,
-            "Review github.com/owner/repo/pull/7"
-        );
-        let home = Home {
-            registry: before.identity,
-            channel,
-            creation_ordinal: 5,
-        };
-        let empty = registry.read_channel_work(&home, Page::default()).unwrap();
-        assert_eq!(empty.revision, 0);
-        assert!(empty.entries.is_empty() && empty.history.is_empty());
-        let operations: u64 = registry
+
+        let registry = Registry::at(&path).unwrap();
+        assert_eq!(inspect(&registry.db).unwrap().version, SCHEMA_VERSION);
+        let tables: Vec<String> = registry
             .db
-            .query_row("SELECT count(*) FROM channel_work_operations", [], |row| {
-                row.get(0)
-            })
+            .prepare("SELECT name FROM sqlite_schema WHERE name GLOB 'channel_work*'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(
-            operations, 0,
-            "migration does not invent an attribution receipt"
-        );
-        let request = Mutation {
-            home,
-            expected_revision: 0,
-            operation: uuid::Uuid::new_v4(),
-            change: Change::Claim {
-                target: Target::PullRequest(
-                    PullRequestKey::new(
-                        GitHubRepoKey::new("github.com", None, "owner", "repo").unwrap(),
-                        7,
-                    )
-                    .unwrap(),
-                ),
-                role: Role::Steward,
-            },
-        };
-        let reply = registry
-            .apply_channel_work(
-                &TrustedResolvedOrigin {
-                    origin: Origin::User,
-                    proof: None,
-                },
-                &request,
-            )
-            .unwrap();
-        assert!(reply.receipt.changed);
-        assert_eq!(reply.snapshot.entries.len(), 1);
-        assert_eq!(registry.model().unwrap().sequence, 8);
-        let after = registry.model().unwrap();
-        assert_eq!(after.channels, before.channels);
-        assert_eq!(after.projects, before.projects);
-        assert_eq!(after.views, before.views);
-        assert_eq!(after.agents, before.agents);
+        assert!(tables.is_empty(), "{tables:?}");
+        let model = registry.model().unwrap();
+        assert_eq!(model.identity.to_string(), identity);
+        assert_eq!(model.sequence, 7, "dropping channel work is no model edit");
+        let kept = model.channel(channel).unwrap();
+        assert_eq!((kept.ordinal, kept.title.as_str()), (5, "My channel"));
         drop(registry);
-        let reopened = Registry::at(&path).unwrap();
-        assert_eq!(reopened.model().unwrap(), after);
-        assert_eq!(
-            reopened.read_channel_work(&home, Page::default()).unwrap(),
-            reply.snapshot
-        );
+        let mut registry = Registry::at(&path).unwrap();
+        assert_eq!(registry.model().unwrap(), model);
+        // Its declarations no longer keep the emptied channel.
+        let scope = crate::workspace_model::views::Scope::Channel(channel);
+        let retire = ModelEdit::RetireEmptyChannel {
+            home: crate::workspace_model::ChannelIncarnation {
+                registry: model.identity,
+                channel,
+                creation_ordinal: 5,
+            },
+            expected_view_revision: registry.view_revision(&scope).unwrap(),
+        };
+        assert!(registry.apply(&retire).unwrap().changed);
+        assert!(registry.model().unwrap().channel(channel).is_none());
     }
 
     #[test]
@@ -1519,7 +1532,7 @@ mod tests {
     fn each_actual_migration_failure_rolls_back_all_prior_steps_and_header() {
         let _clear = Clear;
         for step in [
-            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22,
+            1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24,
         ] {
             let dir = fixture_dir();
             let path = dir.path().join("rollback.sqlite3");

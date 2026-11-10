@@ -1082,14 +1082,14 @@ mod tests {
         ));
     }
 
-    fn channel_close_fixture() -> (Cagents, CardId, crate::channel_work::Home) {
+    fn channel_close_fixture() -> (Cagents, CardId, crate::workspace_model::ChannelIncarnation) {
         use crate::workspace_model::{
             ModelChannel,
             views::{Pane, Scope, View},
         };
         let mut app = super::super::tests::context_inspector_test_app(true);
         let card = app.workspace.focused().unwrap();
-        let home = crate::channel_work::Home {
+        let home = crate::workspace_model::ChannelIncarnation {
             registry: uuid::Uuid::new_v4(),
             channel: crate::model::ChannelId::new(),
             creation_ordinal: 4,
@@ -1128,7 +1128,7 @@ mod tests {
     fn assert_deferred_home_close(
         app: &mut Cagents,
         card: CardId,
-        home: crate::channel_work::Home,
+        home: crate::workspace_model::ChannelIncarnation,
     ) {
         use crate::workspace_model::ModelEdit;
         assert!(!app.card_state(card).unwrap().existence.is_open());

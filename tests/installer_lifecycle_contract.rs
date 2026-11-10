@@ -356,6 +356,23 @@ case "$*" in
     [ "$FIXTURE_TERMINALS" = 0 ] || exit 3
     rm "$FIXTURE_RUNNING"
     ;;
+  'daemon store-schema --help'|'daemon downgrade-store --help')
+    [ "$CLI" = new ] && [ "$#" -eq 3 ] || exit 98
+    printf 'Usage: cagents daemon %s\n' "$2"
+    ;;
+  'daemon store-schema')
+    [ "$CLI" = new ] && [ "$#" -eq 2 ] || exit 98
+    [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
+    [ "$(readlink "$FIXTURE_PREFIX/current")" = versions/old ] || exit 98
+    printf '%s\n' new:store-schema >> "$FIXTURE_ACTIONS"
+    printf '%s\n' 23
+    ;;
+  'daemon downgrade-store 23')
+    [ "$CLI" = new ] && [ "$#" -eq 3 ] || exit 98
+    [ ! -e "$FIXTURE_RUNNING" ] && [ ! -e "$FIXTURE_PENDING" ] || exit 98
+    [ "$(readlink "$FIXTURE_PREFIX/current")" = versions/9.9.9 ] || exit 98
+    printf '%s\n' new:downgrade-store:23 >> "$FIXTURE_ACTIONS"
+    ;;
   'daemon start')
     [ "$#" -eq 2 ] || exit 98
     printf '%s:start\n' "$CLI" >> "$FIXTURE_ACTIONS"
@@ -798,18 +815,21 @@ exec sh "$@""#,
             );
         }
     } else if restart == Some("empty-start-unknown") {
-        assert_eq!(actions, "require-empty\nnew:start\n");
+        assert_eq!(actions, "require-empty\nnew:store-schema\nnew:start\n");
         assert!(!checkpoint.exists());
         assert!(!restored.exists());
     } else if restart == Some("empty-start-failure") {
-        assert_eq!(actions, "require-empty\nnew:start\nold:start\n");
+        assert_eq!(
+            actions,
+            "require-empty\nnew:store-schema\nnew:start\nnew:downgrade-store:23\nold:start\n"
+        );
         assert!(!checkpoint.exists());
         assert!(!restored.exists());
     } else if restart == Some("empty") {
         assert_eq!(
             actions,
             if terminals == 0 {
-                "require-empty\nnew:start\n"
+                "require-empty\nnew:store-schema\nnew:start\n"
             } else {
                 "require-empty\n"
             }
@@ -822,14 +842,16 @@ exec sh "$@""#,
             ("legacy" | "relaunch-unsupported", _) => "old:help\n",
             ("prepare-failure", _) => "old:help\nold:prepare\n",
             ("start-failure", _) => {
-                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\nnew:stopped\nold:start\n"
+                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:store-schema\nnew:start\nnew:stopped\nnew:downgrade-store:23\nold:start\n"
             }
             ("success" | "relaunch" | "decline" | "decline-legacy", None) => {
-                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n"
+                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:store-schema\nnew:start\n"
             }
-            ("success", Some(_)) => "old:help\nold:prepare\nold:draining\nold:stopped\nold:start\n",
+            ("success", Some(_)) => {
+                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:store-schema\nnew:downgrade-store:23\nold:start\n"
+            }
             ("start-unknown" | "start-signal", _) => {
-                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:start\n"
+                "old:help\nold:prepare\nold:draining\nold:stopped\nnew:store-schema\nnew:start\n"
             }
             _ => panic!("unknown fixture restart mode"),
         };
