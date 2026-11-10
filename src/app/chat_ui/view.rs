@@ -8998,6 +8998,7 @@ mod tests {
             .unwrap()
             .set_visible(false)
             .unwrap();
+        app.chat_runtime_mut(target).unwrap().cool();
         preparation::retirement_barrier();
         assert!(runtime(&app, target).cache.is_empty());
         app.chat_runtime_mut(target)
@@ -9226,6 +9227,7 @@ mod tests {
                 .unwrap()
                 .set_visible(false)
                 .unwrap();
+            app.chat_runtime_mut(target).unwrap().cool();
             preparation::retirement_barrier();
             assert!(runtime(&app, target).cache.is_empty());
             app.chat_runtime_mut(target)
@@ -10192,6 +10194,7 @@ mod tests {
                 .unwrap()
                 .set_visible(false)
                 .unwrap();
+            app.chat_runtime_mut(target).unwrap().cool();
             preparation::retirement_barrier();
             assert!(runtime(&app, target).cache.is_empty());
             app.chat_runtime_mut(target)

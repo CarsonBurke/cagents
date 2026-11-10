@@ -9375,6 +9375,7 @@ impl Cagents {
                 VisibilityClass::Visible | VisibilityClass::Overscan => reconcile_now = true,
             }
         }
+        self.trim_warm_chats();
         if synchronize_scroll && update.offset_changed {
             tasks.push(self.synchronize_workspace_scroll());
         }
@@ -12769,6 +12770,15 @@ impl Cagents {
     }
 
     fn set_workspace_surfaces_visible(&mut self, workspace_visible: bool) {
+        self.apply_workspace_surface_visibility(workspace_visible);
+        self.trim_warm_chats();
+    }
+
+    /// [`Self::set_workspace_surfaces_visible`] without applying the warm
+    /// chat budget, for a caller that shows the next panes before the budget
+    /// is applied: hiding everything first must not cool the chats about to
+    /// be shown again.
+    fn apply_workspace_surface_visibility(&mut self, workspace_visible: bool) {
         let visible_cards = self
             .presence
             .iter()
@@ -14469,6 +14479,7 @@ impl Cagents {
                     _ => {}
                 }
             }
+            self.chat_ui.set_parked_syntax_theme(syntax_theme);
         }
         if previous.diff_hide_unchanged != self.settings.diff_hide_unchanged {
             for runtime in self.cards.values_mut() {

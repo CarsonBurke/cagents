@@ -395,9 +395,17 @@ geometry and build profile on both revisions. Record the exact commit and dirty
 state, process identity, sampled UI CPU/RSS/PSS, and time boundaries alongside
 raw samples. Exercise `huge 1024`, `stream 300 300`, 43 composer characters,
 40 wheel notches, Find, selection/copy, and a hidden `tools 300` child. Opening
-the 1 MiB answer has a 150 MB RSS growth budget; after switching away, the UI
-must return within 30 MB of its prior baseline. Repeat hide/reveal and close
-cycles, including Hide tab. Use the isolated development runner described in
+the 1 MiB answer has a 150 MB RSS growth budget. Switching away keeps the
+most recently hidden chats warm (`src/app/chat_ui/warm.rs`): at most 8, within
+an estimated 96 MiB of heap together, and none over 32 MiB, which goes cold as
+it hides. The estimate is calibrated against the heap cooling frees, measured
+by `frame_cost::what_a_warm_hidden_chat_holds`. After switching away from a
+chat that goes cold, the UI must return within 30 MB of its prior baseline;
+while chats are warm, within 30 MB of that baseline plus their estimate. Record
+RSS for 1, 4, 8 and 9 hidden chats, the ninth sending the first cold. Freed
+heap is not always returned to the system, so compare RSS after the repeat
+cycles too, not only after the first. Repeat hide/reveal and close cycles,
+including Hide tab. Use the isolated development runner described in
 [development.md](development.md), preserving existing sessions.
 
 Full-context shaping holds one output permit through UI consumption; queued
