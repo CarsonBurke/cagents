@@ -2,6 +2,22 @@
 //! an original positional prompt. Constructors still validate transport values.
 use super::{Provider, Session};
 
+pub(super) const CODEX_REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+
+/// The only Codex config override with an equivalent native fresh-thread field.
+pub(super) fn codex_config_effort(value: &str) -> Option<&str> {
+    value
+        .strip_prefix(CODEX_REASONING_EFFORT_KEY)
+        .and_then(|rest| rest.strip_prefix('='))
+        .map(|effort| {
+            effort
+                .strip_prefix('"')
+                .and_then(|effort| effort.strip_suffix('"'))
+                .unwrap_or(effort)
+        })
+        .filter(|effort| crate::agent_execution::valid_reasoning_effort(effort))
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum ArgumentArity {
     Switch,
@@ -149,6 +165,9 @@ impl Session {
                         // only for --remote; other inline forms are ambiguous.
                         if provider == Provider::Codex && inline.is_some() && flag != "--remote" {
                             return None;
+                        }
+                        if provider == Provider::Codex && matches!(flag, "--config" | "-c") {
+                            codex_config_effort(value)?;
                         }
                         if owned_address.as_ref().is_some_and(|address| {
                             flag == "--sock" || (flag == "--remote" && value != address)
@@ -360,6 +379,32 @@ mod tests {
             let mut source = session(provider, &["--resume", &upper]);
             source.launch.session_id = Some(upper.clone());
             assert_eq!(source.fresh_start().is_some(), provider == Provider::Omp);
+        }
+    }
+
+    #[test]
+    fn codex_config_values_require_an_equivalent_fresh_thread_override() {
+        for flag in ["--config", "-c"] {
+            for value in [
+                "model_reasoning_effort=high",
+                "model_reasoning_effort=\"low\"",
+            ] {
+                let source = session(Provider::Codex, &[flag, value]);
+                assert_eq!(
+                    source.fresh_start().unwrap().launch.recipe.arguments,
+                    [flag, value]
+                );
+            }
+            for value in [
+                "model=\"o3\"",
+                "model_reasoning_effort=unsupported",
+                "model_reasoning_effort=\"high",
+            ] {
+                let source = session(Provider::Codex, &[flag, value]);
+                let original = source.clone();
+                assert!(source.fresh_start().is_none());
+                assert_eq!(source, original);
+            }
         }
     }
 

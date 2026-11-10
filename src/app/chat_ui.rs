@@ -27698,10 +27698,12 @@ mod tests {
             vec!["--resume".into(), "a-different-conversation".into()],
             vec!["an already consumed prompt".into()],
             vec!["--model".into()],
+            vec!["-c".into(), "model=\"o3\"".into()],
         ] {
             let mut app = crate::app::tests::context_inspector_test_app(false);
             let (card, target) = unresumable_chat(&mut app);
             let mut source = chat_runtime(&app, card).session.clone();
+            source.reset_owned_codex_listener();
             source.launch.recipe.arguments = arguments;
             app.card_state_mut(card).unwrap().kind = CardKind::Chat(source.clone());
             let runtime = app.chat_runtime_mut(target).unwrap();

@@ -21,7 +21,7 @@ pub(crate) mod rollout;
 /// recipe names it as `--config model_reasoning_effort=<effort>`, the way the
 /// Codex CLI takes it, and a new thread receives it as a `thread/start`
 /// configuration override.
-pub const REASONING_EFFORT_KEY: &str = "model_reasoning_effort";
+pub const REASONING_EFFORT_KEY: &str = crate::chat::fresh::CODEX_REASONING_EFFORT_KEY;
 
 /// The shortest directory suffix that distinguishes one same-name skill from
 /// its peers. A skill can declare a name different from its directory name.
@@ -297,16 +297,7 @@ fn create_inner(
                 })?;
                 // Only an override with a typed `thread/start` equivalent is
                 // translated; any other key would silently change meaning.
-                let effort = value
-                    .strip_prefix(REASONING_EFFORT_KEY)
-                    .and_then(|rest| rest.strip_prefix('='))
-                    .map(|effort| {
-                        effort
-                            .strip_prefix('"')
-                            .and_then(|effort| effort.strip_suffix('"'))
-                            .unwrap_or(effort)
-                    })
-                    .filter(|effort| crate::agent_execution::valid_reasoning_effort(effort))
+                let effort = crate::chat::fresh::codex_config_effort(value)
                     .ok_or_else(|| {
                         super::SetupError::Invalid(format!(
                             "Codex launch option {arg} {value:?} cannot safely be translated to native app-server mode"
@@ -9984,6 +9975,63 @@ mod fresh_recipe_constructor_tests {
             let original = saved.clone();
             assert!(saved.fresh_start().is_none(), "{arguments:?}");
             assert_eq!(saved, original);
+        }
+    }
+
+    #[test]
+    fn fresh_config_admission_refuses_overrides_that_only_resume_can_ignore() {
+        let root = tempfile::tempdir().unwrap();
+        for flag in ["-c", "--config"] {
+            for value in [
+                "model=\"o3\"",
+                "model_reasoning_effort=unsupported",
+                "model_reasoning_effort=\"high",
+            ] {
+                let saved = source(root.path(), vec![flag.into(), value.into()]);
+                let original = saved.clone();
+                assert!(
+                    create_with_listener_for_start(&saved.launch, root.path().join("saved.sock"))
+                        .is_ok(),
+                    "the existing thread is admitted without changing its live configuration"
+                );
+                assert!(saved.fresh_start().is_none(), "{flag} {value}");
+                assert_eq!(saved, original);
+            }
+        }
+        assert!(!root.path().join("codex").exists());
+    }
+
+    #[test]
+    fn fresh_config_admission_preserves_quoted_and_unquoted_reasoning_effort() {
+        let root = tempfile::tempdir().unwrap();
+        for flag in ["-c", "--config"] {
+            for (value, effort) in [
+                ("model_reasoning_effort=high", "high"),
+                ("model_reasoning_effort=\"low\"", "low"),
+            ] {
+                let saved = source(root.path(), vec![flag.into(), value.into()]);
+                let original = saved.clone();
+                let fresh = saved.fresh_start().unwrap();
+                assert_eq!(fresh.launch.recipe.arguments, [flag, value]);
+                let (_, mut adapter) =
+                    create_with_listener_for_start(&fresh.launch, root.path().join("fresh.sock"))
+                        .unwrap();
+                let initialize = adapter.initialize_for_start().unwrap();
+                let start = adapter.receive(json!({"id":initialize.writes[0]["id"],"result":{"userAgent":"codex","codexHome":root.path().join("home/.codex")}})).unwrap();
+                let thread = start
+                    .writes
+                    .iter()
+                    .find(|frame| frame["method"] == "thread/start")
+                    .unwrap();
+                assert_eq!(thread["params"]["config"][REASONING_EFFORT_KEY], effort);
+                assert!(
+                    !start
+                        .writes
+                        .iter()
+                        .any(|frame| frame["method"] == "thread/resume")
+                );
+                assert_eq!(saved, original);
+            }
         }
     }
 }
