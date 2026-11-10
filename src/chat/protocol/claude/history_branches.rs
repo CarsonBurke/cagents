@@ -507,13 +507,17 @@ pub(super) fn index_activity(
             } else {
                 &frame
             };
+            let notification = string(&frame, "subtype") == "task_notification";
             notices.push((
                 raw.to_owned(),
                 string(&frame, "task_id").to_owned(),
-                super::task_status(
-                    string(patch, "status"),
-                    string(&frame, "subtype") == "task_notification",
-                ),
+                super::task_status(string(patch, "status"), notification).map(|status| {
+                    if notification && super::interim_notice(string(patch, "status"), patch) {
+                        ToolStatus::Waiting
+                    } else {
+                        status
+                    }
+                }),
                 string(&frame, "subtype") == "task_started",
                 false,
                 None,
@@ -554,6 +558,17 @@ pub(super) fn index_activity(
                 }
                 if started {
                     ended.remove(&identity);
+                } else if status == Some(ToolStatus::Waiting) {
+                    // A waiting agent hasn't ended, but a stop still has: a
+                    // recorded report of waiting that follows one doesn't
+                    // bring it back.
+                    if ended.get(&identity) == Some(&ToolStatus::Stopped) {
+                        if recorded {
+                            continue;
+                        }
+                    } else {
+                        ended.remove(&identity);
+                    }
                 } else if let Some(status) = status
                     && ended.get(&identity) != Some(&ToolStatus::Stopped)
                 {

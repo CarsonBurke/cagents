@@ -576,6 +576,8 @@ enum Tone {
 enum BackgroundState {
     Working,
     Waiting,
+    /// Alive, with its result so far delivered: nothing is asked of anyone.
+    OnBackgroundWork,
     Failed,
     Stopped,
     Finished,
@@ -586,6 +588,7 @@ impl BackgroundState {
         match self {
             Self::Working => "Working",
             Self::Waiting => "Waiting for you",
+            Self::OnBackgroundWork => "Waiting on background work",
             Self::Failed => "Failed",
             Self::Stopped => "Stopped",
             Self::Finished => "Finished",
@@ -595,6 +598,7 @@ impl BackgroundState {
     fn tool_status(self) -> ToolStatus {
         match self {
             Self::Working | Self::Waiting => ToolStatus::Running,
+            Self::OnBackgroundWork => ToolStatus::Waiting,
             Self::Failed => ToolStatus::Failed,
             Self::Stopped => ToolStatus::Stopped,
             Self::Finished => ToolStatus::Succeeded,
@@ -863,6 +867,7 @@ impl Runtime {
             .filter(|_| matches!(status, ToolStatus::Running | ToolStatus::Succeeded))
         {
             Some(BackgroundState::Waiting) => muted_glyph(Icon::AgentWaiting),
+            Some(BackgroundState::OnBackgroundWork) => muted_glyph(Icon::AgentBackground),
             Some(state) => self.card_indicator(state.tool_status(), Icon::Agent),
             None => self.card_indicator(status, Icon::Agent),
         };
@@ -1018,6 +1023,8 @@ impl Runtime {
             Some(BackgroundState::Waiting)
         } else if any(ToolStatus::Running) {
             Some(BackgroundState::Working)
+        } else if any(ToolStatus::Waiting) {
+            Some(BackgroundState::OnBackgroundWork)
         } else if any(ToolStatus::Failed) {
             Some(BackgroundState::Failed)
         } else if any(ToolStatus::Stopped) || any(ToolStatus::Denied) {
