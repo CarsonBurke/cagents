@@ -1623,3 +1623,6 @@ mod tests {
         assert_eq!(short_index, 0);
     }
 }
+
+#[cfg(test)]
+mod durable_save_workload;
