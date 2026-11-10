@@ -213,9 +213,9 @@ pub(super) fn wait_stop(
     let (mut preview, mut list) = observe()?;
     if !terminal {
         return Err(invalid(format!(
-            "{}\n{}",
-            list.render_preview(),
-            floor::terminal_confirmation(state, job)?
+            "{} Details: {}",
+            floor::terminal_confirmation(state, job)?,
+            list.render_preview()
         )));
     }
     let mut nonce = uuid::Uuid::new_v4().to_string();
