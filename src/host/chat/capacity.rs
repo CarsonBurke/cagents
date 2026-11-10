@@ -1204,7 +1204,7 @@ exit 0
         };
         host.lock().unwrap().chat_handoffs.insert(
             source.id,
-            HandoffReceipt::new(
+            TerminalHandoff::new(
                 source.clone(),
                 terminal.clone(),
                 1,

@@ -27492,16 +27492,8 @@ mod tests {
         );
         assert_eq!(stopped.secondary, None);
         assert_eq!(runtime.stopped(true, false).primary.unwrap().2, false);
-        let labels = recovery_labels(runtime.stopped_controls(false, false));
         assert!(
-            labels
-                .iter()
-                .any(|label| label == "Start a new conversation")
-        );
-        assert!(
-            labels
-                .iter()
-                .all(|label| label != "Try again" && label != "Reconnect")
+            matches!(stopped.primary.unwrap().1.action(runtime.target), Action::StartFresh(fresh) if fresh == card)
         );
 
         let target = runtime.target;
