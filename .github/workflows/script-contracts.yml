@@ -227,6 +227,7 @@ jobs:
               ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
               ("workload time limit", "scripts/bounded", "tests/bounded.py"),
               ("synthetic Claude provider", "tests/fixtures/chat-composer-claude.sh", "tests/chat_composer_provider.py"),
+              ("harness capabilities", "scripts/require-niri-harness", "tests/niri_harness.py"),
               ("local install head check", "scripts/install-local", "tests/install_local.py"),
           ):
               source_present = present(Path(source))
