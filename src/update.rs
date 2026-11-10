@@ -1111,7 +1111,7 @@ fn perform_update(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    let inspection = reconcile_saved_sources(staged.identity.protocol)?;
+    let inspection = reconcile_saved_sources(staged.identity.protocol, false)?;
     let context = ReviewContext::capture(installation)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Installation::detect()?;
@@ -1238,11 +1238,17 @@ pub(crate) fn inspect_source_panes(
 // user will consent to. Never expand consent after windows have prepared.
 fn reconcile_saved_sources(
     destination_protocol: u16,
+    replaces_compatible_daemon: bool,
 ) -> Result<source_inspection::SourceInspection, UpdateError> {
     let guard = crate::instance::UiUpdateGuard::acquire()?;
     let (protocol, proof) = source::inspect_identity(None)?;
     crate::install_guard::preflight_editor_companions(Some(destination_protocol))?;
-    inspect_source_panes_mode(&guard, proof, protocol != destination_protocol, true)
+    inspect_source_panes_mode(
+        &guard,
+        proof,
+        protocol != destination_protocol || replaces_compatible_daemon,
+        true,
+    )
 }
 
 fn inspect_source_panes_mode(

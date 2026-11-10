@@ -75,7 +75,7 @@ pub(super) fn perform(
     let layout = locate(&std::env::current_exe()?)?;
     let (source_protocol, _) = source::inspect_identity(None)?;
     // Retain the exact installation boundary even for an older source.
-    installed_daemon_owner(&layout)?;
+    let source_owner = installed_daemon_owner(&layout)?;
     if served_version_root(&layout)? != root {
         return Err(invalid(
             "the installed candidate changed; inspect the installation again",
@@ -116,7 +116,12 @@ pub(super) fn perform(
     if staged.identity.protocol == source_protocol {
         staged.verify_compatible_handshake(&cancellation)?;
     }
-    let inspection = reconcile_saved_sources(staged.identity.protocol)?;
+    // A different installed daemon is replaced even at the same protocol.
+    // Inspect with the same intent used by the reviewed impact and preflight.
+    let replaces_compatible_daemon = source_owner
+        .as_ref()
+        .is_some_and(|owner| owner.version_root != root);
+    let inspection = reconcile_saved_sources(staged.identity.protocol, replaces_compatible_daemon)?;
     let context = ReviewContext::capture(installation)?;
     let confirmed = confirmation::wait(state, job, |policy| {
         Ok(context.apply(observe(policy)?.with_inspection(&inspection)))
