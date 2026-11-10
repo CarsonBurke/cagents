@@ -5,6 +5,8 @@ pub(crate) mod child_reaper;
 pub(crate) mod holder_registry;
 pub(crate) mod hosting;
 #[cfg(feature = "host")]
+pub(crate) mod lost_processes;
+#[cfg(feature = "host")]
 pub(crate) mod owned_children;
 #[cfg(feature = "host")]
 pub(crate) mod process_scope;
@@ -434,6 +436,31 @@ impl HostLease {
             socket_path: paths.socket.clone(),
             lock,
         })
+    }
+}
+
+#[cfg(feature = "host")]
+impl HostLease {
+    /// [`Self::acquire_for_maintenance`] for shared-model store maintenance,
+    /// which may run when no daemon has started since the runtime directory
+    /// was cleared: creates the lock file a daemon would, without metadata, so
+    /// a status check still sees no daemon.
+    pub(crate) fn acquire_for_store_maintenance(
+        paths: &RuntimePaths,
+    ) -> Result<Self, PlatformError> {
+        prepare_runtime_directory(&paths.directory)?;
+        // flock belongs to an open file description, so closing this one
+        // cannot release a lock another holds.
+        drop(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .mode(PRIVATE_FILE_MODE)
+                .custom_flags(LOCK_OPEN_FLAGS)
+                .open(&paths.lock)?,
+        );
+        Self::acquire_for_maintenance(paths)
     }
 }
 

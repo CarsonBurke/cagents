@@ -4672,7 +4672,10 @@ impl Cagents {
     /// The longest known worktree or repository root containing `directory`
     /// determines its project. This is a short in-memory scan only when
     /// starting work or drawing the Accounts pane; no filesystem query is needed.
-    fn project_for_directory(&self, directory: &Path) -> Option<(ProjectId, &str, &Path)> {
+    pub(super) fn project_for_directory(
+        &self,
+        directory: &Path,
+    ) -> Option<(ProjectId, &str, &Path)> {
         self.sidebar_model
             .projects
             .iter()
@@ -5470,15 +5473,8 @@ impl Cagents {
 
     /// The Accounts pane: every account, as a table grouped by provider.
     pub(super) fn accounts_pane(&self) -> Element<'_, Message> {
-        table::view(self).map(pane_message)
+        table::view(self)
     }
-}
-
-/// Preserve every callback's pane origin, including responsive children and
-/// overlays. Shared global controls and accepted task completions are not
-/// wrapped: only these completed workspace pane views use this boundary.
-pub(super) fn pane_message(message: Message) -> Message {
-    Message::UtilityPaneUi(Box::new(message))
 }
 
 fn browser_login_available() -> Result<(), String> {

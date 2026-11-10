@@ -48,6 +48,8 @@ def uptime():
 # tests, nor its registry of real builds; the tests about either set them.
 os.environ["CAGENTS_BUILD_MEMORY_PRESSURE"] = "0"
 os.environ["CAGENTS_BUILD_REGISTRY"] = ""
+# Nor may a guard they run trim the host's real offload slots.
+os.environ["CAGENTS_BUILD_OFFLOAD_SLOTS"] = ""
 # In the names of what these tests leave spinning, so that another run of
 # them on the same host cannot be taken for this one's.
 TAG = str(os.getpid())
@@ -366,6 +368,7 @@ class InstalledGateSync(unittest.TestCase):
     """A gate change merged into main is installed by the next gate run."""
 
     files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py",
+             "cargo-host-test-helper.py",
              "cargo-gate-rustc-guard", "cargo-offload", "memory-capped",
              "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
 
@@ -391,6 +394,7 @@ class InstalledGateSync(unittest.TestCase):
                     if not key.startswith("CAGENTS_BUILD_")} | {
             "CAGENTS_BUILD_LOCK": str(self.root / "slot.lock"),
             "CAGENTS_BUILD_REMOTE": "local",
+            "CAGENTS_BUILD_OFFLOAD_SLOTS": "",
             "CAGENTS_BUILD_INSTALLED_GATE": str(self.installed)}
         self.install()
         self.assertEqual(self.recorded(), self.first)

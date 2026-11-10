@@ -498,6 +498,11 @@ struct PublishedState {
     /// reveal forces.
     announced_generation: AtomicU64,
     visible: AtomicBool,
+    /// The newest generation published before the worker last stopped
+    /// showing the terminal. `visible` turns on when a reveal starts, before
+    /// its capture is published or while a synchronized update holds it back;
+    /// until a later generation is published, the screen is from before.
+    hidden_through: AtomicU64,
     wake: Arc<WakeCallback>,
     output_observer: OnceLock<Arc<dyn Fn(u64) + Send + Sync>>,
     output_armed: AtomicBool,
@@ -584,6 +589,7 @@ impl PublishedState {
             transcript_location: OnceLock::new(),
             announced_generation: AtomicU64::new(0),
             visible: AtomicBool::new(visible),
+            hidden_through: AtomicU64::new(0),
             wake,
             output_observer: OnceLock::new(),
             output_armed: AtomicBool::new(false),
@@ -686,12 +692,21 @@ impl PublishedState {
         if self.shutdown_requested.load(Ordering::Acquire) {
             return Err(TerminalSendError::Closed);
         }
-        if let Command::HostVisibility(visibility) = &command {
-            // HostState already offers this retained generation when a view
-            // becomes visible. Calling its wake callback here would reenter
-            // the host mutex held by visibility/attach/detach operations.
-            self.visible
-                .store(*visibility == Visibility::Visible, Ordering::Release);
+        // Visibility and focus belong to the retained surface, independent
+        // of whether its completed scrollback could be archived. They do not
+        // need the parser or history, and must not repeat a retention failure.
+        let visible = match &command {
+            Command::HostVisibility(visibility) => Some(*visibility == Visibility::Visible),
+            Command::Hide | Command::Hibernate => Some(false),
+            Command::Reveal => Some(true),
+            Command::Restore { visible } => Some(*visible),
+            Command::Focus(_) => return Ok(()),
+            _ => None,
+        };
+        if let Some(visible) = visible {
+            // HostState already offers the retained generation on reveal.
+            // A wake here could reenter the host mutex held by its caller.
+            self.visible.store(visible, Ordering::Release);
             return Ok(());
         }
         if !matches!(
@@ -717,10 +732,23 @@ impl PublishedState {
         };
         let events = events.clone();
         let result = match history {
-            Err(message) => Some(TerminalEvent::Error {
-                operation: "review completed terminal",
-                message: message.clone(),
-            }),
+            Err(message) => match command {
+                Command::ReadViewport { reply, .. } => {
+                    // Completion already reported the loss once. The parser
+                    // is gone; its final retained screen is still readable,
+                    // even when no scrollback could replace it.
+                    let _ = reply.send(Ok(self.snapshot.load_full()));
+                    return Ok(());
+                }
+                Command::Scroll(_)
+                | Command::Resize(_)
+                | Command::SetTheme(_)
+                | Command::ClearScrollback => return Ok(()),
+                _ => Some(TerminalEvent::Error {
+                    operation: "review completed terminal",
+                    message: message.clone(),
+                }),
+            },
             Ok(history) => {
                 match command {
                     Command::Search {
@@ -777,12 +805,6 @@ impl PublishedState {
                     Command::Resize(size) => history.resize(size),
                     Command::SetTheme(theme) => history.set_theme(theme),
                     Command::ClearScrollback => history.clear(),
-                    Command::Hide | Command::Hibernate => {
-                        self.visible.store(false, Ordering::Release)
-                    }
-                    Command::Reveal => self.visible.store(true, Ordering::Release),
-                    Command::Restore { visible } => self.visible.store(visible, Ordering::Release),
-                    Command::Focus(_) => return Ok(()),
                     _ => return Err(TerminalSendError::Closed),
                 }
                 let snapshot = history.snapshot(
@@ -886,8 +908,42 @@ impl PublishedState {
         }
     }
 
-    fn suppress_wakes(&self) {
+    /// Stops announcing frames and marks what is published as the screen
+    /// from before, which a reveal must replace before reads can trust it.
+    fn stop_presenting(&self) {
         self.visible.store(false, Ordering::Release);
+        self.hidden_through.store(
+            self.published_generation.load(Ordering::Acquire),
+            Ordering::Release,
+        );
+    }
+
+    /// Admits commands to what the completed terminal left. Nothing is
+    /// published after this, so the published screen is its screen even when
+    /// it completed hidden and no history could be kept to replace it.
+    fn freeze(
+        &self,
+        history: Result<archive::History, String>,
+        events: Arc<Sender<TerminalEvent>>,
+    ) {
+        self.hidden_through.store(0, Ordering::Release);
+        *self.archive.lock().unwrap_or_else(|p| p.into_inner()) =
+            ArchivePhase::Frozen { history, events };
+        self.archive_ready.notify_all();
+    }
+
+    fn frozen(&self) -> bool {
+        matches!(
+            *self.archive.lock().unwrap_or_else(|p| p.into_inner()),
+            ArchivePhase::Frozen { .. }
+        )
+    }
+
+    /// Whether `snapshot`, read from this state, is the screen the worker is
+    /// showing now rather than one from before it was last hidden.
+    fn presents(&self, snapshot: &RenderSnapshot) -> bool {
+        self.visible.load(Ordering::Acquire)
+            && snapshot.generation > self.hidden_through.load(Ordering::Acquire)
     }
 
     /// Records the generation the subscriber drew and releases the capture
@@ -1239,9 +1295,10 @@ impl TerminalHandle {
     }
 
     /// `shown` says the host has asked this worker to show the terminal.
-    /// Until the worker has done so, what it published is a hibernation
-    /// marker, nothing, or the screen from before it was hidden. Such a read
-    /// is answered on the worker, after the reveal queued ahead of it.
+    /// Until the worker has published a screen since, what it published is a
+    /// hibernation marker, nothing, or the screen from before it was hidden.
+    /// Such a read is answered on the worker, after the reveal queued ahead
+    /// of it.
     pub(crate) fn viewport_snapshot(
         &self,
         offset: Option<u64>,
@@ -1253,7 +1310,10 @@ impl TerminalHandle {
         if !shown && !drawn {
             return Ok(published);
         }
-        let current = !shown || self.inner.published.visible.load(Ordering::Acquire);
+        // A reveal turns `visible` on before its capture is published, and a
+        // synchronized update can hold that capture back; until then the
+        // published screen is the one from before the terminal was hidden.
+        let current = !shown || self.inner.published.presents(&published);
         let default_view = drawn
             && offset.is_none()
             && rows.is_none_or(|rows| rows == published.rows)
@@ -1277,8 +1337,13 @@ impl TerminalHandle {
         match receive.recv_timeout(Duration::from_secs(3)) {
             Ok(result) => result,
             // A completed terminal whose history could not be kept reports
-            // that once, as an event, and keeps its marker.
-            Err(RecvTimeoutError::Disconnected) if !drawn => Ok(self.snapshot()),
+            // that as an event and keeps what it published. Only its archive
+            // drops a read unanswered; anything else that does is a failure.
+            Err(RecvTimeoutError::Disconnected)
+                if !drawn || (default_view && self.inner.published.frozen()) =>
+            {
+                Ok(self.snapshot())
+            }
             Err(error) => Err(error.to_string()),
         }
     }
@@ -2938,6 +3003,9 @@ impl Worker {
                 ) {
                     command.env("PATH", path);
                 }
+                // Before the holder forks, so nothing this launch starts
+                // predates its record.
+                crate::lineage_birth::record_instance_launch(&session)?;
                 (
                     holder::spawn_recoverable(
                         command,
@@ -3490,15 +3558,7 @@ impl Worker {
             } else if let Err(message) = &history {
                 self.error("retain completed terminal history", message.clone());
             }
-            *self
-                .published
-                .archive
-                .lock()
-                .unwrap_or_else(|p| p.into_inner()) = ArchivePhase::Frozen {
-                history,
-                events: self.events.clone(),
-            };
-            self.published.archive_ready.notify_all();
+            self.published.freeze(history, self.events.clone());
             self.published
                 .request_wake(self.published.published_generation.load(Ordering::Acquire));
             while let Ok(command) = self.commands.try_recv() {
@@ -4201,7 +4261,7 @@ impl Worker {
 
     fn set_hidden(&mut self) {
         self.visibility = Visibility::Hidden;
-        self.published.suppress_wakes();
+        self.published.stop_presenting();
         // Nothing is published while away, so there is no update to time.
         self.synchronized_since = None;
     }
@@ -4232,7 +4292,7 @@ impl Worker {
 
     fn hibernate_visuals(&mut self) {
         self.visibility = Visibility::Hibernated;
-        self.published.suppress_wakes();
+        self.published.stop_presenting();
         self.synchronized_since = None;
         self.visual = None;
         self.generation = self.generation.saturating_add(1);
@@ -8072,6 +8132,217 @@ mod tests {
         worker.process_output(b" done\x1b[?2026l".to_vec());
         assert_eq!(published_row(&worker, 0), "half done");
         worker.run();
+    }
+
+    /// A reveal shows the terminal before its capture is published, and an
+    /// update in progress holds that capture back. A read that asked to see
+    /// the terminal meanwhile must show what arrived while it was hidden, not
+    /// the screen from before (#2521).
+    #[test]
+    fn a_read_during_a_reveal_shows_output_from_while_hidden() {
+        let (mut worker, _) = capture_worker();
+        worker.process_output(b"before".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.handle_command(Command::Hide);
+        worker.process_output(b"\r\nwhile hidden\x1b[?2026h".to_vec());
+        worker.handle_command(Command::Reveal);
+        assert!(worker.published.visible.load(Ordering::Acquire));
+        assert_eq!(published_row(&worker, 1), "", "the reveal was not held");
+
+        let (commands, pending) = command_channel(1);
+        let published = Arc::clone(&worker.published);
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: crossbeam_channel::never(),
+                worker: joins::JoinOwner::empty(Arc::clone(&published)),
+                published,
+            }),
+        };
+        let read = std::thread::spawn(move || handle.viewport_snapshot(None, None, true));
+        let command = pending
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the read was answered with the screen from before");
+        worker.handle_command(command);
+        worker.process_output(b"\x1b[?2026l".to_vec());
+        let screen = read.join().unwrap().unwrap();
+        let row = screen.lines[1]
+            .cells
+            .iter()
+            .map(|cell| cell.text.as_str())
+            .collect::<String>();
+        assert_eq!(row.trim_end(), "while hidden");
+        worker.run();
+    }
+
+    fn completed_without_history(hibernated: bool) -> (TerminalHandle, Receiver<TerminalEvent>) {
+        let (mut worker, events) = capture_worker();
+        worker.process_output(b"before".to_vec());
+        worker.publish_snapshot(true);
+        present(&worker);
+        worker.handle_command(if hibernated {
+            Command::Hibernate
+        } else {
+            Command::Hide
+        });
+        worker.process_output(b"\r\nfinished while away".to_vec());
+        let published = Arc::clone(&worker.published);
+        // Observe natural PTY EOF and child exit, rather than shutting down
+        // through the command channel. Fault only the archive byte budget.
+        let (commands, receiver) = command_channel(8);
+        worker.commands = receiver;
+        archive::with_capture_budget(0, || worker.run());
+        assert!(published.completed.load(Ordering::Acquire));
+        assert!(matches!(
+            &*published.archive.lock().unwrap(),
+            ArchivePhase::Frozen {
+                history: Err(_),
+                ..
+            }
+        ));
+        let handle = TerminalHandle {
+            inner: Arc::new(HandleInner {
+                commands,
+                events: events.clone(),
+                worker: joins::JoinOwner::empty(Arc::clone(&published)),
+                published,
+            }),
+        };
+        (handle, events)
+    }
+
+    #[test]
+    fn completed_without_history_retains_output_produced_while_away() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let screen = handle.snapshot();
+            assert!(!screen.detached);
+            assert!(screen.lines.iter().any(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.text.as_str())
+                    .collect::<String>()
+                    .contains("finished while away")
+            }));
+            assert_eq!(
+                events
+                    .try_iter()
+                    .filter(|event| matches!(
+                        event,
+                        TerminalEvent::Error {
+                            operation: "retain completed terminal history",
+                            ..
+                        }
+                    ))
+                    .count(),
+                1
+            );
+        }
+    }
+
+    #[test]
+    fn completed_without_history_visibility_commands_do_not_repeat_the_loss() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let _: Vec<_> = events.try_iter().collect();
+            for _ in 0..3 {
+                handle.hide().unwrap();
+                handle.hibernate().unwrap();
+                handle.reveal().unwrap();
+                handle.restore(false).unwrap();
+                handle.restore(true).unwrap();
+                handle.focus(false).unwrap();
+                handle.focus(true).unwrap();
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_without_history_presentation_refresh_does_not_repeat_loss() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let _: Vec<_> = events.try_iter().collect();
+            for _ in 0..3 {
+                // HostState refreshes focus and the size owner's saved size
+                // when revealing/focusing a completed terminal.
+                handle
+                    .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+                    .unwrap();
+                handle.focus(true).unwrap();
+                handle
+                    .resize(TerminalSize {
+                        columns: 80,
+                        rows: 24,
+                        cell_width_px: 8,
+                        cell_height_px: 16,
+                    })
+                    .unwrap();
+                handle.set_theme(TerminalTheme::Light).unwrap();
+                handle.scroll_to_top().unwrap();
+                handle.clear_scrollback().unwrap();
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn completed_without_history_answers_repeated_viewport_reads() {
+        for hibernated in [false, true] {
+            let (handle, events) = completed_without_history(hibernated);
+            let _: Vec<_> = events.try_iter().collect();
+            handle
+                .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+                .unwrap();
+            for _ in 0..3 {
+                let screen = handle.viewport_snapshot(Some(0), Some(1), true).unwrap();
+                assert!(!screen.detached);
+                assert!(screen.rows > 0);
+                assert!(
+                    events
+                        .try_iter()
+                        .all(|event| !matches!(event, TerminalEvent::Error { .. }))
+                );
+            }
+        }
+    }
+
+    /// Nothing is published after a terminal completes, so a terminal that
+    /// completed hidden, without history to replace its screen, is shown with
+    /// what it published: no trip to the archive, and no error for each read.
+    #[test]
+    fn a_shown_read_of_a_terminal_that_completed_hidden_shows_its_last_screen() {
+        let fixture = RenderStreamFixture::new(|_| {});
+        let published = &fixture.handle.inner.published;
+        let mut screen = RenderSnapshot::empty();
+        screen.generation = 1;
+        screen.rows = 1;
+        published.publish(Arc::new(screen));
+        published.stop_presenting();
+        published.freeze(
+            Err("The completed terminal view is unavailable".into()),
+            Arc::clone(&fixture.events),
+        );
+        fixture
+            .handle
+            .set_host_visibility(super::super::ipc::TerminalVisibility::Visible)
+            .unwrap();
+
+        let read = fixture.handle.viewport_snapshot(None, None, true).unwrap();
+        assert_eq!(read.generation, 1);
+        assert!(
+            fixture.handle.events().try_recv().is_err(),
+            "the read went to an archive without history"
+        );
     }
 
     #[test]

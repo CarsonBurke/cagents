@@ -29,7 +29,7 @@ holds a `.git` or `Cargo.toml` is a checkout, never build output. A main checkou
 directory, seeds new worktrees, so it waits four times as long. Never
 touched: the checkouts given with --keep-checkout, the directories given
 with --keep, ~/.local/share, the offload build slots
-(~/.cache/cagents-offload, whose leases manage them), other users' files
+(~/.cache/cagents-offload, whose leases bound them), other users' files
 and anything a symlink leads to.
 
 One run at a time per user. The checkouts given with --root, and the mirror,

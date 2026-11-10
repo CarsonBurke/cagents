@@ -15,6 +15,7 @@ person.
 | Drive the app by hand for a while, or run several at once | [`scripts/run-development --instance NAME`](development.md#parallel-instances) |
 | A chat that answers offline, with tools, subagents, errors or crashes | The synthetic Claude provider, [`tests/fixtures/chat-composer-claude.sh`](chat-composer-fixture.md) |
 | GitHub availability, project avatars or a worktree's pull request in the sidebar, offline | The fixture's forge, [`tests/fixtures/fixture-gh.sh`](#an-offline-github), switched on by `home/.config/fixture-forge` |
+| A saved Claude conversation damaged by a crash and a huge tool output, to resume | [`tests/fixtures/claude-damaged-history.py`](../tests/fixtures/claude-damaged-history.py)` PROJECT`, run in a session's fixture with `scripts/native-evidence env python3 ...`; it writes the transcript under the fixture HOME's `.claude` |
 | A Codex chat that answers offline, with tool rows, subagent errors or terminal escapes | A [Codex peer](#an-offline-codex), installed by `native-evidence start SIDE --codex PEER` |
 | Test a script's contract without a compositor or Cargo | The stubbed Python suites in `tests/*.py`, such as `tests/native_evidence.py` |
 
@@ -79,6 +80,17 @@ Anything else, including every write, fails and names the command. A project
 shows as connected to GitHub only when its checkout has a github.com remote,
 so add one: `git remote add origin https://github.com/OWNER/NAME`. The fixture
 sets `GIT_ALLOW_PROTOCOL=file`, so Git never fetches from or pushes to it.
+
+The named `SidebarPullRequests` and `SidebarHistory` GraphQL queries use seeded
+rows too. The open query computes the aggregate check state from the seed's
+`statusCheckRollup`; history omits checks. This exercises the native sidebar's
+actual query and decoder without a GitHub account.
+
+For polling evidence, create `home/.config/fixture-forge-trace`. The forge then
+appends epoch time, parent PID and operation label to
+`home/.config/fixture-forge-requests.tsv`. Authored listing labels include their
+author and repository, so daemon Work polling can be counted separately from
+sidebar and branch lookups. No query bodies or variables are recorded.
 
 Whether or not the switch is on, the fixture's `curl` always fails and Git
 reaches only local paths, so a step cannot download a file or clone over https;

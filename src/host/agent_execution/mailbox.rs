@@ -961,6 +961,63 @@ mod tests {
     }
 
     #[test]
+    fn courier_keeps_delivery_after_actor_step_fails_with_queued_input() {
+        use crate::{
+            agent_execution::mailbox::Party, chat::runtime::courier_tests::RequestRaceFixture,
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let registry = Arc::new(Mutex::new(
+            crate::host::model::Registry::at(&directory.path().join("model.sqlite3")).unwrap(),
+        ));
+        let session = TerminalId::new();
+        let message = Message {
+            id: MessageId::new(),
+            from: Party::user(),
+            to: Party {
+                lineage: Some(Lineage(session)),
+                session: None,
+                title: None,
+            },
+            reply_to: None,
+            body: "Do not replay input after a failed actor step".into(),
+            wait_until_ms: None,
+            state: State::Pending,
+            created_ms: super::super::now(),
+        };
+        registry.lock().unwrap().post_message(&message).unwrap();
+        let courier = Handle(Arc::new(Inner {
+            host: Weak::new(),
+            registry: registry.clone(),
+            seal: Arc::new(Seal::new([8; 32])),
+            state: Mutex::default(),
+            changed: Condvar::new(),
+            limits: Mutex::default(),
+            scanned_generation: Mutex::new(None),
+            scanned: Condvar::new(),
+        }));
+        let mut actor = RequestRaceFixture::with_input_failure(true);
+        courier.hand_over(&message, session, &actor.handle).unwrap();
+        let delivered = registry
+            .lock()
+            .unwrap()
+            .message(message.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(delivered.state, State::Delivered);
+        assert_eq!(delivered.to.session, Some(session));
+        // A later idle actor must not receive a replacement prompt, even if
+        // the first actor exited before its caller could observe provider I/O.
+        let mut successor = RequestRaceFixture::new();
+        courier
+            .hand_over(&message, session, &successor.handle)
+            .unwrap();
+        assert_eq!(actor.prompt_count(), 1);
+        assert_eq!(successor.prompt_count(), 0);
+        actor.close();
+        successor.close();
+    }
+
+    #[test]
     fn retained_idle_uncertainty_keeps_the_courier_claim_and_explicit_refusal_requeues() {
         use crate::chat::runtime::{Handle as RuntimeHandle, RetainedInputOutcome};
         for outcome in [

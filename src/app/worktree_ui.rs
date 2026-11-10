@@ -193,6 +193,7 @@ fn scope_descriptor(
         card_scopes: HashMap::new(),
         chat_drafts: HashMap::new(),
         chat_draft_attachments: HashMap::new(),
+        chat_waiting_messages: HashMap::new(),
         agent_updates: Default::default(),
         workspace_history: Vec::new(),
         repository_navigation: HashMap::new(),
@@ -360,7 +361,20 @@ impl Cagents {
         )
     }
 
+    /// Shows channel `id`, saving the workspace now: callers may have changed
+    /// it on the way here.
     pub(super) fn select_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.show_channel(id, DurableChange::Content)
+    }
+
+    /// Shows channel `id` when nothing but where this window is changes, as
+    /// when the user opens it from the sidebar. The switch is saved with the
+    /// next save, or within [`NAVIGATION_SAVE_DELAY`].
+    pub(super) fn navigate_to_channel(&mut self, id: ChannelId) -> Task<Message> {
+        self.show_channel(id, DurableChange::Navigation)
+    }
+
+    fn show_channel(&mut self, id: ChannelId, change: DurableChange) -> Task<Message> {
         let Some(path) = self.channel_directory(id) else {
             return Task::none();
         };
@@ -404,7 +418,7 @@ impl Cagents {
             .and_then(|channel| channel.focused);
         let scoped = scope_descriptor(&self.durable, &path, &[], &self.worktree_owners, focused);
         let offset = self.channel_offsets.get(&id).copied();
-        let scope = self.install_workspace_scope(scoped, path, offset);
+        let scope = self.install_workspace_scope(scoped, path, offset, change);
         if discarded {
             self.persist();
         }
@@ -707,6 +721,23 @@ impl Cagents {
         path: PathBuf,
         create_if_empty: bool,
     ) -> (bool, Task<Message>) {
+        self.show_worktree(path, create_if_empty, DurableChange::Content)
+    }
+
+    /// Shows the worktree at `path` when nothing but where this window is
+    /// changes, as when the user opens it from the sidebar. The switch is
+    /// saved with the next save, or within [`NAVIGATION_SAVE_DELAY`]; a
+    /// default pane opened for an empty worktree saves itself.
+    pub(super) fn navigate_to_worktree(&mut self, path: PathBuf) -> Task<Message> {
+        self.show_worktree(path, true, DurableChange::Navigation).1
+    }
+
+    fn show_worktree(
+        &mut self,
+        path: PathBuf,
+        create_if_empty: bool,
+        change: DurableChange,
+    ) -> (bool, Task<Message>) {
         let path = self
             .refresh_worktree_owners(Some(&path))
             .expect("selected scope");
@@ -812,7 +843,7 @@ impl Cagents {
             .iter()
             .any(|card| matches!(card.kind, CardKind::Terminal(_) | CardKind::Chat(_)));
         let offset = self.worktree_offsets.get(&path).copied();
-        let scope = self.install_workspace_scope(scoped, path.clone(), offset);
+        let scope = self.install_workspace_scope(scoped, path.clone(), offset, change);
         let terminal = if create_if_empty && !has_terminal {
             self.add_default_pane(path, self.settings.default_worktree_pane)
         } else {
@@ -829,11 +860,14 @@ impl Cagents {
         scoped: WorkspaceState,
         path: PathBuf,
         offset: Option<f32>,
+        change: DurableChange,
     ) -> Task<Message> {
         let width = self.workspace.viewport_width();
         // Hide before replacing the strip: its former widgets no longer get a
         // chance to send native-surface visibility updates after unmounting.
-        self.set_workspace_surfaces_visible(false);
+        // The warm chat budget waits for `apply_viewport` below, once the
+        // panes this scope shows are visible again and so not candidates.
+        self.apply_workspace_surface_visibility(false);
         self.active_workspace = Some(path);
         self.workspace_view_generation = self.workspace_view_generation.wrapping_add(1);
         // Iced inherits old anonymous IDs during diff. A named generation ID
@@ -880,7 +914,7 @@ impl Cagents {
                 transitions,
             },
             true,
-            true,
+            change,
         );
         // The strip being left keeps its visuals for the usual grace, so
         // coming straight back finds its panes as they were instead of
@@ -2263,6 +2297,71 @@ mod tests {
         assert_eq!(app.durable.cards.len(), 3);
     }
 
+    /// Opening worktrees from the sidebar changes where this window is and
+    /// nothing else: the durable state follows each click at once, and the
+    /// burst is handed to the writer once.
+    #[test]
+    fn opening_worktrees_from_the_sidebar_saves_once_after_the_burst() {
+        use super::super::terminal_output_tests::persists;
+        let mut app = super::super::tests::context_inspector_test_app(false);
+        let a = terminal("/repo");
+        let b = terminal("/repo/nested");
+        app.durable = Arc::new(WorkspaceState {
+            cards: vec![a.clone(), b.clone()],
+            focused: Some(a.id),
+            ..WorkspaceState::default()
+        });
+        app.sidebar_model.projects = vec![SidebarProject::new(
+            ProjectId::new(),
+            RepositoryId::new(),
+            "repo".into(),
+            "/repo".into(),
+            ["/repo", "/repo/nested"]
+                .into_iter()
+                .map(|path| {
+                    SidebarWorktree::new(
+                        crate::model::WorktreeId::new(),
+                        path.into(),
+                        None,
+                        false,
+                        false,
+                        None,
+                        None,
+                        None,
+                    )
+                })
+                .collect(),
+            Vec::new(),
+        )];
+        app.workspace = Cagents::rebuild_workspace(&app.durable);
+        app.workspace.resize_viewport(1_280.0);
+        let _ = app.restore_worktree_scope();
+
+        let saved = persists();
+        for (path, card) in [("/repo/nested", &b), ("/repo", &a), ("/repo/nested", &b)] {
+            let project = &app.sidebar_model.projects[0];
+            let worktree = project
+                .worktrees
+                .iter()
+                .find(|worktree| worktree.path == std::path::Path::new(path))
+                .unwrap();
+            let open = SidebarAction::OpenWorktree {
+                project_id: project.id,
+                worktree_id: worktree.id,
+                path: path.into(),
+            };
+            drop(app.update(Message::Sidebar(open)));
+            assert_eq!(app.workspace.focused(), Some(card.id));
+            assert_eq!(
+                app.durable.active_worktree.as_deref(),
+                Some(std::path::Path::new(path))
+            );
+            assert_eq!(persists(), saved, "a click alone waits for the burst");
+        }
+        drop(app.update(Message::NavigationSaveDue(app.navigation_save_generation)));
+        assert_eq!(persists(), saved + 1, "the burst is saved once");
+    }
+
     #[test]
     fn application_close_protects_unsaved_editors_in_hidden_worktrees() {
         let mut app = super::super::tests::context_inspector_test_app(false);
@@ -2310,7 +2409,7 @@ mod tests {
         let _ = app.restore_worktree_scope();
         let _ = app.select_worktree("/b".into(), false);
         let update = app.workspace.focus(browser.id).unwrap();
-        let _ = app.apply_viewport(update, false, false);
+        let _ = app.apply_viewport(update, false, DurableChange::None);
         let mut restarted = super::super::tests::context_inspector_test_app(false);
         restarted.durable = Arc::clone(&app.durable);
         restarted.sidebar_model = app.sidebar_model.clone();

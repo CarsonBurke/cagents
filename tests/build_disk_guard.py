@@ -234,6 +234,94 @@ class BuildDiskGuard(unittest.TestCase):
         os.utime(self.root / "pruner.scheduled", (long_ago, long_ago))
         self.assertIn("in the background", self.guard(self.band(), guard=guard).stderr)
 
+    def stand_in_offload(self, guard):
+        """A stand-in for the offload helper beside `guard`, recording how it
+        was run in `trims`."""
+        trims = self.root / "trims"
+        offload = guard.with_name("cargo-offload")
+        offload.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {trims}\n')
+        offload.chmod(0o755)
+        return trims
+
+    def test_running_low_idle_offload_slots_are_trimmed_before_the_pruner_runs(self):
+        guard, calls = self.stand_in_pruner()
+        trims = self.stand_in_offload(guard)
+        floor = self.band()
+        result = self.guard(floor, guard=guard)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.calls(calls, 1)
+        # Beside the pruner's detached run, without waiting for what it frees.
+        self.assertEqual(self.calls(trims, 1), [f"--trim-slots {floor}"])
+
+    def test_below_the_floor_idle_offload_slots_are_trimmed_and_waited_for(self):
+        guard, calls = self.stand_in_pruner()
+        trims = self.stand_in_offload(guard)
+        result = self.guard(10**9, guard=guard)
+        self.assertEqual(result.returncode, 2)
+        self.calls(calls, 2)
+        self.assertEqual(sorted(self.calls(trims, 2)),
+                         [f"--trim-slots {10**9}", f"--trim-slots {10**9} --wait"])
+
+    def test_without_timeout_the_trim_below_the_floor_is_not_waited_for(self):
+        guard, calls = self.stand_in_pruner()
+        trims = self.root / "trims"
+        offload = guard.with_name("cargo-offload")
+        offload.write_text(f'#!/bin/sh\nprintf "%s\\n" "$*" >> {trims}\nsleep 5\n')
+        offload.chmod(0o755)
+        # Every command the guard could find but timeout.
+        tools = self.root / "tools"
+        tools.mkdir()
+        path_bin = self.root / "path-bin"
+        path_bin.mkdir()
+        (path_bin / "dangling-command").symlink_to(self.root / "missing-command")
+        # A repeated PATH directory must not recreate an already copied,
+        # dangling symlink. Keep this reproducible with any caller's PATH.
+        for directory in [str(path_bin), str(path_bin), *os.environ["PATH"].split(os.pathsep)]:
+            for entry in os.scandir(directory) if os.path.isdir(directory) else ():
+                target = tools / entry.name
+                if entry.name != "timeout" and not (target.exists() or target.is_symlink()):
+                    target.symlink_to(entry.path)
+        self.assertTrue((tools / "dangling-command").is_symlink())
+        self.assertFalse((tools / "dangling-command").exists())
+        started = time.monotonic()
+        result = subprocess.run(
+            [str(guard), str(self.root / "absent/build/target")],
+            env={**self.env, "PATH": str(tools), "CAGENTS_BUILD_FREE_FLOOR_GIB": str(10**9)},
+            capture_output=True, text=True, timeout=60,
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertEqual(self.calls(trims, 2), [f"--trim-slots {10**9}"] * 2)
+
+    def test_a_reclaim_command_of_its_own_leaves_offload_slots_alone(self):
+        guard = self.alone()
+        trims = self.stand_in_offload(guard)
+        result = self.guard(10**9, guard=guard)
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(self.prunes(), 1)
+        time.sleep(0.5)
+        self.assertFalse(trims.exists())
+
+    def test_the_background_trim_keeps_none_of_the_builds_descriptors(self):
+        # As the real trim closes what it inherited as it starts, and then
+        # runs on; the shell that starts it must not hold them meanwhile.
+        guard, calls = self.stand_in_pruner(then="exec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\n")
+        offload = guard.with_name("cargo-offload")
+        offload.write_text("#!/bin/sh\nexec 3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&-\nsleep 5\n")
+        offload.chmod(0o755)
+        read, write = os.pipe()
+        started = time.monotonic()
+        with subprocess.Popen([str(guard), str(self.root)], pass_fds=(write,),
+                              env={**self.env, "CAGENTS_BUILD_FREE_FLOOR_GIB": str(self.band())},
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) as guarding:
+            os.close(write)
+            self.assertEqual(guarding.wait(timeout=30), 0)
+            self.calls(calls, 1)
+            # The pipe closes once nothing of the build's holds it.
+            self.assertEqual(os.read(read, 1), b"")
+        os.close(read)
+        self.assertLess(time.monotonic() - started, 4)
+
     def test_the_background_run_keeps_none_of_the_builds_descriptors(self):
         # As the real pruner closes what it inherited, and then runs on.
         guard, calls = self.stand_in_pruner(
@@ -380,6 +468,7 @@ class InstallCargoGate(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         names = ["build-disk-guard", "cagents-cargo-gate", "cargo-gate-command.py",
+                 "cargo-host-test-helper.py",
                  "cargo-gate-rustc-guard", "cargo-gate-sync.py", "cargo-offload",
                  "memory-capped", "prune-build-dirs", "seed-build-dir"]
         self.assertEqual(
@@ -424,6 +513,7 @@ class InstallCargoGate(unittest.TestCase):
         scripts = self.root / "checkout/scripts"
         scripts.mkdir(parents=True)
         for name in ("install-cargo-gate", "cargo-gate", "cargo-gate-command.py",
+                     "cargo-host-test-helper.py",
                      "cargo-gate-sync.py", "cargo-gate-rustc-guard", "cargo-offload",
                      "seed-build-dir", "memory-capped",
                      "build-disk-guard", "prune-build-dirs"):

@@ -203,7 +203,12 @@ impl Worker {
             }
         };
         let child = match command.spawn() {
-            Ok(child) => Some(child),
+            Ok(child) => {
+                // Only a successfully exec'd supervisor receives custody.
+                // Failure paths retain scoped ownership and unlock on return.
+                drop(lease.into_file());
+                Some(child)
+            }
             Err(error) => {
                 // spawn reports exec failure before any helper could launch
                 // the user's command. This is a proved safe terminal result.
@@ -217,10 +222,10 @@ impl Worker {
                     },
                 )
                 .map_err(held)?;
+                drop(lease);
                 None
             }
         };
-        drop(lease);
         Ok(Self {
             directory,
             firing: request.firing,
@@ -232,7 +237,10 @@ impl Worker {
     }
 
     /// Everything before spawn: failure here proves no helper can exist.
-    fn prepare_launch(directory: &Path, request: &Request) -> io::Result<(File, Command)> {
+    fn prepare_launch(
+        directory: &Path,
+        request: &Request,
+    ) -> io::Result<(crate::instance::OwnedLock, Command)> {
         create_record(directory, "request", request)?;
         let lease = OpenOptions::new()
             .read(true)
@@ -241,9 +249,7 @@ impl Worker {
             .mode(0o600)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(directory.join("lease"))?;
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let lease = crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB)?;
         lease.sync_all()?;
         File::open(directory)?.sync_all()?;
         let fd = lease.as_raw_fd();
@@ -378,16 +384,14 @@ impl Worker {
             Err(error) if error.kind() == io::ErrorKind::NotFound && retirement.is_some() => None,
             Err(error) => return Err(error),
         };
-        if lease.as_ref().is_some_and(|lease| unsafe {
-            libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) != 0
-        }) {
-            let error = io::Error::last_os_error();
-            return if error.kind() == io::ErrorKind::WouldBlock {
-                Ok(false)
-            } else {
-                Err(error)
-            };
-        }
+        let lease = match lease
+            .map(|lease| crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB))
+            .transpose()
+        {
+            Ok(lease) => lease,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => return Ok(false),
+            Err(error) => return Err(error),
+        };
         // Only our bounded, flat proof files are reclaimable. An unexpected
         // directory or symlink is never traversed as part of housekeeping.
         let entries = fs::read_dir(&self.directory)?
@@ -505,36 +509,35 @@ impl Worker {
             Err(error) => return Err(error),
         }
         let lease = private_file(&self.directory.join("lease"))?;
-        if unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
-            // The owner can publish between the first read and releasing its
-            // lease. Check again while excluding a still-starting owner.
-            if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt")) {
-                if receipt.firing == self.firing && receipt.revision == self.revision {
-                    return Ok(Status::Complete(receipt.outcome));
+        match crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB) {
+            Ok(_lease) => {
+                // The owner can publish between the first read and releasing its
+                // lease. Check again while excluding a still-starting owner.
+                if let Ok(receipt) = read_record::<Receipt>(&self.directory.join("receipt")) {
+                    if receipt.firing == self.firing && receipt.revision == self.revision {
+                        return Ok(Status::Complete(receipt.outcome));
+                    }
                 }
+                if let Ok(started) = read_record::<Started>(&self.directory.join("started")) {
+                    if started.firing != self.firing || started.revision != self.revision {
+                        return Err(io::Error::other(
+                            "Precheck start proof belongs to another firing",
+                        ));
+                    }
+                    if started.boot != crate::daemon::read_boot_id().map_err(io::Error::other)? {
+                        // A different kernel boot proves old descendants extinct,
+                        // but says nothing about command effects before shutdown.
+                        return Ok(Status::Complete(Outcome::Stopped {
+                            state: FiringState::Interrupted,
+                            skip: None,
+                            diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
+                        }));
+                    }
+                }
+                Ok(Status::CleanupUnconfirmed)
             }
-            if let Ok(started) = read_record::<Started>(&self.directory.join("started")) {
-                if started.firing != self.firing || started.revision != self.revision {
-                    return Err(io::Error::other(
-                        "Precheck start proof belongs to another firing",
-                    ));
-                }
-                if started.boot != crate::daemon::read_boot_id().map_err(io::Error::other)? {
-                    // A different kernel boot proves old descendants extinct,
-                    // but says nothing about command effects before shutdown.
-                    return Ok(Status::Complete(Outcome::Stopped {
-                        state: FiringState::Interrupted, skip: None,
-                        diagnostic: "The system restarted before the precheck result was recorded; its effects are uncertain and it was not repeated".into(),
-                    }));
-                }
-            }
-            return Ok(Status::CleanupUnconfirmed);
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::WouldBlock {
-            Ok(Status::Running)
-        } else {
-            Err(error)
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(Status::Running),
+            Err(error) => Err(error),
         }
     }
 }
@@ -892,10 +895,7 @@ mod tests {
             worker.status().unwrap(),
             Status::CleanupUnconfirmed
         ));
-        assert_eq!(
-            unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
+        let lease = crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB).unwrap();
         assert!(matches!(worker.status().unwrap(), Status::Running));
         create_record(
             &directory,
@@ -986,10 +986,8 @@ mod tests {
                 fs::remove_file(worker.directory.join("lease")).unwrap();
             } else {
                 let lease = private_file(&worker.directory.join("lease")).unwrap();
-                assert_eq!(
-                    unsafe { libc::flock(lease.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-                    0
-                );
+                let lease =
+                    crate::instance::owned_file_lock(lease, libc::LOCK_EX | libc::LOCK_NB).unwrap();
                 assert!(!worker.retire().unwrap());
                 assert!(!marker.exists(), "live lease cannot mint retirement proof");
                 drop(lease);

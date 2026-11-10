@@ -1,4 +1,6 @@
 //! Shared exact-session recovery authority and durable daemon upgrade handoff.
+#[cfg(any(feature = "host", feature = "ui"))]
+use crate::lineage_birth::LineageBirth;
 #[cfg(any(feature = "host", test))]
 use crate::model::HostSessionProof;
 #[cfg(any(feature = "host", feature = "ui", test))]
@@ -163,9 +165,10 @@ pub(crate) fn ensure_no_surviving_process(
     owner: u32,
     proc_root: &Path,
 ) -> Result<(), String> {
-    match surviving_process(session, owner, proc_root)? {
-        Some(survivor) => Err(survivor.reason),
-        None => Ok(()),
+    match surviving_process(session, owner, proc_root, &[]) {
+        Ok(Some(survivor)) => Err(survivor.reason),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error.to_string()),
     }
 }
 
@@ -191,23 +194,133 @@ pub(crate) enum SurvivorLink {
     Lineage,
 }
 
-/// `Err` means the scan could not finish, not that anything is running: a
-/// process can be mid-exec or vanish while it is read.
+/// A process of this user whose environment the kernel won't show, because it
+/// made itself undumpable (ssh-agent) or changed credentials (an SSH login's
+/// `sshd-session`). Its arguments and cgroup were read and don't tie it to the
+/// terminal; only the terminal's markers could, and they can't be read.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnreadableProcess {
+    pub(crate) pid: u32,
+    /// Clock ticks after boot. With the PID it names one process, so leaving
+    /// it running can't extend to a later process given the same PID.
+    start: Option<u64>,
+    /// The kernel's short name for it, unless it exited during the scan.
+    pub(crate) name: Option<String>,
+    /// Its unified-hierarchy cgroup, which anyone can read.
+    cgroup: Option<String>,
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl UnreadableProcess {
+    #[cfg(all(test, feature = "ui"))]
+    pub(crate) fn fixture(pid: u32, start: u64, name: &str) -> Self {
+        Self {
+            pid,
+            start: Some(start),
+            name: Some(name.into()),
+            cgroup: None,
+        }
+    }
+
+    /// Whether the lineage's records rule this process out of it. See
+    /// [`crate::lineage_birth`] for why each fact does.
+    fn outside_lineage(&self, birth: &LineageBirth, namespace: Option<&str>) -> bool {
+        match birth {
+            LineageBirth::Unborn => true,
+            LineageBirth::Born {
+                since,
+                contained_in,
+            } => {
+                self.start.is_some_and(|start| start < *since)
+                    || (contained_in.is_some()
+                        && contained_in.as_deref() == namespace
+                        && self.cgroup.as_deref().is_some_and(|cgroup| {
+                            crate::lineage_birth::placement(cgroup, crate::daemon::current_uid())
+                                == crate::lineage_birth::Placement::Outside
+                        }))
+            }
+        }
+    }
+
+    /// Whether it can be told apart from a later process given its PID.
+    #[cfg(feature = "ui")]
+    pub(crate) fn identified(&self) -> bool {
+        self.start.is_some()
+    }
+
+    fn same_process(&self, other: &Self) -> bool {
+        self.pid == other.pid && self.start.is_some() && self.start == other.start
+    }
+}
+
+/// Why a scan found no survivor but can't say there is none.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ScanError {
+    /// Every other process was ruled out; these couldn't be, and nothing
+    /// short of their exit or a person's decision will change that.
+    Unreadable(Vec<UnreadableProcess>),
+    /// The scan couldn't finish: a process kept changing as it was read, or
+    /// the process list itself couldn't be read.
+    Incomplete(String),
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl std::fmt::Display for ScanError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(processes) => {
+                let processes = processes
+                    .iter()
+                    .map(|process| match &process.name {
+                        Some(name) => format!("{name} ({})", process.pid),
+                        None => format!("process {}", process.pid),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    formatter,
+                    "cannot rule out surviving terminal processes; the environment of {processes} cannot be read"
+                )
+            }
+            Self::Incomplete(detail) => formatter.write_str(detail),
+        }
+    }
+}
+
+/// `Err` means the scan could not rule everything out, not that anything is
+/// running. `leave` names unreadable processes a person chose to leave
+/// running; they are passed over, never signaled.
 #[cfg(any(feature = "host", feature = "ui"))]
 pub(crate) fn surviving_process(
     session: &TerminalSession,
     owner: u32,
     proc_root: &Path,
-) -> Result<Option<SurvivingProcess>, String> {
-    finish_process_scan(|| scan_for_survivor(session, owner, proc_root))
+    leave: &[UnreadableProcess],
+) -> Result<Option<SurvivingProcess>, ScanError> {
+    // Only the real process table goes with this instance's records.
+    let real = proc_root == Path::new("/proc");
+    scan_for_survivor(
+        session,
+        owner,
+        proc_root,
+        leave,
+        || {
+            real.then(|| crate::lineage_birth::instance_birth(session))
+                .flatten()
+        },
+        real.then(crate::lineage_birth::cgroup_namespace).flatten(),
+    )
 }
 
 /// A process shows no arguments for a moment while it execs or exits, which on a
-/// machine that's building happens often enough that one scan alone would turn
-/// people away. Each attempt scans everything again, so a process that keeps
-/// re-execing or stays unreadable can still fail the scan: unknown is not absent.
+/// machine that's building happens often enough that one read alone would turn
+/// people away. Only the read that failed is repeated: repeating the whole scan
+/// let several processes that keep re-execing each fail a different attempt.
+/// A process that stays unreadable still fails: unknown is not absent.
 #[cfg(any(feature = "host", feature = "ui"))]
-fn finish_process_scan<T>(mut scan: impl FnMut() -> Result<T, String>) -> Result<T, String> {
+fn settle<T>(mut read: impl FnMut() -> Result<T, String>) -> Result<T, String> {
     const ATTEMPTS: usize = 4;
     const WAIT: std::time::Duration = if cfg!(test) {
         std::time::Duration::from_millis(1)
@@ -215,12 +328,99 @@ fn finish_process_scan<T>(mut scan: impl FnMut() -> Result<T, String>) -> Result
         std::time::Duration::from_millis(100)
     };
     for _ in 1..ATTEMPTS {
-        match scan() {
+        match read() {
             Err(_) => std::thread::sleep(WAIT),
             finished => return finished,
         }
     }
-    scan()
+    read()
+}
+
+/// This user's processes, as one read of the process list saw them.
+#[cfg(any(feature = "host", feature = "ui"))]
+#[derive(Default)]
+struct ProcessTable {
+    parents: std::collections::HashMap<u32, u32>,
+    sessions: std::collections::HashMap<u32, u32>,
+    starts: std::collections::HashMap<u32, u64>,
+}
+
+/// The fields of `/proc/<pid>/stat` after the parenthesized name, which can
+/// itself contain spaces and parentheses.
+#[cfg(any(feature = "host", feature = "ui"))]
+fn stat_fields(stat: &str) -> Option<Vec<&str>> {
+    Some(stat.rsplit_once(')')?.1.split_whitespace().collect())
+}
+
+/// Indices into [`stat_fields`]: the stat field number less three.
+#[cfg(any(feature = "host", feature = "ui"))]
+mod stat_field {
+    pub(super) const STATE: usize = 0;
+    pub(super) const PARENT: usize = 1;
+    pub(super) const SESSION: usize = 3;
+    pub(super) const START: usize = 19;
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl ProcessTable {
+    fn read(proc_root: &Path) -> Result<Self, String> {
+        let mut table = Self::default();
+        for entry in fs::read_dir(proc_root).map_err(process_error)? {
+            let entry = entry.map_err(process_error)?;
+            let Some(pid) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| name.parse::<u32>().ok())
+            else {
+                continue;
+            };
+            let metadata = match entry.metadata() {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            if metadata.uid() != crate::daemon::current_uid() {
+                continue;
+            }
+            let stat = match fs::read_to_string(entry.path().join("stat")) {
+                Ok(stat) => stat,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(process_error(error)),
+            };
+            let fields = stat_fields(&stat).ok_or("cannot inspect process ancestry")?;
+            let state = *fields
+                .get(stat_field::STATE)
+                .ok_or("cannot inspect process state")?;
+            let parent = fields
+                .get(stat_field::PARENT)
+                .and_then(|value| value.parse::<u32>().ok())
+                .ok_or("cannot inspect process parent")?;
+            if state != "Z" && state != "X" {
+                table.parents.insert(pid, parent);
+                let session = fields
+                    .get(stat_field::SESSION)
+                    .and_then(|value| value.parse::<u32>().ok());
+                let start = fields
+                    .get(stat_field::START)
+                    .and_then(|value| value.parse::<u64>().ok());
+                if let Some(session) = session {
+                    table.sessions.insert(pid, session);
+                }
+                if let Some(start) = start {
+                    table.starts.insert(pid, start);
+                }
+            }
+        }
+        Ok(table)
+    }
+}
+
+/// What one process's evidence says about the terminal.
+#[cfg(any(feature = "host", feature = "ui"))]
+enum Inspected {
+    Unrelated,
+    Survivor(SurvivingProcess),
+    Unreadable(UnreadableProcess),
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
@@ -228,71 +428,100 @@ fn scan_for_survivor(
     session: &TerminalSession,
     owner: u32,
     proc_root: &Path,
-) -> Result<Option<SurvivingProcess>, String> {
-    use std::collections::HashMap;
-    let mut processes = HashMap::new();
-    let mut starts = HashMap::new();
-    let manager = UserManagerSession::connect();
-    for entry in fs::read_dir(proc_root).map_err(process_error)? {
-        let entry = entry.map_err(process_error)?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|name| name.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let metadata = match entry.metadata() {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        if metadata.uid() != crate::daemon::current_uid() {
+    leave: &[UnreadableProcess],
+    lineage: impl FnOnce() -> Option<LineageBirth>,
+    namespace: Option<String>,
+) -> Result<Option<SurvivingProcess>, ScanError> {
+    let table = settle(|| ProcessTable::read(proc_root)).map_err(ScanError::Incomplete)?;
+    let scan = Scan::new(session, proc_root, &table);
+    let mut incomplete = None;
+    let mut unreadable = Vec::new();
+    let mut pids: Vec<_> = table.parents.keys().copied().collect();
+    pids.sort_unstable();
+    for pid in pids {
+        if pid == std::process::id() || belongs_to_owner(pid, owner, &table.parents) {
             continue;
         }
-        let stat = match fs::read_to_string(entry.path().join("stat")) {
-            Ok(stat) => stat,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(process_error(error)),
-        };
-        let fields = stat
-            .rsplit_once(')')
-            .ok_or("cannot inspect process ancestry")?
-            .1;
-        let mut fields = fields.split_whitespace();
-        let state = fields.next().ok_or("cannot inspect process state")?;
-        let parent = fields
-            .next()
-            .and_then(|value| value.parse::<u32>().ok())
-            .ok_or("cannot inspect process parent")?;
-        if state != "Z" && state != "X" {
-            processes.insert(pid, parent);
-            if let Some(start) = fields.nth(17).and_then(|start| start.parse::<u64>().ok()) {
-                starts.insert(pid, start);
+        // A survivor anywhere is the answer even when another process
+        // couldn't be read, so the scan goes on past an unknown.
+        match settle(|| scan.inspect(pid)) {
+            Ok(Inspected::Unrelated) => {}
+            Ok(Inspected::Survivor(survivor)) => return Ok(Some(survivor)),
+            Ok(Inspected::Unreadable(process)) => {
+                if !leave.iter().any(|left| left.same_process(&process)) {
+                    unreadable.push(process);
+                }
+            }
+            Err(error) => {
+                incomplete.get_or_insert(error);
             }
         }
     }
-    let exact_resume = session.agent_resume_recipe();
-    let exact_identity = exact_resume.as_ref().and_then(exact_conversation);
-    let terminal_marker = format!("CAGENTS_TERMINAL_ID={}", session.id);
-    let origin_marker = format!(
-        "CAGENTS_RECOVERY_ORIGIN={}",
-        session.recovery_origin.unwrap_or(session.id)
-    );
-    let carries_marker = |environment: &[u8]| {
-        environment
-            .split(|byte| *byte == 0)
-            .any(|entry| entry == terminal_marker.as_bytes() || entry == origin_marker.as_bytes())
-    };
-    let unit = systemd_unit(&session.launch);
-    for &pid in processes.keys() {
-        if pid == std::process::id() || belongs_to_owner(pid, owner, &processes) {
-            continue;
+    if let Some(error) = incomplete {
+        return Err(ScanError::Incomplete(error));
+    }
+    // Read after the processes, so it covers every launch that could have
+    // started one of them.
+    if !unreadable.is_empty()
+        && let Some(birth) = lineage()
+    {
+        unreadable.retain(|process| !process.outside_lineage(&birth, namespace.as_deref()));
+    }
+    if unreadable.is_empty() {
+        Ok(None)
+    } else {
+        Err(ScanError::Unreadable(unreadable))
+    }
+}
+
+/// The evidence one scan compares every process against.
+#[cfg(any(feature = "host", feature = "ui"))]
+struct Scan<'a> {
+    session: &'a TerminalSession,
+    proc_root: &'a Path,
+    table: &'a ProcessTable,
+    manager: Option<UserManagerSession>,
+    exact_identity: Option<(crate::agent::Provider, uuid::Uuid)>,
+    terminal_marker: String,
+    origin_marker: String,
+    unit: Option<&'a str>,
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+impl<'a> Scan<'a> {
+    fn new(session: &'a TerminalSession, proc_root: &'a Path, table: &'a ProcessTable) -> Self {
+        Self {
+            session,
+            proc_root,
+            table,
+            manager: UserManagerSession::connect(),
+            exact_identity: session
+                .agent_resume_recipe()
+                .as_ref()
+                .and_then(exact_conversation),
+            terminal_marker: format!("CAGENTS_TERMINAL_ID={}", session.id),
+            origin_marker: format!(
+                "CAGENTS_RECOVERY_ORIGIN={}",
+                session.recovery_origin.unwrap_or(session.id)
+            ),
+            unit: systemd_unit(&session.launch),
         }
-        let path = proc_root.join(pid.to_string());
+    }
+
+    fn carries_marker(&self, environment: &[u8]) -> bool {
+        environment.split(|byte| *byte == 0).any(|entry| {
+            entry == self.terminal_marker.as_bytes() || entry == self.origin_marker.as_bytes()
+        })
+    }
+
+    fn inspect(&self, pid: u32) -> Result<Inspected, String> {
+        let session = self.session;
+        let path = self.proc_root.join(pid.to_string());
         let argv = match fs::read(path.join("cmdline")) {
             Ok(argv) => argv,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Inspected::Unrelated);
+            }
             Err(error) => return Err(process_error(error)),
         };
         // exec can temporarily expose an empty proc file before publishing the
@@ -306,7 +535,9 @@ fn scan_for_survivor(
             // Keep its ancestry above; descendants are inspected separately.
             let stat = match fs::read_to_string(path.join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Inspected::Unrelated);
+                }
                 Err(error) => return Err(process_error(error)),
             };
             if stat.rsplit_once(')').is_some_and(|(_, fields)| {
@@ -315,18 +546,18 @@ fn scan_for_survivor(
                     && fields
                         .get(19)
                         .and_then(|start| start.parse::<u64>().ok())
-                        .is_some_and(|start| starts.get(&pid) == Some(&start))
+                        .is_some_and(|start| self.table.starts.get(&pid) == Some(&start))
                     && fields
                         .get(6)
                         .and_then(|flags| flags.parse::<u64>().ok())
                         .is_some_and(|flags| flags & 0x4 != 0)
             }) {
-                continue;
+                return Ok(Inspected::Unrelated);
             }
             return Err(format!("cannot inspect process invocation ({pid})"));
         }
         if argv.split(|byte| *byte == 0).any(|arg| {
-            exact_identity.is_some_and(|(provider, id)| {
+            self.exact_identity.is_some_and(|(provider, id)| {
                 std::str::from_utf8(arg).ok().is_some_and(|arg| {
                     uuid::Uuid::parse_str(arg).ok() == Some(id)
                         || provider
@@ -336,7 +567,7 @@ fn scan_for_survivor(
                 })
             })
         }) {
-            return Ok(Some(survivor(
+            return Ok(Inspected::Survivor(survivor(
                 &path,
                 pid,
                 SurvivorLink::Conversation,
@@ -345,16 +576,18 @@ fn scan_for_survivor(
                 ),
             )));
         }
-        if let Some(unit) = unit {
+        if let Some(unit) = self.unit {
             let cgroup = match fs::read_to_string(path.join("cgroup")) {
                 Ok(cgroup) => cgroup,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Inspected::Unrelated);
+                }
                 Err(error) => return Err(process_error(error)),
             };
             if in_systemd_unit(&cgroup, unit) && !detached_browser_helper(&path) {
                 let marked = fs::read(path.join("environ"))
-                    .is_ok_and(|environment| carries_marker(&environment));
-                return Ok(Some(survivor(
+                    .is_ok_and(|environment| self.carries_marker(&environment));
+                return Ok(Inspected::Survivor(survivor(
                     &path,
                     pid,
                     if marked {
@@ -378,14 +611,28 @@ fn scan_for_survivor(
         }
         let environment = match fs::read(path.join("environ")) {
             Ok(environment) => environment,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-            Err(error)
-                if error.kind() == io::ErrorKind::PermissionDenied
-                    && manager
-                        .as_ref()
-                        .is_some_and(|manager| manager.contains(pid)) =>
-            {
-                continue;
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(Inspected::Unrelated);
+            }
+            Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+                if self
+                    .manager
+                    .as_ref()
+                    .is_some_and(|manager| manager.contains(pid))
+                    || self.in_unmarked_session(pid)
+                {
+                    return Ok(Inspected::Unrelated);
+                }
+                return Ok(Inspected::Unreadable(UnreadableProcess {
+                    pid,
+                    start: self.table.starts.get(&pid).copied(),
+                    name: process_name(&path),
+                    cgroup: fs::read_to_string(path.join("cgroup"))
+                        .ok()
+                        .and_then(|listing| {
+                            crate::lineage_birth::unified_cgroup(&listing).map(str::to_owned)
+                        }),
+                }));
             }
             Err(error) => return Err(process_error(error)),
         };
@@ -394,7 +641,9 @@ fn scan_for_survivor(
             // initialized zero-length range proves this is not an exec-time gap.
             let stat = match fs::read_to_string(path.join("stat")) {
                 Ok(stat) => stat,
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Ok(Inspected::Unrelated);
+                }
                 Err(error) => return Err(process_error(error)),
             };
             let published_empty = stat.rsplit_once(')').is_some_and(|(_, fields)| {
@@ -408,8 +657,8 @@ fn scan_for_survivor(
                 return Err(format!("cannot inspect process environment ({pid})"));
             }
         }
-        if carries_marker(&environment) && !detached_browser_helper(&path) {
-            return Ok(Some(survivor(
+        if self.carries_marker(&environment) && !detached_browser_helper(&path) {
+            return Ok(Inspected::Survivor(survivor(
                 &path,
                 pid,
                 SurvivorLink::Lineage,
@@ -422,18 +671,68 @@ fn scan_for_survivor(
         // Terminal branding and another terminal's marker can be inherited by
         // detached browsers and services. Neither proves ownership of this
         // session. Recovery lineage and exact agent identities do.
+        Ok(Inspected::Unrelated)
     }
-    Ok(None)
+
+    /// Whether `pid` sits in another process's POSIX session whose leader is
+    /// readable and unmarked, which rules it out as well as reading its own
+    /// environment would. A session is joined only by forking inside it, and a
+    /// terminal's shell starts a new one with `setsid`, so nothing the terminal
+    /// started can be in a session it didn't create. Any member of a session
+    /// the terminal's lineage created descends from that session's leader,
+    /// which would then be the terminal's own. A leader can't leave its
+    /// session, and Linux doesn't reuse a PID that still names a session with a
+    /// live member, so a live process at the session's PID is its leader. The
+    /// start times confirm the order in case every member left between reads.
+    fn in_unmarked_session(&self, pid: u32) -> bool {
+        let Some(&leader) = self.table.sessions.get(&pid) else {
+            return false;
+        };
+        if leader == pid || leader == 0 {
+            return false;
+        }
+        let path = self.proc_root.join(leader.to_string());
+        let Ok(stat) = fs::read_to_string(path.join("stat")) else {
+            return false;
+        };
+        let Some(fields) = stat_fields(&stat) else {
+            return false;
+        };
+        let field = |index: usize| {
+            fields
+                .get(index)
+                .and_then(|value| value.parse::<u64>().ok())
+        };
+        let alive = fields
+            .get(stat_field::STATE)
+            .is_some_and(|state| *state != "Z" && *state != "X");
+        let leads = field(stat_field::SESSION) == Some(u64::from(leader));
+        let earlier = matches!(
+            (field(stat_field::START), self.table.starts.get(&pid)),
+            (Some(leader), Some(&member)) if leader <= member
+        );
+        if !alive || !leads || !earlier {
+            return false;
+        }
+        // An empty read can be a moment of exec, so it rules nothing out.
+        fs::read(path.join("environ"))
+            .is_ok_and(|environment| !environment.is_empty() && !self.carries_marker(&environment))
+    }
+}
+
+#[cfg(any(feature = "host", feature = "ui"))]
+fn process_name(process: &Path) -> Option<String> {
+    fs::read_to_string(process.join("comm"))
+        .ok()
+        .map(|name| name.trim_end().to_owned())
+        .filter(|name| !name.is_empty())
 }
 
 #[cfg(any(feature = "host", feature = "ui"))]
 fn survivor(process: &Path, pid: u32, link: SurvivorLink, reason: String) -> SurvivingProcess {
     SurvivingProcess {
         pid,
-        name: fs::read_to_string(process.join("comm"))
-            .ok()
-            .map(|name| name.trim_end().to_owned())
-            .filter(|name| !name.is_empty()),
+        name: process_name(process),
         link,
         reason,
     }
@@ -1337,9 +1636,14 @@ pub(crate) mod handoff {
         pub aliases: Vec<chat::Session>,
     }
 
+    /// A restoring provider can take its full attachment timeout even when
+    /// there is no upgrade inventory (for example, after a daemon crash).
+    pub(crate) const STARTUP_BASE: std::time::Duration = std::time::Duration::from_secs(30);
+
     /// Budget sequential provider confirmation without parsing session payloads.
+    /// Estimating readiness must not create durable upgrade storage.
     pub(crate) fn startup_timeout() -> Result<std::time::Duration, String> {
-        Store::discover()?.startup_timeout()
+        Store::existing()?.map_or(Ok(STARTUP_BASE), |store| store.startup_timeout())
     }
 
     #[derive(Deserialize)]
@@ -1446,7 +1750,7 @@ pub(crate) mod handoff {
 
         fn startup_timeout(&self) -> Result<std::time::Duration, String> {
             let Some(bytes) = self.read_bytes()? else {
-                return Ok(std::time::Duration::from_secs(5));
+                return Ok(STARTUP_BASE);
             };
             let inventory: Inventory =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
@@ -1459,10 +1763,11 @@ pub(crate) mod handoff {
                 return Err("Upgrade checkpoint exceeds session limits".into());
             }
             // Adopting a carried terminal is a local handshake with its holder.
-            Ok(std::time::Duration::from_secs(
-                5 + 30 * (inventory.terminals + inventory.chats) as u64
-                    + 5 * inventory.carried as u64,
-            ))
+            Ok(STARTUP_BASE
+                + std::time::Duration::from_secs(
+                    30 * (inventory.terminals + inventory.chats) as u64
+                        + 5 * inventory.carried as u64,
+                ))
         }
 
         #[cfg(any(feature = "host", test))]
@@ -1887,13 +2192,32 @@ pub(crate) mod handoff {
         }
 
         #[test]
-        fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
+        fn startup_budget_without_inventory_allows_provider_restoration() {
             let directory = tempfile::tempdir().unwrap();
             let store = Store::open(directory.path()).unwrap();
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(5)
+                std::time::Duration::from_secs(30)
             );
+            let mut file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(&store.path)
+                .unwrap();
+            file.write_all(br#"{"version":3,"terminals":[],"chats":[]}"#)
+                .unwrap();
+            assert_eq!(
+                store.startup_timeout().unwrap(),
+                std::time::Duration::from_secs(30)
+            );
+        }
+
+        #[test]
+        fn startup_budget_counts_sequential_items_and_rejects_untrusted_inventory() {
+            let directory = tempfile::tempdir().unwrap();
+            let store = Store::open(directory.path()).unwrap();
+            assert_eq!(store.startup_timeout().unwrap(), STARTUP_BASE);
             let save = |bytes: &[u8]| {
                 let mut file = std::fs::OpenOptions::new()
                     .write(true)
@@ -1907,12 +2231,12 @@ pub(crate) mod handoff {
             save(br#"{"version":1,"terminals":[{"nested":["ignored"]},{}],"chats":[{}]}"#);
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(95)
+                std::time::Duration::from_secs(120)
             );
             save(br#"{"version":2,"terminals":[{}],"carried":[{},{}],"chats":[]}"#);
             assert_eq!(
                 store.startup_timeout().unwrap(),
-                std::time::Duration::from_secs(45)
+                std::time::Duration::from_secs(70)
             );
             save(br#"{"version":3,"terminals":[],"chats":[]}"#);
             assert!(store.startup_timeout().is_ok());
@@ -1937,7 +2261,7 @@ pub(crate) mod handoff {
                 );
                 assert_eq!(
                     store.startup_timeout().unwrap(),
-                    std::time::Duration::from_secs(5 + 30 * chats as u64)
+                    STARTUP_BASE + std::time::Duration::from_secs(30 * chats as u64)
                 );
             }
             for (terminals, chats) in [(MAX_TERMINALS + 1, 0), (0, MAX_CHATS + 1)] {
@@ -2456,6 +2780,311 @@ mod tests {
         assert!(error.contains("agent session still has a live process"));
     }
 
+    /// A synthetic `/proc/<pid>/stat`. PIDs above `i32::MAX` keep the real
+    /// user-manager session check, which asks the kernel, from matching one.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn process_stat(pid: u32, state: &str, session: u32, start: u64) -> String {
+        let mut fields = vec!["0".to_owned(); 20];
+        fields[stat_field::STATE] = state.into();
+        fields[stat_field::PARENT] = "1".into();
+        fields[stat_field::SESSION] = session.to_string();
+        fields[stat_field::START] = start.to_string();
+        format!("{pid} (process) {}", fields.join(" "))
+    }
+
+    /// A process whose environment the kernel won't show this user, as it
+    /// won't for ssh-agent or an SSH login's sshd-session.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn protected_process(root: &Path, pid: u32, name: &str, session: u32, start: u64) {
+        use std::os::unix::fs::PermissionsExt;
+        let process = root.join(pid.to_string());
+        // A PID that named another process names this one now.
+        if process.exists() {
+            fs::remove_dir_all(&process).unwrap();
+        }
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), process_stat(pid, "S", session, start)).unwrap();
+        fs::write(process.join("comm"), format!("{name}\n")).unwrap();
+        fs::write(process.join("cmdline"), format!("{name}\0")).unwrap();
+        fs::write(process.join("environ"), b"PATH=/bin\0").unwrap();
+        fs::set_permissions(process.join("environ"), fs::Permissions::from_mode(0)).unwrap();
+        assert_eq!(
+            fs::read(process.join("environ")).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied,
+            "the test must exercise an unreadable environment"
+        );
+    }
+
+    #[cfg(any(feature = "host", feature = "ui"))]
+    fn readable_process(root: &Path, pid: u32, state: &str, environment: &str, start: u64) {
+        let process = root.join(pid.to_string());
+        fs::create_dir_all(&process).unwrap();
+        fs::write(process.join("stat"), process_stat(pid, state, pid, start)).unwrap();
+        fs::write(process.join("comm"), "fish\n").unwrap();
+        fs::write(process.join("cmdline"), b"fish\0").unwrap();
+        fs::write(process.join("environ"), environment).unwrap();
+    }
+
+    /// #2365: an unreadable process can't be ruled out, but the refusal names
+    /// every one of them so a person knows what is in the way.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn unreadable_processes_are_named_rather_than_left_unknown() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let agent = u32::MAX - 2;
+        let sftp = u32::MAX - 1;
+        protected_process(directory.path(), agent, "ssh-agent", agent, 100);
+        protected_process(directory.path(), sftp, "sshd-session", sftp, 200);
+
+        let error = surviving_process(&source, u32::MAX, directory.path(), &[]).unwrap_err();
+        let ScanError::Unreadable(processes) = &error else {
+            panic!("{error:?}");
+        };
+        let named: Vec<_> = processes
+            .iter()
+            .map(|process| (process.pid, process.name.as_deref()))
+            .collect();
+        assert_eq!(
+            named,
+            [(agent, Some("ssh-agent")), (sftp, Some("sshd-session"))]
+        );
+        let message = ensure_no_surviving_process(&source, u32::MAX, directory.path()).unwrap_err();
+        for expected in [
+            format!("ssh-agent ({agent})"),
+            format!("sshd-session ({sftp})"),
+        ] {
+            assert!(message.contains(&expected), "{message}");
+        }
+
+        // A live survivor is the answer even beside a process that can't be read.
+        readable_process(
+            directory.path(),
+            u32::MAX - 3,
+            "S",
+            &format!("CAGENTS_TERMINAL_ID={}\0", source.id),
+            300,
+        );
+        let survivor = surviving_process(&source, u32::MAX, directory.path(), &[])
+            .unwrap()
+            .unwrap();
+        assert_eq!(survivor.pid, u32::MAX - 3);
+        fs::remove_dir_all(directory.path().join((u32::MAX - 3).to_string())).unwrap();
+
+        // An unfinished read is not narrowed to the unreadable processes it saw.
+        let blank = directory.path().join((u32::MAX - 4).to_string());
+        fs::create_dir(&blank).unwrap();
+        fs::write(blank.join("stat"), process_stat(u32::MAX - 4, "R", 1, 1)).unwrap();
+        fs::write(blank.join("cmdline"), b"").unwrap();
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Incomplete(_))
+        ));
+    }
+
+    /// Leaving a process running covers that one process: not another one that
+    /// takes its PID later, and not one whose start couldn't be read.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_process_left_running_is_passed_over_only_while_it_is_the_same_process() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let pid = u32::MAX - 1;
+        protected_process(directory.path(), pid, "ssh-agent", pid, 100);
+        let Err(ScanError::Unreadable(seen)) =
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+        else {
+            panic!("the process must be unreadable");
+        };
+        assert_eq!(
+            surviving_process(&source, u32::MAX, directory.path(), &seen),
+            Ok(None)
+        );
+
+        // The PID now names a later process.
+        protected_process(directory.path(), pid, "ssh-agent", pid, 101);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &seen),
+            Err(ScanError::Unreadable(processes)) if processes.len() == 1
+        ));
+
+        // Another unreadable process is still named.
+        protected_process(directory.path(), pid, "ssh-agent", pid, 100);
+        protected_process(directory.path(), pid - 1, "gpg-agent", pid - 1, 50);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &seen),
+            Err(ScanError::Unreadable(processes))
+                if processes.len() == 1 && processes[0].pid == pid - 1
+        ));
+        fs::remove_dir_all(directory.path().join((pid - 1).to_string())).unwrap();
+
+        // Without a start time a PID alone identifies nothing.
+        fs::write(
+            directory.path().join(pid.to_string()).join("stat"),
+            format!("{pid} (ssh-agent) S 1 {pid} {pid} 0"),
+        )
+        .unwrap();
+        let Err(ScanError::Unreadable(unstarted)) =
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+        else {
+            panic!("the process must be unreadable");
+        };
+        assert!(surviving_process(&source, u32::MAX, directory.path(), &unstarted).is_err());
+    }
+
+    /// #2365: what the lineage's records prove rules an unreadable process out,
+    /// and nothing short of that does.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn a_lineage_record_rules_out_only_what_it_proves() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let pid = u32::MAX - 1;
+        protected_process(directory.path(), pid, "sshd-session", pid, 100);
+        let uid = crate::daemon::current_uid();
+        let set_cgroup = |cgroup: &str| {
+            fs::write(
+                directory.path().join(pid.to_string()).join("cgroup"),
+                format!("0::{cgroup}\n"),
+            )
+            .unwrap();
+        };
+        let login = format!("/user.slice/user-{uid}.slice/session-4.scope");
+        set_cgroup(&login);
+        let ruled_out =
+            |birth: Option<LineageBirth>, namespace: Option<&str>| match scan_for_survivor(
+                &source,
+                u32::MAX,
+                directory.path(),
+                &[],
+                || birth,
+                namespace.map(str::to_owned),
+            ) {
+                Ok(None) => true,
+                Err(ScanError::Unreadable(processes)) if processes.len() == 1 => false,
+                other => panic!("{other:?}"),
+            };
+        let born = |since, contained_in: Option<&str>| {
+            Some(LineageBirth::Born {
+                since,
+                contained_in: contained_in.map(str::to_owned),
+            })
+        };
+        assert!(!ruled_out(None, Some("ns")), "no records to go by");
+        assert!(ruled_out(Some(LineageBirth::Unborn), None));
+        assert!(
+            ruled_out(born(101, None), None),
+            "started before the lineage"
+        );
+        assert!(
+            !ruled_out(born(100, None), None),
+            "the same tick isn't before"
+        );
+        assert!(
+            ruled_out(born(50, Some("ns")), Some("ns")),
+            "outside the user manager"
+        );
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("other")),
+            "another view"
+        );
+        assert!(!ruled_out(born(50, Some("ns")), None));
+        assert!(
+            !ruled_out(born(50, None), Some("ns")),
+            "a launch was outside"
+        );
+        set_cgroup(&format!(
+            "/user.slice/user-{uid}.slice/user@{uid}.service/app.slice/ssh-agent.service"
+        ));
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "reachable from the lineage"
+        );
+        set_cgroup("ssh-agent.service");
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "not a path from the root"
+        );
+        fs::remove_file(directory.path().join(pid.to_string()).join("cgroup")).unwrap();
+        assert!(
+            !ruled_out(born(50, Some("ns")), Some("ns")),
+            "no cgroup to read"
+        );
+        assert!(ruled_out(born(101, Some("ns")), Some("ns")));
+    }
+
+    /// An `ssh-agent -D` started in another shell is in that shell's session.
+    /// Nothing this terminal started can be, so a readable, unmarked leader rules
+    /// it out. Every way that inference could be wrong keeps it unreadable.
+    #[cfg(any(feature = "host", feature = "ui"))]
+    #[test]
+    fn an_unreadable_process_in_an_unmarked_session_is_ruled_out() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = checkpoint(directory.path()).terminals.remove(0).source;
+        let leader = u32::MAX - 2;
+        let agent = u32::MAX - 1;
+        let other = "CAGENTS_TERMINAL_ID=other-terminal\0";
+        let unreadable = |directory: &Path| {
+            matches!(
+                surviving_process(&source, u32::MAX, directory, &[]),
+                Err(ScanError::Unreadable(processes))
+                    if processes.iter().map(|process| process.pid).eq([agent])
+            )
+        };
+        protected_process(directory.path(), agent, "ssh-agent", leader, 200);
+        assert!(unreadable(directory.path()), "no leader to read");
+
+        readable_process(directory.path(), leader, "S", other, 100);
+        assert_eq!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Ok(None)
+        );
+
+        // The leader is this terminal's (and is itself a survivor), or its
+        // evidence is a moment of exec, or a zombie, or a later process.
+        readable_process(
+            directory.path(),
+            leader,
+            "S",
+            &format!("CAGENTS_RECOVERY_ORIGIN={}\0", source.id),
+            100,
+        );
+        assert_eq!(
+            surviving_process(&source, u32::MAX, directory.path(), &[])
+                .unwrap()
+                .map(|survivor| survivor.pid),
+            Some(leader)
+        );
+        for (state, start) in [("Z", 100), ("S", 300)] {
+            readable_process(directory.path(), leader, state, other, start);
+            assert!(unreadable(directory.path()), "{state} {start}");
+        }
+        // The blank leader can't be ruled out itself either.
+        readable_process(directory.path(), leader, "S", "", 100);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Incomplete(_))
+        ));
+
+        // A process at the session's PID that doesn't lead it isn't its leader.
+        readable_process(directory.path(), leader, "S", other, 100);
+        fs::write(
+            directory.path().join(leader.to_string()).join("stat"),
+            process_stat(leader, "S", 1, 100),
+        )
+        .unwrap();
+        assert!(unreadable(directory.path()));
+
+        // A leader whose own environment can't be read rules nothing out, as
+        // for an SSH login's sshd-session under its root-owned monitor.
+        protected_process(directory.path(), leader, "sshd-session", leader, 100);
+        assert!(matches!(
+            surviving_process(&source, u32::MAX, directory.path(), &[]),
+            Err(ScanError::Unreadable(processes))
+                if processes.iter().any(|process| process.pid == agent)
+        ));
+    }
+
     /// A zombie shows no arguments for as long as its parent leaves it, and it
     /// has stopped running, so it mustn't block every Close and Retry.
     #[cfg(any(feature = "host", feature = "ui"))]
@@ -2485,7 +3114,7 @@ mod tests {
     #[test]
     fn a_process_scan_gets_past_a_moment_of_exec_but_not_a_lasting_unknown() {
         let mut scans = 0;
-        let finished = finish_process_scan(|| {
+        let finished = settle(|| {
             scans += 1;
             if scans < 3 {
                 Err("cannot inspect process invocation (42)".to_owned())
@@ -2497,7 +3126,7 @@ mod tests {
         assert_eq!(scans, 3);
 
         let mut scans = 0;
-        let unknown = finish_process_scan::<()>(|| {
+        let unknown = settle::<()>(|| {
             scans += 1;
             Err("cannot inspect process invocation (42)".to_owned())
         });
@@ -2505,7 +3134,7 @@ mod tests {
         assert_eq!(scans, 4);
 
         let mut scans = 0;
-        let found = finish_process_scan(|| {
+        let found = settle(|| {
             scans += 1;
             Ok::<_, String>(Some(42))
         });

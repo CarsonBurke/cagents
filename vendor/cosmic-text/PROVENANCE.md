@@ -4,8 +4,9 @@ Base: crates.io cosmic-text0.19.0 archive, SHA256
 be17b688510d934ce13f48a2beba700e11583e281e0fda99c22bb256a14eda73.
 The retained original manifest, README and MIT/Apache-2.0 licenses identify
 the upstream package. Local library changes combine two independently
-reviewed feature lines; neither standalone provenance statement replaces
-the other's contract.
+reviewed feature lines, neither of whose standalone provenance statements
+replaces the other's contract, and add font matching that reads no font
+file.
 
 - PR1316 source9fb2ae2c0da9c1991440efbdc05f3747d401bd2c adds immutable
   consuming full-context LayoutSnapshot/projection APIs. Its buffer.rs,
@@ -17,11 +18,21 @@ the other's contract.
   local overwide-blank correction. The final shape.rs is byte-identical to
   that peer: after an ordinary word-wrap break the final ellipsized line
   starts at the next word; an overflowing blank advances past that blank.
-  Authored text and indentation are not trimmed or normalized.
+  Authored text and indentation are not trimmed or normalized. PR535's
+  updated tests/images/ellipsize_ltr_end_two_lines.png (SHA256
+  1dcd10ab7524150bdb2d0142985bd9f1e94b06753e71ecce58e2b53d15174bba) is
+  taken with it: the crates.io archive's older image predates PR535 and
+  failed against the backported shape.rs (cagents#2472).
 - lib.rs adds the compile-time CAGENTS_CHECKOUT_ROOT identity anchor. The
   cache qualifier adds only the matching cosmic source-hook name, preserving
   PR1316's historical unanchored-producer/package-bootstrap and unrelated
   artifact-retention proofs.
+- cagents#2166 removes FontMatchKey's variable_weight_match.
+  FontSystem::matches_weight reads a face's wght axis when fallback first
+  considers it and caches the range by face ID, cleared with the database;
+  font/fallback/mod.rs asks it after the family test. Selection order and
+  results are unchanged: src/font/system/fallback_choice_tests.rs compares
+  every choice over the repository fonts with upstream's.
 
 The union retains PR1316's complete eight upstream integration-test targets,
 two benchmarks, development dependencies, test profile, source/fonts and

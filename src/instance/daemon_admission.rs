@@ -289,7 +289,7 @@ impl std::fmt::Display for DaemonStillStarting {
 pub(crate) fn admission_wait_timeout() -> Duration {
     // A daemon restoring an upgrade checkpoint may take as long as its
     // inventory allows. An unreadable checkpoint fails that daemon anyway.
-    crate::upgrade::handoff::startup_timeout().unwrap_or(Duration::from_secs(5))
+    crate::upgrade::handoff::startup_timeout().unwrap_or(crate::upgrade::handoff::STARTUP_BASE)
         + ADMISSION_WAIT_ALLOWANCE
 }
 
@@ -844,7 +844,7 @@ mod tests {
             libc::LOCK_EX | libc::LOCK_NB,
         )
         .unwrap();
-        publish_capability(&mut lease.0).unwrap();
+        publish_capability(lease.file_mut()).unwrap();
         assert!(admit_windows(runtime.path()).is_ok());
         let mut capability = WindowCapability {
             format: 1,
