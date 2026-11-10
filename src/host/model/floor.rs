@@ -6,9 +6,15 @@ use crate::{
 };
 
 impl Registry {
+    #[cfg(test)]
     pub(crate) fn capture_update_floor(&self, record: &mut Record) -> Result<(), String> {
         let transaction = self.db.unchecked_transaction().map_err(|e| e.to_string())?;
-        let views = super::views::all(&transaction)?;
+        self.capture_update_floor_snapshot(record)?;
+        transaction.commit().map_err(|e| e.to_string())
+    }
+
+    fn capture_update_floor_snapshot(&self, record: &mut Record) -> Result<(), String> {
+        let views = super::views::all(&self.db)?;
         for session in &record.chats {
             let Some(agent) = self.agent_for_session(session.id)? else {
                 continue;
@@ -50,7 +56,7 @@ impl Registry {
                 restored: false,
             });
         }
-        transaction.commit().map_err(|e| e.to_string())
+        Ok(())
     }
 
     pub(crate) fn restore_update_floor(&mut self, record: &mut Record) -> Result<(), String> {
@@ -144,6 +150,26 @@ impl Registry {
         // retain that acknowledgement, before any user can edit the restored pane.
         Ok(())
     }
+}
+
+pub(in crate::host) fn capture_presentations(record: &mut Record) -> Result<(), String> {
+    let dirs = crate::instance::project_dirs()
+        .ok_or_else(|| "the data directory is unavailable".to_owned())?;
+    capture_presentations_at(&dirs.data_dir().join("workspace-model.sqlite3"), record)
+}
+
+fn capture_presentations_at(path: &Path, record: &mut Record) -> Result<(), String> {
+    let registry = Registry {
+        db: super::schema::open_readonly(path)?,
+        path: path.to_owned(),
+    };
+    let snapshot = registry
+        .db
+        .unchecked_transaction()
+        .map_err(|e| e.to_string())?;
+    super::schema::require_published_snapshot(&snapshot)?;
+    registry.capture_update_floor_snapshot(record)?;
+    snapshot.commit().map_err(|e| e.to_string())
 }
 
 pub(in crate::host) fn restore_presentations() -> Result<(), String> {
@@ -317,6 +343,114 @@ mod tests {
             agent,
         )
     }
+    #[test]
+    fn capturing_live_schema_twenty_two_never_admits_a_new_writer_or_migrates_it() {
+        let (fixture, mut record, agent) = fixture();
+        let view = super::super::views::all(&fixture.db).unwrap().remove(0);
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("workspace-model.sqlite3");
+        let mut previous_writer = Connection::open(&path).unwrap();
+        let tx = previous_writer.transaction().unwrap();
+        super::super::migrate_through(&tx, 0, 22).unwrap();
+        tx.pragma_update(None, "user_version", 22).unwrap();
+        tx.commit().unwrap();
+        previous_writer
+            .execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
+            .unwrap();
+        let scope = serde_json::to_string(&view.scope).unwrap();
+        let Scope::Channel(channel) = view.scope else {
+            panic!("the captured fixture must have a channel pane");
+        };
+        previous_writer
+            .execute("INSERT INTO projects VALUES('/work','Work',1,'git')", [])
+            .unwrap();
+        previous_writer
+            .execute(
+                "INSERT INTO channels VALUES(?1,'/work','Channel',1,2)",
+                [channel.to_string()],
+            )
+            .unwrap();
+        previous_writer
+            .execute(
+                "INSERT INTO shared_view_scopes(scope,channel) VALUES(?1,?2)",
+                params![scope, channel.to_string()],
+            )
+            .unwrap();
+        previous_writer
+            .execute(
+                "INSERT INTO shared_views VALUES(?1,1,?2,'[]')",
+                params![scope, serde_json::to_string(&view.panes).unwrap()],
+            )
+            .unwrap();
+        previous_writer
+            .execute(
+                "INSERT INTO shared_view_panes VALUES(?1,?2)",
+                params![view.panes[0].id.to_string(), scope],
+            )
+            .unwrap();
+        previous_writer
+            .execute(
+                "INSERT INTO agents VALUES(?1,?2,?3,?4,0)",
+                params![
+                    agent.id.to_string(),
+                    serde_json::to_string(&agent.origin).unwrap(),
+                    serde_json::to_string(&agent).unwrap(),
+                    record.chats[0].id.to_string(),
+                ],
+            )
+            .unwrap();
+        // A raw descriptor must not close while any SQLite connection to the
+        // same inode retains POSIX locks. Pin both files until after the writer
+        // drops, including during assertion unwinding.
+        struct PinnedWriter {
+            db: Connection,
+            main: fs::File,
+            wal: fs::File,
+        }
+        fn bytes(file: &fs::File) -> Vec<u8> {
+            use std::os::unix::fs::FileExt;
+            let mut bytes = vec![0; file.metadata().unwrap().len() as usize];
+            file.read_exact_at(&mut bytes, 0).unwrap();
+            bytes
+        }
+        let mut previous = PinnedWriter {
+            db: previous_writer,
+            main: fs::File::open(&path).unwrap(),
+            wal: fs::File::open(path.with_extension("sqlite3-wal")).unwrap(),
+        };
+        let before = (bytes(&previous.main), bytes(&previous.wal));
+        // Retain a real old writer transaction while the new build captures
+        // presentations. A migration would need this writer and change schema22.
+        let writer = previous
+            .db
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+        capture_presentations_at(&path, &mut record).unwrap();
+        assert_eq!(record.presentations.len(), 1);
+        assert_eq!(record.presentations[0].pane, view.panes[0]);
+        assert_eq!(
+            writer
+                .pragma_query_value(None, "user_version", |row| row.get::<_, u32>(0))
+                .unwrap(),
+            22
+        );
+        assert_eq!(
+            writer
+                .query_row(
+                    "SELECT count(*) FROM sqlite_schema WHERE name='console_relaunches'",
+                    [],
+                    |row| row.get::<_, u32>(0)
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!((bytes(&previous.main), bytes(&previous.wal)), before);
+        writer
+            .execute("UPDATE metadata SET sequence=sequence+1 WHERE key=0", [])
+            .unwrap();
+        writer.commit().unwrap();
+    }
+
     #[test]
     fn restoring_an_old_close_keeps_only_the_reviewed_pane_and_never_replays_work() {
         let (mut registry, mut record, agent) = fixture();

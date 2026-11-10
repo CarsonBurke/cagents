@@ -3263,7 +3263,7 @@ fn retain_floor_entry() -> Option<Result<(), String>> {
                 }
             }
         }
-        super::model::Registry::open()?.capture_update_floor(&mut record)?;
+        super::model::floor::capture_presentations(&mut record)?;
         // ChatClose returns its final snapshot itself. A service shutdown has
         // no per-chat acknowledgement, so capture that page immediately before
         // stopping it. No capture is durable until an action is acknowledged.

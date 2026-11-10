@@ -45,6 +45,18 @@ pub(super) fn open(path: &Path) -> Result<Connection, String> {
     open_existing(path)
 }
 
+/// Inspection while a previous daemon is still the writer must neither
+/// migrate its published layout nor recover an unconfirmed rollback journal.
+pub(super) fn open_readonly(path: &Path) -> Result<Connection, String> {
+    reject_unjournaled_layout(path)?;
+    connect(path, true)
+}
+
+/// The caller pins this check and its reads in the same SQLite transaction.
+pub(super) fn require_published_snapshot(db: &Connection) -> Result<(), String> {
+    require_open_layout(db, inspect(db)?.version)
+}
+
 fn prepare_file(path: &Path) -> Result<(), String> {
     // POSIX close(any descriptor for an inode) releases the process's fcntl
     // locks, even if another SQLite connection owns them. Never open/close an
