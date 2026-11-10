@@ -542,6 +542,9 @@ mod tests {
     }
     #[test]
     fn continuously_dirty_output_keeps_two_custom_viewports_responsive() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         let (host, handle, id, _dir) = fixture_with(
             r#"i=1; while :; do printf 'ROW-%03d\n' "$i"; i=$((i+1)); sleep 0.005; done"#,
         );
@@ -571,7 +574,11 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(5));
         }
-        assert!(started.elapsed() < Duration::from_secs(3));
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "60 viewport reads took {elapsed:?}"
+        );
         handle.shutdown().unwrap();
     }
 }

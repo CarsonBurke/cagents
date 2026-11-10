@@ -5840,6 +5840,9 @@ exec /bin/sleep 60
     }
     #[test]
     fn read_only_inspection_of_a_stalled_exact_peer_obeys_one_budget_without_actor_changes() {
+        if crate::retained_fixture::run_isolated() {
+            return;
+        }
         let fixture = resident_fixture();
         let mut record = fixture.server.identity.record.clone();
         record.boot = crate::daemon::read_boot_id().unwrap();
@@ -5851,37 +5854,72 @@ exec /bin/sleep 60
             .push(CAPABILITY.into());
         let socket = fixture._root.path().join("deadline-inspect.sock");
         let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let (release, wait) = crossbeam_channel::bounded(1);
-        let peer = thread::spawn(move || {
-            let (control, _) = listener.accept().unwrap();
-            let request: Invocation = receive(&control, TIMEOUT).unwrap();
-            assert_eq!(request.method, "inspect");
-            assert!(request.epoch.is_none());
-            // SO_PEERCRED has identified this exact Record.holder process, but
-            // its inspection response stalls. The client must still return.
-            let _ = wait.recv_timeout(Duration::from_secs(2));
-        });
         let epoch = fixture.server.epoch;
         let source = fixture.server.source.clone();
-        let started = Instant::now();
-        let error = RemoteActor::inspect_at_until(
-            &record,
-            fixture.server.proof.clone(),
-            &socket,
-            started + Duration::from_millis(40),
-        )
-        .err()
-        .expect("stalled inspection must time out");
-        let elapsed = started.elapsed();
-        let _ = release.send(());
-        peer.join().unwrap();
-        assert!(error.contains("deadline"));
-        assert!(elapsed < Duration::from_millis(250));
+        let (inspection, elapsed, peer_result) = thread::scope(|scope| {
+            let (ready, peer_ready) = crossbeam_channel::bounded(1);
+            let peer = scope.spawn(move || -> Result<(), String> {
+                ready.send(()).unwrap();
+                let deadline = Instant::now() + TIMEOUT;
+                let control = loop {
+                    match listener.accept() {
+                        Ok((control, _)) => break control,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                        Err(error) => {
+                            return Err(format!("inspection peer accept failed: {error}"));
+                        }
+                    }
+                    if Instant::now() >= deadline {
+                        return Err("inspection never reached peer before accept deadline".into());
+                    }
+                    match wait.recv_timeout(Duration::from_millis(5)) {
+                        Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                            return Err(
+                                "inspection never reached peer before client returned".into()
+                            );
+                        }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    }
+                };
+                let request: Invocation = receive(&control, TIMEOUT)?;
+                assert_eq!(request.method, "inspect");
+                assert!(request.epoch.is_none());
+                // SO_PEERCRED has identified this exact Record.holder process,
+                // but its inspection response stalls. The client must return.
+                let _ = wait.recv_timeout(Duration::from_secs(2));
+                Ok(())
+            });
+            peer_ready
+                .recv_timeout(TIMEOUT)
+                .expect("inspection peer did not start");
+            let started = Instant::now();
+            let inspection = RemoteActor::inspect_at_until(
+                &record,
+                fixture.server.proof.clone(),
+                &socket,
+                started + Duration::from_millis(40),
+            );
+            let elapsed = started.elapsed();
+            let _ = release.send(());
+            let peer_result = peer.join().expect("inspection peer panicked");
+            (inspection, elapsed, peer_result)
+        });
+        let error = inspection.err().expect("stalled inspection must time out");
+        assert!(error.contains("deadline"), "{error}; elapsed={elapsed:?}");
         assert_eq!(fixture.server.epoch, epoch);
         assert_eq!(fixture.server.source, source);
         assert!(!fixture.server.actor.is_completed());
         assert!(fixture.server.pending.is_empty());
         assert_eq!(fixture.server.journal.lock().unwrap().latest().unwrap(), 0);
+        peer_result.unwrap_or_else(|peer_error| {
+            panic!("{peer_error}; client={error}; elapsed={elapsed:?}")
+        });
+        assert!(
+            elapsed < Duration::from_millis(250),
+            "inspection took {elapsed:?}: {error}"
+        );
     }
 
     #[test]
@@ -7201,6 +7239,7 @@ done"#;
         // Preserve itself fences new helper input, so manufacturing a command
         // after preserve would test a forbidden ordering rather than a lost ACK.
         actor.0.stop.store(true, Ordering::Release);
+        actor.0.wake.notify();
         let pump = actor.0.worker.lock().unwrap().take();
         pump.expect("metadata pump").join().unwrap();
         let identity = InputIdentity {
