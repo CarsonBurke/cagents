@@ -2740,6 +2740,14 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
     // The previous daemon prepares its checkpoint and stops; its successor
     // restores the checkpoint from the same registry.
     let update = |host: SharedHost, incarnation: &str, previous_launch: usize| {
+        let providers = host
+            .lock()
+            .unwrap()
+            .chats
+            .values()
+            .map(|record| record.handle.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(providers.len(), 1, "the fixture owns exactly one provider");
         // A local holder-backed runtime does not populate provider_process().
         // The controlled stub records its own kernel identity before exec,
         // which retains PID/start, so this also detects death or PID reuse
@@ -2777,6 +2785,9 @@ fn updated_codex_agent_answers_through_its_relaunched_server() {
         super::super::finish_chat_shutdown(&host).unwrap();
         for terminal in shutdown {
             let _ = terminal.shutdown();
+        }
+        for handle in providers {
+            assert!(handle.is_completed(), "the provider teardown must complete");
         }
         // Removal is justified by this original process's actual retirement,
         // not by assuming that shutdown succeeded or by hiding it from the
