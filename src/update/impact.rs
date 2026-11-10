@@ -279,6 +279,7 @@ mod tests {
             replaces_daemon: false,
             daemon: None,
             from_version: "1".into(),
+            editors: Vec::new(),
             windows: 2,
             stopped: vec![StoppedPane {
                 pane: TerminalId::new(),

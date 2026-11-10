@@ -187,6 +187,7 @@ mod tests {
                 digest: "reviewed-build".into(),
             },
             from_version: "0.1.3+local.991daa43e".into(),
+            editors: Vec::new(),
             windows: 2,
             replaces_daemon: true,
             daemon: Some(DaemonImpact {
@@ -294,6 +295,24 @@ mod tests {
                 "    Build · Release · alpha: its running work needs to finish\n",
             )
         );
+    }
+
+    #[test]
+    fn review_names_an_editor_whose_companion_differs() {
+        let mut preview = preview();
+        for (name, protocol) in [("Ceditor", Some(127)), ("Matched", Some(160))] {
+            preview.editors.push(crate::install_guard::EditorCompanion {
+                name: name.into(),
+                version: Some("0.1.3+local.07e7efc5".into()),
+                protocol,
+                pid: 7,
+            });
+        }
+        let review = render_review(&preview);
+        assert!(review.contains(
+            "Ceditor (0.1.3+local.07e7efc5) keeps running; its agent features need Ceditor to be updated as well.\n"
+        ));
+        assert!(!review.contains("Matched"));
     }
 
     #[test]
