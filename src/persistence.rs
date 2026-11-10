@@ -12327,8 +12327,10 @@ mod tests {
         let boot_id = boot("boot-a");
         let store = StateStore::open(&path, boot_id.clone()).unwrap();
         let (workspace, mut lane) = settled_closed_history(&store, &boot_id);
-        let rows = workspace.cards[1..]
+        let rows = workspace
+            .cards
             .iter()
+            .skip(1)
             .map(|card| stored_card_row(&store, card.id))
             .collect::<Vec<_>>();
 
@@ -12344,7 +12346,7 @@ mod tests {
             3,
             "each flush writes its workspace row and nothing else"
         );
-        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+        for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
             assert_eq!(lane.cards[&card.id], row.0.cast_unsigned());
         }
@@ -12365,7 +12367,7 @@ mod tests {
             }),
             1
         );
-        for (card, row) in workspace.cards[1..].iter().zip(&rows) {
+        for (card, row) in workspace.cards.iter().skip(1).zip(&rows) {
             assert_eq!(&stored_card_row(&store, card.id), row);
         }
     }

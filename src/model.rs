@@ -1230,13 +1230,6 @@ impl<T> Shared<T> {
     }
 }
 
-impl<T: Clone> Shared<T> {
-    /// The value, copied only if another workspace still shares it.
-    pub fn into_inner(self) -> T {
-        std::sync::Arc::unwrap_or_clone(self.0)
-    }
-}
-
 impl<T> Clone for Shared<T> {
     fn clone(&self) -> Self {
         Self(std::sync::Arc::clone(&self.0))
@@ -1387,23 +1380,8 @@ impl Cards {
         self.0.clear();
     }
 
-    pub fn truncate(&mut self, len: usize) {
-        self.0.truncate(len);
-    }
-
     pub fn swap(&mut self, a: usize, b: usize) {
         self.0.swap(a, b);
-    }
-
-    pub fn sort_by_key<K: Ord>(&mut self, mut key: impl FnMut(&CardState) -> K) {
-        self.0.sort_by_key(|card| key(card));
-    }
-
-    pub fn sort_by(
-        &mut self,
-        mut compare: impl FnMut(&CardState, &CardState) -> std::cmp::Ordering,
-    ) {
-        self.0.sort_by(|a, b| compare(a, b));
     }
 }
 
@@ -1475,17 +1453,6 @@ impl FromIterator<CardState> for Cards {
 impl Extend<CardState> for Cards {
     fn extend<I: IntoIterator<Item = CardState>>(&mut self, cards: I) {
         self.0.extend(cards.into_iter().map(Shared::new));
-    }
-}
-
-impl IntoIterator for Cards {
-    type Item = CardState;
-    type IntoIter =
-        std::iter::Map<std::vec::IntoIter<Shared<CardState>>, fn(Shared<CardState>) -> CardState>;
-
-    /// Each card, copied only if a snapshot still shares it.
-    fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter().map(Shared::into_inner)
     }
 }
 
