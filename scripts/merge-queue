@@ -130,7 +130,7 @@ class Queue:
                     resource = "graphql" if arguments[0] == "graphql" else "core"
                     until = json.loads(limits.stdout)["resources"][resource]["reset"] + 1
                 with self.state() as state:
-                    state["retry_at"] = max(time.time() + POLL_SECONDS, until)
+                    state["retry_at"] = max(state.get("retry_at", 0), time.time() + POLL_SECONDS, until)
                 self.log(f"GitHub rate limited; retry after {until}")
                 continue
             if result.returncode and "PUT" in arguments and "409" in result.stdout:

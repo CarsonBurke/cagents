@@ -461,6 +461,40 @@ class ApiCooldown(unittest.TestCase):
                         patch.object(module.time, 'sleep', side_effect=sleep):
                     self.assertEqual(queue.api(['graphql']), {'ok': True})
                 self.assertEqual(sleeps, [expected])
+    def test_concurrent_rate_limit_cannot_shorten_shared_deadline(self):
+        module = self.module()
+        queue = object.__new__(module.Queue)
+        queue.root = ROOT
+        queue.log = lambda _: None
+        state = {'retry_at': 0}
+
+        @contextmanager
+        def transaction():
+            yield state
+
+        queue.state = transaction
+        now = [1000.0]
+        calls = []
+
+        def command(*_, **kwargs):
+            calls.append(now[0])
+            if len(calls) == 1:
+                # Another in-flight PR read records a longer cooldown before
+                # this read's shorter Retry-After response is handled.
+                state['retry_at'] = 2000
+                return subprocess.CompletedProcess([], 1,
+                    'HTTP/2.0 403 Forbidden\nRetry-After: 300\n\n{"message":"rate limit"}')
+            return subprocess.CompletedProcess([], 0, 'HTTP/2.0 200 OK\n\n{"ok":true}')
+
+        def sleep(delay):
+            now[0] += delay
+
+        with patch.object(module, 'command', side_effect=command), \
+                patch.object(module.time, 'time', side_effect=lambda: now[0]), \
+                patch.object(module.time, 'sleep', side_effect=sleep):
+            self.assertEqual(queue.api(['graphql']), {'ok': True})
+        self.assertEqual(calls, [1000, 2000])
+
     def test_merge_retry_rechecks_base_after_cooldown(self):
         module = self.module()
         queue = object.__new__(module.Queue)
