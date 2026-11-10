@@ -1187,14 +1187,18 @@ exit 0
         let host = host();
         let mut source = session();
         source.launch.session_id = Some("12345678-1234-4234-8234-123456789abc".into());
-        source.proof = Some(host.lock().unwrap().proof().clone());
+        let proof = host.lock().unwrap().proof().clone();
+        source.proof = Some(proof.clone());
         let recipe = source.launch.recipe.clone();
+        // A committed handoff retains the descriptor published by the daemon,
+        // including its ownership proof, even after the replacement retires.
         let terminal = crate::model::TerminalSession {
             id: TerminalId::new(),
-            launch: recipe.clone(),
-            continuity: crate::model::TerminalContinuity::RelaunchAvailable {
-                recipe,
-                last_exit: None,
+            launch: recipe,
+            continuity: crate::model::TerminalContinuity::Live {
+                host_session_id: proof.host_session_id,
+                boot_id: proof.boot_id,
+                host_incarnation: proof.host_incarnation,
             },
             owned_codex_listener: None,
             recovery_origin: None,
