@@ -217,6 +217,7 @@ jobs:
               ("validation checkout", "scripts/prepare-validation-checkout", "tests/prepare_validation_checkout.py"),
               ("process custody", "scripts/qualification/process_custody.py", "tests/qualification/test_process_custody.py"),
               ("native evidence", "scripts/native-evidence", "tests/native_evidence.py"),
+              ("retired ownership fixture", "tests/fixtures/native-retired-ownership.py", "tests/native_retired_ownership.py"),
               ("build directory seeding", "scripts/seed-build-dir", "tests/seed_build_dir.py"),
               ("build disk guard and gate install", "scripts/build-disk-guard", "tests/build_disk_guard.py"),
               ("build directory pruning", "scripts/prune-build-dirs", "tests/prune_build_dirs.py"),
