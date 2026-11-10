@@ -1532,7 +1532,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .filter_map(|remote| remote.fetch_url.as_deref())
             .filter_map(remote_repository_key)
             .collect();
-        let Some(host) = keys.first().map(|key| key.host.clone()) else {
+        let Some(host) = keys.first().map(|key| key.authority()) else {
             return Ok(false);
         };
         self.with_transport_scope(&host, "core", || {
@@ -1543,10 +1543,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 return Ok(false);
             }
             Self::check_remote_rate_limits(remotes)?;
-            let output = self.execute(
-                &self.gh_command(["auth", "status", "--json", "hosts"]),
-                cancellation,
-            )?;
+            let authority = unambiguous_remote_authority(remotes);
+            let mut command = self.gh_command(["auth", "status", "--json", "hosts"]);
+            if let Some(authority) = &authority {
+                command
+                    .arguments
+                    .extend(["--hostname".into(), authority.into()]);
+            }
+            let output = self.execute(&command, cancellation)?;
             if !output.success
                 && let Some(limit) = polling::classify(
                     &format!(
@@ -1558,8 +1562,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 )
             {
                 let error = GitHubError::RateLimited { limit };
-                for key in &keys {
-                    polling::failed(&key.host, &error);
+                if let Some(authority) = &authority {
+                    polling::failed(authority, &error);
                 }
                 return Err(error);
             }
@@ -1573,22 +1577,30 @@ impl<E: ProcessExecutor> GitHubService<E> {
         })
     }
 
-    // Discovery has not selected a repository yet. Conservatively pause it if
-    // any candidate fetch host is limited, before gh can choose that host.
+    // gh selects the repository during discovery. A quota observed for one
+    // candidate cannot refuse a different authority before that selection.
     fn check_remote_rate_limits(
         remotes: &[crate::repository::RemoteRecord],
     ) -> Result<(), GitHubError> {
-        if let Some(limit) = remotes
-            .iter()
-            .filter_map(|remote| remote.fetch_url.as_deref())
-            .filter_map(remote_repository_key)
-            .filter_map(|key| polling::rate_limit(&key.host))
-            .max_by_key(|limit| limit.retry_at)
+        if let Some(limit) = unambiguous_remote_authority(remotes)
+            .and_then(|authority| polling::rate_limit(&authority))
         {
             return Err(GitHubError::RateLimited { limit });
         }
         Ok(())
     }
+}
+
+fn unambiguous_remote_authority(remotes: &[crate::repository::RemoteRecord]) -> Option<String> {
+    let mut authorities = remotes
+        .iter()
+        .filter_map(|remote| remote.fetch_url.as_deref())
+        .filter_map(remote_repository_key)
+        .map(|key| key.authority());
+    let first = authorities.next()?;
+    authorities
+        .all(|authority| authority == first)
+        .then_some(first)
 }
 
 fn command_resource(command: &CommandSpec) -> &'static str {
@@ -1779,18 +1791,14 @@ impl<E: ProcessExecutor> GitHubService<E> {
             .iter()
             .filter_map(|remote| remote.fetch_url.as_deref())
             .find_map(remote_repository_key)
-            .map_or_else(|| "github.com".into(), |key| key.host);
+            .map_or_else(|| "github.com".into(), |key| key.authority());
         self.with_transport_scope(&host, "graphql", || {
             Self::check_remote_rate_limits(remotes)?;
             let result = self.resolve_repository_inner(repository, cancellation);
-            if let Err(error) = &result {
-                for key in remotes
-                    .iter()
-                    .filter_map(|remote| remote.fetch_url.as_deref())
-                    .filter_map(remote_repository_key)
-                {
-                    polling::failed(&key.host, error);
-                }
+            if let Err(error) = &result
+                && let Some(authority) = unambiguous_remote_authority(remotes)
+            {
+                polling::failed(&authority, error);
             }
             result
         })
@@ -1833,10 +1841,10 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
         cancellation: &CancellationToken,
     ) -> Result<GhAuthStatus, GitHubError> {
-        self.with_transport_scope(&repository.host, "core", || {
+        self.with_transport_scope(&repository.authority(), "core", || {
             let command = self.auth_status_command(repository);
             repository.validate()?;
-            if let Some(limit) = polling::rate_limit(&repository.host) {
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
                 return Err(GitHubError::RateLimited { limit });
             }
             let result = (|| {
@@ -1849,7 +1857,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 )
             })();
             if let Err(error) = &result {
-                polling::failed(&repository.host, error);
+                polling::failed(&repository.authority(), error);
             }
             result
         })
@@ -2075,12 +2083,12 @@ impl<E: ProcessExecutor> GitHubService<E> {
         variables: Vec<(&str, GraphQlValue)>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
-        self.with_transport_scope(&repository.host, "graphql", || {
+        self.with_transport_scope(&repository.authority(), "graphql", || {
             let command = self.graphql_command(repository, query, variables);
             let output = self.run_checked(&command, repository, cancellation)?;
             let result = attach_process(parse_graphql(&output.stdout), &output);
             if let Err(error) = &result {
-                polling::failed(&repository.host, error);
+                polling::failed(&repository.authority(), error);
             }
             result
         })
@@ -2095,9 +2103,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         variables: Vec<(&str, GraphQlValue)>,
         cancellation: &CancellationToken,
     ) -> Result<serde_json::Value, GitHubError> {
-        self.with_transport_scope(&repository.host, "graphql", || {
+        self.with_transport_scope(&repository.authority(), "graphql", || {
             repository.validate()?;
-            if let Some(limit) = polling::rate_limit(&repository.host) {
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
                 return Err(GitHubError::RateLimited { limit });
             }
             let command = self.graphql_command(repository, query, variables);
@@ -2113,10 +2121,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 let headers =
                     &output.stdout[..output.stdout.len() - graphql_body(&output.stdout).len()];
                 match polling::classify(&String::from_utf8_lossy(headers), polling::now()) {
-                    Some(limit) => {
-                        polling::failed(&repository.host, &GitHubError::RateLimited { limit })
-                    }
-                    None => polling::succeeded(&repository.host),
+                    Some(limit) => polling::failed(
+                        &repository.authority(),
+                        &GitHubError::RateLimited { limit },
+                    ),
+                    None => polling::succeeded(&repository.authority()),
                 }
                 return Ok(data);
             }
@@ -2126,7 +2135,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             )?;
             let result = attach_process(parse_graphql(&output.stdout), &output);
             if let Err(error) = &result {
-                polling::failed(&repository.host, error);
+                polling::failed(&repository.authority(), error);
             }
             result
         })
@@ -2230,8 +2239,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
         key: &PullRequestKey,
         cancellation: &CancellationToken,
     ) -> Result<Vec<PullRequestCheck>, GitHubError> {
-        self.with_transport_scope(&key.repository.host, "graphql", || {
-            if let Some(limit) = polling::rate_limit(&key.repository.host) {
+        self.with_transport_scope(&key.repository.authority(), "graphql", || {
+            if let Some(limit) = polling::rate_limit(&key.repository.authority()) {
                 return Err(GitHubError::RateLimited { limit });
             }
             let result = (|| {
@@ -2271,8 +2280,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
             })();
             match &result {
                 Err(GitHubError::ChecksPending { .. }) => {}
-                Err(error) => polling::failed(&key.repository.host, error),
-                Ok(_) => polling::succeeded(&key.repository.host),
+                Err(error) => polling::failed(&key.repository.authority(), error),
+                Ok(_) => polling::succeeded(&key.repository.authority()),
             }
             result
         })
@@ -2345,8 +2354,8 @@ impl<E: ProcessExecutor> GitHubService<E> {
         request: &CreatePullRequestRequest,
         cancellation: &CancellationToken,
     ) -> Result<PullRequestCreationOutcome, GitHubError> {
-        self.with_transport_scope(&request.repository.host, "graphql", || {
-            if let Some(limit) = polling::rate_limit(&request.repository.host) {
+        self.with_transport_scope(&request.repository.authority(), "graphql", || {
+            if let Some(limit) = polling::rate_limit(&request.repository.authority()) {
                 return Err(GitHubError::RateLimited { limit });
             }
             let command = self.create_command(request)?;
@@ -2464,9 +2473,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         repository: &GitHubRepoKey,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitHubError> {
-        self.with_transport_scope(&repository.host, command_resource(command), || {
+        self.with_transport_scope(&repository.authority(), command_resource(command), || {
             repository.validate()?;
-            if let Some(limit) = polling::rate_limit(&repository.host) {
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
                 return Err(GitHubError::RateLimited { limit });
             }
             let result = self
@@ -2500,7 +2509,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             if let Some(limit) =
                 polling::classify(&String::from_utf8_lossy(headers), polling::now())
             {
-                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+                polling::failed(&repository.authority(), &GitHubError::RateLimited { limit });
             }
             Ok(output)
         } else if output.exit_code == Some(4) {
@@ -2579,9 +2588,9 @@ impl<E: ProcessExecutor> GitHubService<E> {
         payload: &str,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<serde_json::Value>, GitHubError> {
-        self.with_transport_scope(&repository.host, "graphql", || {
+        self.with_transport_scope(&repository.authority(), "graphql", || {
             repository.validate()?;
-            if let Some(limit) = polling::rate_limit(&repository.host) {
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
                 return Err(GitHubError::RateLimited { limit });
             }
             let command = self.graphql_command(repository, mutation, variables);
@@ -2616,7 +2625,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 ),
                 polling::now(),
             ) {
-                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+                polling::failed(&repository.authority(), &GitHubError::RateLimited { limit });
             }
             let applied = body
                 .as_ref()
@@ -3479,8 +3488,8 @@ fn charge_host<T>(
     result: Result<T, GitHubError>,
 ) -> Result<T, GitHubError> {
     match &result {
-        Ok(_) => polling::succeeded(&repository.host),
-        Err(error) => polling::failed(&repository.host, error),
+        Ok(_) => polling::succeeded(&repository.authority()),
+        Err(error) => polling::failed(&repository.authority(), error),
     }
     result
 }
@@ -3904,6 +3913,95 @@ mod tests {
             fetch_url: Some(fetch_url.into()),
             push_url: None,
         }
+    }
+
+    #[test]
+    fn discovery_rate_limits_are_published_only_for_an_unambiguous_authority() {
+        for association in [false, true] {
+            for mixed in [false, true] {
+                let host = format!("discovery-{association}-{mixed}.invalid");
+                let first = GitHubRepoKey::new(&host, Some(8443), "o", "r").unwrap();
+                let second = GitHubRepoKey::new(&host, Some(9443), "o", "r").unwrap();
+                let remotes = [
+                    remote("origin", &format!("https://{}:{}/o/r", host, 8443)),
+                    remote(
+                        "upstream",
+                        &format!("https://{}:{}/o/r", host, if mixed { 9443 } else { 8443 }),
+                    ),
+                ];
+                let executor = Arc::new(FakeExecutor::with_outputs(vec![Ok(ProcessOutput {
+                    success: false,
+                    exit_code: Some(1),
+                    signal: None,
+                    stdout: vec![],
+                    stderr: b"secondary rate limit\nRetry-After: 120".to_vec(),
+                })]));
+                let service = GitHubService::new("gh", executor.clone());
+                polling::with_scope("discovery-account", || {
+                    if association {
+                        assert!(
+                            service
+                                .has_associated_remote(&remotes, &CancellationToken::new())
+                                .is_err()
+                        );
+                    } else {
+                        assert!(
+                            service
+                                .resolve_repository(
+                                    Path::new("/fixture/repo"),
+                                    &remotes,
+                                    &CancellationToken::new()
+                                )
+                                .is_err()
+                        );
+                    }
+                    assert_eq!(polling::rate_limit(&first.authority()).is_some(), !mixed);
+                    assert!(polling::rate_limit(&second.authority()).is_none());
+                });
+                assert_eq!(executor.commands.lock().unwrap().len(), 1);
+                if association && !mixed {
+                    assert!(
+                        executor.commands.lock().unwrap()[0]
+                            .arguments
+                            .iter()
+                            .any(|arg| arg == first.authority().as_str())
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn discovery_can_select_an_unlimited_port_when_another_candidate_is_paused() {
+        let host = "discovery-mixed-admission.invalid";
+        let first = GitHubRepoKey::new(host, Some(8443), "o", "r").unwrap();
+        let second = GitHubRepoKey::new(host, Some(9443), "o", "r").unwrap();
+        let remotes = [
+            remote("origin", &format!("https://{host}:8443/o/r")),
+            remote("upstream", &format!("https://{host}:9443/o/r")),
+        ];
+        let body = format!(r#"{{"nameWithOwner":"o/r","url":"https://{host}:9443/o/r"}}"#);
+        let executor = Arc::new(FakeExecutor::with_outputs(vec![success(body.as_bytes())]));
+        let service = GitHubService::new("gh", executor.clone());
+        polling::with_scope("mixed-admission-account", || {
+            polling::failed(
+                &first.authority(),
+                &GitHubError::RateLimited {
+                    limit: polling::RateLimit::secondary(polling::now() + 120),
+                },
+            );
+            let selected = service
+                .resolve_repository(
+                    Path::new("/fixture/repo"),
+                    &remotes,
+                    &CancellationToken::new(),
+                )
+                .unwrap();
+            assert_eq!(selected, second);
+            assert!(polling::rate_limit(&first.authority()).is_some());
+            assert!(polling::rate_limit(&second.authority()).is_none());
+        });
+        assert_eq!(executor.commands.lock().unwrap().len(), 1);
     }
 
     #[test]

@@ -740,7 +740,7 @@ impl Cagents {
     pub(super) fn github_project_polling_ready(&self, project: ProjectId) -> bool {
         self.review_repositories
             .get(&project)
-            .is_none_or(|repository| crate::github::polling::ready(&repository.host, false))
+            .is_none_or(|repository| crate::github::polling::ready(&repository.authority(), false))
     }
 
     pub(super) fn github_read_task(&mut self, project: ProjectId) -> Task<Message> {

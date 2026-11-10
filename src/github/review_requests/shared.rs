@@ -96,7 +96,7 @@ pub fn poll(
     cancellation: &CancellationToken,
 ) -> Result<PollResult, String> {
     let credentials = pr_status::credential_fingerprint()?;
-    polling::bind_scope(&repository.host, &credentials);
+    polling::bind_scope(&repository.authority(), &credentials);
     let root = pr_status::state_root()?;
     let result = poll_with(
         &root,
@@ -214,7 +214,9 @@ fn poll_with(
         .as_ref()
         .err()
         .and_then(GitHubError::rate_limit)
-        .or_else(|| polling::with_scope(credentials, || polling::rate_limit(&repository.host)));
+        .or_else(|| {
+            polling::with_scope(credentials, || polling::rate_limit(&repository.authority()))
+        });
     if cancellation.is_cancelled() {
         if let Some(limit) = &rate_limit {
             // Cancellation must not discard a Retry-After already received.

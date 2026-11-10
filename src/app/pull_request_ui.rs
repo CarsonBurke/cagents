@@ -169,7 +169,7 @@ impl State {
         if same_identity {
             self.loading = false;
             if self.target.as_ref().is_some_and(|target| {
-                !crate::github::polling::ready(&target.repository().host, false)
+                !crate::github::polling::ready(&target.repository().authority(), false)
             }) {
                 return ActionTask::none();
             }
@@ -206,8 +206,8 @@ impl State {
         let Some(target) = self.target.clone() else {
             return ActionTask::none();
         };
-        if !crate::github::polling::ready(&target.repository().host, true) {
-            self.error = crate::github::polling::rate_limit(&target.repository().host)
+        if !crate::github::polling::ready(&target.repository().authority(), true) {
+            self.error = crate::github::polling::rate_limit(&target.repository().authority())
                 .map(|limit| limit.to_string());
             return ActionTask::none();
         }
@@ -1628,7 +1628,7 @@ impl Cagents {
                 .target
                 .as_ref()
                 .is_none_or(|target| {
-                    !crate::github::polling::ready(&target.repository().host, false)
+                    !crate::github::polling::ready(&target.repository().authority(), false)
                 })
         {
             return Task::none();
@@ -2291,7 +2291,7 @@ mod tests {
             GitHubRepoKey::new("review-inspector-pause.invalid", None, "o", "r").unwrap();
         let target = Target::from(branch);
         crate::github::polling::failed(
-            &target.repository().host,
+            &target.repository().authority(),
             &crate::github::GitHubError::RateLimited {
                 limit: crate::github::polling::RateLimit::secondary(
                     crate::github::polling::now() + 120,
@@ -2324,7 +2324,7 @@ mod tests {
             GitHubRepoKey::new("review-inspector-backoff.invalid", None, "o", "r").unwrap();
         let target = Target::from(branch);
         crate::github::polling::failed(
-            &target.repository().host,
+            &target.repository().authority(),
             &crate::github::GitHubError::Inspection("offline".into()),
         );
         app.context_inspector_open = true;

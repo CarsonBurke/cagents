@@ -758,7 +758,7 @@ mod tests {
             Vec::new(),
         ));
         crate::github::polling::failed(
-            &key.host,
+            &key.authority(),
             &crate::github::GitHubError::Inspection("offline".into()),
         );
         let sequence = app.repository_load_sequence;

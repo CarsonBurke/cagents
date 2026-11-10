@@ -1013,7 +1013,7 @@ impl State {
             Action::BrowserFocused => {
                 if self.target.is_none()
                     && self.source.as_ref().is_some_and(|source| {
-                        crate::github::polling::ready(&source.repository.host, false)
+                        crate::github::polling::ready(&source.repository.authority(), false)
                     })
                 {
                     let open = if self.list_request.loading {
@@ -1161,7 +1161,7 @@ impl State {
             Action::RefreshIfDue(now) => {
                 if self.target.is_none()
                     && self.source.as_ref().is_some_and(|source| {
-                        crate::github::polling::ready(&source.repository.host, false)
+                        crate::github::polling::ready(&source.repository.authority(), false)
                     })
                 {
                     // Both lists refresh, so a row that closed leaves the
@@ -1181,7 +1181,7 @@ impl State {
                 if !self.refreshing
                     && !self.discussion_is_busy()
                     && self.target.as_ref().is_some_and(|target| {
-                        crate::github::polling::ready(&target.repository.host, false)
+                        crate::github::polling::ready(&target.repository.authority(), false)
                     })
                     && self.last_refresh.is_some_and(|last| {
                         now.saturating_duration_since(last) >= Duration::from_secs(30)
@@ -1704,15 +1704,15 @@ impl State {
         if self.target.is_none() || self.discussion_is_busy() {
             return ActionTask::none();
         }
-        if !self
-            .target
-            .as_ref()
-            .is_some_and(|target| crate::github::polling::ready(&target.repository.host, manual))
-        {
+        if !self.target.as_ref().is_some_and(|target| {
+            crate::github::polling::ready(&target.repository.authority(), manual)
+        }) {
             self.notice = self
                 .target
                 .as_ref()
-                .and_then(|target| crate::github::polling::rate_limit(&target.repository.host))
+                .and_then(|target| {
+                    crate::github::polling::rate_limit(&target.repository.authority())
+                })
                 .map(|limit| limit.to_string());
             return ActionTask::none();
         }
@@ -2123,7 +2123,7 @@ impl State {
                                 });
                             }
                         }
-                        if refused.is_none() && !crate::github::polling::ready(&repository.host, false) {
+                        if refused.is_none() && !crate::github::polling::ready(&repository.authority(), false) {
                             refused = Some("GitHub polling is paused after a failure or rate limit. Retry after the reset.".into());
                         }
                         let results: Vec<(RepoPath, bool, ViewedOutcome)> = if let Some(message) = &refused {
@@ -3075,8 +3075,8 @@ impl State {
 
 /// Why the browser may not ask GitHub now, if the host's budget forbids it.
 fn browser_paused(source: &ReviewSource) -> Option<String> {
-    (!crate::github::polling::ready(&source.repository.host, true)).then(|| {
-        crate::github::polling::rate_limit(&source.repository.host)
+    (!crate::github::polling::ready(&source.repository.authority(), true)).then(|| {
+        crate::github::polling::rate_limit(&source.repository.authority())
             .map(|limit| limit.to_string())
             .unwrap_or_else(|| "GitHub refresh is paused. Try again shortly.".into())
     })
@@ -4734,7 +4734,7 @@ pub(crate) mod tests {
         state.list = ListState::Ready(vec![Arc::new(pull_request(1))]);
         let before = state.browser_generation;
         crate::github::polling::failed(
-            &repository.host,
+            &repository.authority(),
             &crate::github::GitHubError::RateLimited {
                 limit: crate::github::polling::RateLimit::secondary(
                     crate::github::polling::now() + 120,

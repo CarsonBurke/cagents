@@ -533,7 +533,7 @@ impl State {
                     }
                 }
                 if self.target.as_ref().is_some_and(|target| {
-                    crate::github::polling::ready(&target.repository.host, false)
+                    crate::github::polling::ready(&target.repository.authority(), false)
                 }) {
                     self.refreshing = true;
                     let load = self.start_load();

@@ -9,11 +9,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
         request: &AddReviewThreadRequest,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
-        self.with_transport_scope(&key.repository.host, "core", || {
+        self.with_transport_scope(&key.repository.authority(), "core", || {
             key.validate()?;
             validate_review_oid(commit)?;
             request.validate()?;
-            if let Some(limit) = polling::rate_limit_for(&key.repository.host, "core") {
+            if let Some(limit) = polling::rate_limit_for(&key.repository.authority(), "core") {
                 return Err(GitHubError::RateLimited { limit });
             }
             let endpoint = format!(
@@ -90,7 +90,10 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 ),
                 polling::now(),
             ) {
-                polling::failed(&key.repository.host, &GitHubError::RateLimited { limit });
+                polling::failed(
+                    &key.repository.authority(),
+                    &GitHubError::RateLimited { limit },
+                );
             }
             if output.success
                 && response
@@ -126,7 +129,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         viewed: bool,
         cancellation: &CancellationToken,
     ) -> Vec<(String, Result<ReviewMutationOutcome<()>, GitHubError>)> {
-        self.with_transport_scope(&repository.host, "graphql", || {
+        self.with_transport_scope(&repository.authority(), "graphql", || {
             let validate = || -> Result<(), GitHubError> {
                 repository.validate()?;
                 validate_node_id("pull_request_id", pr)?;
@@ -154,7 +157,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             if paths.is_empty() {
                 return Vec::new();
             }
-            if let Some(limit) = polling::rate_limit(&repository.host) {
+            if let Some(limit) = polling::rate_limit(&repository.authority()) {
                 return paths
                     .iter()
                     .map(|path| {
@@ -249,7 +252,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 ),
                 polling::now(),
             ) {
-                polling::failed(&repository.host, &GitHubError::RateLimited { limit });
+                polling::failed(&repository.authority(), &GitHubError::RateLimited { limit });
             }
             paths
                 .iter()
@@ -482,9 +485,9 @@ mod tests {
             result,
             Ok(ReviewMutationOutcome::NotApplied { .. })
         ));
-        let limit = polling::rate_limit(&key.repository.host).unwrap();
+        let limit = polling::rate_limit(&key.repository.authority()).unwrap();
         assert!(limit.retry_at >= reset && limit.retry_at <= reset + 1);
-        assert!(!polling::ready(&key.repository.host, true));
+        assert!(!polling::ready(&key.repository.authority(), true));
         assert!(matches!(
             service.graphql(
                 &key.repository,

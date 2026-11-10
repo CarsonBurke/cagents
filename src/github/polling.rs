@@ -303,6 +303,100 @@ mod tests {
     }
 
     #[test]
+    fn enterprise_ports_keep_primary_and_secondary_worker_and_ui_budgets_separate() {
+        struct Enterprise {
+            headers: String,
+            commands: Mutex<Vec<CommandSpec>>,
+        }
+        impl ProcessExecutor for Enterprise {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.commands.lock().unwrap().push(command.clone());
+                let limited = command
+                    .arguments
+                    .iter()
+                    .any(|arg| arg.to_string_lossy().ends_with(":8443"));
+                Ok(ProcessOutput {
+                    success: !limited,
+                    exit_code: Some(if limited { 1 } else { 0 }),
+                    signal: None,
+                    stdout: if limited {
+                        format!("HTTP/2.0 403 Forbidden\r\n{}\r\n\r\n{{\"message\":\"API rate limit exceeded\"}}", self.headers).into_bytes()
+                    } else {
+                        br#"{"data":{"viewer":{"login":"reader"}}}"#.to_vec()
+                    },
+                    stderr: vec![],
+                })
+            }
+        }
+        for (suffix, headers) in [
+            (
+                "primary",
+                format!(
+                    "X-RateLimit-Remaining: 0\r\nX-RateLimit-Resource: graphql\r\nX-RateLimit-Reset: {}",
+                    now() + 3600
+                ),
+            ),
+            ("secondary", "Retry-After: 60".into()),
+        ] {
+            let host = format!("ports-{suffix}.invalid");
+            let first = GitHubRepoKey::new(&host, Some(8443), "owner", "repo").unwrap();
+            let second = GitHubRepoKey::new(&host, Some(9443), "owner", "repo").unwrap();
+            bind_scope(&first.authority(), "same-account");
+            bind_scope(&second.authority(), "same-account");
+            let executor = Arc::new(Enterprise {
+                headers,
+                commands: Mutex::new(vec![]),
+            });
+            let service = GitHubService::new("gh", executor.clone());
+            with_scope("same-account", || {
+                assert!(
+                    service
+                        .graphql(
+                            &first,
+                            "query{viewer{login}}",
+                            vec![],
+                            &CancellationToken::new()
+                        )
+                        .is_err()
+                );
+                service
+                    .graphql(
+                        &second,
+                        "query{viewer{login}}",
+                        vec![],
+                        &CancellationToken::new(),
+                    )
+                    .unwrap();
+                assert!(
+                    service
+                        .graphql(
+                            &first,
+                            "query{viewer{login}}",
+                            vec![],
+                            &CancellationToken::new()
+                        )
+                        .is_err()
+                );
+            });
+            // UI admission uses the worker's authority binding without touching
+            // credential files or the shared cache on its thread.
+            assert!(!ready(&first.authority(), false));
+            assert!(ready(&second.authority(), false));
+            assert_eq!(executor.commands.lock().unwrap().len(), 2);
+            BUDGETS
+                .lock()
+                .unwrap()
+                .retain(|key, _| !key.starts_with(&host));
+            ACTIVE.lock().unwrap().remove(&first.authority());
+            ACTIVE.lock().unwrap().remove(&second.authority());
+        }
+    }
+
+    #[test]
     fn local_coordination_refusal_proves_no_mutation_was_submitted() {
         struct Deferred;
         impl ProcessExecutor for Deferred {

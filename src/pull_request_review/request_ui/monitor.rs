@@ -615,14 +615,17 @@ mod tests {
         let repository =
             GitHubRepoKey::new("old-review-credential-budget.invalid", None, "o", "r").unwrap();
         crate::github::polling::failed(
-            &repository.host,
+            &repository.authority(),
             &crate::github::GitHubError::RateLimited {
                 limit: crate::github::polling::RateLimit::secondary(
                     crate::github::polling::now() + 120,
                 ),
             },
         );
-        assert!(!crate::github::polling::ready(&repository.host, false));
+        assert!(!crate::github::polling::ready(
+            &repository.authority(),
+            false
+        ));
         drop(monitor.update(Action::Tick, [repository.clone()]));
         assert_eq!(
             monitor.busy.as_ref().map(|(key, _)| key),
