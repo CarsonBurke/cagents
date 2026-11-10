@@ -1265,8 +1265,7 @@ A bare `cargo test` runs only the shared CLI lane: under the default `full`
 feature, the `ui` and `host` unit tests are compiled out. Cargo skips integration
 targets whose required features are absent, rather than compiling and linking
 empty harnesses. The host-only terminal workload example is also skipped outside
-its lane. Cover the boundaries a change touches; prepare the HOST prerequisites
-below before running that lane:
+its lane. Cover the boundaries a change touches:
 
 ```sh
 scripts/cargo-gate test --locked --no-default-features --all-targets
@@ -1278,15 +1277,14 @@ An SSH login has a soft limit of 1024 open files, and whatever it starts, with
 `nohup` or `setsid` included, inherits that. A UI test run can exceed it and fail
 with `Too many open files`, so run `ulimit -n 65536` first.
 
-HOST fixtures that exec retained actors require
-`CAGENTS_TEST_RETAINED_ACTOR_HELPER` to name a `cagentsd` built from the same
-checkout and source state as the tests. Build it immediately before testing,
-keeping sources, Cargo environment, target, configuration and any explicit
-profile overrides fixed. Ordinary build and test profile defaults differ as
-expected.
-The existing artifact helper reads Cargo's exact executable path, including
-configured target directories/triples. A matching version alone does not prove
-that two dirty source trees match.
+The gate prepares HOST fixtures automatically. Before running HOST tests it
+builds `cagentsd` in the same admitted build slot, from the same source copy and
+Cargo environment, then sets `CAGENTS_TEST_RETAINED_ACTOR_HELPER` to Cargo's exact
+executable path. It keeps the test command's profile, target, feature and config
+options; with no profile option, the helper uses the test profile. A failed helper
+build stops the command before the tests run. CLI and UI lanes do not build it.
+This also works for narrow HOST library tests. An explicitly supplied helper
+variable is preserved, for qualifications that prepare their own matched binary.
 
 Through the gate, which is how a hosted agent runs it, there is no base to
 choose. The build host gives each slot a short, private `TMPDIR` such as
@@ -1298,21 +1296,11 @@ directory isn't private to you, the slot falls back to its own `tmp` under
 `~/.cache`, which is too long for the socket budget and inside the home, where
 the bundled-skill tests below refuse to install.
 
-```sh
-(
-    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
-            --no-default-features --features host --bin cagentsd
-    ) || exit
-    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
-    scripts/cargo-gate test --locked --no-default-features --features host --all-targets
-)
-```
+The ordinary HOST command needs no environment setup:
 
-The gate sends the helper, which is in the target, to the build host and points
-the variable at its copy there. It refuses a `CAGENTS_` setting that names a
-path outside the checkout and its target, which the build host doesn't have;
-`CAGENTS_BUILD_*` settings and the gate's own are exempt.
+```sh
+scripts/cargo-gate test --locked --no-default-features --features host --all-targets
+```
 
 For a local HOST run, with `CAGENTS_BUILD_REMOTE=local`, select an existing
 private **disk-backed** base with a short, physical absolute path. Verify its
@@ -1339,18 +1327,12 @@ mkdir -p -m 700 /var/tmp/ct
     TMPDIR=$(mktemp -d /var/tmp/ct/tXXXXXX) || exit
     export TMPDIR
     printf 'Fixture root (retain until children settle): %s\n' "$TMPDIR"
-    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
-        scripts/cargo-gate exec python3 scripts/build-ceditor-product cagentsd --locked \
-            --no-default-features --features host --bin cagentsd
-    ) || exit
-    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
     scripts/cargo-gate test --locked --no-default-features --features host --all-targets
 )
 ```
 
-A helper build failure prevents the test command. Use the same preparation for
-narrow HOST targets that need retained actors. Keep the temporary root and any
-separately retained fixture evidence until their original children have settled;
+Keep the temporary root and any separately retained fixture evidence until their
+original children have settled;
 this recipe deliberately installs no automatic deletion trap. Do not change
 socket limits, remove enclosing Git markers or silently select another fixture
 root to make a failed preparation pass.
@@ -1374,11 +1356,32 @@ scripts/cargo-gate test --locked --no-default-features --features ui --test sess
 ```
 
 For focused root library tests, compile one isolated test harness and run the
-Cargo-reported executable directly, after its build admission has ended:
+Cargo-reported executable directly, after its build admission has ended.
+
+`--no-run` only compiles tests. A later direct harness launch, including
+`scripts/test-lib host`, must receive its own matched helper, because it runs
+outside the gate. Prepare it immediately before that launch, without changing
+sources, Cargo environment, target or profile:
+
+```sh
+(
+    CAGENTS_TEST_RETAINED_ACTOR_HELPER=$(
+        scripts/cargo-gate exec /usr/bin/python3 scripts/build-ceditor-product cagentsd --locked \
+            --no-default-features --features host --profile test --bin cagentsd
+    ) || exit
+    export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    scripts/test-lib host --prefix terminal:: --test-threads 1
+)
+```
+
+Use the same profile option in both commands when overriding it. The gate
+translates a supplied helper path inside the checkout or target to its build-host
+copy; a path outside both is refused. A matching version alone does not prove
+that binaries from two dirty source trees match. CLI and UI focused runs need no
+helper:
 
 ```sh
 scripts/test-lib cli search_match::tests::overlapping_occurrences_keep_the_best_boundary_rank
-scripts/test-lib host --prefix terminal:: --test-threads 1
 scripts/test-lib ui --profile dev-runtime --prefix app::chat_ui::
 ```
 
@@ -1685,6 +1688,16 @@ harness, it provides:
   directory is removed or for a seed saved by an older tool, every `start` says
   the seed's chats won't reopen. Recreate them and save the seed again.
   Extended attributes and ACLs are not restored.
+- **UI-only restart.** To measure restored chats while their providers keep
+  running, close the app window normally, then run `relaunch` in the same
+  session. It reuses the recorded executables through the development runner
+  and refuses compilation under the native lock. `relaunch` stays in the
+  foreground until that UI exits; run measurements from another shell and
+  finish with `stop`. This preserves the daemon and live providers, whereas
+  `stop` ends them. Add `--chat-stages` to record UI-thread chat stage timings
+  under `logs/` on normal close; these measure synchronous work rather than
+  compositor presentation. Recreate the same workload on each revision when comparing
+  startup; a saved descriptor whose provider was killed is not a live chat.
 - **Matching evidence.** `start` refuses a checkout that changed since its build.
   `shots/manifest.tsv` records each image's revision, source state, requested
   width and size, so a pair can be compared and named in the PR.
@@ -1897,10 +1910,13 @@ scripts/rehearse-update --root /var/tmp/cr/u1 run \
 The scenario installs OLD, starts a KWin virtual desktop with nested niri,
 opens the main and `second` windows, seeds offline work, records and captures
 both windows, stages NEW, and invokes the staged CLI's `daemon upgrade` on a
-controlling pseudo-terminal. `--answer` responds to each observed confirmation;
-`--yes` instead passes the updater's approval flag. Extra upgrade flags use
-`--upgrade-arg=--interrupt` or `--upgrade-arg=--accept-unreopenable`. The harness
-does not add either policy automatically. Refusals are measured outcomes: even
+controlling pseudo-terminal. `--answer` responds to each observed `[Y/n]`
+confirmation; `--yes` instead passes the updater's approval flag. `--working`
+is typed at the choice offered while agents are mid-turn (empty presses Enter,
+which waits for them; `i` interrupts them). `--stop` is typed at the destructive
+stop list; it defaults to empty, which cancels, so a rehearsal stops panes only
+with `--stop stop`, as a person would type. Extra upgrade flags use
+`--upgrade-arg=--interrupt`; the harness adds no policy automatically. Refusals are measured outcomes: even
 a deliberately expected refusal, such as `--uncarryable`, reports `Outcome: FAIL`.
 
 Add `--ceditor /var/tmp/cagents-rehearsal/builds/ceditor-07e7efc/bin` to launch

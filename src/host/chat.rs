@@ -2967,6 +2967,53 @@ pub(super) fn process(
     })
 }
 
+pub(super) fn read_presentation(
+    host: &SharedHost,
+    client: ClientId,
+    chat_id: crate::model::TerminalId,
+    after_generation: Option<u64>,
+) -> Result<crate::terminal_ipc::PreparedResponse, ProtocolError> {
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
+        receipt.require_attached(client)?;
+        if !receipt.subscribers.get(&client).copied().unwrap_or(false) {
+            return Err(error(
+                "Hidden chat has no presentation stream; make it visible before reading",
+            ));
+        }
+        return Ok(ServerResponse::ChatSnapshot {
+            chat_id,
+            snapshot: (!after_generation
+                .is_some_and(|generation| generation >= receipt.generation))
+            .then(|| receipt.snapshot()),
+        }
+        .into());
+    }
+    let record = attached(&state, client, chat_id)?;
+    if !record.subscribers.get(&client).copied().unwrap_or(false) {
+        return Err(error(
+            "Hidden chat has no presentation stream; make it visible before reading",
+        ));
+    }
+    let handle = record.handle.clone();
+    drop(state);
+    let response = handle
+        .presentation_wire(chat_id, after_generation)
+        .map_err(unavailable)?;
+    // A close, detach, replacement actor, or visibility change during
+    // hydration must not publish data under the old attachment.
+    let state = host.lock().unwrap_or_else(|p| p.into_inner());
+    let current = attached(&state, client, chat_id)?;
+    if !current.handle.same_attachment(&handle)
+        || !current.subscribers.get(&client).copied().unwrap_or(false)
+    {
+        return Err(error(
+            "Chat attachment changed while preparing its transcript",
+        ));
+    }
+    Ok(response)
+}
+
 fn process_inner(
     host: &SharedHost,
     client: ClientId,
@@ -3453,50 +3500,9 @@ fn process_inner(
         ClientRequest::ChatRead {
             chat_id,
             after_generation,
-        } => {
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            if let Some(receipt) = state.chat_handoffs.get(&chat_id) {
-                receipt.require_attached(client)?;
-                if !receipt.subscribers.get(&client).copied().unwrap_or(false) {
-                    return Err(error(
-                        "Hidden chat has no presentation stream; make it visible before reading",
-                    ));
-                }
-                return Ok(ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: (!after_generation
-                        .is_some_and(|generation| generation >= receipt.generation))
-                    .then(|| receipt.snapshot()),
-                });
-            }
-            let record = attached(&state, client, chat_id)?;
-            if !record.subscribers.get(&client).copied().unwrap_or(false) {
-                return Err(error(
-                    "Hidden chat has no presentation stream; make it visible before reading",
-                ));
-            }
-            let handle = record.handle.clone();
-            drop(state);
-            let response = handle
-                .presentation(chat_id, after_generation)
-                .map_err(unavailable)?
-                .unwrap_or(ServerResponse::ChatSnapshot {
-                    chat_id,
-                    snapshot: None,
-                });
-            // A close, detach, replacement actor, or visibility change during
-            // hydration must not publish data under the old attachment.
-            let state = host.lock().unwrap_or_else(|p| p.into_inner());
-            let current = attached(&state, client, chat_id)?;
-            if !current.handle.same_attachment(&handle)
-                || !current.subscribers.get(&client).copied().unwrap_or(false)
-            {
-                return Err(error(
-                    "Chat attachment changed while preparing its transcript",
-                ));
-            }
-            Ok(response)
-        }
+        } => read_presentation(host, client, chat_id, after_generation)?
+            .decode()
+            .map_err(unavailable),
         ClientRequest::ChatReturnTerminal { chat_id } => {
             super::account_lifecycle::ensure_idle(host)?;
             let (owners, closing) = {

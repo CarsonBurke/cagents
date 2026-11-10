@@ -64,6 +64,9 @@ STUBS = {
                 shot) shot=${args[i + 1]} ;;
                 env) printf 'export NESTED_MARKER=nested\\n'; exit 0 ;;
                 observe)
+                    [ ! -e "$STUB_LOG/observe-error" ] || exit 1
+                    if [ -e "$STUB_LOG/observe-malformed" ]; then printf 'invalid'; exit 0; fi
+                    if [ -e "$STUB_LOG/ui-absent" ]; then printf '{"window":null}\\n'; exit 0; fi
                     if [ -e "$STUB_LOG/cropped" ]; then
                         printf '{"window":{"size":[900,600]},"output":{"logical":{"width":900,"height":561}},"text":"'
                     else
@@ -129,7 +132,12 @@ STUBS = {
     """,
     "fixture-cli": """
         #!/bin/bash
-        if [ "${0##*/}" = cagents-ui ]; then printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"; exec sleep 300; fi
+        if [ "${0##*/}" = cagents-ui ]; then
+            rm -f "$STUB_LOG/ui-absent"
+            printf '%s\\n' "$$" > "$STUB_LOG/ui-pid"
+            printf '%s\\n' "$*" > "$STUB_LOG/ui-ran"
+            exec sleep 300
+        fi
         printf '%s\\n' "$*" >> "$STUB_LOG/cli"
         if [ "$*" = '--no-start daemon preflight' ]; then printf 'capability'; exit 0; fi
         if [ "${1:-}" = print-env ]; then env; fi
@@ -828,6 +836,68 @@ class Evidence(unittest.TestCase):
         self.assertIn("DBUS_SESSION_BUS_ADDRESS=stub\n", runner)
         self.assertIn("WAYLAND_DISPLAY=evidence\n", runner)
         self.assertIn(f"CARGO_HOME={self.root}/real-home/.cargo\n", runner)
+
+    def test_relaunch_refuses_an_unconfirmed_window_observation(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        os.kill(int((self.logs / "ui-pid").read_text()), 15)
+        (self.task / "niri" / "session.rc").write_text("0")
+        (self.logs / "ui-absent").touch()
+        before = (self.logs / "runner").read_text()
+        for marker in ("observe-error", "observe-malformed"):
+            with self.subTest(marker=marker):
+                failed = self.logs / marker
+                failed.touch()
+                try:
+                    result = self.run_tool("relaunch", check=False)
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertIn("could not observe whether", result.stderr)
+                    self.assertEqual((self.logs / "runner").read_text(), before)
+                finally:
+                    failed.unlink()
+        self.run_tool("stop")
+
+    def test_relaunch_keeps_the_session_and_replays_only_the_built_products(self) -> None:
+        self.built()
+        self.run_tool("start", "after")
+        original_pid = int((self.logs / "ui-pid").read_text())
+        refused = self.run_tool("relaunch", check=False)
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("close the app window", refused.stderr)
+        os.kill(original_pid, 15)
+        (self.task / "niri" / "session.rc").write_text("0")
+        (self.logs / "ui-absent").touch()
+        cargo_before = (self.logs / "cargo").read_text()
+        identity = (self.task / "fixture" / "home" / ".claude").stat().st_ino
+        output = self.logs / "relaunch-output"
+        with output.open("w") as sink:
+            process = subprocess.Popen([str(SCRIPT), "relaunch", "--chat-stages"], env=self.env,
+                stdin=subprocess.DEVNULL, stdout=sink, stderr=sink)
+        try:
+            for _ in range(200):
+                current = int((self.logs / "ui-pid").read_text())
+                if current != original_pid and not (self.task / "session" / "replaying").exists():
+                    break
+                if process.poll() is not None:
+                    self.fail(output.read_text())
+                time.sleep(0.05)
+            else:
+                self.fail("relaunched UI did not appear: " + output.read_text())
+            self.assertFalse(self.lock_is_free(self.native_lock))
+            self.assertEqual((self.logs / "cargo").read_text(), cargo_before)
+            self.assertEqual((self.task / "fixture" / "home" / ".claude").stat().st_ino, identity)
+            self.assertEqual(len((self.logs / "runner").read_text().splitlines()), 2)
+            self.assertIn(f"CAGENTS_CHAT_STAGE_OUTPUT={self.task}/logs/chat-stages/after-", (self.logs / "runner-env").read_text())
+            self.assertEqual(stat.S_IMODE((self.task / "logs" / "chat-stages").stat().st_mode), 0o700)
+            self.run_tool("stop")
+            process.wait(timeout=20)
+            self.assertTrue(self.lock_is_free(self.native_lock))
+            self.assertFalse((self.task / "session" / "replaying").exists())
+        finally:
+            if process.poll() is None:
+                self.run_tool("stop", check=False)
+                process.terminate()
+                process.wait(timeout=20)
 
     def test_a_sessions_builds_never_start_the_pruner(self) -> None:
         # Its runner's builds replay what `build` made. Their disk guard would

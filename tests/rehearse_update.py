@@ -204,6 +204,28 @@ class Pty(unittest.TestCase):
         self.assertEqual(result.stdout.count("[rehearsal prompt="), 2)
         self.assertIn("both confirmations received", result.stdout)
 
+    def test_answers_the_working_choice_and_the_stop_list_separately(self):
+        result = self.run_peer(
+            "import sys; "
+            "tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Update now? [Y/n] '); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'yes'; "
+            "sys.stdout.write('Enter: update when they finish   i: interrupt them now   n: cancel\\n'); sys.stdout.flush(); "
+            "assert tty.readline() == '\\n'; "
+            "sys.stdout.write('Type \"stop\" to stop these and update. Anything else cancels.\\n'); sys.stdout.flush(); "
+            "assert tty.readline().strip() == 'stop'; "
+            "print('all three answered')", "--answer", "yes", "--stop", "stop")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(result.stdout.count("[rehearsal prompt="), 3)
+        self.assertIn("all three answered", result.stdout)
+
+    def test_stop_list_is_cancelled_unless_asked(self):
+        result = self.run_peer(
+            "import sys; tty=open('/dev/tty','r'); "
+            "sys.stdout.write('Type \"stop\" to stop these and update. Anything else cancels.\\n'); sys.stdout.flush(); "
+            "raise SystemExit(0 if tty.readline() == '\\n' else 3)", "--answer", "yes")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_child_exit_status_is_preserved(self):
         result = self.run_peer("raise SystemExit(7)")
         self.assertEqual(result.returncode, 7, result.stdout + result.stderr)
