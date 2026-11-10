@@ -1091,8 +1091,10 @@ impl Cagents {
         // A new view proof also wakes retained automatic names. These tails
         // inspect canonical open views and must run even for presentation-only
         // changes, just as they do after a complete reconciliation.
+        let mut phase = WorkspaceProjectionTiming::new(true);
         self.refresh_channel_title_suggestions();
         self.restore_channel_names();
+        phase.mark("selected_naming");
         Task::batch([installed, projected])
     }
 

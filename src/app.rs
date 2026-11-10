@@ -1173,6 +1173,31 @@ impl Drop for WorkspaceUpdateTiming {
     }
 }
 
+/// Opt-in phase timing for a selected projection. Disabled tracing does not
+/// read the clock or allocate, and phase fields do not replace inclusive time.
+struct WorkspaceProjectionTiming(Option<std::time::Instant>);
+
+impl WorkspaceProjectionTiming {
+    fn new(selected: bool) -> Self {
+        Self(
+            (selected
+                && tracing::enabled!(target: "cagents::workspace_pipeline", tracing::Level::DEBUG))
+            .then(std::time::Instant::now),
+        )
+    }
+
+    fn mark(&mut self, phase: &'static str) {
+        let Some(started) = self.0.as_mut() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        tracing::debug!(target: "cagents::workspace_pipeline", stage = phase,
+            phase_us = now.duration_since(*started).as_micros().min(u64::MAX as u128) as u64,
+            "Projected shared presentation phase");
+        *started = now;
+    }
+}
+
 /// Shared workspace model updates, from the observer and publisher threads.
 #[derive(Clone)]
 struct WorkspaceModelSource(async_channel::Receiver<workspace_model_sync::ModelUpdate>);
@@ -18742,7 +18767,9 @@ impl Application for Cagents {
                 #[cfg(test)]
                 if model_update { self.shared_views.chrome_tail_count += 1; }
                 let notices = self.reconcile_notice_popup();
+                let mut phase = WorkspaceProjectionTiming::new(_workspace_timing.is_some());
                 let chrome = self.sync_chrome();
+                phase.mark("selected_chrome");
                 return Task::batch([
                     task,
                     chrome,

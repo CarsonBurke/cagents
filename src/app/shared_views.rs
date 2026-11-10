@@ -159,6 +159,8 @@ pub(super) struct State {
     #[cfg(test)]
     scope_discovery_count: std::cell::Cell<usize>,
     #[cfg(test)]
+    pub(super) notification_attribution_count: std::cell::Cell<usize>,
+    #[cfg(test)]
     pane_attachment_count: usize,
     #[cfg(test)]
     pub(super) structural_tail_count: usize,
@@ -1988,6 +1990,7 @@ impl Cagents {
 
     fn reconcile_shared_views_for(&mut self, projection: ViewProjection<'_>) -> Task<Message> {
         let all = matches!(projection, ViewProjection::All);
+        let mut phase = WorkspaceProjectionTiming::new(!all);
         if all {
             self.publish_unpublished_local_chats();
             // A watcher snapshot can announce the destination before the explicit
@@ -2141,6 +2144,7 @@ impl Cagents {
                 }
             }
         }
+        phase.mark("selected_prepare");
         let mut projected_scopes = Vec::new();
         for mut view in views {
             if self.shared_views.blocked.contains(&view.scope) {
@@ -2197,6 +2201,7 @@ impl Cagents {
             }
             projected_scopes.push(view.scope);
         }
+        phase.mark("selected_project");
         self.shared_views.applying = false;
         // Capture after the active strip snapshot, then share this immutable
         // pass between settled baselines and publication. Uninitialized scopes
@@ -2213,15 +2218,22 @@ impl Cagents {
             }
             app.publish_projected_view_changes(projected);
         });
+        phase.mark("selected_save");
         if let Some(path) = self.shared_views.deferred_default.take() {
             if self.active_workspace.as_ref() == Some(&path) && self.workspace.cards().is_empty() {
                 tasks.push(self.add_default_pane(path, settings::DefaultPane::Terminal));
             }
         }
-        self.reproject_notification_unread();
+        // Presentation-only projection preserves every notification attribution
+        // input: source, membership, ownership, placement and project identity.
+        // Journal snapshots attribute their own new evidence independently.
+        if all {
+            self.reproject_notification_unread();
+        }
         tasks.push(self.release_held_terminals());
         // Restored shared panes queued for an attach wait for the registry.
         tasks.push(self.attach_next_restored_agent());
+        phase.mark("selected_postlude");
         Task::batch(tasks)
     }
 
@@ -4921,6 +4933,100 @@ mod tests {
     }
 
     #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_managed_notice(
+        app: &mut Cagents,
+        channel: ChannelId,
+        card: CardId,
+    ) -> crate::notifications::Notice {
+        use crate::agent_execution::{Agent, HostedSession, Origin, Spec, Surface, Target};
+        let CardKind::Terminal(session) = moving_terminal_kind() else {
+            unreachable!()
+        };
+        let repository = app
+            .workspace_model
+            .channel(channel)
+            .unwrap()
+            .repository
+            .clone();
+        let state = CardState {
+            id: card,
+            generation: 0,
+            title: "Managed attention".into(),
+            width_fraction: 0.5,
+            existence: Existence::Open,
+            kind: CardKind::Terminal(session.clone()),
+        };
+        let durable = Arc::make_mut(&mut app.durable);
+        if let Some(existing) = durable.cards.iter_mut().find(|row| row.id == card) {
+            *existing = state;
+        } else {
+            durable.cards.push(state);
+        }
+        durable.card_scopes.remove(&card);
+        for row in &mut durable.channels {
+            row.cards.retain(|id| *id != card);
+            if row.id == channel {
+                row.cards.push(card);
+            }
+        }
+        let pane = Pane::from_card(app.card_state(card).unwrap(), None).unwrap();
+        for view in &mut app.workspace_model.views {
+            view.panes.retain(|pane| pane.id != card);
+        }
+        app.workspace_model
+            .views
+            .iter_mut()
+            .find(|view| view.scope == Scope::Channel(channel))
+            .unwrap()
+            .panes
+            .push(pane);
+        app.workspace_model.agents.push(Agent {
+            id: crate::model::AgentId::from_uuid(card.as_uuid()),
+            name: None,
+            origin: Origin::User,
+            spec: Spec {
+                provider: crate::agent::Provider::Claude,
+                account: None,
+                target: Target {
+                    repository,
+                    directory: session.launch.working_directory.clone(),
+                    placement: Some(Scope::Channel(channel)),
+                },
+                surface: Surface::Terminal,
+                model: None,
+                permission_mode: None,
+                reasoning_effort: None,
+            },
+            placement: Scope::Channel(channel),
+            session: Some(HostedSession::Terminal(session.clone())),
+            console: Some(session.clone()),
+            created_ms: 0,
+            closed: false,
+        });
+        app.cards.insert(card, CardRuntime::Loading);
+        app.register_presence(card, Exposure::Offscreen, Residency::Cold);
+        app.shared_views.attached.insert(card);
+        crate::notifications::Notice {
+            id: uuid::Uuid::new_v4(),
+            delivered: false,
+            acknowledged: false,
+            window: None,
+            event: crate::notifications::Event {
+                content: None,
+                target: crate::notifications::Target::Session(session.id),
+                source_session: Some(session.id),
+                provider: Some(crate::agent::Provider::Claude),
+                directory: Some(session.launch.working_directory),
+                destination: None,
+                evidence: crate::notifications::Evidence {
+                    key: format!("presentation-managed-{card}"),
+                    kind: crate::notifications::Kind::Failed,
+                },
+            },
+        }
+    }
+
+    #[cfg(not(feature = "integrated-browser"))]
     fn presentation_edge(
         app: &Cagents,
         scope: Scope,
@@ -4976,7 +5082,7 @@ mod tests {
     #[test]
     #[cfg(not(feature = "integrated-browser"))]
     fn presentation_edge_uses_the_selected_projector_and_chrome_update_tail() {
-        let (mut app, source, _, pane) = presentation_fixture();
+        let (mut app, source, destination, pane) = presentation_fixture();
         // Match the native bounded workload's saved history. Only 83 panes
         // are open; historical roots/cards must not enter this edit's local
         // discovery or projection budget.
@@ -5025,6 +5131,35 @@ mod tests {
                 path: PathBuf::from(format!("/repo/closed-{}", app.workspace_model.views.len())),
             }));
         }
+        let managed = app
+            .durable
+            .cards
+            .iter()
+            .skip(1)
+            .take(20)
+            .map(|card| card.id)
+            .collect::<Vec<_>>();
+        let managed_channel = destination;
+        let notices = managed
+            .iter()
+            .map(|card| presentation_managed_notice(&mut app, managed_channel, *card))
+            .collect::<Vec<_>>();
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices,
+                diagnostic: None,
+            },
+        )));
+        assert!(
+            managed
+                .iter()
+                .all(|card| app.sidebar_state.has_card_update(*card))
+        );
+        let attention = managed
+            .iter()
+            .map(|card| app.sidebar_state.card_attention(*card))
+            .collect::<Vec<_>>();
+        app.shared_views.notification_attribution_count.set(0);
         let failure = match app.cards.get(&pane.id) {
             Some(CardRuntime::Failed(error)) => format!("{error:?}"),
             _ => panic!("browserless unavailable surface"),
@@ -5048,6 +5183,18 @@ mod tests {
             app.shared_views.scope_discovery_count.get(),
             0,
             "settled presentation does not rediscover historical scopes in a release tail"
+        );
+        assert_eq!(
+            app.shared_views.notification_attribution_count.get(),
+            0,
+            "stable presentation does not rebuild managed notification ownership"
+        );
+        assert_eq!(
+            managed
+                .iter()
+                .map(|card| app.sidebar_state.card_attention(*card))
+                .collect::<Vec<_>>(),
+            attention
         );
         assert_eq!(app.shared_views.local_projection_count.get(), 0);
         assert_eq!(app.shared_views.selected_projection_count.get(), 1);
@@ -5076,6 +5223,102 @@ mod tests {
         assert!(app.shared_views.attached.contains(&listed_passive));
         assert!(!app.saved_terminals.entries.contains_key(&listed_passive));
         assert!(!app.terminal_start_in_flight(listed_passive));
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_preserves_managed_attention_and_later_snapshot_marks_new_evidence() {
+        let (mut app, source, channel, _) = presentation_fixture();
+        let card = CardId::new();
+        let notice = presentation_managed_notice(&mut app, channel, card);
+        let first_notice = notice.id;
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices: vec![notice.clone()],
+                diagnostic: None,
+            },
+        )));
+        assert!(app.sidebar_state.has_card_update(card));
+        let attention = app.sidebar_state.card_attention(card);
+        let runtime = app.cards.get(&card).unwrap() as *const CardRuntime;
+        app.shared_views.notification_attribution_count.set(0);
+        let update = presentation_edge(&app, Scope::Channel(source), 30, "Presentation", 0.7);
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.notification_attribution_count.get(), 0);
+        assert_eq!(app.sidebar_state.card_attention(card), attention);
+        assert_eq!(app.cards.get(&card).unwrap() as *const CardRuntime, runtime);
+        assert!(!app.notification_ui.acknowledged_for_test(first_notice));
+        app.sidebar_state.forget_card_attention(card);
+        let mut later = notice;
+        later.id = uuid::Uuid::new_v4();
+        later.event.evidence.key = "later-managed-failure".into();
+        let later_id = later.id;
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices: vec![later],
+                diagnostic: None,
+            },
+        )));
+        assert_eq!(app.shared_views.notification_attribution_count.get(), 1);
+        assert!(app.sidebar_state.has_card_update(card));
+        assert_eq!(app.sidebar_state.card_attention(card), attention);
+        assert!(!app.notification_ui.acknowledged_for_test(later_id));
+    }
+
+    #[test]
+    #[cfg(not(feature = "integrated-browser"))]
+    fn presentation_keeps_duplicate_notification_owners_failclosed_until_full_metadata_repair() {
+        use super::super::workspace_model_sync::{EdgeChanges, ModelUpdate};
+        use crate::workspace_model::delta::EditEffects;
+        let (mut app, source, channel, _) = presentation_fixture();
+        let card = CardId::new();
+        let notice = presentation_managed_notice(&mut app, channel, card);
+        let notice_id = notice.id;
+        let mut duplicate = app.workspace_model.agents[0].clone();
+        duplicate.id = crate::model::AgentId::new();
+        let duplicate_id = duplicate.id;
+        app.workspace_model.agents.push(duplicate);
+        drop(app.update_notifications(notification_ui::Action::Snapshot(
+            crate::notifications::Snapshot {
+                notices: vec![notice],
+                diagnostic: None,
+            },
+        )));
+        assert!(!app.sidebar_state.has_card_update(card));
+        app.shared_views.notification_attribution_count.set(0);
+        let update = presentation_edge(
+            &app,
+            Scope::Channel(source),
+            31,
+            "No ownership change",
+            0.65,
+        );
+        drop(app.update(Message::WorkspaceModelObserved(update)));
+        assert_eq!(app.shared_views.notification_attribution_count.get(), 0);
+        assert!(!app.sidebar_state.has_card_update(card));
+        drop(
+            app.update(Message::WorkspaceModelObserved(ModelUpdate::Changed {
+                sequence: 32,
+                edit: ModelEdit::AgentsChanged,
+                changes: EdgeChanges {
+                    identity: Some(app.workspace_model.identity),
+                    effects: EditEffects {
+                        removed_agents: vec![duplicate_id],
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            })),
+        );
+        assert!(
+            app.shared_views.notification_attribution_count.get() > 0,
+            "actual owner metadata repair retains full attribution"
+        );
+        assert!(
+            app.sidebar_state.has_card_update(card),
+            "retained notice is attributed without another journal delivery"
+        );
+        assert!(!app.notification_ui.acknowledged_for_test(notice_id));
     }
 
     fn listed_passive_release_fixture() -> (Cagents, ChannelId, ChannelId, Pane) {
