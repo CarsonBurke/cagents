@@ -2,6 +2,40 @@
 use super::*;
 use crate::chat::protocol::{Adapter, ProcessSpec, Step, TransportSpec};
 
+/// Production recovery always inspects the real process table. Unit fixtures
+/// substitute only the proc filesystem, retaining the normal survivor parser.
+fn resume_process_root() -> std::path::PathBuf {
+    #[cfg(test)]
+    if let Some(root) = RESUME_PROCESS_ROOT.with(|slot| slot.borrow().clone()) {
+        return root;
+    }
+    "/proc".into()
+}
+
+#[cfg(test)]
+thread_local! {
+    static RESUME_PROCESS_ROOT: std::cell::RefCell<Option<std::path::PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+struct ProcessRootGuard(Option<std::path::PathBuf>);
+
+#[cfg(test)]
+impl ProcessRootGuard {
+    fn install(root: &std::path::Path) -> Self {
+        Self(RESUME_PROCESS_ROOT.with(|slot| slot.replace(Some(root.to_owned()))))
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProcessRootGuard {
+    fn drop(&mut self) {
+        RESUME_PROCESS_ROOT.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
 struct StoppedAdapter;
 impl Adapter for StoppedAdapter {
     fn initialize(&mut self) -> Result<Step, String> {
@@ -204,12 +238,8 @@ pub(super) fn prepare_resume(
                 host_incarnation: proof.host_incarnation.clone(),
             },
         };
-        if crate::upgrade::surviving_process(
-            &terminal,
-            std::process::id(),
-            std::path::Path::new("/proc"),
-        )?
-        .is_some()
+        if crate::upgrade::surviving_process(&terminal, std::process::id(), &resume_process_root())?
+            .is_some()
         {
             return Err("This conversation is still running elsewhere; nothing was started".into());
         }
@@ -221,7 +251,7 @@ pub(super) fn prepare_resume(
                 if crate::upgrade::surviving_process(
                     terminal,
                     std::process::id(),
-                    std::path::Path::new("/proc"),
+                    &resume_process_root(),
                 )?
                 .is_some()
                 {
@@ -382,6 +412,9 @@ mod flow_tests {
             );
             return;
         };
+        let processes = root.join("proc");
+        std::fs::create_dir(&processes).unwrap();
+        let _process_root = ProcessRootGuard::install(&processes);
         let proof = |name, boot| HostSessionProof {
             host_session_id: crate::model::HostSessionId::new("floor-flow"),
             boot_id: crate::model::BootId::new(boot),
@@ -509,6 +542,47 @@ mod flow_tests {
             assert!(successor.proof.is_none());
             assert!(chat::is_retained_resume_successor(&reader, &successor));
         }
+        // A process outside this host still names the old exact conversation.
+        // This is parsed by the production census against an owned proc fixture,
+        // avoiding unrelated protected processes on a shared build machine.
+        let source = &record.chats[0];
+        let pid = std::process::id() + 1;
+        let process = processes.join(pid.to_string());
+        std::fs::create_dir(&process).unwrap();
+        let mut fields = vec!["0".to_owned(); 52];
+        fields[0] = "S".into();
+        fields[1] = "1".into();
+        fields[2] = pid.to_string();
+        fields[3] = pid.to_string();
+        fields[19] = "700".into();
+        std::fs::write(
+            process.join("stat"),
+            format!("{pid} (old-provider) {}", fields.join(" ")),
+        )
+        .unwrap();
+        std::fs::write(
+            process.join("cmdline"),
+            format!(
+                "claude\0--resume\0{}\0",
+                source.launch.session_id.as_ref().unwrap()
+            ),
+        )
+        .unwrap();
+        std::fs::write(process.join("environ"), b"PATH=/usr/bin\0").unwrap();
+        let failure = super::super::process(
+            &host,
+            1,
+            ClientRequest::ChatPrepareResume {
+                source: source.clone(),
+            },
+        )
+        .unwrap_err();
+        assert!(
+            failure.message.contains("still running elsewhere"),
+            "{}",
+            failure.message
+        );
+        std::fs::remove_dir_all(&process).unwrap();
         // A different allocation already writing this conversation vetoes only
         // its explicit Resume, even after a confirmed service stop.
         let source = &record.chats[0];
