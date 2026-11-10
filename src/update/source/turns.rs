@@ -432,8 +432,47 @@ mod tests {
                     },
                 )
                 .unwrap();
+                write_frame(
+                    &mut server_stream,
+                    &ServerEnvelope {
+                        version: 156,
+                        request_id: None,
+                        proof: proof.clone(),
+                        message: ServerMessage::ChatAccountUsage {
+                            chat_id: source.id,
+                            report: crate::account::LiveReport::CodexLogin(
+                                crate::account::codex::LoginUpdate {
+                                    chatgpt: true,
+                                    plan: None,
+                                },
+                            ),
+                            observed_at: 1,
+                        },
+                    },
+                )
+                .unwrap();
                 response(&mut server_stream, read.request_id, publication);
             }
+            let _: ClientEnvelope = read_frame(&mut server_stream).unwrap().unwrap();
+            write_frame(
+                &mut server_stream,
+                &ServerEnvelope {
+                    version: 156,
+                    request_id: None,
+                    proof: proof.clone(),
+                    message: ServerMessage::ChatAccountUsage {
+                        chat_id: TerminalId::new(),
+                        report: crate::account::LiveReport::CodexLogin(
+                            crate::account::codex::LoginUpdate {
+                                chatgpt: true,
+                                plan: None,
+                            },
+                        ),
+                        observed_at: 2,
+                    },
+                },
+            )
+            .unwrap();
         });
         let mut client = ControlClient::from_stream_at_source_protocol(
             stream,
@@ -469,6 +508,9 @@ mod tests {
                 "invalid deltas cannot waive the idle wait"
             );
         }
+        let unrelated = observed.refresh(&mut client, session.id).unwrap_err();
+        assert!(unrelated.to_string().contains("chat_account_usage"));
+        assert_eq!(observed.activity.generation, 9);
         drop(client);
         server.join().unwrap();
     }
