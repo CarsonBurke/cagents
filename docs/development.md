@@ -1753,8 +1753,11 @@ stops a unit it did not attribute to this root.
 
 The desktop holds
 `/var/tmp/cagents-fw16-native.lock` (override with
-`CAGENTS_EVIDENCE_NATIVE_LOCK`), shared with native evidence work. `run` stops
-its desktop and all private processes on completion; keep manual sessions short.
+`CAGENTS_EVIDENCE_NATIVE_LOCK`), shared with native evidence work. `desktop start`
+waits in that lock's queue for as long as it takes, reporting every five minutes;
+only the desktop's startup after it takes the lock is bounded (five minutes), so a
+busy host delays a rehearsal instead of failing it. `run` stops its desktop and all
+private processes on completion; keep manual sessions short.
 Do not run the harness inside `native-evidence`: both acquire the same native
 lock, so the inner invocation would wait on its caller.
 
