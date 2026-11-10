@@ -693,6 +693,13 @@ fn a_native_discovery_owner_refuses_lost_agent_close() {
         assert!(Instant::now() < deadline, "the paired view did not exit");
         thread::sleep(Duration::from_millis(10));
     }
+    // Shutdown joins the worker, but its Exited event is queued on the shared
+    // observer. Settle that real observation before testing an unblocked close.
+    crate::terminal::flush_archived_notices();
+    assert!(
+        !host.lock().unwrap().is_live(&paired),
+        "the host observed the paired view's exit"
+    );
 
     // With each blocker gone, the same original agent closes without
     // starting a provider. A completed view holds nothing.
