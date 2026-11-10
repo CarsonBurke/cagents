@@ -266,19 +266,6 @@ pub(super) fn published_fixture_from_rows(source: &Registry, version: u32) -> st
     );
     let quote = |name: &str| format!("\"{}\"", name.replace('"', "\"\""));
     for table in tables {
-        // A table a later schema dropped, such as channel work's, has no rows
-        // to carry back: it stays as its published migration created it.
-        let current: bool = source
-            .db
-            .query_row(
-                "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name=?1)",
-                [&table],
-                |row| row.get(0),
-            )
-            .unwrap();
-        if !current {
-            continue;
-        }
         let table = quote(&table);
         let columns = {
             let mut statement = tx.prepare(&format!("PRAGMA table_info({table})")).unwrap();
