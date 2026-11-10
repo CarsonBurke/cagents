@@ -988,7 +988,7 @@ if verified.returncode:
     sys.exit(91)
 with (pathlib.Path(os.environ['HOME'])/'events').open('a') as events:
     events.write('source-inspect\n')
-print(json.dumps({'Err':'fixture source panes refused'} if os.environ['FIXTURE_SOURCE_REFUSED']=='1' else {'Ok':None}))
+print(json.dumps({'Err':'fixture source panes refused'} if os.environ['FIXTURE_SOURCE_REFUSED']=='1' else {'Ok':{'stopped':[], 'stopped_windows':[], 'labels':{}}}))
 "#).unwrap();
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
 }

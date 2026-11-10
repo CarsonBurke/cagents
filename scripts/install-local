@@ -18,7 +18,7 @@ fail() {
 usage() {
     cat <<'EOF'
 Usage: scripts/install-local [--build-host HOST] [--stage-only] [--this-commit]
-                             [--yes] [--interrupt] [--accept-unreopenable]
+                             [--yes] [--interrupt]
 
 Builds HEAD with the `local` Cargo profile as version <version>+local.<sha>,
 stages it with install.sh --stage-only, and runs `cagents daemon upgrade`.
@@ -32,7 +32,7 @@ and edits in other checkouts never reach the binaries.
   --stage-only       Stop after staging; finish later with: cagents daemon upgrade
   --this-commit      Build HEAD even when it is detached or its branch is
                      behind its upstream.
-  --yes, --interrupt, --accept-unreopenable
+  --yes, --interrupt
                      Passed to `cagents daemon upgrade`.
 
 CARGO_BUILD_JOBS defaults to every CPU of the build host.
@@ -50,12 +50,12 @@ while (($#)); do
             ;;
         --stage-only) STAGE_ONLY=1; shift ;;
         --this-commit) THIS_COMMIT=1; shift ;;
-        --yes|--interrupt|--accept-unreopenable) UPGRADE_ARGS+=("$1"); shift ;;
+        --yes|--interrupt) UPGRADE_ARGS+=("$1"); shift ;;
         -h|--help) usage; exit 0 ;;
         *) fail "unknown argument: $1 (see --help)" ;;
     esac
 done
-((STAGE_ONLY == 0 || ${#UPGRADE_ARGS[@]} == 0)) || fail '--yes, --interrupt and --accept-unreopenable apply to the upgrade, not --stage-only'
+((STAGE_ONLY == 0 || ${#UPGRADE_ARGS[@]} == 0)) || fail '--yes and --interrupt apply to the upgrade, not --stage-only'
 
 # install.sh refuses hosted agent sessions; say so before spending a build.
 [[ ${CAGENTS_AGENT_AUTHORITY+x} != x ]] || fail 'run this from your own terminal; hosted sessions cannot change the installation'
