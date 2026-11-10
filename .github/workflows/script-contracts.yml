@@ -221,6 +221,7 @@ jobs:
               ("build disk guard and gate install", "scripts/build-disk-guard", "tests/build_disk_guard.py"),
               ("build directory pruning", "scripts/prune-build-dirs", "tests/prune_build_dirs.py"),
               ("build offload", "scripts/cargo-offload", "tests/cargo_offload.py"),
+              ("main build sentinel", "scripts/main-build-sentinel", "tests/main_build_sentinel.py"),
               ("focused lib tests", "scripts/test-lib", "tests/test_lib.py"),
               ("lock holders", "scripts/lock-holders", "tests/lock_holders.py"),
               ("memory limit", "scripts/memory-capped", "tests/memory_capped.py"),
