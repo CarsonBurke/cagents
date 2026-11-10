@@ -93,3 +93,43 @@ pub(super) fn drain(reader: &UnixStream) {
     let mut buffer = [0; 256];
     while (&*reader).read(&mut buffer).is_ok_and(|n| n > 0) {}
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retiring_a_watcher_disconnects_even_while_a_descriptor_copy_lives() {
+        let watcher = Watcher::default();
+        for replace in [true, false] {
+            let mut reader = watcher.subscribe().unwrap();
+            reader
+                .set_read_timeout(Some(Duration::from_millis(200)))
+                .unwrap();
+            let mut byte = [0];
+            assert_eq!(reader.read(&mut byte).unwrap(), 1);
+            // An unrelated child paused between fork and exec can keep the
+            // close-on-exec descriptor alive just like this duplicate.
+            let held = watcher
+                .0
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .try_clone()
+                .unwrap();
+            let replacement = replace.then(|| watcher.subscribe().unwrap());
+            if !replace {
+                watcher.clear();
+            }
+            assert_eq!(
+                reader
+                    .read(&mut byte)
+                    .expect("retired readiness must close"),
+                0
+            );
+            drop(held);
+            drop(replacement);
+        }
+    }
+}
