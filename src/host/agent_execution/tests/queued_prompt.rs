@@ -902,3 +902,33 @@ fn a_scheduled_firing_still_fails_rather_than_queueing_behind_a_busy_turn() {
     assert!(run.result.diagnostic.unwrap().contains("not idle"));
     std::fs::write(root.join("cleanup-release"), "").unwrap();
 }
+
+#[test]
+fn nothing_to_interrupt_names_what_the_interrupt_cannot_reach() {
+    let held = |name: &str, waiting| chat::HeldSubagent {
+        name: name.into(),
+        waiting,
+    };
+    let idle = nothing_to_interrupt(State::Succeeded, &chat::WorkHold::default(), 0);
+    assert_eq!(
+        idle,
+        "The agent has no active run and its main turn is idle, so there is nothing to interrupt. Its latest run is Succeeded."
+    );
+    let hold = chat::WorkHold {
+        turn: false,
+        subagents: vec![held("Run the dev server", true)],
+    };
+    assert_eq!(
+        nothing_to_interrupt(State::Succeeded, &hold, 1),
+        "The agent has no active run and its main turn is idle, so there is nothing to interrupt. Its latest run is Succeeded. This provider's interrupt doesn't reach its 1 waiting background subagent (“Run the dev server”); stop it from its tab in the agent's chat, or close the agent. It is waiting on 1 request(s): see `cagents agent requests`."
+    );
+    let hold = chat::WorkHold {
+        turn: false,
+        subagents: vec![held("Scout", false), held("", true)],
+    };
+    let both = nothing_to_interrupt(State::Cancelled, &hold, 0);
+    assert!(
+        both.contains("doesn't reach its 1 running and 1 waiting background subagent (“Scout” and 1 more); stop them from their tabs"),
+        "{both}"
+    );
+}

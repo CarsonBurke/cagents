@@ -1794,31 +1794,38 @@ fn interrupt_unowned_turn(
             }
         })?;
     } else if !unsent {
-        let mut message = format!(
-            "The agent has no active run and its main turn is idle, so there is nothing to interrupt. Its latest run is {:?}.",
-            run.state
-        );
-        let hold = handle.work_hold();
-        let background = hold.subagents();
-        if !background.is_empty() {
-            message.push_str(&format!(
-                " This provider's interrupt doesn't reach its {}; stop {} in its chat, or close the agent.",
-                background.count(),
-                background.where_to_stop()
-            ));
-        }
-        let requests = handle.requests().len();
-        if requests > 0 {
-            message.push_str(&format!(
-                " It is waiting on {requests} request(s): see `cagents agent requests`."
-            ));
-        }
-        return Err(message);
+        return Err(nothing_to_interrupt(
+            run.state,
+            &handle.work_hold(),
+            handle.requests().len(),
+        ));
     }
     if unsent {
         withdraw_queued(host, run)?;
     }
     Ok((reachable, unsent.then_some(run.id)))
+}
+
+/// Why an interrupt found nothing to stop: the main turn is idle, and whatever
+/// still holds the agent is out of the interrupt's reach.
+fn nothing_to_interrupt(latest: State, hold: &chat::WorkHold, requests: usize) -> String {
+    let mut message = format!(
+        "The agent has no active run and its main turn is idle, so there is nothing to interrupt. Its latest run is {latest:?}."
+    );
+    let background = hold.subagents();
+    if !background.is_empty() {
+        message.push_str(&format!(
+            " This provider's interrupt doesn't reach its {}; stop {} in the agent's chat, or close the agent.",
+            background.counted(),
+            background.where_to_stop()
+        ));
+    }
+    if requests > 0 {
+        message.push_str(&format!(
+            " It is waiting on {requests} request(s): see `cagents agent requests`."
+        ));
+    }
+    message
 }
 
 /// A person's Stop from the agent's console: the agent's turns become theirs,
