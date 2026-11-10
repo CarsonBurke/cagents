@@ -368,6 +368,7 @@ class InstalledGateSync(unittest.TestCase):
     """A gate change merged into main is installed by the next gate run."""
 
     files = ("cargo-gate", "cargo-gate-command.py", "cargo-gate-sync.py",
+             "cargo-host-test-helper.py",
              "cargo-gate-rustc-guard", "cargo-offload", "memory-capped",
              "seed-build-dir", "build-disk-guard", "prune-build-dirs", "install-cargo-gate")
 

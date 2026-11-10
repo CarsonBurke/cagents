@@ -34,7 +34,7 @@ fi
 # checkout whose gate is older than the installed one runs the installed one,
 # so a worktree that has fallen behind main does not keep main's fixes from its
 # builds.
-gate_version=23
+gate_version=24
 installed=${CAGENTS_BUILD_INSTALLED_GATE-/var/tmp/cagents-cargo-gate}
 # The helpers this gate runs are the ones beside the file it is, so an
 # installed gate keeps its own while a newer installation takes its name.
@@ -991,6 +991,26 @@ build_phase() {
     fi
 }
 
+# Library tests cannot use Cargo's integration-only CARGO_BIN_EXE_* variables.
+# Build their real daemon in the same admitted slot and pass its reported path.
+prepare_test_helper() {
+    case ${1-} in test|t|+*) ;; *) return 0 ;; esac
+    [ -z "${CAGENTS_TEST_RETAINED_ACTOR_HELPER-}" ] || return 0
+    [ -f "$here/cargo-host-test-helper.py" ] || return 0
+    helper_output=$(mktemp "${TMPDIR:-/tmp}/cagents-test-helper.XXXXXX") || return "$?"
+    helper_status=0
+    # Keep supervision in this shell: a command-substitution subshell would
+    # own the cancellation traps while the gate that holds the slot has none.
+    held /usr/bin/python3 "$here/cargo-host-test-helper.py" "$cargo" "$@" >"$helper_output" || helper_status=$?
+    test_helper=$(cat -- "$helper_output") || helper_status=$?
+    rm -f -- "$helper_output"
+    [ "$helper_status" -eq 0 ] || return "$helper_status"
+    if [ -n "$test_helper" ]; then
+        CAGENTS_TEST_RETAINED_ACTOR_HELPER=$test_helper
+        export CAGENTS_TEST_RETAINED_ACTOR_HELPER
+    fi
+}
+
 # Tests have no slot, but a runaway must not take the host with it.
 run_tests() {
     [ ! -x "$here/memory-capped" ] || exec "$here/memory-capped" "$@"
@@ -1228,6 +1248,7 @@ if inside_gate || inherits_slot || started_by_flock; then
     fi
     if [ "$mode" = cargo ]; then
         stamp_command "$@"
+        prepare_test_helper "$@" || exit "$?"
         subcommand=$1
         case $subcommand in
             run|test|bench)
@@ -1313,6 +1334,11 @@ acquire
 stamp_command "$subcommand" "$@"
 status=0
 if [ "$runs_separately" = true ]; then
+    prepare_test_helper "$subcommand" "$@" || status=$?
+    if [ "$status" -ne 0 ]; then
+        release
+        exit "$status"
+    fi
     build_phase "$@" || status=$?
     release
     [ "$status" -eq 0 ] || exit "$status"
