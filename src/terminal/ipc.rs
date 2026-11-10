@@ -224,7 +224,10 @@ use crate::{
 /// Version 167 carries a provider's current activity and a prompt's queued
 /// state in agent replies, what an interrupt did, and a way to withdraw only
 /// the prompt. An older client is sent its replies without them.
-pub const PROTOCOL_VERSION: u16 = 167;
+/// Version 168 lets a chat send its queued messages to the running turn now
+/// and stop a command the main agent left running, and its snapshot says how
+/// both stand. An older client is sent snapshots without them.
+pub const PROTOCOL_VERSION: u16 = 168;
 /// The install candidate line's protocol. Every message an update exchanges
 /// with its daemon (Connect, the upgrade preview and preparation, and the
 /// inspector's frozen and saved-history requests) has this release's
@@ -237,7 +240,9 @@ pub const CANDIDATE_LINE_PROTOCOL: u16 = 128;
 
 mod older_clients;
 pub use older_clients::{OlderClient, is_cli_peer, older_client};
-pub(crate) use older_clients::{WAITING_TOOL_STATUS, encoding_before, new_in_provider_activity};
+pub(crate) use older_clients::{
+    WAITING_TOOL_STATUS, encoding_before, new_in_provider_activity, new_in_send_queued_now,
+};
 
 /// Postcard encodes an 80x24 grid in roughly 20 KiB and a typical single-row
 /// delta in a few hundred bytes, but a full repaint of a very large grid after

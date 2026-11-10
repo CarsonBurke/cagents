@@ -83,6 +83,25 @@ Open the resulting chat in the UI and check:
 6. Repeat the queued-state checks at a narrow window width, including keyboard
    focus and the split composer toolbar.
 
+For a turn blocked on long-running work with subagents running, create
+`$fixture_root/home/.claude/fixture-subagent-wait` before spawning the agent. Its
+first line is the number of subagents (default 1). The scene advertises
+`interrupt_send_now_v1`, keeps the first turn on a waiting command, and has each
+subagent report every two seconds until stopped. **Send now** moves the command
+aside, delivers everything queued, and leaves the command and subagents running.
+Esc, or Enter in an empty composer, does the same while every queued message is
+for the next step. A `fixture-send-now-abort` file beside it has the turn
+writing a reply instead, so Send now stops the reply and starts a new turn. A
+`fixture-subagent-idle` file ends the first turn right after the launch, leaving
+the conversation idle with subagents working. `fixture-admission-delay` and
+`fixture-send-now-delay` hold a number of seconds: how late a message's queued
+notice and the answer to Send now arrive. A `fixture-send-now-decline` file has
+Send now answered with nothing waiting and the messages left queued, as a CLI
+declining to send early answers.
+The frames follow `tests/fixtures/claude-send-now/`, recorded from Claude Code
+2.1.296; the scene does not exercise how the provider chooses between those paths
+or how long they take.
+
 Store screenshots under `docs/screenshots/` for PR evidence. Stop the owned
 nested session, close its synthetic agent, and stop only its isolated daemon
 when finished. The fixture directory can then be removed.

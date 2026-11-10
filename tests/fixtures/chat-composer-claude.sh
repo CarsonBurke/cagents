@@ -307,7 +307,7 @@ answer_control() {
     subtype=$(printf '%s' "$1" | jq -r '.request.subtype')
     metadata='{}'
     if [ "$subtype" = initialize ]; then
-        metadata='{"claude_code_version":"2.1.286","current_permission_mode":"default","models":[{"value":"haiku","displayName":"Claude Haiku"}]}'
+        metadata=$(jq -cn --arg version "$version" '{claude_code_version:$version,current_permission_mode:"default",capabilities:["ui_surface_v1"],models:[{value:"haiku",displayName:"Claude Haiku"}]}')
         if [ "$fast_fixture" = 1 ]; then
             metadata=$(jq -cn --arg fast "$fast" '{claude_code_version:"2.1.286",current_permission_mode:"default",model:"opus",fast_mode_state:$fast,models:[{value:"opus",displayName:"Claude Opus",supportedEffortLevels:["high"]}]}')
         fi
@@ -328,6 +328,26 @@ answer_control() {
         if [ "$requested" = true ]; then fast=on; else fast=off; fi
         metadata=$(jq -cn --arg fast "$fast" '{fast_mode_state:$fast}')
     fi
+    send_now=false
+    if [ "$subagent_wait" = 1 ] && [ "$subtype" = interrupt ] &&
+        [ "$(printf '%s' "$1" | jq -r '.request.send_now == true')" = true ]; then
+        send_now=true
+        answer=nothing_waiting
+        still_queued='[]'
+        if [ "$busy" = true ] && [ -s "$scene/waiting" ]; then
+            answer=delivering
+            if [ -e "$config/fixture-send-now-abort" ]; then answer=stopped; fi
+            # A CLI that will not hand the queue over early says nothing
+            # is waiting for it and leaves the messages queued.
+            if [ -e "$config/fixture-send-now-decline" ]; then
+                answer=nothing_waiting
+                still_queued=$(jq -cs 'map(.uuid)' "$scene/waiting")
+            fi
+        fi
+        metadata=$(jq -cn --arg answer "$answer" --argjson still "$still_queued" '{still_queued:$still,send_now:$answer}')
+        # The answer may be slow to come back.
+        if [ -s "$config/fixture-send-now-delay" ]; then sleep "$(cat "$config/fixture-send-now-delay")"; fi
+    fi
     jq -cn --arg id "$id" --argjson metadata "$metadata" \
         '{type:"control_response",response:{subtype:"success",request_id:$id,response:$metadata}}'
     case $subtype in
@@ -335,9 +355,21 @@ answer_control() {
             uuid=$(printf '%s' "$1" | jq -r '.request.message_uuid')
             jq -cn --arg uuid "$uuid" \
                 '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
+            if [ "$subagent_wait" = 1 ]; then
+                jq -c --arg uuid "$uuid" 'select(.uuid != $uuid)' "$scene/waiting" > "$scene/kept"
+                mv "$scene/kept" "$scene/waiting"
+            fi
             ;;
         stop_task)
             task=$(printf '%s' "$1" | jq -r '.request.task_id')
+            case $task in
+                bscene)
+                    jq -cn '{type:"system",subtype:"task_updated",task_id:"bscene",patch:{status:"killed"}}'
+                    jq -cn '{type:"system",subtype:"task_notification",task_id:"bscene",tool_use_id:"toolu_scene_bash",status:"stopped",summary:"Background command stopped"}'
+                    return 0
+                    ;;
+                ascene*) scene_stop_child "${task#ascene}"; return 0 ;;
+            esac
             case " $background_agents " in
                 *" ${task#fixture-task-} "*) stop_agent "${task#fixture-task-}" ;;
                 # Any other task, such as one fixture-frames.jsonl started,
@@ -349,6 +381,26 @@ answer_control() {
             esac
             ;;
         interrupt)
+            if [ "$send_now" = true ]; then
+                [ "$answer" != nothing_waiting ] || return 0
+                scene_send_now
+                return 1
+            fi
+            if [ "$subagent_wait" = 1 ]; then
+                # A plain interrupt stops running subagents even with the
+                # turn over, but not a command already moved aside.
+                scene_stop_children
+                if [ "$busy" = false ]; then
+                    jq -cn '{type:"user",uuid:"scene-rejected",parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:"[Request interrupted by user for tool use]"}]}}'
+                    return 0
+                fi
+                jq -cn '{type:"user",uuid:"scene-interrupted",parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:"[Request interrupted by user]"}]}}'
+                jq -cn --arg session "$session" \
+                    '{type:"result",uuid:"scene-interrupted-result",subtype:"error_during_execution",is_error:true,errors:["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],session_id:$session}'
+                busy=false
+                if [ -s "$scene/waiting" ]; then scene_deliver_waiting; fi
+                return 1
+            fi
             busy=false
             for tool in $background_agents; do stop_agent "$tool"; done
             jq -cn --arg session "$session" --arg turn "$turn" \
@@ -467,6 +519,98 @@ if [ "$probe" = false ] && [ -e "$config/fixture-slow-start" ]; then
     sleep "$start_delay"
 fi
 
+# Optional scene: a turn blocked on a long command with subagents running, so
+# queued messages wait and Send now has something to move aside. The frames and
+# their order follow tests/fixtures/claude-send-now/, recorded from Claude Code
+# 2.1.296. The file's first line is how many subagents to run (default 1); a
+# fixture-send-now-abort file beside it has the turn writing a reply instead of
+# waiting on a command, the path where Send now stops the turn. Subagents and
+# commands run until stopped. No model or real tool runs: this does not exercise
+# when the provider chooses each path, or how long it takes.
+subagent_wait=0
+scene_subagents=1
+version=2.1.286
+capabilities='[]'
+if fixture_switch "${CAGENTS_FIXTURE_SUBAGENT_WAIT:-0}" fixture-subagent-wait; then
+    subagent_wait=1
+    version=2.1.296
+    capabilities='["interrupt_send_now_v1"]'
+    if [ -s "$config/fixture-subagent-wait" ]; then scene_subagents=$(head -n 1 "$config/fixture-subagent-wait"); fi
+    scene=$(mktemp -d)
+    : > "$scene/waiting"
+    trap 'rm -rf "$scene"; [ -z "${reporter:-}" ] || kill "$reporter" 2>/dev/null || :' EXIT
+fi
+scene_subagents_start() {
+    i=1
+    while [ "$i" -le "$scene_subagents" ]; do
+        jq -cn --arg i "$i" '{type:"assistant",uuid:("scene-agent-"+$i),parent_tool_use_id:null,message:{id:("scene-agent-"+$i),role:"assistant",content:[{type:"tool_use",id:("toolu_scene_agent_"+$i),name:"Agent",input:{description:("Check area "+$i),prompt:"Fixture subagent",subagent_type:"general-purpose",run_in_background:true}}]}}'
+        jq -cn --arg i "$i" '{type:"system",subtype:"task_started",task_id:("ascene"+$i),tool_use_id:("toolu_scene_agent_"+$i),description:("Check area "+$i),subagent_type:"general-purpose",is_backgrounded:true,task_type:"local_agent"}'
+        jq -cn --arg i "$i" '{type:"user",uuid:("scene-agent-result-"+$i),parent_tool_use_id:null,message:{role:"user",content:[{tool_use_id:("toolu_scene_agent_"+$i),type:"tool_result",content:[{type:"text",text:("Async agent launched successfully.\nagentId: ascene"+$i)}]}]},tool_use_result:{isAsync:true,status:"async_launched",agentId:("ascene"+$i),description:("Check area "+$i)}}'
+        : > "$scene/child-$i"
+        i=$((i + 1))
+    done
+    # Each subagent keeps reporting whatever the main turn is doing.
+    (
+        step=0
+        while kill -0 "$$" 2>/dev/null; do
+            sleep 2
+            step=$((step + 1))
+            i=1
+            while [ "$i" -le "$scene_subagents" ]; do
+                if [ -e "$scene/child-$i" ]; then
+                    jq -cn --arg i "$i" --arg step "$step" '{type:"assistant",uuid:("scene-child-"+$i+"-"+$step),parent_tool_use_id:("toolu_scene_agent_"+$i),message:{id:("scene-child-"+$i+"-"+$step),role:"assistant",content:[{type:"text",text:("Checked file "+$step+" of area "+$i+".")}]}}'
+                fi
+                i=$((i + 1))
+            done
+        done
+    ) &
+    reporter=$!
+}
+scene_stop_child() {
+    jq -cn --arg i "$1" '{type:"system",subtype:"task_updated",task_id:("ascene"+$i),patch:{status:"killed"}}'
+    jq -cn --arg i "$1" '{type:"system",subtype:"task_notification",task_id:("ascene"+$i),tool_use_id:("toolu_scene_agent_"+$i),status:"stopped",summary:"Stopped"}'
+    rm -f "$scene/child-$1"
+}
+scene_stop_children() {
+    for child in "$scene"/child-*; do
+        [ -e "$child" ] || continue
+        scene_stop_child "${child##*/child-}"
+    done
+}
+# Everything waiting goes in together, and the turn it joined answers it.
+scene_deliver_waiting() {
+    uuids=''
+    while IFS= read -r waiting; do
+        turn=$((turn + 1))
+        persist_record "$waiting"
+        printf '%s\n' "$waiting"
+        uuid=$(printf '%s' "$waiting" | jq -r '.uuid')
+        uuids="$uuids $uuid"
+        jq -cn --arg uuid "$uuid" '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
+    done < "$scene/waiting"
+    : > "$scene/waiting"
+    emit_record "$(jq -cn --arg turn "$turn" '{type:"assistant",uuid:("scene-answer-"+$turn),message:{id:("scene-answer-"+$turn),role:"assistant",content:[{type:"text",text:"Got your message. The subagents are still checking their areas, and I will report when they finish."}]}}')"
+    for uuid in $uuids; do
+        jq -cn --arg uuid "$uuid" '{type:"command_lifecycle",command_uuid:$uuid,state:"completed"}'
+    done
+    jq -cn --arg session "$session" --arg turn "$turn" \
+        '{type:"result",uuid:("fixture-result-"+$turn),subtype:"success",is_error:false,stop_reason:"end_turn",session_id:$session}'
+    busy=false
+}
+scene_send_now() {
+    if [ -e "$config/fixture-send-now-abort" ]; then
+        emit_record "$(jq -cn '{type:"assistant",uuid:"scene-cut-off",message:{id:"scene-cut-off",role:"assistant",content:[{type:"text",text:"Here is the plan so f"}]}}')"
+        jq -cn '{type:"user",uuid:"scene-interrupted",parent_tool_use_id:null,message:{role:"user",content:[{type:"text",text:"[Request interrupted by user]"}]}}'
+        jq -cn --arg session "$session" \
+            '{type:"result",uuid:"scene-stopped-result",subtype:"error_during_execution",is_error:true,errors:["[ede_diagnostic] result_type=user last_content_type=n/a stop_reason=null"],session_id:$session}'
+        jq -cn --arg uuid "$scene_turn" '{type:"command_lifecycle",command_uuid:$uuid,state:"cancelled"}'
+    else
+        jq -cn '{type:"system",subtype:"task_updated",task_id:"bscene",patch:{is_backgrounded:true}}'
+        jq -cn '{type:"user",uuid:"scene-moved",parent_tool_use_id:null,message:{role:"user",content:[{tool_use_id:"toolu_scene_bash",type:"tool_result",content:"Command was moved to the background (ID: bscene) so that a message that arrived while it was running can reach you; it was not interrupted.",is_error:false}]},tool_use_result:{stdout:"",stderr:"",interrupted:false,backgroundTaskId:"bscene",backgroundedToDeliverMessage:true}}'
+    fi
+    scene_deliver_waiting
+}
+
 busy=false
 fast=off
 # The provider's input, which a paused turn reads while the frames loop has
@@ -502,8 +646,13 @@ while IFS= read -r frame; do
         user)
             uuid=$(printf '%s' "$frame" | jq -r '.uuid')
             if [ "$busy" = true ]; then
+                # Admission can lag a message's arrival; Send now must wait for it.
+                if [ "$subagent_wait" = 1 ] && [ -s "$config/fixture-admission-delay" ]; then
+                    sleep "$(cat "$config/fixture-admission-delay")"
+                fi
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"queued"}'
+                if [ "$subagent_wait" = 1 ]; then printf '%s\n' "$frame" >> "$scene/waiting"; fi
             elif [ "$(printf '%s' "$frame" | jq -r '.message.content | if type == "array" then map(.text // "") | join("") else . end')" = /compact ]; then
                 turn=$((turn + 1))
                 compact_turn
@@ -513,11 +662,31 @@ while IFS= read -r frame; do
                 printf '%s\n' "$frame"
                 jq -cn --arg uuid "$uuid" \
                     '{type:"command_lifecycle",command_uuid:$uuid,state:"started"}'
-                jq -cn --arg session "$session" --arg model "$(resolved_model)" \
-                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:"2.1.286",model:$model}'
+                jq -cn --arg session "$session" --arg model "$(resolved_model)" --arg version "$version" --argjson capabilities "$capabilities" \
+                    '{type:"system",subtype:"init",session_id:$session,claude_code_version:$version,capabilities:$capabilities,model:$model}'
                 if [ -n "$task_scene" ]; then
                     task_receipt_turn
                     busy=false
+                    continue
+                fi
+                if [ "$subagent_wait" = 1 ] && [ "$turn" -eq 1 ]; then
+                    scene_turn=$uuid
+                    scene_subagents_start
+                    if [ -e "$config/fixture-subagent-idle" ]; then
+                        emit_record "$(jq -cn '{type:"assistant",uuid:"scene-idle",message:{id:"scene-idle",role:"assistant",content:[{type:"text",text:"The subagents are checking each area. I will report when they finish."}]}}')"
+                        jq -cn --arg session "$session" \
+                            '{type:"result",uuid:"scene-idle-result",subtype:"success",is_error:false,stop_reason:"end_turn",session_id:$session}'
+                        continue
+                    fi
+                    if [ -e "$config/fixture-send-now-abort" ]; then
+                        jq -cn '{type:"stream_event",event:{type:"message_start",message:{id:"scene-cut-off",role:"assistant"}}}'
+                        jq -cn '{type:"stream_event",event:{type:"content_block_start",index:0,content_block:{type:"text",text:""}}}'
+                        jq -cn '{type:"stream_event",event:{type:"content_block_delta",index:0,delta:{type:"text_delta",text:"Here is the plan so f"}}}'
+                    else
+                        jq -cn '{type:"assistant",uuid:"scene-bash",parent_tool_use_id:null,message:{id:"scene-bash",role:"assistant",content:[{type:"tool_use",id:"toolu_scene_bash",name:"Bash",input:{command:"until [ -e subagents-done ]; do sleep 1; done",description:"Wait for the subagents to finish"}}]}}'
+                        jq -cn '{type:"system",subtype:"task_started",task_id:"bscene",tool_use_id:"toolu_scene_bash",description:"Wait for the subagents to finish",is_backgrounded:false,task_type:"local_bash"}'
+                    fi
+                    busy=true
                     continue
                 fi
                 # Optional provider failure for a prompt with an image, settled
