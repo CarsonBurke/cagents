@@ -139,7 +139,7 @@ pub(super) fn perform(
             confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
         let latest = observe(confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
             .map_err(io::Error::other)?.with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
+        if !confirmed.preserves_consent(&context.apply(latest)) || digest(root).map_err(io::Error::other)? != staged.identity.digest {
             return Err(io::Error::other("The installed build or session ownership changed during pane inspection; existing windows were kept open"));
         }
         Ok(())
@@ -154,6 +154,7 @@ pub(super) fn perform(
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
         )?
         .with_inspection(&confirmed.inspection());
+        let current = context.apply(current);
         if !confirmed.preserves_consent(&current) || digest(root)? != staged.identity.digest {
             return Err(invalid(
                 "the installed build or session ownership changed; review the update again",

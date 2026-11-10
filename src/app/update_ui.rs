@@ -217,7 +217,7 @@ fn preview_details(preview: &crate::update::impact::Preview) -> String {
         preview_summary(preview)
     );
     if let Some(daemon) = &preview.daemon {
-        for session in &daemon.sessions {
+        for session in daemon.sessions.iter().map(|session| session.review()) {
             details.push_str(&format!(
                 "\n{} — {}\n{}\n",
                 session.title,
@@ -225,8 +225,8 @@ fn preview_details(preview: &crate::update::impact::Preview) -> String {
                 session.reason
             ));
         }
-        for blocker in &daemon.blockers {
-            details.push_str(&format!("\n{blocker}\n"));
+        for notice in daemon.review_notices() {
+            details.push_str(&format!("\n{notice}\n"));
         }
     }
     details
@@ -320,13 +320,14 @@ impl Cagents {
             let (attention, settled): (Vec<_>, Vec<_>) = daemon
                 .sessions
                 .iter()
+                .map(|session| session.review())
                 .partition(|session| session.disposition == Disposition::Blocked);
             let mut rows = attention
                 .into_iter()
                 .chain(settled)
                 .map(|session| self.update_session_row(session))
                 .collect::<Vec<_>>();
-            rows.extend(daemon.blockers.iter().map(notice_body));
+            rows.extend(daemon.review_notices().into_iter().map(notice_body));
             if !rows.is_empty() {
                 body.push(
                     widget::container(widget::scrollable(
@@ -391,11 +392,11 @@ impl Cagents {
     /// window is the one holding its tab.
     fn update_session_row<'a>(
         &self,
-        session: &'a crate::update::impact::SessionImpact,
+        session: crate::update::impact::SessionReview,
     ) -> Element<'a, Message> {
         use crate::update::impact::Disposition;
         let mut header = vec![
-            widget::selectable_text(session.title.as_str())
+            widget::selectable_text(session.title.clone())
                 .size(design::TEXT_HEADING)
                 .font(design::heading_font())
                 .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
@@ -419,7 +420,7 @@ impl Cagents {
                 .align_y(Alignment::Center)
                 .spacing(space::S)
                 .into(),
-            notice_detail(session.reason.as_str()),
+            notice_detail(session.reason),
         ])
         .spacing(space::XXS)
         .into()
@@ -1560,10 +1561,47 @@ mod tests {
         );
         let details = preview_details(&confirmation.preview);
         assert!(details.starts_with("Update to 9.8.7\n"));
-        assert!(
-            details.contains("Shell · project — Continues\nWhy Shell · project is Continues\n")
-        );
+        assert!(details.contains(
+            "Shell · project — Continues\nThe conversation and its running work stay alive.\n"
+        ));
         assert!(details.ends_with("Wait for starting sessions to finish opening.\n"));
+    }
+
+    #[test]
+    fn copied_review_keeps_diagnostics_out_and_preserves_recovery_actions() {
+        use crate::update::impact::{Disposition, STOPPED_WITH_UNSETTLED_WORK};
+        let raw =
+            "Cannot join existing Codex daemon at /run/private.socket: Source transport failed";
+        let mut blocked = session("Conversation", Disposition::Blocked);
+        blocked.reason = raw.into();
+        let mut confirmation = daemon_preview(vec![blocked]);
+        let daemon = confirmation.preview.daemon.as_mut().unwrap();
+        daemon.blockers.push(raw.into());
+        daemon
+            .blockers
+            .push("Wait for starting sessions to finish opening.".into());
+
+        let details = preview_details(&confirmation.preview);
+        for internal in [raw, "/run/", "socket", "daemon", "Source", "transport"] {
+            assert!(!details.contains(internal), "{details}");
+        }
+        assert!(
+            details.contains("Let its work finish, then try again"),
+            "{details}"
+        );
+        assert!(details.contains("try the update again"), "{details}");
+        assert!(
+            details.contains("Wait for starting sessions to finish opening."),
+            "{details}"
+        );
+
+        confirmation.preview.daemon.as_mut().unwrap().sessions[0].reason =
+            STOPPED_WITH_UNSETTLED_WORK.into();
+        let details = preview_details(&confirmation.preview);
+        assert!(
+            details.contains("Close this conversation before updating."),
+            "{details}"
+        );
     }
 
     /// The restart saves and closes every window, so it must lose to anything

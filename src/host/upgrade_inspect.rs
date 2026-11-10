@@ -97,18 +97,16 @@ impl Reader {
     }
 }
 
-fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
-    let family = source::client_family(request.protocol).ok_or_else(|| {
-        "Source protocol has no qualified migration inspector; source windows remain usable"
-            .to_owned()
-    })?;
+fn connect(request: &Request, deadline: Instant) -> Result<Reader, InspectionFailure> {
+    let family =
+        source::client_family(request.protocol).ok_or(InspectionFailure::UnsupportedProtocol)?;
     let proof = request
         .proof
         .as_ref()
         .filter(|proof| proof.is_complete())
-        .ok_or("Saved conversations have no authenticated source service")?;
+        .ok_or(InspectionFailure::UnverifiedService)?;
     let socket = crate::terminal::ipc::daemon_socket_path()
-        .map_err(|_| "Source service namespace is unavailable")?;
+        .map_err(|_| InspectionFailure::ServiceUnavailable)?;
     match family {
         ClientFamily::Current => {
             current::Client::connect(&socket, proof, deadline, request.protocol)
@@ -117,6 +115,7 @@ fn connect(request: &Request, deadline: Instant) -> Result<Reader, String> {
         ClientFamily::V68 => v68::Client::connect(&socket, proof, deadline).map(Reader::Legacy68),
         ClientFamily::V77 => v77::Client::connect(&socket, proof, deadline).map(Reader::Legacy),
     }
+    .map_err(InspectionFailure::Unchecked)
 }
 
 const UNCHECKED: &str = "could not be checked before the update";
@@ -206,10 +205,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             }
             Err(_) => inspection.stopped_windows.push(StoppedWindow {
                 window: window + 1,
-                reason: format!(
-                    "A saved window ({}) could not be read; it may not reopen",
-                    path.file_name().unwrap_or_default().to_string_lossy()
-                ),
+                reason: format!("Window {} could not be read; it may not reopen", window + 1),
                 recovery: "Its saved file stays as it is".into(),
             }),
         }
@@ -217,7 +213,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
     let evidence = ExecutionEvidence::load(&current_boot, deadline);
     record_ended_panes(&mut inspection, &saved, &evidence);
     if check_deadline(deadline).is_err() {
-        inspection_failure(&mut inspection, "Checking saved panes took too long");
+        inspection_failure(&mut inspection, InspectionFailure::TimedOut);
         stop_unchecked(&mut inspection, &saved, &HashSet::new(), &current_boot);
         return Ok(inspection);
     }
@@ -227,7 +223,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         let mut checked = HashSet::new();
         for (_, kind) in &saved {
             if check_deadline(deadline).is_err() {
-                inspection_failure(&mut inspection, "Checking saved panes took too long");
+                inspection_failure(&mut inspection, InspectionFailure::TimedOut);
                 stop_unchecked(&mut inspection, &saved, &checked, &current_boot);
                 break;
             }
@@ -268,18 +264,18 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
     let mut reader = match connect(&request, deadline) {
         Ok(reader) => reader,
         Err(reason) => {
-            inspection_failure(&mut inspection, &reason);
+            inspection_failure(&mut inspection, reason);
             stop_unchecked(&mut inspection, &saved, &HashSet::new(), &current_boot);
             return Ok(inspection);
         }
     };
     let mut checked_saved = HashSet::new();
-    let inspect_live = (|| -> Result<(), String> {
-        let initial_inventory = reader.list()?;
+    let inspect_live = (|| -> Result<(), InspectionFailure> {
+        let initial_inventory = reader.list().map_err(InspectionFailure::Unchecked)?;
         let mut resolutions: Vec<(Session, Result<Session, String>)> = Vec::new();
         let mut cold_history = Vec::new();
         for (_, kind) in &saved {
-            check_deadline(deadline)?;
+            check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
             if let CardKind::Chat(source) = kind {
                 if !source.is_unstarted()
                     && (source.proof.as_ref() != request.proof.as_ref()
@@ -323,15 +319,15 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
                 }
             }
         }
-        let inventory = reader.list()?;
-        let terminals = reader.terminals()?;
+        let inventory = reader.list().map_err(InspectionFailure::Unchecked)?;
+        let terminals = reader.terminals().map_err(InspectionFailure::Unchecked)?;
         if inventory.len() > handoff::MAX_CHATS || terminals.len() > handoff::MAX_TERMINALS {
-            return Err("Source inventory exceeds its inspection limit".into());
+            return Err(InspectionFailure::InventoryLimit);
         }
         let proof = request
             .proof
             .as_ref()
-            .ok_or("Source service is unavailable")?;
+            .ok_or(InspectionFailure::ServiceUnavailable)?;
         record_live_panes(
             &mut inspection,
             &inventory,
@@ -341,10 +337,10 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         );
         let matched_cli = crate::companion::Product::Cli
             .beside_current()
-            .map_err(|_| "Cannot inspect the destination console companion")?;
+            .map_err(|_| InspectionFailure::ConsoleHelper)?;
         let mut ids = HashSet::new();
         for session in &inventory {
-            check_deadline(deadline)?;
+            check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
             if !ids.insert(session.id) || session.proof.as_ref() != Some(proof) {
                 inspection.stop(
                     session.id,
@@ -376,7 +372,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             }
         }
         for terminal in &terminals {
-            check_deadline(deadline)?;
+            check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
             if request.require_resumable
                 && !inventory.iter().any(|chat| chat.id == terminal.session.id)
                 && terminal.session.continuity.can_resume_live(proof)
@@ -390,7 +386,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
             }
         }
         for (_, kind) in &saved {
-            check_deadline(deadline)?;
+            check_deadline(deadline).map_err(|_| InspectionFailure::TimedOut)?;
             match kind {
                 CardKind::Chat(source) => {
                     checked_saved.insert(source.id);
@@ -468,7 +464,7 @@ fn inspect(request: Request) -> Result<SourceInspection, String> {
         Ok(())
     })();
     if let Err(reason) = inspect_live {
-        inspection_failure(&mut inspection, &reason);
+        inspection_failure(&mut inspection, reason);
         stop_unchecked(&mut inspection, &saved, &checked_saved, &current_boot);
     }
     Ok(inspection)
@@ -575,45 +571,44 @@ fn console_keeps_running(
     );
 }
 
-fn inspection_failure(inspection: &mut SourceInspection, reason: &str) {
-    let lower = reason.to_ascii_lowercase();
-    let readable = if lower.contains("console companion") {
-        "the console helper installed with this build could not be checked".to_owned()
-    } else if lower.contains("timed out")
-        || lower.contains("budget")
-        || lower.contains("took too long")
-    {
-        "checking panes took too long".to_owned()
-    } else if lower.contains("ownership")
-        || lower.contains("owner")
-        || lower.contains("proof")
-        || lower.contains("authenticate")
-    {
-        "the running terminal service's identity changed or could not be verified".to_owned()
-    } else if lower.contains("connect")
-        || lower.contains("namespace")
-        || lower.contains("unavailable")
-        || lower.contains("send")
-    {
-        "the running terminal service could not be reached".to_owned()
-    } else if lower.contains("limit") || lower.contains("exceeds") || lower.contains("exceeded") {
-        "the running terminal service sent more pane data than could be checked".to_owned()
-    } else if lower.contains("protocol")
-        || lower.contains("response")
-        || lower.contains("contract")
-        || lower.contains("unsupported")
-    {
-        "the running terminal service returned pane data this build could not read".to_owned()
-    } else {
-        reason
-            .replace("Source service", "The running terminal service")
-            .replace("source service", "running terminal service")
-            .replace("Source", "The running terminal service")
+/// The operation that failed owns its user-facing classification. Compatibility
+/// clients still return diagnostic strings; those are logged, never classified
+/// by their contents or included in the review.
+#[derive(Debug)]
+enum InspectionFailure {
+    TimedOut,
+    ServiceUnavailable,
+    UnverifiedService,
+    UnsupportedProtocol,
+    InventoryLimit,
+    ConsoleHelper,
+    Unchecked(String),
+}
+
+fn inspection_failure(inspection: &mut SourceInspection, failure: InspectionFailure) {
+    let readable = match failure {
+        InspectionFailure::TimedOut => "checking panes took too long",
+        InspectionFailure::ServiceUnavailable => {
+            "the running terminal service could not be reached"
+        }
+        InspectionFailure::UnverifiedService => {
+            "the running terminal service's identity could not be verified"
+        }
+        InspectionFailure::UnsupportedProtocol => {
+            "this build cannot check panes from the running version"
+        }
+        InspectionFailure::InventoryLimit => "there were more panes than could be checked",
+        InspectionFailure::ConsoleHelper => {
+            "the console helper installed with this build could not be checked"
+        }
+        InspectionFailure::Unchecked(reason) => {
+            tracing::warn!(%reason, "live pane inspection failed");
+            "some running panes could not be checked"
+        }
     };
-    inspection
-        .details
-        .notices
-        .push(format!("Live panes could not all be checked: {readable}."));
+    inspection.details.notices.push(format!(
+        "Live panes could not all be checked: {readable}. Review the recovery instructions for the affected panes before updating."
+    ));
 }
 
 // Cold terminal presentation is retained unchanged. An actual previous boot
@@ -1939,9 +1934,9 @@ mod tests {
             // are refused before reading any service namespace or opening a socket.
             let error = connect(&request, deadline).err().unwrap();
             assert_eq!(
-                error == "Saved conversations have no authenticated source service",
+                matches!(error, InspectionFailure::UnverifiedService),
                 source::is_qualified_source(protocol),
-                "protocol {protocol}: {error}"
+                "protocol {protocol}: {error:?}"
             );
             assert_eq!(
                 current::supports_protocol(protocol),
@@ -2074,14 +2069,32 @@ mod tests {
     #[test]
     fn live_inspection_failure_keeps_one_readable_reason() {
         let mut inspection = SourceInspection::default();
-        inspection_failure(&mut inspection, "Cannot connect to the source service");
+        inspection_failure(&mut inspection, InspectionFailure::ServiceUnavailable);
         assert_eq!(
             inspection.details.notices,
             [
-                "Live panes could not all be checked: the running terminal service could not be reached."
+                "Live panes could not all be checked: the running terminal service could not be reached. Review the recovery instructions for the affected panes before updating."
             ]
         );
         assert!(inspection.stopped.is_empty());
+    }
+
+    #[test]
+    fn untyped_inspection_errors_never_classify_or_expose_diagnostic_text() {
+        for reason in [
+            "Cannot descend into /private/Source/conversation",
+            "SOURCE response at /run/private.socket has secret detail",
+            "Cannot send source inspection",
+        ] {
+            let mut inspection = SourceInspection::default();
+            inspection_failure(&mut inspection, InspectionFailure::Unchecked(reason.into()));
+            assert_eq!(
+                inspection.details.notices,
+                [
+                    "Live panes could not all be checked: some running panes could not be checked. Review the recovery instructions for the affected panes before updating."
+                ]
+            );
+        }
     }
 
     #[test]

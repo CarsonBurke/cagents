@@ -647,50 +647,6 @@ fn read_review_choice(
     }
 }
 
-/// End only the exact source descriptors selected by a later destructive
-/// confirmation. Kept separate from the non-destructive update review.
-#[allow(dead_code)]
-fn end_source_chats(
-    daemon: &impact::DaemonImpact,
-    ending: Vec<crate::chat::Session>,
-) -> Result<(), UpdateError> {
-    let mut client = source_client_for(daemon)?;
-    // One the source cannot end does not keep the rest: each was approved
-    // on its own, and ending it releases what it held either way.
-    let mut failed = Vec::new();
-    for session in ending {
-        let title = session.launch.provider.label().to_owned();
-        match client.close_chat(session) {
-            Ok(()) => eprintln!("  Ended {title}"),
-            Err(error) => {
-                eprintln!("  Could not end {title}: {error}");
-                failed.push(title);
-            }
-        }
-    }
-    if failed.is_empty() {
-        Ok(())
-    } else {
-        Err(invalid(format!(
-            "The update still cannot carry {}; it was not started.",
-            failed.join(", ")
-        )))
-    }
-}
-
-/// The reviewed source, authenticated again: a preview never authorizes
-/// acting on a different owner.
-fn source_client_for(daemon: &impact::DaemonImpact) -> Result<source::Client, UpdateError> {
-    let socket = crate::terminal_ipc::daemon_socket_path()?;
-    let client = source::Client::connect(&socket).map_err(|error| invalid(error.to_string()))?;
-    if *client.proof() != daemon.capability.proof {
-        return Err(invalid(
-            "The source changed since its update impact was reviewed",
-        ));
-    }
-    Ok(client)
-}
-
 fn running_installation() -> Result<Installation, UpdateError> {
     let layout = locate(&std::env::current_exe()?)?;
     if layout.version != crate::version() {
@@ -1129,7 +1085,7 @@ fn perform_update(
             confirmed.daemon.as_ref().map(|daemon| daemon.capability.proof.clone()), confirmed.replaces_daemon)?;
         let latest = observe_impact(&staged.identity, confirmed.daemon.as_ref().map_or(impact::Policy::WhenIdle, |daemon| daemon.policy))
             .map_err(io::Error::other)?.with_inspection(&inspected);
-        if !confirmed.preserves_consent(&latest) {
+        if !confirmed.preserves_consent(&context.apply(latest)) {
             return Err(io::Error::other("Session ownership changed during pane inspection; existing windows were kept open"));
         }
         Ok(())
@@ -1144,6 +1100,7 @@ fn perform_update(
                 .map_or(impact::Policy::WhenIdle, |daemon| daemon.policy),
         )?
         .with_inspection(&confirmed.inspection());
+        let current = context.apply(current);
         if !confirmed.preserves_consent(&current) {
             return Err(invalid(
                 "Session ownership changed while saving windows; reopen and review the update again",
