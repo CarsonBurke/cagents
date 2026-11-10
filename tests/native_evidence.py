@@ -1176,6 +1176,16 @@ class Evidence(unittest.TestCase):
         self.assertFalse((fixture / "bin" / "codex").exists())
         self.assertFalse((fixture / "libexec" / "codex").exists())
 
+    def test_codex_peer_preserves_an_explicit_narrow_viewport(self) -> None:
+        self.built()
+        self.run_tool("start", "after", "--width", "900", "--height", "800",
+                      "--codex", "tool-rows")
+        self.assertIn("size=900,800", (self.logs / "kwinrules").read_text())
+        self.assertIn("--width 900 --height 800", (self.logs / "kwin").read_text())
+        self.assertEqual(self.fixture_shell("codex --version").stdout,
+                         "codex-cli 0.162.0 (offline tool-rows fixture)\n")
+        self.run_tool("stop")
+
     def test_an_unknown_codex_peer_is_refused_before_the_lock(self) -> None:
         self.built()
         result = self.run_tool("start", "after", "--codex", "codex", check=False)
@@ -1591,11 +1601,12 @@ class RemoteEvidence(unittest.TestCase):
         steps = self.root / "steps.sh"
         steps.write_text('evidence drive click "Open repository"\nevidence shot "home-$SIDE"\n')
         self.run_tool("pair", "--before", str(before), "--after", str(after),
-                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk")
+                      "--steps", str(steps), "--width", "1200", "--height", "800", "--portal", "gtk",
+                      "--codex", "tool-rows")
         self.assertTrue((self.task / "shots" / "before-home-before.webp").exists())
         self.assertTrue((self.task / "shots" / "after-home-after.webp").exists())
         calls = self.tool_calls()
-        self.assertIn("start before --width 1200 --height 800 --portal gtk", calls)
+        self.assertIn("start before --width 1200 --height 800 --portal gtk --codex tool-rows", calls)
         self.assertIn("drive click Open repository", calls)
         self.assertEqual(calls.count("stop"), 2)
 
