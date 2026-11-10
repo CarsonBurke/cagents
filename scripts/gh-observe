@@ -124,8 +124,9 @@ def supplied_query(args):
 
 def operation(query):
     # Hash the field shape, removing argument values and comments.
-    query = re.sub(r'"""[\s\S]*?"""|"(?:\\.|[^"\\])*"', '""', query)
-    query = re.sub(r"#[^\n]*", "", query)
+    lexical = GraphQLText(redact=True)
+    lexical.feed(query + "\n")
+    query = "".join(lexical.redacted)
     query = re.sub(r"\b\d+\b", "0", query)
     name = re.search(r"(?:^|})\s*(query|mutation|subscription)(?:\s+([A-Za-z_][A-Za-z_0-9]*))?", query)
     kind = name.group(1) if name else "query"
@@ -159,8 +160,8 @@ def safe_endpoint(target):
 
 
 class GraphQLText:
-    """Literal state for the raw query formatter; retain malformed input."""
-    def __init__(self):
+    """Shared literal state for trace framing and private metadata redaction."""
+    def __init__(self, redact=False):
         self.literal = None
         self.escaped = False
         self.comment = False
@@ -168,6 +169,12 @@ class GraphQLText:
         self.selection = False
         self.malformed = False
         self.pending = ""
+        self.redacted = [] if redact else None
+
+    def emit(self, text):
+        # Malformed input must not resume exposing a private literal suffix.
+        if self.redacted is not None and not self.malformed:
+            self.redacted.append(text)
 
     def complete(self):
         return self.selection and not self.literal and not self.comment and not self.pending and not self.malformed and self.braces == self.parentheses == self.brackets == 0
@@ -185,6 +192,8 @@ class GraphQLText:
             char = text[index]
             if self.comment:
                 self.comment = char != "\n"
+                if not self.comment:
+                    self.emit(char)
                 index += 1
             elif self.literal == "block":
                 if text.startswith('\\"""', index):
@@ -205,9 +214,11 @@ class GraphQLText:
                     self.malformed = True
                 index += 1
             elif text.startswith('"""', index):
+                self.emit('""')
                 self.literal = "block"
                 index += 3
             elif char == '"':
+                self.emit('""')
                 self.literal = "string"
                 index += 1
             elif char == "#":
@@ -231,6 +242,7 @@ class GraphQLText:
                     self.malformed = True
                 if self.braces < 0 or self.parentheses < 0 or self.brackets < 0:
                     self.malformed = True
+                self.emit(char)
                 index += 1
 
 

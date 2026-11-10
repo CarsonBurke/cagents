@@ -100,6 +100,60 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(first["shape"], second["shape"])
         self.assertEqual(first["operation"], "anonymous")
 
+    def test_escaped_block_string_cannot_supply_an_operation_name(self):
+        query = '{search(query:"""text\\"""\n} query SYNTHETIC_PRIVATE_VALUE {viewer{id}}\n""",type:ISSUE,first:1){issueCount}}'
+        lexical = observe.GraphQLText()
+        lexical.feed(query + "\n")
+        self.assertTrue(lexical.complete())
+        metadata = observe.operation(query)
+        reference = observe.operation('{search(query:"reference",type:ISSUE,first:1){issueCount}}')
+        self.assertEqual(metadata, reference)
+        self.assertEqual(metadata["operation"], "anonymous")
+        self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", json.dumps(metadata))
+
+    def test_string_values_and_comment_quotes_do_not_change_operation_shapes(self):
+        reference = '{search(query:"reference",type:ISSUE,first:1){issueCount}}'
+        values = [
+            '"different value"',
+            '"escaped \\" } query SYNTHETIC_PRIVATE_VALUE {viewer{id}} \\\\ tail"',
+            '"""block value\n} query SYNTHETIC_PRIVATE_VALUE {viewer{id}}\n"""',
+            '"""escaped \\""" block\n} query SYNTHETIC_PRIVATE_VALUE {viewer{id}}\n"""',
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                query = '{search(query:' + value + ',type:ISSUE,first:42){issueCount}}'
+                lexical = observe.GraphQLText()
+                lexical.feed(query + "\n")
+                self.assertTrue(lexical.complete())
+                self.assertEqual(observe.operation(query), observe.operation(reference))
+        plain = 'query Public {viewer{id}}'
+        commented = '# """ } query SYNTHETIC_PRIVATE_VALUE {viewer{id}}\n' + plain + ' # "unterminated comment'
+        self.assertEqual(observe.operation(commented), observe.operation(plain))
+
+    def test_unfinished_or_malformed_literal_consumes_private_suffix(self):
+        values = [
+            '"unfinished\n} query SYNTHETIC_PRIVATE_VALUE {viewer{id}}',
+            '"""unfinished \\"""\n} query SYNTHETIC_PRIVATE_VALUE {viewer{id}}',
+            '"invalid newline\n" } query SYNTHETIC_PRIVATE_VALUE {viewer{id}}',
+        ]
+        for value in values:
+            with self.subTest(value=value):
+                query = '{search(query:' + value
+                metadata = observe.operation(query)
+                self.assertEqual(metadata["operation"], "anonymous")
+                self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", json.dumps(metadata))
+                self.assertEqual(metadata, observe.operation(query.replace("SYNTHETIC_PRIVATE_VALUE", "ANOTHER_PRIVATE_VALUE")))
+
+    def test_ordinary_operation_shape_hashes_remain_compatible(self):
+        cases = [
+            ('query Find($n:Int=10){repository(owner:"one",name:"two"){pullRequests(first:100){totalCount}}}', "Find", "78ca395196a6e522"),
+            ('{repository(owner:"one",name:"two"){pullRequests(first:100){totalCount}}}', "anonymous", "45f610adcbb069c7"),
+            ('query Public { search(query:"""one\n two""",type:ISSUE,first:10){issueCount} }', "Public", "e639c0e1d165bad6"),
+        ]
+        for query, name, shape in cases:
+            with self.subTest(name=name):
+                self.assertEqual(observe.operation(query), {"graphql_kind": "query", "operation": name, "shape": shape})
+
     def test_mutation_estimate_is_explicit_and_cost_unknown(self):
         rows = self.parse({"query": "mutation AddComment($input:AddCommentInput!){addComment(input:$input){clientMutationId}}"}, {"data": {}})
         self.assertEqual(rows[0]["secondary_points_estimate"], 5)
@@ -323,6 +377,18 @@ sys.exit(42)
         self.assertIsNone(json.loads(self.marker.read_text())["debug"])
         self.assertEqual(len(self.rows()), 1)
         self.assertFalse(self.rows()[0]["detailed"])
+
+    def test_default_shim_never_logs_operation_names_from_escaped_block_values(self):
+        query = '{search(query:"""text\\"""\n} query SYNTHETIC_PRIVATE_VALUE {viewer{id}}\n""",type:ISSUE,first:1){issueCount}}'
+        self.args = ["api", "graphql", "-f", "query=" + query]
+        self.assert_unchanged(self.opted_in(http=False))
+        self.assertIsNone(json.loads(self.marker.read_text())["debug"])
+        rows = self.rows()
+        self.assertEqual(len(rows), 1)
+        self.assertFalse(rows[0]["detailed"])
+        self.assertEqual(rows[0]["operation"], "anonymous")
+        self.assertEqual(rows[0]["shape"], observe.operation('{search(query:"reference",type:ISSUE,first:1){issueCount}}')["shape"])
+        self.assertNotIn("SYNTHETIC_PRIVATE_VALUE", json.dumps(rows))
 
     def test_http_flag_explicitly_enriches_known_json_operation(self):
         self.assert_unchanged(self.opted_in(http=True))
