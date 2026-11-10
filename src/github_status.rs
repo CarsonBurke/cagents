@@ -78,7 +78,7 @@ impl<E: ProcessExecutor> StatusService<E> {
             .filter(|errors| !errors.is_empty())
         {
             let text = format!("{headers}\n{}", serde_json::Value::Array(errors.clone()));
-            if let Some(limit) = RateLimit::classify(&text, now()) {
+            if let Some(limit) = RateLimit::classify_for(&text, now(), "graphql") {
                 return Err(StatusError::RateLimited(limit));
             }
             let messages = errors
@@ -95,7 +95,10 @@ impl<E: ProcessExecutor> StatusService<E> {
             .and_then(|envelope| envelope.remove("data"))
             .filter(serde_json::Value::is_object)
             .ok_or_else(|| StatusError::Message("GitHub returned no status data".into()))?;
-        Ok((parse(&data, key)?, RateLimit::classify(&headers, now())))
+        Ok((
+            parse(&data, key)?,
+            RateLimit::classify_for(&headers, now(), "graphql"),
+        ))
     }
 }
 
@@ -129,9 +132,10 @@ fn classify_failure(stdout: &[u8], stderr: &[u8]) -> Option<RateLimit> {
         ),
         Err(_) => String::from_utf8_lossy(body).into_owned(),
     };
-    RateLimit::classify(
+    RateLimit::classify_for(
         &format!("{headers}\n{detail}\n{}", String::from_utf8_lossy(stderr)),
         now(),
+        "graphql",
     )
 }
 
@@ -401,25 +405,49 @@ pub(crate) fn lock(
 }
 
 fn host_paths(root: &Path, credentials: &str, host: &str) -> (PathBuf, PathBuf) {
-    let name = digest(&["host-v1", credentials, &host.to_ascii_lowercase()]);
+    let name = digest(&["host-v2", credentials, &host.to_ascii_lowercase()]);
     (
         root.join(format!("{name}.lock")),
         root.join(format!("{name}.cooldown")),
     )
 }
 
+/// Versioned, resource-aware pacing. host-v1 stored an ambiguous bare reset
+/// timestamp, which cannot establish an all-resource secondary pause.
+#[derive(Default, Serialize, Deserialize)]
+struct HostBudget {
+    primary: std::collections::BTreeMap<String, u64>,
+    secondary: u64,
+}
+
+impl HostBudget {
+    fn limit(&self, resource: &str, at: u64) -> Option<RateLimit> {
+        let secondary = (self.secondary > at).then_some(self.secondary);
+        if let Some(&due) = self.primary.get(resource).filter(|&&due| due > at) {
+            Some(RateLimit {
+                retry_at: due.max(secondary.unwrap_or(0)),
+                resource: Some(resource.into()),
+                secondary_retry_at: secondary,
+            })
+        } else {
+            secondary.map(RateLimit::secondary)
+        }
+    }
+}
+
 pub(crate) fn shared_cooldown(
     root: &Path,
     credentials: &str,
     host: &str,
+    resource: &str,
     cancellation: &CancellationToken,
 ) -> Result<Option<RateLimit>, String> {
     let (lock_path, path) = host_paths(root, credentials, host);
     let _host = lock(&lock_path, cancellation)?;
-    Ok(load::<u64>(&path)
+    Ok(load::<HostBudget>(&path)
         .map_err(|error| error.to_string())?
-        .filter(|due| *due > now())
-        .map(|retry_at| RateLimit { retry_at }))
+        .unwrap_or_default()
+        .limit(resource, now()))
 }
 
 pub(crate) fn record_cooldown(
@@ -431,10 +459,24 @@ pub(crate) fn record_cooldown(
 ) -> Result<(), String> {
     let (lock_path, path) = host_paths(root, credentials, host);
     let _host = lock(&lock_path, cancellation)?;
-    let existing = load::<u64>(&path)
+    let mut budget = load::<HostBudget>(&path)
         .map_err(|error| error.to_string())?
-        .unwrap_or(0);
-    store(&path, &existing.max(limit.retry_at)).map_err(|error| error.to_string())
+        .unwrap_or_default();
+    budget.primary.retain(|_, due| *due > now());
+    match limit.resource.as_deref() {
+        Some("unknown") => {
+            return Err("Cannot persist a primary GitHub limit without its resource".into());
+        }
+        Some(resource) => {
+            let due = budget.primary.entry(resource.into()).or_default();
+            *due = (*due).max(limit.retry_at);
+            if let Some(due) = limit.secondary_retry_at {
+                budget.secondary = budget.secondary.max(due);
+            }
+        }
+        None => budget.secondary = budget.secondary.max(limit.retry_at),
+    }
+    store(&path, &budget).map_err(|error| error.to_string())
 }
 
 pub(crate) fn load<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
@@ -500,9 +542,13 @@ fn read_with<E: ProcessExecutor>(
         verify_credentials()?;
         return Ok(cached.report(key, "cache", current));
     }
-    if let Some(limit) =
-        shared_cooldown(root, credentials, &key.repository.authority(), cancellation)?
-    {
+    if let Some(limit) = shared_cooldown(
+        root,
+        credentials,
+        &key.repository.authority(),
+        "graphql",
+        cancellation,
+    )? {
         cached.error = Some(limit.to_string());
         cached.next_attempt = limit.retry_at;
         verify_credentials()?;
@@ -626,6 +672,122 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
         root
+    }
+
+    #[test]
+    fn persisted_cooldowns_preserve_resource_and_credential_boundaries() {
+        let root = private_tempdir();
+        let cancellation = CancellationToken::new();
+        let due = now() + 3600;
+        record_cooldown(
+            root.path(),
+            "first",
+            "example.invalid",
+            &RateLimit::primary("graphql", due),
+            &cancellation,
+        )
+        .unwrap();
+        let graphql = shared_cooldown(
+            root.path(),
+            "first",
+            "example.invalid",
+            "graphql",
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(graphql.resource.as_deref(), Some("graphql"));
+        assert_eq!(graphql.retry_at, due);
+        assert!(
+            shared_cooldown(
+                root.path(),
+                "first",
+                "example.invalid",
+                "core",
+                &cancellation
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(
+            shared_cooldown(
+                root.path(),
+                "second",
+                "example.invalid",
+                "graphql",
+                &cancellation
+            )
+            .unwrap()
+            .is_none()
+        );
+        record_cooldown(
+            root.path(),
+            "first",
+            "example.invalid",
+            &RateLimit::secondary(now() + 60),
+            &cancellation,
+        )
+        .unwrap();
+        let core = shared_cooldown(
+            root.path(),
+            "first",
+            "example.invalid",
+            "core",
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(core.resource.is_none());
+        assert!(core.retry_at < due);
+        let graphql = shared_cooldown(
+            root.path(),
+            "first",
+            "example.invalid",
+            "graphql",
+            &cancellation,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(graphql.resource.as_deref(), Some("graphql"));
+        assert_eq!(graphql.retry_at, due);
+        assert_eq!(graphql.secondary_retry_at, Some(core.retry_at));
+    }
+
+    #[test]
+    fn legacy_unscoped_cooldowns_do_not_become_secondary_pauses() {
+        let root = private_tempdir();
+        let name = digest(&["host-v1", "account", "example.invalid"]);
+        store(
+            &root.path().join(format!("{name}.cooldown")),
+            &(now() + 3600),
+        )
+        .unwrap();
+        for resource in ["graphql", "core", "search"] {
+            assert!(
+                shared_cooldown(
+                    root.path(),
+                    "account",
+                    "example.invalid",
+                    resource,
+                    &CancellationToken::new()
+                )
+                .unwrap()
+                .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn expired_secondary_pause_does_not_inherit_another_resources_primary_reset() {
+        let budget = HostBudget {
+            primary: std::collections::BTreeMap::from([("graphql".into(), 3600)]),
+            secondary: 120,
+        };
+        assert_eq!(budget.limit("core", 110), Some(RateLimit::secondary(120)));
+        assert!(budget.limit("core", 121).is_none());
+        let graphql = budget.limit("graphql", 121).unwrap();
+        assert_eq!(graphql.resource.as_deref(), Some("graphql"));
+        assert_eq!(graphql.secondary_retry_at, None);
     }
 
     fn key() -> PullRequestKey {

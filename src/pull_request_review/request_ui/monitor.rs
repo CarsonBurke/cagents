@@ -617,9 +617,9 @@ mod tests {
         crate::github::polling::failed(
             &repository.host,
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
         assert!(!crate::github::polling::ready(&repository.host, false));

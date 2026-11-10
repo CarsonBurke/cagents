@@ -2104,9 +2104,9 @@ mod tests {
         crate::github::polling::failed(
             host,
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
         let mut state = State::default();
@@ -2293,9 +2293,9 @@ mod tests {
         crate::github::polling::failed(
             &target.repository().host,
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
         let mut state = State::default();

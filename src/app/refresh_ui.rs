@@ -709,9 +709,9 @@ mod tests {
         let mut app = super::super::tests::context_inspector_test_app(false);
         let project = ProjectId::new();
         let availability = || GitHubAvailability::RateLimited {
-            limit: crate::github::polling::RateLimit {
-                retry_at: crate::github::polling::now() + 120,
-            },
+            limit: crate::github::polling::RateLimit::secondary(
+                crate::github::polling::now() + 120,
+            ),
         };
         app.repository_generations.insert(project, 1);
         drop(app.update(Message::GitUi(git_ui::Action::Remote {
@@ -790,9 +790,9 @@ mod tests {
         crate::github::polling::failed(
             "review-scheduler-paused.invalid",
             &crate::github::GitHubError::RateLimited {
-                limit: crate::github::polling::RateLimit {
-                    retry_at: crate::github::polling::now() + 120,
-                },
+                limit: crate::github::polling::RateLimit::secondary(
+                    crate::github::polling::now() + 120,
+                ),
             },
         );
         let now = Instant::now();

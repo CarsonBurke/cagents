@@ -6,6 +6,7 @@ thread_local! {
     /// Shared workers already captured their credential context off the UI
     /// thread. Keep that context through all service-level pacing decisions.
     static SCOPE: RefCell<Option<String>> = const { RefCell::new(None) };
+    static RESOURCE: RefCell<String> = RefCell::new("graphql".into());
 }
 
 pub(crate) fn with_scope<T>(scope: &str, read: impl FnOnce() -> T) -> T {
@@ -21,6 +22,27 @@ pub(crate) fn with_scope<T>(scope: &str, read: impl FnOnce() -> T) -> T {
 
 pub(crate) fn current_scope() -> Option<String> {
     SCOPE.with(|scope| scope.borrow().clone())
+}
+
+/// Foreground admission defaults to GraphQL, which owns the app's polling
+/// queries. Transport workers select their actual resource without UI file IO.
+pub(crate) fn with_resource<T>(resource: &str, read: impl FnOnce() -> T) -> T {
+    struct Restore(String);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RESOURCE.with(|current| *current.borrow_mut() = std::mem::take(&mut self.0));
+        }
+    }
+    let _restore = Restore(RESOURCE.with(|current| current.replace(resource.to_owned())));
+    read()
+}
+
+pub(crate) fn resource() -> String {
+    RESOURCE.with(|current| current.borrow().clone())
+}
+
+pub(crate) fn classify(text: &str, now: u64) -> Option<RateLimit> {
+    RateLimit::classify_for(text, now, &resource())
 }
 
 static ACTIVE: LazyLock<Mutex<HashMap<String, String>>> = LazyLock::new(Default::default);
@@ -64,29 +86,51 @@ struct Budget {
     failures: u32,
     due: u64,
     rate_limited: bool,
+    primary: HashMap<String, u64>,
 }
 static BUDGETS: LazyLock<Mutex<HashMap<String, Budget>>> = LazyLock::new(Default::default);
-/// Manual refresh bypasses transient backoff, never a server's rate limit.
+impl Budget {
+    fn limit(&self, resource: &str, at: u64) -> Option<RateLimit> {
+        let secondary = (self.rate_limited && self.due > at).then_some(self.due);
+        if let Some(&due) = self.primary.get(resource).filter(|&&due| due > at) {
+            Some(RateLimit {
+                retry_at: due.max(secondary.unwrap_or(0)),
+                resource: Some(resource.into()),
+                secondary_retry_at: secondary,
+            })
+        } else {
+            secondary.map(RateLimit::secondary)
+        }
+    }
+}
+
+/// Manual refresh bypasses transient backoff, never applicable server pacing.
+/// UI callers inspect the GraphQL budget; REST transports select core/search.
 pub fn ready(host: &str, manual: bool) -> bool {
+    let at = now();
     BUDGETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&budget_key(host))
-        .is_none_or(|b| b.due <= now() || (manual && !b.rate_limited))
+        .is_none_or(|b| b.limit(&resource(), at).is_none() && (b.due <= at || manual))
 }
+
 pub fn rate_limit(host: &str) -> Option<RateLimit> {
     BUDGETS
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .get(&budget_key(host))
-        .filter(|budget| budget.rate_limited && budget.due > now())
-        .map(|budget| RateLimit {
-            retry_at: budget.due,
-        })
+        .and_then(|budget| budget.limit(&resource(), now()))
+}
+
+pub(crate) fn rate_limit_for(host: &str, resource: &str) -> Option<RateLimit> {
+    with_resource(resource, || rate_limit(host))
 }
 
 pub fn failed(host: &str, error: &GitHubError) {
-    let rate_limit = error.rate_limit();
+    let rate_limit = error
+        .rate_limit()
+        .map(|limit| limit.with_resource(&resource()));
     // Closing or switching a review cancels reads without a host outage. Any
     // server pacing already observed still applies, including partial output.
     if rate_limit.is_none()
@@ -98,8 +142,17 @@ pub fn failed(host: &str, error: &GitHubError) {
     let budget = budgets.entry(budget_key(host)).or_default();
     budget.failures = budget.failures.saturating_add(1);
     if let Some(limit) = rate_limit {
-        budget.due = budget.due.max(limit.retry_at);
-        budget.rate_limited = true;
+        if let Some(resource) = limit.resource {
+            let due = budget.primary.entry(resource).or_default();
+            *due = (*due).max(limit.retry_at);
+            if let Some(secondary) = limit.secondary_retry_at {
+                budget.due = budget.due.max(secondary);
+                budget.rate_limited = true;
+            }
+        } else {
+            budget.due = budget.due.max(limit.retry_at);
+            budget.rate_limited = true;
+        }
     } else if !budget.rate_limited || budget.due <= now() {
         let delay = 30u64.saturating_mul(1u64 << budget.failures.saturating_sub(1).min(6));
         // A per-host/time offset staggers windows recovering together.
@@ -114,16 +167,140 @@ pub fn failed(host: &str, error: &GitHubError) {
 pub fn succeeded(host: &str) {
     let mut budgets = BUDGETS.lock().unwrap_or_else(|e| e.into_inner());
     let key = budget_key(host);
-    if budgets
-        .get(&key)
-        .is_none_or(|b| !b.rate_limited || b.due <= now())
-    {
-        budgets.remove(&key);
+    if let Some(budget) = budgets.get_mut(&key) {
+        budget.primary.retain(|_, due| *due > now());
+        if !budget.rate_limited || budget.due <= now() {
+            budget.failures = 0;
+            budget.due = 0;
+            budget.rate_limited = false;
+        }
+        if budget.primary.is_empty() && !budget.rate_limited {
+            budgets.remove(&key);
+        }
     }
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn primary_resources_do_not_block_other_transports_but_secondary_pacing_does() {
+        struct Healthy {
+            commands: Mutex<Vec<CommandSpec>>,
+            exhausted: Mutex<Option<&'static str>>,
+        }
+        impl ProcessExecutor for Healthy {
+            fn execute(
+                &self,
+                command: &CommandSpec,
+                _: &CancellationToken,
+            ) -> Result<ProcessOutput, ProcessFailure> {
+                self.commands.lock().unwrap().push(command.clone());
+                let resource = command_resource(command);
+                let mut exhausted = self.exhausted.lock().unwrap();
+                if *exhausted == Some(resource) {
+                    *exhausted = None;
+                    return Ok(ProcessOutput { success: false, exit_code: Some(1), signal: None,
+                        stdout: format!("HTTP/2.0 403 Forbidden\r\nX-RateLimit-Remaining: 0\r\nX-RateLimit-Resource: {resource}\r\nX-RateLimit-Reset: {}\r\n\r\n{{\"message\":\"API rate limit exceeded\"}}", now() + 3600).into_bytes(), stderr: vec![] });
+                }
+                Ok(ProcessOutput {
+                    success: true,
+                    exit_code: Some(0),
+                    signal: None,
+                    stdout: if command_resource(command) == "graphql" {
+                        br#"{"data":{"viewer":{"login":"reader"}}}"#.to_vec()
+                    } else {
+                        br#"{"id":1,"ok":true}"#.to_vec()
+                    },
+                    stderr: vec![],
+                })
+            }
+        }
+        let host = "resource-isolation.invalid";
+        let repository = GitHubRepoKey::new(host, None, "owner", "repo").unwrap();
+        let executor = Arc::new(Healthy {
+            commands: Mutex::new(vec![]),
+            exhausted: Mutex::new(Some("graphql")),
+        });
+        let service = GitHubService::new("gh", executor.clone());
+        let cancellation = CancellationToken::new();
+        with_scope("resource-account", || {
+            assert!(
+                service
+                    .graphql(&repository, "query{viewer{login}}", vec![], &cancellation)
+                    .is_err()
+            );
+            assert!(!ready(host, false));
+            let rest = service.gh_command(["api", "--include", "repos/owner/repo"]);
+            assert!(
+                service
+                    .run_checked(&rest, &repository, &cancellation)
+                    .is_ok()
+            );
+            assert!(matches!(
+                service.post_single_review_comment(
+                    &PullRequestKey::new(repository.clone(), 1).unwrap(),
+                    &"a".repeat(40),
+                    &AddReviewThreadRequest {
+                        review_id: "unused".into(),
+                        path: "file.rs".into(),
+                        subject: ReviewThreadSubject::File,
+                        body: "A comment".into()
+                    },
+                    &cancellation,
+                ),
+                Ok(ReviewMutationOutcome::Applied(()))
+            ));
+            assert!(
+                service
+                    .graphql(&repository, "query{viewer{login}}", vec![], &cancellation)
+                    .is_err()
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), 3);
+            BUDGETS.lock().unwrap().remove(&budget_key(host));
+            *executor.exhausted.lock().unwrap() = Some("core");
+            assert!(
+                service
+                    .run_checked(&rest, &repository, &cancellation)
+                    .is_err()
+            );
+            assert!(
+                ready(host, false),
+                "UI GraphQL admission ignores core exhaustion"
+            );
+            service
+                .graphql(&repository, "query{viewer{login}}", vec![], &cancellation)
+                .unwrap();
+            assert!(
+                service
+                    .run_checked(&rest, &repository, &cancellation)
+                    .is_err()
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), 5);
+            let secondary = classify("secondary rate limit\nRetry-After: 60", now()).unwrap();
+            failed(host, &GitHubError::RateLimited { limit: secondary });
+            assert!(!ready(host, true));
+            assert!(
+                service
+                    .graphql(&repository, "query{viewer{login}}", vec![], &cancellation)
+                    .is_err()
+            );
+            assert!(
+                service
+                    .run_checked(&rest, &repository, &cancellation)
+                    .is_err()
+            );
+            assert_eq!(executor.commands.lock().unwrap().len(), 5);
+            with_scope("another-account", || {
+                assert!(ready(host, false));
+                service
+                    .run_checked(&rest, &repository, &cancellation)
+                    .unwrap();
+            });
+            BUDGETS.lock().unwrap().remove(&budget_key(host));
+        });
+    }
 
     #[test]
     fn local_coordination_refusal_proves_no_mutation_was_submitted() {
@@ -269,9 +446,7 @@ Retry-After: 120
             failed(
                 host,
                 &GitHubError::RateLimited {
-                    limit: RateLimit {
-                        retry_at: now() + 120,
-                    },
+                    limit: RateLimit::secondary(now() + 120),
                 },
             )
         });
@@ -300,9 +475,7 @@ Retry-After: 120
     fn captured_credentials_isolate_pacing_and_restore_scope_after_unwind() {
         let host = "credential-scope.invalid";
         let limit = GitHubError::RateLimited {
-            limit: RateLimit {
-                retry_at: now() + 120,
-            },
+            limit: RateLimit::secondary(now() + 120),
         };
         failed(host, &limit);
         assert!(!ready(host, false));
@@ -370,9 +543,7 @@ Retry-After: 120
         failed(
             host,
             &GitHubError::RateLimited {
-                limit: RateLimit {
-                    retry_at: now() + 120,
-                },
+                limit: RateLimit::secondary(now() + 120),
             },
         );
         assert!(!ready(host, false));
@@ -416,9 +587,7 @@ Retry-After: 120
         failed(host, &cancelled);
         assert_eq!(snapshot(), transient);
 
-        let limit = RateLimit {
-            retry_at: now() + 120,
-        };
+        let limit = RateLimit::secondary(now() + 120);
         failed(
             host,
             &GitHubError::RateLimited {
@@ -453,7 +622,10 @@ Retry-After: 120
                 started: true,
             }),
         );
-        assert_eq!(rate_limit(host), Some(RateLimit { retry_at }));
+        assert_eq!(
+            rate_limit(host),
+            Some(RateLimit::primary("graphql", retry_at))
+        );
         assert!(!ready(host, false));
         assert!(!ready(host, true));
         BUDGETS.lock().unwrap().remove(host);

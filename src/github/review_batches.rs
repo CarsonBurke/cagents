@@ -9,11 +9,11 @@ impl<E: ProcessExecutor> GitHubService<E> {
         request: &AddReviewThreadRequest,
         cancellation: &CancellationToken,
     ) -> Result<ReviewMutationOutcome<()>, GitHubError> {
-        self.with_host_scope(&key.repository.host, || {
+        self.with_transport_scope(&key.repository.host, "core", || {
             key.validate()?;
             validate_review_oid(commit)?;
             request.validate()?;
-            if let Some(limit) = polling::rate_limit(&key.repository.host) {
+            if let Some(limit) = polling::rate_limit_for(&key.repository.host, "core") {
                 return Err(GitHubError::RateLimited { limit });
             }
             let endpoint = format!(
@@ -81,7 +81,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
                 .and_then(|body| body.get("message"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            if let Some(limit) = polling::RateLimit::classify(
+            if let Some(limit) = polling::classify(
                 &format!(
                     "{}\n{}\n{}",
                     String::from_utf8_lossy(headers),
@@ -126,7 +126,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
         viewed: bool,
         cancellation: &CancellationToken,
     ) -> Vec<(String, Result<ReviewMutationOutcome<()>, GitHubError>)> {
-        self.with_host_scope(&repository.host, || {
+        self.with_transport_scope(&repository.host, "graphql", || {
             let validate = || -> Result<(), GitHubError> {
                 repository.validate()?;
                 validate_node_id("pull_request_id", pr)?;
@@ -231,7 +231,7 @@ impl<E: ProcessExecutor> GitHubService<E> {
             };
             let body =
                 serde_json::from_slice::<serde_json::Value>(graphql_body(&output.stdout)).ok();
-            if let Some(limit) = polling::RateLimit::classify(
+            if let Some(limit) = polling::classify(
                 &format!(
                     "{}\n{}",
                     format!(

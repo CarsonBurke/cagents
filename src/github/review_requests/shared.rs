@@ -189,9 +189,13 @@ fn poll_with(
     if stored.due > now {
         return Ok(stored.result(now));
     }
-    if let Some(limit) =
-        pr_status::shared_cooldown(root, credentials, &repository.authority(), cancellation)?
-    {
+    if let Some(limit) = pr_status::shared_cooldown(
+        root,
+        credentials,
+        &repository.authority(),
+        "graphql",
+        cancellation,
+    )? {
         stored.error = Some(limit.to_string());
         stored.due = limit.retry_at;
         stored.observed.clear();
@@ -700,7 +704,7 @@ pub(crate) mod tests {
             || 1060,
             |_, _| {
                 Err(GitHubError::RateLimited {
-                    limit: polling::RateLimit { retry_at },
+                    limit: polling::RateLimit::secondary(retry_at),
                 })
             },
             || Ok(()),
@@ -778,7 +782,7 @@ pub(crate) mod tests {
             |_, _| {
                 cancellation.cancel();
                 Err(GitHubError::RateLimited {
-                    limit: polling::RateLimit { retry_at },
+                    limit: polling::RateLimit::secondary(retry_at),
                 })
             },
             || Ok(()),
